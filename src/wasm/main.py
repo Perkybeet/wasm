@@ -13,6 +13,7 @@ from wasm.cli.commands import (
     handle_cert,
     handle_setup,
 )
+from wasm.cli.commands.monitor import handle_monitor
 from wasm.core.logger import Logger
 from wasm.core.exceptions import WASMError
 
@@ -79,6 +80,13 @@ def main() -> int:
             print("Use: wasm setup --help", file=sys.stderr)
             return 1
         return handle_setup(args)
+    
+    elif command in ["monitor", "mon"]:
+        if not args.action:
+            print("Error: monitor requires an action", file=sys.stderr)
+            print("Use: wasm monitor --help", file=sys.stderr)
+            return 1
+        return handle_monitor(args)
     
     else:
         print(f"Unknown command: {command}", file=sys.stderr)

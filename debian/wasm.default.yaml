@@ -20,3 +20,62 @@ ssl:
 logging:
   level: info
   directory: /var/log/wasm
+
+# =============================================================================
+# AI-Powered Process Monitor Configuration
+# =============================================================================
+# The process monitor scans running processes to detect and neutralize
+# suspicious or malicious activity (e.g., cryptocurrency miners, reverse shells)
+#
+# IMPORTANT: This feature requires additional dependencies:
+#   - psutil (pip install psutil)
+#   - httpx or requests (pip install httpx)
+
+monitor:
+  # Enable/disable the monitor (default: false)
+  enabled: false
+  
+  # How often to scan processes (in seconds)
+  # Default: 3600 (1 hour)
+  scan_interval: 3600
+  
+  # Resource thresholds that trigger additional scrutiny
+  cpu_threshold: 80.0      # Processes using more than this % CPU
+  memory_threshold: 80.0   # Processes using more than this % memory
+  
+  # Automatic termination settings
+  auto_terminate: true           # Automatically terminate detected threats
+  terminate_malicious_only: true # Only terminate "malicious" (not "suspicious")
+  
+  # AI Analysis using OpenAI
+  use_ai: true
+  
+  # Dry run mode - log actions without actually terminating processes
+  dry_run: false
+  
+  # Monitor log file
+  log_file: /var/log/wasm/monitor.log
+  
+  # OpenAI API Configuration
+  # Get your API key from: https://platform.openai.com/api-keys
+  openai:
+    api_key: ""              # Your OpenAI API key
+    model: "gpt-4o-mini"     # Model to use for analysis
+  
+  # SMTP Configuration for Email Notifications
+  # Sends alerts when threats are detected and after mitigation
+  smtp:
+    host: ""                 # SMTP server hostname (e.g., smtp.ionos.es)
+    port: 465                # SMTP port (465 for SSL, 587 for TLS)
+    username: ""             # SMTP username (usually your email)
+    password: ""             # SMTP password
+    use_ssl: true            # Use SSL/TLS connection
+    use_tls: false           # Use STARTTLS (if use_ssl is false)
+    from_address: ""         # From address (defaults to username)
+  
+  # List of email addresses to receive alerts
+  email_recipients: []
+  # Example:
+  # email_recipients:
+  #   - admin@example.com
+  #   - security@example.com

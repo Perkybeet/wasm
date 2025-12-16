@@ -1,92 +1,17 @@
-wasm (0.1.0-2~noble) noble; urgency=medium
+wasm (0.8.0-1~noble) noble; urgency=medium
 
-  * Add shell completions for bash, zsh, and fish
-  * Add 'wasm setup' command for initial setup and completions installation
-  * Update postinst to show shell completion info
+  * Major version bump to 0.8.0
+  * Add AI-powered process monitoring with OpenAI integration
+  * Add email notifications for security threats (SMTP support)
+  * Add automatic malicious process termination
+  * Add pattern-based threat detection
+  * Fix config file permissions for non-root users
+  * Improve CLI structure and help messages
 
- -- Yago López Prado <yago.lopez.adeje@gmail.com>  Mon, 16 Dec 2025 16:00:00 +0000
-
-wasm (0.1.0-2~plucky) plucky; urgency=medium
-
-  * Add shell completions for bash, zsh, and fish
-  * Add 'wasm setup' command for initial setup and completions installation
-  * Update postinst to show shell completion info
-
- -- Yago López Prado <yago.lopez.adeje@gmail.com>  Mon, 16 Dec 2025 15:59:00 +0000
-
-wasm (0.1.0-2~noble) noble; urgency=medium
-
-  * Add shell completions for bash, zsh, and fish
-  * Add 'wasm setup' command for initial setup and completions installation
-  * Update postinst to show shell completion info
-
- -- Yago López Prado <yago.lopez.adeje@gmail.com>  Mon, 16 Dec 2025 15:58:00 +0000
-
-wasm (0.1.0-1ubuntu3) noble; urgency=medium
-
-  * Fix critical bug: Logger.stream attribute order in __init__
-  * Fix missing is_valid_source() function in validators/source.py
-  * Fix validators for inquirer: add check_domain() and check_port() wrappers
-  * Add __main__.py for python -m wasm support
-  * Build for Ubuntu 25.10 (Questing)
-
- -- Yago López Prado <yago.lopez.adeje@gmail.com>  Wed, 18 Dec 2025 12:00:00 +0000
-
-wasm (0.1.0-1ubuntu3~plucky1) plucky; urgency=medium
-
-  * Fix critical bug: Logger.stream attribute order in __init__
-  * Fix missing is_valid_source() function in validators/source.py
-  * Fix validators for inquirer: add check_domain() and check_port() wrappers
-  * Add __main__.py for python -m wasm support
-  * Build for Ubuntu 25.04 (Plucky)
-
- -- Yago López Prado <yago.lopez.adeje@gmail.com>  Wed, 18 Dec 2025 11:59:00 +0000
-
-wasm (0.1.0-1ubuntu3) noble; urgency=medium
-
-  * Fix critical bug: Logger.stream attribute order in __init__
-  * Fix missing is_valid_source() function in validators/source.py
-  * Fix validators for inquirer: add check_domain() and check_port() wrappers
-  * Add __main__.py for python -m wasm support
-
- -- Yago López Prado <yago.lopez.adeje@gmail.com>  Wed, 18 Dec 2025 11:58:00 +0000
-
-wasm (0.1.0-1ubuntu2~questing1) questing; urgency=medium
-
-  * Fix build dependency: add pybuild-plugin-pyproject for PEP517 builds
-  * Build for Ubuntu 25.10 (Questing)
-
- -- Yago López Prado <yago.lopez.adeje@gmail.com>  Mon, 16 Dec 2025 13:22:00 +0000
-
-wasm (0.1.0-1ubuntu2~plucky1) plucky; urgency=medium
-
-  * Fix build dependency: add pybuild-plugin-pyproject for PEP517 builds
-  * Build for Ubuntu 25.04 (Plucky)
-
- -- Yago López Prado <yago.lopez.adeje@gmail.com>  Mon, 16 Dec 2025 13:21:00 +0000
-
-wasm (0.1.0-1ubuntu2~oracular1) oracular; urgency=medium
-
-  * Fix build dependency: add pybuild-plugin-pyproject for PEP517 builds
-  * Build for Ubuntu 24.10 (Oracular)
-
- -- Yago López Prado <yago.lopez.adeje@gmail.com>  Mon, 16 Dec 2025 13:20:00 +0000
-
-wasm (0.1.0-1ubuntu2) noble; urgency=medium
-
-  * Fix build dependency: add pybuild-plugin-pyproject for PEP517 builds
-
- -- Yago López Prado <yago.lopez.adeje@gmail.com>  Tue, 17 Dec 2025 13:10:00 +0000
+ -- Yago López Prado <yago.lopez.adeje@gmail.com>  Mon, 16 Dec 2024 18:00:00 +0000
 
 wasm (0.1.0-1ubuntu1) noble; urgency=medium
 
   * Initial release.
-  * Features:
-    - Web application deployment (Next.js, Node.js, Vite, Python, static)
-    - Nginx and Apache site management
-    - SSL certificate management via Certbot
-    - Systemd service management
-    - Interactive mode with inquirer
-    - One-command deployments
 
- -- Yago López Prado <yago.lopez.adeje@gmail.com>  Mon, 16 Dec 2024 12:00:00 +0000
+ -- Yago López Prado <yago.lopez.adeje@gmail.com>  Mon, 16 Dec 2024 10:00:00 +0000

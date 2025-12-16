@@ -87,6 +87,9 @@ For more information, visit: https://github.com/your-org/wasm
     # Cert commands
     _add_cert_parser(subparsers)
     
+    # Monitor commands
+    _add_monitor_parser(subparsers)
+    
     # Setup commands
     _add_setup_parser(subparsers)
     
@@ -628,6 +631,82 @@ def _add_cert_parser(subparsers) -> None:
         "--force", "-f",
         action="store_true",
         help="Skip confirmation",
+    )
+
+
+def _add_monitor_parser(subparsers) -> None:
+    """Add monitor subcommands."""
+    monitor = subparsers.add_parser(
+        "monitor",
+        aliases=["mon"],
+        help="AI-powered process security monitoring",
+        description="Monitor system processes for suspicious activity using AI analysis",
+    )
+    
+    monitor_sub = monitor.add_subparsers(
+        dest="action",
+        title="actions",
+        metavar="<action>",
+    )
+    
+    # monitor status
+    monitor_sub.add_parser(
+        "status",
+        aliases=["info"],
+        help="Show monitor service status",
+    )
+    
+    # monitor scan
+    scan = monitor_sub.add_parser(
+        "scan",
+        help="Run a single security scan",
+    )
+    scan.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Don't terminate processes, just report",
+    )
+    
+    # monitor run
+    monitor_sub.add_parser(
+        "run",
+        help="Run monitor continuously (foreground)",
+    )
+    
+    # monitor enable (main command - installs if needed)
+    monitor_sub.add_parser(
+        "enable",
+        help="Enable monitor (installs dependencies and service if needed)",
+    )
+    
+    # monitor install (optional - just installs without enabling)
+    monitor_sub.add_parser(
+        "install",
+        help="Install monitor service only (without enabling)",
+    )
+    
+    # monitor disable
+    monitor_sub.add_parser(
+        "disable",
+        help="Disable and stop monitor service",
+    )
+    
+    # monitor uninstall
+    monitor_sub.add_parser(
+        "uninstall",
+        help="Uninstall monitor service",
+    )
+    
+    # monitor test-email
+    monitor_sub.add_parser(
+        "test-email",
+        help="Send a test email to verify notification settings",
+    )
+    
+    # monitor config
+    monitor_sub.add_parser(
+        "config",
+        help="Show current monitor configuration",
     )
 
 

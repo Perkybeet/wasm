@@ -3,6 +3,11 @@ set -e
 
 case "$1" in
     configure)
+        # Create wasm group if it doesn't exist
+        if ! getent group wasm > /dev/null 2>&1; then
+            groupadd --system wasm
+        fi
+        
         # Set proper permissions for directories
         if [ -d /var/www/apps ]; then
             chown -R www-data:www-data /var/www/apps
@@ -10,29 +15,39 @@ case "$1" in
         fi
         
         if [ -d /var/log/wasm ]; then
-            chown -R www-data:www-data /var/log/wasm
-            chmod 755 /var/log/wasm
+            chown -R www-data:wasm /var/log/wasm
+            chmod 775 /var/log/wasm
         fi
         
         if [ -d /etc/wasm ]; then
             chmod 755 /etc/wasm
-            chmod 644 /etc/wasm/config.yaml 2>/dev/null || true
+            # Config file readable by wasm group (contains sensitive data)
+            chown root:wasm /etc/wasm/config.yaml 2>/dev/null || true
+            chmod 640 /etc/wasm/config.yaml 2>/dev/null || true
         fi
         
         echo ""
         echo "========================================"
-        echo "  WASM installed successfully!"
+        echo "  WASM v0.8.0 installed successfully!"
         echo "========================================"
         echo ""
         echo "Quick start:"
-        echo "  wasm --help              Show help"
-        echo "  wasm -i                  Interactive mode"
-        echo "  wasm create -d DOMAIN -s SOURCE -t TYPE"
+        echo "  sudo wasm --help         Show help"
+        echo "  sudo wasm -i             Interactive mode"
+        echo "  sudo wasm create -d DOMAIN -s SOURCE -t TYPE"
+        echo ""
+        echo "Monitor (AI security):"
+        echo "  sudo wasm monitor enable   Enable process monitoring"
+        echo "  sudo wasm monitor scan     Run security scan"
         echo ""
         echo "Shell completions installed for bash, zsh, and fish."
         echo "Restart your shell to enable tab completion."
         echo ""
         echo "Configuration: /etc/wasm/config.yaml"
+        echo ""
+        echo "NOTE: To use wasm without sudo, add your user to the wasm group:"
+        echo "  sudo usermod -aG wasm \$USER"
+        echo "  (Log out and back in for changes to take effect)"
         echo "========================================"
         echo ""
         ;;

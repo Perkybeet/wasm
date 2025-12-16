@@ -119,3 +119,18 @@ class TemplateError(WASMError):
 class RollbackError(WASMError):
     """Raised when rollback operation fails."""
     pass
+
+
+class MonitorError(WASMError):
+    """Raised when process monitoring operations fail."""
+    pass
+
+
+class AIAnalysisError(WASMError):
+    """Raised when AI analysis fails."""
+    pass
+
+
+class EmailError(WASMError):
+    """Raised when email notification fails."""
+    pass

@@ -48,6 +48,31 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "default_version": "3.11",
         "use_venv": True,
     },
+    "monitor": {
+        "enabled": False,
+        "scan_interval": 3600,  # 1 hour in seconds
+        "cpu_threshold": 80.0,
+        "memory_threshold": 80.0,
+        "auto_terminate": True,
+        "terminate_malicious_only": True,
+        "use_ai": True,
+        "dry_run": False,
+        "log_file": str(DEFAULT_LOG_DIR / "monitor.log"),
+        "openai": {
+            "api_key": "",
+            "model": "gpt-4o-mini",
+        },
+        "smtp": {
+            "host": "",
+            "port": 465,
+            "username": "",
+            "password": "",
+            "use_ssl": True,
+            "use_tls": False,
+            "from_address": "",
+        },
+        "email_recipients": [],
+    },
 }
 
 
