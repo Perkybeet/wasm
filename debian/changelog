@@ -1,3 +1,10 @@
+wasm (0.8.1-1~noble) noble; urgency=medium
+
+  * Fix: python3-inquirer now a required dependency (was Recommends)
+  * Interactive mode (-i) now works out of the box
+
+ -- Yago López Prado <yago.lopez.adeje@gmail.com>  Mon, 16 Dec 2024 19:00:00 +0000
+
 wasm (0.8.0-1~noble) noble; urgency=medium
 
   * Major version bump to 0.8.0

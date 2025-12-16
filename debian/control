@@ -22,9 +22,9 @@ Depends: ${python3:Depends},
          python3 (>= 3.10),
          python3-yaml,
          python3-jinja2,
+         python3-inquirer,
          nginx | apache2,
          certbot
-Recommends: python3-inquirer
 Suggests: git,
           nodejs,
           npm
