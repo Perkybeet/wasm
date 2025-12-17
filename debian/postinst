@@ -3,6 +3,12 @@ set -e
 
 case "$1" in
     configure)
+        # Install Python dependencies that aren't available as .deb packages
+        echo "Installing Python dependencies..."
+        pip3 install inquirer --break-system-packages --quiet 2>/dev/null || {
+            echo "Warning: Failed to install inquirer. Interactive mode may not work."
+        }
+        
         # Create wasm group if it doesn't exist
         if ! getent group wasm > /dev/null 2>&1; then
             groupadd --system wasm
@@ -28,15 +34,17 @@ case "$1" in
         
         echo ""
         echo "========================================"
-        echo "  WASM v0.8.1 installed successfully!"
+        echo "  WASM v0.8.2 installed successfully!"
         echo "========================================"
         echo ""
         echo "Quick start:"
         echo "  sudo wasm --help         Show help"
         echo "  sudo wasm -i             Interactive mode"
+        echo "  sudo wasm create -d DOMAIN -s SOURCE -t TYPE"
         echo ""
-        echo "Monitor (AI security) [NEW!]:"
-        echo "  sudo wasm monitor --help"
+        echo "Monitor (AI security):"
+        echo "  sudo wasm monitor enable   Enable process monitoring"
+        echo "  sudo wasm monitor scan     Run security scan"
         echo ""
         echo "Shell completions installed for bash, zsh, and fish."
         echo "Restart your shell to enable tab completion."
