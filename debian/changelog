@@ -1,20 +1,26 @@
-wasm (0.8.2-1~--help) --help; urgency=medium
+wasm (0.9.0-1~noble) noble; urgency=medium
 
-  * Auto-install python3-inquirer via pip during package installation
-  * Remove python3-inquirer from package dependencies (not in Ubuntu repos)
-  * Add python3-pip as dependency for post-install script
-  * All dependencies now install automatically with the package
+  * Major enhancement: Comprehensive system dependency checker
+  * Add guided 'wasm setup init' wizard with 6 installation phases
+  * Add 'wasm setup doctor' command for system diagnostics
+  * Support for Node.js package managers: npm, pnpm, yarn, bun
+  * Pre-deployment verification warns about missing dependencies
+  * Package manager fallback: auto-use available PM if requested not found
+  * Add setup.py fallback for Ubuntu Jammy (22.04) compatibility
+  * Improved error messages with actionable hints
+  * 93 tests passing
 
- -- Yago López Prado <yago.lopez.adeje@gmail.com>  Tue, 17 Dec 2024 10:00:00 +0000
+ -- Yago López Prado <yago.lopez.adeje@gmail.com>  Wed, 18 Dec 2025 00:00:00 +0000
 
-wasm (0.8.2-1~plucky) plucky; urgency=medium
+wasm (0.8.3-1~noble) noble; urgency=medium
 
-  * Auto-install python3-inquirer via pip during package installation
-  * Remove python3-inquirer from package dependencies (not in Ubuntu repos)
-  * Add python3-pip as dependency for post-install script
-  * All dependencies now install automatically with the package
+  * Add SSH key validation and setup wizard for Git authentication
+  * Auto-generate SSH keys when cloning private repos without SSH configured
+  * Add 'wasm setup ssh' command to manage SSH keys
+  * Improve error messages with step-by-step guidance
+  * Fix test suite compatibility issues
 
- -- Yago López Prado <yago.lopez.adeje@gmail.com>  Tue, 17 Dec 2024 10:00:00 +0000
+ -- Yago López Prado <yago.lopez.adeje@gmail.com>  Tue, 17 Dec 2024 16:00:00 +0000
 
 wasm (0.8.2-1~noble) noble; urgency=medium
 

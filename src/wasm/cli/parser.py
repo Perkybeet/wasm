@@ -751,6 +751,43 @@ def _add_setup_parser(subparsers) -> None:
         "permissions",
         help="Check and display permission status",
     )
+    
+    # setup ssh
+    ssh_parser = setup_sub.add_parser(
+        "ssh",
+        help="Setup SSH key for Git authentication",
+        description="Generate SSH keys and display instructions for adding to Git providers",
+    )
+    ssh_parser.add_argument(
+        "--generate", "-g",
+        action="store_true",
+        help="Generate a new SSH key if none exists",
+    )
+    ssh_parser.add_argument(
+        "--type", "-t",
+        choices=["ed25519", "rsa", "ecdsa"],
+        default="ed25519",
+        dest="key_type",
+        help="Type of SSH key to generate (default: ed25519)",
+    )
+    ssh_parser.add_argument(
+        "--test", "-T",
+        dest="test_host",
+        metavar="HOST",
+        help="Test SSH connection to a host (e.g., github.com)",
+    )
+    ssh_parser.add_argument(
+        "--show", "-S",
+        action="store_true",
+        help="Show the public key",
+    )
+    
+    # setup doctor
+    setup_sub.add_parser(
+        "doctor",
+        help="Run system diagnostics and check for issues",
+        description="Comprehensive check of all dependencies and configurations",
+    )
 
 
 def parse_args(args: Optional[list] = None) -> argparse.Namespace:

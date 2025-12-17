@@ -61,7 +61,11 @@ def handle_webapp(args: Namespace) -> int:
         logger = Logger(verbose=args.verbose)
         logger.error(str(e))
         if e.details:
-            logger.error(e.details)
+            # Print details preserving formatting (for SSH guidance, etc.)
+            print()
+            for line in e.details.split("\n"):
+                print(f"  {line}")
+            print()
         return 1
     except Exception as e:
         logger = Logger(verbose=args.verbose)
@@ -97,6 +101,36 @@ def _handle_create(args: Namespace) -> int:
     
     # Get package manager preference
     package_manager = getattr(args, "package_manager", "auto") or "auto"
+    
+    # =========================================================================
+    # Pre-deployment verification
+    # =========================================================================
+    from wasm.core.dependencies import check_deployment_ready
+    
+    can_deploy, missing, warnings = check_deployment_ready(
+        app_type=app_type,
+        package_manager=package_manager,
+        verbose=args.verbose,
+    )
+    
+    # Show warnings (non-blocking)
+    for warning in warnings:
+        logger.warning(warning)
+    
+    # Check critical requirements
+    if not can_deploy:
+        logger.error("System is not ready for deployment")
+        logger.blank()
+        logger.info("Missing requirements:")
+        for item in missing:
+            logger.error(f"  ✗ {item}")
+        logger.blank()
+        logger.info("To fix these issues, run:")
+        logger.info("  sudo wasm setup init")
+        logger.blank()
+        logger.info("Or for detailed diagnostics:")
+        logger.info("  wasm setup doctor")
+        return 1
     
     # Load environment variables from file
     env_vars = {}

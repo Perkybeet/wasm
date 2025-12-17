@@ -43,6 +43,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "nodejs": {
         "default_version": "20",
         "use_nvm": False,
+        "package_managers": ["npm"],  # Available: npm, pnpm, yarn, bun
     },
     "python": {
         "default_version": "3.11",

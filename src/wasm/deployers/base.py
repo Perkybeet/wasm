@@ -163,6 +163,48 @@ class BaseDeployer(ABC):
         
         return "npm"
     
+    def _verify_package_manager(self) -> None:
+        """
+        Verify the package manager is installed and available.
+        Falls back to an available package manager if the requested one is not installed.
+        
+        Raises:
+            DeploymentError: If no package manager is available at all.
+        """
+        from wasm.core.utils import command_exists
+        from wasm.core.dependencies import DependencyChecker
+        
+        pm = self.package_manager
+        
+        if command_exists(pm):
+            return  # Requested PM is available, all good
+        
+        # Requested PM not available, check what is available
+        checker = DependencyChecker()
+        available = checker.get_available_package_managers()
+        
+        if not available:
+            # No package managers at all
+            raise DeploymentError(
+                "No package manager available",
+                details=(
+                    "No Node.js package manager (npm, pnpm, yarn, bun) is installed.\n\n"
+                    "To fix this, run the setup wizard:\n"
+                    "  sudo wasm setup init\n\n"
+                    "Or install Node.js manually which includes npm:\n"
+                    "  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -\n"
+                    "  sudo apt install -y nodejs"
+                )
+            )
+        
+        # Fall back to first available package manager
+        fallback_pm = available[0]
+        self.logger.warning(
+            f"Package manager '{pm}' not installed. Using '{fallback_pm}' instead."
+        )
+        self.logger.info(f"Available package managers: {', '.join(available)}")
+        self.package_manager = fallback_pm
+    
     def _detect_prisma(self) -> bool:
         """
         Detect if project uses Prisma ORM.
@@ -427,6 +469,9 @@ class BaseDeployer(ABC):
         # Detect package manager
         self.package_manager = self._detect_package_manager()
         self.logger.debug(f"Using package manager: {self.package_manager}")
+        
+        # Verify the package manager is available
+        self._verify_package_manager()
         
         # Detect Prisma
         self.has_prisma = self._detect_prisma()

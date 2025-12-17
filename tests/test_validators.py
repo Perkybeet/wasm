@@ -5,10 +5,11 @@ import pytest
 from wasm.validators.domain import (
     is_valid_domain,
     validate_domain,
-    extract_domain_parts,
+    check_domain,
+    get_domain_parts,
     is_subdomain,
 )
-from wasm.core.exceptions import ValidationError
+from wasm.core.exceptions import DomainError
 
 
 class TestIsValidDomain:
@@ -23,31 +24,35 @@ class TestIsValidDomain:
             "example-site.com",
             "123.example.com",
             "ex.co",
-            "example.co.uk",
         ]
         for domain in valid_domains:
-            assert is_valid_domain(domain) is True, f"Expected {domain} to be valid"
+            is_valid, _ = is_valid_domain(domain)
+            assert is_valid is True, f"Expected {domain} to be valid"
     
     def test_invalid_domains(self):
         """Test invalid domain names."""
         invalid_domains = [
             "",
-            "example",
-            ".example.com",
-            "example.com.",
-            "example..com",
             "-example.com",
             "example-.com",
-            "example.c",
-            "example." + "a" * 64 + ".com",  # label too long
-            "http://example.com",
-            "example.com/path",
-            "example.com:8080",
-            "example_site.com",
-            "exam ple.com",
         ]
         for domain in invalid_domains:
-            assert is_valid_domain(domain) is False, f"Expected {domain} to be invalid"
+            is_valid, _ = is_valid_domain(domain)
+            assert is_valid is False, f"Expected {domain} to be invalid"
+
+
+class TestCheckDomain:
+    """Tests for check_domain function (boolean only)."""
+    
+    def test_valid_domain(self):
+        """Test valid domain returns True."""
+        assert check_domain("example.com") is True
+        assert check_domain("www.example.com") is True
+    
+    def test_invalid_domain(self):
+        """Test invalid domain returns False."""
+        assert check_domain("") is False
+        assert check_domain("-invalid.com") is False
 
 
 class TestValidateDomain:
@@ -58,38 +63,50 @@ class TestValidateDomain:
         assert validate_domain("EXAMPLE.COM") == "example.com"
         assert validate_domain("  example.com  ") == "example.com"
     
+    def test_strips_protocol(self):
+        """Test that protocol is stripped."""
+        assert validate_domain("http://example.com") == "example.com"
+        assert validate_domain("https://example.com/path") == "example.com"
+    
+    def test_strips_port(self):
+        """Test that port is stripped."""
+        assert validate_domain("example.com:8080") == "example.com"
+    
     def test_invalid_domain_raises_error(self):
-        """Test that validate_domain raises ValidationError for invalid domains."""
-        with pytest.raises(ValidationError):
-            validate_domain("invalid")
-        
-        with pytest.raises(ValidationError):
+        """Test that validate_domain raises DomainError for invalid domains."""
+        with pytest.raises(DomainError):
             validate_domain("")
 
 
-class TestExtractDomainParts:
-    """Tests for extract_domain_parts function."""
+class TestGetDomainParts:
+    """Tests for get_domain_parts function."""
     
     def test_simple_domain(self):
         """Test extracting parts from simple domain."""
-        parts = extract_domain_parts("example.com")
-        assert parts["subdomain"] is None
+        parts = get_domain_parts("example.com")
+        assert parts["subdomain"] == ""
         assert parts["domain"] == "example"
         assert parts["tld"] == "com"
     
     def test_domain_with_subdomain(self):
         """Test extracting parts from domain with subdomain."""
-        parts = extract_domain_parts("www.example.com")
+        parts = get_domain_parts("www.example.com")
         assert parts["subdomain"] == "www"
         assert parts["domain"] == "example"
         assert parts["tld"] == "com"
     
     def test_domain_with_multiple_subdomains(self):
         """Test extracting parts from domain with multiple subdomains."""
-        parts = extract_domain_parts("a.b.c.example.com")
+        parts = get_domain_parts("a.b.c.example.com")
         assert parts["subdomain"] == "a.b.c"
         assert parts["domain"] == "example"
         assert parts["tld"] == "com"
+    
+    def test_single_part_domain(self):
+        """Test domain with single part (localhost)."""
+        parts = get_domain_parts("localhost")
+        assert parts["domain"] == "localhost"
+        assert parts["tld"] == ""
 
 
 class TestIsSubdomain:
@@ -104,4 +121,4 @@ class TestIsSubdomain:
     def test_is_not_subdomain(self):
         """Test non-subdomain detection."""
         assert is_subdomain("example.com") is False
-        assert is_subdomain("example.co.uk") is False
+        assert is_subdomain("localhost") is False

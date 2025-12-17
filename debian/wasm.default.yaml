@@ -22,6 +22,34 @@ logging:
   directory: /var/log/wasm
 
 # =============================================================================
+# Node.js Configuration
+# =============================================================================
+# Configure Node.js and package managers for JavaScript applications
+
+nodejs:
+  # Default Node.js version to use
+  default_version: "20"
+  
+  # Whether to use nvm (Node Version Manager)
+  use_nvm: false
+  
+  # Package managers to use/install during setup
+  # Available: npm, pnpm, yarn, bun
+  # npm comes with Node.js by default
+  package_managers:
+    - npm
+    # - pnpm  # Uncomment to enable pnpm
+    # - yarn  # Uncomment to enable yarn
+    # - bun   # Uncomment to enable bun
+
+# =============================================================================
+# Python Configuration
+# =============================================================================
+python:
+  default_version: "3.11"
+  use_venv: true
+
+# =============================================================================
 # AI-Powered Process Monitor Configuration
 # =============================================================================
 # The process monitor scans running processes to detect and neutralize

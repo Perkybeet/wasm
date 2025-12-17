@@ -134,3 +134,22 @@ class AIAnalysisError(WASMError):
 class EmailError(WASMError):
     """Raised when email notification fails."""
     pass
+
+
+class SSHError(WASMError):
+    """
+    Raised when SSH authentication or configuration fails.
+    
+    Provides detailed guidance for resolving SSH issues.
+    """
+    pass
+
+
+class SetupError(WASMError):
+    """
+    Raised when required setup/configuration is missing.
+    
+    Used when prerequisites are not met (e.g., missing SSH keys,
+    missing dependencies, etc.)
+    """
+    pass

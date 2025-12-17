@@ -23,6 +23,11 @@ from wasm.validators.source import (
     parse_git_url,
     validate_source,
 )
+from wasm.validators.ssh import (
+    is_ssh_url,
+    validate_ssh_setup_for_url,
+    ensure_ssh_setup,
+)
 
 
 class SourceManager(BaseManager):
@@ -183,6 +188,7 @@ class SourceManager(BaseManager):
             
         Raises:
             SourceError: If clone fails.
+            SSHError: If SSH authentication is not properly configured.
         """
         if not self.is_installed():
             raise SourceError("Git is not installed")
@@ -192,6 +198,11 @@ class SourceManager(BaseManager):
         if parsed["branch"] and not branch:
             branch = parsed["branch"]
             url = url.split("#")[0]
+        
+        # Validate SSH setup for SSH URLs
+        if is_ssh_url(url):
+            self.logger.debug("Validating SSH configuration...")
+            ensure_ssh_setup(url, auto_generate=True, verbose=self.verbose)
         
         # Build clone command
         cmd = ["git", "clone"]

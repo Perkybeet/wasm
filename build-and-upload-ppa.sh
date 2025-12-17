@@ -16,7 +16,7 @@ set -e  # Exit on error
 # Configuration
 PPA="ppa:yago2003/wasm"
 GPG_KEY="56544DFCBF62C2C26FA4689BDA2D452B1614CA82"
-DEFAULT_DISTRIBUTIONS=("noble" "plucky" "questing")
+DEFAULT_DISTRIBUTIONS=("jammy" "noble" "plucky" "questing")
 CHANGELOG_FILE="debian/changelog"
 PARENT_DIR=".."
 
@@ -205,7 +205,7 @@ main() {
     fi
     
     echo -e "${BLUE}╔════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║  WASM PPA Builder - Multi-Distribution Package Upload ║${NC}"
+    echo -e "${BLUE}║  WASM PPA Builder - Multi-Distribution Package Upload  ║${NC}"
     echo -e "${BLUE}╚════════════════════════════════════════════════════════╝${NC}"
     echo ""
     
