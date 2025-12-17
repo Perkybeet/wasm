@@ -1,4 +1,4 @@
-wasm (0.8.2-1~--help) --help; urgency=medium
+wasm (0.8.2-1~questing) questing; urgency=medium
 
   * Auto-install python3-inquirer via pip during package installation
   * Remove python3-inquirer from package dependencies (not in Ubuntu repos)

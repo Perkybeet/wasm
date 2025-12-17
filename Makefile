@@ -12,6 +12,7 @@ help:
 	@echo "  make lint          Run linters"
 	@echo "  make format        Format code"
 	@echo "  make debian        Build Debian package"
+	@echo "  make ppa-upload    Build and upload to PPA (all distributions)"
 	@echo ""
 
 install:
@@ -58,3 +59,12 @@ debian: clean
 debian-source: clean
 	dpkg-buildpackage -us -uc -S
 	@echo "Source package built in parent directory"
+
+ppa-upload: 
+	@echo "Building and uploading packages to PPA..."
+	./build-and-upload-ppa.sh
+
+ppa-upload-custom:
+	@echo "Building and uploading packages to PPA for custom distributions..."
+	@echo "Usage: make ppa-upload-custom DISTS='noble plucky'"
+	./build-and-upload-ppa.sh $(DISTS)
