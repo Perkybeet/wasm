@@ -16,7 +16,7 @@ set -e  # Exit on error
 # Configuration
 PPA="ppa:yago2003/wasm"
 GPG_KEY="56544DFCBF62C2C26FA4689BDA2D452B1614CA82"
-DEFAULT_DISTRIBUTIONS=("jammy" "noble" "oracular" "plucky")
+DEFAULT_DISTRIBUTIONS=("jammy" "noble" "plucky" "questing")
 CHANGELOG_FILE="debian/changelog"
 PARENT_DIR=".."
 

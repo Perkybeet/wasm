@@ -1,3 +1,11 @@
+wasm (0.9.1-1~noble) noble; urgency=medium
+
+  * Fix setup.py for Ubuntu Jammy compatibility
+  * Provide explicit package metadata in setup.py for older build systems
+  * Fix pybuild "UNKNOWN wheel" error on Jammy
+
+ -- Yago López Prado <yago.lopez.adeje@gmail.com>  Wed, 18 Dec 2025 00:00:00 +0000
+
 wasm (0.9.0-1~noble) noble; urgency=medium
 
   * Major enhancement: Comprehensive system dependency checker

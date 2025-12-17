@@ -1,13 +1,42 @@
 #!/usr/bin/env python3
 """
-Minimal setup.py for backwards compatibility.
+setup.py for backwards compatibility with Ubuntu Jammy (22.04).
 
-This file exists for compatibility with older build systems (like Ubuntu Jammy)
-that don't fully support pyproject.toml-only builds.
-
-All configuration is in pyproject.toml - this just provides a fallback entry point.
+This file exists because Jammy's older pybuild/setuptools don't fully support
+pyproject.toml-only builds. We explicitly provide the essential metadata here.
 """
-from setuptools import setup
+from setuptools import setup, find_packages
 
-if __name__ == "__main__":
-    setup()
+setup(
+    name="wasm-cli",
+    version="0.9.1",
+    description="Web App System Management - Deploy and manage web applications on Linux servers",
+    author="WASM Team",
+    license="MIT",
+    python_requires=">=3.10",
+    package_dir={"": "src"},
+    packages=find_packages(where="src"),
+    include_package_data=True,
+    install_requires=[
+        "inquirer>=3.1.0",
+        "Jinja2>=3.1.0",
+        "PyYAML>=6.0",
+    ],
+    entry_points={
+        "console_scripts": [
+            "wasm=wasm.main:main",
+        ],
+    },
+    classifiers=[
+        "Development Status :: 4 - Beta",
+        "Environment :: Console",
+        "Intended Audience :: Developers",
+        "Intended Audience :: System Administrators",
+        "License :: OSI Approved :: MIT License",
+        "Operating System :: POSIX :: Linux",
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+    ],
+)
