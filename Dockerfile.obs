@@ -1,0 +1,47 @@
+#
+# Dockerfile.obs
+# Docker environment for building and uploading packages to OBS (Open Build Service)
+#
+# Usage:
+#   docker build -t wasm-obs -f Dockerfile.obs .
+#   docker run -it --rm -v $(pwd):/workspace wasm-obs
+#
+
+FROM opensuse/tumbleweed:latest
+
+LABEL maintainer="Perkybeet"
+LABEL description="WASM OBS Build Environment"
+
+# Install OBS tools and dependencies
+RUN zypper refresh && zypper install -y \
+    osc \
+    obs-service-tar_scm \
+    obs-service-obs_scm \
+    obs-service-set_version \
+    obs-service-recompress \
+    rpm-build \
+    rpmdevtools \
+    python3 \
+    python3-pip \
+    python3-setuptools \
+    python3-wheel \
+    git \
+    curl \
+    vim \
+    && zypper clean -a
+
+# Create workspace directory
+WORKDIR /workspace
+
+# Copy entrypoint script
+COPY docker/obs-entrypoint.sh /usr/local/bin/obs-entrypoint.sh
+RUN chmod +x /usr/local/bin/obs-entrypoint.sh
+
+# Set environment variables
+ENV OBS_API="https://api.opensuse.org"
+ENV OBS_PROJECT="home:Perkybeet"
+ENV OBS_PACKAGE="wasm"
+
+# Default command
+ENTRYPOINT ["/usr/local/bin/obs-entrypoint.sh"]
+CMD ["bash"]

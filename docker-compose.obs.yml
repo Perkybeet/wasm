@@ -1,0 +1,32 @@
+# docker-compose.obs.yml
+# Docker Compose for OBS build environment
+#
+# Usage:
+#   docker-compose -f docker-compose.obs.yml run --rm obs bash
+#   docker-compose -f docker-compose.obs.yml run --rm obs obs-upload
+#
+
+services:
+  obs:
+    build:
+      context: .
+      dockerfile: Dockerfile.obs
+    image: wasm-obs:latest
+    container_name: wasm-obs
+    volumes:
+      - .:/workspace:rw
+      - obs-cache:/var/tmp/build-root
+      - obs-config:/root/.config/osc
+    environment:
+      - OBS_API=https://api.opensuse.org
+      - OBS_PROJECT=home:Perkybeet
+      - OBS_PACKAGE=wasm
+    stdin_open: true
+    tty: true
+    working_dir: /workspace
+
+volumes:
+  obs-cache:
+    name: wasm-obs-cache
+  obs-config:
+    name: wasm-obs-config

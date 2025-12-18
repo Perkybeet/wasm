@@ -34,7 +34,7 @@
 
 ## 📦 Installation
 
-### From PPA (Recommended)
+### Ubuntu/Debian - From PPA (Recommended)
 
 ```bash
 sudo add-apt-repository ppa:yago2003/wasm
@@ -46,6 +46,49 @@ Supported Ubuntu versions:
 - Ubuntu 24.04 LTS (Noble Numbat)
 - Ubuntu 24.10 (Plucky Puffin)
 - Ubuntu 25.04 (Questing Qetzal)
+
+### Fedora - From OBS Repository
+
+```bash
+# Add repository
+sudo dnf config-manager --add-repo \
+  https://download.opensuse.org/repositories/home:/Perkybeet/Fedora_40/home:Perkybeet.repo
+
+# Install
+sudo dnf install wasm-cli
+```
+
+### openSUSE - From OBS Repository
+
+```bash
+# Tumbleweed
+sudo zypper ar -f \
+  https://download.opensuse.org/repositories/home:/Perkybeet/openSUSE_Tumbleweed/ \
+  home_Perkybeet
+sudo zypper install wasm-cli
+
+# Leap 15.6
+sudo zypper ar -f \
+  https://download.opensuse.org/repositories/home:/Perkybeet/openSUSE_Leap_15.6/ \
+  home_Perkybeet
+sudo zypper install wasm-cli
+```
+
+### Debian - From OBS Repository
+
+```bash
+# Add repository key
+curl -fsSL https://download.opensuse.org/repositories/home:/Perkybeet/Debian_12/Release.key | \
+  gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/home_Perkybeet.gpg > /dev/null
+
+# Add repository
+echo 'deb https://download.opensuse.org/repositories/home:/Perkybeet/Debian_12/ /' | \
+  sudo tee /etc/apt/sources.list.d/home_Perkybeet.list
+
+# Install
+sudo apt update
+sudo apt install wasm-cli
+```
 
 ### From .deb Package
 

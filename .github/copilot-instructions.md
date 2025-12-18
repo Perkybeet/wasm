@@ -31,13 +31,16 @@ wasm/
 │   │       ├── site.py             # wasm site <action>
 │   │       ├── service.py          # wasm service <action>
 │   │       ├── cert.py             # wasm cert <action>
-│   │       └── backup.py           # wasm backup <action>
+│   │       ├── backup.py           # wasm backup <action>
+│   │       ├── monitor.py          # wasm monitor <action>
+│   │       └── setup.py            # wasm setup (initial configuration)
 │   │
 │   ├── core/
 │   │   ├── __init__.py
 │   │   ├── config.py               # Global config, paths, defaults
 │   │   ├── logger.py               # Custom logger with verbose support
 │   │   ├── exceptions.py           # Custom exception hierarchy
+│   │   ├── dependencies.py         # System dependency checker
 │   │   └── utils.py                # Shell commands, file ops, helpers
 │   │
 │   ├── managers/
@@ -60,13 +63,23 @@ wasm/
 │   │   ├── python.py               # Django/Flask/FastAPI
 │   │   └── static.py               # Static HTML sites
 │   │
+│   ├── completions/                # Shell completions
+│   │   ├── wasm.bash               # Bash completion
+│   │   ├── wasm.fish               # Fish completion
+│   │   └── _wasm                   # Zsh completion
+│   │
+│   ├── monitor/                    # AI Security Monitor
+│   │   ├── ai_analyzer.py          # OpenAI-based process analyzer
+│   │   ├── email_notifier.py       # SMTP email notifications
+│   │   └── process_monitor.py      # Process scanning
+│   │
 │   ├── templates/
 │   │   ├── nginx/
 │   │   │   ├── proxy.conf.j2       # Reverse proxy template
-│   │   │   ├── static.conf.j2      # Static site template
-│   │   │   └── ssl.conf.j2         # SSL snippet
+│   │   │   └── static.conf.j2      # Static site template
 │   │   ├── apache/
-│   │   │   └── proxy.conf.j2
+│   │   │   ├── proxy.conf.j2
+│   │   │   └── static.conf.j2
 │   │   └── systemd/
 │   │       └── app.service.j2      # Generic service template
 │   │
@@ -74,13 +87,41 @@ wasm/
 │       ├── __init__.py
 │       ├── domain.py               # Domain name validation
 │       ├── port.py                 # Port availability check
-│       └── source.py               # Git URL / path validation
+│       ├── source.py               # Git URL / path validation
+│       └── ssh.py                  # SSH key validation
 │
-├── tests/
-├── debian/                         # .deb packaging
-├── docs/
-├── pyproject.toml
-└── Makefile
+├── tests/                          # pytest tests
+│
+├── debian/                         # Debian packaging (source of truth)
+│   ├── changelog                   # Version history
+│   ├── control                     # Package metadata
+│   ├── rules                       # Build rules
+│   ├── postinst                    # Post-install script
+│   ├── postrm                      # Post-remove script
+│   ├── wasm.1                      # Man page
+│   └── wasm.default.yaml           # Default config file
+│
+├── obs/                            # OBS-specific files (for debtransform)
+│   ├── debian.*                    # Modified debian files for OBS
+│   └── wasm.dsc                    # Debian source control
+│
+├── rpm/                            # RPM packaging
+│   └── wasm.spec                   # RPM spec file
+│
+├── docker/                         # Docker tooling
+│   ├── obs-entrypoint.sh           # OBS upload automation
+│   └── oscrc/                      # OSC credentials (volume)
+│
+├── docs/                           # Documentation
+│   ├── MONITOR.md                  # AI monitor docs
+│   └── OBS_SETUP.md                # OBS setup guide
+│
+├── docker-compose.obs.yml          # OBS Docker environment
+├── Dockerfile.obs                  # OBS build container
+├── Dockerfile.test                 # Test container
+├── pyproject.toml                  # Python project config
+├── Makefile                        # Dev shortcuts
+└── README.md
 ```
 
 ## Coding Conventions
@@ -275,6 +316,7 @@ def prompt_webapp_create() -> dict:
 ```
 wasm [--verbose] [--help] [--version]
 wasm --interactive
+wasm setup
 
 wasm create -d DOMAIN -s SOURCE -t TYPE [-p PORT] [--pm npm|pnpm|bun] [--no-ssl]
 wasm list
@@ -301,6 +343,11 @@ wasm cert list
 wasm cert renew [--all]
 wasm cert info DOMAIN
 wasm cert revoke DOMAIN
+
+wasm monitor start [--domain DOMAIN] [--interval SECONDS]
+wasm monitor stop
+wasm monitor status
+wasm monitor logs [--lines N]
 ```
 
 ## Configuration Files
@@ -367,10 +414,12 @@ Templates use `.j2` extension and these variables:
 ## Dependencies
 
 ### Python Packages
-- inquirer
-- jinja2
-- pyyaml
-- rich (optional, for better output)
+- inquirer (>=3.1.0) - Interactive prompts
+- jinja2 (>=3.1.0) - Template rendering
+- pyyaml (>=6.0) - Configuration files
+- psutil (>=5.9.0) - Process monitoring (optional, for `wasm monitor`)
+- httpx (>=0.25.0) - HTTP health checks (optional, for `wasm monitor`)
+- rich (>=13.0) - Enhanced terminal output (optional)
 
 ### System Dependencies
 - nginx or apache2
@@ -393,7 +442,8 @@ Templates use `.j2` extension and these variables:
 - [x] Source management (Git, local paths, archives)
 - [x] Interactive mode with guided prompts
 - [x] Shell completions (bash, zsh, fish)
-- [x] AI-powered security monitoring
+- [x] AI-powered security monitoring (`wasm monitor`)
+- [x] Initial setup wizard (`wasm setup`)
 
 #### Deployers
 - [x] Next.js deployer
@@ -496,9 +546,9 @@ Templates use `.j2` extension and these variables:
 
 | Version | Date | Features Added |
 |---------|------|----------------|
-| 0.9.0 | - | Initial release with core features |
-| 0.9.1 | - | AI security monitoring, shell completions |
-| 0.10.0 | 2025-01 | Backup & Rollback system |
+| 0.9.0 | 2024-11 | Initial release with core features |
+| 0.9.1 | 2024-12 | AI security monitoring, shell completions |
+| 0.10.0 | 2024-12 | Backup & Rollback system |
 
 ---
 
@@ -510,13 +560,11 @@ Para probar WASM en un entorno aislado, usar el Dockerfile de desarrollo:
 
 ```bash
 # Construir imagen de pruebas
-cd /home/yago/Documents/wasm
 docker build -t wasm-test -f Dockerfile.test .
 
 # Ejecutar contenedor interactivo
 docker run -it --rm \
   -v $(pwd):/app \
-  -v /var/run/docker.sock:/var/run/docker.sock \
   --name wasm-dev \
   wasm-test bash
 
@@ -525,27 +573,6 @@ pip install -e .
 wasm --version
 pytest -v
 ```
-
-### PPA Build & Upload
-
-Para construir y subir paquetes al PPA (ejecutar como usuario `yago`):
-
-```bash
-cd /home/yago/Documents/wasm
-
-# Build para todas las distribuciones (jammy, noble, plucky, questing)
-./build-and-upload-ppa.sh
-
-# Build solo para distribuciones específicas
-./build-and-upload-ppa.sh noble plucky
-
-# Configuración del script:
-# - PPA: ppa:yago2003/wasm
-# - GPG Key: 56544DFCBF62C2C26FA4689BDA2D452B1614CA82
-# - Requiere: devscripts, debhelper, dh-python, gpg configurado
-```
-
-**Importante:** El script debe ejecutarse como usuario `yago` (no root) porque necesita acceso a la clave GPG para firmar los paquetes.
 
 ### Running Tests
 
@@ -559,3 +586,116 @@ pytest tests/test_backup.py -v
 # Con cobertura
 pytest --cov=wasm --cov-report=html
 ```
+
+---
+
+## Release Process
+
+### Supported Distributions (via OBS)
+
+| Distribution | Versions | Architectures | Package |
+|--------------|----------|---------------|---------|
+| **Ubuntu** | 22.04, 24.04, 24.10, 25.04, 25.10 | x86_64 | `wasm` |
+| **Debian** | 12, 13 | x86_64, i586 | `wasm` |
+| **Fedora** | 41, 42, 43 | x86_64, aarch64 | `wasm-cli` |
+| **openSUSE Leap** | 15.6, 16.0 | x86_64, aarch64 | `wasm-cli` |
+| **openSUSE Tumbleweed** | Rolling | x86_64, i586 | `wasm-cli` |
+
+### Release Steps
+
+#### 1. Update Version Numbers
+
+```bash
+# pyproject.toml
+version = "X.Y.Z"
+
+# src/wasm/__init__.py
+__version__ = "X.Y.Z"
+```
+
+#### 2. Update Changelogs
+
+**Debian** (`debian/changelog`):
+```
+wasm (X.Y.Z-1) unstable; urgency=medium
+
+  * New feature description
+  * Bug fix description
+
+ -- Yago López Prado <yago.lopez.adeje@gmail.com>  Thu, 01 Jan 2025 12:00:00 +0000
+```
+
+**RPM** (`rpm/wasm.spec`):
+```spec
+%changelog
+* Thu Jan 01 2025 Perkybeet <yago.lopez.adeje@gmail.com> - X.Y.Z-1
+- New feature description
+- Bug fix description
+```
+
+#### 3. Commit and Tag
+
+```bash
+git add .
+git commit -m "Release vX.Y.Z"
+git tag vX.Y.Z
+git push origin main
+git push origin vX.Y.Z
+```
+
+#### 4. Upload to OBS
+
+```bash
+# Build Docker image (if changed)
+docker-compose -f docker-compose.obs.yml build
+
+# Upload to OBS (credentials prompted first time)
+docker-compose -f docker-compose.obs.yml run --rm obs obs-upload
+
+# Check build status
+docker-compose -f docker-compose.obs.yml run --rm obs obs-status
+```
+
+#### 5. Verify Installation
+
+```bash
+# Ubuntu
+docker run --rm ubuntu:24.04 sh -c "
+  apt-get update -qq && apt-get install -y -qq gpg curl >/dev/null
+  curl -fsSL https://download.opensuse.org/repositories/home:Perkybeet/xUbuntu_24.04/Release.key | gpg --dearmor -o /usr/share/keyrings/wasm.gpg
+  echo 'deb [signed-by=/usr/share/keyrings/wasm.gpg] https://download.opensuse.org/repositories/home:Perkybeet/xUbuntu_24.04/ /' > /etc/apt/sources.list.d/wasm.list
+  apt-get update -qq && apt-get install -y -qq wasm >/dev/null
+  wasm --version
+"
+
+# Fedora
+docker run --rm fedora:42 sh -c "
+  dnf config-manager addrepo --from-repofile=https://download.opensuse.org/repositories/home:Perkybeet/Fedora_42/home:Perkybeet.repo
+  dnf install -y wasm-cli
+  wasm --version
+"
+
+# openSUSE
+docker run --rm opensuse/tumbleweed sh -c "
+  zypper addrepo https://download.opensuse.org/repositories/home:Perkybeet/openSUSE_Tumbleweed/home:Perkybeet.repo
+  zypper --gpg-auto-import-keys refresh
+  zypper -n install wasm-cli
+  wasm --version
+"
+```
+
+### OBS Configuration
+
+- **Project:** `home:Perkybeet/wasm`
+- **URL:** https://build.opensuse.org/package/show/home:Perkybeet/wasm
+- **Repositories:** https://download.opensuse.org/repositories/home:Perkybeet/
+
+### Files Uploaded to OBS
+
+| File | Purpose |
+|------|---------|
+| `wasm-X.Y.Z.tar.gz` | Source tarball (auto-generated from git) |
+| `wasm.spec` | RPM spec for Fedora/openSUSE |
+| `wasm.dsc` | Debian source control |
+| `debian.*` | Debian packaging files |
+| `wasm.default.yaml` | Default config (RPM Source1) |

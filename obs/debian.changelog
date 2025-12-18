@@ -1,12 +1,4 @@
-wasm (0.10.1-1~noble) noble; urgency=medium
-
-  * Add man page (wasm.1) for all distributions
-  * Fix RPM packaging to include man page
-  * Improve documentation
-
- -- Yago López Prado <yago.lopez.adeje@gmail.com>  Thu, 19 Dec 2024 00:00:00 +0000
-
-wasm (0.10.0-1~noble) noble; urgency=medium
+wasm (0.10.0-1) unstable; urgency=medium
 
   * New feature: Backup and Rollback system
   * Add 'wasm backup create <domain>' - Create application backups
@@ -30,7 +22,7 @@ wasm (0.10.0-1~noble) noble; urgency=medium
 
  -- Yago López Prado <yago.lopez.adeje@gmail.com>  Wed, 18 Dec 2024 18:00:00 +0000
 
-wasm (0.9.2-1~noble) noble; urgency=medium
+wasm (0.9.2-1) unstable; urgency=medium
 
   * Fix: Show complete error output (stdout+stderr) when dependency install fails
   * Fix: Auto-retry without --frozen-lockfile when strict lockfile install fails
@@ -38,17 +30,17 @@ wasm (0.9.2-1~noble) noble; urgency=medium
   * Fix: Better error display with line limit (20 default, 50 with --verbose)
   * Improve pnpm/yarn compatibility with version mismatch fallback
 
- -- Yago López Prado <yago.lopez.adeje@gmail.com>  Tue, 17 Dec 2025 00:00:00 +0000
+ -- Yago López Prado <yago.lopez.adeje@gmail.com>  Tue, 17 Dec 2024 00:00:00 +0000
 
-wasm (0.9.1-1~noble) noble; urgency=medium
+wasm (0.9.1-1) unstable; urgency=medium
 
   * Fix setup.py for Ubuntu Jammy compatibility
   * Provide explicit package metadata in setup.py for older build systems
   * Fix pybuild "UNKNOWN wheel" error on Jammy
 
- -- Yago López Prado <yago.lopez.adeje@gmail.com>  Wed, 18 Dec 2025 00:00:00 +0000
+ -- Yago López Prado <yago.lopez.adeje@gmail.com>  Wed, 18 Dec 2024 00:00:00 +0000
 
-wasm (0.9.0-1~noble) noble; urgency=medium
+wasm (0.9.0-1) unstable; urgency=medium
 
   * Major enhancement: Comprehensive system dependency checker
   * Add guided 'wasm setup init' wizard with 6 installation phases
@@ -60,9 +52,9 @@ wasm (0.9.0-1~noble) noble; urgency=medium
   * Improved error messages with actionable hints
   * 93 tests passing
 
- -- Yago López Prado <yago.lopez.adeje@gmail.com>  Wed, 18 Dec 2025 00:00:00 +0000
+ -- Yago López Prado <yago.lopez.adeje@gmail.com>  Wed, 18 Dec 2024 00:00:00 +0000
 
-wasm (0.8.3-1~noble) noble; urgency=medium
+wasm (0.8.3-1) unstable; urgency=medium
 
   * Add SSH key validation and setup wizard for Git authentication
   * Auto-generate SSH keys when cloning private repos without SSH configured
@@ -72,7 +64,7 @@ wasm (0.8.3-1~noble) noble; urgency=medium
 
  -- Yago López Prado <yago.lopez.adeje@gmail.com>  Tue, 17 Dec 2024 16:00:00 +0000
 
-wasm (0.8.2-1~noble) noble; urgency=medium
+wasm (0.8.2-1) unstable; urgency=medium
 
   * Auto-install python3-inquirer via pip during package installation
   * Remove python3-inquirer from package dependencies (not in Ubuntu repos)
@@ -81,14 +73,14 @@ wasm (0.8.2-1~noble) noble; urgency=medium
 
  -- Yago López Prado <yago.lopez.adeje@gmail.com>  Tue, 17 Dec 2024 10:00:00 +0000
 
-wasm (0.8.1-1~noble) noble; urgency=medium
+wasm (0.8.1-1) unstable; urgency=medium
 
   * Fix: python3-inquirer now a required dependency (was Recommends)
   * Interactive mode (-i) now works out of the box
 
  -- Yago López Prado <yago.lopez.adeje@gmail.com>  Mon, 16 Dec 2024 19:00:00 +0000
 
-wasm (0.8.0-1~noble) noble; urgency=medium
+wasm (0.8.0-1) unstable; urgency=medium
 
   * Major version bump to 0.8.0
   * Add AI-powered process monitoring with OpenAI integration
@@ -100,7 +92,7 @@ wasm (0.8.0-1~noble) noble; urgency=medium
 
  -- Yago López Prado <yago.lopez.adeje@gmail.com>  Mon, 16 Dec 2024 18:00:00 +0000
 
-wasm (0.1.0-1ubuntu1) noble; urgency=medium
+wasm (0.1.0-1) unstable; urgency=medium
 
   * Initial release.
 

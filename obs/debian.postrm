@@ -1,0 +1,32 @@
+#!/bin/bash
+set -e
+
+case "$1" in
+    remove)
+        echo "Removing WASM..."
+        # Don't remove apps or configuration on remove
+        ;;
+    
+    purge)
+        echo "Purging WASM configuration..."
+        # Remove configuration
+        rm -rf /etc/wasm
+        # Remove logs
+        rm -rf /var/log/wasm
+        # Note: We intentionally don't remove /var/www/apps
+        # to prevent accidental data loss
+        echo "Note: /var/www/apps was not removed to prevent data loss"
+        ;;
+    
+    upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+    
+    *)
+        echo "postrm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

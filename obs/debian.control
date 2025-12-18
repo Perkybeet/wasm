@@ -11,8 +11,6 @@ Build-Depends: debhelper-compat (= 13),
                python3-wheel
 Standards-Version: 4.6.0
 Homepage: https://github.com/Perkybeet/wasm
-Vcs-Browser: https://github.com/Perkybeet/wasm
-Vcs-Git: https://github.com/Perkybeet/wasm.git
 Rules-Requires-Root: no
 
 Package: wasm
@@ -40,4 +38,3 @@ Description: Web App System Management CLI Tool
   - SSL certificate management via Certbot/Let's Encrypt
   - Systemd service management
   - Interactive mode with guided prompts
-  - One-command deployments
