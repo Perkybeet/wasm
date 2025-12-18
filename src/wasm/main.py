@@ -14,6 +14,7 @@ from wasm.cli.commands import (
     handle_setup,
 )
 from wasm.cli.commands.monitor import handle_monitor
+from wasm.cli.commands.backup import handle_backup, handle_rollback
 from wasm.core.logger import Logger
 from wasm.core.exceptions import WASMError
 
@@ -87,6 +88,15 @@ def main() -> int:
             print("Use: wasm monitor --help", file=sys.stderr)
             return 1
         return handle_monitor(args)
+    
+    elif command in ["backup", "bak"]:
+        if not args.action:
+            # Default to list
+            args.action = "list"
+        return handle_backup(args)
+    
+    elif command in ["rollback", "rb"]:
+        return handle_rollback(args)
     
     else:
         print(f"Unknown command: {command}", file=sys.stderr)

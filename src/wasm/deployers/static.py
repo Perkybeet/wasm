@@ -135,6 +135,10 @@ class StaticDeployer(BaseDeployer):
             True if deployment was successful.
         """
         from wasm.core.logger import Icons
+        from wasm.core.exceptions import CertificateError
+        
+        # Track if SSL was successfully obtained
+        ssl_obtained = False
         
         try:
             # Step 1: Fetch source
@@ -145,14 +149,27 @@ class StaticDeployer(BaseDeployer):
             self.logger.step(2, total_steps, "Preparing static files", Icons.FOLDER)
             self.pre_install()
             
-            # Step 3: Create site
+            # Step 3: Create site (initially WITHOUT SSL if SSL is requested)
             self.logger.step(3, total_steps, "Creating site configuration", Icons.GLOBE)
-            self.create_site()
+            self.create_site(with_ssl=False)
             
-            # Step 4: SSL certificate
+            # Step 4: SSL certificate (best effort - continue if it fails)
             if self.ssl:
                 self.logger.step(4, total_steps, "Obtaining SSL certificate", Icons.LOCK)
-                self.obtain_certificate()
+                try:
+                    self.obtain_certificate()
+                    ssl_obtained = True
+                    # Update site config with SSL
+                    self.logger.substep("Updating site configuration with SSL")
+                    self.create_site(with_ssl=True)
+                except CertificateError as e:
+                    self.logger.warning(f"SSL certificate failed: {e.message}")
+                    self.logger.warning("Continuing deployment without SSL...")
+                    self.logger.substep("Site will be available via HTTP only")
+                except Exception as e:
+                    self.logger.warning(f"SSL certificate failed: {e}")
+                    self.logger.warning("Continuing deployment without SSL...")
+                    self.logger.substep("Site will be available via HTTP only")
             else:
                 self.logger.step(4, total_steps, "Skipping SSL certificate", Icons.LOCK)
             
@@ -162,8 +179,13 @@ class StaticDeployer(BaseDeployer):
             if self.health_check():
                 self.logger.success("Static site deployed successfully!")
                 self.logger.blank()
-                self.logger.key_value("URL", f"https://{self.domain}" if self.ssl else f"http://{self.domain}")
+                protocol = "https" if ssl_obtained else "http"
+                self.logger.key_value("URL", f"{protocol}://{self.domain}")
                 self.logger.key_value("Root", str(self.static_dir or self.app_path))
+                if self.ssl and not ssl_obtained:
+                    self.logger.blank()
+                    self.logger.warning("SSL was requested but could not be obtained.")
+                    self.logger.info("To add SSL later, run: wasm cert create -d " + self.domain)
                 return True
             else:
                 self.logger.warning("Deployment completed but verification failed")

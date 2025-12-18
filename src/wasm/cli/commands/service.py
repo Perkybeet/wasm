@@ -66,7 +66,7 @@ def _handle_create(args: Namespace) -> int:
     
     manager.create_service(
         name=args.name,
-        command=args.command,
+        command=args.exec_command,
         working_directory=args.directory,
         user=args.user,
         description=args.description,

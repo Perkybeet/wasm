@@ -1,3 +1,24 @@
+wasm (0.10.0-1~noble) noble; urgency=medium
+
+  * New feature: Backup and Rollback system
+  * Add 'wasm backup create <domain>' - Create application backups
+  * Add 'wasm backup list [domain]' - List all or app-specific backups
+  * Add 'wasm backup restore <backup_id>' - Restore from backup
+  * Add 'wasm backup delete <backup_id>' - Delete a backup
+  * Add 'wasm backup verify <backup_id>' - Verify backup integrity
+  * Add 'wasm backup info <backup_id>' - Show backup details
+  * Add 'wasm backup storage' - Display storage usage statistics
+  * Add 'wasm rollback <domain> [backup_id]' - Quick rollback to previous state
+  * Auto-backup before 'wasm update' for safe rollback
+  * Backup rotation (configurable max backups per app)
+  * SHA256 checksum verification for backup integrity
+  * Git commit/branch tracking in backup metadata
+  * Exclude node_modules, .git, cache by default (configurable)
+  * JSON output support for automation (--json flag)
+  * 132 tests passing
+
+ -- Yago López Prado <yago.lopez.adeje@gmail.com>  Sun, 19 Jan 2025 12:00:00 +0000
+
 wasm (0.9.2-1~noble) noble; urgency=medium
 
   * Fix: Show complete error output (stdout+stderr) when dependency install fails

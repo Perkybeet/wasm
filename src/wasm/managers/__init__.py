@@ -6,6 +6,7 @@ from wasm.managers.apache_manager import ApacheManager
 from wasm.managers.service_manager import ServiceManager
 from wasm.managers.cert_manager import CertManager
 from wasm.managers.source_manager import SourceManager
+from wasm.managers.backup_manager import BackupManager, RollbackManager, BackupError
 
 __all__ = [
     "BaseManager",
@@ -14,4 +15,7 @@ __all__ = [
     "ServiceManager",
     "CertManager",
     "SourceManager",
+    "BackupManager",
+    "RollbackManager",
+    "BackupError",
 ]

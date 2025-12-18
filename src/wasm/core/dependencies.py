@@ -414,6 +414,16 @@ class DependencyChecker:
         # Check certbot for SSL
         if not self.check_command("certbot"):
             warnings.append("certbot: SSL certificate tool not found. SSL will be unavailable.")
+        else:
+            # Check if certbot nginx plugin is available when using nginx
+            if has_nginx:
+                result = run_command(["certbot", "plugins"])
+                if result.success and "* nginx" not in result.stdout:
+                    warnings.append(
+                        "certbot nginx plugin not installed. "
+                        "Webroot method will be used for SSL. "
+                        "For faster SSL setup, install: sudo apt install python3-certbot-nginx"
+                    )
         
         can_deploy = len(missing) == 0
         return can_deploy, missing, warnings

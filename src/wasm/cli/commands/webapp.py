@@ -291,11 +291,12 @@ def _handle_update(args: Namespace) -> int:
     Handle webapp update command with zero-downtime strategy.
     
     Strategy:
-    1. Pull/fetch new code
-    2. Install dependencies (new packages)
-    3. Generate Prisma if needed
-    4. Build application
-    5. Only then restart service (minimal downtime)
+    1. Create pre-update backup (for rollback)
+    2. Pull/fetch new code
+    3. Install dependencies (new packages)
+    4. Generate Prisma if needed
+    5. Build application
+    6. Only then restart service (minimal downtime)
     """
     logger = Logger(verbose=args.verbose)
     config = Config()
@@ -314,16 +315,32 @@ def _handle_update(args: Namespace) -> int:
     logger.info("Zero-downtime update strategy")
     logger.blank()
     
-    total_steps = 6
+    total_steps = 7
     
-    # Step 1: Pull latest changes or fetch from new source
+    # Step 1: Create pre-update backup for potential rollback
+    logger.step(1, total_steps, "Creating pre-update backup")
+    try:
+        from wasm.managers.backup_manager import RollbackManager
+        rollback_manager = RollbackManager(verbose=args.verbose)
+        backup = rollback_manager.create_pre_deploy_backup(
+            domain=domain,
+            description="Pre-update automatic backup"
+        )
+        if backup:
+            logger.substep(f"Backup created: {backup.id}")
+        else:
+            logger.substep("No existing app to backup")
+    except Exception as e:
+        logger.substep(f"Backup skipped: {e}")
+    
+    # Step 2: Pull latest changes or fetch from new source
     from wasm.managers.source_manager import SourceManager
     source_manager = SourceManager(verbose=args.verbose)
     
     new_source = getattr(args, "source", None)
     
     if new_source:
-        logger.step(1, total_steps, "Fetching from new source")
+        logger.step(2, total_steps, "Fetching from new source")
         logger.substep(f"Source: {new_source}")
         # For new source, we need to handle it differently
         # Back up current .env if exists
@@ -340,11 +357,11 @@ def _handle_update(args: Namespace) -> int:
             env_file.write_text(env_backup)
             logger.substep("Restored .env file")
     else:
-        logger.step(1, total_steps, "Pulling latest changes")
+        logger.step(2, total_steps, "Pulling latest changes")
         source_manager.pull(app_path, branch=args.branch)
     
-    # Step 2: Detect app type and configure deployer
-    logger.step(2, total_steps, "Detecting application type")
+    # Step 3: Detect app type and configure deployer
+    logger.step(3, total_steps, "Detecting application type")
     app_type = detect_app_type(app_path, verbose=args.verbose)
     if not app_type:
         app_type = "nodejs"
@@ -364,24 +381,24 @@ def _handle_update(args: Namespace) -> int:
     if deployer.has_prisma:
         logger.substep("Prisma detected")
     
-    # Step 3: Install dependencies (without stopping the app)
-    logger.step(3, total_steps, "Installing dependencies")
+    # Step 4: Install dependencies (without stopping the app)
+    logger.step(4, total_steps, "Installing dependencies")
     deployer.install_dependencies()
     
-    # Step 4: Generate Prisma and run migrations if needed
+    # Step 5: Generate Prisma and run migrations if needed
     if deployer.has_prisma:
-        logger.step(4, total_steps, "Updating Prisma")
+        logger.step(5, total_steps, "Updating Prisma")
         deployer.generate_prisma()
         deployer.run_prisma_migrate(deploy=True)
     else:
-        logger.step(4, total_steps, "Prisma not detected, skipping")
+        logger.step(5, total_steps, "Prisma not detected, skipping")
     
-    # Step 5: Build application (without stopping the app)
-    logger.step(5, total_steps, "Building application")
+    # Step 6: Build application (without stopping the app)
+    logger.step(6, total_steps, "Building application")
     deployer.build()
     
-    # Step 6: Restart service - this is the only moment of downtime
-    logger.step(6, total_steps, "Restarting application")
+    # Step 7: Restart service - this is the only moment of downtime
+    logger.step(7, total_steps, "Restarting application")
     logger.substep("Minimal downtime during restart...")
     service_manager = ServiceManager(verbose=args.verbose)
     service_manager.restart(app_name)

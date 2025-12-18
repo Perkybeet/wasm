@@ -30,7 +30,8 @@ wasm/
 │   │       ├── webapp.py           # wasm <action> (webapp commands)
 │   │       ├── site.py             # wasm site <action>
 │   │       ├── service.py          # wasm service <action>
-│   │       └── cert.py             # wasm cert <action>
+│   │       ├── cert.py             # wasm cert <action>
+│   │       └── backup.py           # wasm backup <action>
 │   │
 │   ├── core/
 │   │   ├── __init__.py
@@ -46,7 +47,8 @@ wasm/
 │   │   ├── apache_manager.py       # Apache site operations
 │   │   ├── service_manager.py      # Systemd service operations
 │   │   ├── cert_manager.py         # Certbot/SSL operations
-│   │   └── source_manager.py       # Git clone, URL fetch
+│   │   ├── source_manager.py       # Git clone, URL fetch
+│   │   └── backup_manager.py       # Backup/restore operations
 │   │
 │   ├── deployers/
 │   │   ├── __init__.py
@@ -376,3 +378,184 @@ Templates use `.j2` extension and these variables:
 - git
 - nodejs/npm (for JS apps)
 - python3-venv (for Python apps)
+
+---
+
+## Features Implementation Checklist
+
+### ✅ Implemented Features
+
+#### Core Features
+- [x] Web application deployment (create, update, delete)
+- [x] Service management (start, stop, restart, status, logs)
+- [x] Site management (Nginx/Apache configuration)
+- [x] SSL certificate management (certbot integration)
+- [x] Source management (Git, local paths, archives)
+- [x] Interactive mode with guided prompts
+- [x] Shell completions (bash, zsh, fish)
+- [x] AI-powered security monitoring
+
+#### Deployers
+- [x] Next.js deployer
+- [x] Node.js deployer  
+- [x] Vite deployer
+- [x] Python deployer (Django/Flask/FastAPI)
+- [x] Static site deployer
+
+#### Backups & Rollback (v0.10.0)
+- [x] Create application backups (`wasm backup create`)
+- [x] List backups (`wasm backup list`)
+- [x] Restore from backup (`wasm backup restore`)
+- [x] Delete backups (`wasm backup delete`)
+- [x] Verify backup integrity (`wasm backup verify`)
+- [x] Show backup info (`wasm backup info`)
+- [x] Storage usage statistics (`wasm backup storage`)
+- [x] Quick rollback (`wasm rollback <domain>`)
+- [x] Auto-backup before updates
+- [x] Backup rotation (configurable max per app)
+- [x] Checksum verification
+- [x] Git commit/branch tracking in backups
+
+### 🔄 Planned Features
+
+#### Environment Variables Management
+- [ ] `wasm env list <domain>` - List environment variables
+- [ ] `wasm env set <domain> KEY=VALUE` - Set variables
+- [ ] `wasm env get <domain> KEY` - Get specific variable
+- [ ] `wasm env import <domain> <file>` - Import from file
+- [ ] `wasm env export <domain>` - Export to file
+- [ ] Encrypted storage for sensitive values
+
+#### Docker Support
+- [ ] Auto-detect Dockerfile/docker-compose
+- [ ] Container deployment strategy
+- [ ] Docker network management
+- [ ] Volume management for persistence
+
+#### Database Management
+- [ ] `wasm db create` - Create database (MySQL/PostgreSQL)
+- [ ] `wasm db backup` - Database backups
+- [ ] `wasm db restore` - Database restoration
+- [ ] Connection string auto-configuration
+- [ ] Database migrations integration
+
+#### Health Monitoring
+- [ ] HTTP endpoint health checks
+- [ ] Memory usage tracking
+- [ ] CPU usage tracking
+- [ ] Custom health check commands
+- [ ] Alert notifications (email, webhook)
+
+#### Resource Limits
+- [ ] Memory limits per application
+- [ ] CPU limits per application
+- [ ] Disk quota management
+- [ ] Network bandwidth limits
+
+#### Clone Application
+- [ ] `wasm clone <source> <target>` - Clone to new domain
+- [ ] Including all configurations
+- [ ] Optional data cloning
+
+#### Logs Search
+- [ ] `wasm logs search <pattern>` - Search in logs
+- [ ] Time-based filtering
+- [ ] Log aggregation
+- [ ] Log rotation configuration
+
+#### Performance Metrics
+- [ ] Response time tracking
+- [ ] Request rate statistics
+- [ ] Error rate monitoring
+- [ ] Dashboard integration
+
+#### Templates/Presets
+- [ ] Save deployment configurations as templates
+- [ ] Quick deploy from templates
+- [ ] Community template sharing
+
+#### Bulk Operations
+- [ ] `wasm restart --all` - Restart all apps
+- [ ] `wasm update --all` - Update all apps
+- [ ] `wasm backup create --all` - Backup all apps
+- [ ] Selective operations with filters
+
+#### Cron Jobs
+- [ ] `wasm cron add` - Add scheduled tasks
+- [ ] `wasm cron list` - List scheduled tasks
+- [ ] `wasm cron delete` - Remove scheduled tasks
+- [ ] Integration with application lifecycle
+
+### ❌ Not Planned
+- Webhooks/CI-CD triggers (use GitHub Actions instead)
+- Multi-domain per app (use reverse proxy)
+
+---
+
+## Version History
+
+| Version | Date | Features Added |
+|---------|------|----------------|
+| 0.9.0 | - | Initial release with core features |
+| 0.9.1 | - | AI security monitoring, shell completions |
+| 0.10.0 | 2025-01 | Backup & Rollback system |
+
+---
+
+## Development & Testing
+
+### Docker Test Environment
+
+Para probar WASM en un entorno aislado, usar el Dockerfile de desarrollo:
+
+```bash
+# Construir imagen de pruebas
+cd /home/yago/Documents/wasm
+docker build -t wasm-test -f Dockerfile.test .
+
+# Ejecutar contenedor interactivo
+docker run -it --rm \
+  -v $(pwd):/app \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  --name wasm-dev \
+  wasm-test bash
+
+# Dentro del contenedor:
+pip install -e .
+wasm --version
+pytest -v
+```
+
+### PPA Build & Upload
+
+Para construir y subir paquetes al PPA (ejecutar como usuario `yago`):
+
+```bash
+cd /home/yago/Documents/wasm
+
+# Build para todas las distribuciones (jammy, noble, plucky, questing)
+./build-and-upload-ppa.sh
+
+# Build solo para distribuciones específicas
+./build-and-upload-ppa.sh noble plucky
+
+# Configuración del script:
+# - PPA: ppa:yago2003/wasm
+# - GPG Key: 56544DFCBF62C2C26FA4689BDA2D452B1614CA82
+# - Requiere: devscripts, debhelper, dh-python, gpg configurado
+```
+
+**Importante:** El script debe ejecutarse como usuario `yago` (no root) porque necesita acceso a la clave GPG para firmar los paquetes.
+
+### Running Tests
+
+```bash
+# Todos los tests
+pytest -v
+
+# Solo tests de backup
+pytest tests/test_backup.py -v
+
+# Con cobertura
+pytest --cov=wasm --cov-report=html
+```

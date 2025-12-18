@@ -6,8 +6,14 @@ server {
     listen [::]:80;
     server_name {{ domain }};
 
+    # ACME challenge location for Let's Encrypt (webroot method)
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+        allow all;
+    }
+
 {% if ssl %}
-    # Redirect HTTP to HTTPS
+    # Redirect HTTP to HTTPS (except ACME challenges)
     location / {
         return 301 https://$host$request_uri;
     }
@@ -30,8 +36,8 @@ server {
     ssl_session_cache shared:SSL:50m;
     ssl_stapling on;
     ssl_stapling_verify on;
-
 {% endif %}
+
     # Document root
     root {{ static_dir | default(app_path) }};
     index index.html index.htm;

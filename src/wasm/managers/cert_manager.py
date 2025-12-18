@@ -128,6 +128,21 @@ class CertManager(BaseManager):
         
         return None
     
+    def _check_certbot_plugin(self, plugin: str) -> bool:
+        """
+        Check if a certbot plugin is available.
+        
+        Args:
+            plugin: Plugin name (nginx, apache).
+            
+        Returns:
+            True if plugin is available.
+        """
+        result = self._run(["certbot", "plugins"])
+        if result.success:
+            return f"* {plugin}" in result.stdout
+        return False
+    
     def obtain(
         self,
         domain: str,
@@ -175,21 +190,51 @@ class CertManager(BaseManager):
         # Non-interactive
         cmd.extend(["--non-interactive", "--agree-tos"])
         
-        # Plugin selection
+        # Plugin selection with fallback logic
+        use_webroot = False
+        webroot_path = webroot or Path(f"/var/www/html")
+        
         if nginx:
-            cmd.append("--nginx")
+            # Check if nginx plugin is available
+            if self._check_certbot_plugin("nginx"):
+                cmd.append("--nginx")
+            else:
+                self.logger.warning(
+                    "certbot nginx plugin not installed. Using webroot method instead. "
+                    "Install with: sudo apt install python3-certbot-nginx"
+                )
+                use_webroot = True
         elif apache:
-            cmd.append("--apache")
+            # Check if apache plugin is available
+            if self._check_certbot_plugin("apache"):
+                cmd.append("--apache")
+            else:
+                self.logger.warning(
+                    "certbot apache plugin not installed. Using webroot method instead. "
+                    "Install with: sudo apt install python3-certbot-apache"
+                )
+                use_webroot = True
         elif standalone:
             cmd.append("--standalone")
         elif webroot:
-            cmd.extend(["--webroot", "-w", str(webroot)])
+            use_webroot = True
         else:
-            # Default to nginx if available
-            if self._run(["which", "nginx"]).success:
+            # Auto-detect: prefer nginx plugin if available
+            if self._run(["which", "nginx"]).success and self._check_certbot_plugin("nginx"):
                 cmd.append("--nginx")
+            elif self._run(["which", "nginx"]).success:
+                # Nginx installed but plugin not available, use webroot
+                self.logger.warning(
+                    "certbot nginx plugin not installed. Using webroot method. "
+                    "Install with: sudo apt install python3-certbot-nginx"
+                )
+                use_webroot = True
             else:
                 cmd.append("--standalone")
+        
+        # Configure webroot if needed
+        if use_webroot:
+            cmd.extend(["--webroot", "-w", str(webroot_path)])
         
         # Add domains
         cmd.extend(["-d", domain])

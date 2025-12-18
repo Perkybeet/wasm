@@ -6,8 +6,14 @@ server {
     listen [::]:80;
     server_name {{ domain }};
 
+    # ACME challenge location for Let's Encrypt (webroot method)
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+        allow all;
+    }
+
 {% if ssl %}
-    # Redirect HTTP to HTTPS
+    # Redirect HTTP to HTTPS (except ACME challenges)
     location / {
         return 301 https://$host$request_uri;
     }
@@ -30,8 +36,8 @@ server {
     ssl_session_cache shared:SSL:50m;
     ssl_stapling on;
     ssl_stapling_verify on;
-
 {% endif %}
+
     # Logging
     access_log /var/log/nginx/{{ domain }}.access.log;
     error_log /var/log/nginx/{{ domain }}.error.log;
@@ -78,7 +84,7 @@ server {
         proxy_busy_buffers_size 256k;
     }
 
-{% if health_check is defined %}
+{% if health_check is defined and health_check != '/' %}
     # Health check endpoint
     location {{ health_check }} {
         proxy_pass http://127.0.0.1:{{ port }}{{ health_check }};

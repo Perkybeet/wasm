@@ -93,6 +93,12 @@ For more information, visit: https://github.com/your-org/wasm
     # Setup commands
     _add_setup_parser(subparsers)
     
+    # Backup commands
+    _add_backup_parser(subparsers)
+    
+    # Rollback command
+    _add_rollback_parser(subparsers)
+    
     return parser
 
 
@@ -398,6 +404,7 @@ def _add_service_parser(subparsers) -> None:
     )
     create.add_argument(
         "--command", "-c",
+        dest="exec_command",
         required=True,
         help="Command to execute",
     )
@@ -787,6 +794,190 @@ def _add_setup_parser(subparsers) -> None:
         "doctor",
         help="Run system diagnostics and check for issues",
         description="Comprehensive check of all dependencies and configurations",
+    )
+
+
+def _add_backup_parser(subparsers) -> None:
+    """Add backup subcommands."""
+    backup = subparsers.add_parser(
+        "backup",
+        aliases=["bak"],
+        help="Manage application backups",
+        description="Create, list, restore, and manage application backups",
+    )
+    
+    backup_sub = backup.add_subparsers(
+        dest="action",
+        title="actions",
+        metavar="<action>",
+    )
+    
+    # backup create
+    create = backup_sub.add_parser(
+        "create",
+        aliases=["new"],
+        help="Create a backup of an application",
+    )
+    create.add_argument(
+        "domain",
+        help="Domain name of the application to backup",
+    )
+    create.add_argument(
+        "--description", "-m",
+        default="",
+        help="Description or note for this backup",
+    )
+    create.add_argument(
+        "--no-env",
+        action="store_true",
+        help="Exclude .env files from backup",
+    )
+    create.add_argument(
+        "--include-node-modules",
+        action="store_true",
+        help="Include node_modules (warning: large!)",
+    )
+    create.add_argument(
+        "--include-build",
+        action="store_true",
+        help="Include build artifacts (.next, dist, build)",
+    )
+    create.add_argument(
+        "--tags", "-t",
+        help="Comma-separated tags for the backup",
+    )
+    
+    # backup list
+    list_cmd = backup_sub.add_parser(
+        "list",
+        aliases=["ls"],
+        help="List backups",
+    )
+    list_cmd.add_argument(
+        "domain",
+        nargs="?",
+        help="Filter by domain (optional)",
+    )
+    list_cmd.add_argument(
+        "--tags", "-t",
+        help="Filter by tags (comma-separated)",
+    )
+    list_cmd.add_argument(
+        "--limit", "-n",
+        type=int,
+        help="Maximum number of backups to show",
+    )
+    list_cmd.add_argument(
+        "--json",
+        action="store_true",
+        help="Output in JSON format",
+    )
+    
+    # backup restore
+    restore = backup_sub.add_parser(
+        "restore",
+        help="Restore from a backup",
+    )
+    restore.add_argument(
+        "backup_id",
+        help="Backup ID to restore",
+    )
+    restore.add_argument(
+        "--target-domain",
+        help="Restore to a different domain (optional)",
+    )
+    restore.add_argument(
+        "--no-env",
+        action="store_true",
+        help="Don't restore .env files (keep current)",
+    )
+    restore.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="Skip checksum verification",
+    )
+    restore.add_argument(
+        "--force", "-f",
+        action="store_true",
+        help="Skip confirmation prompt",
+    )
+    
+    # backup delete
+    delete = backup_sub.add_parser(
+        "delete",
+        aliases=["remove", "rm"],
+        help="Delete a backup",
+    )
+    delete.add_argument(
+        "backup_id",
+        help="Backup ID to delete",
+    )
+    delete.add_argument(
+        "--force", "-f",
+        action="store_true",
+        help="Skip confirmation prompt",
+    )
+    
+    # backup verify
+    verify = backup_sub.add_parser(
+        "verify",
+        aliases=["check"],
+        help="Verify a backup's integrity",
+    )
+    verify.add_argument(
+        "backup_id",
+        help="Backup ID to verify",
+    )
+    
+    # backup info
+    info = backup_sub.add_parser(
+        "info",
+        aliases=["show"],
+        help="Show detailed backup information",
+    )
+    info.add_argument(
+        "backup_id",
+        help="Backup ID",
+    )
+    info.add_argument(
+        "--json",
+        action="store_true",
+        help="Output in JSON format",
+    )
+    
+    # backup storage
+    storage = backup_sub.add_parser(
+        "storage",
+        help="Show backup storage usage",
+    )
+    storage.add_argument(
+        "--json",
+        action="store_true",
+        help="Output in JSON format",
+    )
+
+
+def _add_rollback_parser(subparsers) -> None:
+    """Add rollback command."""
+    rollback = subparsers.add_parser(
+        "rollback",
+        aliases=["rb"],
+        help="Rollback an application to a previous state",
+        description="Quick rollback to the most recent backup or a specific backup",
+    )
+    rollback.add_argument(
+        "domain",
+        help="Domain name of the application to rollback",
+    )
+    rollback.add_argument(
+        "backup_id",
+        nargs="?",
+        help="Specific backup ID (defaults to most recent)",
+    )
+    rollback.add_argument(
+        "--no-rebuild",
+        action="store_true",
+        help="Don't rebuild after restore",
     )
 
 

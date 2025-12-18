@@ -214,7 +214,7 @@ class ApacheManager(BaseManager):
             raise ApacheError("Template environment not initialized")
         
         # Ensure required modules are enabled
-        required_modules = ["proxy", "proxy_http", "proxy_wstunnel", "rewrite"]
+        required_modules = ["proxy", "proxy_http", "proxy_wstunnel", "rewrite", "headers"]
         for module in required_modules:
             self.enable_module(module)
         

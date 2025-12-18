@@ -296,6 +296,40 @@ class BaseDeployer(ABC):
         else:  # npm
             return ["npx"] + cmd_parts
     
+    def _resolve_absolute_path(self, command: str) -> str:
+        """
+        Resolve command to use absolute paths for executables.
+        
+        This is required for systemd services as ExecStart
+        must use absolute paths.
+        
+        Args:
+            command: Command string (e.g., "npm run start")
+            
+        Returns:
+            Command with absolute path (e.g., "/usr/bin/npm run start")
+        """
+        import shutil
+        
+        parts = command.split()
+        if not parts:
+            return command
+        
+        executable = parts[0]
+        
+        # Already absolute
+        if executable.startswith("/"):
+            return command
+        
+        # Try to find the absolute path
+        abs_path = shutil.which(executable)
+        if abs_path:
+            parts[0] = abs_path
+            return " ".join(parts)
+        
+        # Fallback: return original (systemd will fail, but error will be clearer)
+        return command
+    
     def generate_prisma(self) -> bool:
         """
         Generate Prisma client if Prisma is detected.
@@ -551,12 +585,23 @@ class BaseDeployer(ABC):
         
         result = self._run(command, timeout=600)
         if not result.success:
-            # Try without --frozen-lockfile if it failed (common with pnpm/yarn version mismatches)
+            # Try fallback install methods
+            fallback_command = None
+            
+            # Check if it's a frozen lockfile issue (pnpm/yarn/bun)
             if "--frozen-lockfile" in command:
                 self.logger.warning("Strict lockfile install failed, trying regular install...")
-                command_fallback = [c for c in command if c != "--frozen-lockfile"]
-                self.logger.substep(f"Running: {' '.join(command_fallback)}")
-                result = self._run(command_fallback, timeout=600)
+                fallback_command = [c for c in command if c != "--frozen-lockfile"]
+            
+            # Check if it's npm ci failing (no package-lock.json)
+            elif command == ["npm", "ci"]:
+                if "package-lock.json" in str(result.stderr) or "EUSAGE" in str(result.stderr):
+                    self.logger.warning("npm ci failed (no lockfile), using npm install...")
+                    fallback_command = ["npm", "install"]
+            
+            if fallback_command:
+                self.logger.substep(f"Running: {' '.join(fallback_command)}")
+                result = self._run(fallback_command, timeout=600)
             
             if not result.success:
                 # Combine stdout and stderr for better error visibility
@@ -612,14 +657,20 @@ class BaseDeployer(ABC):
         self.post_build()
         return True
     
-    def create_site(self) -> bool:
+    def create_site(self, with_ssl: bool = False) -> bool:
         """
         Create web server site configuration.
+        
+        Args:
+            with_ssl: If True, create config with SSL enabled.
+                      If False, create config without SSL (for initial setup).
         
         Returns:
             True if successful.
         """
         context = self.get_template_context()
+        # Override SSL setting based on parameter
+        context["ssl"] = with_ssl
         
         if self.webserver == "nginx":
             manager = NginxManager(verbose=self.verbose)
@@ -630,12 +681,17 @@ class BaseDeployer(ABC):
         
         self.logger.substep(f"Web server: {self.webserver}")
         self.logger.substep(f"Template: {template}")
+        if self.ssl:
+            self.logger.substep(f"SSL: {'enabled' if with_ssl else 'pending certificate'}")
         
-        # Create site
-        manager.create_site(self.domain, template=template, context=context)
-        
-        # Enable site
-        manager.enable_site(self.domain)
+        # Check if site already exists (update vs create)
+        if manager.site_exists(self.domain):
+            manager.update_site(self.domain, template=template, context=context)
+        else:
+            # Create site
+            manager.create_site(self.domain, template=template, context=context)
+            # Enable site
+            manager.enable_site(self.domain)
         
         # Reload web server
         manager.reload()
@@ -650,6 +706,9 @@ class BaseDeployer(ABC):
             True if successful.
         """
         start_command = self.get_start_command()
+        
+        # Resolve to absolute path for systemd compatibility
+        start_command = self._resolve_absolute_path(start_command)
         
         self.logger.substep(f"Service: {self.app_name}")
         self.logger.substep(f"Command: {start_command}")
@@ -773,6 +832,10 @@ class BaseDeployer(ABC):
             True if deployment was successful.
         """
         from wasm.core.logger import Icons
+        from wasm.core.exceptions import CertificateError
+        
+        # Track if SSL was successfully obtained
+        ssl_obtained = False
         
         try:
             # Step 1: Fetch source
@@ -787,14 +850,27 @@ class BaseDeployer(ABC):
             self.logger.step(3, total_steps, "Building application", Icons.BUILD)
             self.build()
             
-            # Step 4: Create site
+            # Step 4: Create site (initially WITHOUT SSL to allow certbot validation)
             self.logger.step(4, total_steps, "Creating site configuration", Icons.GLOBE)
-            self.create_site()
+            self.create_site(with_ssl=False)
             
-            # Step 5: SSL certificate
+            # Step 5: SSL certificate (best effort - continue if it fails)
             if self.ssl:
                 self.logger.step(5, total_steps, "Obtaining SSL certificate", Icons.LOCK)
-                self.obtain_certificate()
+                try:
+                    self.obtain_certificate()
+                    ssl_obtained = True
+                    # After obtaining certificate, update site config WITH SSL
+                    self.logger.substep("Updating site configuration with SSL")
+                    self.create_site(with_ssl=True)
+                except CertificateError as e:
+                    self.logger.warning(f"SSL certificate failed: {e.message}")
+                    self.logger.warning("Continuing deployment without SSL...")
+                    self.logger.substep("Application will be available via HTTP only")
+                except Exception as e:
+                    self.logger.warning(f"SSL certificate failed: {e}")
+                    self.logger.warning("Continuing deployment without SSL...")
+                    self.logger.substep("Application will be available via HTTP only")
             else:
                 self.logger.step(5, total_steps, "Skipping SSL certificate", Icons.LOCK)
             
@@ -810,9 +886,14 @@ class BaseDeployer(ABC):
             if self.health_check():
                 self.logger.success(f"Application deployed successfully!")
                 self.logger.blank()
-                self.logger.key_value("URL", f"https://{self.domain}" if self.ssl else f"http://{self.domain}")
+                protocol = "https" if ssl_obtained else "http"
+                self.logger.key_value("URL", f"{protocol}://{self.domain}")
                 self.logger.key_value("Service", self.app_name)
                 self.logger.key_value("Port", str(self.port))
+                if self.ssl and not ssl_obtained:
+                    self.logger.blank()
+                    self.logger.warning("SSL was requested but could not be obtained.")
+                    self.logger.info("To add SSL later, run: wasm cert create -d " + self.domain)
                 return True
             else:
                 self.logger.warning("Application started but health check failed")
