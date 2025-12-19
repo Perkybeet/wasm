@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.10.3
+Version:        0.10.4
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        MIT
@@ -117,6 +117,10 @@ echo "Note: You may need to install python3-inquirer via pip:"
 echo "  pip3 install inquirer"
 
 %changelog
+* Thu Dec 19 2024 Perkybeet <yago.lopez.adeje@gmail.com> - 0.10.4-1
+- CI: Automatic deployment to OBS on release
+- Fix: OBS deployment configuration in GitHub Actions
+
 * Thu Dec 19 2024 Perkybeet <yago.lopez.adeje@gmail.com> - 0.10.3-1
 - Fix: Git pull with unstaged/uncommitted changes during wasm update
 - Auto-stash local changes before pull, restore after
