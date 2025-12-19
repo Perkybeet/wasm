@@ -1,3 +1,10 @@
+wasm (0.10.4-1) unstable; urgency=medium
+
+  * CI: Automatic deployment to OBS on release
+  * Fix: OBS deployment configuration in GitHub Actions
+
+ -- Yago López Prado <yago.lopez.adeje@gmail.com>  Thu, 19 Dec 2024 20:00:00 +0000
+
 wasm (0.10.3-1) unstable; urgency=medium
 
   * Fix: Git pull with unstaged/uncommitted changes during wasm update

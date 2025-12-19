@@ -593,6 +593,29 @@ pytest --cov=wasm --cov-report=html
 
 ## Release Process
 
+### Version Update Checklist
+
+**CRITICAL**: When releasing a new version, update ALL of the following files:
+
+| File | What to Update | Example |
+|------|----------------|---------|
+| `src/wasm/__init__.py` | `__version__ = "X.Y.Z"` | `__version__ = "0.10.4"` |
+| `pyproject.toml` | `version = "X.Y.Z"` | `version = "0.10.4"` |
+| `debian/changelog` | New entry at top | `wasm (X.Y.Z-1~noble) noble; ...` |
+| `obs/debian.changelog` | New entry at top | `wasm (X.Y.Z-1) unstable; ...` |
+| `obs/wasm.dsc` | `Version:` and tarball name | `Version: X.Y.Z-1` + `wasm-X.Y.Z.tar.gz` |
+| `rpm/wasm.spec` | `Version:` and `%changelog` | `Version: X.Y.Z` |
+
+**Workflow**:
+1. Update all 6 files listed above
+2. Commit: `git commit -m "Release vX.Y.Z - Description"`
+3. Tag: `git tag vX.Y.Z`
+4. Push: `git push origin main && git push origin vX.Y.Z`
+5. GitHub Actions will automatically:
+   - Create GitHub Release
+   - Build and publish to PyPI
+   - Build and publish to OBS
+
 ### Supported Distributions (via OBS)
 
 | Distribution | Versions | Architectures | Package |
