@@ -549,6 +549,8 @@ Templates use `.j2` extension and these variables:
 | 0.9.0 | 2024-11 | Initial release with core features |
 | 0.9.1 | 2024-12 | AI security monitoring, shell completions |
 | 0.10.0 | 2024-12 | Backup & Rollback system |
+| 0.10.1 | 2024-12 | Man page, RPM packaging fixes |
+| 0.10.2 | 2024-12 | Fix Git dubious ownership error |
 
 ---
 
@@ -604,6 +606,17 @@ pytest --cov=wasm --cov-report=html
 ### Release Steps
 
 #### 1. Update Version Numbers
+
+All files that must be updated when changing version:
+
+| File | Field/Line | Example |
+|------|------------|---------|
+| `pyproject.toml` | `version = "X.Y.Z"` | `version = "0.10.2"` |
+| `src/wasm/__init__.py` | `__version__ = "X.Y.Z"` | `__version__ = "0.10.2"` |
+| `debian/changelog` | New entry at top | `wasm (X.Y.Z-1~noble) noble; ...` |
+| `obs/debian.changelog` | New entry at top | `wasm (X.Y.Z-1) unstable; ...` |
+| `obs/wasm.dsc` | `Version:` and `Files:` | `Version: X.Y.Z-1` + tarball name |
+| `rpm/wasm.spec` | `Version:` and `%changelog` | `Version: X.Y.Z` |
 
 ```bash
 # pyproject.toml

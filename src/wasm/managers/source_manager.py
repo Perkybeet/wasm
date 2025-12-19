@@ -128,6 +128,9 @@ class SourceManager(BaseManager):
         Returns:
             True if update was successful.
         """
+        # Ensure directory is marked as safe (handles dubious ownership)
+        self._ensure_safe_directory(destination)
+        
         # Update remote URL if different
         result = self._run(["git", "remote", "get-url", "origin"], cwd=destination)
         current_url = result.stdout.strip() if result.success else ""
@@ -229,6 +232,27 @@ class SourceManager(BaseManager):
         
         return True
     
+    def _ensure_safe_directory(self, path: Path) -> None:
+        """
+        Ensure a directory is marked as safe for Git operations.
+        
+        This handles the "dubious ownership" error that occurs when Git
+        is run as root on a repository owned by another user.
+        
+        Args:
+            path: Repository path to mark as safe.
+        """
+        # Check if already in safe.directory
+        result = self._run(["git", "config", "--global", "--get-all", "safe.directory"])
+        if result.success:
+            safe_dirs = result.stdout.strip().split("\n")
+            if str(path) in safe_dirs or "*" in safe_dirs:
+                return
+        
+        # Add to safe.directory
+        self.logger.debug(f"Adding to Git safe.directory: {path}")
+        self._run(["git", "config", "--global", "--add", "safe.directory", str(path)])
+    
     def pull(self, path: Path, branch: Optional[str] = None) -> bool:
         """
         Pull latest changes in a Git repository.
@@ -242,6 +266,9 @@ class SourceManager(BaseManager):
         """
         if not (path / ".git").exists():
             raise SourceError(f"Not a Git repository: {path}")
+        
+        # Ensure directory is marked as safe (handles dubious ownership)
+        self._ensure_safe_directory(path)
         
         # Checkout branch if specified
         if branch:

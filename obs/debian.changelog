@@ -1,3 +1,10 @@
+wasm (0.10.2-1) unstable; urgency=medium
+
+  * Fix: Git "dubious ownership" error during wasm update
+  * Auto-configure git safe.directory for app directories
+
+ -- Yago López Prado <yago.lopez.adeje@gmail.com>  Thu, 19 Dec 2024 12:00:00 +0000
+
 wasm (0.10.0-1) unstable; urgency=medium
 
   * New feature: Backup and Rollback system
