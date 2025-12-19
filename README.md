@@ -9,6 +9,30 @@
 </p>
 
 <p align="center">
+  <a href="https://build.opensuse.org/package/show/home:Perkybeet/wasm">
+    <img src="https://build.opensuse.org/projects/home:Perkybeet/packages/wasm/badge.svg?type=default" alt="OBS Build Status">
+  </a>
+  <a href="https://pypi.org/project/wasm-cli/">
+    <img src="https://img.shields.io/pypi/v/wasm-cli?color=blue&logo=pypi&logoColor=white" alt="PyPI Version">
+  </a>
+  <a href="https://pypi.org/project/wasm-cli/">
+    <img src="https://img.shields.io/pypi/pyversions/wasm-cli?logo=python&logoColor=white" alt="Python Version">
+  </a>
+  <a href="https://github.com/Perkybeet/wasm/blob/main/LICENSE">
+    <img src="https://img.shields.io/github/license/Perkybeet/wasm?color=blue" alt="License">
+  </a>
+  <a href="https://github.com/Perkybeet/wasm/stargazers">
+    <img src="https://img.shields.io/github/stars/Perkybeet/wasm?style=social" alt="GitHub Stars">
+  </a>
+  <a href="https://pypi.org/project/wasm-cli/">
+    <img src="https://img.shields.io/pypi/dm/wasm-cli?color=blue&logo=pypi" alt="PyPI Downloads">
+  </a>
+  <a href="https://github.com/Perkybeet/wasm/issues">
+    <img src="https://img.shields.io/github/issues/Perkybeet/wasm" alt="GitHub Issues">
+  </a>
+</p>
+
+<p align="center">
   <a href="#installation">Installation</a> •
   <a href="#quick-start">Quick Start</a> •
   <a href="#features">Features</a> •
