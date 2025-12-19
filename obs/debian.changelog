@@ -1,3 +1,11 @@
+wasm (0.10.5-1) unstable; urgency=medium
+
+  * Detect OOM (Out of Memory) build failures with exit code 137
+  * Provide actionable suggestions for resolving memory issues
+  * Add OutOfMemoryError exception with swap/memory configuration tips
+
+ -- Yago López Prado <yago.lopez.adeje@gmail.com>  Thu, 19 Dec 2024 22:00:00 +0000
+
 wasm (0.10.4-1) unstable; urgency=medium
 
   * CI: Automatic deployment to OBS on release

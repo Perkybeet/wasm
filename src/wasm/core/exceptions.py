@@ -44,6 +44,51 @@ class BuildError(DeploymentError):
     pass
 
 
+class OutOfMemoryError(BuildError):
+    """
+    Raised when build fails due to Out of Memory (OOM) condition.
+    
+    This is detected when the process exits with code 137 (128 + SIGKILL)
+    which typically indicates the OOM killer terminated the process.
+    """
+    
+    def __init__(self, message: str = "Build killed due to insufficient memory", details: str = ""):
+        suggestions = """
+The build process was killed by the system (exit code 137), typically caused by
+insufficient RAM. Next.js/Turbopack builds can require 2-4GB+ of memory.
+
+Solutions to try:
+
+1. Add swap space (if not already configured):
+   sudo fallocate -l 4G /swapfile
+   sudo chmod 600 /swapfile
+   sudo mkswap /swapfile
+   sudo swapon /swapfile
+   echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+
+2. Limit Node.js memory usage:
+   Add to .env file: NODE_OPTIONS="--max-old-space-size=1536"
+   Then redeploy: wasm update <domain>
+
+3. Build locally and deploy pre-built:
+   - Build on your local machine: npm run build
+   - Commit the .next folder (remove from .gitignore)
+   - Push changes and update: wasm update <domain>
+
+4. Use a server with more RAM (recommended: 2GB+ for Next.js apps)
+
+5. Disable Turbopack (if using Next.js 15+):
+   In next.config.js, ensure you're not using experimental turbo features
+   for production builds."""
+        
+        if details:
+            full_details = f"{details}\n{suggestions}"
+        else:
+            full_details = suggestions
+        
+        super().__init__(message, full_details)
+
+
 class SourceError(WASMError):
     """Raised when source fetching fails (git clone, download, etc.)."""
     pass

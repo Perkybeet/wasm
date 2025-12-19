@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.10.4
+Version:        0.10.5
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        MIT
@@ -117,6 +117,11 @@ echo "Note: You may need to install python3-inquirer via pip:"
 echo "  pip3 install inquirer"
 
 %changelog
+* Thu Dec 19 2024 Perkybeet <yago.lopez.adeje@gmail.com> - 0.10.5-1
+- Detect OOM (Out of Memory) build failures with exit code 137
+- Provide actionable suggestions for resolving memory issues
+- Add OutOfMemoryError exception with swap/memory configuration tips
+
 * Thu Dec 19 2024 Perkybeet <yago.lopez.adeje@gmail.com> - 0.10.4-1
 - CI: Automatic deployment to OBS on release
 - Fix: OBS deployment configuration in GitHub Actions

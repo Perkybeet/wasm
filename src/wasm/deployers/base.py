@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Literal
 
 from wasm.core.config import Config
 from wasm.core.logger import Logger
-from wasm.core.exceptions import DeploymentError, BuildError
+from wasm.core.exceptions import DeploymentError, BuildError, OutOfMemoryError
 from wasm.core.utils import run_command, domain_to_app_name
 from wasm.managers.nginx_manager import NginxManager
 from wasm.managers.apache_manager import ApacheManager
@@ -628,6 +628,10 @@ class BaseDeployer(ABC):
         
         Returns:
             True if successful.
+            
+        Raises:
+            OutOfMemoryError: If build is killed due to OOM (exit code 137).
+            BuildError: If build fails for other reasons.
         """
         self.pre_build()
         
@@ -648,6 +652,13 @@ class BaseDeployer(ABC):
                     error_output += "\n" + result.stdout
                 else:
                     error_output = result.stdout
+            
+            # Check for OOM killer (exit code 137 = 128 + SIGKILL)
+            if result.exit_code == 137:
+                raise OutOfMemoryError(
+                    "Build killed due to insufficient memory (exit code 137)",
+                    details=error_output or "Process was killed by the OOM killer.",
+                )
             
             raise BuildError(
                 "Build failed",
