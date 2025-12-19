@@ -146,20 +146,20 @@ jobs:
           OBS_PASS: ${{ secrets.OBS_PASS }}
         run: |
           mkdir -p ~/.config/osc
-          cat > ~/.config/osc/oscrc << EOF
-          [general]
-          apiurl = https://api.opensuse.org
-
-          [https://api.opensuse.org]
-          user = ${OBS_USER}
-          pass = ${OBS_PASS}
-          trusted_prj = openSUSE:Factory openSUSE:Tumbleweed
-          EOF
-          # Fix indentation (heredoc adds leading spaces)
-          sed -i 's/^          //' ~/.config/osc/oscrc
+          echo "[general]" > ~/.config/osc/oscrc
+          echo "apiurl = https://api.opensuse.org" >> ~/.config/osc/oscrc
+          echo "" >> ~/.config/osc/oscrc
+          echo "[https://api.opensuse.org]" >> ~/.config/osc/oscrc
+          echo "user = ${OBS_USER}" >> ~/.config/osc/oscrc
+          echo "pass = ${OBS_PASS}" >> ~/.config/osc/oscrc
+          echo "trusted_prj = openSUSE:Factory openSUSE:Tumbleweed" >> ~/.config/osc/oscrc
           chmod 600 ~/.config/osc/oscrc
-          # Verify config
-          echo "OSC config created. User: ${OBS_USER}"
+          # Debug: show config (without password)
+          echo "=== OSC Config (sanitized) ==="
+          grep -v "^pass" ~/.config/osc/oscrc
+          echo "pass = ********"
+          echo "=== Testing OSC connection ==="
+          osc api /about || echo "Connection test failed"
 
       - name: Get version
         id: version
