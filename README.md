@@ -1,7 +1,7 @@
 # WASM - Web App System Management
 
 <p align="center">
-  <img src="docs/assets/logo.png" alt="WASM Logo" width="200">
+  <img src="docs/assets/logo_bg.png" alt="WASM Logo" width="400">
 </p>
 
 <p align="center">
