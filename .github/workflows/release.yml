@@ -1,0 +1,128 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+      version: ${{ steps.get_version.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: get_version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Extract changelog
+        id: changelog
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          # Extract changelog for this version from debian/changelog
+          CHANGELOG=$(sed -n "/^wasm (${VERSION}/,/^wasm (/p" debian/changelog | head -n -1 | tail -n +2 | sed 's/^  //')
+          echo "changelog<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGELOG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: WASM v${{ steps.get_version.outputs.version }}
+          body: |
+            ## Changes in v${{ steps.get_version.outputs.version }}
+            
+            ${{ steps.changelog.outputs.changelog }}
+            
+            ## Installation
+            
+            ### Ubuntu/Debian
+            ```bash
+            curl -fsSL https://download.opensuse.org/repositories/home:Perkybeet/xUbuntu_24.04/Release.key | sudo gpg --dearmor -o /usr/share/keyrings/wasm.gpg
+            echo "deb [signed-by=/usr/share/keyrings/wasm.gpg] https://download.opensuse.org/repositories/home:Perkybeet/xUbuntu_24.04/ /" | sudo tee /etc/apt/sources.list.d/wasm.list
+            sudo apt update && sudo apt install wasm
+            ```
+            
+            ### Fedora
+            ```bash
+            sudo dnf config-manager addrepo --from-repofile=https://download.opensuse.org/repositories/home:Perkybeet/Fedora_42/home:Perkybeet.repo
+            sudo dnf install wasm-cli
+            ```
+            
+            ### From PyPI
+            ```bash
+            pip install wasm-cli
+            ```
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-sdist:
+    name: Build Source Distribution
+    runs-on: ubuntu-latest
+    needs: release
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build tools
+        run: pip install build
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            dist/*.tar.gz
+            dist/*.whl
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-pypi:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    needs: build-sdist
+    environment:
+      name: pypi
+      url: https://pypi.org/p/wasm-cli
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build tools
+        run: pip install build twine
+
+      - name: Build package
+        run: python -m build
+
+      - name: Publish to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: twine upload dist/*
+        continue-on-error: true  # Don't fail if package already exists
