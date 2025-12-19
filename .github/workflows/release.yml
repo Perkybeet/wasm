@@ -176,7 +176,7 @@ jobs:
       - name: Get version
         id: version
         run: |
-          VERSION=$(head -n 1 debian/changelog | sed 's/.*(\(.*\)).*/\1/' | cut -d'~' -f1)
+          VERSION=$(head -n 1 obs/debian.changelog | sed 's/.*\((.*)\).*/\1/' | cut -d'~' -f1)
           VERSION_BASE=$(echo "${VERSION}" | cut -d'-' -f1)
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
           echo "version_base=${VERSION_BASE}" >> $GITHUB_OUTPUT
@@ -211,9 +211,10 @@ jobs:
           cp ../../obs/debian.copyright .
           cp ../../obs/debian.postinst . 2>/dev/null || true
           cp ../../obs/debian.postrm . 2>/dev/null || true
-          cp ../../debian/wasm.default.yaml debian.wasm.default.yaml 2>/dev/null || true
-          cp ../../debian/wasm.default.yaml . 2>/dev/null || true
-          cp ../../debian/wasm.1 . 2>/dev/null || true
+          cp ../../obs/wasm.default.yaml . 2>/dev/null || true
+          cp ../../obs/wasm.1 . 2>/dev/null || true
+          cp ../../obs/wasm.dirs . 2>/dev/null || true
+          cp ../../obs/wasm.manpages . 2>/dev/null || true
           
           # Add new files
           osc add ${TARBALL} 2>/dev/null || true
