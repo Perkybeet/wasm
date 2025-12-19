@@ -107,3 +107,6 @@ debian/*.log
 *.deb
 *.changes
 *.buildinfo
+
+# GitHub Copilot
+.github/copilot-instructions.md
