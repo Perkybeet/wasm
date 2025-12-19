@@ -38,3 +38,7 @@ Description: Web App System Management CLI Tool
   - SSL certificate management via Certbot/Let's Encrypt
   - Systemd service management
   - Interactive mode with guided prompts
+  - Web dashboard for remote management (optional)
+  - REST API with token-based authentication
+  - Backup and rollback system
+  - AI-powered security monitoring

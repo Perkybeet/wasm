@@ -15,6 +15,7 @@ from wasm.cli.commands import (
 )
 from wasm.cli.commands.monitor import handle_monitor
 from wasm.cli.commands.backup import handle_backup, handle_rollback
+from wasm.cli.commands.web import handle_web
 from wasm.core.logger import Logger
 from wasm.core.exceptions import WASMError
 
@@ -97,6 +98,13 @@ def main() -> int:
     
     elif command in ["rollback", "rb"]:
         return handle_rollback(args)
+    
+    elif command == "web":
+        if not args.action:
+            print("Error: web requires an action", file=sys.stderr)
+            print("Use: wasm web --help", file=sys.stderr)
+            return 1
+        return handle_web(args)
     
     else:
         print(f"Unknown command: {command}", file=sys.stderr)

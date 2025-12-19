@@ -100,29 +100,40 @@ def _handle_scan(args: Namespace) -> int:
     
     logger = Logger(verbose=args.verbose)
     
-    # Check for dry run mode
+    # Check for options
     dry_run = getattr(args, "dry_run", False)
+    force_ai = getattr(args, "force_ai", False)
+    scan_all = getattr(args, "all", False)
     
     config = None
+    from wasm.core.config import Config
+    global_config = Config()
+    
+    config = MonitorConfig(
+        enabled=True,
+        scan_interval=0,
+        auto_terminate=global_config.get("monitor.auto_terminate", True),
+        terminate_malicious_only=global_config.get("monitor.terminate_malicious_only", True),
+        use_ai=global_config.get("monitor.use_ai", True),
+        dry_run=dry_run,
+    )
+    
     if dry_run:
-        from wasm.core.config import Config
-        global_config = Config()
-        config = MonitorConfig(
-            enabled=True,
-            scan_interval=0,
-            auto_terminate=global_config.get("monitor.auto_terminate", True),
-            terminate_malicious_only=global_config.get("monitor.terminate_malicious_only", True),
-            use_ai=global_config.get("monitor.use_ai", True),
-            dry_run=True,
-        )
         logger.warning("Running in DRY RUN mode - no processes will be terminated")
+    
+    if force_ai:
+        logger.info("Force AI analysis enabled - will analyze all detected processes")
+    
+    if scan_all:
+        logger.warning("Scanning ALL processes with AI - this may be slow and expensive")
     
     monitor = ProcessMonitor(config=config, verbose=args.verbose)
     
     logger.info("Running security scan...")
     logger.info("")
     
-    reports = monitor.scan_once()
+    # Use force_ai and scan_all options
+    reports = monitor.scan_once(force_ai=force_ai, analyze_all=scan_all)
     
     if not reports:
         logger.success("System scan complete - no threats detected")

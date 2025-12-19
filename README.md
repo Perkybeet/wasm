@@ -58,18 +58,25 @@
 
 ## 📦 Installation
 
-### Ubuntu/Debian - From PPA (Recommended)
+### Ubuntu/Debian - From OBS Repository (Recommended)
 
 ```bash
-sudo add-apt-repository ppa:yago2003/wasm
+# Add repository key
+curl -fsSL https://download.opensuse.org/repositories/home:/Perkybeet/xUbuntu_24.04/Release.key | \
+  gpg --dearmor | sudo tee /usr/share/keyrings/wasm.gpg > /dev/null
+
+# Add repository (Ubuntu 24.04)
+echo 'deb [signed-by=/usr/share/keyrings/wasm.gpg] https://download.opensuse.org/repositories/home:/Perkybeet/xUbuntu_24.04/ /' | \
+  sudo tee /etc/apt/sources.list.d/wasm.list
+
+# Install
 sudo apt update
 sudo apt install wasm
 ```
 
 Supported Ubuntu versions:
+- Ubuntu 22.04 LTS (Jammy Jellyfish)
 - Ubuntu 24.04 LTS (Noble Numbat)
-- Ubuntu 24.10 (Plucky Puffin)
-- Ubuntu 25.04 (Questing Qetzal)
 
 ### Fedora - From OBS Repository
 
@@ -131,7 +138,7 @@ pip install wasm-cli
 ### From Source
 
 ```bash
-git clone https://github.com/your-org/wasm.git
+git clone https://github.com/Perkybeet/wasm.git
 cd wasm
 pip install -e .
 ```
@@ -478,17 +485,14 @@ pip install -e ".[dev]"
 # Run tests
 pytest
 
-# Build .deb package
-make debian
+# Build and upload to OBS (all distributions)
+make obs-upload
 
-# Build and upload to PPA (all distributions)
-make ppa-upload
-
-# Or for specific distributions
-./build-and-upload-ppa.sh noble plucky
+# Check OBS build status
+make obs-status
 ```
 
-For detailed information about building and uploading to PPA, see [docs/PPA_UPLOAD.md](docs/PPA_UPLOAD.md).
+For detailed information about building and uploading to OBS, see [docs/OBS_SETUP.md](docs/OBS_SETUP.md).
 
 ---
 

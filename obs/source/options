@@ -1,0 +1,22 @@
+# Exclude development and CI files from source package
+extend-diff-ignore = "^(.github/|.gitignore|Dockerfile.*|build-and-upload-obs.sh|tests/|docs/|pytest.ini|Makefile|README.md)"
+
+# Files to exclude from tarball
+tar-ignore = .git
+tar-ignore = .github
+tar-ignore = tests
+tar-ignore = docs
+tar-ignore = *.pyc
+tar-ignore = __pycache__
+tar-ignore = .pytest_cache
+tar-ignore = .mypy_cache
+tar-ignore = *.egg-info
+tar-ignore = build
+tar-ignore = dist
+tar-ignore = Dockerfile*
+tar-ignore = docker-compose*
+tar-ignore = docker
+tar-ignore = Makefile
+tar-ignore = pytest.ini
+tar-ignore = .gitignore
+tar-ignore = .ruff_cache

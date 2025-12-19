@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.10.5
+Version:        0.11.0
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        MIT
@@ -61,6 +61,8 @@ Features:
  * One-command deployments
  * AI-powered security monitoring
  * Backup and rollback system
+ * Web dashboard for remote management (optional)
+ * REST API with token-based authentication
 
 %prep
 %autosetup -n wasm-%{version}
@@ -117,6 +119,17 @@ echo "Note: You may need to install python3-inquirer via pip:"
 echo "  pip3 install inquirer"
 
 %changelog
+* Thu Dec 19 2024 Perkybeet <yago.lopez.adeje@gmail.com> - 0.11.0-1
+- New feature: Web Interface Dashboard (wasm web start/stop/status)
+- REST API for remote application management
+- Real-time WebSocket updates for logs and events
+- Token-based authentication with JWT
+- Rate limiting and brute force protection
+- API endpoints: /api/apps, /api/services, /api/sites, /api/certs
+- API endpoints: /api/backups, /api/monitor, /api/system, /api/config
+- Background job processing with progress tracking
+- Optional dependencies: pip install wasm-cli[web]
+
 * Thu Dec 19 2024 Perkybeet <yago.lopez.adeje@gmail.com> - 0.10.5-1
 - Detect OOM (Out of Memory) build failures with exit code 137
 - Provide actionable suggestions for resolving memory issues

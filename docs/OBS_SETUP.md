@@ -4,14 +4,11 @@ This guide explains how to build and distribute WASM packages via the Open Build
 
 ## Why OBS?
 
-| Feature | Launchpad PPA | Open Build Service |
-|---------|---------------|-------------------|
-| Distributions | Ubuntu only | Ubuntu, Debian, Fedora, openSUSE, Arch, Mageia, etc. |
-| Package formats | .deb | .deb, .rpm, AppImage, Snap |
-| Build triggers | Manual script | Automatic from Git webhooks |
-| Repository hosting | Automatic | Automatic + custom repos |
-| CI/CD integration | Limited | Built-in |
-| Cost | Free | Free (build.opensuse.org) |
+- **Multi-distribution**: Build for Ubuntu, Debian, Fedora, openSUSE, Arch, Mageia, etc. from a single source
+- **Multi-format**: Generate .deb, .rpm, and other package formats automatically
+- **Automatic builds**: Git webhooks can trigger rebuilds automatically
+- **Free hosting**: Repository hosting included at build.opensuse.org
+- **CI/CD ready**: Built-in continuous integration
 
 ## Quick Start
 
@@ -254,13 +251,22 @@ wasm/
 ├── rpm/
 │   └── wasm.spec               # RPM package specification
 ├── obs/
-│   └── _service                # OBS service configuration
-├── debian/                     # Keep for PPA (unchanged)
-│   ├── control
-│   ├── rules
-│   └── ...
-├── build-and-upload-obs.sh     # Upload to OBS
-└── build-and-upload-ppa.sh     # Upload to PPA (unchanged)
+│   ├── _service                # OBS service configuration (optional)
+│   ├── debian.changelog        # Debian changelog
+│   ├── debian.control          # Debian package metadata
+│   ├── debian.rules            # Debian build rules
+│   ├── debian.postinst         # Post-install script
+│   ├── debian.postrm           # Post-remove script
+│   ├── debian.copyright        # License info
+│   ├── wasm.dsc                # Debian source control
+│   ├── wasm.1                  # Man page
+│   ├── wasm.default.yaml       # Default config
+│   ├── wasm.dirs               # Directories to create
+│   ├── wasm.manpages           # Man pages list
+│   └── source/
+│       ├── format              # Source format
+│       └── options             # Build options
+└── build-and-upload-obs.sh     # Upload to OBS
 ```
 
 ## Differences: .deb vs .rpm Packaging
@@ -316,18 +322,19 @@ For Python packages not in distribution repos, you may need to:
 1. **Version Tags**: Use Git tags (`v0.9.1`) for releases, OBS can auto-detect
 2. **Test Locally**: Use `osc build` to test before uploading
 3. **Watch First Build**: Monitor first build of each distro carefully
-4. **Update Changelog**: Keep `.spec` changelog updated
-5. **Parallel PPA**: Keep PPA for Ubuntu users familiar with it
+4. **Update Changelog**: Keep `.spec` and `debian.changelog` updated
+5. **Sync Versions**: Keep version numbers consistent across all package files
 
-## Comparison: PPA vs OBS Workflow
+## Workflow Summary
 
-| Task | Launchpad PPA | Open Build Service |
-|------|---------------|-------------------|
-| Upload | `./build-and-upload-ppa.sh` | `./build-and-upload-obs.sh` |
-| Per-distro versions | Manual changelog edits | Automatic |
-| Build time | 5-30 min per series | 10-60 min total |
-| User install | `apt install` | `dnf/zypper/apt install` |
-| Monitoring | Email notifications | Web UI + CLI |
+## Workflow Summary
+
+| Task | Command |
+|------|---------|  
+| Upload to OBS | `./build-and-upload-obs.sh` or `make obs-upload` |
+| Check status | `make obs-status` or `osc results home:Perkybeet wasm` |
+| View logs | `make obs-logs DISTRO=Fedora_40 ARCH=x86_64` |
+| Watch builds | `make obs-status-watch` |
 
 ## Next Steps
 

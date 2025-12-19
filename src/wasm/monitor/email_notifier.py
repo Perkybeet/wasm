@@ -83,6 +83,8 @@ class EmailNotifier:
         """
         self.logger = Logger(verbose=verbose)
         self.config = Config()
+        # Always reload config to get latest values
+        self.config.reload()
         
         if smtp_config:
             self.smtp_config = smtp_config

@@ -4,7 +4,7 @@ WASM - Web App System Management
 A robust CLI tool for deploying and managing web applications on Linux servers.
 """
 
-__version__ = "0.10.5"
+__version__ = "0.11.0"
 __author__ = "WASM Team"
 __license__ = "MIT"
 

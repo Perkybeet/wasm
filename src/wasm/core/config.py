@@ -74,6 +74,18 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         },
         "email_recipients": [],
     },
+    "web": {
+        "enabled": False,
+        "host": "127.0.0.1",
+        "port": 8080,
+        "rate_limit_enabled": True,
+        "rate_limit_requests": 100,
+        "rate_limit_window": 60,
+        "max_failed_attempts": 5,
+        "lockout_duration": 300,
+        "token_expiration_hours": 24,
+        "ip_whitelist": [],
+    },
 }
 
 
@@ -186,6 +198,25 @@ class Config:
     def webserver(self) -> str:
         """Get the default web server."""
         return self.get("webserver", "nginx")
+    
+    def reload(self) -> None:
+        """
+        Reload configuration from disk.
+        
+        Use this after configuration changes to ensure
+        the latest values are loaded.
+        """
+        self._load_config()
+    
+    @classmethod
+    def reset_instance(cls) -> None:
+        """
+        Reset the singleton instance.
+        
+        Forces a fresh config load on next access.
+        """
+        cls._instance = None
+        cls._config = {}
     
     @property
     def service_user(self) -> str:

@@ -13,10 +13,9 @@ help:
 	@echo "  make format            Format code"
 	@echo ""
 	@echo "Packaging:"
-	@echo "  make debian            Build Debian package"
-	@echo "  make ppa-upload        Build and upload to PPA (all distributions)"
 	@echo "  make obs-upload        Build and upload to OBS (all distributions)"
 	@echo "  make obs-status        Check OBS build status"
+	@echo "  make obs-logs          View OBS build logs"
 	@echo ""
 
 install:
@@ -55,23 +54,6 @@ format:
 	black src/wasm tests
 	isort src/wasm tests
 	ruff check --fix src/wasm tests
-
-debian: clean
-	dpkg-buildpackage -us -uc -b
-	@echo "Debian package built in parent directory"
-
-debian-source: clean
-	dpkg-buildpackage -us -uc -S
-	@echo "Source package built in parent directory"
-
-ppa-upload: 
-	@echo "Building and uploading packages to PPA..."
-	./build-and-upload-ppa.sh
-
-ppa-upload-custom:
-	@echo "Building and uploading packages to PPA for custom distributions..."
-	@echo "Usage: make ppa-upload-custom DISTS='noble plucky'"
-	./build-and-upload-ppa.sh $(DISTS)
 
 # OBS (Open Build Service) targets
 obs-upload:

@@ -26,7 +26,8 @@ class MonitorConfig:
     """Process monitor configuration."""
     
     enabled: bool = False
-    scan_interval: int = 3600  # 1 hour in seconds
+    scan_interval: int = 30  # Local scan every 30 seconds (was 3600)
+    ai_interval: int = 3600  # AI analysis every hour
     cpu_threshold: float = 80.0
     memory_threshold: float = 80.0
     auto_terminate: bool = True
@@ -77,7 +78,8 @@ class ProcessMonitor:
         """Load monitor configuration from global config."""
         return MonitorConfig(
             enabled=self.global_config.get("monitor.enabled", False),
-            scan_interval=self.global_config.get("monitor.scan_interval", 3600),
+            scan_interval=self.global_config.get("monitor.scan_interval", 30),
+            ai_interval=self.global_config.get("monitor.ai_interval", 3600),
             cpu_threshold=self.global_config.get("monitor.cpu_threshold", 80.0),
             memory_threshold=self.global_config.get("monitor.memory_threshold", 80.0),
             auto_terminate=self.global_config.get("monitor.auto_terminate", True),
@@ -497,10 +499,18 @@ class ProcessMonitor:
             action_taken="; ".join(actions_taken) if actions_taken else None,
         )
     
-    def scan_once(self) -> List[ThreatReport]:
+    def scan_once(
+        self,
+        force_ai: bool = False,
+        analyze_all: bool = False,
+    ) -> List[ThreatReport]:
         """
         Perform a single scan for threats.
         
+        Args:
+            force_ai: Force AI analysis even if no suspicious processes found locally.
+            analyze_all: Analyze ALL processes with AI (expensive).
+            
         Returns:
             List of threat reports.
         """
@@ -514,6 +524,8 @@ class ProcessMonitor:
         results = self.analyzer.analyze_processes(
             processes,
             use_ai=self.config.use_ai,
+            force_ai=force_ai,
+            analyze_all=analyze_all,
         )
         
         if not results:
@@ -607,21 +619,61 @@ class ProcessMonitor:
         """
         Run the monitor continuously.
         
-        Scans at the configured interval until stopped.
+        Performs local pattern-matching scans every scan_interval seconds (default 30s),
+        and full AI analysis every ai_interval seconds (default 3600s = 1 hour).
         """
         self._running = True
+        
+        scan_interval = self.config.scan_interval
+        ai_interval = self.config.ai_interval
+        
         self.logger.info(
-            f"Starting process monitor (interval: {self.config.scan_interval}s)"
+            f"Starting process monitor (local scan: {scan_interval}s, AI: {ai_interval}s)"
         )
+        
+        # Track time since last AI analysis
+        time_since_ai = 0
         
         while self._running:
             try:
-                self.scan_once()
+                # Determine if we should use AI this scan
+                use_ai_this_scan = time_since_ai >= ai_interval
+                
+                if use_ai_this_scan:
+                    self.logger.info("Running full scan with AI analysis...")
+                    self.scan_once(force_ai=False, analyze_all=False)
+                    time_since_ai = 0
+                else:
+                    # Local pattern matching only (quick scan)
+                    self.logger.debug("Running quick local scan...")
+                    
+                    # Get processes and do quick pattern check
+                    processes = self._get_processes()
+                    
+                    # Only do pattern matching, no AI
+                    threats = []
+                    for process in processes:
+                        quick_result = self.analyzer._quick_check(process)
+                        if quick_result:
+                            threats.append(quick_result)
+                    
+                    if threats:
+                        self.logger.warning(
+                            f"Quick scan found {len(threats)} potential threats - "
+                            "triggering full AI scan"
+                        )
+                        # Trigger immediate AI scan
+                        self.scan_once(force_ai=True, analyze_all=False)
+                        time_since_ai = 0
+                    else:
+                        self.logger.debug("Quick scan: No threats detected")
+                        time_since_ai += scan_interval
+                        
             except Exception as e:
                 self.logger.error(f"Scan error: {e}")
             
             # Wait for next scan
-            for _ in range(self.config.scan_interval):
+            for _ in range(scan_interval):
                 if not self._running:
                     break
                 time.sleep(1)
@@ -654,7 +706,7 @@ class ProcessMonitor:
 
 [Unit]
 Description=WASM AI-Powered Process Monitor
-Documentation=https://github.com/your-org/wasm
+Documentation=https://github.com/Perkybeet/wasm
 After=network.target
 
 [Service]
@@ -756,6 +808,78 @@ WantedBy=multi-user.target
                 details=str(e),
             )
     
+    def start_service(self) -> bool:
+        """
+        Start the monitor service (without enabling on boot).
+        
+        Returns:
+            True if started successfully.
+        """
+        import subprocess
+        try:
+            # Use subprocess directly for reliability
+            result = subprocess.run(
+                ["systemctl", "start", self.SERVICE_NAME],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            if result.returncode == 0:
+                self.logger.success("Monitor service started")
+                return True
+            else:
+                raise MonitorError(
+                    "Failed to start monitor service",
+                    details=result.stderr or result.stdout,
+                )
+        except subprocess.TimeoutExpired:
+            raise MonitorError(
+                "Failed to start monitor service",
+                details="Command timed out",
+            )
+        except Exception as e:
+            raise MonitorError(
+                "Failed to start monitor service",
+                details=str(e),
+            )
+    
+    def stop_service(self) -> bool:
+        """
+        Stop the monitor service (without disabling on boot).
+        
+        Returns:
+            True if stopped successfully.
+        """
+        import subprocess
+        try:
+            # Use subprocess directly for reliability
+            result = subprocess.run(
+                ["systemctl", "stop", self.SERVICE_NAME],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            if result.returncode == 0:
+                self.logger.success("Monitor service stopped")
+                return True
+            else:
+                raise MonitorError(
+                    "Failed to stop monitor service",
+                    details=result.stderr or result.stdout,
+                )
+        except subprocess.TimeoutExpired:
+            raise MonitorError(
+                "Failed to stop monitor service",
+                details="Command timed out",
+            )
+        except Exception as e:
+            raise MonitorError(
+                "Failed to stop monitor service",
+                details=str(e),
+            )
+    
     def uninstall_service(self) -> bool:
         """
         Uninstall the monitor service.
@@ -806,31 +930,77 @@ WantedBy=multi-user.target
         if not status["installed"]:
             return status
         
-        # Check if enabled
-        result = run_command([
-            "systemctl", "is-enabled", self.SERVICE_NAME
-        ])
-        status["enabled"] = result.success and "enabled" in result.stdout
+        # Check if enabled - use subprocess directly for reliability
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["systemctl", "is-enabled", self.SERVICE_NAME],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            enabled_status = result.stdout.strip().lower()
+            status["enabled"] = enabled_status == "enabled"
+        except Exception:
+            pass
         
         # Check if active
-        result = run_command([
-            "systemctl", "is-active", self.SERVICE_NAME
-        ])
-        status["active"] = result.success and "active" in result.stdout
+        try:
+            result = subprocess.run(
+                ["systemctl", "is-active", self.SERVICE_NAME],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            active_status = result.stdout.strip().lower()
+            status["active"] = active_status in ("active", "activating")
+        except Exception:
+            pass
         
-        # Get detailed status
-        result = run_command([
-            "systemctl", "show", self.SERVICE_NAME,
-            "--property=MainPID,ActiveEnterTimestamp"
-        ])
+        # Get detailed status for PID and uptime
+        try:
+            result = subprocess.run(
+                ["systemctl", "show", self.SERVICE_NAME,
+                 "--property=MainPID,ActiveEnterTimestamp,ActiveState"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            
+            if result.returncode == 0:
+                for line in result.stdout.strip().split('\n'):
+                    if '=' not in line:
+                        continue
+                    key, value = line.split('=', 1)
+                    value = value.strip()
+                    
+                    if key == "MainPID" and value and value != "0":
+                        try:
+                            status["pid"] = int(value)
+                        except ValueError:
+                            pass
+                    elif key == "ActiveEnterTimestamp" and value:
+                        status["uptime"] = value
+                    elif key == "ActiveState":
+                        # Double-check active state
+                        if value.lower() in ("active", "activating"):
+                            status["active"] = True
+        except Exception:
+            pass
         
-        if result.success:
-            for line in result.stdout.strip().split('\n'):
-                if line.startswith("MainPID="):
-                    pid = line.split("=")[1]
-                    if pid and pid != "0":
-                        status["pid"] = int(pid)
-                elif line.startswith("ActiveEnterTimestamp="):
-                    status["uptime"] = line.split("=", 1)[1]
+        # As a final fallback, check if the process is actually running
+        if not status["pid"] and status["active"]:
+            try:
+                import psutil
+                for proc in psutil.process_iter(['pid', 'cmdline']):
+                    try:
+                        cmdline = proc.info.get('cmdline') or []
+                        if cmdline and 'wasm' in ' '.join(cmdline) and 'monitor' in ' '.join(cmdline) and 'run' in ' '.join(cmdline):
+                            status["pid"] = proc.info['pid']
+                            break
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+            except ImportError:
+                pass
         
         return status

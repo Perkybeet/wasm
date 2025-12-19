@@ -41,7 +41,7 @@ Examples:
   wasm service status myapp
   wasm cert create -d example.com
 
-For more information, visit: https://github.com/your-org/wasm
+For more information, visit: https://github.com/Perkybeet/wasm
         """,
     )
     
@@ -98,6 +98,9 @@ For more information, visit: https://github.com/your-org/wasm
     
     # Rollback command
     _add_rollback_parser(subparsers)
+    
+    # Web interface commands
+    _add_web_parser(subparsers)
     
     return parser
 
@@ -673,6 +676,16 @@ def _add_monitor_parser(subparsers) -> None:
         action="store_true",
         help="Don't terminate processes, just report",
     )
+    scan.add_argument(
+        "--force-ai",
+        action="store_true",
+        help="Force AI analysis even if no suspicious processes are found",
+    )
+    scan.add_argument(
+        "--all",
+        action="store_true",
+        help="Analyze ALL processes with AI (expensive, use sparingly)",
+    )
     
     # monitor run
     monitor_sub.add_parser(
@@ -978,6 +991,89 @@ def _add_rollback_parser(subparsers) -> None:
         "--no-rebuild",
         action="store_true",
         help="Don't rebuild after restore",
+    )
+
+
+def _add_web_parser(subparsers) -> None:
+    """Add web interface commands."""
+    web = subparsers.add_parser(
+        "web",
+        help="Web dashboard interface",
+        description="Start, stop, and manage the WASM web dashboard",
+    )
+    
+    web_sub = web.add_subparsers(
+        dest="action",
+        title="actions",
+        description="Web interface actions",
+        metavar="<action>",
+    )
+    
+    # web start
+    start = web_sub.add_parser(
+        "start",
+        help="Start the web dashboard server",
+    )
+    start.add_argument(
+        "--host", "-H",
+        default="127.0.0.1",
+        help="Host to bind to (default: 127.0.0.1, use 0.0.0.0 for all interfaces)",
+    )
+    start.add_argument(
+        "--port", "-p",
+        type=int,
+        default=8080,
+        help="Port to listen on (default: 8080)",
+    )
+    start.add_argument(
+        "--daemon", "-d",
+        action="store_true",
+        help="Run in background as daemon",
+    )
+    
+    # web stop
+    web_sub.add_parser(
+        "stop",
+        help="Stop the web dashboard server",
+    )
+    
+    # web status
+    web_sub.add_parser(
+        "status",
+        help="Show web dashboard status",
+    )
+    
+    # web restart
+    restart = web_sub.add_parser(
+        "restart",
+        help="Restart the web dashboard server",
+    )
+    restart.add_argument(
+        "--host", "-H",
+        default="127.0.0.1",
+        help="Host to bind to",
+    )
+    restart.add_argument(
+        "--port", "-p",
+        type=int,
+        default=8080,
+        help="Port to listen on",
+    )
+    restart.add_argument(
+        "--daemon", "-d",
+        action="store_true",
+        help="Run in background as daemon",
+    )
+    
+    # web token
+    token = web_sub.add_parser(
+        "token",
+        help="Manage access tokens",
+    )
+    token.add_argument(
+        "--regenerate", "-r",
+        action="store_true",
+        help="Generate a new access token (revokes all sessions)",
     )
 
 

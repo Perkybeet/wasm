@@ -4,7 +4,7 @@
 .\" Copyright (C) 2024-2025 Yago López Prado
 .\" Licensed under MIT License
 .\"
-.TH WASM 1 "December 2025" "WASM 0.10.0" "User Commands"
+.TH WASM 1 "December 2025" "WASM 0.11.0" "User Commands"
 .\"
 .\" ===== NAME =====
 .\"
@@ -454,6 +454,68 @@ Stop the monitoring daemon.
 .BR "monitor analyze"
 Run an immediate security analysis.
 .\"
+.\" --- WEB INTERFACE COMMANDS ---
+.\"
+.SS "Web Interface Commands"
+Commands for the web-based management dashboard.
+.PP
+The web interface provides a graphical dashboard for managing all WASM
+functionality through a REST API. Requires optional dependencies:
+\fBpip install wasm-cli[web]\fR
+.TP
+.BR "web start"
+Start the web interface server.
+.RS
+.TP
+.BR \-\-host " \fIHOST\fR"
+Host/IP to bind to (default: 127.0.0.1). Use 0.0.0.0 to expose to network.
+.TP
+.BR \-\-port " \fIPORT\fR"
+Port to listen on (default: 8080).
+.TP
+.BR \-\-daemon ", " \-d
+Run in background (daemonize).
+.RE
+.TP
+.BR "web stop"
+Stop the running web interface server.
+.TP
+.BR "web status"
+Show current web interface status (running/stopped, PID, memory usage).
+.TP
+.BR "web restart"
+Restart the web interface server.
+.TP
+.BR "web token"
+Manage API access tokens.
+.RS
+.TP
+.BR \-\-regenerate
+Generate a new access token (revokes all existing sessions).
+.RE
+.PP
+.B API Endpoints:
+.RS
+.IP \(bu 3
+\fB/api/apps\fR \- Application management (list, create, update, delete)
+.IP \(bu 3
+\fB/api/services\fR \- Systemd service control
+.IP \(bu 3
+\fB/api/sites\fR \- Web server site configuration
+.IP \(bu 3
+\fB/api/certs\fR \- SSL certificate management
+.IP \(bu 3
+\fB/api/backups\fR \- Backup and restore operations
+.IP \(bu 3
+\fB/api/monitor\fR \- Security monitoring status
+.IP \(bu 3
+\fB/api/system\fR \- System information and health
+.IP \(bu 3
+\fB/api/config\fR \- WASM configuration
+.IP \(bu 3
+\fB/api/auth\fR \- Authentication and token management
+.RE
+.\"
 .\" ===== CONFIGURATION =====
 .\"
 .SH CONFIGURATION
@@ -678,6 +740,32 @@ wasm setup ssh
 wasm --interactive
 .fi
 .RE
+.SS "Web Interface"
+.PP
+.RS
+.nf
+# Install web dependencies
+pip install wasm-cli[web]
+
+# Start web dashboard (foreground)
+wasm web start --host 127.0.0.1 --port 8080
+
+# Start in background (daemon mode)
+sudo wasm web start --daemon
+
+# Check status
+wasm web status
+
+# Get/regenerate access token
+wasm web token --regenerate
+
+# Stop the server
+wasm web stop
+
+# Access the dashboard at http://localhost:8080
+# Use the access token shown at startup for authentication
+.fi
+.RE
 .\"
 .\" ===== EXIT STATUS =====
 .\"
@@ -828,11 +916,12 @@ Licensed under the MIT License.
 .PP
 Full documentation: https://github.com/Perkybeet/wasm
 .PP
-PPA installation:
+OBS installation:
 .RS
 .nf
-sudo add-apt-repository ppa:yago2003/wasm
-sudo apt update
-sudo apt install wasm
+# Ubuntu/Debian
+curl -fsSL https://download.opensuse.org/repositories/home:Perkybeet/xUbuntu_24.04/Release.key | sudo gpg --dearmor -o /usr/share/keyrings/wasm.gpg
+echo "deb [signed-by=/usr/share/keyrings/wasm.gpg] https://download.opensuse.org/repositories/home:Perkybeet/xUbuntu_24.04/ /" | sudo tee /etc/apt/sources.list.d/wasm.list
+sudo apt update && sudo apt install wasm
 .fi
 .RE

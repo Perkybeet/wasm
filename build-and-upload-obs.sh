@@ -51,8 +51,8 @@ if [ ! -f ~/.oscrc ]; then
     exit 1
 fi
 
-# Get version
-VERSION=$(head -n 1 debian/changelog | sed 's/.*(\(.*\)).*/\1/' | cut -d'~' -f1)
+# Get version from obs/debian.changelog
+VERSION=$(head -n 1 obs/debian.changelog | sed 's/.*(\(.*\)).*/\1/' | cut -d'-' -f1)
 log_info "Building version: $VERSION"
 
 # Create tarball
@@ -78,16 +78,36 @@ cd "$OBS_PROJECT/$OBS_PACKAGE"
 
 # Copy files
 log_info "Copying package files..."
-cp "$OLDPWD/../$TARBALL" .
-cp "$OLDPWD/rpm/wasm.spec" .
-cp "$OLDPWD/obs/_service" .
+SCRIPT_DIR="$OLDPWD"
+cp "$SCRIPT_DIR/../$TARBALL" .
+cp "$SCRIPT_DIR/rpm/wasm.spec" .
 
-# Update version in spec file
-log_info "Updating version in spec file..."
+# Copy Debian packaging files from obs/
+log_info "Copying Debian packaging files..."
+cp "$SCRIPT_DIR/obs/debian.changelog" .
+cp "$SCRIPT_DIR/obs/debian.control" .
+cp "$SCRIPT_DIR/obs/debian.rules" .
+cp "$SCRIPT_DIR/obs/debian.copyright" .
+cp "$SCRIPT_DIR/obs/debian.postinst" .
+cp "$SCRIPT_DIR/obs/debian.postrm" .
+cp "$SCRIPT_DIR/obs/wasm.dsc" .
+cp "$SCRIPT_DIR/obs/wasm.1" .
+cp "$SCRIPT_DIR/obs/wasm.default.yaml" .
+cp "$SCRIPT_DIR/obs/wasm.dirs" .
+cp "$SCRIPT_DIR/obs/wasm.manpages" .
+
+# Copy _service if exists
+if [ -f "$SCRIPT_DIR/obs/_service" ]; then
+    cp "$SCRIPT_DIR/obs/_service" .
+fi
+
+# Update version in spec file and dsc file
+log_info "Updating version in spec and dsc files..."
 sed -i "s/^Version:.*/Version:        $VERSION/" wasm.spec
+sed -i "s/^Version:.*/Version: $VERSION/" wasm.dsc
 
 # Add all files
-osc add "$TARBALL" wasm.spec _service 2>/dev/null || true
+osc addremove 2>/dev/null || true
 
 # Show changes
 log_info "Changes to be committed:"
@@ -109,7 +129,7 @@ echo "Or watch live:"
 echo "  watch -n 10 \"osc results $OBS_PROJECT $OBS_PACKAGE\""
 
 # Cleanup
-cd "$OLDPWD"
+cd "$SCRIPT_DIR"
 rm -rf "$TMP_DIR"
 rm "../$TARBALL"
 

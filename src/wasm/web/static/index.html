@@ -1,0 +1,1470 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WASM - Web Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <link rel="stylesheet" href="/static/css/main.css">
+</head>
+<body class="min-h-screen">
+    <!-- Check authentication -->
+    <script>
+        if (!localStorage.getItem('wasm_session')) {
+            window.location.href = '/login';
+        }
+    </script>
+    
+    <div id="app" class="flex h-screen">
+        <!-- Sidebar -->
+        <aside class="sidebar w-64 flex flex-col">
+            <!-- Logo -->
+            <div class="p-6 border-b border-slate-700">
+                <h1 class="text-2xl font-bold flex items-center gap-2">
+                    <img src="/static/logo.webp" alt="WASM" class="w-10 h-10"> WASM
+                </h1>
+                <p class="text-sm text-slate-400 mt-1">Web Dashboard</p>
+            </div>
+            
+            <!-- Navigation -->
+            <nav class="flex-1 p-4">
+                <ul class="space-y-2">
+                    <li>
+                        <a href="#dashboard" class="nav-item active flex items-center gap-3 px-4 py-3 rounded-lg" data-page="dashboard">
+                            <i class="fas fa-home w-5"></i>
+                            <span>Dashboard</span>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="#apps" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="apps">
+                            <i class="fas fa-cube w-5"></i>
+                            <span>Applications</span>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="#services" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="services">
+                            <i class="fas fa-cogs w-5"></i>
+                            <span>Services</span>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="#sites" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="sites">
+                            <i class="fas fa-globe w-5"></i>
+                            <span>Sites</span>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="#certificates" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="certificates">
+                            <i class="fas fa-shield-alt w-5"></i>
+                            <span>Certificates</span>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="#monitor" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="monitor">
+                            <i class="fas fa-heartbeat w-5"></i>
+                            <span>Monitor</span>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="#logs" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="logs">
+                            <i class="fas fa-terminal w-5"></i>
+                            <span>Logs</span>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="#jobs" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="jobs">
+                            <i class="fas fa-tasks w-5"></i>
+                            <span>Jobs</span>
+                            <span id="active-jobs-badge" class="hidden ml-auto bg-indigo-500 text-white text-xs px-2 py-0.5 rounded-full">0</span>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="#backups" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="backups">
+                            <i class="fas fa-archive w-5"></i>
+                            <span>Backups</span>
+                        </a>
+                    </li>
+                    <li>
+                        <a href="#config" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="config">
+                            <i class="fas fa-sliders-h w-5"></i>
+                            <span>Settings</span>
+                        </a>
+                    </li>
+                </ul>
+            </nav>
+            
+            <!-- Footer -->
+            <div class="p-4 border-t border-slate-700">
+                <button onclick="logout()" class="flex items-center gap-3 px-4 py-3 rounded-lg text-slate-400 hover:text-white hover:bg-slate-700 w-full">
+                    <i class="fas fa-sign-out-alt w-5"></i>
+                    <span>Logout</span>
+                </button>
+            </div>
+        </aside>
+        
+        <!-- Main Content -->
+        <main class="flex-1 overflow-auto">
+            <!-- Header -->
+            <header class="bg-slate-800/50 border-b border-slate-700 px-6 py-4 flex items-center justify-between sticky top-0 z-10 backdrop-blur">
+                <h2 id="page-title" class="text-xl font-semibold">Dashboard</h2>
+                <div class="flex items-center gap-4">
+                    <div id="connection-status" class="flex items-center gap-2 text-sm">
+                        <span class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
+                        <span class="text-slate-400">Connected</span>
+                    </div>
+                    <button onclick="refreshData()" class="p-2 rounded-lg hover:bg-slate-700" title="Refresh">
+                        <i class="fas fa-sync-alt"></i>
+                    </button>
+                </div>
+            </header>
+            
+            <!-- Content Area -->
+            <div id="content" class="p-6">
+                <!-- Dashboard Page -->
+                <div id="page-dashboard" class="page">
+                    <!-- System Metrics -->
+                    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+                        <div class="metric-card card p-6">
+                            <div class="flex items-center justify-between mb-4">
+                                <span class="text-slate-400">CPU Usage</span>
+                                <i class="fas fa-microchip text-indigo-400"></i>
+                            </div>
+                            <div class="text-3xl font-bold" id="cpu-value">--</div>
+                            <div class="mt-2 h-2 bg-slate-700 rounded-full overflow-hidden">
+                                <div id="cpu-bar" class="progress-bar h-full bg-indigo-500 rounded-full" style="width: 0%"></div>
+                            </div>
+                        </div>
+                        
+                        <div class="metric-card card p-6">
+                            <div class="flex items-center justify-between mb-4">
+                                <span class="text-slate-400">Memory</span>
+                                <i class="fas fa-memory text-green-400"></i>
+                            </div>
+                            <div class="text-3xl font-bold" id="memory-value">--</div>
+                            <div class="mt-2 h-2 bg-slate-700 rounded-full overflow-hidden">
+                                <div id="memory-bar" class="progress-bar h-full bg-green-500 rounded-full" style="width: 0%"></div>
+                            </div>
+                        </div>
+                        
+                        <div class="metric-card card p-6">
+                            <div class="flex items-center justify-between mb-4">
+                                <span class="text-slate-400">Disk Usage</span>
+                                <i class="fas fa-hdd text-yellow-400"></i>
+                            </div>
+                            <div class="text-3xl font-bold" id="disk-value">--</div>
+                            <div class="mt-2 h-2 bg-slate-700 rounded-full overflow-hidden">
+                                <div id="disk-bar" class="progress-bar h-full bg-yellow-500 rounded-full" style="width: 0%"></div>
+                            </div>
+                        </div>
+                        
+                        <div class="metric-card card p-6">
+                            <div class="flex items-center justify-between mb-4">
+                                <span class="text-slate-400">Load Average</span>
+                                <i class="fas fa-chart-line text-purple-400"></i>
+                            </div>
+                            <div class="text-3xl font-bold" id="load-value">--</div>
+                            <div class="mt-2 text-sm text-slate-400" id="load-detail">--</div>
+                        </div>
+                    </div>
+                    
+                    <!-- Apps Overview -->
+                    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                        <div class="card p-6">
+                            <div class="flex items-center justify-between mb-4">
+                                <h3 class="text-lg font-semibold">Applications</h3>
+                                <a href="#apps" class="text-indigo-400 hover:text-indigo-300 text-sm">View All →</a>
+                            </div>
+                            <div id="apps-overview" class="space-y-3">
+                                <div class="text-slate-400 text-center py-4">Loading...</div>
+                            </div>
+                        </div>
+                        
+                        <div class="card p-6">
+                            <div class="flex items-center justify-between mb-4">
+                                <h3 class="text-lg font-semibold">System Info</h3>
+                            </div>
+                            <div id="system-info" class="space-y-3">
+                                <div class="text-slate-400 text-center py-4">Loading...</div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Jobs and Monitor Widgets -->
+                    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-6">
+                        <!-- Recent Jobs Widget -->
+                        <div class="card p-6">
+                            <div class="flex items-center justify-between mb-4">
+                                <h3 class="text-lg font-semibold flex items-center gap-2">
+                                    <i class="fas fa-tasks text-indigo-400"></i>
+                                    Recent Jobs
+                                </h3>
+                                <a href="#jobs" class="text-indigo-400 hover:text-indigo-300 text-sm">View All →</a>
+                            </div>
+                            <div id="jobs-overview" class="space-y-3">
+                                <div class="text-slate-400 text-center py-4">Loading...</div>
+                            </div>
+                        </div>
+                        
+                        <!-- Top Processes Widget -->
+                        <div class="card p-6">
+                            <div class="flex items-center justify-between mb-4">
+                                <h3 class="text-lg font-semibold flex items-center gap-2">
+                                    <i class="fas fa-server text-yellow-400"></i>
+                                    Top Processes
+                                </h3>
+                                <a href="#monitor" class="text-indigo-400 hover:text-indigo-300 text-sm">View All →</a>
+                            </div>
+                            <div id="processes-overview" class="space-y-2">
+                                <div class="text-slate-400 text-center py-4">Loading...</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Apps Page -->
+                <div id="page-apps" class="page hidden">
+                    <div class="flex items-center justify-between mb-6">
+                        <h3 class="text-lg font-semibold">Deployed Applications</h3>
+                        <button onclick="showCreateAppModal()" class="btn-primary px-4 py-2 rounded-lg flex items-center gap-2">
+                            <i class="fas fa-plus"></i>
+                            <span>Deploy New</span>
+                        </button>
+                    </div>
+                    <div id="apps-list" class="space-y-4">
+                        <div class="text-slate-400 text-center py-8">Loading...</div>
+                    </div>
+                </div>
+                
+                <!-- Services Page -->
+                <div id="page-services" class="page hidden">
+                    <div class="flex items-center justify-between mb-6">
+                        <div class="flex items-center gap-4">
+                            <h3 class="text-lg font-semibold">System Services</h3>
+                            <label class="flex items-center gap-2 cursor-pointer text-sm">
+                                <input type="checkbox" id="services-wasm-only" checked class="w-4 h-4" onchange="window.servicesPage.load()">
+                                <span class="text-slate-400">WASM only</span>
+                            </label>
+                        </div>
+                        <button onclick="showCreateServiceModal()" class="btn-primary px-4 py-2 rounded-lg flex items-center gap-2">
+                            <i class="fas fa-plus"></i>
+                            <span>Create Service</span>
+                        </button>
+                    </div>
+                    <div id="services-list" class="space-y-4">
+                        <div class="text-slate-400 text-center py-8">Loading...</div>
+                    </div>
+                </div>
+                
+                <!-- Sites Page -->
+                <div id="page-sites" class="page hidden">
+                    <div class="flex items-center justify-between mb-6">
+                        <h3 class="text-lg font-semibold">Web Server Sites</h3>
+                        <div class="flex gap-2">
+                            <button onclick="showCreateSiteModal()" class="btn-primary px-4 py-2 rounded-lg flex items-center gap-2">
+                                <i class="fas fa-plus"></i>
+                                <span>New Site</span>
+                            </button>
+                            <button onclick="reloadWebserver()" class="bg-slate-700 px-4 py-2 rounded-lg flex items-center gap-2 hover:bg-slate-600">
+                                <i class="fas fa-sync-alt"></i>
+                                <span>Reload Server</span>
+                            </button>
+                        </div>
+                    </div>
+                    <div id="sites-list" class="space-y-4">
+                        <div class="text-slate-400 text-center py-8">Loading...</div>
+                    </div>
+                </div>
+                
+                <!-- Certificates Page -->
+                <div id="page-certificates" class="page hidden">
+                    <div class="flex items-center justify-between mb-6">
+                        <h3 class="text-lg font-semibold">SSL Certificates</h3>
+                        <div class="flex gap-2">
+                            <button onclick="showCreateCertModal()" class="btn-primary px-4 py-2 rounded-lg flex items-center gap-2">
+                                <i class="fas fa-plus"></i>
+                                <span>New Certificate</span>
+                            </button>
+                            <button onclick="renewAllCerts()" class="bg-slate-700 px-4 py-2 rounded-lg flex items-center gap-2 hover:bg-slate-600">
+                                <i class="fas fa-sync-alt"></i>
+                                <span>Renew All</span>
+                            </button>
+                        </div>
+                    </div>
+                    <div id="certs-list" class="space-y-4">
+                        <div class="text-slate-400 text-center py-8">Loading...</div>
+                    </div>
+                </div>
+                
+                <!-- Monitor Page -->
+                <div id="page-monitor" class="page hidden">
+                    <div class="flex items-center justify-between mb-6">
+                        <div>
+                            <h3 class="text-lg font-semibold">Process Monitor</h3>
+                            <p class="text-sm text-slate-400 mt-1">AI-powered security monitoring for malicious processes</p>
+                        </div>
+                        <div class="flex gap-2">
+                            <div class="relative group">
+                                <button onclick="runScan()" class="btn-primary px-4 py-2 rounded-lg flex items-center gap-2">
+                                    <i class="fas fa-search"></i>
+                                    <span>Run Scan</span>
+                                    <i class="fas fa-chevron-down text-xs ml-1"></i>
+                                </button>
+                                <!-- Dropdown menu -->
+                                <div class="absolute right-0 mt-1 w-56 bg-slate-800 rounded-lg shadow-lg border border-slate-700 hidden group-hover:block z-10">
+                                    <button onclick="runScan(false, false)" class="w-full text-left px-4 py-2 hover:bg-slate-700 rounded-t-lg flex items-center gap-2">
+                                        <i class="fas fa-search text-slate-400 w-4"></i>
+                                        <div>
+                                            <div class="text-sm">Quick Scan</div>
+                                            <div class="text-xs text-slate-400">Pattern matching only</div>
+                                        </div>
+                                    </button>
+                                    <button onclick="runScan(true, false)" class="w-full text-left px-4 py-2 hover:bg-slate-700 flex items-center gap-2">
+                                        <i class="fas fa-robot text-indigo-400 w-4"></i>
+                                        <div>
+                                            <div class="text-sm">Force AI Analysis</div>
+                                            <div class="text-xs text-slate-400">Send top processes to AI</div>
+                                        </div>
+                                    </button>
+                                    <button onclick="runScan(true, true)" class="w-full text-left px-4 py-2 hover:bg-slate-700 rounded-b-lg flex items-center gap-2 border-t border-slate-700">
+                                        <i class="fas fa-brain text-yellow-400 w-4"></i>
+                                        <div>
+                                            <div class="text-sm">Full AI Scan</div>
+                                            <div class="text-xs text-slate-400">Analyze all processes (slow)</div>
+                                        </div>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Service Status Card -->
+                    <div class="card p-6 mb-6">
+                        <h4 class="font-semibold mb-4 flex items-center gap-2">
+                            <i class="fas fa-server text-indigo-400"></i>
+                            Service Status
+                        </h4>
+                        <div id="monitor-status">
+                            <div class="text-slate-400 text-center py-4">Loading...</div>
+                        </div>
+                    </div>
+                    
+                    <div class="card p-6">
+                        <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-4">
+                            <h4 class="font-semibold flex items-center gap-2">
+                                <i class="fas fa-microchip text-yellow-400"></i>
+                                System Processes
+                            </h4>
+                            
+                            <!-- Process Controls -->
+                            <div class="flex flex-wrap items-center gap-3">
+                                <!-- Search -->
+                                <div class="relative">
+                                    <input type="text" id="process-search" 
+                                        placeholder="Filter processes..." 
+                                        class="bg-slate-700 border border-slate-600 rounded-lg px-3 py-1.5 text-sm w-40 focus:w-52 transition-all"
+                                        oninput="window.monitorPage.filterProcesses()">
+                                    <i class="fas fa-search absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 text-xs"></i>
+                                </div>
+                                
+                                <!-- Sort by dropdown -->
+                                <select id="process-sort" class="bg-slate-700 border border-slate-600 rounded-lg px-3 py-1.5 text-sm" onchange="window.monitorPage.loadProcesses()">
+                                    <option value="cpu">Sort by CPU</option>
+                                    <option value="memory">Sort by Memory</option>
+                                    <option value="name">Sort by Name</option>
+                                    <option value="pid">Sort by PID</option>
+                                </select>
+                                
+                                <!-- Limit dropdown -->
+                                <select id="process-limit" class="bg-slate-700 border border-slate-600 rounded-lg px-3 py-1.5 text-sm" onchange="window.monitorPage.loadProcesses()">
+                                    <option value="30">Show 30</option>
+                                    <option value="50">Show 50</option>
+                                    <option value="100" selected>Show 100</option>
+                                    <option value="200">Show 200</option>
+                                    <option value="500">Show All</option>
+                                </select>
+                                
+                                <!-- Column Toggle Button -->
+                                <div class="relative">
+                                    <button id="column-toggle-btn" class="bg-slate-700 border border-slate-600 rounded-lg px-3 py-1.5 text-sm flex items-center gap-2 hover:bg-slate-600" onclick="window.monitorPage.toggleColumnMenu()">
+                                        <i class="fas fa-columns"></i>
+                                        <span class="hidden sm:inline">Columns</span>
+                                    </button>
+                                    <!-- Column Menu -->
+                                    <div id="column-menu" class="hidden absolute right-0 mt-1 w-48 bg-slate-800 rounded-lg shadow-lg border border-slate-700 z-20 p-2">
+                                        <div class="text-xs text-slate-400 mb-2 px-2">Toggle Columns</div>
+                                        <label class="flex items-center gap-2 px-2 py-1 hover:bg-slate-700 rounded cursor-pointer">
+                                            <input type="checkbox" id="col-pid" checked onchange="window.monitorPage.updateColumns()" class="w-3.5 h-3.5">
+                                            <span class="text-sm">PID</span>
+                                        </label>
+                                        <label class="flex items-center gap-2 px-2 py-1 hover:bg-slate-700 rounded cursor-pointer">
+                                            <input type="checkbox" id="col-name" checked onchange="window.monitorPage.updateColumns()" class="w-3.5 h-3.5">
+                                            <span class="text-sm">Name</span>
+                                        </label>
+                                        <label class="flex items-center gap-2 px-2 py-1 hover:bg-slate-700 rounded cursor-pointer">
+                                            <input type="checkbox" id="col-cpu" checked onchange="window.monitorPage.updateColumns()" class="w-3.5 h-3.5">
+                                            <span class="text-sm">CPU %</span>
+                                        </label>
+                                        <label class="flex items-center gap-2 px-2 py-1 hover:bg-slate-700 rounded cursor-pointer">
+                                            <input type="checkbox" id="col-memory" checked onchange="window.monitorPage.updateColumns()" class="w-3.5 h-3.5">
+                                            <span class="text-sm">Memory %</span>
+                                        </label>
+                                        <label class="flex items-center gap-2 px-2 py-1 hover:bg-slate-700 rounded cursor-pointer">
+                                            <input type="checkbox" id="col-user" checked onchange="window.monitorPage.updateColumns()" class="w-3.5 h-3.5">
+                                            <span class="text-sm">User</span>
+                                        </label>
+                                        <label class="flex items-center gap-2 px-2 py-1 hover:bg-slate-700 rounded cursor-pointer">
+                                            <input type="checkbox" id="col-status" onchange="window.monitorPage.updateColumns()" class="w-3.5 h-3.5">
+                                            <span class="text-sm">Status</span>
+                                        </label>
+                                        <label class="flex items-center gap-2 px-2 py-1 hover:bg-slate-700 rounded cursor-pointer">
+                                            <input type="checkbox" id="col-command" onchange="window.monitorPage.updateColumns()" class="w-3.5 h-3.5">
+                                            <span class="text-sm">Command</span>
+                                        </label>
+                                    </div>
+                                </div>
+                                
+                                <!-- Show/Hide Inactive Toggle -->
+                                <label class="flex items-center gap-2 cursor-pointer text-sm">
+                                    <input type="checkbox" id="show-inactive" class="w-3.5 h-3.5" onchange="window.monitorPage.filterProcesses()">
+                                    <span class="text-slate-400">Show inactive</span>
+                                </label>
+                                
+                                <!-- Refresh Button -->
+                                <button onclick="window.monitorPage.loadProcesses()" class="bg-slate-700 border border-slate-600 rounded-lg px-3 py-1.5 text-sm hover:bg-slate-600" title="Refresh">
+                                    <i class="fas fa-sync-alt"></i>
+                                </button>
+                            </div>
+                        </div>
+                        <div id="processes-list" class="overflow-x-auto">
+                            <div class="text-slate-400 text-center py-4">Loading...</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Logs Page -->
+                <div id="page-logs" class="page hidden">
+                    <div class="flex items-center justify-between mb-6">
+                        <h3 class="text-lg font-semibold">Live Logs</h3>
+                        <div class="flex items-center gap-4">
+                            <select id="log-app-select" class="bg-slate-700 border border-slate-600 rounded-lg px-4 py-2" onchange="switchLogStream()">
+                                <option value="">Select Application...</option>
+                            </select>
+                            <button onclick="clearLogs()" class="bg-slate-700 px-4 py-2 rounded-lg hover:bg-slate-600">
+                                <i class="fas fa-trash"></i>
+                            </button>
+                        </div>
+                    </div>
+                    <div id="logs-container" class="card log-container h-[calc(100vh-250px)] overflow-auto p-4 rounded-lg">
+                        <div class="text-slate-500 text-center py-8">Select an application to view logs</div>
+                    </div>
+                </div>
+                
+                <!-- Jobs Page -->
+                <div id="page-jobs" class="page hidden">
+                    <div class="flex items-center justify-between mb-6">
+                        <h3 class="text-lg font-semibold">Background Jobs</h3>
+                        <div class="flex items-center gap-4">
+                            <select id="jobs-filter" class="bg-slate-700 border border-slate-600 rounded-lg px-4 py-2" onchange="filterJobs()">
+                                <option value="">All Jobs</option>
+                                <option value="running">Running</option>
+                                <option value="pending">Pending</option>
+                                <option value="completed">Completed</option>
+                                <option value="failed">Failed</option>
+                            </select>
+                            <button onclick="refreshData()" class="bg-slate-700 px-4 py-2 rounded-lg hover:bg-slate-600">
+                                <i class="fas fa-sync-alt"></i>
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <!-- Active Jobs Summary -->
+                    <div id="active-jobs-summary" class="hidden mb-6">
+                        <div class="card p-4 bg-indigo-500/10 border-indigo-500/30">
+                            <div class="flex items-center gap-3">
+                                <div class="animate-spin rounded-full h-5 w-5 border-2 border-indigo-500 border-t-transparent"></div>
+                                <span id="active-jobs-text">0 jobs running</span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div id="jobs-list" class="space-y-4">
+                        <div class="text-slate-400 text-center py-8">Loading...</div>
+                    </div>
+                </div>
+                
+                <!-- Backups Page -->
+                <div id="page-backups" class="page hidden">
+                    <div class="flex items-center justify-between mb-6">
+                        <h3 class="text-lg font-semibold">Application Backups</h3>
+                        <div class="flex gap-2">
+                            <button onclick="showCreateBackupModal()" class="btn-primary px-4 py-2 rounded-lg flex items-center gap-2">
+                                <i class="fas fa-plus"></i>
+                                <span>Create Backup</span>
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <!-- Storage Info -->
+                    <div id="backup-storage-info" class="card p-4 mb-6 bg-slate-800/50">
+                        <div class="text-slate-400 text-center py-2">Loading storage info...</div>
+                    </div>
+                    
+                    <!-- Filters -->
+                    <div class="flex items-center gap-4 mb-6">
+                        <select id="backup-app-filter" class="bg-slate-700 border border-slate-600 rounded-lg px-4 py-2" onchange="filterBackups()">
+                            <option value="">All Applications</option>
+                        </select>
+                        <input type="text" id="backup-search" class="bg-slate-700 border border-slate-600 rounded-lg px-4 py-2" placeholder="Search backups..." oninput="filterBackups()">
+                    </div>
+                    
+                    <!-- Backups List -->
+                    <div id="backups-list" class="space-y-4">
+                        <div class="text-slate-400 text-center py-8">Loading...</div>
+                    </div>
+                </div>
+                
+                <!-- Configuration Page -->
+                <div id="page-config" class="page hidden">
+                    <div class="flex items-center justify-between mb-6">
+                        <h3 class="text-lg font-semibold">Configuration</h3>
+                        <div class="flex gap-2">
+                            <button onclick="saveConfig()" class="btn-primary px-4 py-2 rounded-lg flex items-center gap-2">
+                                <i class="fas fa-save"></i>
+                                <span>Save Changes</span>
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <!-- Config Tabs -->
+                    <div class="flex gap-2 mb-6 border-b border-slate-700 pb-2 overflow-x-auto">
+                        <button onclick="window.configPage.switchTab('general')" data-config-tab="general" class="config-tab px-4 py-2 rounded-t-lg text-sm font-medium transition-colors bg-indigo-500/20 text-indigo-400 border-b-2 border-indigo-500">
+                            <i class="fas fa-cog mr-2"></i>General
+                        </button>
+                        <button onclick="window.configPage.switchTab('deploy')" data-config-tab="deploy" class="config-tab px-4 py-2 rounded-t-lg text-sm font-medium transition-colors text-slate-400 hover:text-white">
+                            <i class="fas fa-rocket mr-2"></i>Deploy
+                        </button>
+                        <button onclick="window.configPage.switchTab('monitor')" data-config-tab="monitor" class="config-tab px-4 py-2 rounded-t-lg text-sm font-medium transition-colors text-slate-400 hover:text-white">
+                            <i class="fas fa-shield-alt mr-2"></i>Monitor
+                        </button>
+                        <button onclick="window.configPage.switchTab('email')" data-config-tab="email" class="config-tab px-4 py-2 rounded-t-lg text-sm font-medium transition-colors text-slate-400 hover:text-white">
+                            <i class="fas fa-envelope mr-2"></i>Email
+                        </button>
+                        <button onclick="window.configPage.switchTab('web')" data-config-tab="web" class="config-tab px-4 py-2 rounded-t-lg text-sm font-medium transition-colors text-slate-400 hover:text-white">
+                            <i class="fas fa-desktop mr-2"></i>Web
+                        </button>
+                        <button onclick="window.configPage.switchTab('raw')" data-config-tab="raw" class="config-tab px-4 py-2 rounded-t-lg text-sm font-medium transition-colors text-slate-400 hover:text-white">
+                            <i class="fas fa-code mr-2"></i>Raw YAML
+                        </button>
+                    </div>
+                    
+                    <!-- General Tab -->
+                    <div id="config-tab-general" class="config-tab-content">
+                        <div class="grid gap-6">
+                            <!-- Core Settings -->
+                            <div class="card p-6">
+                                <h4 class="font-semibold mb-4 flex items-center gap-2">
+                                    <i class="fas fa-folder text-slate-400"></i>
+                                    Core Settings
+                                </h4>
+                                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    <div>
+                                        <label class="form-label">Applications Directory</label>
+                                        <input type="text" id="config-apps-dir" class="form-input" placeholder="/var/www/apps">
+                                    </div>
+                                    <div>
+                                        <label class="form-label">Web Server</label>
+                                        <select id="config-webserver" class="form-input">
+                                            <option value="nginx">Nginx</option>
+                                            <option value="apache">Apache</option>
+                                        </select>
+                                    </div>
+                                    <div>
+                                        <label class="form-label">Service User</label>
+                                        <input type="text" id="config-service-user" class="form-input" placeholder="www-data">
+                                    </div>
+                                    <div>
+                                        <label class="form-label">Service Group</label>
+                                        <input type="text" id="config-service-group" class="form-input" placeholder="www-data">
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <!-- Backup Settings -->
+                            <div class="card p-6">
+                                <h4 class="font-semibold mb-4 flex items-center gap-2">
+                                    <i class="fas fa-archive text-purple-400"></i>
+                                    Backup Settings
+                                </h4>
+                                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    <div>
+                                        <label class="form-label">Backup Directory</label>
+                                        <input type="text" id="config-backup-dir" class="form-input" placeholder="/var/backups/wasm">
+                                    </div>
+                                    <div>
+                                        <label class="form-label">Max Backups per App</label>
+                                        <input type="number" id="config-max-backups" min="1" max="100" class="form-input" placeholder="10">
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <!-- SSL Settings -->
+                            <div class="card p-6">
+                                <h4 class="font-semibold mb-4 flex items-center gap-2">
+                                    <i class="fas fa-lock text-green-400"></i>
+                                    SSL Settings
+                                </h4>
+                                <div class="space-y-4">
+                                    <label class="flex items-center gap-2 cursor-pointer">
+                                        <input type="checkbox" id="config-ssl-enabled" class="w-4 h-4">
+                                        <span>Enable SSL by default</span>
+                                    </label>
+                                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                        <div>
+                                            <label class="form-label">SSL Provider</label>
+                                            <select id="config-ssl-provider" class="form-input">
+                                                <option value="certbot">Certbot (Let's Encrypt)</option>
+                                            </select>
+                                        </div>
+                                        <div>
+                                            <label class="form-label">Certificate Email</label>
+                                            <input type="email" id="config-ssl-email" class="form-input" placeholder="admin@example.com">
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Deploy Tab -->
+                    <div id="config-tab-deploy" class="config-tab-content hidden">
+                        <div class="grid gap-6">
+                            <!-- Package Managers -->
+                            <div class="card p-6">
+                                <h4 class="font-semibold mb-4 flex items-center gap-2">
+                                    <i class="fab fa-node-js text-green-500"></i>
+                                    Available Package Managers
+                                </h4>
+                                <p class="text-sm text-slate-400 mb-4">
+                                    Select which package managers can be used when deploying Node.js applications.
+                                    The deployer will auto-detect based on lock files (package-lock.json, pnpm-lock.yaml, etc.)
+                                </p>
+                                <div class="flex flex-wrap gap-6">
+                                    <label class="flex items-center gap-2 cursor-pointer">
+                                        <input type="checkbox" id="config-pm-npm" class="w-4 h-4" checked>
+                                        <span>npm</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 cursor-pointer">
+                                        <input type="checkbox" id="config-pm-pnpm" class="w-4 h-4">
+                                        <span>pnpm</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 cursor-pointer">
+                                        <input type="checkbox" id="config-pm-yarn" class="w-4 h-4">
+                                        <span>yarn</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 cursor-pointer">
+                                        <input type="checkbox" id="config-pm-bun" class="w-4 h-4">
+                                        <span>bun</span>
+                                    </label>
+                                </div>
+                            </div>
+                            
+                            <div class="card p-6 bg-slate-800/50 border border-slate-700">
+                                <p class="text-sm text-slate-400">
+                                    <i class="fas fa-info-circle text-blue-400 mr-2"></i>
+                                    <strong>Note:</strong> Node.js and Python versions are auto-detected from your system.
+                                    Use <code class="bg-slate-900 px-1 rounded">wasm setup</code> to install or configure runtime versions.
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Monitor Tab -->
+                    <div id="config-tab-monitor" class="config-tab-content hidden">
+                        <div class="grid gap-6">
+                            <!-- Important Note -->
+                            <div class="card p-4 bg-indigo-500/10 border border-indigo-500/30">
+                                <div class="flex items-start gap-3">
+                                    <i class="fas fa-info-circle text-indigo-400 mt-0.5"></i>
+                                    <div>
+                                        <p class="text-sm text-slate-300">
+                                            <strong>Note:</strong> These settings configure <em>how</em> the monitor behaves. 
+                                            To <strong>start/stop</strong> the monitor service, go to the 
+                                            <a href="#monitor" class="text-indigo-400 hover:underline font-medium">Monitor page</a>.
+                                        </p>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <!-- Monitor Settings -->
+                            <div class="card p-6">
+                                <h4 class="font-semibold mb-4 flex items-center gap-2">
+                                    <i class="fas fa-shield-alt text-yellow-500"></i>
+                                    Scan Settings
+                                </h4>
+                                <div class="space-y-4">
+                                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                        <div>
+                                            <label class="form-label">Scan Interval (seconds)</label>
+                                            <input type="number" id="config-monitor-interval" min="60" class="form-input" placeholder="3600">
+                                        </div>
+                                        <div>
+                                            <label class="form-label">CPU Threshold (%)</label>
+                                            <input type="number" id="config-monitor-cpu" min="1" max="100" class="form-input" placeholder="80">
+                                        </div>
+                                        <div>
+                                            <label class="form-label">Memory Threshold (%)</label>
+                                            <input type="number" id="config-monitor-memory" min="1" max="100" class="form-input" placeholder="80">
+                                        </div>
+                                    </div>
+                                    
+                                    <div class="flex flex-wrap gap-x-6 gap-y-2">
+                                        <label class="flex items-center gap-2 cursor-pointer" title="Automatically terminate detected threats">
+                                            <input type="checkbox" id="config-monitor-auto-terminate" class="w-4 h-4">
+                                            <span>Auto-terminate threats</span>
+                                        </label>
+                                        <label class="flex items-center gap-2 cursor-pointer" title="Only terminate confirmed malicious processes, not just suspicious ones">
+                                            <input type="checkbox" id="config-monitor-terminate-malicious" class="w-4 h-4">
+                                            <span>Malicious only (safer)</span>
+                                        </label>
+                                        <label class="flex items-center gap-2 cursor-pointer" title="Use OpenAI to analyze suspicious processes">
+                                            <input type="checkbox" id="config-monitor-use-ai" class="w-4 h-4">
+                                            <span>AI analysis</span>
+                                        </label>
+                                        <label class="flex items-center gap-2 cursor-pointer" title="Report only, don't actually terminate processes">
+                                            <input type="checkbox" id="config-monitor-dry-run" class="w-4 h-4">
+                                            <span>Dry run (test mode)</span>
+                                        </label>
+                                    </div>
+                                    
+                                    <div>
+                                        <label class="form-label">Monitor Log File</label>
+                                        <input type="text" id="config-monitor-log-file" class="form-input" placeholder="/var/log/wasm/monitor.log">
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <!-- OpenAI Settings -->
+                            <div class="card p-6">
+                                <h4 class="font-semibold mb-4 flex items-center gap-2">
+                                    <i class="fas fa-brain text-purple-500"></i>
+                                    OpenAI Settings (for AI Analysis)
+                                </h4>
+                                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    <div>
+                                        <label class="form-label">API Key</label>
+                                        <input type="password" id="config-openai-api-key" class="form-input" placeholder="sk-...">
+                                        <p class="text-xs text-slate-500 mt-1">Required for AI-powered threat analysis</p>
+                                    </div>
+                                    <div>
+                                        <label class="form-label">Model</label>
+                                        <select id="config-openai-model" class="form-input">
+                                            <option value="gpt-4o-mini">GPT-4o Mini (Fast & Cheap)</option>
+                                            <option value="gpt-4o">GPT-4o (Powerful)</option>
+                                            <option value="gpt-4-turbo">GPT-4 Turbo</option>
+                                            <option value="gpt-3.5-turbo">GPT-3.5 Turbo (Fastest)</option>
+                                        </select>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Email Tab -->
+                    <div id="config-tab-email" class="config-tab-content hidden">
+                        <div class="card p-6">
+                            <h4 class="font-semibold mb-4 flex items-center gap-2">
+                                <i class="fas fa-envelope text-blue-400"></i>
+                                SMTP / Email Notifications
+                            </h4>
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <div>
+                                    <label class="form-label">SMTP Host</label>
+                                    <input type="text" id="config-smtp-host" class="form-input" placeholder="smtp.gmail.com">
+                                </div>
+                                <div>
+                                    <label class="form-label">SMTP Port</label>
+                                    <input type="number" id="config-smtp-port" min="1" max="65535" class="form-input" placeholder="465">
+                                </div>
+                                <div>
+                                    <label class="form-label">SMTP Username</label>
+                                    <input type="text" id="config-smtp-username" class="form-input" placeholder="your-email@gmail.com">
+                                </div>
+                                <div>
+                                    <label class="form-label">SMTP Password</label>
+                                    <input type="password" id="config-smtp-password" class="form-input" placeholder="••••••••">
+                                </div>
+                                <div>
+                                    <label class="form-label">From Address</label>
+                                    <input type="email" id="config-smtp-from" class="form-input" placeholder="noreply@example.com">
+                                </div>
+                                <div>
+                                    <label class="form-label">Email Recipients</label>
+                                    <input type="text" id="config-email-recipients" class="form-input" placeholder="admin@example.com, ops@example.com">
+                                    <p class="text-xs text-slate-500 mt-1">Comma-separated list</p>
+                                </div>
+                            </div>
+                            <div class="flex items-center gap-6 mt-4">
+                                <label class="flex items-center gap-2 cursor-pointer">
+                                    <input type="checkbox" id="config-smtp-ssl" class="w-4 h-4">
+                                    <span>Use SSL</span>
+                                </label>
+                                <label class="flex items-center gap-2 cursor-pointer">
+                                    <input type="checkbox" id="config-smtp-tls" class="w-4 h-4">
+                                    <span>Use TLS</span>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Web Tab -->
+                    <div id="config-tab-web" class="config-tab-content hidden">
+                        <div class="card p-6">
+                            <h4 class="font-semibold mb-4 flex items-center gap-2">
+                                <i class="fas fa-shield-alt text-blue-400"></i>
+                                Security Settings
+                            </h4>
+                            <div class="space-y-4">
+                                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    <div>
+                                        <label class="form-label">Token Expiration (hours)</label>
+                                        <input type="number" id="config-web-token-exp" min="1" max="720" class="form-input" placeholder="24">
+                                        <p class="text-xs text-slate-500 mt-1">How long login sessions remain valid</p>
+                                    </div>
+                                    <div>
+                                        <label class="form-label">Max Failed Login Attempts</label>
+                                        <input type="number" id="config-web-max-failed" min="1" max="20" class="form-input" placeholder="5">
+                                    </div>
+                                </div>
+                                
+                                <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                    <div>
+                                        <label class="form-label">Rate Limit Requests</label>
+                                        <input type="number" id="config-web-rate-limit" min="10" class="form-input" placeholder="100">
+                                        <p class="text-xs text-slate-500 mt-1">Max requests per window</p>
+                                    </div>
+                                    <div>
+                                        <label class="form-label">Rate Limit Window (sec)</label>
+                                        <input type="number" id="config-web-rate-window" min="10" class="form-input" placeholder="60">
+                                    </div>
+                                    <div>
+                                        <label class="form-label">Lockout Duration (sec)</label>
+                                        <input type="number" id="config-web-lockout" min="60" class="form-input" placeholder="300">
+                                    </div>
+                                </div>
+                                
+                                <div>
+                                    <label class="form-label">IP Whitelist</label>
+                                    <input type="text" id="config-web-ip-whitelist" class="form-input" placeholder="127.0.0.1, 192.168.1.0/24">
+                                    <p class="text-xs text-slate-500 mt-1">Comma-separated. Empty = allow all IPs</p>
+                                </div>
+                                
+                                <label class="flex items-center gap-2 cursor-pointer">
+                                    <input type="checkbox" id="config-web-rate-enabled" class="w-4 h-4" checked>
+                                    <span>Enable Rate Limiting</span>
+                                </label>
+                            </div>
+                        </div>
+                        
+                        <div class="card p-6 mt-6 bg-slate-800/50 border border-slate-700">
+                            <p class="text-sm text-slate-400">
+                                <i class="fas fa-info-circle text-blue-400 mr-2"></i>
+                                <strong>Note:</strong> Host and port are configured via CLI when starting the web server:
+                                <code class="bg-slate-900 px-2 py-0.5 rounded ml-1">wasm web start --host 0.0.0.0 --port 8080</code>
+                            </p>
+                        </div>
+                    </div>
+                    
+                    <!-- Raw YAML Tab -->
+                    <div id="config-tab-raw" class="config-tab-content hidden">
+                        <div class="card p-6">
+                            <div class="flex items-center justify-between mb-4">
+                                <h4 class="font-semibold flex items-center gap-2">
+                                    <i class="fas fa-code text-slate-400"></i>
+                                    Raw Configuration (config.yaml)
+                                </h4>
+                                <div class="flex gap-2">
+                                    <button onclick="window.configPage.formatYaml()" class="px-3 py-1 text-sm rounded bg-slate-700 hover:bg-slate-600" title="Format YAML">
+                                        <i class="fas fa-align-left mr-1"></i> Format
+                                    </button>
+                                    <button onclick="window.configPage.validateYaml()" class="px-3 py-1 text-sm rounded bg-slate-700 hover:bg-slate-600" title="Validate YAML">
+                                        <i class="fas fa-check mr-1"></i> Validate
+                                    </button>
+                                </div>
+                            </div>
+                            <textarea id="config-raw-yaml" class="w-full h-[500px] bg-slate-900 text-green-400 font-mono text-sm p-4 rounded-lg border border-slate-700 focus:border-indigo-500 focus:outline-none resize-y" placeholder="# WASM Configuration"></textarea>
+                            <p class="text-xs text-slate-500 mt-2">
+                                <i class="fas fa-info-circle mr-1"></i>
+                                Direct YAML editing. Changes here will overwrite form values when saved.
+                            </p>
+                        </div>
+                    </div>
+                    
+                    <!-- Config File Path -->
+                    <div class="card p-4 bg-slate-800/50 mt-6">
+                        <div class="flex items-center justify-between">
+                            <span class="text-sm text-slate-400">
+                                <i class="fas fa-file-alt mr-2"></i>
+                                Config: <code id="config-path" class="bg-slate-700 px-2 py-1 rounded">/etc/wasm/config.yaml</code>
+                            </span>
+                            <button onclick="resetToDefaults()" class="text-sm text-slate-400 hover:text-red-400">
+                                <i class="fas fa-undo mr-1"></i>
+                                Reset to Defaults
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+    
+    <!-- Toast Container -->
+    <div id="toast-container" class="fixed bottom-4 right-4 z-50 space-y-2"></div>
+    
+    <!-- Create Backup Modal -->
+    <div id="create-backup-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center">
+        <div class="modal-backdrop absolute inset-0" onclick="hideCreateBackupModal()"></div>
+        <div class="relative w-full max-w-lg mx-4">
+            <div class="card p-6 modal-content">
+                <h3 class="text-xl font-semibold mb-6">Create Backup</h3>
+                <form id="create-backup-form" onsubmit="createBackup(event)">
+                    <div class="space-y-4">
+                        <div>
+                            <label class="form-label">Application Domain *</label>
+                            <select id="backup-app-select" name="domain" required class="form-input">
+                                <option value="">Select Application...</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="form-label">Description</label>
+                            <input type="text" name="description" class="form-input" placeholder="Optional backup description">
+                        </div>
+                        <div>
+                            <label class="form-label">Tags</label>
+                            <input type="text" name="tags" class="form-input" placeholder="Comma-separated tags (e.g., release, weekly)">
+                        </div>
+                        <div class="space-y-2">
+                            <label class="flex items-center gap-2 cursor-pointer">
+                                <input type="checkbox" name="include_env" checked class="w-4 h-4">
+                                <span>Include .env files</span>
+                            </label>
+                            <label class="flex items-center gap-2 cursor-pointer">
+                                <input type="checkbox" name="include_build" class="w-4 h-4">
+                                <span>Include build artifacts</span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="flex justify-end gap-4 mt-6">
+                        <button type="button" onclick="hideCreateBackupModal()" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600">
+                            Cancel
+                        </button>
+                        <button type="submit" class="btn-primary px-6 py-2 rounded-lg">
+                            Create Backup
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Backup Details Modal -->
+    <div id="backup-details-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center">
+        <div class="modal-backdrop absolute inset-0" onclick="hideBackupDetailsModal()"></div>
+        <div class="relative w-full max-w-2xl mx-4">
+            <div class="card p-6 modal-content">
+                <div class="flex items-center justify-between mb-4">
+                    <h3 class="text-xl font-semibold">Backup Details</h3>
+                    <button onclick="hideBackupDetailsModal()" class="text-slate-400 hover:text-white">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+                <div id="backup-details-content" class="space-y-4">
+                    <!-- Content will be dynamically inserted -->
+                </div>
+                <div class="flex justify-end gap-2 mt-6 pt-4 border-t border-slate-700">
+                    <button onclick="restoreBackup()" class="px-4 py-2 rounded-lg bg-green-500/20 text-green-400 hover:bg-green-500/30 flex items-center gap-2">
+                        <i class="fas fa-undo"></i>
+                        Restore
+                    </button>
+                    <button onclick="deleteBackup()" class="px-4 py-2 rounded-lg bg-red-500/20 text-red-400 hover:bg-red-500/30 flex items-center gap-2">
+                        <i class="fas fa-trash"></i>
+                        Delete
+                    </button>
+                    <button onclick="hideBackupDetailsModal()" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600">
+                        Close
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Create Certificate Modal -->
+    <div id="create-cert-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center">
+        <div class="modal-backdrop absolute inset-0" onclick="hideCreateCertModal()"></div>
+        <div class="relative w-full max-w-lg mx-4">
+            <div class="card p-6 modal-content">
+                <h3 class="text-xl font-semibold mb-6">Obtain SSL Certificate</h3>
+                <form id="create-cert-form" onsubmit="createCert(event)">
+                    <div class="space-y-4">
+                        <div>
+                            <label class="form-label">Domain Name(s) *</label>
+                            <input type="text" name="domains" required class="form-input" placeholder="example.com, www.example.com">
+                            <p class="text-xs text-slate-500 mt-1">Comma-separated domains</p>
+                        </div>
+                        <div>
+                            <label class="form-label">Email Address</label>
+                            <input type="email" name="email" class="form-input" placeholder="admin@example.com">
+                            <p class="text-xs text-slate-500 mt-1">For certificate expiration notifications</p>
+                        </div>
+                        <div>
+                            <label class="form-label">Method</label>
+                            <select name="method" class="form-input">
+                                <option value="nginx">Nginx Plugin</option>
+                                <option value="apache">Apache Plugin</option>
+                                <option value="standalone">Standalone</option>
+                                <option value="webroot">Webroot</option>
+                            </select>
+                        </div>
+                        <div class="flex items-center gap-4">
+                            <label class="flex items-center gap-2 cursor-pointer">
+                                <input type="checkbox" name="dry_run" class="w-4 h-4">
+                                <span>Dry Run (test only)</span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="flex justify-end gap-4 mt-6">
+                        <button type="button" onclick="hideCreateCertModal()" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600">
+                            Cancel
+                        </button>
+                        <button type="submit" class="btn-primary px-6 py-2 rounded-lg">
+                            Obtain Certificate
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Create Service Modal -->
+    <div id="create-service-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center">
+        <div class="modal-backdrop absolute inset-0" onclick="hideCreateServiceModal()"></div>
+        <div class="relative w-full max-w-2xl mx-4">
+            <div class="card p-6 modal-content max-h-[90vh] overflow-y-auto">
+                <h3 class="text-xl font-semibold mb-4">Create Service</h3>
+                
+                <!-- Mode Toggle -->
+                <div class="flex gap-2 mb-4 border-b border-slate-700 pb-2">
+                    <button type="button" onclick="toggleServiceCreateMode('simple')" id="service-mode-simple" class="px-3 py-1 text-sm rounded bg-indigo-500/20 text-indigo-400">
+                        <i class="fas fa-magic mr-1"></i> Simple
+                    </button>
+                    <button type="button" onclick="toggleServiceCreateMode('advanced')" id="service-mode-advanced" class="px-3 py-1 text-sm rounded text-slate-400 hover:text-white">
+                        <i class="fas fa-code mr-1"></i> Advanced (Raw)
+                    </button>
+                </div>
+                
+                <form id="create-service-form" onsubmit="createService(event)">
+                    <!-- Simple Mode -->
+                    <div id="service-simple-mode" class="space-y-4">
+                        <div>
+                            <label class="form-label">Service Name *</label>
+                            <input type="text" name="name" required class="form-input" placeholder="my-service">
+                        </div>
+                        <div>
+                            <label class="form-label">Command *</label>
+                            <input type="text" name="command" required class="form-input" placeholder="/usr/bin/node server.js">
+                        </div>
+                        <div>
+                            <label class="form-label">Working Directory *</label>
+                            <input type="text" name="directory" required class="form-input" placeholder="/var/www/apps/my-app">
+                        </div>
+                        <div class="grid grid-cols-2 gap-4">
+                            <div>
+                                <label class="form-label">User</label>
+                                <input type="text" name="user" class="form-input" placeholder="www-data" value="www-data">
+                            </div>
+                            <div>
+                                <label class="form-label">Description</label>
+                                <input type="text" name="description" class="form-input" placeholder="My custom service">
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Advanced Mode (Raw systemd unit) -->
+                    <div id="service-advanced-mode" class="hidden">
+                        <div class="mb-2">
+                            <label class="form-label">Service Name *</label>
+                            <input type="text" name="name_advanced" class="form-input mb-2" placeholder="my-service">
+                        </div>
+                        <label class="form-label">Systemd Unit File Content</label>
+                        <textarea name="raw_content" class="w-full h-64 bg-slate-900 text-green-400 font-mono text-sm p-4 rounded-lg border border-slate-700 focus:border-indigo-500 focus:outline-none resize-y" placeholder="[Unit]
+Description=My Custom Service
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/var/www/apps/my-app
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target"></textarea>
+                        <p class="text-xs text-slate-500 mt-1">
+                            <i class="fas fa-info-circle mr-1"></i>
+                            Full systemd unit file. Will be saved to /etc/systemd/system/{name}.service
+                        </p>
+                    </div>
+                    
+                    <div class="flex justify-end gap-4 mt-6">
+                        <button type="button" onclick="hideCreateServiceModal()" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600">
+                            Cancel
+                        </button>
+                        <button type="submit" class="btn-primary px-6 py-2 rounded-lg">
+                            Create
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Service Logs Modal -->
+    <div id="service-logs-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center">
+        <div class="modal-backdrop absolute inset-0" onclick="hideServiceLogsModal()"></div>
+        <div class="relative w-full max-w-4xl max-h-[80vh] mx-4">
+            <div class="card p-6 flex flex-col max-h-[80vh] modal-content">
+                <div class="flex items-center justify-between mb-4">
+                    <h3 class="text-xl font-semibold" id="service-logs-title">Service Logs</h3>
+                    <button onclick="hideServiceLogsModal()" class="text-slate-400 hover:text-white">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+                <div id="service-logs-content" class="log-container flex-1 overflow-auto p-3 rounded-lg text-sm">
+                    <div class="text-slate-500">Loading logs...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Service Config Modal -->
+    <div id="service-config-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center">
+        <div class="modal-backdrop absolute inset-0" onclick="hideServiceConfigModal()"></div>
+        <div class="relative w-full max-w-4xl max-h-[90vh] mx-4">
+            <div class="card p-6 flex flex-col max-h-[90vh] modal-content">
+                <div class="flex items-center justify-between mb-4">
+                    <h3 class="text-xl font-semibold" id="service-config-title">Service Configuration</h3>
+                    <div class="flex items-center gap-2">
+                        <div id="service-config-view-mode">
+                            <button type="button" onclick="toggleServiceConfigEdit()" class="btn btn-secondary text-sm">
+                                <i class="fas fa-edit mr-1"></i> Edit
+                            </button>
+                        </div>
+                        <div id="service-config-edit-mode" class="hidden flex gap-2">
+                            <button type="button" onclick="saveServiceConfig()" class="btn btn-primary text-sm">
+                                <i class="fas fa-save mr-1"></i> Save
+                            </button>
+                            <button type="button" onclick="cancelServiceConfigEdit()" class="btn btn-secondary text-sm">
+                                Cancel
+                            </button>
+                        </div>
+                        <button onclick="hideServiceConfigModal()" class="text-slate-400 hover:text-white ml-2">
+                            <i class="fas fa-times"></i>
+                        </button>
+                    </div>
+                </div>
+                <!-- View Mode -->
+                <div id="service-config-view-content">
+                    <div id="service-config-content" class="log-container flex-1 overflow-auto p-3 rounded-lg text-sm">
+                        <div class="text-slate-500">Loading configuration...</div>
+                    </div>
+                </div>
+                <!-- Edit Mode -->
+                <div id="service-config-edit-content" class="hidden flex-1">
+                    <textarea id="service-config-edit" 
+                        class="w-full h-96 font-mono text-sm bg-slate-900 border border-slate-600 rounded-lg p-3 text-slate-300 focus:outline-none focus:border-indigo-500"
+                        placeholder="Systemd unit content..."></textarea>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Create Site Modal -->
+    <div id="create-site-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center">
+        <div class="modal-backdrop absolute inset-0" onclick="hideCreateSiteModal()"></div>
+        <div class="relative w-full max-w-2xl mx-4">
+            <div class="card p-6 modal-content max-h-[90vh] overflow-y-auto">
+                <h3 class="text-xl font-semibold mb-4">Create Site Configuration</h3>
+                
+                <!-- Mode Toggle -->
+                <div class="flex gap-2 mb-4 border-b border-slate-700 pb-2">
+                    <button type="button" onclick="toggleSiteCreateMode('simple')" id="site-mode-simple" class="px-3 py-1 text-sm rounded bg-indigo-500/20 text-indigo-400">
+                        <i class="fas fa-magic mr-1"></i> Simple
+                    </button>
+                    <button type="button" onclick="toggleSiteCreateMode('advanced')" id="site-mode-advanced" class="px-3 py-1 text-sm rounded text-slate-400 hover:text-white">
+                        <i class="fas fa-code mr-1"></i> Advanced (Raw)
+                    </button>
+                </div>
+                
+                <form id="create-site-form" onsubmit="createSite(event)">
+                    <!-- Simple Mode -->
+                    <div id="site-simple-mode" class="space-y-4">
+                        <div>
+                            <label class="form-label">Domain Name *</label>
+                            <input type="text" name="domain" required class="form-input" placeholder="example.com">
+                        </div>
+                        <div class="grid grid-cols-2 gap-4">
+                            <div>
+                                <label class="form-label">Web Server</label>
+                                <select name="webserver" class="form-input">
+                                    <option value="nginx">Nginx</option>
+                                    <option value="apache">Apache</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="form-label">Template</label>
+                                <select name="template" class="form-input">
+                                    <option value="proxy">Proxy (for apps)</option>
+                                    <option value="static">Static Files</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div>
+                            <label class="form-label">Backend Port</label>
+                            <input type="number" name="port" class="form-input" placeholder="3000" value="3000">
+                            <p class="text-xs text-slate-500 mt-1">Only used for proxy template</p>
+                        </div>
+                    </div>
+                    
+                    <!-- Advanced Mode (Raw config) -->
+                    <div id="site-advanced-mode" class="hidden">
+                        <div class="grid grid-cols-2 gap-4 mb-2">
+                            <div>
+                                <label class="form-label">Site Name *</label>
+                                <input type="text" name="domain_advanced" class="form-input" placeholder="example.com">
+                            </div>
+                            <div>
+                                <label class="form-label">Web Server</label>
+                                <select name="webserver_advanced" class="form-input">
+                                    <option value="nginx">Nginx</option>
+                                    <option value="apache">Apache</option>
+                                </select>
+                            </div>
+                        </div>
+                        <label class="form-label">Configuration Content</label>
+                        <textarea name="raw_config" class="w-full h-64 bg-slate-900 text-green-400 font-mono text-sm p-4 rounded-lg border border-slate-700 focus:border-indigo-500 focus:outline-none resize-y" placeholder="server {
+    listen 80;
+    server_name example.com;
+    
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
+    }
+}"></textarea>
+                        <p class="text-xs text-slate-500 mt-1">
+                            <i class="fas fa-info-circle mr-1"></i>
+                            Full configuration file. Will be saved to sites-available/{name}
+                        </p>
+                    </div>
+                    
+                    <div class="flex justify-end gap-4 mt-6">
+                        <button type="button" onclick="hideCreateSiteModal()" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600">
+                            Cancel
+                        </button>
+                        <button type="submit" class="btn-primary px-6 py-2 rounded-lg">
+                            Create
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Site Config Modal (View/Edit) -->
+    <div id="site-config-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center">
+        <div class="modal-backdrop absolute inset-0" onclick="hideSiteConfigModal()"></div>
+        <div class="relative w-full max-w-4xl max-h-[85vh] mx-4">
+            <div class="card p-6 flex flex-col max-h-[85vh] modal-content">
+                <div class="flex items-center justify-between mb-4">
+                    <h3 class="text-xl font-semibold" id="site-config-title">Site Configuration</h3>
+                    <div class="flex items-center gap-2">
+                        <button id="site-config-edit-btn" onclick="toggleSiteConfigEdit()" class="px-3 py-1 text-sm rounded bg-slate-700 hover:bg-slate-600" title="Edit configuration">
+                            <i class="fas fa-edit mr-1"></i> Edit
+                        </button>
+                        <button onclick="hideSiteConfigModal()" class="text-slate-400 hover:text-white px-2">
+                            <i class="fas fa-times"></i>
+                        </button>
+                    </div>
+                </div>
+                <div id="site-config-content" class="flex-1 overflow-auto">
+                    <!-- View mode -->
+                    <div id="site-config-view">
+                        <pre class="bg-slate-800 p-4 rounded-lg text-sm text-slate-300 whitespace-pre-wrap h-full"><code id="site-config-code">Loading...</code></pre>
+                    </div>
+                    <!-- Edit mode (hidden by default) -->
+                    <div id="site-config-edit" class="hidden h-full flex flex-col">
+                        <textarea id="site-config-textarea" class="flex-1 w-full bg-slate-900 text-green-400 font-mono text-sm p-4 rounded-lg border border-slate-700 focus:border-indigo-500 focus:outline-none resize-none min-h-[400px]" placeholder="# Site configuration"></textarea>
+                        <div class="flex justify-end gap-2 mt-4">
+                            <button type="button" onclick="cancelSiteConfigEdit()" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600">
+                                Cancel
+                            </button>
+                            <button type="button" onclick="saveSiteConfig()" class="btn-primary px-4 py-2 rounded-lg">
+                                <i class="fas fa-save mr-1"></i> Save
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Create App Modal -->
+    <div id="create-app-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center">
+        <div class="modal-backdrop absolute inset-0" onclick="hideCreateAppModal()"></div>
+        <div class="relative w-full max-w-2xl mx-4">
+            <div class="card p-6 modal-content max-h-[90vh] overflow-y-auto">
+                <h3 class="text-xl font-semibold mb-6">Deploy New Application</h3>
+                <form id="create-app-form" onsubmit="createApp(event)">
+                    <div class="space-y-4">
+                        <!-- Required Fields -->
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div>
+                                <label class="form-label">Domain *</label>
+                                <input type="text" name="domain" required class="form-input" placeholder="example.com">
+                            </div>
+                            <div>
+                                <label class="form-label">Source (Git URL or Path) *</label>
+                                <input type="text" name="source" required class="form-input" placeholder="git@github.com:user/repo.git">
+                            </div>
+                        </div>
+                        
+                        <!-- Type & Port -->
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <div>
+                                <label class="form-label">App Type</label>
+                                <select name="app_type" class="form-input">
+                                    <option value="auto">Auto Detect</option>
+                                    <option value="nextjs">Next.js</option>
+                                    <option value="nodejs">Node.js</option>
+                                    <option value="vite">Vite</option>
+                                    <option value="python">Python</option>
+                                    <option value="static">Static</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="form-label">Port (optional)</label>
+                                <input type="number" name="port" class="form-input" placeholder="Auto">
+                            </div>
+                            <div>
+                                <label class="form-label">Git Branch</label>
+                                <input type="text" name="branch" class="form-input" placeholder="main">
+                            </div>
+                        </div>
+                        
+                        <!-- Web Server & Package Manager -->
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div>
+                                <label class="form-label">Web Server</label>
+                                <select name="webserver" class="form-input">
+                                    <option value="nginx">Nginx</option>
+                                    <option value="apache">Apache</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="form-label">Package Manager</label>
+                                <select name="package_manager" class="form-input">
+                                    <option value="auto">Auto Detect</option>
+                                    <option value="npm">npm</option>
+                                    <option value="pnpm">pnpm</option>
+                                    <option value="yarn">yarn</option>
+                                    <option value="bun">bun</option>
+                                </select>
+                            </div>
+                        </div>
+                        
+                        <!-- Environment Variables -->
+                        <div>
+                            <label class="form-label">Environment Variables (optional)</label>
+                            <textarea name="env_vars" class="form-input h-20" placeholder="KEY=value&#10;ANOTHER_KEY=another_value"></textarea>
+                            <p class="text-xs text-slate-500 mt-1">One per line: KEY=value</p>
+                        </div>
+                        
+                        <!-- Options -->
+                        <div class="flex flex-wrap items-center gap-6">
+                            <label class="flex items-center gap-2 cursor-pointer">
+                                <input type="checkbox" name="ssl" checked class="w-4 h-4">
+                                <span>Enable SSL</span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="flex justify-end gap-4 mt-6">
+                        <button type="button" onclick="hideCreateAppModal()" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600">
+                            Cancel
+                        </button>
+                        <button type="submit" class="btn-primary px-6 py-2 rounded-lg">
+                            <i class="fas fa-rocket mr-2"></i>Deploy
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Job Details Modal -->
+    <div id="job-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center">
+        <div class="modal-backdrop absolute inset-0" onclick="hideJobModal()"></div>
+        <div class="relative w-full max-w-2xl max-h-[80vh] overflow-hidden mx-4">
+            <div class="card p-6 flex flex-col max-h-[80vh] modal-content">
+                <div class="flex items-center justify-between mb-4">
+                    <h3 class="text-xl font-semibold" id="job-modal-title">Job Details</h3>
+                    <button onclick="hideJobModal()" class="text-slate-400 hover:text-white">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+                
+                <!-- Job Status -->
+                <div class="mb-4">
+                    <div class="flex items-center justify-between mb-2">
+                        <span id="job-modal-status" class="badge">Running</span>
+                        <span id="job-modal-progress" class="text-sm text-slate-400">0%</span>
+                    </div>
+                    <div class="h-2 bg-slate-700 rounded-full overflow-hidden">
+                        <div id="job-modal-progress-bar" class="h-full bg-indigo-500 rounded-full progress-bar" style="width: 0%"></div>
+                    </div>
+                    <p id="job-modal-step" class="text-sm text-slate-400 mt-2">--</p>
+                </div>
+                
+                <!-- Job Logs -->
+                <div class="flex-1 overflow-hidden">
+                    <h4 class="text-sm font-semibold text-slate-400 mb-2">Output</h4>
+                    <div id="job-modal-logs" class="log-container h-64 overflow-auto p-3 rounded-lg text-sm">
+                        <div class="text-slate-500">Waiting for output...</div>
+                    </div>
+                </div>
+                
+                <!-- Actions -->
+                <div class="flex justify-between mt-4 pt-4 border-t border-slate-700">
+                    <div id="job-modal-metadata" class="text-sm text-slate-400">
+                        <span id="job-modal-created">--</span>
+                    </div>
+                    <div class="flex gap-2">
+                        <button id="job-modal-cancel" onclick="cancelCurrentJob()" class="hidden px-4 py-2 rounded-lg bg-red-500/20 text-red-400 hover:bg-red-500/30">
+                            <i class="fas fa-stop mr-2"></i>Cancel
+                        </button>
+                        <button onclick="hideJobModal()" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600">
+                            Close
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Load main application module -->
+    <script type="module" src="/static/js/main.js"></script>
+</body>
+</html>

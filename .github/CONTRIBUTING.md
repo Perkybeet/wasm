@@ -112,7 +112,7 @@ wasm/
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-org/wasm.git
+git clone https://github.com/Perkybeet/wasm.git
 cd wasm
 
 # Create virtual environment

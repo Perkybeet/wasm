@@ -481,6 +481,8 @@ Return ONLY confirmed threats as JSON array. Empty array [] if nothing malicious
         self,
         processes: List[ProcessInfo],
         use_ai: bool = True,
+        force_ai: bool = False,
+        analyze_all: bool = False,
     ) -> List[AnalysisResult]:
         """
         Analyze a list of processes for threats.
@@ -491,6 +493,8 @@ Return ONLY confirmed threats as JSON array. Empty array [] if nothing malicious
         Args:
             processes: List of processes to analyze.
             use_ai: Whether to use AI analysis.
+            force_ai: Force AI analysis even if no suspicious processes found.
+            analyze_all: Analyze ALL processes with AI (expensive).
             
         Returns:
             List of analysis results for detected threats.
@@ -512,32 +516,81 @@ Return ONLY confirmed threats as JSON array. Empty array [] if nothing malicious
         
         # Second pass: AI analysis for remaining suspicious candidates
         if use_ai and self.api_key and remaining_processes:
-            # Filter to processes worth analyzing - be very selective
             candidates = []
-            for p in remaining_processes:
-                # Skip if matches any safe pattern
-                is_safe = any(
-                    re.search(pattern, p.name.lower())
-                    for pattern in self.SAFE_PATTERNS
-                )
-                if is_safe:
-                    continue
+            
+            if analyze_all:
+                # Analyze ALL processes (expensive)
+                candidates = remaining_processes
+                self.logger.info(f"Force analyzing ALL {len(candidates)} processes with AI")
+            elif force_ai or results:
+                # Filter to processes worth analyzing - be very selective
+                for p in remaining_processes:
+                    # Skip if matches any safe pattern (unless analyze_all)
+                    is_safe = any(
+                        re.search(pattern, p.name.lower())
+                        for pattern in self.SAFE_PATTERNS
+                    )
+                    if is_safe:
+                        continue
+                    
+                    # Only analyze if there's a concrete reason to be suspicious:
+                    # 1. Very high CPU (could be miner)
+                    # 2. Running from suspicious locations (/tmp, /var/tmp, /dev/shm)
+                    # 3. Has suspicious characters in name (hidden files)
+                    # 4. Unknown process with network connections
+                    suspicious_location = any(
+                        loc in (p.cwd or "")
+                        for loc in ["/tmp", "/var/tmp", "/dev/shm"]
+                    )
+                    suspicious_name = p.name.startswith(".") or "hidden" in p.name.lower()
+                    high_cpu_unknown = p.cpu_percent > 50 and not is_safe
+                    has_many_connections = len(p.connections) > 20
+                    
+                    if suspicious_location or suspicious_name or high_cpu_unknown or has_many_connections:
+                        candidates.append(p)
                 
-                # Only analyze if there's a concrete reason to be suspicious:
-                # 1. Very high CPU (could be miner)
-                # 2. Running from suspicious locations (/tmp, /var/tmp, /dev/shm)
-                # 3. Has suspicious characters in name (hidden files)
-                # 4. Unknown process with network connections
-                suspicious_location = any(
-                    loc in (p.cwd or "")
-                    for loc in ["/tmp", "/var/tmp", "/dev/shm"]
-                )
-                suspicious_name = p.name.startswith(".") or "hidden" in p.name.lower()
-                high_cpu_unknown = p.cpu_percent > 50 and not is_safe
-                has_many_connections = len(p.connections) > 20
-                
-                if suspicious_location or suspicious_name or high_cpu_unknown or has_many_connections:
-                    candidates.append(p)
+                # If force_ai is set but no candidates yet, take top CPU/memory processes
+                if force_ai and not candidates:
+                    # Get top 10 processes by CPU and memory
+                    sorted_by_cpu = sorted(
+                        remaining_processes,
+                        key=lambda p: p.cpu_percent,
+                        reverse=True
+                    )[:10]
+                    sorted_by_mem = sorted(
+                        remaining_processes,
+                        key=lambda p: p.memory_percent,
+                        reverse=True
+                    )[:10]
+                    
+                    # Combine and deduplicate
+                    seen = set()
+                    for p in sorted_by_cpu + sorted_by_mem:
+                        if p.pid not in seen:
+                            candidates.append(p)
+                            seen.add(p.pid)
+                    
+                    self.logger.info(f"Force AI enabled: analyzing top {len(candidates)} resource consumers")
+            else:
+                # Normal mode: Only analyze if there's a concrete reason
+                for p in remaining_processes:
+                    is_safe = any(
+                        re.search(pattern, p.name.lower())
+                        for pattern in self.SAFE_PATTERNS
+                    )
+                    if is_safe:
+                        continue
+                    
+                    suspicious_location = any(
+                        loc in (p.cwd or "")
+                        for loc in ["/tmp", "/var/tmp", "/dev/shm"]
+                    )
+                    suspicious_name = p.name.startswith(".") or "hidden" in p.name.lower()
+                    high_cpu_unknown = p.cpu_percent > 50 and not is_safe
+                    has_many_connections = len(p.connections) > 20
+                    
+                    if suspicious_location or suspicious_name or high_cpu_unknown or has_many_connections:
+                        candidates.append(p)
             
             if candidates:
                 self.logger.debug(f"Sending {len(candidates)} processes to AI for analysis")
@@ -546,6 +599,8 @@ Return ONLY confirmed threats as JSON array. Empty array [] if nothing malicious
                     results.extend(ai_results)
                 except AIAnalysisError as e:
                     self.logger.warning(f"AI analysis failed: {e}")
+        
+        return results
         
         return results
     

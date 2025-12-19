@@ -28,8 +28,8 @@ jobs:
         id: changelog
         run: |
           VERSION="${{ steps.get_version.outputs.version }}"
-          # Extract changelog for this version from debian/changelog
-          CHANGELOG=$(sed -n "/^wasm (${VERSION}/,/^wasm (/p" debian/changelog | head -n -1 | tail -n +2 | sed 's/^  //')
+          # Extract changelog for this version from obs/debian.changelog
+          CHANGELOG=$(sed -n "/^wasm (${VERSION}/,/^wasm (/p" obs/debian.changelog | head -n -1 | tail -n +2 | sed 's/^  //')
           echo "changelog<<EOF" >> $GITHUB_OUTPUT
           echo "$CHANGELOG" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT

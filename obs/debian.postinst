@@ -34,7 +34,7 @@ case "$1" in
         
         echo ""
         echo "========================================"
-        echo "  WASM v0.10.0 installed successfully!"
+        echo "  WASM v0.11.0 installed successfully!"
         echo "========================================"
         echo ""
         echo "Quick start:"
