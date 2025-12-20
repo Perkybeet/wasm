@@ -1,3 +1,10 @@
+wasm (0.11.3-1) unstable; urgency=medium
+
+  * Fix: GitHub Actions workflow version extraction for OBS tarball naming
+  * The sed regex was including parentheses in version string
+
+ -- Yago López Prado <yago.lopez.adeje@gmail.com>  Sat, 21 Dec 2025 13:00:00 +0000
+
 wasm (0.11.2-1) unstable; urgency=medium
 
   * Fix: Make web dependencies optional (Recommends) for OBS packages

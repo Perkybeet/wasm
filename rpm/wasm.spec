@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.11.2
+Version:        0.11.3
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        MIT
@@ -135,6 +135,9 @@ echo "Note: You may need to install python3-inquirer via pip:"
 echo "  pip3 install inquirer"
 
 %changelog
+* Sun Dec 21 2025 Perkybeet <yago.lopez.adeje@gmail.com> - 0.11.3-1
+- Fix: GitHub Actions workflow version extraction for OBS tarball naming
+
 * Sun Dec 21 2025 Perkybeet <yago.lopez.adeje@gmail.com> - 0.11.2-1
 - Fix: Make web dependencies optional (Recommends) for OBS packages
 - Web deps like python3-fastapi not available as native packages in Fedora/openSUSE

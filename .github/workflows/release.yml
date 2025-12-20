@@ -176,7 +176,7 @@ jobs:
       - name: Get version
         id: version
         run: |
-          VERSION=$(head -n 1 obs/debian.changelog | sed 's/.*\((.*)\).*/\1/' | cut -d'~' -f1)
+          VERSION=$(head -n 1 obs/debian.changelog | grep -oP '\(\K[^)]+' | cut -d'~' -f1)
           VERSION_BASE=$(echo "${VERSION}" | cut -d'-' -f1)
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
           echo "version_base=${VERSION_BASE}" >> $GITHUB_OUTPUT
