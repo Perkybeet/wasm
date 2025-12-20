@@ -90,14 +90,14 @@ async def list_backups(
         backups = []
         for backup in backups_list:
             backups.append(BackupInfo(
-                backup_id=backup.backup_id,
+                backup_id=backup.id,
                 domain=backup.domain,
-                timestamp=backup.timestamp.isoformat() if backup.timestamp else "",
-                size=backup.size,
+                timestamp=backup.created_at,
+                size=backup.size_bytes,
                 size_human=backup.size_human,
                 age=backup.age,
                 app_type=backup.app_type,
-                has_database=backup.has_database,
+                has_database=False,  # BackupMetadata doesn't track this
                 git_commit=backup.git_commit,
                 git_branch=backup.git_branch
             ))
@@ -172,14 +172,14 @@ async def get_backup(
             raise HTTPException(status_code=404, detail=f"Backup not found: {backup_id}")
         
         return BackupInfo(
-            backup_id=backup.backup_id,
+            backup_id=backup.id,
             domain=backup.domain,
-            timestamp=backup.timestamp.isoformat() if backup.timestamp else "",
-            size=backup.size,
+            timestamp=backup.created_at,
+            size=backup.size_bytes,
             size_human=backup.size_human,
             age=backup.age,
             app_type=backup.app_type,
-            has_database=backup.has_database,
+            has_database=False,  # BackupMetadata doesn't track this
             git_commit=backup.git_commit,
             git_branch=backup.git_branch
         )
@@ -201,27 +201,25 @@ async def create_backup(
     try:
         manager = BackupManager(verbose=False)
         
-        # Find app path
+        # Check if app exists
         from wasm.core.config import Config
         from wasm.core.utils import domain_to_app_name
         
         config = Config()
         app_name = domain_to_app_name(data.domain)
-        app_path = config.apps_dir / app_name
+        app_path = config.apps_directory / app_name
         
         if not app_path.exists():
             raise HTTPException(status_code=404, detail=f"Application not found: {data.domain}")
         
         backup_meta = manager.create(
             domain=data.domain,
-            app_path=app_path,
-            include_db=data.include_database
         )
         
         return BackupActionResponse(
             success=True,
-            message=f"Backup created: {backup_meta.backup_id}",
-            backup_id=backup_meta.backup_id
+            message=f"Backup created: {backup_meta.id}",
+            backup_id=backup_meta.id
         )
     except HTTPException:
         raise

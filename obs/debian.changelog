@@ -1,3 +1,13 @@
+wasm (0.11.4-1) unstable; urgency=medium
+
+  * Fix: Backup API using wrong attribute names (backup_id vs id)
+  * Fix: Add -y flag as alias for --force/-f in delete commands
+  * Fix: WebSocket logs handler error handling and stderr capture
+  * Fix: Frontend logs page now handles error and warning messages
+  * Fix: Create backup endpoint using correct BackupManager.create() signature
+
+ -- Yago López Prado <yago.lopez.adeje@gmail.com>  Sat, 21 Dec 2025 16:00:00 +0000
+
 wasm (0.11.3-1) unstable; urgency=medium
 
   * Fix: GitHub Actions workflow version extraction for OBS tarball naming

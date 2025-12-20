@@ -70,6 +70,16 @@ export function switchStream() {
                 info.className = 'text-slate-500 text-center py-2';
                 info.textContent = `Connected to ${data.service}`;
                 container.appendChild(info);
+            } else if (data.type === 'error') {
+                const errLine = document.createElement('div');
+                errLine.className = 'text-red-400 py-2';
+                errLine.textContent = `Error: ${data.message}`;
+                container.appendChild(errLine);
+            } else if (data.type === 'warning') {
+                const warnLine = document.createElement('div');
+                warnLine.className = 'text-yellow-400 py-2';
+                warnLine.textContent = data.data;
+                container.appendChild(warnLine);
             }
         },
         (error) => {

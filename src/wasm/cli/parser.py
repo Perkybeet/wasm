@@ -245,9 +245,9 @@ def _add_webapp_commands(subparsers) -> None:
         help="Application domain",
     )
     delete.add_argument(
-        "--force", "-f",
+        "--force", "-f", "-y",
         action="store_true",
-        help="Skip confirmation",
+        help="Skip confirmation (yes to all)",
     )
     delete.add_argument(
         "--keep-files",
@@ -363,9 +363,9 @@ def _add_site_parser(subparsers) -> None:
         help="Domain name",
     )
     delete.add_argument(
-        "--force", "-f",
+        "--force", "-f", "-y",
         action="store_true",
-        help="Skip confirmation",
+        help="Skip confirmation (yes to all)",
     )
     
     # site show
@@ -511,9 +511,9 @@ def _add_service_parser(subparsers) -> None:
         help="Service name",
     )
     delete.add_argument(
-        "--force", "-f",
+        "--force", "-f", "-y",
         action="store_true",
-        help="Skip confirmation",
+        help="Skip confirmation (yes to all)",
     )
 
 
@@ -926,9 +926,9 @@ def _add_backup_parser(subparsers) -> None:
         help="Backup ID to delete",
     )
     delete.add_argument(
-        "--force", "-f",
+        "--force", "-f", "-y",
         action="store_true",
-        help="Skip confirmation prompt",
+        help="Skip confirmation (yes to all)",
     )
     
     # backup verify

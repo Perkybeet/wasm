@@ -66,7 +66,18 @@ async def websocket_logs(
         _log_connections[domain] = set()
     _log_connections[domain].add(websocket)
     
+    process = None
+    
     try:
+        # Check if journalctl exists
+        import shutil
+        if not shutil.which("journalctl"):
+            await websocket.send_json({
+                "type": "error",
+                "message": "journalctl not found. Log streaming requires systemd."
+            })
+            return
+        
         # Start journalctl follow process
         process = await asyncio.create_subprocess_exec(
             "journalctl",
@@ -86,13 +97,37 @@ async def websocket_logs(
             "service": service_name
         })
         
+        # Check for immediate stderr (e.g., service not found)
+        async def check_stderr():
+            try:
+                stderr_data = await asyncio.wait_for(
+                    process.stderr.read(1024),
+                    timeout=0.5
+                )
+                if stderr_data:
+                    error_msg = stderr_data.decode("utf-8", errors="replace").strip()
+                    if error_msg:
+                        await websocket.send_json({
+                            "type": "warning",
+                            "data": f"journalctl: {error_msg}"
+                        })
+            except asyncio.TimeoutError:
+                pass
+            except Exception:
+                pass
+        
+        await check_stderr()
+        
         # Stream logs
         async def read_logs():
             while True:
                 try:
                     line = await process.stdout.readline()
                     if not line:
-                        break
+                        # Check if process exited
+                        if process.returncode is not None:
+                            break
+                        continue
                     
                     log_line = line.decode("utf-8", errors="replace").strip()
                     if log_line:
@@ -130,9 +165,6 @@ async def websocket_logs(
         for task in pending:
             task.cancel()
         
-        # Kill process
-        process.terminate()
-        
     except WebSocketDisconnect:
         pass
     except Exception as e:
@@ -144,6 +176,17 @@ async def websocket_logs(
         except Exception:
             pass
     finally:
+        # Kill process if running
+        if process and process.returncode is None:
+            try:
+                process.terminate()
+                await asyncio.wait_for(process.wait(), timeout=2.0)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+        
         # Remove from connections
         if domain in _log_connections:
             _log_connections[domain].discard(websocket)

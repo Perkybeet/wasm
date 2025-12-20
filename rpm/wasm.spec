@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.11.3
+Version:        0.11.4
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        MIT
@@ -159,6 +159,13 @@ echo "  pip3 install inquirer"
 - API endpoints: /api/backups, /api/monitor, /api/system, /api/config
 - Background job processing with progress tracking
 - Optional dependencies: pip install wasm-cli[web]
+
+* Sat Dec 21 2024 Perkybeet <yago.lopez.adeje@gmail.com> - 0.11.4-1
+- Fix: Backup API using wrong attribute names (backup_id vs id)
+- Fix: Add -y flag as alias for --force/-f in delete commands
+- Fix: WebSocket logs handler error handling and stderr capture
+- Fix: Frontend logs page now handles error and warning messages
+- Fix: Create backup endpoint using correct BackupManager.create() signature
 
 * Thu Dec 19 2024 Perkybeet <yago.lopez.adeje@gmail.com> - 0.10.5-1
 - Detect OOM (Out of Memory) build failures with exit code 137
