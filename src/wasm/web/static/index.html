@@ -16,15 +16,30 @@
         }
     </script>
     
+    <!-- Mobile Sidebar Overlay -->
+    <div id="sidebar-overlay" class="sidebar-overlay" onclick="toggleMobileSidebar()"></div>
+    
     <div id="app" class="flex h-screen">
         <!-- Sidebar -->
-        <aside class="sidebar w-64 flex flex-col">
+        <aside id="sidebar" class="sidebar w-64 flex flex-col">
             <!-- Logo -->
-            <div class="p-6 border-b border-slate-700">
+            <div class="p-6 border-b border-slate-700 flex items-center justify-between">
                 <h1 class="text-2xl font-bold flex items-center gap-2">
                     <img src="/static/logo.webp" alt="WASM" class="w-10 h-10"> WASM
                 </h1>
-                <p class="text-sm text-slate-400 mt-1">Web Dashboard</p>
+                <!-- Mobile close button -->
+                <button class="md:hidden text-slate-400 hover:text-white" onclick="toggleMobileSidebar()">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            
+            <!-- Search shortcut hint -->
+            <div class="px-4 pt-4">
+                <button onclick="window.globalSearch?.open()" class="w-full flex items-center gap-3 px-4 py-2 rounded-lg bg-slate-800/50 border border-slate-700 text-slate-400 hover:text-white hover:border-slate-600 transition-colors">
+                    <i class="fas fa-search text-sm"></i>
+                    <span class="flex-1 text-left text-sm">Search...</span>
+                    <kbd class="hidden sm:inline-block px-1.5 py-0.5 text-xs bg-slate-700 rounded">⌘K</kbd>
+                </button>
             </div>
             
             <!-- Navigation -->
@@ -94,8 +109,13 @@
                 </ul>
             </nav>
             
-            <!-- Footer -->
-            <div class="p-4 border-t border-slate-700">
+            <!-- Footer with keyboard hint -->
+            <div class="p-4 border-t border-slate-700 space-y-2">
+                <button onclick="window.keyboardShortcuts?.showHelp()" class="flex items-center gap-3 px-4 py-2 rounded-lg text-slate-400 hover:text-white hover:bg-slate-700/50 w-full text-sm">
+                    <i class="fas fa-keyboard w-5"></i>
+                    <span>Keyboard Shortcuts</span>
+                    <kbd class="ml-auto px-1.5 py-0.5 text-xs bg-slate-700 rounded">?</kbd>
+                </button>
                 <button onclick="logout()" class="flex items-center gap-3 px-4 py-3 rounded-lg text-slate-400 hover:text-white hover:bg-slate-700 w-full">
                     <i class="fas fa-sign-out-alt w-5"></i>
                     <span>Logout</span>
@@ -107,9 +127,23 @@
         <main class="flex-1 overflow-auto">
             <!-- Header -->
             <header class="bg-slate-800/50 border-b border-slate-700 px-6 py-4 flex items-center justify-between sticky top-0 z-10 backdrop-blur">
-                <h2 id="page-title" class="text-xl font-semibold">Dashboard</h2>
+                <!-- Mobile menu button -->
+                <button id="mobile-menu-btn" class="hidden mr-4 p-2 rounded-lg hover:bg-slate-700 md:hidden" onclick="toggleMobileSidebar()">
+                    <i class="fas fa-bars"></i>
+                </button>
+                
+                <!-- Breadcrumbs -->
                 <div class="flex items-center gap-4">
-                    <div id="connection-status" class="flex items-center gap-2 text-sm">
+                    <div class="breadcrumbs hidden sm:flex">
+                        <a href="#dashboard"><i class="fas fa-home"></i></a>
+                        <span class="separator">/</span>
+                        <span id="breadcrumb-current" class="current">Dashboard</span>
+                    </div>
+                    <h2 id="page-title" class="text-xl font-semibold sm:hidden">Dashboard</h2>
+                </div>
+                
+                <div class="flex items-center gap-4">
+                    <div id="connection-status" class="flex items-center gap-2 text-sm hidden sm:flex">
                         <span class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
                         <span class="text-slate-400">Connected</span>
                     </div>
@@ -1463,6 +1497,71 @@ WantedBy=multi-user.target"></textarea>
             </div>
         </div>
     </div>
+    
+    <!-- Quick Actions FAB -->
+    <div class="quick-actions">
+        <div id="quick-actions-menu" class="quick-actions-menu hidden">
+            <div class="quick-actions-item" onclick="window.showCreateAppModal?.(); toggleQuickActions();">
+                <i class="fas fa-rocket text-indigo-400"></i>
+                <span>Deploy App</span>
+            </div>
+            <div class="quick-actions-item" onclick="window.showCreateServiceModal?.(); toggleQuickActions();">
+                <i class="fas fa-cogs text-green-400"></i>
+                <span>New Service</span>
+            </div>
+            <div class="quick-actions-item" onclick="window.showCreateSiteModal?.(); toggleQuickActions();">
+                <i class="fas fa-globe text-blue-400"></i>
+                <span>New Site</span>
+            </div>
+            <div class="quick-actions-item" onclick="window.showCreateCertModal?.(); toggleQuickActions();">
+                <i class="fas fa-shield-alt text-yellow-400"></i>
+                <span>New Certificate</span>
+            </div>
+            <div class="quick-actions-item" onclick="window.showCreateBackupModal?.(); toggleQuickActions();">
+                <i class="fas fa-archive text-purple-400"></i>
+                <span>Create Backup</span>
+            </div>
+        </div>
+        <button id="quick-actions-fab" class="fab-button" onclick="toggleQuickActions()" title="Quick Actions">
+            <i class="fas fa-plus"></i>
+        </button>
+    </div>
+    
+    <!-- Helper functions for mobile sidebar and quick actions -->
+    <script>
+        function toggleMobileSidebar() {
+            const sidebar = document.getElementById('sidebar');
+            const overlay = document.getElementById('sidebar-overlay');
+            sidebar.classList.toggle('open');
+            overlay.classList.toggle('active');
+        }
+        
+        function toggleQuickActions() {
+            const menu = document.getElementById('quick-actions-menu');
+            const fab = document.getElementById('quick-actions-fab');
+            menu.classList.toggle('hidden');
+            fab.classList.toggle('active');
+        }
+        
+        // Close quick actions on outside click
+        document.addEventListener('click', (e) => {
+            const quickActions = document.querySelector('.quick-actions');
+            if (quickActions && !quickActions.contains(e.target)) {
+                document.getElementById('quick-actions-menu')?.classList.add('hidden');
+                document.getElementById('quick-actions-fab')?.classList.remove('active');
+            }
+        });
+        
+        // Update breadcrumb when page changes
+        window.addEventListener('hashchange', () => {
+            const page = window.location.hash.replace('#', '') || 'dashboard';
+            const breadcrumb = document.getElementById('breadcrumb-current');
+            const pageTitle = document.getElementById('page-title');
+            if (breadcrumb) {
+                breadcrumb.textContent = page.charAt(0).toUpperCase() + page.slice(1);
+            }
+        });
+    </script>
     
     <!-- Load main application module -->
     <script type="module" src="/static/js/main.js"></script>
