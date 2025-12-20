@@ -1,3 +1,11 @@
+wasm (0.11.2-1) unstable; urgency=medium
+
+  * Fix: Make web dependencies optional (Recommends) for OBS packages
+  * Web dependencies like python3-fastapi are not available as native packages
+    in Fedora/openSUSE, so they must be installed via pip when needed
+
+ -- Yago López Prado <yago.lopez.adeje@gmail.com>  Sat, 21 Dec 2025 12:00:00 +0000
+
 wasm (0.11.1-1) unstable; urgency=medium
 
   * Fix: Include web dependencies in OBS packages (deb/rpm)

@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.11.1
+Version:        0.11.2
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        MIT
@@ -26,14 +26,14 @@ BuildRequires:  python3-wheel
 Requires:       python3-jinja2 >= 3.1.0
 Requires:       python3-pyyaml >= 6.0
 Requires:       python3-inquirer >= 3.1.0
-# Web interface dependencies
-Requires:       python3-fastapi >= 0.109.0
-Requires:       python3-uvicorn >= 0.27.0
-Requires:       python3-jose >= 3.3.0
-Requires:       python3-passlib >= 1.7.4
-Requires:       python3-bcrypt
-Requires:       python3-psutil >= 5.9.0
-Requires:       python3-aiofiles >= 23.0.0
+# Web interface dependencies (optional, install via pip if not available)
+Recommends:     python3-fastapi >= 0.109.0
+Recommends:     python3-uvicorn >= 0.27.0
+Recommends:     python3-jose >= 3.3.0
+Recommends:     python3-passlib >= 1.7.4
+Recommends:     python3-bcrypt
+Recommends:     python3-psutil >= 5.9.0
+Recommends:     python3-aiofiles >= 23.0.0
 %endif
 
 # openSUSE specific
@@ -42,14 +42,14 @@ BuildRequires:  python3-wheel
 Requires:       python3-Jinja2 >= 3.1.0
 Requires:       python3-PyYAML >= 6.0
 # inquirer may need to be installed via pip on SUSE
-# Web interface dependencies
-Requires:       python3-fastapi >= 0.109.0
-Requires:       python3-uvicorn >= 0.27.0
-Requires:       python3-python-jose >= 3.3.0
-Requires:       python3-passlib >= 1.7.4
-Requires:       python3-bcrypt
-Requires:       python3-psutil >= 5.9.0
-Requires:       python3-aiofiles >= 23.0.0
+# Web interface dependencies (optional, install via pip if not available)
+Recommends:     python3-fastapi >= 0.109.0
+Recommends:     python3-uvicorn >= 0.27.0
+Recommends:     python3-python-jose >= 3.3.0
+Recommends:     python3-passlib >= 1.7.4
+Recommends:     python3-bcrypt
+Recommends:     python3-psutil >= 5.9.0
+Recommends:     python3-aiofiles >= 23.0.0
 %endif
 
 # Runtime requirements (common)
@@ -135,6 +135,10 @@ echo "Note: You may need to install python3-inquirer via pip:"
 echo "  pip3 install inquirer"
 
 %changelog
+* Sun Dec 21 2025 Perkybeet <yago.lopez.adeje@gmail.com> - 0.11.2-1
+- Fix: Make web dependencies optional (Recommends) for OBS packages
+- Web deps like python3-fastapi not available as native packages in Fedora/openSUSE
+
 * Sat Dec 20 2025 Perkybeet <yago.lopez.adeje@gmail.com> - 0.11.1-1
 - Fix: Include web dependencies in OBS packages (deb/rpm)
 - Add python3-fastapi, python3-uvicorn, python3-jose as dependencies
