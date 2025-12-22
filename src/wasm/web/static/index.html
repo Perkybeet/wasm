@@ -22,111 +22,111 @@
     <div id="app" class="flex h-screen">
         <!-- Sidebar -->
         <aside id="sidebar" class="sidebar w-64 flex flex-col">
-            <!-- Logo -->
-            <div class="p-6 border-b border-slate-700 flex items-center justify-between">
-                <h1 class="text-2xl font-bold flex items-center gap-2 sidebar-logo">
-                    <img src="/static/logo.webp" alt="WASM" class="w-10 h-10"> 
-                    <span class="sidebar-text">WASM</span>
-                </h1>
-                <!-- Mobile close button -->
-                <button class="md:hidden text-slate-400 hover:text-white" onclick="toggleMobileSidebar()">
-                    <i class="fas fa-times"></i>
-                </button>
+            <!-- Logo Header -->
+            <div class="sidebar-header p-4 border-b border-slate-700">
+                <div class="flex items-center justify-between">
+                    <a href="#dashboard" class="flex items-center gap-3 sidebar-brand">
+                        <img src="/static/logo.webp" alt="WASM" class="sidebar-logo-img w-10 h-10 flex-shrink-0">
+                        <span class="sidebar-text text-xl font-bold">WASM</span>
+                    </a>
+                    <!-- Mobile close button -->
+                    <button class="md:hidden text-slate-400 hover:text-white p-2" onclick="toggleMobileSidebar()">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
             </div>
             
-            <!-- Desktop collapse button -->
-            <div class="px-4 pt-4 hidden md:flex justify-end">
-                <button id="sidebar-collapse-btn" onclick="toggleSidebarCollapse()" class="p-2 rounded-lg hover:bg-slate-700 text-slate-400 hover:text-white" title="Collapse sidebar">
-                    <i class="fas fa-chevron-left"></i>
-                </button>
-            </div>
-            
-            <!-- Search shortcut hint -->
-            <div class="px-4 pt-4">
-                <button onclick="window.globalSearch?.open()" class="w-full flex items-center gap-3 px-4 py-2 rounded-lg bg-slate-800/50 border border-slate-700 text-slate-400 hover:text-white hover:border-slate-600 transition-colors sidebar-search">
-                    <i class="fas fa-search text-sm"></i>
-                    <span class="flex-1 text-left text-sm sidebar-text">Search...</span>
-                    <kbd class="hidden sm:inline-block px-1.5 py-0.5 text-xs bg-slate-700 rounded sidebar-text">⌘K</kbd>
+            <!-- Search -->
+            <div class="sidebar-search-container px-3 py-3">
+                <button onclick="window.globalSearch?.open()" class="sidebar-search-btn w-full flex items-center gap-3 px-3 py-2 rounded-lg bg-slate-800/50 border border-slate-700 text-slate-400 hover:text-white hover:border-slate-600 transition-colors">
+                    <i class="fas fa-search text-sm flex-shrink-0"></i>
+                    <span class="sidebar-text flex-1 text-left text-sm truncate">Search...</span>
+                    <kbd class="sidebar-text px-1.5 py-0.5 text-xs bg-slate-700 rounded">⌘K</kbd>
                 </button>
             </div>
             
             <!-- Navigation -->
-            <nav class="flex-1 p-4">
-                <ul class="space-y-2">
+            <nav class="sidebar-nav flex-1 px-3 py-2 overflow-hidden">
+                <ul class="space-y-1">
                     <li>
-                        <a href="#dashboard" class="nav-item active flex items-center gap-3 px-4 py-3 rounded-lg" data-page="dashboard" title="Dashboard">
-                            <i class="fas fa-home w-5"></i>
+                        <a href="#dashboard" class="nav-item active" data-page="dashboard" title="Dashboard">
+                            <i class="fas fa-home nav-icon"></i>
                             <span class="sidebar-text">Dashboard</span>
                         </a>
                     </li>
                     <li>
-                        <a href="#apps" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="apps" title="Applications">
-                            <i class="fas fa-cube w-5"></i>
+                        <a href="#apps" class="nav-item" data-page="apps" title="Applications">
+                            <i class="fas fa-cube nav-icon"></i>
                             <span class="sidebar-text">Applications</span>
                         </a>
                     </li>
                     <li>
-                        <a href="#services" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="services" title="Services">
-                            <i class="fas fa-cogs w-5"></i>
+                        <a href="#services" class="nav-item" data-page="services" title="Services">
+                            <i class="fas fa-cogs nav-icon"></i>
                             <span class="sidebar-text">Services</span>
                         </a>
                     </li>
                     <li>
-                        <a href="#sites" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="sites" title="Sites">
-                            <i class="fas fa-globe w-5"></i>
+                        <a href="#sites" class="nav-item" data-page="sites" title="Sites">
+                            <i class="fas fa-globe nav-icon"></i>
                             <span class="sidebar-text">Sites</span>
                         </a>
                     </li>
                     <li>
-                        <a href="#certificates" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="certificates" title="Certificates">
-                            <i class="fas fa-shield-alt w-5"></i>
+                        <a href="#certificates" class="nav-item" data-page="certificates" title="Certificates">
+                            <i class="fas fa-shield-alt nav-icon"></i>
                             <span class="sidebar-text">Certificates</span>
                         </a>
                     </li>
                     <li>
-                        <a href="#monitor" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="monitor" title="Monitor">
-                            <i class="fas fa-heartbeat w-5"></i>
+                        <a href="#monitor" class="nav-item" data-page="monitor" title="Monitor">
+                            <i class="fas fa-heartbeat nav-icon"></i>
                             <span class="sidebar-text">Monitor</span>
                         </a>
                     </li>
                     <li>
-                        <a href="#logs" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="logs" title="Logs">
-                            <i class="fas fa-terminal w-5"></i>
+                        <a href="#logs" class="nav-item" data-page="logs" title="Logs">
+                            <i class="fas fa-terminal nav-icon"></i>
                             <span class="sidebar-text">Logs</span>
                         </a>
                     </li>
                     <li>
-                        <a href="#jobs" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="jobs" title="Jobs">
-                            <i class="fas fa-tasks w-5"></i>
+                        <a href="#jobs" class="nav-item" data-page="jobs" title="Jobs">
+                            <i class="fas fa-tasks nav-icon"></i>
                             <span class="sidebar-text">Jobs</span>
-                            <span id="active-jobs-badge" class="hidden ml-auto bg-indigo-500 text-white text-xs px-2 py-0.5 rounded-full sidebar-text">0</span>
+                            <span id="active-jobs-badge" class="hidden ml-auto bg-indigo-500 text-white text-xs px-2 py-0.5 rounded-full">0</span>
                         </a>
                     </li>
                     <li>
-                        <a href="#backups" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="backups" title="Backups">
-                            <i class="fas fa-archive w-5"></i>
+                        <a href="#backups" class="nav-item" data-page="backups" title="Backups">
+                            <i class="fas fa-archive nav-icon"></i>
                             <span class="sidebar-text">Backups</span>
                         </a>
                     </li>
                     <li>
-                        <a href="#config" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="config">
-                            <i class="fas fa-sliders-h w-5"></i>
-                            <span>Settings</span>
+                        <a href="#config" class="nav-item" data-page="config" title="Settings">
+                            <i class="fas fa-sliders-h nav-icon"></i>
+                            <span class="sidebar-text">Settings</span>
                         </a>
                     </li>
                 </ul>
             </nav>
             
-            <!-- Footer with keyboard hint -->
-            <div class="p-4 border-t border-slate-700 space-y-2">
-                <button onclick="window.keyboardShortcuts?.showHelp()" class="flex items-center gap-3 px-4 py-2 rounded-lg text-slate-400 hover:text-white hover:bg-slate-700/50 w-full text-sm">
-                    <i class="fas fa-keyboard w-5"></i>
-                    <span>Keyboard Shortcuts</span>
-                    <kbd class="ml-auto px-1.5 py-0.5 text-xs bg-slate-700 rounded">?</kbd>
+            <!-- Footer -->
+            <div class="sidebar-footer border-t border-slate-700 px-3 py-3 space-y-1">
+                <button onclick="window.keyboardShortcuts?.showHelp()" class="nav-item w-full" title="Keyboard Shortcuts">
+                    <i class="fas fa-keyboard nav-icon"></i>
+                    <span class="sidebar-text">Shortcuts</span>
+                    <kbd class="sidebar-text ml-auto px-1.5 py-0.5 text-xs bg-slate-700 rounded">?</kbd>
                 </button>
-                <button onclick="logout()" class="flex items-center gap-3 px-4 py-3 rounded-lg text-slate-400 hover:text-white hover:bg-slate-700 w-full">
-                    <i class="fas fa-sign-out-alt w-5"></i>
-                    <span>Logout</span>
+                <!-- Collapse button -->
+                <button id="sidebar-collapse-btn" onclick="toggleSidebarCollapse()" class="nav-item w-full hidden md:flex" title="Collapse sidebar">
+                    <i class="fas fa-chevron-left nav-icon collapse-icon"></i>
+                    <span class="sidebar-text">Collapse</span>
+                </button>
+                <button onclick="logout()" class="nav-item w-full text-red-400 hover:text-red-300" title="Logout">
+                    <i class="fas fa-sign-out-alt nav-icon"></i>
+                    <span class="sidebar-text">Logout</span>
                 </button>
             </div>
         </aside>
@@ -150,7 +150,7 @@
                     <h2 id="page-title" class="text-xl font-semibold sm:hidden">Dashboard</h2>
                 </div>
                 
-                <div class="flex items-center gap-4">
+                <div id="header-controls" class="flex items-center gap-4">
                     <div id="connection-status" class="flex items-center gap-2 text-sm hidden sm:flex">
                         <span class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
                         <span class="text-slate-400">Connected</span>
@@ -158,6 +158,7 @@
                     <button id="refresh-btn" onclick="refreshData()" class="p-2 rounded-lg hover:bg-slate-700" title="Refresh">
                         <i class="fas fa-sync-alt"></i>
                     </button>
+                    <!-- Notification bell will be inserted here by JS -->
                 </div>
             </header>
             
@@ -1546,23 +1547,34 @@ WantedBy=multi-user.target"></textarea>
         
         function toggleSidebarCollapse() {
             const sidebar = document.getElementById('sidebar');
-            const app = document.getElementById('app');
             const collapseBtn = document.getElementById('sidebar-collapse-btn');
-            const icon = collapseBtn.querySelector('i');
+            const icon = collapseBtn?.querySelector('.collapse-icon');
             
             sidebar.classList.toggle('collapsed');
             
-            // Update button icon
-            if (sidebar.classList.contains('collapsed')) {
-                icon.classList.remove('fa-chevron-left');
-                icon.classList.add('fa-chevron-right');
-                collapseBtn.title = 'Expand sidebar';
-            } else {
-                icon.classList.remove('fa-chevron-right');
-                icon.classList.add('fa-chevron-left');
-                collapseBtn.title = 'Collapse sidebar';
+            // Save preference
+            localStorage.setItem('sidebar_collapsed', sidebar.classList.contains('collapsed'));
+            
+            // Update icon rotation
+            if (icon) {
+                if (sidebar.classList.contains('collapsed')) {
+                    icon.style.transform = 'rotate(180deg)';
+                } else {
+                    icon.style.transform = 'rotate(0deg)';
+                }
             }
         }
+        
+        // Restore sidebar state on load
+        document.addEventListener('DOMContentLoaded', () => {
+            const savedState = localStorage.getItem('sidebar_collapsed');
+            if (savedState === 'true') {
+                const sidebar = document.getElementById('sidebar');
+                const icon = document.querySelector('.collapse-icon');
+                sidebar?.classList.add('collapsed');
+                if (icon) icon.style.transform = 'rotate(180deg)';
+            }
+        });
         
         function toggleQuickActions() {
             const menu = document.getElementById('quick-actions-menu');
@@ -1575,9 +1587,9 @@ WantedBy=multi-user.target"></textarea>
         function refreshData() {
             const refreshBtn = document.getElementById('refresh-btn');
             const icon = refreshBtn?.querySelector('i');
-            if (icon) {
-                icon.classList.add('fa-spin');
-                setTimeout(() => icon.classList.remove('fa-spin'), 1000);
+            if (icon && !icon.classList.contains('spinning')) {
+                icon.classList.add('spinning');
+                setTimeout(() => icon.classList.remove('spinning'), 1000);
             }
             
             // Trigger actual refresh based on current page

@@ -104,7 +104,7 @@ ssl:\n\
   email: test@example.com" > /etc/wasm/config.yaml
 
 # Expose ports for testing
-EXPOSE 80 443 3000 8080
+EXPOSE 80 443 3000 8080 8000
 
-# Default command
-CMD ["/bin/bash"]
+# Start web interface by default (showing token)
+CMD ["bash", "-c", "wasm web start --host 0.0.0.0 2>&1"]

@@ -29,7 +29,8 @@ class NotificationCenter {
             return;
         }
 
-        const controlsDiv = header.querySelector('.flex.items-center.gap-4');
+        // Use specific ID for header controls
+        const controlsDiv = document.getElementById('header-controls');
         if (!controlsDiv || document.getElementById('notification-bell')) return;
 
         // Create notification bell
@@ -42,8 +43,8 @@ class NotificationCenter {
             </button>
         `;
 
-        // Insert at the beginning of controls
-        controlsDiv.insertBefore(bellContainer, controlsDiv.firstChild);
+        // Append at the end of controls (rightmost position)
+        controlsDiv.appendChild(bellContainer);
 
         // Create dropdown panel
         const panel = document.createElement('div');
