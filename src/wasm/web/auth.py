@@ -27,7 +27,7 @@ SECRET_KEY_LENGTH = 64
 MAX_FAILED_ATTEMPTS = 5
 LOCKOUT_DURATION = 300  # 5 minutes
 RATE_LIMIT_WINDOW = 60  # 1 minute
-RATE_LIMIT_MAX_REQUESTS = 100
+RATE_LIMIT_MAX_REQUESTS = 1000  # Increased from 100 to 1000 for better UX
 TOKEN_FILE_PATH = Path("/etc/wasm/web-token")
 SECRET_FILE_PATH = Path("/etc/wasm/web-secret")
 

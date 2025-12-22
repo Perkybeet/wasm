@@ -24,8 +24,9 @@
         <aside id="sidebar" class="sidebar w-64 flex flex-col">
             <!-- Logo -->
             <div class="p-6 border-b border-slate-700 flex items-center justify-between">
-                <h1 class="text-2xl font-bold flex items-center gap-2">
-                    <img src="/static/logo.webp" alt="WASM" class="w-10 h-10"> WASM
+                <h1 class="text-2xl font-bold flex items-center gap-2 sidebar-logo">
+                    <img src="/static/logo.webp" alt="WASM" class="w-10 h-10"> 
+                    <span class="sidebar-text">WASM</span>
                 </h1>
                 <!-- Mobile close button -->
                 <button class="md:hidden text-slate-400 hover:text-white" onclick="toggleMobileSidebar()">
@@ -33,12 +34,19 @@
                 </button>
             </div>
             
+            <!-- Desktop collapse button -->
+            <div class="px-4 pt-4 hidden md:flex justify-end">
+                <button id="sidebar-collapse-btn" onclick="toggleSidebarCollapse()" class="p-2 rounded-lg hover:bg-slate-700 text-slate-400 hover:text-white" title="Collapse sidebar">
+                    <i class="fas fa-chevron-left"></i>
+                </button>
+            </div>
+            
             <!-- Search shortcut hint -->
             <div class="px-4 pt-4">
-                <button onclick="window.globalSearch?.open()" class="w-full flex items-center gap-3 px-4 py-2 rounded-lg bg-slate-800/50 border border-slate-700 text-slate-400 hover:text-white hover:border-slate-600 transition-colors">
+                <button onclick="window.globalSearch?.open()" class="w-full flex items-center gap-3 px-4 py-2 rounded-lg bg-slate-800/50 border border-slate-700 text-slate-400 hover:text-white hover:border-slate-600 transition-colors sidebar-search">
                     <i class="fas fa-search text-sm"></i>
-                    <span class="flex-1 text-left text-sm">Search...</span>
-                    <kbd class="hidden sm:inline-block px-1.5 py-0.5 text-xs bg-slate-700 rounded">⌘K</kbd>
+                    <span class="flex-1 text-left text-sm sidebar-text">Search...</span>
+                    <kbd class="hidden sm:inline-block px-1.5 py-0.5 text-xs bg-slate-700 rounded sidebar-text">⌘K</kbd>
                 </button>
             </div>
             
@@ -46,58 +54,58 @@
             <nav class="flex-1 p-4">
                 <ul class="space-y-2">
                     <li>
-                        <a href="#dashboard" class="nav-item active flex items-center gap-3 px-4 py-3 rounded-lg" data-page="dashboard">
+                        <a href="#dashboard" class="nav-item active flex items-center gap-3 px-4 py-3 rounded-lg" data-page="dashboard" title="Dashboard">
                             <i class="fas fa-home w-5"></i>
-                            <span>Dashboard</span>
+                            <span class="sidebar-text">Dashboard</span>
                         </a>
                     </li>
                     <li>
-                        <a href="#apps" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="apps">
+                        <a href="#apps" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="apps" title="Applications">
                             <i class="fas fa-cube w-5"></i>
-                            <span>Applications</span>
+                            <span class="sidebar-text">Applications</span>
                         </a>
                     </li>
                     <li>
-                        <a href="#services" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="services">
+                        <a href="#services" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="services" title="Services">
                             <i class="fas fa-cogs w-5"></i>
-                            <span>Services</span>
+                            <span class="sidebar-text">Services</span>
                         </a>
                     </li>
                     <li>
-                        <a href="#sites" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="sites">
+                        <a href="#sites" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="sites" title="Sites">
                             <i class="fas fa-globe w-5"></i>
-                            <span>Sites</span>
+                            <span class="sidebar-text">Sites</span>
                         </a>
                     </li>
                     <li>
-                        <a href="#certificates" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="certificates">
+                        <a href="#certificates" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="certificates" title="Certificates">
                             <i class="fas fa-shield-alt w-5"></i>
-                            <span>Certificates</span>
+                            <span class="sidebar-text">Certificates</span>
                         </a>
                     </li>
                     <li>
-                        <a href="#monitor" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="monitor">
+                        <a href="#monitor" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="monitor" title="Monitor">
                             <i class="fas fa-heartbeat w-5"></i>
-                            <span>Monitor</span>
+                            <span class="sidebar-text">Monitor</span>
                         </a>
                     </li>
                     <li>
-                        <a href="#logs" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="logs">
+                        <a href="#logs" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="logs" title="Logs">
                             <i class="fas fa-terminal w-5"></i>
-                            <span>Logs</span>
+                            <span class="sidebar-text">Logs</span>
                         </a>
                     </li>
                     <li>
-                        <a href="#jobs" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="jobs">
+                        <a href="#jobs" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="jobs" title="Jobs">
                             <i class="fas fa-tasks w-5"></i>
-                            <span>Jobs</span>
-                            <span id="active-jobs-badge" class="hidden ml-auto bg-indigo-500 text-white text-xs px-2 py-0.5 rounded-full">0</span>
+                            <span class="sidebar-text">Jobs</span>
+                            <span id="active-jobs-badge" class="hidden ml-auto bg-indigo-500 text-white text-xs px-2 py-0.5 rounded-full sidebar-text">0</span>
                         </a>
                     </li>
                     <li>
-                        <a href="#backups" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="backups">
+                        <a href="#backups" class="nav-item flex items-center gap-3 px-4 py-3 rounded-lg" data-page="backups" title="Backups">
                             <i class="fas fa-archive w-5"></i>
-                            <span>Backups</span>
+                            <span class="sidebar-text">Backups</span>
                         </a>
                     </li>
                     <li>
@@ -128,7 +136,7 @@
             <!-- Header -->
             <header class="bg-slate-800/50 border-b border-slate-700 px-6 py-4 flex items-center justify-between sticky top-0 z-10 backdrop-blur">
                 <!-- Mobile menu button -->
-                <button id="mobile-menu-btn" class="hidden mr-4 p-2 rounded-lg hover:bg-slate-700 md:hidden" onclick="toggleMobileSidebar()">
+                <button id="mobile-menu-btn" class="mr-4 p-2 rounded-lg hover:bg-slate-700 md:hidden" onclick="toggleMobileSidebar()">
                     <i class="fas fa-bars"></i>
                 </button>
                 
@@ -147,7 +155,7 @@
                         <span class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
                         <span class="text-slate-400">Connected</span>
                     </div>
-                    <button onclick="refreshData()" class="p-2 rounded-lg hover:bg-slate-700" title="Refresh">
+                    <button id="refresh-btn" onclick="refreshData()" class="p-2 rounded-lg hover:bg-slate-700" title="Refresh">
                         <i class="fas fa-sync-alt"></i>
                     </button>
                 </div>
@@ -1536,11 +1544,46 @@ WantedBy=multi-user.target"></textarea>
             overlay.classList.toggle('active');
         }
         
+        function toggleSidebarCollapse() {
+            const sidebar = document.getElementById('sidebar');
+            const app = document.getElementById('app');
+            const collapseBtn = document.getElementById('sidebar-collapse-btn');
+            const icon = collapseBtn.querySelector('i');
+            
+            sidebar.classList.toggle('collapsed');
+            
+            // Update button icon
+            if (sidebar.classList.contains('collapsed')) {
+                icon.classList.remove('fa-chevron-left');
+                icon.classList.add('fa-chevron-right');
+                collapseBtn.title = 'Expand sidebar';
+            } else {
+                icon.classList.remove('fa-chevron-right');
+                icon.classList.add('fa-chevron-left');
+                collapseBtn.title = 'Collapse sidebar';
+            }
+        }
+        
         function toggleQuickActions() {
             const menu = document.getElementById('quick-actions-menu');
             const fab = document.getElementById('quick-actions-fab');
             menu.classList.toggle('hidden');
             fab.classList.toggle('active');
+        }
+        
+        // Animation for refresh button
+        function refreshData() {
+            const refreshBtn = document.getElementById('refresh-btn');
+            const icon = refreshBtn?.querySelector('i');
+            if (icon) {
+                icon.classList.add('fa-spin');
+                setTimeout(() => icon.classList.remove('fa-spin'), 1000);
+            }
+            
+            // Trigger actual refresh based on current page
+            const currentPage = window.location.hash.replace('#', '') || 'dashboard';
+            const event = new CustomEvent('refresh', { detail: { page: currentPage } });
+            window.dispatchEvent(event);
         }
         
         // Close quick actions on outside click
