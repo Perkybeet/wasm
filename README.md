@@ -121,13 +121,19 @@ sudo apt update
 sudo apt install wasm-cli
 ```
 
-### From .deb Package
+### From .deb Package (GitHub Release)
+
+Download the latest `.deb` from the [GitHub Releases](https://github.com/Perkybeet/wasm/releases/latest) page:
 
 ```bash
-wget https://github.com/Perkybeet/wasm/releases/latest/download/wasm_0.8.2_all.deb
-sudo dpkg -i wasm_0.8.2_all.deb
+# Download latest version (check releases page for current version)
+VERSION=$(curl -s https://api.github.com/repos/Perkybeet/wasm/releases/latest | grep -oP '"tag_name": "v\K[^"]+')
+wget "https://github.com/Perkybeet/wasm/releases/latest/download/wasm_${VERSION}_all.deb"
+sudo dpkg -i "wasm_${VERSION}_all.deb"
 sudo apt install -f  # Install dependencies if needed
 ```
+
+Or manually download from: **https://github.com/Perkybeet/wasm/releases/latest**
 
 ### From PyPI
 

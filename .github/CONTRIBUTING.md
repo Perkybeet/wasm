@@ -398,19 +398,19 @@ sudo apt install devscripts debhelper dh-python python3-all
 
 ```bash
 # Update version in pyproject.toml and debian/changelog
-make version VERSION=1.0.0
+make version VERSION=X.Y.Z
 
 # Build the package
 make deb
 
-# The .deb file will be in ../wasm_1.0.0_all.deb
+# The .deb file will be in ../wasm_X.Y.Z_all.deb
 ```
 
 ### Testing the Package
 
 ```bash
-# Install locally
-sudo dpkg -i ../wasm_1.0.0_all.deb
+# Install locally (replace X.Y.Z with actual version)
+sudo dpkg -i ../wasm_X.Y.Z_all.deb
 
 # Test installation
 wasm --version
