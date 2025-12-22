@@ -1,21 +1,102 @@
-MIT License
+WASM Non-Commercial Source-Available License (WASM-NCSAL)
+Version 1.0
 
-Copyright (c) 2024 WASM Team
+Copyright (c) 2024-2025 Yago López Prado
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+TERMS AND CONDITIONS
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+1. DEFINITIONS
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+   "Software" refers to WASM (Web App System Management) and all associated 
+   source code, documentation, and related materials.
+   
+   "Author" refers to Yago López Prado.
+   
+   "Commercial Use" means any use of the Software that directly or indirectly 
+   generates revenue or provides business value, including but not limited to: 
+   selling the Software, incorporating it into paid products or services, using 
+   it in commercial operations, deploying it in business environments to reduce 
+   costs or increase efficiency, or any form of monetization or business 
+   advantage whatsoever.
+
+2. GRANT OF RIGHTS
+
+   Subject to the terms of this License, the Author hereby grants you a 
+   worldwide, royalty-free, non-exclusive license to:
+   
+   a) Use the Software for personal and educational purposes only
+   b) Study, modify, and adapt the Software
+   c) Distribute copies of the Software
+   d) Contribute improvements back to the project
+
+3. CONDITIONS
+
+   The above rights are granted provided that:
+   
+   a) You include this License and copyright notice in all copies or substantial 
+      portions of the Software
+   b) You do not use the Software for Commercial Use without prior written 
+      authorization from the Author
+   c) You do not claim ownership or authorship of the original Software
+   d) Any modifications must be clearly marked as such and not misrepresented 
+      as the original Software
+
+4. COMMERCIAL USE PROHIBITION
+
+   Commercial Use of this Software is strictly prohibited without prior written 
+   agreement with the Author. This includes but is not limited to:
+   
+   - Selling the Software or any derivative works
+   - Including the Software in paid products or services
+   - Using the Software to provide paid services to third parties
+   - Using the Software in business environments to reduce costs or gain 
+     competitive advantages
+   - Any form of monetization, appropriation, or business benefit from the 
+     Software
+
+5. OBTAINING COMMERCIAL LICENSE
+
+   If you wish to use this Software for Commercial purposes, you must contact 
+   the Author to discuss licensing terms and reach a commercial agreement:
+   
+   Email:    yago.lopez.adeje@gmail.com
+             hello@bitbeet.dev
+   Phone:    +34 637 881 066
+
+6. CONTRIBUTIONS
+
+   Contributions to this project are welcome and encouraged. By submitting 
+   contributions, you agree that:
+   
+   a) Your contributions will be licensed under the same terms as this License
+   b) You have the right to submit the contribution
+   c) You grant the Author a perpetual, worldwide, non-exclusive, royalty-free, 
+      irrevocable, sublicensable license to use, reproduce, modify, distribute, 
+      and commercialize your contributions in any way, including in commercial 
+      versions of the Software
+   d) The Author is not obligated to include your contributions in the Software
+
+7. DISCLAIMER OF WARRANTY
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR 
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+   AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN 
+   ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION 
+   WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+8. LIMITATION OF LIABILITY
+
+   IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, INCIDENTAL, INDIRECT, 
+   OR CONSEQUENTIAL DAMAGES WHATSOEVER ARISING OUT OF THE USE OF OR INABILITY 
+   TO USE THE SOFTWARE.
+
+9. TERMINATION
+
+   This License automatically terminates if you violate any of its terms. Upon 
+   termination, you must destroy all copies of the Software in your possession.
+
+10. GOVERNING LAW
+
+    This License shall be governed by and construed in accordance with the laws 
+    of Spain, without regard to its conflict of laws provisions.

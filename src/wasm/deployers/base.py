@@ -1,3 +1,7 @@
+# Copyright (c) 2024-2025 Yago López Prado
+# Licensed under WASM-NCSAL 1.0 (Commercial use prohibited)
+# https://github.com/Perkybeet/wasm/blob/main/LICENSE
+
 """
 Base deployer class for WASM.
 

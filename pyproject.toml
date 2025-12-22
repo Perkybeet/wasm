@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wasm-cli"
-version = "0.11.4"
+version = "0.12.0"
 description = "Web App System Management - Deploy and manage web applications on Linux servers"
 readme = "README.md"
-license = { text = "MIT" }
+license = { text = "WASM-NCSAL" }
 requires-python = ">=3.10"
 authors = [
-    { name = "WASM Team" }
+    { name = "Yago López Prado", email = "yago.lopez.adeje@gmail.com" }
 ]
 keywords = [
     "cli",
@@ -28,7 +28,7 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",
-    "License :: OSI Approved :: MIT License",
+    "License :: Other/Proprietary License",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",

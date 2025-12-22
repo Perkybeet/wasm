@@ -1,14 +1,14 @@
 # spec file for package wasm-cli
 #
-# Copyright (c) 2024 Perkybeet
-# License: MIT
+# Copyright (c) 2024-2025 Yago López Prado
+# License: WASM-NCSAL (Non-Commercial Source-Available License)
 #
 
 Name:           wasm-cli
-Version:        0.11.4
+Version:        0.12.0
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
-License:        MIT
+License:        WASM-NCSAL
 URL:            https://github.com/Perkybeet/wasm
 Source0:        wasm-%{version}.tar.gz
 Source1:        wasm.default.yaml

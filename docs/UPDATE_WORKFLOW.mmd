@@ -1,0 +1,303 @@
+graph TB
+    Start([Usuario ejecuta: wasm update domain.com]) --> ParseArgs[Parser CLI: webapp.py]
+    
+    ParseArgs --> HandleUpdate{handle_update}
+    
+    HandleUpdate --> ValidateDomain[Validar Dominio]
+    ValidateDomain --> CheckAppExists{¿App existe?}
+    
+    CheckAppExists -->|No| Error1[Error: App no encontrada]
+    CheckAppExists -->|Sí| InitUpdate[Inicializar Update]
+    
+    InitUpdate --> Header[Mostrar Header: Updating domain.com]
+    Header --> Strategy[Estrategia: Zero-downtime]
+    
+    %% PASO 1: BACKUP
+    Strategy --> Step1[PASO 1/7: Crear Backup Pre-Update]
+    Step1 --> BackupManager[BackupManager.create_pre_deploy_backup]
+    
+    BackupManager --> CheckExistingApp{¿App existe?}
+    CheckExistingApp -->|No| SkipBackup[Skip: No hay app que respaldar]
+    CheckExistingApp -->|Sí| CreateBackup[Crear Backup]
+    
+    CreateBackup --> GetGitInfo[Obtener info Git: commit + branch]
+    GetGitInfo --> DetectAppType[Detectar tipo de app]
+    DetectAppType --> BuildExcludes[Construir lista de exclusiones]
+    BuildExcludes --> TarArchive[tar -czf con excludes]
+    TarArchive --> CalcChecksum[Calcular SHA256 checksum]
+    CalcChecksum --> SaveMetadata[Guardar metadata JSON]
+    SaveMetadata --> RotateBackups[Rotar backups antiguos]
+    RotateBackups --> BackupComplete[Backup ID generado]
+    
+    SkipBackup --> Step2
+    BackupComplete --> Step2
+    
+    %% PASO 2: FETCH SOURCE
+    Step2[PASO 2/7: Obtener Código Fuente]
+    
+    Step2 --> CheckNewSource{¿Nueva fuente?}
+    
+    CheckNewSource -->|Sí| HandleNewSource[Nueva Fuente Especificada]
+    CheckNewSource -->|No| HandlePull[Pull desde Git existente]
+    
+    HandleNewSource --> BackupEnv[Backup .env actual]
+    BackupEnv --> FetchSource[SourceManager.fetch]
+    FetchSource --> RestoreEnv[Restaurar .env]
+    
+    HandlePull --> PullSource[SourceManager.pull]
+    
+    %% Detalles del SourceManager.pull
+    PullSource --> EnsureSafe[git config safe.directory]
+    EnsureSafe --> CheckLocalChanges{¿Cambios locales?}
+    
+    CheckLocalChanges -->|Sí| StashChanges[git stash]
+    CheckLocalChanges -->|No| TryPull
+    StashChanges --> TryPull[git pull --rebase]
+    
+    TryPull --> PullSuccess{¿Pull exitoso?}
+    
+    PullSuccess -->|No| AnalyzeError{Analizar Error}
+    
+    AnalyzeError -->|Divergent branches| ForcePull[Fetch + Reset Hard]
+    AnalyzeError -->|Conflicts| AbortRebase[git rebase --abort + Reset]
+    AnalyzeError -->|Uncommitted changes| ForceReset[Force Reset]
+    AnalyzeError -->|Unrelated histories| ForceResetHard[Reset Hard]
+    
+    ForcePull --> FetchAll[git fetch --all]
+    FetchAll --> DetermineRef[Determinar target ref]
+    DetermineRef --> ResetHard[git reset --hard origin/branch]
+    ResetHard --> CleanTracked[git clean -fd]
+    CleanTracked --> DropStash[Dropear stash incompatible]
+    
+    AbortRebase --> FetchAll
+    ForceReset --> FetchAll
+    ForceResetHard --> FetchAll
+    
+    PullSuccess -->|Sí| RestoreStash{¿Había stash?}
+    RestoreStash -->|Sí| PopStash[git stash pop]
+    RestoreStash -->|No| SourceComplete
+    PopStash --> PopSuccess{¿Pop exitoso?}
+    PopSuccess -->|Sí| SourceComplete
+    PopSuccess -->|No| PreserveStash[Preservar stash para manual]
+    
+    RestoreEnv --> SourceComplete
+    DropStash --> SourceComplete
+    PreserveStash --> SourceComplete[Código actualizado]
+    
+    %% PASO 3: DETECT APP TYPE
+    SourceComplete --> Step3[PASO 3/7: Detectar Tipo de App]
+    
+    Step3 --> DetectType[detect_app_type]
+    DetectType --> ScanPath[Escanear app_path]
+    
+    ScanPath --> CheckNextJS{¿next.config.js/mjs?}
+    CheckNextJS -->|Sí| TypeNextJS[tipo: nextjs]
+    CheckNextJS -->|No| CheckVite{¿vite.config.js/ts?}
+    
+    CheckVite -->|Sí| TypeVite[tipo: vite]
+    CheckVite -->|No| CheckPython{¿requirements.txt/pyproject.toml?}
+    
+    CheckPython -->|Sí| TypePython[tipo: python]
+    CheckPython -->|No| CheckPackageJSON{¿package.json?}
+    
+    CheckPackageJSON -->|Sí| TypeNodeJS[tipo: nodejs]
+    CheckPackageJSON -->|No| CheckStatic{¿index.html?}
+    
+    CheckStatic -->|Sí| TypeStatic[tipo: static]
+    CheckStatic -->|No| DefaultNodeJS[tipo: nodejs default]
+    
+    TypeNextJS --> GetDeployer[Obtener Deployer Instance]
+    TypeVite --> GetDeployer
+    TypePython --> GetDeployer
+    TypeNodeJS --> GetDeployer
+    TypeStatic --> GetDeployer
+    DefaultNodeJS --> GetDeployer
+    
+    GetDeployer --> ConfigureDeployer[Configurar Deployer]
+    ConfigureDeployer --> SetPaths[Establecer app_path, app_name, domain]
+    SetPaths --> PreInstall[Ejecutar pre_install]
+    
+    %% pre_install hook
+    PreInstall --> DetectPM[Detectar Package Manager]
+    
+    DetectPM --> CheckPMLock{Verificar lockfiles}
+    CheckPMLock -->|pnpm-lock.yaml| UsePNPM[PM: pnpm]
+    CheckPMLock -->|bun.lockb| UseBun[PM: bun]
+    CheckPMLock -->|yarn.lock| UseYarn[PM: yarn]
+    CheckPMLock -->|Ninguno| UseNPM[PM: npm]
+    
+    UsePNPM --> VerifyPM[Verificar PM disponible]
+    UseBun --> VerifyPM
+    UseYarn --> VerifyPM
+    UseNPM --> VerifyPM
+    
+    VerifyPM --> PMExists{¿PM existe?}
+    PMExists -->|No| CheckAvailable[Verificar PMs disponibles]
+    PMExists -->|Sí| DetectPrismaStep[Detectar Prisma]
+    
+    CheckAvailable --> AnyAvailable{¿Alguno disponible?}
+    AnyAvailable -->|No| ErrorNoPM[Error: No package manager]
+    AnyAvailable -->|Sí| UseFallback[Usar primer PM disponible]
+    
+    UseFallback --> DetectPrismaStep
+    DetectPrismaStep --> CheckPrismaDir{¿prisma/ existe?}
+    
+    CheckPrismaDir -->|Sí| HasPrisma[has_prisma = True]
+    CheckPrismaDir -->|No| CheckPrismaPackage{¿prisma/client en deps?}
+    
+    CheckPrismaPackage -->|Sí| HasPrisma
+    CheckPrismaPackage -->|No| NoPrisma[has_prisma = False]
+    
+    HasPrisma --> PreInstallComplete[pre_install completo]
+    NoPrisma --> PreInstallComplete
+    
+    %% PASO 4: INSTALL DEPENDENCIES
+    PreInstallComplete --> Step4[PASO 4/7: Instalar Dependencias]
+    
+    Step4 --> GetInstallCmd[get_install_command]
+    GetInstallCmd --> BuildCmd{Construir comando}
+    
+    BuildCmd -->|pnpm| CmdPNPM[pnpm install --frozen-lockfile]
+    BuildCmd -->|bun| CmdBun[bun install --frozen-lockfile]
+    BuildCmd -->|yarn| CmdYarn[yarn install --frozen-lockfile]
+    BuildCmd -->|npm| CmdNPM[npm ci]
+    
+    CmdPNPM --> RunInstall[Ejecutar comando install]
+    CmdBun --> RunInstall
+    CmdYarn --> RunInstall
+    CmdNPM --> RunInstall
+    
+    RunInstall --> InstallSuccess{¿Exitoso?}
+    
+    InstallSuccess -->|No| TryFallback{Analizar error}
+    
+    TryFallback -->|frozen-lockfile fail| RemoveFrozen[Remover --frozen-lockfile]
+    TryFallback -->|npm ci sin lock| UseNPMInstall[Usar npm install]
+    TryFallback -->|Otro error| ThrowInstallError[Error: Install failed]
+    
+    RemoveFrozen --> RetryInstall[Reintentar install]
+    UseNPMInstall --> RetryInstall
+    
+    RetryInstall --> RetrySuccess{¿Exitoso?}
+    RetrySuccess -->|No| ThrowInstallError
+    RetrySuccess -->|Sí| PostInstall[post_install hook]
+    
+    InstallSuccess -->|Sí| PostInstall
+    
+    PostInstall --> PostPrismaCheck{¿has_prisma?}
+    PostPrismaCheck -->|Sí| GeneratePrisma[generate_prisma]
+    PostPrismaCheck -->|No| InstallComplete[Dependencias instaladas]
+    
+    GeneratePrisma --> PrismaGenCmd[npx prisma generate]
+    PrismaGenCmd --> PrismaGenSuccess{¿Exitoso?}
+    PrismaGenSuccess -->|No| WarnPrismaGen[Warning: Prisma gen failed]
+    PrismaGenSuccess -->|Sí| InstallComplete
+    WarnPrismaGen --> InstallComplete
+    
+    %% PASO 5: PRISMA MIGRATIONS
+    InstallComplete --> Step5[PASO 5/7: Actualizar Prisma]
+    
+    Step5 --> CheckPrismaUpdate{¿has_prisma?}
+    
+    CheckPrismaUpdate -->|No| SkipPrisma[Skip: Prisma no detectado]
+    CheckPrismaUpdate -->|Sí| CheckMigrations{¿Carpeta migrations/?}
+    
+    CheckMigrations -->|No| SkipMigrations[Skip: No migrations]
+    CheckMigrations -->|Sí| RunMigrate[run_prisma_migrate deploy]
+    
+    RunMigrate --> MigrateCmd[npx prisma migrate deploy]
+    MigrateCmd --> MigrateSuccess{¿Exitoso?}
+    
+    MigrateSuccess -->|No| WarnMigrate[Warning: Migrate failed]
+    MigrateSuccess -->|Sí| PrismaComplete[Prisma actualizado]
+    
+    WarnMigrate --> PrismaComplete
+    SkipPrisma --> Step6[PASO 6/7: Build Application]
+    SkipMigrations --> Step6
+    PrismaComplete --> Step6
+    
+    %% PASO 6: BUILD
+    Step6 --> PreBuild[pre_build hook]
+    PreBuild --> GetBuildCmd[get_build_command]
+    
+    GetBuildCmd --> BuildCmdType{Tipo de build}
+    
+    BuildCmdType -->|NextJS| NextBuild[npm run build]
+    BuildCmdType -->|Vite| ViteBuild[npm run build]
+    BuildCmdType -->|NodeJS| NodeBuild[Verificar package.json scripts]
+    BuildCmdType -->|Python| PythonBuild[No build needed]
+    BuildCmdType -->|Static| StaticBuild[No build needed]
+    
+    NextBuild --> ExecuteBuild[Ejecutar build]
+    ViteBuild --> ExecuteBuild
+    NodeBuild --> HasBuildScript{¿build script?}
+    
+    HasBuildScript -->|Sí| ExecuteBuild
+    HasBuildScript -->|No| NoBuild[No build needed]
+    
+    ExecuteBuild --> BuildResult{¿Exitoso?}
+    
+    BuildResult -->|Exit 137| OOMError[Error: Out of Memory]
+    BuildResult -->|Otro error| BuildFailed[Error: Build failed]
+    BuildResult -->|Éxito| PostBuild[post_build hook]
+    
+    PostBuild --> BuildComplete[Build completo]
+    
+    NoBuild --> BuildComplete
+    PythonBuild --> BuildComplete
+    StaticBuild --> BuildComplete
+    
+    %% PASO 7: RESTART
+    BuildComplete --> Step7[PASO 7/7: Reiniciar Aplicación]
+    
+    Step7 --> RestartInfo[Mostrar: Minimal downtime...]
+    RestartInfo --> ServiceRestart[ServiceManager.restart]
+    
+    ServiceRestart --> GetServiceName[Obtener service name: wasm-domain-com]
+    GetServiceName --> SystemdRestart[systemctl restart wasm-domain-com]
+    
+    SystemdRestart --> RestartSuccess{¿Exitoso?}
+    
+    RestartSuccess -->|No| RestartError[Error: Restart failed]
+    RestartSuccess -->|Sí| WaitStartup[Esperar 2 segundos]
+    
+    WaitStartup --> HealthCheck[Verificar estado del servicio]
+    
+    HealthCheck --> GetStatus[ServiceManager.get_status]
+    GetStatus --> CheckActive{¿Servicio activo?}
+    
+    CheckActive -->|Sí| ShowSuccess[Mostrar Success Message]
+    CheckActive -->|No| ShowWarning[Warning: No está corriendo]
+    
+    ShowSuccess --> DisplayInfo[Mostrar información:]
+    DisplayInfo --> InfoStatus[Status: Running]
+    InfoStatus --> InfoPM[Package Manager: npm/pnpm/bun/yarn]
+    InfoPM --> InfoPrisma{¿has_prisma?}
+    
+    InfoPrisma -->|Sí| InfoPrismaUpdated[Prisma: Updated]
+    InfoPrisma -->|No| UpdateComplete([Update Completo - Return 0])
+    
+    InfoPrismaUpdated --> UpdateComplete
+    ShowWarning --> SuggestLogs[Sugerir: wasm logs domain.com]
+    SuggestLogs --> UpdateComplete
+    
+    %% Error handlers
+    Error1 --> ErrorExit([Return 1])
+    ErrorNoPM --> ErrorExit
+    ThrowInstallError --> ErrorExit
+    OOMError --> ErrorExit
+    BuildFailed --> ErrorExit
+    RestartError --> ErrorExit
+    
+    %% Styling
+    classDef successClass fill:#90EE90,stroke:#006400,stroke-width:2px,color:#000
+    classDef errorClass fill:#FFB6C1,stroke:#8B0000,stroke-width:2px,color:#000
+    classDef processClass fill:#87CEEB,stroke:#00008B,stroke-width:2px,color:#000
+    classDef decisionClass fill:#FFE4B5,stroke:#FF8C00,stroke-width:2px,color:#000
+    classDef backupClass fill:#DDA0DD,stroke:#4B0082,stroke-width:2px,color:#000
+    
+    class UpdateComplete,ShowSuccess,BuildComplete,InstallComplete,SourceComplete successClass
+    class Error1,ErrorNoPM,ThrowInstallError,OOMError,BuildFailed,RestartError,ErrorExit errorClass
+    class Step1,Step2,Step3,Step4,Step5,Step6,Step7 processClass
+    class CheckAppExists,CheckNewSource,CheckLocalChanges,PullSuccess,InstallSuccess,BuildResult,RestartSuccess decisionClass
+    class BackupManager,CreateBackup,BackupComplete backupClass

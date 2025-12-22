@@ -1,8 +1,23 @@
 # Contributing to WASM (Web App System Management)
 
+Thank you for your interest in contributing to WASM! We welcome contributions from the community and are grateful for any help you can provide.
+
 ## 📋 Project Overview
 
 WASM is a robust Python CLI tool for managing web applications, sites, services, and SSL certificates on Linux servers. It supports both Nginx and Apache, with automated deployment workflows for various application types.
+
+## 📜 License Notice
+
+**Important:** This project is licensed under the **WASM Non-Commercial Source-Available License (WASM-NCSAL)**. By contributing to this project, you agree that:
+
+1. Your contributions will be licensed under the same WASM-NCSAL license
+2. You have the right to submit the contribution
+3. You grant the author (Yago López Prado) a perpetual, irrevocable, sublicensable license to use, modify, and commercialize your contributions
+4. The author can include your contributions in commercial versions of the Software
+
+**Commercial Use:** If you intend to use WASM commercially, please contact:
+- 📧 Email: yago.lopez.adeje@gmail.com | hello@bitbeet.dev  
+- 📱 Phone: +34 637 881 066
 
 ## 🏗️ Architecture
 
@@ -501,6 +516,15 @@ docs(readme): update installation instructions
 - Open an issue for bugs or features
 - Use discussions for questions
 - Check existing issues before creating new ones
+
+## 📬 Contact
+
+For questions about contributions, licensing, or commercial use:
+
+- **Author:** Yago López Prado
+- **Email:** yago.lopez.adeje@gmail.com | hello@bitbeet.dev
+- **Phone:** +34 637 881 066
+- **Website:** [bitbeet.dev](https://bitbeet.dev)
 
 ---
 

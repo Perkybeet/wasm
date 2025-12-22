@@ -498,7 +498,32 @@ For detailed information about building and uploading to OBS, see [docs/OBS_SETU
 
 ## 📜 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+**WASM-NCSAL 1.0** - Free for personal and educational use.  
+For commercial use or business environments, a commercial license is required.
+
+This project is licensed under the **WASM Non-Commercial Source-Available License (WASM-NCSAL) Version 1.0**.
+
+### ✅ You CAN (Free):
+- Use for **personal projects** and **learning**
+- Study, modify, and adapt the code
+- Contribute improvements to the project
+- Distribute copies (maintaining the license)
+
+### ❌ You CANNOT (Requires License):
+- Use in **commercial environments** (companies, startups, agencies)
+- Use to **reduce business costs** or gain competitive advantages
+- Sell or monetize the software or derivatives
+- Provide paid services using this software
+
+### 💼 Need a Commercial License?
+
+If you're a business or want to use WASM commercially:
+
+- 📧 **Email:** yago.lopez.adeje@gmail.com | hello@bitbeet.dev
+- 📱 **Phone:** +34 637 881 066
+- 🌐 **Web:** [bitbeet.dev](https://bitbeet.dev)
+
+👉 **[Read full license terms](LICENSE)**
 
 ---
 
@@ -511,5 +536,5 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ---
 
 <p align="center">
-  Made with ❤️ for the DevOps community
+  Made with ❤️ by <a href="https://bitbeet.dev">Bitbeet</a>
 </p>
