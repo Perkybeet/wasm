@@ -11,6 +11,13 @@ import { ws } from './core/websocket.js';
 import { router } from './core/router.js';
 import { showToast } from './core/ui.js';
 
+// New UX modules
+import { globalSearch } from './core/search.js';
+import { keyboardShortcuts } from './core/shortcuts.js';
+import { themeManager } from './core/theme.js';
+import { notificationCenter } from './core/notifications.js';
+import { showConfirmDialog } from './core/dialogs.js';
+
 // Page modules
 import dashboardPage from './pages/dashboard.js';
 import appsPage from './pages/apps.js';
@@ -84,8 +91,21 @@ window.deleteBackup = () => backupsPage.remove();
 window.refreshData = () => {
     router.refresh();
     showToast('Data refreshed', 'success');
+    notificationCenter.add('Data refreshed successfully', 'success');
 };
 window.logout = logout;
+
+// Enhanced confirm dialog (replacing browser confirm)
+window.confirm = async (message) => {
+    return await showConfirmDialog({
+        title: 'Confirm Action',
+        message: message,
+        type: 'warning'
+    });
+};
+
+// Export router for keyboard shortcuts
+window.router = router;
 
 // ============ Application Initialization ============
 

@@ -86,6 +86,12 @@ class Router {
             titleEl.textContent = this.formatPageTitle(pageName);
         }
 
+        // Update breadcrumb
+        const breadcrumbEl = document.getElementById('breadcrumb-current');
+        if (breadcrumbEl) {
+            breadcrumbEl.textContent = this.formatPageTitle(pageName);
+        }
+
         // Update URL
         if (updateHistory) {
             window.location.hash = pageName;

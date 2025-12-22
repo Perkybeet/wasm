@@ -7,7 +7,7 @@
 
 const toastContainer = () => document.getElementById('toast-container');
 
-export function showToast(message, type = 'info') {
+export function showToast(message, type = 'info', addToHistory = true) {
     const container = toastContainer();
     if (!container) return;
 
@@ -33,6 +33,11 @@ export function showToast(message, type = 'info') {
     `;
 
     container.appendChild(toast);
+
+    // Also add to notification center if available
+    if (addToHistory && window.notificationCenter) {
+        window.notificationCenter.add(message, type);
+    }
 
     setTimeout(() => {
         toast.classList.add('toast-exit');
@@ -60,7 +65,15 @@ export function hideModal(modalId) {
 
 // ============ Confirmation Dialog ============
 
-export function confirm(message) {
+export async function confirm(message) {
+    // Use styled dialog if available, fallback to native
+    if (window.showConfirmDialog) {
+        return await window.showConfirmDialog({
+            title: 'Confirm Action',
+            message: message,
+            type: 'warning'
+        });
+    }
     return window.confirm(message);
 }
 
