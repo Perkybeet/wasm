@@ -36,6 +36,10 @@ clean:
 	rm -rf .mypy_cache/
 	rm -rf .coverage
 	rm -rf htmlcov/
+	rm -rf .pybuild/
+	rm -f *.deb
+	rm -f *.changes
+	rm -f *.buildinfo
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	find . -type f -name "*.pyc" -delete
 
