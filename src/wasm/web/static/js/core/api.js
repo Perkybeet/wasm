@@ -205,6 +205,55 @@ class WasmAPI {
     installMonitor() { return this.post('/api/monitor/install'); }
     uninstallMonitor() { return this.post('/api/monitor/uninstall'); }
     testEmail() { return this.post('/api/monitor/test-email'); }
+
+    // Databases
+    getDbEngines() { return this.get('/api/databases/engines'); }
+    getDbEngineStatus(engine) { return this.get(`/api/databases/engines/${encodeURIComponent(engine)}/status`); }
+    getDbEngineLogs(engine, lines = 100) { 
+        return this.get(`/api/databases/engines/${encodeURIComponent(engine)}/logs?lines=${lines}`); 
+    }
+    installDbEngine(engine) { return this.post(`/api/databases/engines/${encodeURIComponent(engine)}/install`); }
+    uninstallDbEngine(engine, purge = false) { 
+        return this.post(`/api/databases/engines/${encodeURIComponent(engine)}/uninstall?purge=${purge}`); 
+    }
+    startDbEngine(engine) { return this.post(`/api/databases/engines/${encodeURIComponent(engine)}/start`); }
+    stopDbEngine(engine) { return this.post(`/api/databases/engines/${encodeURIComponent(engine)}/stop`); }
+    restartDbEngine(engine) { return this.post(`/api/databases/engines/${encodeURIComponent(engine)}/restart`); }
+    
+    getDatabases(engine = null) { 
+        let url = '/api/databases/databases';
+        if (engine) url += `?engine=${encodeURIComponent(engine)}`;
+        return this.get(url);
+    }
+    getDatabase(engine, name) { 
+        return this.get(`/api/databases/databases/${encodeURIComponent(engine)}/${encodeURIComponent(name)}`); 
+    }
+    createDatabase(data) { return this.post('/api/databases/databases', data); }
+    dropDatabase(engine, name, force = false) { 
+        return this.delete(`/api/databases/databases/${encodeURIComponent(engine)}/${encodeURIComponent(name)}?force=${force}`); 
+    }
+    
+    getDbUsers(engine) { return this.get(`/api/databases/users/${encodeURIComponent(engine)}`); }
+    createDbUser(data) { return this.post('/api/databases/users', data); }
+    deleteDbUser(engine, username, host = 'localhost') { 
+        return this.delete(`/api/databases/users/${encodeURIComponent(engine)}/${encodeURIComponent(username)}?host=${encodeURIComponent(host)}`); 
+    }
+    grantDbPrivileges(data) { return this.post('/api/databases/users/grant', data); }
+    revokeDbPrivileges(data) { return this.post('/api/databases/users/revoke', data); }
+    
+    getDbBackups(engine = null, database = null) {
+        let url = '/api/databases/backups';
+        const params = [];
+        if (engine) params.push(`engine=${encodeURIComponent(engine)}`);
+        if (database) params.push(`database=${encodeURIComponent(database)}`);
+        if (params.length > 0) url += '?' + params.join('&');
+        return this.get(url);
+    }
+    createDbBackup(data) { return this.post('/api/databases/backups', data); }
+    restoreDbBackup(data) { return this.post('/api/databases/backups/restore', data); }
+    
+    executeDbQuery(data) { return this.post('/api/databases/query', data); }
+    getDbConnectionString(data) { return this.post('/api/databases/connection-string', data); }
 }
 
 // Export singleton instance

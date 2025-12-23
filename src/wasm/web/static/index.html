@@ -104,6 +104,12 @@
                         </a>
                     </li>
                     <li>
+                        <a href="#databases" class="nav-item" data-page="databases" title="Databases">
+                            <i class="fas fa-database nav-icon"></i>
+                            <span class="sidebar-text">Databases</span>
+                        </a>
+                    </li>
+                    <li>
                         <a href="#config" class="nav-item" data-page="config" title="Settings">
                             <i class="fas fa-sliders-h nav-icon"></i>
                             <span class="sidebar-text">Settings</span>
@@ -567,6 +573,22 @@
                     </div>
                 </div>
                 
+                <!-- Databases Page -->
+                <div id="page-databases" class="page hidden">
+                    <!-- Breadcrumb and Actions -->
+                    <div class="flex items-center justify-between mb-6 flex-wrap gap-4">
+                        <div id="databases-breadcrumb" class="flex items-center text-sm">
+                            <span class="text-slate-400">Database Engines</span>
+                        </div>
+                        <div id="databases-actions" class="flex items-center gap-2 flex-wrap">
+                            <!-- Actions populated by JS based on view -->
+                        </div>
+                    </div>
+                    <div id="databases-list" class="space-y-4">
+                        <div class="text-slate-400 text-center py-8">Loading...</div>
+                    </div>
+                </div>
+                
                 <!-- Configuration Page -->
                 <div id="page-config" class="page hidden">
                     <div class="flex items-center justify-between mb-6">
@@ -963,6 +985,414 @@
     
     <!-- Toast Container -->
     <div id="toast-container" class="fixed bottom-4 right-4 z-50 space-y-2"></div>
+    
+    <!-- Create Database Modal -->
+    <div id="create-db-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center">
+        <div class="modal-backdrop absolute inset-0" onclick="window.databasesPage.hideCreateDb()"></div>
+        <div class="relative w-full max-w-lg mx-4">
+            <div class="card p-6 modal-content">
+                <h3 class="text-xl font-semibold mb-6">Create Database</h3>
+                <form id="create-db-form" onsubmit="window.databasesPage.createDb(event)">
+                    <input type="hidden" id="create-db-engine" name="engine">
+                    <div class="space-y-4">
+                        <div>
+                            <label class="form-label">Database Name *</label>
+                            <input type="text" name="name" required class="form-input" placeholder="my_database">
+                        </div>
+                        <div>
+                            <label class="form-label">Owner (optional)</label>
+                            <input type="text" name="owner" class="form-input" placeholder="database owner">
+                        </div>
+                        <div>
+                            <label class="form-label">Encoding (optional)</label>
+                            <input type="text" name="encoding" class="form-input" placeholder="UTF8">
+                        </div>
+                    </div>
+                    <div class="flex justify-end gap-4 mt-6">
+                        <button type="button" onclick="window.databasesPage.hideCreateDb()" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600">
+                            Cancel
+                        </button>
+                        <button type="submit" class="btn-primary px-6 py-2 rounded-lg">
+                            Create
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Create User Modal -->
+    <div id="create-user-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center">
+        <div class="modal-backdrop absolute inset-0" onclick="window.databasesPage.hideCreateUser()"></div>
+        <div class="relative w-full max-w-lg mx-4">
+            <div class="card p-6 modal-content">
+                <h3 class="text-xl font-semibold mb-6">Create Database User</h3>
+                <form id="create-user-form" onsubmit="window.databasesPage.createUser(event)">
+                    <input type="hidden" id="create-user-engine" name="engine">
+                    <div class="space-y-4">
+                        <div>
+                            <label class="form-label">Username *</label>
+                            <input type="text" name="username" required class="form-input" placeholder="db_user">
+                        </div>
+                        <div>
+                            <label class="form-label">Password (optional, generated if empty)</label>
+                            <input type="password" name="password" class="form-input" placeholder="Leave empty to auto-generate">
+                        </div>
+                        <div>
+                            <label class="form-label">Grant access to database (optional)</label>
+                            <input type="text" name="database" class="form-input" placeholder="my_database">
+                        </div>
+                        <div>
+                            <label class="form-label">Host</label>
+                            <input type="text" name="host" class="form-input" placeholder="localhost" value="localhost">
+                        </div>
+                    </div>
+                    <div class="flex justify-end gap-4 mt-6">
+                        <button type="button" onclick="window.databasesPage.hideCreateUser()" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600">
+                            Cancel
+                        </button>
+                        <button type="submit" class="btn-primary px-6 py-2 rounded-lg">
+                            Create
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Grant Privileges Modal -->
+    <div id="grant-privileges-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center">
+        <div class="modal-backdrop absolute inset-0" onclick="window.databasesPage.hideGrantPrivileges()"></div>
+        <div class="relative w-full max-w-lg mx-4">
+            <div class="card p-6 modal-content">
+                <h3 class="text-xl font-semibold mb-6">Grant Privileges</h3>
+                <form id="grant-privileges-form" onsubmit="window.databasesPage.grantPrivileges(event)">
+                    <div class="space-y-4">
+                        <input type="hidden" name="engine" id="grant-engine">
+                        <div>
+                            <label class="form-label">Username</label>
+                            <input type="text" name="username" id="grant-username" readonly class="form-input bg-slate-800">
+                        </div>
+                        <div>
+                            <label class="form-label">Database *</label>
+                            <input type="text" name="database" id="grant-database" required class="form-input" placeholder="database_name">
+                        </div>
+                        <div>
+                            <label class="form-label">Host</label>
+                            <input type="text" name="host" id="grant-host" class="form-input" placeholder="localhost" value="localhost">
+                        </div>
+                    </div>
+                    <div class="flex justify-end gap-4 mt-6">
+                        <button type="button" onclick="window.databasesPage.hideGrantPrivileges()" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600">
+                            Cancel
+                        </button>
+                        <button type="submit" class="btn-primary px-6 py-2 rounded-lg">
+                            Grant All Privileges
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Revoke Privileges Modal -->
+    <div id="revoke-privileges-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center">
+        <div class="modal-backdrop absolute inset-0" onclick="window.databasesPage.hideRevokePrivileges()"></div>
+        <div class="relative w-full max-w-lg mx-4">
+            <div class="card p-6 modal-content">
+                <h3 class="text-xl font-semibold mb-6 text-yellow-400">Revoke Privileges</h3>
+                <form id="revoke-privileges-form" onsubmit="window.databasesPage.revokePrivileges(event)">
+                    <div class="space-y-4">
+                        <input type="hidden" name="engine" id="revoke-engine">
+                        <div>
+                            <label class="form-label">Username</label>
+                            <input type="text" name="username" id="revoke-username" readonly class="form-input bg-slate-800">
+                        </div>
+                        <div>
+                            <label class="form-label">Database *</label>
+                            <input type="text" name="database" id="revoke-database" required class="form-input" placeholder="database_name">
+                        </div>
+                        <div>
+                            <label class="form-label">Host</label>
+                            <input type="text" name="host" id="revoke-host" class="form-input" placeholder="localhost" value="localhost">
+                        </div>
+                    </div>
+                    <div class="flex justify-end gap-4 mt-6">
+                        <button type="button" onclick="window.databasesPage.hideRevokePrivileges()" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600">
+                            Cancel
+                        </button>
+                        <button type="submit" class="bg-yellow-600 hover:bg-yellow-700 px-6 py-2 rounded-lg">
+                            Revoke Privileges
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Engine Logs Modal -->
+    <div id="engine-logs-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center">
+        <div class="modal-backdrop absolute inset-0" onclick="window.databasesPage.hideEngineLogs()"></div>
+        <div class="relative w-full max-w-4xl mx-4">
+            <div class="card p-6 modal-content">
+                <div class="flex items-center justify-between mb-6">
+                    <h3 id="engine-logs-title" class="text-xl font-semibold flex items-center gap-2">
+                        <i class="fas fa-terminal text-blue-400"></i>
+                        Engine Logs
+                    </h3>
+                    <button type="button" onclick="window.databasesPage.hideEngineLogs()" class="text-slate-400 hover:text-white">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+                <div class="bg-slate-900 rounded-lg p-4 max-h-96 overflow-auto">
+                    <pre id="engine-logs-content" class="font-mono text-sm text-slate-300 whitespace-pre-wrap">Loading...</pre>
+                </div>
+                <div class="flex justify-end mt-6">
+                    <button type="button" onclick="window.databasesPage.hideEngineLogs()" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600">
+                        Close
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Uninstall Engine Modal -->
+    <div id="uninstall-engine-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center">
+        <div class="modal-backdrop absolute inset-0" onclick="window.databasesPage.hideUninstallEngine()"></div>
+        <div class="relative w-full max-w-lg mx-4">
+            <div class="card p-6 modal-content">
+                <h3 class="text-xl font-semibold mb-6 text-red-400">Uninstall Database Engine</h3>
+                <div class="space-y-4">
+                    <input type="hidden" id="uninstall-engine-name">
+                    <p class="text-slate-300">
+                        Are you sure you want to uninstall <strong id="uninstall-engine-display"></strong>?
+                    </p>
+                    <div class="p-3 bg-red-500/10 border border-red-500/30 rounded-lg">
+                        <label class="flex items-center gap-2 cursor-pointer text-red-400">
+                            <input type="checkbox" id="uninstall-purge" class="w-4 h-4">
+                            <span>Purge all data (DESTRUCTIVE - removes databases and configs)</span>
+                        </label>
+                    </div>
+                </div>
+                <div class="flex justify-end gap-4 mt-6">
+                    <button type="button" onclick="window.databasesPage.hideUninstallEngine()" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600">
+                        Cancel
+                    </button>
+                    <button type="button" onclick="window.databasesPage.confirmUninstallEngine()" class="bg-red-600 hover:bg-red-700 px-6 py-2 rounded-lg">
+                        Uninstall
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Import SQL Modal -->
+    <div id="import-sql-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center">
+        <div class="modal-backdrop absolute inset-0" onclick="window.databasesPage.hideImportSql()"></div>
+        <div class="relative w-full max-w-lg mx-4">
+            <div class="card p-6 modal-content">
+                <h3 class="text-xl font-semibold mb-6 flex items-center gap-2">
+                    <i class="fas fa-file-import text-blue-400"></i>
+                    Import SQL File
+                </h3>
+                <form onsubmit="window.databasesPage.importSql(event)" class="space-y-4">
+                    <input type="hidden" id="import-sql-engine">
+                    <div>
+                        <label class="form-label">Database Name</label>
+                        <input type="text" id="import-sql-database" name="database" class="form-input" 
+                            placeholder="Database to import into" required>
+                        <p class="text-xs text-slate-500 mt-1">Will be created if it doesn't exist</p>
+                    </div>
+                    <div>
+                        <label class="form-label">SQL File Path</label>
+                        <input type="text" id="import-sql-path" name="path" class="form-input" 
+                            placeholder="/path/to/file.sql or /path/to/file.sql.gz" required>
+                        <p class="text-xs text-slate-500 mt-1">Supports .sql and .sql.gz files</p>
+                    </div>
+                    <div class="p-3 bg-red-500/10 border border-red-500/30 rounded-lg">
+                        <label class="flex items-center gap-2 cursor-pointer text-red-400">
+                            <input type="checkbox" id="import-sql-drop" name="drop" class="w-4 h-4">
+                            <span>Drop existing database before import (DESTRUCTIVE)</span>
+                        </label>
+                    </div>
+                    <div class="flex justify-end gap-4 mt-6">
+                        <button type="button" onclick="window.databasesPage.hideImportSql()" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600">
+                            Cancel
+                        </button>
+                        <button type="submit" class="btn-primary px-6 py-2 rounded-lg">
+                            Import
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Connection String Modal -->
+    <div id="connection-string-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center">
+        <div class="modal-backdrop absolute inset-0" onclick="window.databasesPage.hideConnectionString()"></div>
+        <div class="relative w-full max-w-lg mx-4">
+            <div class="card p-6 modal-content">
+                <h3 class="text-xl font-semibold mb-6 flex items-center gap-2">
+                    <i class="fas fa-link text-blue-400"></i>
+                    Connection String Generator
+                </h3>
+                <div class="space-y-4">
+                    <input type="hidden" id="conn-engine">
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label class="form-label">Engine</label>
+                            <input type="text" id="conn-engine-display" class="form-input bg-slate-800" readonly>
+                        </div>
+                        <div>
+                            <label class="form-label">Database *</label>
+                            <input type="text" id="conn-database" class="form-input" placeholder="my_database">
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label class="form-label">Username *</label>
+                            <input type="text" id="conn-username" class="form-input" placeholder="db_user">
+                        </div>
+                        <div>
+                            <label class="form-label">Password</label>
+                            <input type="password" id="conn-password" class="form-input" placeholder="••••••••">
+                        </div>
+                    </div>
+                    <div>
+                        <label class="form-label">Host</label>
+                        <input type="text" id="conn-host" class="form-input" placeholder="localhost" value="localhost">
+                    </div>
+                    <div>
+                        <label class="form-label">Connection String</label>
+                        <div class="flex gap-2">
+                            <input type="text" id="conn-string-output" class="form-input flex-1 font-mono text-sm" placeholder="Click Generate..." readonly>
+                            <button onclick="window.databasesPage.copyConnectionString()" class="bg-slate-700 px-4 py-2 rounded-lg hover:bg-slate-600" title="Copy">
+                                <i class="fas fa-copy"></i>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+                <div class="flex justify-end gap-4 mt-6">
+                    <button type="button" onclick="window.databasesPage.hideConnectionString()" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600">
+                        Close
+                    </button>
+                    <button type="button" onclick="window.databasesPage.generateConnectionString()" class="btn-primary px-6 py-2 rounded-lg">
+                        Generate
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Query Modal -->
+    <div id="query-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center">
+        <div class="modal-backdrop absolute inset-0" onclick="window.databasesPage.hideQueryModal()"></div>
+        <div class="relative w-full max-w-2xl mx-4">
+            <div class="card p-6 modal-content">
+                <h3 class="text-xl font-semibold mb-6 flex items-center gap-2">
+                    <i class="fas fa-terminal text-green-400"></i>
+                    Execute Query
+                </h3>
+                <div class="space-y-4">
+                    <input type="hidden" id="query-modal-engine">
+                    <div>
+                        <label class="form-label">Database</label>
+                        <input type="text" id="query-modal-database" readonly class="form-input bg-slate-800">
+                    </div>
+                    <div>
+                        <label class="form-label">SQL Query</label>
+                        <textarea id="query-modal-input" class="w-full h-32 bg-slate-900 text-green-400 font-mono text-sm p-4 rounded-lg border border-slate-700 focus:border-indigo-500 focus:outline-none resize-y" placeholder="SELECT * FROM users LIMIT 10;"></textarea>
+                    </div>
+                    <div id="query-modal-results">
+                        <div class="text-slate-400 text-center py-4">Execute a query to see results</div>
+                    </div>
+                </div>
+                <div class="flex justify-end gap-4 mt-6">
+                    <button type="button" onclick="window.databasesPage.hideQueryModal()" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600">
+                        Close
+                    </button>
+                    <button type="button" onclick="window.databasesPage.executeModalQuery()" class="btn-primary px-6 py-2 rounded-lg">
+                        <i class="fas fa-play mr-2"></i>Execute
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Backup Database Modal -->
+    <div id="backup-db-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center">
+        <div class="modal-backdrop absolute inset-0" onclick="window.databasesPage.hideBackupDb()"></div>
+        <div class="relative w-full max-w-lg mx-4">
+            <div class="card p-6 modal-content">
+                <h3 class="text-xl font-semibold mb-6">Backup Database</h3>
+                <form id="backup-db-form" onsubmit="window.databasesPage.createDbBackup(event)">
+                    <div class="space-y-4">
+                        <input type="hidden" id="backup-db-engine">
+                        <div id="backup-db-select-container" class="hidden">
+                            <label class="form-label">Database *</label>
+                            <select id="backup-db-select" class="form-input">
+                                <option value="">Select database...</option>
+                            </select>
+                        </div>
+                        <div id="backup-db-input-container">
+                            <label class="form-label">Database</label>
+                            <input type="text" id="backup-db-name" readonly class="form-input bg-slate-800">
+                        </div>
+                        <div>
+                            <label class="flex items-center gap-2 cursor-pointer">
+                                <input type="checkbox" id="backup-db-compress" checked class="w-4 h-4">
+                                <span>Compress backup (gzip)</span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="flex justify-end gap-4 mt-6">
+                        <button type="button" onclick="window.databasesPage.hideBackupDb()" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600">
+                            Cancel
+                        </button>
+                        <button type="submit" class="btn-primary px-6 py-2 rounded-lg">
+                            Create Backup
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Restore Database Modal -->
+    <div id="restore-backup-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center">
+        <div class="modal-backdrop absolute inset-0" onclick="window.databasesPage.hideRestoreBackup()"></div>
+        <div class="relative w-full max-w-lg mx-4">
+            <div class="card p-6 modal-content">
+                <h3 class="text-xl font-semibold mb-6">Restore Database</h3>
+                <form id="restore-backup-form" onsubmit="window.databasesPage.restoreBackup(event)">
+                    <div class="space-y-4">
+                        <input type="hidden" id="restore-engine">
+                        <input type="hidden" id="restore-path">
+                        <div>
+                            <label class="form-label">Target Database</label>
+                            <input type="text" id="restore-database" class="form-input" placeholder="database_name">
+                            <p class="text-xs text-slate-500 mt-1">Leave as-is to restore to original name</p>
+                        </div>
+                        <div class="p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg">
+                            <label class="flex items-center gap-2 cursor-pointer text-yellow-400">
+                                <input type="checkbox" id="restore-drop-existing" class="w-4 h-4">
+                                <span>Drop existing database first (DESTRUCTIVE)</span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="flex justify-end gap-4 mt-6">
+                        <button type="button" onclick="window.databasesPage.hideRestoreBackup()" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600">
+                            Cancel
+                        </button>
+                        <button type="submit" class="btn-primary px-6 py-2 rounded-lg">
+                            Restore
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
     
     <!-- Create Backup Modal -->
     <div id="create-backup-modal" class="fixed inset-0 z-50 hidden flex items-center justify-center">

@@ -2,7 +2,7 @@ Format: 1.0
 Source: wasm
 Binary: wasm
 Architecture: all
-Version: 0.11.4-1
+Version: 0.13.0-1
 Maintainer: Yago López Prado <yago.lopez.adeje@gmail.com>
 Homepage: https://github.com/Perkybeet/wasm
 Standards-Version: 4.6.0

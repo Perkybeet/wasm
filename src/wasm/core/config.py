@@ -90,6 +90,32 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "token_expiration_hours": 24,
         "ip_whitelist": [],
     },
+    "databases": {
+        "backup_dir": "/var/backups/wasm/databases",
+        "default_encoding": {
+            "mysql": "utf8mb4",
+            "postgresql": "UTF8",
+        },
+        "credentials": {
+            "mysql": {
+                "user": "root",
+                "password": "",
+            },
+            "postgresql": {
+                "user": "postgres",
+                "password": "",
+            },
+            "redis": {
+                "password": "",
+            },
+            "mongodb": {
+                "user": "",
+                "password": "",
+            },
+        },
+        "auto_start": True,  # Start engine on install
+        "auto_enable": True,  # Enable on boot on install
+    },
 }
 
 

@@ -264,6 +264,7 @@ class GlobalSearch {
             { name: 'Logs', page: 'logs', icon: 'fa-terminal' },
             { name: 'Jobs', page: 'jobs', icon: 'fa-tasks' },
             { name: 'Backups', page: 'backups', icon: 'fa-archive' },
+            { name: 'Databases', page: 'databases', icon: 'fa-database' },
             { name: 'Settings', page: 'config', icon: 'fa-sliders-h' }
         ];
 

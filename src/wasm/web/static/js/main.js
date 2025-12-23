@@ -29,6 +29,7 @@ import logsPage from './pages/logs.js';
 import jobsPage from './pages/jobs.js';
 import backupsPage from './pages/backups.js';
 import configPage from './pages/config.js';
+import databasesPage from './pages/databases.js';
 
 // Metrics component
 import { updateMetrics } from './components/metrics.js';
@@ -45,6 +46,7 @@ window.logsPage = logsPage;
 window.jobsPage = jobsPage;
 window.backupsPage = backupsPage;
 window.configPage = configPage;
+window.databasesPage = databasesPage;
 
 // Global functions called from HTML
 window.showCreateAppModal = () => appsPage.showCreate();
@@ -129,6 +131,7 @@ async function init() {
         .register('logs', logsPage.load)
         .register('jobs', jobsPage.load)
         .register('backups', backupsPage.load)
+        .register('databases', databasesPage.load)
         .register('config', configPage.load)
         .loadInitialPage();
 

@@ -198,3 +198,43 @@ class SetupError(WASMError):
     missing dependencies, etc.)
     """
     pass
+
+
+class DatabaseError(WASMError):
+    """Base exception for database operations."""
+    pass
+
+
+class DatabaseConnectionError(DatabaseError):
+    """Raised when database connection fails."""
+    pass
+
+
+class DatabaseNotFoundError(DatabaseError):
+    """Raised when a database does not exist."""
+    pass
+
+
+class DatabaseExistsError(DatabaseError):
+    """Raised when trying to create a database that already exists."""
+    pass
+
+
+class DatabaseUserError(DatabaseError):
+    """Raised when database user operations fail."""
+    pass
+
+
+class DatabaseEngineError(DatabaseError):
+    """Raised when database engine operations fail (install, start, stop)."""
+    pass
+
+
+class DatabaseBackupError(DatabaseError):
+    """Raised when database backup/restore operations fail."""
+    pass
+
+
+class DatabaseQueryError(DatabaseError):
+    """Raised when a database query fails."""
+    pass

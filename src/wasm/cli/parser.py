@@ -103,6 +103,9 @@ For more information, visit: https://github.com/Perkybeet/wasm
     # Rollback command
     _add_rollback_parser(subparsers)
     
+    # Database commands
+    _add_db_parser(subparsers)
+    
     # Web interface commands
     _add_web_parser(subparsers)
     
@@ -998,6 +1001,484 @@ def _add_rollback_parser(subparsers) -> None:
     )
 
 
+def _add_db_parser(subparsers) -> None:
+    """Add database management commands."""
+    db = subparsers.add_parser(
+        "db",
+        aliases=["database"],
+        help="Database management",
+        description="Install, manage, and configure database engines (MySQL, PostgreSQL, Redis, MongoDB)",
+    )
+    
+    db_sub = db.add_subparsers(
+        dest="action",
+        title="actions",
+        description="Database actions",
+        metavar="<action>",
+    )
+    
+    # Common arguments for engine
+    engine_help = "Database engine (mysql, postgresql, redis, mongodb)"
+    
+    # ==================== Engine Management ====================
+    
+    # db install
+    install = db_sub.add_parser(
+        "install",
+        help="Install a database engine",
+    )
+    install.add_argument(
+        "engine",
+        help=engine_help,
+    )
+    
+    # db uninstall
+    uninstall = db_sub.add_parser(
+        "uninstall",
+        help="Uninstall a database engine",
+    )
+    uninstall.add_argument(
+        "engine",
+        help=engine_help,
+    )
+    uninstall.add_argument(
+        "--purge",
+        action="store_true",
+        help="Remove all data and configuration",
+    )
+    uninstall.add_argument(
+        "--force", "-f", "-y",
+        action="store_true",
+        help="Skip confirmation",
+    )
+    
+    # db status
+    status = db_sub.add_parser(
+        "status",
+        help="Show database engine status",
+    )
+    status.add_argument(
+        "engine",
+        nargs="?",
+        help=f"{engine_help} (omit to show all)",
+    )
+    status.add_argument(
+        "--json",
+        action="store_true",
+        help="Output in JSON format",
+    )
+    
+    # db start
+    start = db_sub.add_parser(
+        "start",
+        help="Start a database engine",
+    )
+    start.add_argument(
+        "engine",
+        help=engine_help,
+    )
+    
+    # db stop
+    stop = db_sub.add_parser(
+        "stop",
+        help="Stop a database engine",
+    )
+    stop.add_argument(
+        "engine",
+        help=engine_help,
+    )
+    
+    # db restart
+    restart = db_sub.add_parser(
+        "restart",
+        help="Restart a database engine",
+    )
+    restart.add_argument(
+        "engine",
+        help=engine_help,
+    )
+    
+    # db engines
+    engines = db_sub.add_parser(
+        "engines",
+        help="List available database engines",
+    )
+    engines.add_argument(
+        "--json",
+        action="store_true",
+        help="Output in JSON format",
+    )
+    
+    # ==================== Database Management ====================
+    
+    # db create
+    create = db_sub.add_parser(
+        "create",
+        help="Create a new database",
+    )
+    create.add_argument(
+        "name",
+        help="Database name",
+    )
+    create.add_argument(
+        "--engine", "-e",
+        required=True,
+        help=engine_help,
+    )
+    create.add_argument(
+        "--owner", "-o",
+        help="Database owner (user)",
+    )
+    create.add_argument(
+        "--encoding",
+        help="Character encoding (default: UTF8)",
+    )
+    
+    # db drop
+    drop = db_sub.add_parser(
+        "drop",
+        help="Drop a database",
+    )
+    drop.add_argument(
+        "name",
+        help="Database name",
+    )
+    drop.add_argument(
+        "--engine", "-e",
+        required=True,
+        help=engine_help,
+    )
+    drop.add_argument(
+        "--force", "-f", "-y",
+        action="store_true",
+        help="Skip confirmation",
+    )
+    
+    # db list
+    list_cmd = db_sub.add_parser(
+        "list",
+        aliases=["ls"],
+        help="List databases",
+    )
+    list_cmd.add_argument(
+        "--engine", "-e",
+        help=f"{engine_help} (omit to list all)",
+    )
+    list_cmd.add_argument(
+        "--json",
+        action="store_true",
+        help="Output in JSON format",
+    )
+    
+    # db info
+    info = db_sub.add_parser(
+        "info",
+        help="Show database information",
+    )
+    info.add_argument(
+        "name",
+        help="Database name",
+    )
+    info.add_argument(
+        "--engine", "-e",
+        required=True,
+        help=engine_help,
+    )
+    info.add_argument(
+        "--json",
+        action="store_true",
+        help="Output in JSON format",
+    )
+    
+    # ==================== User Management ====================
+    
+    # db user-create
+    user_create = db_sub.add_parser(
+        "user-create",
+        help="Create a database user",
+    )
+    user_create.add_argument(
+        "username",
+        help="Username",
+    )
+    user_create.add_argument(
+        "--engine", "-e",
+        required=True,
+        help=engine_help,
+    )
+    user_create.add_argument(
+        "--password", "-p",
+        help="Password (generated if not provided)",
+    )
+    user_create.add_argument(
+        "--database", "-d",
+        help="Grant access to this database",
+    )
+    user_create.add_argument(
+        "--host",
+        default="localhost",
+        help="Host restriction (default: localhost)",
+    )
+    
+    # db user-delete
+    user_delete = db_sub.add_parser(
+        "user-delete",
+        help="Delete a database user",
+    )
+    user_delete.add_argument(
+        "username",
+        help="Username",
+    )
+    user_delete.add_argument(
+        "--engine", "-e",
+        required=True,
+        help=engine_help,
+    )
+    user_delete.add_argument(
+        "--host",
+        default="localhost",
+        help="Host restriction",
+    )
+    user_delete.add_argument(
+        "--force", "-f", "-y",
+        action="store_true",
+        help="Skip confirmation",
+    )
+    
+    # db user-list
+    user_list = db_sub.add_parser(
+        "user-list",
+        help="List database users",
+    )
+    user_list.add_argument(
+        "--engine", "-e",
+        required=True,
+        help=engine_help,
+    )
+    user_list.add_argument(
+        "--json",
+        action="store_true",
+        help="Output in JSON format",
+    )
+    
+    # db grant
+    grant = db_sub.add_parser(
+        "grant",
+        help="Grant privileges to a user",
+    )
+    grant.add_argument(
+        "username",
+        help="Username",
+    )
+    grant.add_argument(
+        "database",
+        help="Database name",
+    )
+    grant.add_argument(
+        "--engine", "-e",
+        required=True,
+        help=engine_help,
+    )
+    grant.add_argument(
+        "--privileges",
+        help="Comma-separated list of privileges (default: ALL)",
+    )
+    grant.add_argument(
+        "--host",
+        default="localhost",
+        help="Host restriction",
+    )
+    
+    # db revoke
+    revoke = db_sub.add_parser(
+        "revoke",
+        help="Revoke privileges from a user",
+    )
+    revoke.add_argument(
+        "username",
+        help="Username",
+    )
+    revoke.add_argument(
+        "database",
+        help="Database name",
+    )
+    revoke.add_argument(
+        "--engine", "-e",
+        required=True,
+        help=engine_help,
+    )
+    revoke.add_argument(
+        "--privileges",
+        help="Comma-separated list of privileges (default: ALL)",
+    )
+    revoke.add_argument(
+        "--host",
+        default="localhost",
+        help="Host restriction",
+    )
+    
+    # ==================== Backup & Restore ====================
+    
+    # db backup
+    backup = db_sub.add_parser(
+        "backup",
+        help="Backup a database",
+    )
+    backup.add_argument(
+        "database",
+        help="Database name",
+    )
+    backup.add_argument(
+        "--engine", "-e",
+        required=True,
+        help=engine_help,
+    )
+    backup.add_argument(
+        "--output", "-o",
+        help="Output file path",
+    )
+    backup.add_argument(
+        "--no-compress",
+        action="store_true",
+        help="Don't compress the backup",
+    )
+    
+    # db restore
+    restore = db_sub.add_parser(
+        "restore",
+        help="Restore a database from backup",
+    )
+    restore.add_argument(
+        "database",
+        help="Database name",
+    )
+    restore.add_argument(
+        "file",
+        help="Backup file path",
+    )
+    restore.add_argument(
+        "--engine", "-e",
+        required=True,
+        help=engine_help,
+    )
+    restore.add_argument(
+        "--drop",
+        action="store_true",
+        help="Drop existing database before restore",
+    )
+    restore.add_argument(
+        "--force", "-f", "-y",
+        action="store_true",
+        help="Skip confirmation",
+    )
+    
+    # db backups
+    backups = db_sub.add_parser(
+        "backups",
+        help="List available backups",
+    )
+    backups.add_argument(
+        "--engine", "-e",
+        help=engine_help,
+    )
+    backups.add_argument(
+        "--database", "-d",
+        help="Filter by database name",
+    )
+    backups.add_argument(
+        "--json",
+        action="store_true",
+        help="Output in JSON format",
+    )
+    
+    # ==================== Query & Connection ====================
+    
+    # db query
+    query = db_sub.add_parser(
+        "query",
+        help="Execute a query",
+    )
+    query.add_argument(
+        "database",
+        help="Database name",
+    )
+    query.add_argument(
+        "query",
+        help="Query to execute",
+    )
+    query.add_argument(
+        "--engine", "-e",
+        required=True,
+        help=engine_help,
+    )
+    
+    # db connect
+    connect = db_sub.add_parser(
+        "connect",
+        help="Connect to a database interactively",
+    )
+    connect.add_argument(
+        "--engine", "-e",
+        required=True,
+        help=engine_help,
+    )
+    connect.add_argument(
+        "--database", "-d",
+        help="Database name",
+    )
+    connect.add_argument(
+        "--username", "-u",
+        help="Username",
+    )
+    
+    # db connection-string
+    conn_string = db_sub.add_parser(
+        "connection-string",
+        help="Generate a connection string",
+    )
+    conn_string.add_argument(
+        "database",
+        help="Database name",
+    )
+    conn_string.add_argument(
+        "username",
+        help="Username",
+    )
+    conn_string.add_argument(
+        "--engine", "-e",
+        required=True,
+        help=engine_help,
+    )
+    conn_string.add_argument(
+        "--password", "-p",
+        help="Password (shown as placeholder if not provided)",
+    )
+    conn_string.add_argument(
+        "--host",
+        default="localhost",
+        help="Host (default: localhost)",
+    )
+
+    # db config
+    config = db_sub.add_parser(
+        "config",
+        help="Configure database engine credentials",
+    )
+    config.add_argument(
+        "--engine", "-e",
+        required=True,
+        help=engine_help,
+    )
+    config.add_argument(
+        "--user", "-u",
+        help="Admin username (e.g. root)",
+    )
+    config.add_argument(
+        "--password", "-p",
+        help="Admin password",
+    )
+
+
 def _add_web_parser(subparsers) -> None:
     """Add web interface commands."""
     web = subparsers.add_parser(
@@ -1078,6 +1559,22 @@ def _add_web_parser(subparsers) -> None:
         "--regenerate", "-r",
         action="store_true",
         help="Generate a new access token (revokes all sessions)",
+    )
+    
+    # web install
+    install = web_sub.add_parser(
+        "install",
+        help="Install web dashboard dependencies",
+    )
+    install.add_argument(
+        "--apt",
+        action="store_true",
+        help="Use apt to install system packages (Debian/Ubuntu)",
+    )
+    install.add_argument(
+        "--pip",
+        action="store_true",
+        help="Use pip to install user packages",
     )
 
 
