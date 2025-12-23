@@ -31,31 +31,6 @@ case "$1" in
             chown root:wasm /etc/wasm/config.yaml 2>/dev/null || true
             chmod 640 /etc/wasm/config.yaml 2>/dev/null || true
         fi
-        
-        echo ""
-        echo "========================================"
-        echo "  WASM v0.11.0 installed successfully!"
-        echo "========================================"
-        echo ""
-        echo "Quick start:"
-        echo "  sudo wasm --help         Show help"
-        echo "  sudo wasm -i             Interactive mode"
-        echo "  sudo wasm create -d DOMAIN -s SOURCE -t TYPE"
-        echo ""
-        echo "Monitor (AI security):"
-        echo "  sudo wasm monitor enable   Enable process monitoring"
-        echo "  sudo wasm monitor scan     Run security scan"
-        echo ""
-        echo "Shell completions installed for bash, zsh, and fish."
-        echo "Restart your shell to enable tab completion."
-        echo ""
-        echo "Configuration: /etc/wasm/config.yaml"
-        echo ""
-        echo "NOTE: To use wasm without sudo, add your user to the wasm group:"
-        echo "  sudo usermod -aG wasm \$USER"
-        echo "  (Log out and back in for changes to take effect)"
-        echo "========================================"
-        echo ""
         ;;
     
     abort-upgrade|abort-remove|abort-deconfigure)

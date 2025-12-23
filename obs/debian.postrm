@@ -5,7 +5,10 @@ case "$1" in
     remove)
         echo "Removing WASM..."
         # Don't remove apps or configuration on remove
-        ;;
+        ;;Follow instructions in [opus_4_5_system_prompt.prompt.md](vscode-userdata:/home/yago/.config/Code/User/profiles/-7c0a587f/prompts/opus_4_5_system_prompt.prompt.md).
+
+
+Quiero mejorar la página de consultas de reservas, en especial el calendario de reservas. Mejorar UX/UI, funcionalidades, menus contextuales personalziados dentro del calendario con funcionalidades debidamente implementadas y compeltas y robustas, etc... QUe propones?
     
     purge)
         echo "Purging WASM configuration..."
