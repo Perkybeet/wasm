@@ -98,6 +98,7 @@ cython_debug/
 Thumbs.db
 
 # Debian packaging
+.pybuild/
 debian/.debhelper/
 debian/wasm/
 debian/files
