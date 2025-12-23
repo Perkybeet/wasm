@@ -14,6 +14,7 @@ from wasm.web.api.monitor import router as monitor_router
 from wasm.web.api.jobs import router as jobs_router
 from wasm.web.api.config import router as config_router
 from wasm.web.api.backups import router as backups_router
+from wasm.web.api.databases import router as databases_router
 
 router = APIRouter()
 
@@ -28,3 +29,4 @@ router.include_router(monitor_router, prefix="/monitor", tags=["Monitor"])
 router.include_router(jobs_router, tags=["Jobs"])
 router.include_router(config_router, prefix="/config", tags=["Configuration"])
 router.include_router(backups_router, prefix="/backups", tags=["Backups"])
+router.include_router(databases_router, prefix="/databases", tags=["Databases"])

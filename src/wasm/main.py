@@ -20,6 +20,7 @@ from wasm.cli.commands import (
 from wasm.cli.commands.monitor import handle_monitor
 from wasm.cli.commands.backup import handle_backup, handle_rollback
 from wasm.cli.commands.web import handle_web
+from wasm.cli.commands.db import handle_db
 from wasm.core.logger import Logger
 from wasm.core.exceptions import WASMError
 
@@ -109,6 +110,13 @@ def main() -> int:
             print("Use: wasm web --help", file=sys.stderr)
             return 1
         return handle_web(args)
+    
+    elif command in ["db", "database"]:
+        if not args.action:
+            print("Error: db requires an action", file=sys.stderr)
+            print("Use: wasm db --help", file=sys.stderr)
+            return 1
+        return handle_db(args)
     
     else:
         print(f"Unknown command: {command}", file=sys.stderr)
