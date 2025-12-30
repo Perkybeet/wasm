@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.13.0
+Version:        0.13.1
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -119,15 +119,17 @@ echo "Note: You may need to install python3-inquirer via pip:"
 echo "  pip3 install inquirer"
 
 %changelog
+* Mon Dec 30 2025 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.1-1
+- Fix: Systemd services failing with 'Permission denied' when using nvm
+- Fix: Detect and avoid private paths (nvm, ~/.local) in service ExecStart
+- Fix: Prefer global Node.js installation over user-specific nvm paths
+- Enhancement: Add helpful error messages for nvm path issues
+
 * Mon Feb 24 2025 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.0-1
 - Feature: Database UI overhaul with logs, tabs, and SQL import
 - Feature: Database credential management via config.yaml
 - Fix: MySQL connection with password protection
 - Fix: Local environment installation issues
-
-* Thu Dec 19 2024 Perkybeet <yago.lopez.adeje@gmail.com> - 0.11.4-1
-- New feature: Web Interface Dashboard (wasm web start/stop/status)
-- REST API for remote application management
 - Real-time WebSocket updates for logs and events
 - Token-based authentication with JWT
 - Rate limiting and brute force protection
