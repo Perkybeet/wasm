@@ -1,3 +1,12 @@
+wasm (0.13.1-1) unstable; urgency=medium
+
+  * Fix: Systemd services failing with 'Permission denied' when using nvm
+  * Fix: Detect and avoid private paths (nvm, ~/.local) in service ExecStart
+  * Fix: Prefer global Node.js installation over user-specific nvm paths
+  * Enhancement: Add helpful error messages for nvm path issues
+
+ -- Yago López Prado <yago.lopez.adeje@gmail.com>  Mon, 30 Dec 2025 18:00:00 +0000
+
 wasm (0.13.0-1) unstable; urgency=medium
 
   * Feature: Database UI overhaul with logs, tabs, and SQL import
@@ -6,18 +15,6 @@ wasm (0.13.0-1) unstable; urgency=medium
   * Fix: Local environment installation issues
 
  -- Yago López Prado <yago.lopez.adeje@gmail.com>  Mon, 24 Feb 2025 12:00:00 +0000
-
-wasm (0.12.0-1) unstable; urgency=medium
-
-  * License: Changed to WASM-NCSAL (Non-Commercial Source-Available License)
-  * License: Commercial use now requires explicit authorization
-  * License: Added sublicensable rights for contributions
-  * Docs: Updated README with clear license terms and contact info
-  * Docs: Updated CONTRIBUTING.md with license notice
-  * Code: Added copyright headers to critical source files
-  * Meta: Updated author information across all configuration files
-
- -- Yago López Prado <yago.lopez.adeje@gmail.com>  Sun, 22 Dec 2024 12:00:00 +0000
 
 wasm (0.11.4-1) unstable; urgency=medium
 
