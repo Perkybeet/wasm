@@ -357,7 +357,7 @@ def _store_sync(args: Namespace, verbose: bool) -> int:
     """Sync store with actual systemd service states."""
     logger = Logger(verbose=verbose)
     
-    from wasm.core.store import get_store
+    from wasm.core.store import get_store, AppStatus
     from wasm.managers.service_manager import ServiceManager
     
     store = get_store()
@@ -365,7 +365,8 @@ def _store_sync(args: Namespace, verbose: bool) -> int:
     
     logger.header("Sync Service States")
     
-    synced = 0
+    synced_services = 0
+    synced_apps = 0
     services = store.list_services()
     
     for service in services:
@@ -379,14 +380,24 @@ def _store_sync(args: Namespace, verbose: bool) -> int:
         current_active = service.status == "active"
         current_enabled = service.enabled
         
-        # Update store if different
+        # Update service if different
         if current_active != active or current_enabled != enabled:
             store.update_service_status(service.name, active=active, enabled=enabled)
-            logger.substep(f"Updated {service.name}: active={active}, enabled={enabled}")
-            synced += 1
+            logger.substep(f"Updated service {service.name}: active={active}, enabled={enabled}")
+            synced_services += 1
+        
+        # Also update the associated app status
+        if service.app_id:
+            app = store.get_app_by_id(service.app_id)
+            if app:
+                new_status = AppStatus.RUNNING.value if active else AppStatus.STOPPED.value
+                if app.status != new_status:
+                    store.update_app_status(app.domain, new_status)
+                    logger.substep(f"Updated app {app.domain}: {new_status}")
+                    synced_apps += 1
     
     logger.blank()
-    logger.success(f"Sync complete! Updated {synced} services.")
+    logger.success(f"Sync complete! Updated {synced_services} services, {synced_apps} apps.")
     
     return 0
 

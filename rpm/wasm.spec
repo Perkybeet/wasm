@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.13.6
+Version:        0.13.7
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -119,6 +119,9 @@ echo "Note: You may need to install python3-inquirer via pip:"
 echo "  pip3 install inquirer"
 
 %changelog
+* Wed Jan 08 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.7-1
+- Fix: 'wasm store sync' now updates app status along with service status
+
 * Wed Jan 08 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.6-1
 - Fix: 'wasm store sync' attribute naming (service.status vs service.active)
 
