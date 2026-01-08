@@ -174,12 +174,23 @@ def _store_import(args: Namespace, verbose: bool) -> int:
                     pass
                 
                 # Check if we have an app directory
+                # Try multiple naming conventions
                 app_name = domain_to_app_name(domain)
-                app_path = config.apps_directory / app_name
+                possible_paths = [
+                    config.apps_directory / app_name,           # africarsrent-com
+                    config.apps_directory / domain,              # africarsrent.com
+                    config.apps_directory / f"wasm-{app_name}",  # wasm-africarsrent-com
+                ]
+                
+                app_path = None
+                for path in possible_paths:
+                    if path.exists():
+                        app_path = path
+                        break
                 
                 # Create app record if app directory exists
                 app_id = None
-                if app_path.exists():
+                if app_path:
                     app = App(
                         domain=domain,
                         app_type="unknown",  # Can't detect type from just the site
