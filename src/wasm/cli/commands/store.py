@@ -208,11 +208,7 @@ def _store_import(args: Namespace, verbose: bool) -> int:
         for config_file in NGINX_SITES_AVAILABLE.iterdir():
             if config_file.is_file() and config_file.name != "default":
                 domain = config_file.name
-                
-                # Skip if already in store
-                if store.get_site(domain):
-                    logger.substep(f"Skipping {domain} (already tracked)")
-                    continue
+                site_exists = store.get_site(domain) is not None
                 
                 enabled = (NGINX_SITES_ENABLED / domain).exists()
                 
@@ -247,25 +243,24 @@ def _store_import(args: Namespace, verbose: bool) -> int:
                         app_path = path
                         break
                 
-                # Create app record if app directory exists
+                # Create or update app record if app directory exists
                 app_id = None
                 if app_path:
                     # Detect app type from project files
                     app_type = _detect_app_type(app_path)
                     
-                    app = App(
-                        domain=domain,
-                        app_type=app_type,
-                        app_path=str(app_path),
-                        webserver="nginx",
-                        ssl_enabled=(NGINX_SITES_ENABLED / domain).exists(),
-                        status=AppStatus.UNKNOWN.value,
-                        is_static=is_static,
-                        port=proxy_port,
-                    )
-                    
                     existing_app = store.get_app(domain)
                     if not existing_app:
+                        app = App(
+                            domain=domain,
+                            app_type=app_type,
+                            app_path=str(app_path),
+                            webserver="nginx",
+                            ssl_enabled=(NGINX_SITES_ENABLED / domain).exists(),
+                            status=AppStatus.UNKNOWN.value,
+                            is_static=is_static,
+                            port=proxy_port,
+                        )
                         app = store.create_app(app)
                         app_id = app.id
                         imported_apps += 1
@@ -280,19 +275,19 @@ def _store_import(args: Namespace, verbose: bool) -> int:
                     else:
                         app_id = existing_app.id
                 
-                
-                # Create site record
-                site = Site(
-                    app_id=app_id,
-                    domain=domain,
-                    webserver="nginx",
-                    config_path=str(config_file),
-                    enabled=enabled,
-                    is_static=is_static,
-                    proxy_port=proxy_port,
-                )
-                store.create_site(site)
-                imported_sites += 1
+                # Create site record only if it doesn't exist
+                if not site_exists:
+                    site = Site(
+                        app_id=app_id,
+                        domain=domain,
+                        webserver="nginx",
+                        config_path=str(config_file),
+                        enabled=enabled,
+                        is_static=is_static,
+                        proxy_port=proxy_port,
+                    )
+                    store.create_site(site)
+                    imported_sites += 1
     else:
         logger.step(1, 3, "No Nginx sites found")
     
