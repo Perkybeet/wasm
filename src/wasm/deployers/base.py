@@ -16,6 +16,15 @@ from wasm.core.config import Config
 from wasm.core.logger import Logger
 from wasm.core.exceptions import DeploymentError, BuildError, OutOfMemoryError
 from wasm.core.utils import run_command, domain_to_app_name
+from wasm.core.store import (
+    get_store,
+    App,
+    Site,
+    Service,
+    AppType,
+    AppStatus,
+    WebServer,
+)
 from wasm.managers.nginx_manager import NginxManager
 from wasm.managers.apache_manager import ApacheManager
 from wasm.managers.service_manager import ServiceManager
@@ -59,6 +68,7 @@ class BaseDeployer(ABC):
         self.verbose = verbose
         self.config = Config()
         self.logger = Logger(verbose=verbose)
+        self.store = get_store()
         
         # Managers
         self.source_manager = SourceManager(verbose=verbose)
@@ -829,7 +839,47 @@ class BaseDeployer(ABC):
         # Reload web server
         manager.reload()
         
+        # Register site in store
+        self._register_site_in_store(with_ssl, template)
+        
         return True
+    
+    def _register_site_in_store(self, with_ssl: bool, template: str) -> None:
+        """Register or update site in persistent store."""
+        from wasm.core.config import NGINX_SITES_AVAILABLE, APACHE_SITES_AVAILABLE
+        
+        config_path = (
+            NGINX_SITES_AVAILABLE if self.webserver == "nginx"
+            else APACHE_SITES_AVAILABLE
+        ) / self.domain
+        
+        is_static = template == "static"
+        
+        # Get app_id if app exists
+        app = self.store.get_app(self.domain)
+        app_id = app.id if app else None
+        
+        existing_site = self.store.get_site(self.domain)
+        
+        site = Site(
+            id=existing_site.id if existing_site else None,
+            app_id=app_id,
+            domain=self.domain,
+            webserver=self.webserver,
+            config_path=str(config_path),
+            enabled=True,
+            is_static=is_static,
+            document_root=str(self.app_path) if is_static else None,
+            proxy_port=self.port if not is_static else None,
+            ssl_enabled=with_ssl,
+            ssl_certificate=f"/etc/letsencrypt/live/{self.domain}/fullchain.pem" if with_ssl else None,
+            ssl_key=f"/etc/letsencrypt/live/{self.domain}/privkey.pem" if with_ssl else None,
+        )
+        
+        if existing_site:
+            self.store.update_site(site)
+        else:
+            self.store.create_site(site)
     
     def create_service(self) -> bool:
         """
@@ -862,7 +912,44 @@ class BaseDeployer(ABC):
         # Enable service
         self.service_manager.enable(self.app_name)
         
+        # Register service in store
+        self._register_service_in_store(start_command, env)
+        
         return True
+    
+    def _register_service_in_store(self, command: str, env: Dict[str, str]) -> None:
+        """Register service in persistent store."""
+        from wasm.core.config import SYSTEMD_DIR
+        
+        # Get app_id if app exists
+        app = self.store.get_app(self.domain)
+        app_id = app.id if app else None
+        
+        # Service name without prefix (store handles that)
+        service_name = self.app_name
+        service_file = SYSTEMD_DIR / f"wasm-{self.app_name}.service"
+        
+        existing_service = self.store.get_service(service_name)
+        
+        service = Service(
+            id=existing_service.id if existing_service else None,
+            app_id=app_id,
+            name=service_name,
+            service_file=str(service_file),
+            working_directory=str(self.app_path),
+            command=command,
+            user=self.config.service_user,
+            group=self.config.service_group,
+            enabled=True,
+            active=False,  # Will be set to True after start
+            port=self.port,
+            environment=env,
+        )
+        
+        if existing_service:
+            self.store.update_service(service)
+        else:
+            self.store.create_service(service)
     
     def obtain_certificate(self) -> bool:
         """
@@ -966,9 +1053,13 @@ class BaseDeployer(ABC):
         """
         from wasm.core.logger import Icons
         from wasm.core.exceptions import CertificateError
+        from datetime import datetime
         
         # Track if SSL was successfully obtained
         ssl_obtained = False
+        
+        # Register app in store at the start
+        app = self._register_app_in_store(AppStatus.DEPLOYING.value)
         
         try:
             # Step 1: Fetch source
@@ -1015,6 +1106,15 @@ class BaseDeployer(ABC):
             self.logger.step(7, total_steps, "Starting application", Icons.ROCKET)
             self.start()
             
+            # Update app status to running
+            app.status = AppStatus.RUNNING.value
+            app.ssl_enabled = ssl_obtained
+            app.deployed_at = datetime.now().isoformat()
+            self.store.update_app(app)
+            
+            # Update service status
+            self.store.update_service_status(self.app_name, active=True, enabled=True)
+            
             # Health check
             if self.health_check():
                 self.logger.success(f"Application deployed successfully!")
@@ -1033,5 +1133,45 @@ class BaseDeployer(ABC):
                 return True  # Still consider it successful
                 
         except Exception as e:
+            # Update app status to failed
+            app.status = AppStatus.FAILED.value
+            self.store.update_app(app)
             self.logger.error(f"Deployment failed: {e}")
             raise
+    
+    def _register_app_in_store(self, status: str) -> App:
+        """
+        Register or update application in persistent store.
+        
+        Args:
+            status: Initial app status.
+            
+        Returns:
+            The created or updated App object.
+        """
+        existing_app = self.store.get_app(self.domain)
+        
+        # Determine if this is a static app
+        is_static = not bool(self.get_start_command())
+        
+        app = App(
+            id=existing_app.id if existing_app else None,
+            domain=self.domain,
+            app_type=self.APP_TYPE,
+            source=self.source,
+            branch=self.branch,
+            port=self.port if not is_static else None,
+            app_path=str(self.app_path),
+            webserver=self.webserver,
+            ssl_enabled=self.ssl,
+            status=status,
+            is_static=is_static,
+            env_vars=self.env_vars,
+        )
+        
+        if existing_app:
+            # Preserve created_at and deployed_at if updating
+            app.created_at = existing_app.created_at
+            return self.store.update_app(app)
+        else:
+            return self.store.create_app(app)

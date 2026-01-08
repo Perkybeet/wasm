@@ -106,6 +106,9 @@ For more information, visit: https://github.com/Perkybeet/wasm
     # Database commands
     _add_db_parser(subparsers)
     
+    # Store commands
+    _add_store_parser(subparsers)
+    
     # Web interface commands
     _add_web_parser(subparsers)
     
@@ -1575,6 +1578,67 @@ def _add_web_parser(subparsers) -> None:
         "--pip",
         action="store_true",
         help="Use pip to install user packages",
+    )
+
+
+def _add_store_parser(subparsers) -> None:
+    """Add store management commands."""
+    store = subparsers.add_parser(
+        "store",
+        help="Manage WASM persistence store",
+        description="Initialize, manage, and query the SQLite persistence store",
+    )
+    
+    store_sub = store.add_subparsers(
+        dest="action",
+        title="actions",
+        description="Store actions",
+        metavar="<action>",
+    )
+    
+    # store init
+    store_sub.add_parser(
+        "init",
+        help="Initialize or reinitialize the store database",
+    )
+    
+    # store stats
+    stats = store_sub.add_parser(
+        "stats",
+        help="Show store statistics",
+    )
+    stats.add_argument(
+        "--json",
+        action="store_true",
+        help="Output as JSON",
+    )
+    
+    # store import
+    store_sub.add_parser(
+        "import",
+        help="Import legacy apps from systemd services and nginx configs",
+    )
+    
+    # store export
+    export = store_sub.add_parser(
+        "export",
+        help="Export store data to JSON",
+    )
+    export.add_argument(
+        "--output", "-o",
+        help="Output file (stdout if not specified)",
+    )
+    
+    # store sync
+    store_sub.add_parser(
+        "sync",
+        help="Sync store with actual systemd service states",
+    )
+    
+    # store path
+    store_sub.add_parser(
+        "path",
+        help="Show the database file path",
     )
 
 

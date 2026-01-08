@@ -18,6 +18,7 @@ from wasm.core.config import (
     APACHE_SITES_AVAILABLE,
     APACHE_SITES_ENABLED,
 )
+from wasm.core.store import get_store
 
 router = APIRouter()
 
@@ -104,28 +105,42 @@ async def list_sites(
     """
     List all configured sites.
     """
+    store = get_store()
     webserver = _detect_webserver()
     
-    if webserver == "nginx":
-        available_dir = NGINX_SITES_AVAILABLE
-        enabled_dir = NGINX_SITES_ENABLED
-    else:
-        available_dir = APACHE_SITES_AVAILABLE
-        enabled_dir = APACHE_SITES_ENABLED
+    # Get sites from store
+    stored_sites = store.list_sites()
     
     sites = []
+    for site in stored_sites:
+        sites.append(SiteInfo(
+            name=site.domain,
+            webserver=site.webserver,
+            enabled=site.enabled,
+            config_path=site.config_path or "",
+            has_ssl=site.ssl
+        ))
     
-    if available_dir.exists():
-        for config_file in available_dir.iterdir():
-            if config_file.is_file() and not config_file.name.startswith("."):
-                enabled_link = enabled_dir / config_file.name
-                sites.append(SiteInfo(
-                    name=config_file.name,
-                    webserver=webserver,
-                    enabled=enabled_link.exists(),
-                    config_path=str(config_file),
-                    has_ssl=_check_ssl_in_config(config_file)
-                ))
+    # Fallback to filesystem if store is empty (for backwards compatibility)
+    if not sites:
+        if webserver == "nginx":
+            available_dir = NGINX_SITES_AVAILABLE
+            enabled_dir = NGINX_SITES_ENABLED
+        else:
+            available_dir = APACHE_SITES_AVAILABLE
+            enabled_dir = APACHE_SITES_ENABLED
+        
+        if available_dir.exists():
+            for config_file in available_dir.iterdir():
+                if config_file.is_file() and not config_file.name.startswith("."):
+                    enabled_link = enabled_dir / config_file.name
+                    sites.append(SiteInfo(
+                        name=config_file.name,
+                        webserver=webserver,
+                        enabled=enabled_link.exists(),
+                        config_path=str(config_file),
+                        has_ssl=_check_ssl_in_config(config_file)
+                    ))
     
     return SiteListResponse(
         sites=sites,
@@ -143,8 +158,22 @@ async def get_site(
     """
     Get details for a specific site.
     """
+    store = get_store()
     webserver = _detect_webserver()
     
+    # Try store first
+    site = store.get_site(name)
+    
+    if site:
+        return SiteInfo(
+            name=site.domain,
+            webserver=site.webserver,
+            enabled=site.enabled,
+            config_path=site.config_path or "",
+            has_ssl=site.ssl
+        )
+    
+    # Fallback to filesystem
     if webserver == "nginx":
         available_dir = NGINX_SITES_AVAILABLE
         enabled_dir = NGINX_SITES_ENABLED

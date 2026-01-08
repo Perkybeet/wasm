@@ -183,32 +183,50 @@ def _handle_create(args: Namespace) -> int:
 def _handle_list(args: Namespace) -> int:
     """Handle webapp list command."""
     logger = Logger(verbose=args.verbose)
-    service_manager = ServiceManager(verbose=args.verbose)
+    
+    from wasm.core.store import get_store, AppStatus
+    store = get_store()
     
     logger.header("Deployed Applications")
     
-    services = service_manager.list_services()
+    apps = store.list_apps()
     
-    if not services:
+    if not apps:
         logger.info("No applications deployed")
+        logger.blank()
+        logger.info("Deploy an application with:")
+        logger.info("  wasm deploy -d example.com -s https://github.com/user/repo")
         return 0
     
     # Prepare table data
-    headers = ["Domain", "Status", "Service"]
+    headers = ["Domain", "Type", "Status", "Port", "SSL"]
     rows = []
     
-    for svc in services:
-        name = svc["name"]
-        # Extract domain from service name
-        if name.startswith("wasm-"):
-            domain = name[5:].replace("-", ".")
+    for app in apps:
+        # Determine status emoji
+        if app.status == AppStatus.RUNNING.value:
+            status_str = "🟢 Running"
+        elif app.status == AppStatus.STOPPED.value:
+            status_str = "🔴 Stopped"
+        elif app.status == AppStatus.DEPLOYING.value:
+            status_str = "🟡 Deploying"
+        elif app.status == AppStatus.FAILED.value:
+            status_str = "❌ Failed"
         else:
-            domain = name
+            status_str = "⚪ Unknown"
         
-        status = "🟢 Running" if svc["active"] == "active" else "🔴 Stopped"
-        rows.append([domain, status, name])
+        port_str = str(app.port) if app.port else "static"
+        ssl_str = "✓" if app.ssl_enabled else "✗"
+        
+        rows.append([app.domain, app.app_type, status_str, port_str, ssl_str])
     
     logger.table(headers, rows)
+    
+    # Show summary
+    logger.blank()
+    running = sum(1 for a in apps if a.status == AppStatus.RUNNING.value)
+    static = sum(1 for a in apps if a.is_static)
+    logger.info(f"Total: {len(apps)} apps ({running} running, {static} static)")
     
     return 0
 
@@ -218,25 +236,83 @@ def _handle_status(args: Namespace) -> int:
     logger = Logger(verbose=args.verbose)
     service_manager = ServiceManager(verbose=args.verbose)
     
+    from wasm.core.store import get_store
+    store = get_store()
+    
     domain = validate_domain(args.domain)
     app_name = domain_to_app_name(domain)
     
-    status = service_manager.get_status(app_name)
+    # First check the store
+    app_data = store.get_app_with_relations(domain)
+    
+    if not app_data or not app_data['app']:
+        # Fallback to systemd check for legacy apps
+        status = service_manager.get_status(app_name)
+        if not status["exists"]:
+            logger.warning(f"Application not found: {domain}")
+            return 1
+        
+        logger.header(f"Status: {domain}")
+        logger.warning("Legacy app (not in store)")
+        logger.key_value("Service", status["name"])
+        logger.key_value("Active", "Yes" if status["active"] else "No")
+        logger.key_value("Enabled", "Yes" if status["enabled"] else "No")
+        return 0
+    
+    app = app_data['app']
+    site = app_data['site']
+    service = app_data['service']
+    databases = app_data['databases']
     
     logger.header(f"Status: {domain}")
     
-    if not status["exists"]:
-        logger.warning(f"Application not found: {domain}")
-        return 1
+    # App info
+    logger.key_value("Type", app.app_type)
+    logger.key_value("Status", app.status)
+    logger.key_value("Path", app.app_path)
+    logger.key_value("Static", "Yes" if app.is_static else "No")
     
-    logger.key_value("Service", status["name"])
-    logger.key_value("Active", "Yes" if status["active"] else "No")
-    logger.key_value("Enabled", "Yes" if status["enabled"] else "No")
+    if app.port:
+        logger.key_value("Port", str(app.port))
     
-    if status.get("pid"):
-        logger.key_value("PID", status["pid"])
-    if status.get("uptime"):
-        logger.key_value("Started", status["uptime"])
+    if app.source:
+        logger.key_value("Source", app.source)
+        if app.branch:
+            logger.key_value("Branch", app.branch)
+    
+    if app.deployed_at:
+        logger.key_value("Deployed", app.deployed_at)
+    
+    # Site info
+    if site:
+        logger.blank()
+        logger.info("Site Configuration:")
+        logger.key_value("  Web Server", site.webserver)
+        logger.key_value("  SSL", "Yes" if site.ssl_enabled else "No")
+        logger.key_value("  Config", site.config_path)
+    
+    # Service info (for non-static apps)
+    if service:
+        logger.blank()
+        logger.info("Service:")
+        logger.key_value("  Name", service.name)
+        
+        # Get live status from systemd
+        systemd_status = service_manager.get_status(app_name)
+        logger.key_value("  Active", "Yes" if systemd_status.get("active") else "No")
+        logger.key_value("  Enabled", "Yes" if systemd_status.get("enabled") else "No")
+        
+        if systemd_status.get("pid"):
+            logger.key_value("  PID", systemd_status["pid"])
+        if systemd_status.get("uptime"):
+            logger.key_value("  Started", systemd_status["uptime"])
+    
+    # Database info
+    if databases:
+        logger.blank()
+        logger.info(f"Databases ({len(databases)}):")
+        for db in databases:
+            logger.key_value(f"  {db.engine}", db.name)
     
     return 0
 
@@ -427,9 +503,20 @@ def _handle_delete(args: Namespace) -> int:
     logger = Logger(verbose=args.verbose)
     config = Config()
     
+    from wasm.core.store import get_store
+    store = get_store()
+    
     domain = validate_domain(args.domain)
     app_name = domain_to_app_name(domain)
     app_path = config.apps_directory / app_name
+    
+    # Check if app exists in store or filesystem
+    app = store.get_app(domain)
+    app_exists_on_disk = app_path.exists()
+    
+    if not app and not app_exists_on_disk:
+        logger.warning(f"Application not found: {domain}")
+        return 1
     
     # Confirmation
     if not args.force:
@@ -440,8 +527,10 @@ def _handle_delete(args: Namespace) -> int:
     
     logger.header(f"Deleting: {domain}")
     
+    total_steps = 5
+    
     # Stop and delete service
-    logger.step(1, 4, "Stopping service")
+    logger.step(1, total_steps, "Stopping service")
     service_manager = ServiceManager(verbose=args.verbose)
     try:
         service_manager.delete_service(app_name)
@@ -449,7 +538,7 @@ def _handle_delete(args: Namespace) -> int:
         pass
     
     # Delete site configuration
-    logger.step(2, 4, "Removing site configuration")
+    logger.step(2, total_steps, "Removing site configuration")
     try:
         nginx = NginxManager(verbose=args.verbose)
         if nginx.site_exists(domain):
@@ -468,13 +557,20 @@ def _handle_delete(args: Namespace) -> int:
     
     # Delete files
     if not args.keep_files:
-        logger.step(3, 4, "Removing application files")
+        logger.step(3, total_steps, "Removing application files")
         from wasm.core.utils import remove_directory
         remove_directory(app_path, sudo=True)
     else:
-        logger.step(3, 4, "Keeping application files")
+        logger.step(3, total_steps, "Keeping application files")
     
-    logger.step(4, 4, "Cleanup complete")
+    # Delete from store
+    logger.step(4, total_steps, "Removing from database")
+    if app:
+        store.delete_site(domain)
+        store.delete_service(app_name)
+        store.delete_app(domain)
+    
+    logger.step(5, total_steps, "Cleanup complete")
     logger.success(f"Application deleted: {domain}")
     
     return 0
@@ -488,13 +584,16 @@ def _handle_logs(args: Namespace) -> int:
     domain = validate_domain(args.domain)
     app_name = domain_to_app_name(domain)
     
+    # Get service name (ServiceManager adds prefix internally)
+    service_name = f"wasm-{app_name}"
+    
     if args.follow:
         # Use journalctl directly for follow mode
         import subprocess
         try:
             subprocess.run([
                 "journalctl",
-                "-u", f"{app_name}.service",
+                "-u", f"{service_name}.service",
                 "-f",
                 "-n", str(args.lines),
             ])

@@ -11,6 +11,7 @@ from fastapi import APIRouter, Request, HTTPException, Depends, Query
 from pydantic import BaseModel
 
 from wasm.web.api.auth import get_current_session
+from wasm.core.store import get_store
 
 router = APIRouter()
 
@@ -62,25 +63,29 @@ async def list_services(
     """
     from wasm.managers.service_manager import ServiceManager
     
+    store = get_store()
     service_manager = ServiceManager(verbose=False)
-    services = service_manager.list_services()
+    
+    # Get services from store
+    stored_services = store.list_services()
     
     result = []
-    for svc in services:
-        if wasm_only and not svc["name"].startswith("wasm-"):
+    for svc in stored_services:
+        if wasm_only and not svc.name.startswith("wasm-"):
             continue
         
-        status = service_manager.get_status(svc["name"].replace("wasm-", ""))
+        # Get live status from systemd
+        live_status = service_manager.get_status(svc.name.replace("wasm-", ""))
         
         result.append(ServiceInfo(
-            name=svc["name"],
-            description=svc.get("description"),
-            active=svc["active"] == "active",
-            enabled=status.get("enabled", False),
-            status="running" if svc["active"] == "active" else "stopped",
-            pid=status.get("pid"),
-            uptime=status.get("uptime"),
-            memory=status.get("memory")
+            name=svc.name,
+            description=svc.command,
+            active=live_status.get("active", False),
+            enabled=live_status.get("enabled", False),
+            status="running" if live_status.get("active") else "stopped",
+            pid=live_status.get("pid"),
+            uptime=live_status.get("uptime"),
+            memory=live_status.get("memory")
         ))
     
     return ServiceListResponse(services=result, total=len(result))
@@ -97,24 +102,29 @@ async def get_service(
     """
     from wasm.managers.service_manager import ServiceManager
     
+    store = get_store()
     service_manager = ServiceManager(verbose=False)
     
     # Handle both wasm-prefixed and non-prefixed names
-    app_name = name.replace("wasm-", "")
-    status = service_manager.get_status(app_name)
+    svc = store.get_service(name)
+    if not svc:
+        svc = store.get_service(f"wasm-{name}")
     
-    if not status["exists"]:
+    if not svc:
         raise HTTPException(status_code=404, detail=f"Service not found: {name}")
     
+    # Get live status from systemd
+    live_status = service_manager.get_status(svc.name.replace("wasm-", ""))
+    
     return ServiceInfo(
-        name=status["name"],
-        description=status.get("description"),
-        active=status["active"],
-        enabled=status["enabled"],
-        status="running" if status["active"] else "stopped",
-        pid=status.get("pid"),
-        uptime=status.get("uptime"),
-        memory=status.get("memory")
+        name=svc.name,
+        description=svc.command,
+        active=live_status.get("active", False),
+        enabled=live_status.get("enabled", False),
+        status="running" if live_status.get("active") else "stopped",
+        pid=live_status.get("pid"),
+        uptime=live_status.get("uptime"),
+        memory=live_status.get("memory")
     )
 
 

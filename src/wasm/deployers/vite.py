@@ -155,11 +155,13 @@ class ViteDeployer(BaseDeployer):
         return context
     
     def create_service(self) -> bool:
-        """Create service only if SSR mode."""
+        """Create service only if SSR mode, but always register in store."""
         if self.is_ssr:
             return super().create_service()
         
         self.logger.substep("Static build - no service needed")
+        # Note: App is already registered in deploy() before create_service is called
+        # The is_static flag is set based on get_start_command() returning ""
         return True
     
     def start(self) -> bool:

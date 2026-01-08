@@ -10,6 +10,7 @@ from jinja2 import Environment, PackageLoader, TemplateNotFound
 
 from wasm.core.config import APACHE_SITES_AVAILABLE, APACHE_SITES_ENABLED
 from wasm.core.exceptions import ApacheError, TemplateError
+from wasm.core.store import get_store, Site, WebServer
 from wasm.core.utils import (
     create_symlink,
     read_file,
@@ -32,6 +33,7 @@ class ApacheManager(BaseManager):
     def __init__(self, verbose: bool = False):
         """Initialize Apache manager."""
         super().__init__(verbose=verbose)
+        self.store = get_store()
         
         try:
             self.jinja_env = Environment(
@@ -244,6 +246,22 @@ class ApacheManager(BaseManager):
         if not write_file(config_path, config_content, sudo=True):
             raise ApacheError(f"Failed to write configuration: {config_path}")
         
+        # Register in store
+        try:
+            site = Site(
+                domain=domain,
+                webserver=WebServer.APACHE,
+                config_path=str(config_path),
+                port=ctx.get("port"),
+                ssl=ctx.get("ssl", False),
+                ssl_certificate=ctx.get("ssl_certificate") if ctx.get("ssl") else None,
+                ssl_key=ctx.get("ssl_certificate_key") if ctx.get("ssl") else None,
+                enabled=False,
+            )
+            self.store.create_site(site)
+        except Exception as e:
+            self.logger.debug(f"Could not register site in store: {e}")
+        
         self.logger.debug(f"Created site configuration: {config_path}")
         return True
     
@@ -271,6 +289,15 @@ class ApacheManager(BaseManager):
         if not result.success:
             raise ApacheError(f"Failed to enable site: {domain}")
         
+        # Update store
+        try:
+            site = self.store.get_site(domain)
+            if site:
+                site.enabled = True
+                self.store.update_site(site)
+        except Exception as e:
+            self.logger.debug(f"Could not update site in store: {e}")
+        
         self.logger.debug(f"Enabled site: {domain}")
         return True
     
@@ -291,6 +318,15 @@ class ApacheManager(BaseManager):
         result = self._run_sudo(["a2dissite", f"{domain}.conf"])
         if not result.success:
             raise ApacheError(f"Failed to disable site: {domain}")
+        
+        # Update store
+        try:
+            site = self.store.get_site(domain)
+            if site:
+                site.enabled = False
+                self.store.update_site(site)
+        except Exception as e:
+            self.logger.debug(f"Could not update site in store: {e}")
         
         self.logger.debug(f"Disabled site: {domain}")
         return True
@@ -314,6 +350,12 @@ class ApacheManager(BaseManager):
         if config_path.exists():
             if not remove_file(config_path, sudo=True):
                 raise ApacheError(f"Failed to delete site: {domain}")
+        
+        # Remove from store
+        try:
+            self.store.delete_site(domain)
+        except Exception as e:
+            self.logger.debug(f"Could not remove site from store: {e}")
         
         self.logger.debug(f"Deleted site: {domain}")
         return True

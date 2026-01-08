@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from wasm.core.exceptions import CertificateError
+from wasm.core.store import get_store
 from wasm.managers.base_manager import BaseManager
 
 
@@ -24,6 +25,7 @@ class CertManager(BaseManager):
     def __init__(self, verbose: bool = False):
         """Initialize certificate manager."""
         super().__init__(verbose=verbose)
+        self.store = get_store()
     
     def is_installed(self) -> bool:
         """Check if Certbot is installed."""
@@ -255,6 +257,26 @@ class CertManager(BaseManager):
                 details=result.stderr,
             )
         
+        # Update store with SSL info
+        if not dry_run:
+            try:
+                cert_paths = self.get_cert_path(domain)
+                self.store.update_site_ssl(
+                    domain=domain,
+                    ssl=True,
+                    ssl_certificate=str(cert_paths["fullchain"]),
+                    ssl_key=str(cert_paths["privkey"]),
+                )
+                # Also update app if exists
+                app = self.store.get_app(domain)
+                if app:
+                    app.ssl = True
+                    app.ssl_certificate = str(cert_paths["fullchain"])
+                    app.ssl_key = str(cert_paths["privkey"])
+                    self.store.update_app(app)
+            except Exception as e:
+                self.logger.debug(f"Could not update SSL in store: {e}")
+        
         self.logger.debug(f"Obtained certificate for: {domain}")
         return True
     
@@ -331,6 +353,18 @@ class CertManager(BaseManager):
                 details=result.stderr,
             )
         
+        # Update store
+        try:
+            self.store.update_site_ssl(domain=domain, ssl=False)
+            app = self.store.get_app(domain)
+            if app:
+                app.ssl = False
+                app.ssl_certificate = None
+                app.ssl_key = None
+                self.store.update_app(app)
+        except Exception as e:
+            self.logger.debug(f"Could not update SSL in store: {e}")
+        
         self.logger.debug(f"Revoked certificate for: {domain}")
         return True
     
@@ -357,6 +391,18 @@ class CertManager(BaseManager):
                 f"Failed to delete certificate for {domain}",
                 details=result.stderr,
             )
+        
+        # Update store
+        try:
+            self.store.update_site_ssl(domain=domain, ssl=False)
+            app = self.store.get_app(domain)
+            if app:
+                app.ssl = False
+                app.ssl_certificate = None
+                app.ssl_key = None
+                self.store.update_app(app)
+        except Exception as e:
+            self.logger.debug(f"Could not update SSL in store: {e}")
         
         return True
     

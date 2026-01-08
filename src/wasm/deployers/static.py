@@ -136,9 +136,14 @@ class StaticDeployer(BaseDeployer):
         """
         from wasm.core.logger import Icons
         from wasm.core.exceptions import CertificateError
+        from wasm.core.store import AppStatus
+        from datetime import datetime
         
         # Track if SSL was successfully obtained
         ssl_obtained = False
+        
+        # Register app in store at the start
+        app = self._register_app_in_store(AppStatus.DEPLOYING.value)
         
         try:
             # Step 1: Fetch source
@@ -176,6 +181,12 @@ class StaticDeployer(BaseDeployer):
             # Step 5: Verify
             self.logger.step(5, total_steps, "Verifying deployment", Icons.CHECK)
             
+            # Update app status to running
+            app.status = AppStatus.RUNNING.value
+            app.ssl_enabled = ssl_obtained
+            app.deployed_at = datetime.now().isoformat()
+            self.store.update_app(app)
+            
             if self.health_check():
                 self.logger.success("Static site deployed successfully!")
                 self.logger.blank()
@@ -192,6 +203,9 @@ class StaticDeployer(BaseDeployer):
                 return True
                 
         except Exception as e:
+            # Update app status to failed
+            app.status = AppStatus.FAILED.value
+            self.store.update_app(app)
             self.logger.error(f"Deployment failed: {e}")
             raise
 

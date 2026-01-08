@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.13.1
+Version:        0.13.2
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -119,6 +119,15 @@ echo "Note: You may need to install python3-inquirer via pip:"
 echo "  pip3 install inquirer"
 
 %changelog
+* Wed Jan 08 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.2-1
+- Feature: SQLite persistence store for tracking deployed apps
+- New: Store tracks apps, sites, services, and databases
+- New: wasm store commands (init, stats, import, export, sync, path)
+- Enhancement: webapp list/status commands now use SQLite store
+- Enhancement: Database create/drop commands track in store
+- Enhancement: Managers (nginx, apache, service, cert) register in store
+- Fix: GitHub Actions .deb build missing pybuild-plugin-pyproject
+
 * Mon Dec 30 2025 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.1-1
 - Fix: Systemd services failing with 'Permission denied' when using nvm
 - Fix: Detect and avoid private paths (nvm, ~/.local) in service ExecStart

@@ -348,6 +348,21 @@ def _db_create(args: Namespace, verbose: bool) -> int:
             return 1
         
         info = manager.create_database(name, owner=owner, encoding=encoding)
+        
+        # Register in store
+        from wasm.core.store import get_store, Database
+        store = get_store()
+        
+        db_record = Database(
+            name=name,
+            engine=manager.ENGINE_NAME,
+            host="localhost",
+            port=manager.DEFAULT_PORT,
+            username=owner,
+            encoding=encoding,
+        )
+        store.create_database(db_record)
+        
         logger.success(f"Created database: {info.name}")
         
         if info.size:
@@ -393,6 +408,12 @@ def _db_drop(args: Namespace, verbose: bool) -> int:
                 return 0
         
         manager.drop_database(name, force=force)
+        
+        # Remove from store
+        from wasm.core.store import get_store
+        store = get_store()
+        store.delete_database(name, manager.ENGINE_NAME)
+        
         logger.success(f"Dropped database: {name}")
         
         return 0
@@ -406,6 +427,9 @@ def _db_list(args: Namespace, verbose: bool) -> int:
     logger = Logger(verbose=verbose)
     engine = getattr(args, "engine", None)
     json_output = getattr(args, "json", False)
+    
+    from wasm.core.store import get_store
+    store = get_store()
     
     if engine:
         managers = [_get_manager(engine, verbose)]
@@ -424,7 +448,20 @@ def _db_list(args: Namespace, verbose: bool) -> int:
         try:
             databases = manager.list_databases()
             for db in databases:
-                all_databases.append(db.to_dict())
+                db_dict = db.to_dict()
+                
+                # Check if it's tracked in store and get app association
+                store_db = store.get_database(db.name, manager.ENGINE_NAME)
+                if store_db:
+                    db_dict['tracked'] = True
+                    if store_db.app_id:
+                        app = store.get_app_by_id(store_db.app_id)
+                        if app:
+                            db_dict['linked_app'] = app.domain
+                else:
+                    db_dict['tracked'] = False
+                
+                all_databases.append(db_dict)
         except Exception as e:
             if verbose:
                 logger.warning(f"Could not list {manager.DISPLAY_NAME} databases: {e}")
@@ -447,17 +484,20 @@ def _db_list(args: Namespace, verbose: bool) -> int:
     
     for eng, dbs in by_engine.items():
         print(f"\n📦 {eng.upper()}")
-        print("-" * 40)
+        print("-" * 50)
         for db in dbs:
             size = db.get("size", "")
             tables = db.get("tables", 0)
+            tracked = "✓" if db.get("tracked") else " "
+            linked = f" → {db['linked_app']}" if db.get("linked_app") else ""
             
             size_str = f" ({size})" if size else ""
             tables_str = f" - {tables} tables" if tables else ""
             
-            print(f"  {db['name']}{size_str}{tables_str}")
+            print(f"  [{tracked}] {db['name']}{size_str}{tables_str}{linked}")
     
     print()
+    print("  [✓] = tracked by WASM")
     return 0
 
 

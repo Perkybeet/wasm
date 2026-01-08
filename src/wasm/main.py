@@ -118,6 +118,14 @@ def main() -> int:
             return 1
         return handle_db(args)
     
+    elif command == "store":
+        from wasm.cli.commands.store import handle_store
+        if not args.action:
+            print("Error: store requires an action", file=sys.stderr)
+            print("Use: wasm store --help", file=sys.stderr)
+            return 1
+        return handle_store(args)
+    
     else:
         print(f"Unknown command: {command}", file=sys.stderr)
         return 1

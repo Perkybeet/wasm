@@ -10,6 +10,7 @@ from jinja2 import Environment, PackageLoader, TemplateNotFound
 
 from wasm.core.config import SYSTEMD_DIR
 from wasm.core.exceptions import ServiceError, TemplateError
+from wasm.core.store import get_store, Service
 from wasm.core.utils import read_file, remove_file, write_file
 from wasm.managers.base_manager import BaseManager
 
@@ -27,6 +28,7 @@ class ServiceManager(BaseManager):
     def __init__(self, verbose: bool = False):
         """Initialize service manager."""
         super().__init__(verbose=verbose)
+        self.store = get_store()
         
         try:
             self.jinja_env = Environment(
@@ -253,6 +255,23 @@ class ServiceManager(BaseManager):
         # Reload daemon
         self.daemon_reload()
         
+        # Register in store
+        try:
+            svc = Service(
+                name=service_name,
+                unit_file=str(service_file),
+                command=command,
+                working_directory=working_directory,
+                user=ctx["user"],
+                group=ctx["group"],
+                environment=environment,
+                status="inactive",
+                enabled=False,
+            )
+            self.store.create_service(svc)
+        except Exception as e:
+            self.logger.debug(f"Could not register service in store: {e}")
+        
         self.logger.debug(f"Created service: {service_name}")
         return True
     
@@ -283,6 +302,12 @@ class ServiceManager(BaseManager):
         # Reload daemon
         self.daemon_reload()
         
+        # Remove from store
+        try:
+            self.store.delete_service(service_name)
+        except Exception as e:
+            self.logger.debug(f"Could not remove service from store: {e}")
+        
         self.logger.debug(f"Deleted service: {service_name}")
         return True
     
@@ -305,6 +330,12 @@ class ServiceManager(BaseManager):
                 details=result.stderr,
             )
         
+        # Update store status
+        try:
+            self.store.update_service_status(service_name, "active")
+        except Exception as e:
+            self.logger.debug(f"Could not update service status in store: {e}")
+        
         return True
     
     def stop(self, name: str) -> bool:
@@ -319,6 +350,13 @@ class ServiceManager(BaseManager):
         """
         service_name = self._get_service_name(name)
         result = self._run_sudo(["systemctl", "stop", service_name])
+        
+        # Update store status
+        try:
+            self.store.update_service_status(service_name, "inactive")
+        except Exception as e:
+            self.logger.debug(f"Could not update service status in store: {e}")
+        
         return result.success
     
     def restart(self, name: str) -> bool:
@@ -340,6 +378,12 @@ class ServiceManager(BaseManager):
                 details=result.stderr,
             )
         
+        # Update store status
+        try:
+            self.store.update_service_status(service_name, "active")
+        except Exception as e:
+            self.logger.debug(f"Could not update service status in store: {e}")
+        
         return True
     
     def enable(self, name: str) -> bool:
@@ -354,6 +398,16 @@ class ServiceManager(BaseManager):
         """
         service_name = self._get_service_name(name)
         result = self._run_sudo(["systemctl", "enable", service_name])
+        
+        # Update store
+        try:
+            svc = self.store.get_service(service_name)
+            if svc:
+                svc.enabled = True
+                self.store.update_service(svc)
+        except Exception as e:
+            self.logger.debug(f"Could not update service in store: {e}")
+        
         return result.success
     
     def disable(self, name: str) -> bool:
@@ -368,6 +422,16 @@ class ServiceManager(BaseManager):
         """
         service_name = self._get_service_name(name)
         result = self._run_sudo(["systemctl", "disable", service_name])
+        
+        # Update store
+        try:
+            svc = self.store.get_service(service_name)
+            if svc:
+                svc.enabled = False
+                self.store.update_service(svc)
+        except Exception as e:
+            self.logger.debug(f"Could not update service in store: {e}")
+        
         return result.success
     
     def logs(

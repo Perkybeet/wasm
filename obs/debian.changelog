@@ -1,3 +1,15 @@
+wasm (0.13.2-1) unstable; urgency=medium
+
+  * Feature: SQLite persistence store for tracking deployed apps
+  * New: Store tracks apps, sites, services, and databases
+  * New: wasm store commands (init, stats, import, export, sync, path)
+  * Enhancement: webapp list/status commands now use SQLite store
+  * Enhancement: Database create/drop commands track in store
+  * Enhancement: Managers (nginx, apache, service, cert) register in store
+  * Fix: GitHub Actions .deb build missing pybuild-plugin-pyproject
+
+ -- Yago López Prado <yago.lopez.adeje@gmail.com>  Wed, 08 Jan 2026 12:00:00 +0000
+
 wasm (0.13.1-1) unstable; urgency=medium
 
   * Fix: Systemd services failing with 'Permission denied' when using nvm

@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from wasm.web.api.auth import get_current_session
 from wasm.core.config import Config
+from wasm.core.store import get_store
 from wasm.core.utils import domain_to_app_name
 from wasm.validators.domain import validate_domain
 from wasm.validators.port import validate_port, find_available_port
@@ -82,65 +83,39 @@ async def list_apps(
     """
     from wasm.managers.service_manager import ServiceManager
     
-    service_manager = ServiceManager(verbose=False)
-    services = service_manager.list_services()
+    store = get_store()
     config = Config()
+    service_manager = ServiceManager(verbose=False)
     
-    # Services that are not applications (internal WASM services)
-    EXCLUDED_SERVICES = {"wasm-monitor", "wasm-web"}
+    # Get apps from store
+    stored_apps = store.list_apps()
     
     apps = []
-    for svc in services:
-        name = svc["name"]
+    for app in stored_apps:
+        # Get live status from systemd if service exists
+        active = False
+        enabled = False
+        pid = None
+        uptime = None
         
-        # Skip internal WASM services that aren't apps
-        if name in EXCLUDED_SERVICES:
-            continue
-        
-        # Extract domain from service name
-        if name.startswith("wasm-"):
-            domain = name[5:].replace("-", ".")
-        else:
-            domain = name
-        
-        # Get detailed status
-        status = service_manager.get_status(name.replace("wasm-", ""))
-        
-        # Try to get app info from directory
-        app_path = config.apps_directory / name.replace("wasm-", "")
-        app_type = None
-        port = None
-        
-        if app_path.exists():
-            # Try to detect app type
-            if (app_path / "package.json").exists():
-                import json
-                try:
-                    pkg = json.loads((app_path / "package.json").read_text())
-                    if "next" in pkg.get("dependencies", {}):
-                        app_type = "nextjs"
-                    elif "vite" in pkg.get("devDependencies", {}):
-                        app_type = "vite"
-                    else:
-                        app_type = "nodejs"
-                except Exception:
-                    app_type = "nodejs"
-            elif (app_path / "requirements.txt").exists():
-                app_type = "python"
-            else:
-                app_type = "static"
+        if app.service_name:
+            status = service_manager.get_status(app.service_name.replace("wasm-", ""))
+            active = status.get("active", False)
+            enabled = status.get("enabled", False)
+            pid = status.get("pid")
+            uptime = status.get("uptime")
         
         apps.append(AppInfo(
-            name=name,
-            domain=domain,
-            status="running" if svc["active"] == "active" else "stopped",
-            active=svc["active"] == "active",
-            enabled=status.get("enabled", False),
-            pid=status.get("pid"),
-            uptime=status.get("uptime"),
-            port=port,
-            app_type=app_type,
-            path=str(app_path) if app_path.exists() else None
+            name=app.domain,
+            domain=app.domain,
+            status="running" if active else ("stopped" if app.service_name else "static"),
+            active=active,
+            enabled=enabled,
+            pid=int(pid) if pid and pid != "0" else None,
+            uptime=uptime,
+            port=app.port,
+            app_type=app.app_type,
+            path=app.path
         ))
     
     return AppListResponse(apps=apps, total=len(apps))
@@ -162,46 +137,37 @@ async def get_app(
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
     
-    app_name = domain_to_app_name(validated_domain)
-    service_manager = ServiceManager(verbose=False)
-    config = Config()
+    store = get_store()
+    app = store.get_app(validated_domain)
     
-    status = service_manager.get_status(app_name)
-    
-    if not status["exists"]:
+    if not app:
         raise HTTPException(status_code=404, detail=f"Application not found: {domain}")
     
-    app_path = config.apps_directory / app_name
-    app_type = None
+    # Get live status from systemd if service exists
+    active = False
+    enabled = False
+    pid = None
+    uptime = None
     
-    if app_path.exists():
-        if (app_path / "package.json").exists():
-            import json
-            try:
-                pkg = json.loads((app_path / "package.json").read_text())
-                if "next" in pkg.get("dependencies", {}):
-                    app_type = "nextjs"
-                elif "vite" in pkg.get("devDependencies", {}):
-                    app_type = "vite"
-                else:
-                    app_type = "nodejs"
-            except Exception:
-                app_type = "nodejs"
-        elif (app_path / "requirements.txt").exists():
-            app_type = "python"
-        else:
-            app_type = "static"
+    if app.service_name:
+        service_manager = ServiceManager(verbose=False)
+        status = service_manager.get_status(app.service_name.replace("wasm-", ""))
+        active = status.get("active", False)
+        enabled = status.get("enabled", False)
+        pid = status.get("pid")
+        uptime = status.get("uptime")
     
     return AppInfo(
-        name=status["name"],
-        domain=validated_domain,
-        status="running" if status["active"] else "stopped",
-        active=status["active"],
-        enabled=status["enabled"],
-        pid=status.get("pid"),
-        uptime=status.get("uptime"),
-        app_type=app_type,
-        path=str(app_path) if app_path.exists() else None
+        name=app.domain,
+        domain=app.domain,
+        status="running" if active else ("stopped" if app.service_name else "static"),
+        active=active,
+        enabled=enabled,
+        pid=int(pid) if pid and pid != "0" else None,
+        uptime=uptime,
+        port=app.port,
+        app_type=app.app_type,
+        path=app.path
     )
 
 
@@ -411,31 +377,41 @@ async def delete_app(
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
     
+    store = get_store()
+    app = store.get_app(validated_domain)
+    
+    if not app:
+        raise HTTPException(status_code=404, detail=f"Application not found: {domain}")
+    
     app_name = domain_to_app_name(validated_domain)
     service_manager = ServiceManager(verbose=False)
     nginx_manager = NginxManager(verbose=False)
     config = Config()
     
-    status = service_manager.get_status(app_name)
-    if not status["exists"]:
-        raise HTTPException(status_code=404, detail=f"Application not found: {domain}")
-    
     try:
-        # Stop and disable service
-        service_manager.stop(app_name)
-        service_manager.disable(app_name)
+        # Stop and delete service if exists
+        if app.service_name:
+            try:
+                service_manager.stop(app_name)
+                service_manager.disable(app_name)
+                service_manager.delete_service(app_name)
+            except Exception:
+                pass
         
         # Remove nginx config
         try:
-            nginx_manager.remove_site(validated_domain)
+            nginx_manager.delete_site(validated_domain)
         except Exception:
             pass
         
         # Remove files if requested
         if remove_files:
-            app_path = config.apps_directory / app_name
+            app_path = Path(app.path) if app.path else config.apps_directory / app_name
             if app_path.exists():
                 shutil.rmtree(app_path)
+        
+        # Remove from store
+        store.delete_app(validated_domain)
         
         return {
             "success": True,
