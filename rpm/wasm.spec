@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.13.3
+Version:        0.13.4
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -119,6 +119,9 @@ echo "Note: You may need to install python3-inquirer via pip:"
 echo "  pip3 install inquirer"
 
 %changelog
+* Wed Jan 08 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.4-1
+- Fix: 'wasm store import' using wrong attribute name (unit_file)
+
 * Wed Jan 08 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.3-1
 - Fix: Corrupted debian.postrm script causing upgrade failure
 
