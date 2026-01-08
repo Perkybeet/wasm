@@ -23,6 +23,65 @@ from wasm.core.config import Config
 from wasm.core.exceptions import WASMError
 
 
+def _detect_app_type(app_path: Path) -> str:
+    """
+    Detect application type from project files.
+    
+    Detection order:
+    1. next.config.js/ts/mjs → nextjs
+    2. vite.config.js/ts → vite
+    3. package.json exists → nodejs
+    4. requirements.txt / setup.py / pyproject.toml → python
+    5. index.html → static
+    6. Default → unknown
+    """
+    # Next.js detection
+    next_configs = ["next.config.js", "next.config.ts", "next.config.mjs"]
+    for config_file in next_configs:
+        if (app_path / config_file).exists():
+            return "nextjs"
+    
+    # Also check package.json for next dependency
+    package_json = app_path / "package.json"
+    if package_json.exists():
+        try:
+            import json as json_module
+            with open(package_json) as f:
+                pkg = json_module.load(f)
+                deps = pkg.get("dependencies", {})
+                dev_deps = pkg.get("devDependencies", {})
+                all_deps = {**deps, **dev_deps}
+                
+                if "next" in all_deps:
+                    return "nextjs"
+                if "vite" in all_deps:
+                    return "vite"
+        except Exception:
+            pass
+    
+    # Vite detection (config file)
+    vite_configs = ["vite.config.js", "vite.config.ts"]
+    for config_file in vite_configs:
+        if (app_path / config_file).exists():
+            return "vite"
+    
+    # Generic Node.js (has package.json but not next/vite)
+    if package_json.exists():
+        return "nodejs"
+    
+    # Python detection
+    python_markers = ["requirements.txt", "setup.py", "pyproject.toml", "Pipfile"]
+    for marker in python_markers:
+        if (app_path / marker).exists():
+            return "python"
+    
+    # Static site detection
+    if (app_path / "index.html").exists():
+        return "static"
+    
+    return "unknown"
+
+
 def handle_store(args: Namespace) -> int:
     """Handle wasm store <action> commands."""
     action = getattr(args, "action", None)
@@ -191,9 +250,12 @@ def _store_import(args: Namespace, verbose: bool) -> int:
                 # Create app record if app directory exists
                 app_id = None
                 if app_path:
+                    # Detect app type from project files
+                    app_type = _detect_app_type(app_path)
+                    
                     app = App(
                         domain=domain,
-                        app_type="unknown",  # Can't detect type from just the site
+                        app_type=app_type,
                         app_path=str(app_path),
                         webserver="nginx",
                         ssl_enabled=(NGINX_SITES_ENABLED / domain).exists(),
@@ -206,7 +268,8 @@ def _store_import(args: Namespace, verbose: bool) -> int:
                         app = store.create_app(app)
                         app_id = app.id
                         imported_apps += 1
-                        logger.substep(f"Imported app: {domain}")
+                        logger.substep(f"Imported app: {domain} ({app_type})")
+                
                 
                 # Create site record
                 site = Site(

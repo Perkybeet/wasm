@@ -1,3 +1,14 @@
+wasm (0.13.8-1) unstable; urgency=medium
+
+  * Feature: 'wasm store import' now auto-detects app type
+    - Detects nextjs (next.config.*, package.json next dep)
+    - Detects vite (vite.config.*, package.json vite dep)
+    - Detects nodejs (package.json)
+    - Detects python (requirements.txt, setup.py, pyproject.toml)
+    - Detects static (index.html)
+
+ -- Yago López Prado <yago.lopez.adeje@gmail.com>  Wed, 08 Jan 2026 19:00:00 +0000
+
 wasm (0.13.7-1) unstable; urgency=medium
 
   * Fix: 'wasm store sync' now also updates app status (running/stopped)

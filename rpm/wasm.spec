@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.13.7
+Version:        0.13.8
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -176,6 +176,7 @@ echo "  pip3 install inquirer"
 - Add man page (wasm.1) for all distributions
 - Fix RPM packaging to include man page
 - Improve documentation
+- Feature: wasm store import auto-detects app type
 
 * Wed Dec 18 2024 Perkybeet <yago.lopez.adeje@gmail.com> - 0.10.0-1
 - Initial RPM package for OBS
