@@ -712,7 +712,7 @@ class WASMStore:
         with self._transaction() as cursor:
             cursor.execute(
                 """UPDATE sites SET 
-                   ssl = ?, ssl_certificate = ?, ssl_key = ?, updated_at = ?
+                   ssl_enabled = ?, ssl_certificate = ?, ssl_key = ?, updated_at = ?
                    WHERE domain = ?""",
                 (1 if ssl else 0, ssl_certificate, ssl_key, datetime.now().isoformat(), domain)
             )
@@ -807,13 +807,51 @@ class WASMStore:
         
         return service
     
-    def update_service_status(self, name: str, status: str) -> bool:
-        """Update service status (active/inactive)."""
-        active = status == "active"
+    def update_service_status(
+        self, 
+        name: str, 
+        status: Optional[str] = None,
+        active: Optional[bool] = None,
+        enabled: Optional[bool] = None,
+    ) -> bool:
+        """
+        Update service status and/or enabled state.
+        
+        Args:
+            name: Service name.
+            status: Status string ('active', 'inactive', 'failed').
+            active: If True, set status='active'; if False, status='inactive'.
+            enabled: Whether service is enabled.
+            
+        Returns:
+            True if updated.
+        """
+        # Handle active bool -> status string conversion
+        if active is not None and status is None:
+            status = "active" if active else "inactive"
+        
+        updates = []
+        params = []
+        
+        if status is not None:
+            updates.append("status = ?")
+            params.append(status)
+        
+        if enabled is not None:
+            updates.append("enabled = ?")
+            params.append(1 if enabled else 0)
+        
+        if not updates:
+            return False
+        
+        updates.append("updated_at = ?")
+        params.append(datetime.now().isoformat())
+        params.append(name)
+        
         with self._transaction() as cursor:
             cursor.execute(
-                "UPDATE services SET status = ?, updated_at = ? WHERE name = ?",
-                (status, datetime.now().isoformat(), name)
+                f"UPDATE services SET {', '.join(updates)} WHERE name = ?",
+                params
             )
             return cursor.rowcount > 0
     
@@ -1027,7 +1065,7 @@ class WASMStore:
             active: Whether service is active in systemd.
             enabled: Whether service is enabled in systemd.
         """
-        self.update_service_status(name, active, enabled)
+        self.update_service_status(name, active=active, enabled=enabled)
     
     def get_statistics(self) -> Dict[str, Any]:
         """Get store statistics."""

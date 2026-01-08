@@ -270,7 +270,7 @@ class CertManager(BaseManager):
                 # Also update app if exists
                 app = self.store.get_app(domain)
                 if app:
-                    app.ssl = True
+                    app.ssl_enabled = True
                     app.ssl_certificate = str(cert_paths["fullchain"])
                     app.ssl_key = str(cert_paths["privkey"])
                     self.store.update_app(app)
@@ -358,7 +358,7 @@ class CertManager(BaseManager):
             self.store.update_site_ssl(domain=domain, ssl=False)
             app = self.store.get_app(domain)
             if app:
-                app.ssl = False
+                app.ssl_enabled = False
                 app.ssl_certificate = None
                 app.ssl_key = None
                 self.store.update_app(app)
@@ -397,7 +397,7 @@ class CertManager(BaseManager):
             self.store.update_site_ssl(domain=domain, ssl=False)
             app = self.store.get_app(domain)
             if app:
-                app.ssl = False
+                app.ssl_enabled = False
                 app.ssl_certificate = None
                 app.ssl_key = None
                 self.store.update_app(app)

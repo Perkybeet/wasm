@@ -250,10 +250,10 @@ class ApacheManager(BaseManager):
         try:
             site = Site(
                 domain=domain,
-                webserver=WebServer.APACHE,
+                webserver=WebServer.APACHE.value,
                 config_path=str(config_path),
-                port=ctx.get("port"),
-                ssl=ctx.get("ssl", False),
+                proxy_port=ctx.get("port"),
+                ssl_enabled=ctx.get("ssl", False),
                 ssl_certificate=ctx.get("ssl_certificate") if ctx.get("ssl") else None,
                 ssl_key=ctx.get("ssl_certificate_key") if ctx.get("ssl") else None,
                 enabled=False,

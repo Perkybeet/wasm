@@ -89,7 +89,7 @@ async def list_apps(
     
     # Get apps from store
     stored_apps = store.list_apps()
-    
+
     apps = []
     for app in stored_apps:
         # Get live status from systemd if service exists
@@ -97,25 +97,27 @@ async def list_apps(
         enabled = False
         pid = None
         uptime = None
-        
-        if app.service_name:
-            status = service_manager.get_status(app.service_name.replace("wasm-", ""))
+
+        # Get service from store by app_id
+        service = store.get_service_by_app_id(app.id) if app.id else None
+        if service:
+            status = service_manager.get_status(service.name.replace("wasm-", ""))
             active = status.get("active", False)
             enabled = status.get("enabled", False)
             pid = status.get("pid")
             uptime = status.get("uptime")
-        
+
         apps.append(AppInfo(
             name=app.domain,
             domain=app.domain,
-            status="running" if active else ("stopped" if app.service_name else "static"),
+            status="running" if active else ("stopped" if service else "static"),
             active=active,
             enabled=enabled,
             pid=int(pid) if pid and pid != "0" else None,
             uptime=uptime,
             port=app.port,
             app_type=app.app_type,
-            path=app.path
+            path=app.app_path
         ))
     
     return AppListResponse(apps=apps, total=len(apps))
@@ -148,26 +150,28 @@ async def get_app(
     enabled = False
     pid = None
     uptime = None
-    
-    if app.service_name:
+
+    # Get service from store by app_id
+    service = store.get_service_by_app_id(app.id) if app.id else None
+    if service:
         service_manager = ServiceManager(verbose=False)
-        status = service_manager.get_status(app.service_name.replace("wasm-", ""))
+        status = service_manager.get_status(service.name.replace("wasm-", ""))
         active = status.get("active", False)
         enabled = status.get("enabled", False)
         pid = status.get("pid")
         uptime = status.get("uptime")
-    
+
     return AppInfo(
         name=app.domain,
         domain=app.domain,
-        status="running" if active else ("stopped" if app.service_name else "static"),
+        status="running" if active else ("stopped" if service else "static"),
         active=active,
         enabled=enabled,
         pid=int(pid) if pid and pid != "0" else None,
         uptime=uptime,
         port=app.port,
         app_type=app.app_type,
-        path=app.path
+        path=app.app_path
     )
 
 
@@ -390,23 +394,24 @@ async def delete_app(
     
     try:
         # Stop and delete service if exists
-        if app.service_name:
+        service = store.get_service_by_app_id(app.id) if app.id else None
+        if service:
             try:
                 service_manager.stop(app_name)
                 service_manager.disable(app_name)
                 service_manager.delete_service(app_name)
             except Exception:
                 pass
-        
+
         # Remove nginx config
         try:
             nginx_manager.delete_site(validated_domain)
         except Exception:
             pass
-        
+
         # Remove files if requested
         if remove_files:
-            app_path = Path(app.path) if app.path else config.apps_directory / app_name
+            app_path = Path(app.app_path) if app.app_path else config.apps_directory / app_name
             if app_path.exists():
                 shutil.rmtree(app_path)
         

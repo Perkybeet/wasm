@@ -370,14 +370,18 @@ def _store_sync(args: Namespace, verbose: bool) -> int:
     
     for service in services:
         # Get actual state from systemd
-        status = service_manager.get_status(service.name)
+        systemd_status = service_manager.get_status(service.name)
         
-        active = status.get("active", False)
-        enabled = status.get("enabled", False)
+        active = systemd_status.get("active", False)
+        enabled = systemd_status.get("enabled", False)
+        
+        # Convert current store status to bool for comparison
+        current_active = service.status == "active"
+        current_enabled = service.enabled
         
         # Update store if different
-        if service.active != active or service.enabled != enabled:
-            store.update_service_status(service.name, active, enabled)
+        if current_active != active or current_enabled != enabled:
+            store.update_service_status(service.name, active=active, enabled=enabled)
             logger.substep(f"Updated {service.name}: active={active}, enabled={enabled}")
             synced += 1
     

@@ -118,7 +118,7 @@ async def list_sites(
             webserver=site.webserver,
             enabled=site.enabled,
             config_path=site.config_path or "",
-            has_ssl=site.ssl
+            has_ssl=site.ssl_enabled
         ))
     
     # Fallback to filesystem if store is empty (for backwards compatibility)
@@ -170,7 +170,7 @@ async def get_site(
             webserver=site.webserver,
             enabled=site.enabled,
             config_path=site.config_path or "",
-            has_ssl=site.ssl
+            has_ssl=site.ssl_enabled
         )
     
     # Fallback to filesystem

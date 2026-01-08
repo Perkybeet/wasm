@@ -935,13 +935,13 @@ class BaseDeployer(ABC):
             id=existing_service.id if existing_service else None,
             app_id=app_id,
             name=service_name,
-            service_file=str(service_file),
+            unit_file=str(service_file),
             working_directory=str(self.app_path),
             command=command,
             user=self.config.service_user,
             group=self.config.service_group,
             enabled=True,
-            active=False,  # Will be set to True after start
+            status="inactive",  # Will be set to "active" after start
             port=self.port,
             environment=env,
         )
