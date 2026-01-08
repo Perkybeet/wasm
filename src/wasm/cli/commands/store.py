@@ -264,11 +264,21 @@ def _store_import(args: Namespace, verbose: bool) -> int:
                         port=proxy_port,
                     )
                     
-                    if not store.get_app(domain):
+                    existing_app = store.get_app(domain)
+                    if not existing_app:
                         app = store.create_app(app)
                         app_id = app.id
                         imported_apps += 1
                         logger.substep(f"Imported app: {domain} ({app_type})")
+                    elif existing_app.app_type == "unknown" and app_type != "unknown":
+                        # Update existing app's type if it was unknown
+                        existing_app.app_type = app_type
+                        store.update_app(existing_app)
+                        app_id = existing_app.id
+                        imported_apps += 1
+                        logger.substep(f"Updated app type: {domain} → {app_type}")
+                    else:
+                        app_id = existing_app.id
                 
                 
                 # Create site record

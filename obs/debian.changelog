@@ -1,3 +1,10 @@
+wasm (0.13.9-1) unstable; urgency=medium
+
+  * Fix: 'wasm store import' now updates app type for existing apps
+  * Enhancement: Apps with type 'unknown' get re-detected on import
+
+ -- Yago López Prado <yago.lopez.adeje@gmail.com>  Wed, 08 Jan 2026 20:00:00 +0000
+
 wasm (0.13.8-1) unstable; urgency=medium
 
   * Feature: 'wasm store import' now auto-detects app type
