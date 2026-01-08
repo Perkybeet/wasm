@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.13.2
+Version:        0.13.3
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -119,6 +119,9 @@ echo "Note: You may need to install python3-inquirer via pip:"
 echo "  pip3 install inquirer"
 
 %changelog
+* Wed Jan 08 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.3-1
+- Fix: Corrupted debian.postrm script causing upgrade failure
+
 * Wed Jan 08 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.2-1
 - Feature: SQLite persistence store for tracking deployed apps
 - New: Store tracks apps, sites, services, and databases

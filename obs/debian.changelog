@@ -1,3 +1,10 @@
+wasm (0.13.3-1) unstable; urgency=high
+
+  * Fix: Corrupted debian.postrm script causing upgrade failure
+  * Bug caused 'syntax error near unexpected token instructions'
+
+ -- Yago López Prado <yago.lopez.adeje@gmail.com>  Wed, 08 Jan 2026 14:00:00 +0000
+
 wasm (0.13.2-1) unstable; urgency=medium
 
   * Feature: SQLite persistence store for tracking deployed apps
