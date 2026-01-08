@@ -289,7 +289,7 @@ def _store_import(args: Namespace, verbose: bool) -> int:
             service = Service(
                 app_id=app_id,
                 name=app_name,
-                service_file=str(service_file),
+                unit_file=str(service_file),
                 working_directory=working_dir,
                 command=command,
                 user=user,
