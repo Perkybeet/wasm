@@ -388,7 +388,6 @@ def _handle_update(args: Namespace) -> int:
     package_manager = getattr(args, "package_manager", "auto") or "auto"
     
     logger.header(f"Updating: {domain}")
-    logger.info("Zero-downtime update strategy")
     logger.blank()
     
     total_steps = 7
