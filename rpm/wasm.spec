@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.13.13
+Version:        0.13.14
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -119,6 +119,22 @@ echo "Note: You may need to install python3-inquirer via pip:"
 echo "  pip3 install inquirer"
 
 %changelog
+* Wed Jan 15 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.14-1
+- Fix: OBS build failures - add missing python3-inquirer dependency
+- Fix: Update debian.changelog and RPM spec changelog for 0.13.13
+- Enhancement: Ensure all OBS package dependencies are declared
+
+* Wed Jan 15 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.13-1
+- Fix: Critical bare except clause in monitor API
+- Fix: Static apps (Vite) trying to restart non-existent services
+- Fix: Update checker now detects installation method (pip/apt/dnf/etc)
+- Fix: APT package name in update checker (wasm vs wasm-cli)
+- Enhancement: Comprehensive logging for silent exception catches
+- Enhancement: Contextual HTTP error messages in API endpoints
+- Enhancement: Error handling for file operations (env files, journalctl)
+- Feature: Update banner in web dashboard
+- Feature: /api/system/version endpoint for update checking
+
 * Tue Jan 14 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.12-1
 - chore: Clean distribution packages (remove Docker files, dev tools)
 - docs: Rewrite README professionally without emojis
