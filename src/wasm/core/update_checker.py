@@ -225,9 +225,13 @@ class UpdateChecker:
             result = subprocess.run(
                 [sys.executable, "-m", "pip", "show", "wasm-cli"],
                 capture_output=True,
+                text=True,
                 timeout=2
             )
             if result.returncode == 0:
+                # Check if installed in editable mode (from source)
+                if "Editable project location:" in result.stdout or "-e " in result.stdout:
+                    return "source"
                 return "pip"
 
             # Check system package managers
@@ -289,6 +293,7 @@ class UpdateChecker:
             "dnf": "sudo dnf upgrade wasm-cli",
             "yum": "sudo yum update wasm-cli",
             "zypper": "sudo zypper update wasm-cli",
+            "source": "cd <wasm-repo> && git pull && pip install -e .",
             "unknown": "pip install --upgrade wasm-cli  # or use your system package manager"
         }
         return commands.get(method, commands["unknown"])
