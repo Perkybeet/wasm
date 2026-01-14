@@ -244,9 +244,9 @@ class BaseDeployer(ABC):
                     dev_deps = pkg.get("devDependencies", {})
                     if "@prisma/client" in deps or "prisma" in dev_deps:
                         return True
-            except Exception:
-                pass
-        
+            except (json.JSONDecodeError, OSError) as e:
+                self.logger.debug(f"Failed to read package.json for Prisma detection: {e}")
+
         return False
     
     def _get_pm_install_command(self) -> List[str]:
@@ -1030,11 +1030,11 @@ class BaseDeployer(ABC):
                 with urllib.request.urlopen(url, timeout=5) as response:
                     if response.status == 200:
                         return True
-            except URLError:
-                pass
-            except Exception:
-                pass
-            
+            except URLError as e:
+                self.logger.debug(f"Health check URLError: {e}")
+            except Exception as e:
+                self.logger.debug(f"Health check failed with error: {e}")
+
             if i < retries - 1:
                 self.logger.debug(f"Health check attempt {i + 1} failed, retrying...")
                 time.sleep(delay)

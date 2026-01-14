@@ -8,6 +8,7 @@ Provides a rich, user-friendly logging experience with support for:
 - Structured log messages
 """
 
+import logging
 import sys
 from datetime import datetime
 from enum import Enum
@@ -138,8 +139,9 @@ class Logger:
                 clean_message = self._strip_ansi(message)
                 with open(self.log_file, "a") as f:
                     f.write(f"[{timestamp}] {clean_message}{end}")
-            except Exception:
-                pass
+            except OSError as e:
+                # Use standard logging as fallback since we're in the logger itself
+                logging.getLogger(__name__).debug(f"Failed to write to log file: {e}")
     
     def _strip_ansi(self, text: str) -> str:
         """Remove ANSI escape codes from text."""

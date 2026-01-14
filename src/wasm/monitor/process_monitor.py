@@ -941,9 +941,9 @@ WantedBy=multi-user.target
             )
             enabled_status = result.stdout.strip().lower()
             status["enabled"] = enabled_status == "enabled"
-        except Exception:
-            pass
-        
+        except Exception as e:
+            self.logger.debug(f"Failed to check if monitor service is enabled: {e}")
+
         # Check if active
         try:
             result = subprocess.run(
@@ -954,9 +954,9 @@ WantedBy=multi-user.target
             )
             active_status = result.stdout.strip().lower()
             status["active"] = active_status in ("active", "activating")
-        except Exception:
-            pass
-        
+        except Exception as e:
+            self.logger.debug(f"Failed to check if monitor service is active: {e}")
+
         # Get detailed status for PID and uptime
         try:
             result = subprocess.run(
@@ -985,9 +985,9 @@ WantedBy=multi-user.target
                         # Double-check active state
                         if value.lower() in ("active", "activating"):
                             status["active"] = True
-        except Exception:
-            pass
-        
+        except Exception as e:
+            self.logger.debug(f"Failed to get detailed status for monitor service: {e}")
+
         # As a final fallback, check if the process is actually running
         if not status["pid"] and status["active"]:
             try:

@@ -4,6 +4,7 @@ Applications API endpoints.
 Provides endpoints for managing deployed web applications.
 """
 
+import logging
 import os
 import subprocess
 from pathlib import Path
@@ -13,6 +14,8 @@ from fastapi import APIRouter, Request, HTTPException, Depends, Query
 from pydantic import BaseModel, Field
 
 from wasm.web.api.auth import get_current_session
+
+logger = logging.getLogger(__name__)
 from wasm.core.config import Config
 from wasm.core.store import get_store
 from wasm.core.utils import domain_to_app_name
@@ -229,7 +232,11 @@ async def create_app(
             "message": f"Application deployed successfully at {domain}"
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to deploy application {domain}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to deploy application: {str(e)}"
+        )
 
 
 @router.post("/{domain}/restart")
@@ -259,7 +266,11 @@ async def restart_app(
         service_manager.restart(app_name)
         return {"success": True, "message": f"Application restarted: {domain}"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to restart application {domain}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to restart application: {str(e)}"
+        )
 
 
 @router.post("/{domain}/stop")
@@ -289,7 +300,11 @@ async def stop_app(
         service_manager.stop(app_name)
         return {"success": True, "message": f"Application stopped: {domain}"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to stop application {domain}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to stop application: {str(e)}"
+        )
 
 
 @router.post("/{domain}/start")
@@ -319,7 +334,11 @@ async def start_app(
         service_manager.start(app_name)
         return {"success": True, "message": f"Application started: {domain}"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to start application {domain}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to start application: {str(e)}"
+        )
 
 
 @router.get("/{domain}/logs", response_model=AppLogsResponse)
@@ -400,14 +419,14 @@ async def delete_app(
                 service_manager.stop(app_name)
                 service_manager.disable(app_name)
                 service_manager.delete_service(app_name)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to remove service for {domain}: {e}")
 
         # Remove nginx config
         try:
             nginx_manager.delete_site(validated_domain)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to remove nginx config for {domain}: {e}")
 
         # Remove files if requested
         if remove_files:
@@ -424,4 +443,8 @@ async def delete_app(
             "files_removed": remove_files
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to delete application {domain}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete application: {str(e)}"
+        )

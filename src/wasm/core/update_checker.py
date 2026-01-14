@@ -9,11 +9,14 @@ Checks for new versions on GitHub without blocking the user's command.
 """
 
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Optional
 
 from wasm import __version__
+
+logger = logging.getLogger(__name__)
 
 
 class UpdateChecker:
@@ -66,9 +69,9 @@ class UpdateChecker:
             if has_update:
                 cls._show_update_message(latest_version)
 
-        except Exception:
-            # Silently fail - we don't want to interrupt the user
-            pass
+        except Exception as e:
+            # Log but don't interrupt the user
+            logger.debug(f"Failed to check for updates: {e}")
 
     @classmethod
     def _fetch_latest_version(cls) -> Optional[str]:
@@ -202,6 +205,95 @@ class UpdateChecker:
             return False
 
     @classmethod
+    def _detect_installation_method(cls) -> str:
+        """
+        Detect how WASM was installed.
+
+        Returns:
+            Installation method: 'pip', 'pipx', 'apt', 'dnf', 'yum', 'zypper', or 'unknown'.
+        """
+        import subprocess
+        import sys
+
+        try:
+            # Check pipx first (most specific)
+            pipx_path = Path.home() / ".local" / "pipx" / "venvs" / "wasm-cli"
+            if pipx_path.exists():
+                return "pipx"
+
+            # Check if installed with pip in current Python environment
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "show", "wasm-cli"],
+                capture_output=True,
+                timeout=2
+            )
+            if result.returncode == 0:
+                return "pip"
+
+            # Check system package managers
+            # APT (Ubuntu, Debian) - package is called "wasm" not "wasm-cli"
+            if Path("/var/lib/dpkg/status").exists():
+                result = subprocess.run(
+                    ["dpkg", "-l", "wasm"],
+                    capture_output=True,
+                    timeout=2
+                )
+                if result.returncode == 0 and b"wasm" in result.stdout:
+                    return "apt"
+
+            # DNF/YUM (Fedora, RHEL, CentOS)
+            for pkg_manager in ["dnf", "yum"]:
+                try:
+                    result = subprocess.run(
+                        [pkg_manager, "list", "installed", "wasm-cli"],
+                        capture_output=True,
+                        timeout=2
+                    )
+                    if result.returncode == 0:
+                        return pkg_manager
+                except FileNotFoundError:
+                    continue
+
+            # Zypper (openSUSE)
+            try:
+                result = subprocess.run(
+                    ["zypper", "se", "-i", "wasm-cli"],
+                    capture_output=True,
+                    timeout=2
+                )
+                if result.returncode == 0 and b"wasm-cli" in result.stdout:
+                    return "zypper"
+            except FileNotFoundError:
+                pass
+
+        except Exception as e:
+            logger.debug(f"Failed to detect installation method: {e}")
+
+        return "unknown"
+
+    @classmethod
+    def _get_update_command(cls, method: str) -> str:
+        """
+        Get the appropriate update command for the installation method.
+
+        Args:
+            method: Installation method from _detect_installation_method.
+
+        Returns:
+            Update command string.
+        """
+        commands = {
+            "pip": "pip install --upgrade wasm-cli",
+            "pipx": "pipx upgrade wasm-cli",
+            "apt": "sudo apt update && sudo apt install --only-upgrade wasm",
+            "dnf": "sudo dnf upgrade wasm-cli",
+            "yum": "sudo yum update wasm-cli",
+            "zypper": "sudo zypper update wasm-cli",
+            "unknown": "pip install --upgrade wasm-cli  # or use your system package manager"
+        }
+        return commands.get(method, commands["unknown"])
+
+    @classmethod
     def _show_update_message(cls, latest_version: str):
         """
         Display update notification to user.
@@ -210,8 +302,11 @@ class UpdateChecker:
             latest_version: The latest available version.
         """
         try:
+            method = cls._detect_installation_method()
+            update_command = cls._get_update_command(method)
+
             print(f"\n\033[93m⚠  New version available: {latest_version} (current: {__version__})\033[0m")
-            print(f"\033[93m   Update with: pip install --upgrade wasm-cli\033[0m")
+            print(f"\033[93m   Update with: {update_command}\033[0m")
             print(f"\033[93m   Release notes: https://github.com/Perkybeet/wasm/releases/tag/v{latest_version}\033[0m\n")
         except Exception:
             # Even printing can fail in some edge cases

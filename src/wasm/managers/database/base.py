@@ -142,8 +142,8 @@ class BaseDatabaseManager(BaseManager):
             try:
                 self._run_sudo(["mkdir", "-p", str(self.BACKUP_DIR)])
                 self._run_sudo(["chmod", "750", str(self.BACKUP_DIR)])
-            except Exception:
-                pass  # Will fail on actual backup if needed
+            except Exception as e:
+                self.logger.debug(f"Failed to create backup directory {self.BACKUP_DIR}: {e}")
     
     @staticmethod
     def generate_password(length: int = 24) -> str:

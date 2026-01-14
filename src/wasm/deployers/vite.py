@@ -54,9 +54,9 @@ class ViteDeployer(BaseDeployer):
                     deps = pkg.get("dependencies", {})
                     dev_deps = pkg.get("devDependencies", {})
                     return "vite" in deps or "vite" in dev_deps
-            except Exception:
-                pass
-        
+            except (json.JSONDecodeError, OSError) as e:
+                self.logger.debug(f"Failed to read package.json for Vite detection: {e}")
+
         return False
     
     def _check_ssr_mode(self) -> bool:
@@ -70,9 +70,9 @@ class ViteDeployer(BaseDeployer):
                     content = config_path.read_text()
                     if "ssr" in content.lower():
                         return True
-                except Exception:
-                    pass
-        
+                except OSError as e:
+                    self.logger.debug(f"Failed to read {config_file} for SSR mode check: {e}")
+
         return False
     
     def _detect_output_dir(self) -> str:
@@ -89,9 +89,9 @@ class ViteDeployer(BaseDeployer):
                     match = re.search(r"outDir\s*:\s*['\"]([^'\"]+)['\"]", content)
                     if match:
                         return match.group(1)
-                except Exception:
-                    pass
-        
+                except OSError as e:
+                    self.logger.debug(f"Failed to read {config_file} for output dir detection: {e}")
+
         return "dist"
     
     def get_install_command(self) -> List[str]:

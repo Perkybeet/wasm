@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.13.12
+Version:        0.13.13
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL

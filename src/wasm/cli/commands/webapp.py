@@ -142,18 +142,25 @@ def _handle_create(args: Namespace) -> int:
     if args.env_file:
         env_path = Path(args.env_file)
         if env_path.exists():
-            with open(env_path) as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith("#") and "=" in line:
-                        key, value = line.split("=", 1)
-                        value = value.strip()
-                        # Remove surrounding quotes if present
-                        if value.startswith('"') and value.endswith('"'):
-                            value = value[1:-1]
-                        elif value.startswith("'") and value.endswith("'"):
-                            value = value[1:-1]
-                        env_vars[key.strip()] = value
+            try:
+                with open(env_path) as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            key, value = line.split("=", 1)
+                            value = value.strip()
+                            # Remove surrounding quotes if present
+                            if value.startswith('"') and value.endswith('"'):
+                                value = value[1:-1]
+                            elif value.startswith("'") and value.endswith("'"):
+                                value = value[1:-1]
+                            env_vars[key.strip()] = value
+            except OSError as e:
+                logger.error(f"Failed to read environment file {env_path}: {e}")
+                return 1
+            except Exception as e:
+                logger.error(f"Failed to parse environment file {env_path}: {e}")
+                return 1
     
     # Print deployment header
     logger.header("WASM Deployment")
@@ -478,27 +485,44 @@ def _handle_update(args: Namespace) -> int:
     logger.step(6, total_steps, "Building application")
     deployer.build()
     
-    # Step 7: Restart service - this is the only moment of downtime
+    # Step 7: Restart service (only if not static)
     logger.step(7, total_steps, "Restarting application")
-    logger.substep("Minimal downtime during restart...")
     service_manager = ServiceManager(verbose=args.verbose)
-    service_manager.restart(app_name)
-    
-    # Quick health check
-    import time
-    time.sleep(2)  # Give the app a moment to start
-    
-    status = service_manager.get_status(app_name)
-    if status.get("active"):
+
+    # Check if this is a static app (no service to restart)
+    is_static = not bool(deployer.get_start_command())
+
+    if is_static:
+        logger.substep("Static application - no service restart needed")
         logger.success(f"Application updated successfully: {domain}")
         logger.blank()
-        logger.key_value("Status", "Running")
+        logger.key_value("Type", "Static")
         logger.key_value("Package Manager", deployer.package_manager)
-        if deployer.has_prisma:
-            logger.key_value("Prisma", "Updated")
     else:
-        logger.warning("Application restarted but may not be running correctly")
-        logger.info(f"Check logs with: wasm logs {domain}")
+        # Check if service exists before trying to restart
+        status = service_manager.get_status(app_name)
+        if not status.get("exists"):
+            logger.warning("Service not found - application may need to be redeployed")
+            logger.info(f"Try: wasm create -d {domain}")
+        else:
+            logger.substep("Minimal downtime during restart...")
+            service_manager.restart(app_name)
+
+            # Quick health check
+            import time
+            time.sleep(2)  # Give the app a moment to start
+
+            status = service_manager.get_status(app_name)
+            if status.get("active"):
+                logger.success(f"Application updated successfully: {domain}")
+                logger.blank()
+                logger.key_value("Status", "Running")
+                logger.key_value("Package Manager", deployer.package_manager)
+                if deployer.has_prisma:
+                    logger.key_value("Prisma", "Updated")
+            else:
+                logger.warning("Application restarted but may not be running correctly")
+                logger.info(f"Check logs with: wasm logs {domain}")
     
     return 0
 
@@ -539,8 +563,8 @@ def _handle_delete(args: Namespace) -> int:
     service_manager = ServiceManager(verbose=args.verbose)
     try:
         service_manager.delete_service(app_name)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Failed to delete service: {e}")
     
     # Delete site configuration
     logger.step(2, total_steps, "Removing site configuration")
@@ -549,16 +573,16 @@ def _handle_delete(args: Namespace) -> int:
         if nginx.site_exists(domain):
             nginx.delete_site(domain)
             nginx.reload()
-    except Exception:
-        pass
-    
+    except Exception as e:
+        logger.warning(f"Failed to remove nginx site configuration: {e}")
+
     try:
         apache = ApacheManager(verbose=args.verbose)
         if apache.site_exists(domain):
             apache.delete_site(domain)
             apache.reload()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Failed to remove apache site configuration: {e}")
     
     # Delete files
     if not args.keep_files:
@@ -604,6 +628,12 @@ def _handle_logs(args: Namespace) -> int:
             ])
         except KeyboardInterrupt:
             pass
+        except FileNotFoundError:
+            logger.error("journalctl command not found. Please ensure systemd is installed.")
+            return 1
+        except subprocess.SubprocessError as e:
+            logger.error(f"Failed to run journalctl: {e}")
+            return 1
     else:
         logs = service_manager.logs(app_name, lines=args.lines)
         print(logs)

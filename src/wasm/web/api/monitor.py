@@ -4,12 +4,15 @@ Monitor API endpoints.
 Provides endpoints for the AI-powered process monitor.
 """
 
+import logging
 from typing import List, Optional
 
 from fastapi import APIRouter, Request, HTTPException, Depends
 from pydantic import BaseModel
 
 from wasm.web.api.auth import get_current_session
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -81,7 +84,11 @@ async def get_monitor_status(
             active=False
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to get monitor status: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get monitor status: {str(e)}"
+        )
 
 
 @router.get("/config", response_model=MonitorConfig)
@@ -242,7 +249,7 @@ async def run_scan(
         try:
             import psutil
             total_processes = len(list(psutil.process_iter()))
-        except:
+        except (ImportError, Exception):
             total_processes = len(scan_results)
         
         return ScanResponse(
@@ -252,7 +259,11 @@ async def run_scan(
             results=scan_results[:50]  # Limit results
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to run process scan: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to run process scan: {str(e)}"
+        )
 
 
 @router.post("/enable")
@@ -276,7 +287,11 @@ async def enable_monitor(
             detail="Monitor module not available"
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to enable monitor service: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to enable monitor service: {str(e)}"
+        )
 
 
 @router.post("/disable")
@@ -300,7 +315,11 @@ async def disable_monitor(
             detail="Monitor module not available"
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to disable monitor service: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to disable monitor service: {str(e)}"
+        )
 
 
 @router.post("/start")
@@ -324,7 +343,11 @@ async def start_monitor(
             detail="Monitor module not available"
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to start monitor service: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to start monitor service: {str(e)}"
+        )
 
 
 @router.post("/stop")
@@ -348,7 +371,11 @@ async def stop_monitor(
             detail="Monitor module not available"
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to stop monitor service: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to stop monitor service: {str(e)}"
+        )
 
 
 @router.post("/install")
@@ -372,7 +399,11 @@ async def install_monitor(
             detail="Monitor module not available"
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to install monitor service: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to install monitor service: {str(e)}"
+        )
 
 
 @router.post("/uninstall")
@@ -396,7 +427,11 @@ async def uninstall_monitor(
             detail="Monitor module not available"
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to uninstall monitor service: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to uninstall monitor service: {str(e)}"
+        )
 
 
 @router.post("/test-email")

@@ -52,9 +52,9 @@ class NextJSDeployer(BaseDeployer):
                     deps = pkg.get("dependencies", {})
                     dev_deps = pkg.get("devDependencies", {})
                     return "next" in deps or "next" in dev_deps
-            except Exception:
-                pass
-        
+            except (json.JSONDecodeError, OSError) as e:
+                self.logger.debug(f"Failed to read package.json for Next.js detection: {e}")
+
         return False
     
     def _check_standalone_mode(self) -> bool:
@@ -68,9 +68,9 @@ class NextJSDeployer(BaseDeployer):
                     content = config_path.read_text()
                     if "output" in content and "standalone" in content:
                         return True
-                except Exception:
-                    pass
-        
+                except OSError as e:
+                    self.logger.debug(f"Failed to read {config_file} for standalone mode check: {e}")
+
         return False
     
     def get_install_command(self) -> List[str]:
