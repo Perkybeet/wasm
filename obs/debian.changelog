@@ -1,3 +1,17 @@
+wasm (0.13.15-1) unstable; urgency=medium
+
+  * Enhancement: Set update checker interval to instant (CHECK_INTERVAL = 0)
+  * Enhancement: Change update notification color to softer yellow (\\033[33m)
+  * Enhancement: Update notifications more visible but less aggressive
+  * Feature: Add --changelog flag to view current version changelog
+  * Feature: New version.py module for version information display
+  * Enhancement: Users can see changelog without visiting GitHub
+  * Enhancement: Fallback to GitHub release notes if changelog unavailable
+  * docs: Document OBS build failure prevention in CLAUDE.md
+  * docs: Add comprehensive OBS Package Management section
+
+ -- Yago López Prado <yago.lopez.adeje@gmail.com>  Wed, 15 Jan 2026 04:00:00 +0000
+
 wasm (0.13.14-1) unstable; urgency=medium
 
   * Fix: OBS build failures - add missing python3-inquirer dependency

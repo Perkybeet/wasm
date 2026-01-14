@@ -23,13 +23,81 @@ When creating a new release (patch, minor, or major), the version number **MUST*
 When creating a new version:
 
 1. **Update version in all 3 files listed above**
-2. **Create git commit** with descriptive message
-3. **Create annotated git tag**: `git tag -a vX.Y.Z -m "Release vX.Y.Z"`
-4. **Push commit and tag**: `git push && git push origin vX.Y.Z`
-5. GitHub Actions will automatically:
+2. **Update OBS files** (see OBS Package Management section below)
+3. **Create git commit** with descriptive message
+4. **Create annotated git tag**: `git tag -a vX.Y.Z -m "Release vX.Y.Z"`
+5. **Push commit and tag**: `git push && git push origin vX.Y.Z`
+6. GitHub Actions will automatically:
    - Publish to PyPI
    - Deploy to OpenBuildService (OBS)
    - Create GitHub Release
+
+## OBS Package Management
+
+**CRITICAL**: OpenBuildService (OBS) packages require additional maintenance beyond version numbers.
+
+### OBS-Specific Files (MUST update for each release)
+
+1. **`rpm/wasm.spec`**:
+   - Update `Version:` line (line 8)
+   - Add changelog entry in `%changelog` section with release notes
+
+2. **`obs/wasm.dsc`**:
+   - Update `Version:` line (line 5)
+   - Update tarball filename in `Files:` section (line 13)
+
+3. **`obs/debian.changelog`**:
+   - Add new version entry at the TOP of the file
+   - Include all changes from the release
+   - Use proper Debian changelog format
+
+4. **`obs/debian.control`**:
+   - Verify ALL Python dependencies are declared in `Depends:` section
+   - **Common mistake**: Adding Python imports without declaring package dependencies
+
+### Common OBS Build Failures
+
+#### Missing Python Dependencies (v0.13.14 issue)
+**Problem**: Build failed because `python3-inquirer` was imported in code but not declared in `obs/debian.control`.
+
+**Symptoms**:
+- Debian/Ubuntu builds fail on OBS
+- Error: "ModuleNotFoundError: No module named 'inquirer'"
+- RPM builds may succeed if dependency is in Requires section
+
+**Prevention**:
+- When adding Python imports, ALWAYS update `obs/debian.control`
+- Cross-check imports with declared dependencies before each release
+- Test builds locally with `dpkg-buildpackage` if possible
+
+**Package name mapping**:
+| Python import | Debian package | RPM package |
+|---------------|---------------|-------------|
+| `inquirer` | `python3-inquirer` | `python3-inquirer` |
+| `jinja2` | `python3-jinja2` | `python3-jinja2` |
+| `yaml` | `python3-yaml` | `python3-pyyaml` |
+| `fastapi` | `python3-fastapi` | `python3-fastapi` |
+
+### OBS Build Monitoring
+
+- Monitor builds at: https://build.opensuse.org/package/show/home:Perkybeet/wasm
+- Builds typically take 15-30 minutes
+- If builds fail, check build logs for missing dependencies
+
+### Pre-Release Verification
+
+Before creating a tag, verify:
+```bash
+# Check all version files are consistent
+grep -r "X\.Y\.Z" src/wasm/__init__.py setup.py pyproject.toml rpm/wasm.spec obs/wasm.dsc
+
+# Verify debian.control dependencies match Python imports
+grep "^import\|^from" -r src/wasm/ | grep -v __pycache__ | sort -u
+
+# Check changelog entries exist for new version
+head -20 obs/debian.changelog
+head -30 rpm/wasm.spec | grep -A 20 "%changelog"
+```
 
 ## Code Style & Conventions
 

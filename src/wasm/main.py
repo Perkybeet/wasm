@@ -28,12 +28,18 @@ from wasm.core.exceptions import WASMError
 def main() -> int:
     """
     Main entry point for WASM.
-    
+
     Returns:
         Exit code.
     """
     args = parse_args()
-    
+
+    # Show changelog
+    if args.changelog:
+        from wasm.cli.commands.version import show_changelog
+        show_changelog()
+        return 0
+
     # Interactive mode
     if args.interactive:
         try:

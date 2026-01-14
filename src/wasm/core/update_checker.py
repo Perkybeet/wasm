@@ -23,7 +23,7 @@ class UpdateChecker:
     """Check for WASM updates on GitHub."""
 
     CACHE_FILE = Path.home() / ".wasm" / "version_check.json"
-    CHECK_INTERVAL = 3600  # 1 hour in seconds
+    CHECK_INTERVAL = 0  # Instant
     TIMEOUT = 3  # Timeout for HTTP request
     GITHUB_API = "https://api.github.com/repos/Perkybeet/wasm/releases/latest"
 
@@ -310,9 +310,9 @@ class UpdateChecker:
             method = cls._detect_installation_method()
             update_command = cls._get_update_command(method)
 
-            print(f"\n\033[93m⚠  New version available: {latest_version} (current: {__version__})\033[0m")
-            print(f"\033[93m   Update with: {update_command}\033[0m")
-            print(f"\033[93m   Release notes: https://github.com/Perkybeet/wasm/releases/tag/v{latest_version}\033[0m\n")
+            print(f"\n\033[33m⚠  New version available: {latest_version} (current: {__version__})\033[0m")
+            print(f"\033[33m   Update with: {update_command}\033[0m")
+            print(f"\033[33m   Release notes: https://github.com/Perkybeet/wasm/releases/tag/v{latest_version}\033[0m\n")
         except Exception:
             # Even printing can fail in some edge cases
             pass

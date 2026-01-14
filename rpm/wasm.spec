@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.13.14
+Version:        0.13.15
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -119,6 +119,17 @@ echo "Note: You may need to install python3-inquirer via pip:"
 echo "  pip3 install inquirer"
 
 %changelog
+* Wed Jan 15 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.15-1
+- Enhancement: Set update checker interval to instant (CHECK_INTERVAL = 0)
+- Enhancement: Change update notification color to softer yellow (\033[33m)
+- Enhancement: Update notifications more visible but less aggressive
+- Feature: Add --changelog flag to view current version changelog
+- Feature: New version.py module for version information display
+- Enhancement: Users can see changelog without visiting GitHub
+- Enhancement: Fallback to GitHub release notes if changelog unavailable
+- docs: Document OBS build failure prevention in CLAUDE.md
+- docs: Add comprehensive OBS Package Management section
+
 * Wed Jan 15 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.14-1
 - Fix: OBS build failures - add missing python3-inquirer dependency
 - Fix: Update debian.changelog and RPM spec changelog for 0.13.13

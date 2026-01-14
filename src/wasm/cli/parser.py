@@ -56,6 +56,11 @@ For more information, visit: https://github.com/Perkybeet/wasm
         version=f"WASM {__version__}",
     )
     parser.add_argument(
+        "--changelog",
+        action="store_true",
+        help="Show changelog for current version",
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Enable verbose output",
