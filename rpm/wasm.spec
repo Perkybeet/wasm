@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.13.15
+Version:        0.13.16
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -119,6 +119,11 @@ echo "Note: You may need to install python3-inquirer via pip:"
 echo "  pip3 install inquirer"
 
 %changelog
+* Tue Jan 14 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.16-1
+- Fix: Move python3-inquirer from Depends to Recommends
+- Fix: Package installs on systems without python3-inquirer in repos
+- Enhancement: Interactive mode now optional (install inquirer via pip)
+
 * Wed Jan 15 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.15-1
 - Enhancement: Set update checker interval to instant (CHECK_INTERVAL = 0)
 - Enhancement: Change update notification color to softer yellow (\033[33m)
