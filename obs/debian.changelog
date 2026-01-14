@@ -1,3 +1,13 @@
+wasm (0.13.12-1) unstable; urgency=medium
+
+  * chore: Clean distribution packages (remove Docker files, dev tools)
+  * docs: Rewrite README professionally without emojis
+  * feat: Add .gitattributes to exclude dev files from git archive
+  * feat: Add MANIFEST.in to control PyPI source distribution
+  * Package cleanup: removed Dockerfile*, docker/, docker-compose.obs.yml
+
+ -- Yago López Prado <yago.lopez.adeje@gmail.com>  Tue, 14 Jan 2026 17:30:00 +0000
+
 wasm (0.13.11-1) unstable; urgency=medium
 
   * Fix: Environment variables with quotes now properly stripped from .env files

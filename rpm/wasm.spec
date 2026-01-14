@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.13.11
+Version:        0.13.12
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -119,6 +119,13 @@ echo "Note: You may need to install python3-inquirer via pip:"
 echo "  pip3 install inquirer"
 
 %changelog
+* Tue Jan 14 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.12-1
+- chore: Clean distribution packages (remove Docker files, dev tools)
+- docs: Rewrite README professionally without emojis
+- feat: Add .gitattributes to exclude dev files from git archive
+- feat: Add MANIFEST.in to control PyPI source distribution
+- Package cleanup: removed Dockerfile*, docker/, docker-compose.obs.yml
+
 * Tue Jan 14 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.11-1
 - Fix: Environment variables with quotes now properly stripped from .env files
 - Fix: Systemd service files no longer have double-quoted env vars
