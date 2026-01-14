@@ -133,7 +133,17 @@ def main() -> int:
 
 def cli():
     """CLI entry point for setuptools console_scripts."""
-    sys.exit(main())
+    exit_code = main()
+
+    # Check for updates after command execution (non-blocking)
+    try:
+        from wasm.core.update_checker import UpdateChecker
+        UpdateChecker.check_for_updates()
+    except Exception:
+        # Silently ignore any errors during update check
+        pass
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

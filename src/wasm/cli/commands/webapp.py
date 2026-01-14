@@ -147,7 +147,13 @@ def _handle_create(args: Namespace) -> int:
                     line = line.strip()
                     if line and not line.startswith("#") and "=" in line:
                         key, value = line.split("=", 1)
-                        env_vars[key.strip()] = value.strip()
+                        value = value.strip()
+                        # Remove surrounding quotes if present
+                        if value.startswith('"') and value.endswith('"'):
+                            value = value[1:-1]
+                        elif value.startswith("'") and value.endswith("'"):
+                            value = value[1:-1]
+                        env_vars[key.strip()] = value
     
     # Print deployment header
     logger.header("WASM Deployment")
