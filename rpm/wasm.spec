@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.13.10
+Version:        0.13.11
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -119,6 +119,13 @@ echo "Note: You may need to install python3-inquirer via pip:"
 echo "  pip3 install inquirer"
 
 %changelog
+* Tue Jan 14 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.11-1
+- Fix: Environment variables with quotes now properly stripped from .env files
+- Fix: Systemd service files no longer have double-quoted env vars
+- Feature: Automatic update checker via GitHub Releases API
+- Feature: Update notifications shown every hour (cached, non-blocking)
+- Enhancement: Update checker runs post-command to avoid delays
+
 * Wed Jan 08 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.7-1
 - Fix: 'wasm store sync' now updates app status along with service status
 

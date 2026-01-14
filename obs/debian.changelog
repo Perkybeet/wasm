@@ -1,9 +1,12 @@
 wasm (0.13.11-1) unstable; urgency=medium
 
-  * Fix: 'wasm store import' now scans all sites even if already tracked
-  * Fix: App type detection runs for existing apps with unknown type
+  * Fix: Environment variables with quotes now properly stripped from .env files
+  * Fix: Systemd service files no longer have double-quoted env vars
+  * Feature: Automatic update checker via GitHub Releases API
+  * Feature: Update notifications shown every hour (cached, non-blocking)
+  * Enhancement: Update checker runs post-command to avoid delays
 
- -- Yago López Prado <yago.lopez.adeje@gmail.com>  Wed, 08 Jan 2026 21:00:00 +0000
+ -- Yago López Prado <yago.lopez.adeje@gmail.com>  Tue, 14 Jan 2026 16:30:00 +0000
 
 wasm (0.13.9-1) unstable; urgency=medium
 
