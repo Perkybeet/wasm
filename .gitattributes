@@ -1,0 +1,29 @@
+# .gitattributes
+# Control what gets included in git archive (used for source tarballs)
+
+# Exclude development and CI files
+.github/ export-ignore
+.gitignore export-ignore
+.gitattributes export-ignore
+
+# Exclude build and test files
+Makefile export-ignore
+pytest.ini export-ignore
+tests/ export-ignore
+Dockerfile* export-ignore
+docker/ export-ignore
+docker-compose*.yml export-ignore
+
+# Exclude documentation for developers (keep README.md and docs/)
+CLAUDE.md export-ignore
+build-and-upload-obs.sh export-ignore
+
+# Keep these for distribution builds
+# obs/ - needed for Debian/Ubuntu packages
+# rpm/ - needed for RPM packages
+# src/ - the actual source code
+# README.md - user documentation
+# LICENSE - required
+# setup.py - needed for builds
+# pyproject.toml - needed for builds
+# docs/ - user documentation

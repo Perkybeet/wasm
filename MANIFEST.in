@@ -1,0 +1,36 @@
+# MANIFEST.in
+# Control what gets included in PyPI source distributions (sdist)
+
+# Include essential files
+include LICENSE
+include README.md
+include setup.py
+include pyproject.toml
+
+# Include source code (handled by setuptools, but explicit is better)
+recursive-include src *.py
+recursive-include src/wasm/templates *.j2
+recursive-include src/wasm/completions *
+recursive-include src/wasm/web/static *
+
+# Include documentation
+recursive-include docs *.md *.png *.jpg *.svg
+
+# Exclude everything else
+exclude Makefile
+exclude pytest.ini
+exclude build-and-upload-obs.sh
+recursive-exclude tests *
+recursive-exclude docker *
+exclude Dockerfile*
+exclude docker-compose*.yml
+recursive-exclude .github *
+recursive-exclude obs *
+recursive-exclude rpm *
+
+# Exclude Python cache and build artifacts
+global-exclude __pycache__
+global-exclude *.py[co]
+global-exclude .DS_Store
+global-exclude *.so
+global-exclude *.dylib
