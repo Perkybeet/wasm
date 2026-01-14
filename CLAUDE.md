@@ -133,7 +133,7 @@ pytest
 grep -r "0\.13\." --include="*.py" --include="*.toml" src/ setup.py pyproject.toml
 
 # Create release
-make release VERSION=0.13.12
+make release VERSION=X.Y.Z
 
 # Build package
 python -m build
