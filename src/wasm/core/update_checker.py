@@ -181,7 +181,7 @@ class UpdateChecker:
 
         Args:
             remote: Remote version string (e.g., "0.13.11").
-            local: Local version string (e.g., "0.13.10").
+            local: Local version string (e.g., "0.13.11").
 
         Returns:
             True if remote is newer than local.

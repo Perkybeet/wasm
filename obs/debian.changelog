@@ -1,4 +1,4 @@
-wasm (0.13.10-1) unstable; urgency=medium
+wasm (0.13.11-1) unstable; urgency=medium
 
   * Fix: 'wasm store import' now scans all sites even if already tracked
   * Fix: App type detection runs for existing apps with unknown type
