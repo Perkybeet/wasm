@@ -13,6 +13,7 @@ from fastapi import APIRouter, Request, HTTPException, Depends
 from pydantic import BaseModel
 
 from wasm.web.api.auth import get_current_session
+from wasm import __version__
 
 router = APIRouter()
 
@@ -432,3 +433,65 @@ async def get_network_info(
         interfaces.append(iface_info)
     
     return {"interfaces": interfaces}
+
+
+class UpdateInfo(BaseModel):
+    """Update information."""
+    current_version: str
+    latest_version: Optional[str] = None
+    has_update: bool
+    update_command: Optional[str] = None
+    release_url: Optional[str] = None
+
+
+@router.get("/version", response_model=UpdateInfo)
+async def check_version(
+    request: Request,
+    session: dict = Depends(get_current_session)
+):
+    """
+    Check current version and available updates.
+    """
+    from wasm.core.update_checker import UpdateChecker
+
+    # Get cached update info or fetch new
+    cached_data = UpdateChecker._read_cache()
+
+    # If cache is invalid, try to fetch (but don't block)
+    if not UpdateChecker._is_cache_valid():
+        try:
+            latest_version = UpdateChecker._fetch_latest_version()
+            if latest_version:
+                has_update = UpdateChecker._is_newer_version(latest_version, __version__)
+                # Update cache
+                import time
+                UpdateChecker._write_cache({
+                    "latest_version": latest_version,
+                    "has_update": has_update,
+                    "checked_at": time.time()
+                })
+                cached_data = {
+                    "latest_version": latest_version,
+                    "has_update": has_update
+                }
+        except Exception:
+            pass
+
+    # Determine update command
+    update_command = None
+    if cached_data and cached_data.get("has_update"):
+        method = UpdateChecker._detect_installation_method()
+        update_command = UpdateChecker._get_update_command(method)
+
+    # Prepare response
+    latest_version = cached_data.get("latest_version") if cached_data else None
+    has_update = cached_data.get("has_update", False) if cached_data else False
+    release_url = f"https://github.com/Perkybeet/wasm/releases/tag/v{latest_version}" if latest_version and has_update else None
+
+    return UpdateInfo(
+        current_version=__version__,
+        latest_version=latest_version,
+        has_update=has_update,
+        update_command=update_command,
+        release_url=release_url
+    )

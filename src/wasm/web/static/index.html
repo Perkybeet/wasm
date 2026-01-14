@@ -167,7 +167,31 @@
                     <!-- Notification bell will be inserted here by JS -->
                 </div>
             </header>
-            
+
+            <!-- Update Banner (hidden by default) -->
+            <div id="update-banner" class="hidden bg-gradient-to-r from-indigo-600 to-purple-600 border-b border-indigo-500">
+                <div class="px-6 py-3 flex items-center justify-between">
+                    <div class="flex items-center gap-3">
+                        <i class="fas fa-rocket text-white text-xl"></i>
+                        <div class="text-white">
+                            <span class="font-semibold">New version available!</span>
+                            <span id="update-version-text" class="ml-2"></span>
+                        </div>
+                    </div>
+                    <div class="flex items-center gap-3">
+                        <a id="update-release-link" href="#" target="_blank" class="text-white hover:text-indigo-100 text-sm underline">
+                            Release notes
+                        </a>
+                        <button onclick="showUpdateCommand()" class="bg-white/20 hover:bg-white/30 text-white px-4 py-1.5 rounded-lg text-sm font-medium transition-colors">
+                            How to update
+                        </button>
+                        <button onclick="dismissUpdateBanner()" class="text-white/80 hover:text-white p-1.5">
+                            <i class="fas fa-times"></i>
+                        </button>
+                    </div>
+                </div>
+            </div>
+
             <!-- Content Area -->
             <div id="content" class="p-6">
                 <!-- Dashboard Page -->
@@ -2044,6 +2068,83 @@ WantedBy=multi-user.target"></textarea>
             const pageTitle = document.getElementById('page-title');
             if (breadcrumb) {
                 breadcrumb.textContent = page.charAt(0).toUpperCase() + page.slice(1);
+            }
+        });
+
+        // Update checker
+        let updateInfo = null;
+
+        async function checkForUpdates() {
+            try {
+                const response = await fetch('/api/system/version', {
+                    headers: {
+                        'Authorization': `Bearer ${localStorage.getItem('wasm_session')}`
+                    }
+                });
+
+                if (response.ok) {
+                    updateInfo = await response.json();
+
+                    if (updateInfo.has_update && !localStorage.getItem('update_dismissed')) {
+                        showUpdateBanner();
+                    }
+                }
+            } catch (error) {
+                console.error('Failed to check for updates:', error);
+            }
+        }
+
+        function showUpdateBanner() {
+            if (!updateInfo || !updateInfo.has_update) return;
+
+            const banner = document.getElementById('update-banner');
+            const versionText = document.getElementById('update-version-text');
+            const releaseLink = document.getElementById('update-release-link');
+
+            if (banner && versionText && releaseLink) {
+                versionText.textContent = `v${updateInfo.current_version} → v${updateInfo.latest_version}`;
+                releaseLink.href = updateInfo.release_url || '#';
+                banner.classList.remove('hidden');
+            }
+        }
+
+        function dismissUpdateBanner() {
+            const banner = document.getElementById('update-banner');
+            if (banner) {
+                banner.classList.add('hidden');
+                // Remember dismissal for this session
+                localStorage.setItem('update_dismissed', 'true');
+            }
+        }
+
+        function showUpdateCommand() {
+            if (!updateInfo || !updateInfo.update_command) return;
+
+            const command = updateInfo.update_command;
+            const message = `To update WASM, run:\n\n${command}`;
+
+            // Show alert dialog (you can replace with a nicer modal if you have one)
+            alert(message);
+
+            // Also copy to clipboard if available
+            if (navigator.clipboard) {
+                navigator.clipboard.writeText(command).then(() => {
+                    console.log('Update command copied to clipboard');
+                }).catch(err => {
+                    console.error('Failed to copy to clipboard:', err);
+                });
+            }
+        }
+
+        // Check for updates on page load
+        window.addEventListener('load', () => {
+            setTimeout(checkForUpdates, 1000); // Delay slightly to not interfere with initial page load
+        });
+
+        // Clear dismissal when new version is detected
+        window.addEventListener('focus', () => {
+            if (updateInfo && !updateInfo.has_update) {
+                localStorage.removeItem('update_dismissed');
             }
         });
     </script>
