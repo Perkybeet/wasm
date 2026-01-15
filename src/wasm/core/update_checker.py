@@ -5,11 +5,12 @@
 """
 Update checker for WASM.
 
-Checks for new versions on GitHub without blocking the user's command.
+Checks for new versions on GitHub in the background without blocking the user's command.
 """
 
 import json
 import logging
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -22,32 +23,48 @@ logger = logging.getLogger(__name__)
 class UpdateChecker:
     """Check for WASM updates on GitHub."""
 
-    CACHE_FILE = Path.home() / ".wasm" / "version_check.json"
-    CHECK_INTERVAL = 0  # Instant
+    CACHE_FILE = Path.home() / ".cache" / "wasm" / "version_check.json"
+    CHECK_INTERVAL = 300  # 5 minutes
     TIMEOUT = 3  # Timeout for HTTP request
     GITHUB_API = "https://api.github.com/repos/Perkybeet/wasm/releases/latest"
 
-    @classmethod
-    def check_for_updates(cls):
-        """
-        Check for updates and notify user if available.
+    # Background check state
+    _check_thread: Optional[threading.Thread] = None
+    _update_version: Optional[str] = None
 
-        This method is non-blocking and fails silently on errors.
-        Uses a cache to avoid checking too frequently.
+    @classmethod
+    def start_background_check(cls):
+        """
+        Start update check in background thread.
+
+        Call this at the beginning of command execution.
+        The check runs in parallel while the command executes.
         """
         try:
-            # Check if we need to verify (cache expired)
+            # First check cache synchronously (fast)
             if cls._is_cache_valid():
                 cached_data = cls._read_cache()
                 if cached_data and cached_data.get("has_update"):
-                    cls._show_update_message(cached_data["latest_version"])
+                    cls._update_version = cached_data["latest_version"]
                 return
 
-            # Fetch latest version from GitHub
+            # Start background thread for network request
+            cls._update_version = None
+            cls._check_thread = threading.Thread(
+                target=cls._background_check,
+                daemon=True
+            )
+            cls._check_thread.start()
+        except Exception:
+            pass
+
+    @classmethod
+    def _background_check(cls):
+        """Perform the actual update check (runs in background thread)."""
+        try:
             latest_version = cls._fetch_latest_version()
 
             if not latest_version:
-                # Cache negative result to avoid repeated failures
                 cls._write_cache({
                     "latest_version": __version__,
                     "has_update": False,
@@ -55,23 +72,55 @@ class UpdateChecker:
                 })
                 return
 
-            # Compare versions
             has_update = cls._is_newer_version(latest_version, __version__)
 
-            # Save to cache
             cls._write_cache({
                 "latest_version": latest_version,
                 "has_update": has_update,
                 "checked_at": time.time()
             })
 
-            # Show message if update is available
             if has_update:
-                cls._show_update_message(latest_version)
+                cls._update_version = latest_version
 
         except Exception as e:
-            # Log but don't interrupt the user
-            logger.debug(f"Failed to check for updates: {e}")
+            logger.debug(f"Background update check failed: {e}")
+
+    @classmethod
+    def show_update_if_available(cls, timeout: float = 0.1):
+        """
+        Show update message if check completed and update is available.
+
+        Call this at the end of command execution.
+
+        Args:
+            timeout: Max seconds to wait for background check to complete.
+        """
+        try:
+            # Wait briefly for background thread if still running
+            if cls._check_thread and cls._check_thread.is_alive():
+                cls._check_thread.join(timeout=timeout)
+
+            # Show message if update found
+            if cls._update_version:
+                cls._show_update_message(cls._update_version)
+                cls._update_version = None  # Reset for next command
+
+        except Exception:
+            pass
+
+    @classmethod
+    def check_for_updates(cls):
+        """
+        Legacy method: Check for updates synchronously.
+
+        Deprecated: Use start_background_check() and show_update_if_available() instead.
+        """
+        cls.start_background_check()
+        # Wait for completion
+        if cls._check_thread:
+            cls._check_thread.join(timeout=cls.TIMEOUT + 1)
+        cls.show_update_if_available(timeout=0)
 
     @classmethod
     def _fetch_latest_version(cls) -> Optional[str]:

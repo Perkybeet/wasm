@@ -1,10 +1,28 @@
+wasm (0.14.0-1) unstable; urgency=medium
+
+  * Feature: New 'wasm health' command for system diagnostics
+  * Feature: New 'wasm config' command (upgrade, show, path)
+  * Feature: Automatic config migration on package upgrade
+  * Feature: Persistent threat storage with SQLite (threat_store.py)
+  * Feature: New API endpoints /api/monitor/threats/history and resolve
+  * Fix: Monitor module duplicate return statement (dead code)
+  * Fix: Inconsistent scan_interval defaults (30s local, 3600s AI)
+  * Fix: API /scan now respects global config (auto_terminate, use_ai)
+  * Fix: CPU/Memory thresholds now used for logging and alerts
+  * Enhancement: Monitor frontend uses WebSocket instead of HTTP polling
+  * Enhancement: Auto-update wasm-monitor service on package upgrade
+  * Enhancement: Improved process fallback with better ps parsing
+  * Enhancement: Notification report includes all threats for audit
+
+ -- Yago López Prado <yago.lopez.adeje@gmail.com>  Wed, 15 Jan 2026 18:00:00 +0000
+
 wasm (0.13.16-1) unstable; urgency=medium
 
   * Fix: Move python3-inquirer from Depends to Recommends
   * Fix: Package installs on systems without python3-inquirer in repos
   * Enhancement: Interactive mode now optional (install inquirer via pip)
 
- -- Yago López Prado <yago.lopez.adeje@gmail.com>  Tue, 14 Jan 2026 12:00:00 +0000
+ -- Yago López Prado <yago.lopez.adeje@gmail.com>  Wed, 15 Jan 2026 12:00:00 +0000
 
 wasm (0.13.15-1) unstable; urgency=medium
 

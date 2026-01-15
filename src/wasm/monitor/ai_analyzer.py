@@ -601,9 +601,7 @@ Return ONLY confirmed threats as JSON array. Empty array [] if nothing malicious
                     self.logger.warning(f"AI analysis failed: {e}")
         
         return results
-        
-        return results
-    
+
     def get_analysis_summary(self, results: List[AnalysisResult]) -> Dict[str, Any]:
         """
         Generate a summary of analysis results.

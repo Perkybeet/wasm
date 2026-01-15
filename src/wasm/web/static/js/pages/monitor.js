@@ -5,10 +5,12 @@
 import { api } from '../core/api.js';
 import { showToast, setLoading, setError, confirm } from '../core/ui.js';
 import { renderProcessesTable } from '../components/metrics.js';
+import { ws } from '../core/websocket.js';
 
-// Real-time update interval (ms)
-const UPDATE_INTERVAL = 5000;
-let updateIntervalId = null;
+// Process list update interval (less frequent than metrics)
+const PROCESS_UPDATE_INTERVAL = 30000;  // 30 seconds
+let processIntervalId = null;
+let wsConnected = false;
 
 // Store processes data for filtering
 let currentProcesses = [];
@@ -89,24 +91,82 @@ function handleClickOutside(e) {
 }
 
 /**
- * Start real-time updates
+ * Start real-time updates using WebSocket for metrics
+ * and polling for process list (less frequent)
  */
 function startRealTimeUpdates() {
     stopRealTimeUpdates();
-    updateIntervalId = setInterval(() => {
+
+    // Connect to system metrics via WebSocket (faster updates)
+    ws.connectSystem(
+        (data) => {
+            // Update metrics display from WebSocket data
+            if (data.type === 'metrics') {
+                wsConnected = true;
+                updateMetricsDisplay(data);
+            }
+        },
+        (error) => {
+            console.error('[Monitor] WebSocket error:', error);
+            wsConnected = false;
+            // Fall back to polling on WebSocket error
+            startPollingFallback();
+        },
+        5  // Update interval in seconds
+    );
+
+    // Process list still uses polling (less frequent, 30s)
+    processIntervalId = setInterval(() => {
+        loadProcesses();
+    }, PROCESS_UPDATE_INTERVAL);
+
+    // Also poll status periodically as backup
+    setInterval(() => {
+        loadStatus();
+    }, PROCESS_UPDATE_INTERVAL);
+}
+
+/**
+ * Update metrics display from WebSocket data
+ */
+function updateMetricsDisplay(data) {
+    // Update system metrics cards if they exist on the page
+    const cpuEl = document.querySelector('[data-metric="cpu"]');
+    const memEl = document.querySelector('[data-metric="memory"]');
+
+    if (cpuEl && data.cpu) {
+        cpuEl.textContent = `${data.cpu.percent.toFixed(1)}%`;
+    }
+    if (memEl && data.memory) {
+        memEl.textContent = `${data.memory.percent.toFixed(1)}%`;
+    }
+}
+
+/**
+ * Fallback to polling if WebSocket fails
+ */
+function startPollingFallback() {
+    if (wsConnected) return;  // Don't start if WS reconnected
+
+    console.log('[Monitor] Falling back to HTTP polling');
+    // Use a longer interval for fallback polling
+    processIntervalId = setInterval(() => {
         loadStatus();
         loadProcesses();
-    }, UPDATE_INTERVAL);
+    }, 10000);  // 10 seconds
 }
 
 /**
  * Stop real-time updates
  */
 export function stopRealTimeUpdates() {
-    if (updateIntervalId) {
-        clearInterval(updateIntervalId);
-        updateIntervalId = null;
+    if (processIntervalId) {
+        clearInterval(processIntervalId);
+        processIntervalId = null;
     }
+    // Disconnect WebSocket
+    ws.close('system');
+    wsConnected = false;
 }
 
 /**

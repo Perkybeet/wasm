@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Tuple
 from wasm.core.logger import Logger
 from wasm.core.exceptions import WASMError
 from wasm.core.config import DEFAULT_APPS_DIR, DEFAULT_LOG_DIR, DEFAULT_CONFIG_PATH
-from wasm.core.utils import command_exists, run_command, run_command_sudo
+from wasm.core.utils import command_exists, run_command, run_command_sudo, run_trusted_installer
 
 
 def handle_setup(args: Namespace) -> int:
@@ -361,20 +361,20 @@ def _handle_init(args: Namespace) -> int:
     
     if config_choices.get("install_nodejs") and not command_exists("node"):
         logger.substep("Installing Node.js 20.x LTS...")
-        
-        # Install Node.js from NodeSource
-        result = run_command(
-            "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -",
-            shell=True
-        )
-        if result.success:
-            result = run_command_sudo(["apt-get", "install", "-y", "nodejs"])
+
+        # Install Node.js from NodeSource using trusted installer
+        try:
+            result = run_trusted_installer("https://deb.nodesource.com/setup_20.x")
             if result.success:
-                logger.success("Node.js installed")
+                result = run_command_sudo(["apt-get", "install", "-y", "nodejs"])
+                if result.success:
+                    logger.success("Node.js installed")
+                else:
+                    logger.warning(f"Failed to install Node.js: {result.stderr}")
             else:
-                logger.warning(f"Failed to install Node.js: {result.stderr}")
-        else:
-            logger.warning("Failed to setup Node.js repository. Please install manually.")
+                logger.warning("Failed to setup Node.js repository. Please install manually.")
+        except Exception as e:
+            logger.warning(f"Failed to setup Node.js: {e}")
     
     # Install package managers
     selected_pms = config_choices.get("package_managers", ["npm"])
@@ -394,8 +394,12 @@ def _handle_init(args: Namespace) -> int:
         elif pm == "yarn":
             result = run_command_sudo(["npm", "install", "-g", "yarn"])
         elif pm == "bun":
-            # Bun has its own installer
-            result = run_command("curl -fsSL https://bun.sh/install | bash", shell=True)
+            # Bun has its own trusted installer
+            try:
+                result = run_trusted_installer("https://bun.sh/install")
+            except Exception as e:
+                logger.warning(f"Failed to install bun: {e}")
+                continue
         else:
             result = run_command_sudo(["npm", "install", "-g", pm])
         
@@ -467,7 +471,38 @@ def _handle_init(args: Namespace) -> int:
             logger.success(f"Created {DEFAULT_CONFIG_PATH}")
     except Exception as e:
         logger.warning(f"Could not save config file: {e}")
-    
+
+    # Install man page
+    logger.substep("Installing man page...")
+    try:
+        # Search for man page in multiple locations
+        man_source = None
+        search_paths = [
+            # Development: project root
+            Path(__file__).parent.parent.parent.parent.parent / "man" / "wasm.1",
+            # Installed via pip with data_files
+            Path("/usr/local/share/man/man1/wasm.1"),
+            Path("/usr/share/man/man1/wasm.1"),
+        ]
+
+        for path in search_paths:
+            if path.exists():
+                man_source = path
+                break
+
+        if man_source and man_source != Path("/usr/share/man/man1/wasm.1"):
+            man_dest = Path("/usr/share/man/man1/wasm.1")
+            shutil.copy(man_source, man_dest)
+            os.chmod(man_dest, 0o644)
+            run_command(["mandb", "-q"])
+            logger.success("Man page installed (man wasm)")
+        elif man_source:
+            logger.substep("Man page already installed")
+        else:
+            logger.debug("Man page source not found, skipping")
+    except Exception as e:
+        logger.debug(f"Could not install man page: {e}")
+
     # =========================================================================
     # Final Summary
     # =========================================================================

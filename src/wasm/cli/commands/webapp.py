@@ -2,10 +2,16 @@
 Web application command handlers for WASM.
 """
 
+import re
 import sys
 from argparse import Namespace
 from pathlib import Path
 from typing import Dict, Optional
+
+# Constants for .env file parsing
+MAX_ENV_FILE_SIZE = 1024 * 1024  # 1MB max
+MAX_ENV_LINE_LENGTH = 10000
+VALID_ENV_KEY_PATTERN = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 
 from wasm.core.config import Config
 from wasm.core.logger import Logger
@@ -143,18 +149,43 @@ def _handle_create(args: Namespace) -> int:
         env_path = Path(args.env_file)
         if env_path.exists():
             try:
+                # Check file size
+                file_size = env_path.stat().st_size
+                if file_size > MAX_ENV_FILE_SIZE:
+                    logger.error(f"Environment file too large: {file_size} bytes (max: {MAX_ENV_FILE_SIZE})")
+                    return 1
+
                 with open(env_path) as f:
-                    for line in f:
+                    for line_num, line in enumerate(f, 1):
+                        # Check line length
+                        if len(line) > MAX_ENV_LINE_LENGTH:
+                            logger.warning(f"Line {line_num} exceeds max length, skipping")
+                            continue
+
                         line = line.strip()
-                        if line and not line.startswith("#") and "=" in line:
-                            key, value = line.split("=", 1)
-                            value = value.strip()
-                            # Remove surrounding quotes if present
-                            if value.startswith('"') and value.endswith('"'):
-                                value = value[1:-1]
-                            elif value.startswith("'") and value.endswith("'"):
-                                value = value[1:-1]
-                            env_vars[key.strip()] = value
+                        if not line or line.startswith("#"):
+                            continue
+
+                        if "=" not in line:
+                            logger.warning(f"Line {line_num}: invalid format (no '='), skipping")
+                            continue
+
+                        key, value = line.split("=", 1)
+                        key = key.strip()
+                        value = value.strip()
+
+                        # Validate key format
+                        if not VALID_ENV_KEY_PATTERN.match(key):
+                            logger.warning(f"Line {line_num}: invalid key '{key}', skipping")
+                            continue
+
+                        # Remove surrounding quotes if present
+                        if value.startswith('"') and value.endswith('"'):
+                            value = value[1:-1]
+                        elif value.startswith("'") and value.endswith("'"):
+                            value = value[1:-1]
+
+                        env_vars[key] = value
             except OSError as e:
                 logger.error(f"Failed to read environment file {env_path}: {e}")
                 return 1
@@ -333,45 +364,93 @@ def _handle_status(args: Namespace) -> int:
 def _handle_restart(args: Namespace) -> int:
     """Handle webapp restart command."""
     logger = Logger(verbose=args.verbose)
-    service_manager = ServiceManager(verbose=args.verbose)
-    
+
+    from wasm.core.store import get_store
+    store = get_store()
+
     domain = validate_domain(args.domain)
     app_name = domain_to_app_name(domain)
-    
+
+    # Check if app is static (no service to restart)
+    app = store.get_app(domain)
+    if app and app.is_static:
+        logger.info(f"Static application - no service to restart: {domain}")
+        return 0
+
+    service_manager = ServiceManager(verbose=args.verbose)
+
+    # Verify service exists
+    if not service_manager.service_exists(app_name):
+        logger.warning(f"Service not found for: {domain}")
+        logger.info("This may be a static application or the service was not created")
+        return 1
+
     logger.info(f"Restarting {domain}...")
     service_manager.restart(app_name)
     logger.success(f"Application restarted: {domain}")
-    
+
     return 0
 
 
 def _handle_stop(args: Namespace) -> int:
     """Handle webapp stop command."""
     logger = Logger(verbose=args.verbose)
-    service_manager = ServiceManager(verbose=args.verbose)
-    
+
+    from wasm.core.store import get_store
+    store = get_store()
+
     domain = validate_domain(args.domain)
     app_name = domain_to_app_name(domain)
-    
+
+    # Check if app is static (no service to stop)
+    app = store.get_app(domain)
+    if app and app.is_static:
+        logger.info(f"Static application - no service to stop: {domain}")
+        return 0
+
+    service_manager = ServiceManager(verbose=args.verbose)
+
+    # Verify service exists
+    if not service_manager.service_exists(app_name):
+        logger.warning(f"Service not found for: {domain}")
+        logger.info("This may be a static application or the service was not created")
+        return 1
+
     logger.info(f"Stopping {domain}...")
     service_manager.stop(app_name)
     logger.success(f"Application stopped: {domain}")
-    
+
     return 0
 
 
 def _handle_start(args: Namespace) -> int:
     """Handle webapp start command."""
     logger = Logger(verbose=args.verbose)
-    service_manager = ServiceManager(verbose=args.verbose)
-    
+
+    from wasm.core.store import get_store
+    store = get_store()
+
     domain = validate_domain(args.domain)
     app_name = domain_to_app_name(domain)
-    
+
+    # Check if app is static (no service to start)
+    app = store.get_app(domain)
+    if app and app.is_static:
+        logger.info(f"Static application - no service to start: {domain}")
+        return 0
+
+    service_manager = ServiceManager(verbose=args.verbose)
+
+    # Verify service exists
+    if not service_manager.service_exists(app_name):
+        logger.warning(f"Service not found for: {domain}")
+        logger.info("This may be a static application or the service was not created")
+        return 1
+
     logger.info(f"Starting {domain}...")
     service_manager.start(app_name)
     logger.success(f"Application started: {domain}")
-    
+
     return 0
 
 
@@ -531,33 +610,75 @@ def _handle_delete(args: Namespace) -> int:
     """Handle webapp delete command."""
     logger = Logger(verbose=args.verbose)
     config = Config()
-    
+
     from wasm.core.store import get_store
     store = get_store()
-    
+
     domain = validate_domain(args.domain)
     app_name = domain_to_app_name(domain)
     app_path = config.apps_directory / app_name
-    
+
     # Check if app exists in store or filesystem
     app = store.get_app(domain)
     app_exists_on_disk = app_path.exists()
-    
+
     if not app and not app_exists_on_disk:
         logger.warning(f"Application not found: {domain}")
         return 1
-    
+
+    # Dry-run mode: show what would be deleted
+    dry_run = getattr(args, 'dry_run', False)
+    if dry_run:
+        logger.header(f"Dry-run: Would delete {domain}")
+        logger.blank()
+        logger.info("The following actions would be performed:")
+        logger.blank()
+
+        # Check service
+        service_manager = ServiceManager(verbose=args.verbose)
+        try:
+            status = service_manager.status(app_name)
+            if status.get("exists"):
+                logger.key_value("Stop and remove service", f"wasm-{app_name}")
+        except Exception:
+            pass
+
+        # Check nginx
+        nginx = NginxManager(verbose=args.verbose)
+        if nginx.site_exists(domain):
+            logger.key_value("Remove nginx config", f"/etc/nginx/sites-available/{domain}")
+
+        # Check apache
+        apache = ApacheManager(verbose=args.verbose)
+        if apache.site_exists(domain):
+            logger.key_value("Remove apache config", f"/etc/apache2/sites-available/{domain}.conf")
+
+        # Check files
+        if app_exists_on_disk:
+            if not args.keep_files:
+                logger.key_value("Remove app files", str(app_path))
+            else:
+                logger.key_value("Keep app files", str(app_path))
+
+        # Check store records
+        if app:
+            logger.key_value("Remove from database", f"App, Site, and Service records for {domain}")
+
+        logger.blank()
+        logger.info("Run without --dry-run to execute these actions.")
+        return 0
+
     # Confirmation
     if not args.force:
         response = input(f"Delete application '{domain}'? [y/N] ")
         if response.lower() != "y":
             logger.info("Aborted")
             return 0
-    
+
     logger.header(f"Deleting: {domain}")
-    
+
     total_steps = 5
-    
+
     # Stop and delete service
     logger.step(1, total_steps, "Stopping service")
     service_manager = ServiceManager(verbose=args.verbose)
@@ -565,7 +686,7 @@ def _handle_delete(args: Namespace) -> int:
         service_manager.delete_service(app_name)
     except Exception as e:
         logger.warning(f"Failed to delete service: {e}")
-    
+
     # Delete site configuration
     logger.step(2, total_steps, "Removing site configuration")
     try:
@@ -583,7 +704,7 @@ def _handle_delete(args: Namespace) -> int:
             apache.reload()
     except Exception as e:
         logger.warning(f"Failed to remove apache site configuration: {e}")
-    
+
     # Delete files
     if not args.keep_files:
         logger.step(3, total_steps, "Removing application files")
@@ -591,14 +712,14 @@ def _handle_delete(args: Namespace) -> int:
         remove_directory(app_path, sudo=True)
     else:
         logger.step(3, total_steps, "Keeping application files")
-    
+
     # Delete from store
     logger.step(4, total_steps, "Removing from database")
     if app:
         store.delete_site(domain)
         store.delete_service(app_name)
         store.delete_app(domain)
-    
+
     logger.step(5, total_steps, "Cleanup complete")
     logger.success(f"Application deleted: {domain}")
     

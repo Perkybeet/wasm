@@ -11,7 +11,13 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from wasm.core.utils import run_command, run_command_sudo, command_exists
+from wasm.core.utils import (
+    run_command,
+    run_command_sudo,
+    command_exists,
+    run_trusted_installer,
+    TRUSTED_INSTALLER_URLS,
+)
 
 
 class DependencyStatus(Enum):
@@ -444,10 +450,10 @@ class DependencyChecker:
     def install_dependency(self, dep: Dependency) -> Tuple[bool, str]:
         """
         Install a dependency.
-        
+
         Args:
             dep: Dependency to install.
-            
+
         Returns:
             Tuple of (success, message).
         """
@@ -456,46 +462,74 @@ class DependencyChecker:
             if result.success:
                 return True, f"Installed {dep.name} via apt"
             return False, f"Failed to install {dep.name}: {result.stderr}"
-        
+
         if dep.install_script:
-            # Run install script
-            result = run_command(dep.install_script, shell=True)
+            script = dep.install_script
+
+            # Check if script uses a trusted installer URL
+            for url in TRUSTED_INSTALLER_URLS:
+                if url in script:
+                    try:
+                        result = run_trusted_installer(url)
+                        # If the script includes additional commands (e.g., && apt-get install),
+                        # run the rest separately
+                        if "&&" in script:
+                            post_cmd = script.split("&&", 1)[1].strip()
+                            if post_cmd.startswith("sudo"):
+                                result = run_command_sudo(post_cmd.replace("sudo", "").split())
+                        if result.success:
+                            return True, f"Installed {dep.name}"
+                        return False, f"Failed to install {dep.name}: {result.stderr}"
+                    except Exception as e:
+                        return False, f"Failed to install {dep.name}: {e}"
+
+            # For simple npm commands, convert to list format
+            if script.startswith("npm install"):
+                parts = script.split()
+                result = run_command_sudo(parts)
+                if result.success:
+                    return True, f"Installed {dep.name}"
+                return False, f"Failed to install {dep.name}: {result.stderr}"
+
+            # For other scripts, run with shell but log a warning
+            result = run_command(script, shell=True)
             if result.success:
                 return True, f"Installed {dep.name}"
             return False, f"Failed to install {dep.name}: {result.stderr}"
-        
+
         return False, f"No installation method available for {dep.name}"
     
     def install_package_manager(self, pm: str) -> Tuple[bool, str]:
         """
         Install a Node.js package manager.
-        
+
         Args:
             pm: Package manager name.
-            
+
         Returns:
             Tuple of (success, message).
         """
         # First verify npm/node is available
         if not self.check_command("npm"):
             return False, "npm is required to install other package managers. Please install Node.js first."
-        
+
         pm_info = self.PACKAGE_MANAGERS.get(pm)
         if not pm_info:
             return False, f"Unknown package manager: {pm}"
-        
-        install_cmd = pm_info.get("install_cmd", "")
-        
+
         if pm == "bun":
-            # Bun has its own installer
-            result = run_command(install_cmd, shell=True)
+            # Bun has its own trusted installer
+            try:
+                result = run_trusted_installer("https://bun.sh/install")
+            except Exception as e:
+                return False, f"Failed to install bun: {e}"
         else:
             # Install via npm globally
             result = run_command_sudo(["npm", "install", "-g", pm])
-        
+
         if result.success:
             return True, f"Successfully installed {pm}"
-        
+
         return False, f"Failed to install {pm}: {result.stderr}"
     
     def get_setup_summary(self) -> Dict[str, any]:

@@ -30,6 +30,7 @@ from wasm.managers.apache_manager import ApacheManager
 from wasm.managers.service_manager import ServiceManager
 from wasm.managers.cert_manager import CertManager
 from wasm.managers.source_manager import SourceManager
+from wasm.deployers.helpers import PackageManagerHelper, PathResolver, PrismaHelper
 
 
 # Type for package managers
@@ -69,11 +70,16 @@ class BaseDeployer(ABC):
         self.config = Config()
         self.logger = Logger(verbose=verbose)
         self.store = get_store()
-        
+
         # Managers
         self.source_manager = SourceManager(verbose=verbose)
         self.service_manager = ServiceManager(verbose=verbose)
         self.cert_manager = CertManager(verbose=verbose)
+
+        # Helpers
+        self._pm_helper = PackageManagerHelper(logger=self.logger)
+        self._path_resolver = PathResolver(logger=self.logger)
+        self._prisma_helper: Optional[PrismaHelper] = None  # Initialized after app_path is set
         
         # Deployment configuration
         self.domain: Optional[str] = None
@@ -157,368 +163,152 @@ class BaseDeployer(ABC):
     def _detect_package_manager(self) -> str:
         """
         Detect the package manager used in the project.
-        
+
         Returns:
             Detected package manager name.
         """
-        if self._package_manager != "auto":
-            return self._package_manager
-        
-        if not self.app_path:
-            return "npm"
-        
-        # Check for lock files
-        if (self.app_path / "pnpm-lock.yaml").exists():
-            return "pnpm"
-        elif (self.app_path / "bun.lockb").exists():
-            return "bun"
-        elif (self.app_path / "yarn.lock").exists():
-            return "yarn"
-        
-        return "npm"
+        return self._pm_helper.detect(self.app_path, self._package_manager)
     
     def _verify_package_manager(self) -> None:
         """
         Verify the package manager is installed and available.
         Falls back to an available package manager if the requested one is not installed.
-        
+
         Raises:
             DeploymentError: If no package manager is available at all.
         """
-        from wasm.core.utils import command_exists
-        from wasm.core.dependencies import DependencyChecker
-        
-        pm = self.package_manager
-        
-        if command_exists(pm):
-            return  # Requested PM is available, all good
-        
-        # Requested PM not available, check what is available
-        checker = DependencyChecker()
-        available = checker.get_available_package_managers()
-        
-        if not available:
-            # No package managers at all
-            raise DeploymentError(
-                "No package manager available",
-                details=(
-                    "No Node.js package manager (npm, pnpm, yarn, bun) is installed.\n\n"
-                    "To fix this, run the setup wizard:\n"
-                    "  sudo wasm setup init\n\n"
-                    "Or install Node.js manually which includes npm:\n"
-                    "  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -\n"
-                    "  sudo apt install -y nodejs"
-                )
-            )
-        
-        # Fall back to first available package manager
-        fallback_pm = available[0]
-        self.logger.warning(
-            f"Package manager '{pm}' not installed. Using '{fallback_pm}' instead."
-        )
-        self.logger.info(f"Available package managers: {', '.join(available)}")
-        self.package_manager = fallback_pm
+        self.package_manager = self._pm_helper.verify(self.package_manager)
     
     def _detect_prisma(self) -> bool:
         """
         Detect if project uses Prisma ORM.
-        
+
         Returns:
             True if Prisma is detected.
         """
-        if not self.app_path:
-            return False
-        
-        # Check for prisma directory
-        if (self.app_path / "prisma").exists():
-            return True
-        
-        # Check package.json for prisma
-        package_json = self.app_path / "package.json"
-        if package_json.exists():
-            try:
-                import json
-                with open(package_json) as f:
-                    pkg = json.load(f)
-                    deps = pkg.get("dependencies", {})
-                    dev_deps = pkg.get("devDependencies", {})
-                    if "@prisma/client" in deps or "prisma" in dev_deps:
-                        return True
-            except (json.JSONDecodeError, OSError) as e:
-                self.logger.debug(f"Failed to read package.json for Prisma detection: {e}")
-
-        return False
+        return self._ensure_prisma_helper().detect(self.app_path)
     
     def _get_pm_install_command(self) -> List[str]:
         """
         Get the package manager install command.
-        
+
         Returns:
             Install command as list.
         """
-        pm = self.package_manager
-        
-        if pm == "pnpm":
-            return ["pnpm", "install", "--frozen-lockfile"]
-        elif pm == "bun":
-            return ["bun", "install", "--frozen-lockfile"]
-        elif pm == "yarn":
-            return ["yarn", "install", "--frozen-lockfile"]
-        else:  # npm
-            return ["npm", "ci"]
+        return self._pm_helper.get_install_command(self.package_manager)
     
     def _get_pm_run_command(self, script: str) -> List[str]:
         """
         Get the package manager run command.
-        
+
         Args:
             script: Script name to run.
-            
+
         Returns:
             Run command as list.
         """
-        pm = self.package_manager
-        
-        if pm == "pnpm":
-            return ["pnpm", "run", script]
-        elif pm == "bun":
-            return ["bun", "run", script]
-        elif pm == "yarn":
-            return ["yarn", script]
-        else:  # npm
-            return ["npm", "run", script]
+        return self._pm_helper.get_run_command(self.package_manager, script)
     
     def _get_pm_exec_command(self, command: str) -> List[str]:
         """
         Get the package manager exec/dlx command.
-        
+
         Args:
             command: Command to execute.
-            
+
         Returns:
             Exec command as list.
         """
-        pm = self.package_manager
-        cmd_parts = command.split()
-        
-        if pm == "pnpm":
-            return ["pnpm", "exec"] + cmd_parts
-        elif pm == "bun":
-            return ["bunx"] + cmd_parts
-        elif pm == "yarn":
-            return ["yarn"] + cmd_parts
-        else:  # npm
-            return ["npx"] + cmd_parts
+        return self._pm_helper.get_exec_command(self.package_manager, command)
     
     def _is_private_path(self, path: str) -> bool:
         """
         Check if path is in a private/user-specific directory.
-        
-        Private paths (like /root/.nvm or /home/user/.nvm) are not
-        accessible by systemd services running as non-root users.
-        
+
         Args:
             path: Absolute path to check.
-            
+
         Returns:
             True if path is in a private directory.
         """
-        import os
-        
-        private_patterns = [
-            "/root/",
-            "/.nvm/",
-            "/.local/",
-            "/.npm/",
-            "/.yarn/",
-            "/.bun/",
-        ]
-        
-        # Check for home directories (e.g., /home/user/.nvm/)
-        if path.startswith("/home/"):
-            parts = path.split("/")
-            if len(parts) > 3:
-                # Check if it's a hidden directory in user's home
-                for part in parts[3:]:
-                    if part.startswith("."):
-                        return True
-        
-        # Check for known private patterns
-        for pattern in private_patterns:
-            if pattern in path:
-                return True
-        
-        return False
+        return self._path_resolver.is_private_path(path)
     
-    def _find_global_executable(self, executable: str) -> str | None:
+    def _find_global_executable(self, executable: str) -> Optional[str]:
         """
         Find executable in global/system paths only.
-        
-        Searches common system paths for the executable, avoiding
-        user-specific installations like nvm.
-        
+
         Args:
             executable: Name of executable to find.
-            
+
         Returns:
             Absolute path if found in system paths, None otherwise.
         """
-        import os
-        
-        # System paths to search (in order of preference)
-        system_paths = [
-            "/usr/bin",
-            "/usr/local/bin",
-            "/bin",
-            "/usr/sbin",
-            "/usr/local/sbin",
-            "/sbin",
-            "/snap/bin",
-        ]
-        
-        for sys_path in system_paths:
-            candidate = os.path.join(sys_path, executable)
-            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-                return candidate
-        
-        return None
+        return self._path_resolver.find_global_executable(executable)
     
     def _resolve_absolute_path(self, command: str) -> str:
         """
         Resolve command to use absolute paths for executables.
-        
+
         This is required for systemd services as ExecStart
         must use absolute paths. Prefers global system paths
         over user-specific installations (like nvm) to avoid
         permission issues with systemd services.
-        
+
         Args:
             command: Command string (e.g., "npm run start")
-            
+
         Returns:
             Command with absolute path (e.g., "/usr/bin/npm run start")
         """
-        import shutil
-        
-        parts = command.split()
-        if not parts:
-            return command
-        
-        executable = parts[0]
-        
-        # Already absolute - check if it's a private path
-        if executable.startswith("/"):
-            if self._is_private_path(executable):
-                # Try to find a global alternative
-                base_name = executable.split("/")[-1]
-                global_path = self._find_global_executable(base_name)
-                if global_path:
-                    self.logger.warning(
-                        f"Executable '{executable}' is in a private directory. "
-                        f"Using system path: {global_path}"
-                    )
-                    parts[0] = global_path
-                    return " ".join(parts)
-                else:
-                    self.logger.warning(
-                        f"Executable '{executable}' is in a private directory "
-                        f"and no system alternative found. "
-                        f"The service may fail with 'Permission denied'."
-                    )
-            return command
-        
-        # First, try to find in global system paths
-        global_path = self._find_global_executable(executable)
-        if global_path:
-            parts[0] = global_path
-            return " ".join(parts)
-        
-        # Fallback to shutil.which (includes PATH from current environment)
-        abs_path = shutil.which(executable)
-        if abs_path:
-            # Check if the found path is in a private directory
-            if self._is_private_path(abs_path):
-                self.logger.warning(
-                    f"Package manager '{executable}' found at '{abs_path}' "
-                    f"which is in a private directory (e.g., nvm installation)."
-                )
-                self.logger.warning(
-                    f"The systemd service runs as a non-root user and won't be able "
-                    f"to access this path."
-                )
-                self.logger.info(
-                    f"To fix this, install Node.js/npm globally:\n"
-                    f"  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -\n"
-                    f"  sudo apt install -y nodejs\n"
-                    f"Or for pnpm: sudo npm install -g pnpm"
-                )
-            parts[0] = abs_path
-            return " ".join(parts)
-        
-        # Fallback: return original (systemd will fail, but error will be clearer)
-        self.logger.warning(
-            f"Could not find absolute path for '{executable}'. "
-            f"Service may fail to start."
-        )
-        return command
+        return self._path_resolver.resolve_command(command)
     
+    def _ensure_prisma_helper(self) -> PrismaHelper:
+        """
+        Ensure PrismaHelper is initialized and return it.
+
+        Returns:
+            Initialized PrismaHelper instance.
+        """
+        if self._prisma_helper is None:
+            self._prisma_helper = PrismaHelper(
+                logger=self.logger,
+                run_command=self._run,
+                get_exec_command=self._get_pm_exec_command,
+            )
+        return self._prisma_helper
+
     def generate_prisma(self) -> bool:
         """
         Generate Prisma client if Prisma is detected.
-        
+
         Returns:
             True if successful or not needed.
         """
         if not self.has_prisma:
             return True
-        
-        self.logger.substep("Generating Prisma client")
-        
-        # Run prisma generate
-        command = self._get_pm_exec_command("prisma generate")
-        result = self._run(command, timeout=120)
-        
-        if not result.success:
-            self.logger.warning(f"Prisma generate failed: {result.stderr}")
-            # Don't fail the whole deployment for this
-            return True
-        
-        return True
-    
+
+        return self._ensure_prisma_helper().generate(self.app_path)
+
     def run_prisma_migrate(self, deploy: bool = True) -> bool:
         """
         Run Prisma migrations.
-        
+
         Args:
             deploy: If True, run deploy (production), else run dev.
-            
+
         Returns:
             True if successful.
         """
         if not self.has_prisma:
             return True
-        
+
         # Check if there's a migrations folder
         migrations_dir = self.app_path / "prisma" / "migrations"
         if not migrations_dir.exists():
             self.logger.debug("No Prisma migrations found")
             return True
-        
-        self.logger.substep("Running Prisma migrations")
-        
-        if deploy:
-            command = self._get_pm_exec_command("prisma migrate deploy")
-        else:
-            command = self._get_pm_exec_command("prisma migrate dev")
-        
-        result = self._run(command, timeout=300)
-        
-        if not result.success:
-            self.logger.warning(f"Prisma migrate failed: {result.stderr}")
-            # Continue anyway - migrations might already be applied
-            return True
-        
-        return True
+
+        return self._ensure_prisma_helper().migrate(self.app_path, deploy=deploy)
     
     @abstractmethod
     def detect(self, path: Path) -> bool:
@@ -609,19 +399,203 @@ class BaseDeployer(ABC):
     def check_dependencies(self) -> bool:
         """
         Check if system dependencies are installed.
-        
+
         Returns:
             True if all dependencies are available.
         """
         from wasm.core.utils import command_exists
-        
+
         for dep in self.SYSTEM_DEPS:
             if not command_exists(dep):
                 self.logger.warning(f"Missing dependency: {dep}")
                 return False
-        
+
         return True
-    
+
+    def pre_flight_check(self) -> bool:
+        """
+        Perform pre-deployment validation checks.
+
+        Validates that all conditions are met before starting deployment:
+        - Repository is accessible (for git sources)
+        - Sufficient disk space
+        - Port is available
+        - System dependencies are installed
+
+        Returns:
+            True if all checks pass.
+
+        Raises:
+            DeploymentError: If any check fails.
+        """
+        checks_passed = True
+        issues = []
+
+        self.logger.debug("Running pre-flight checks...")
+
+        # 1. Check system dependencies
+        if not self.check_dependencies():
+            issues.append(f"Missing system dependencies: {', '.join(self.SYSTEM_DEPS)}")
+            checks_passed = False
+
+        # 2. Check repository accessibility (for git sources)
+        if self.source and (
+            self.source.startswith("git@") or
+            self.source.startswith("https://") or
+            self.source.startswith("http://") or
+            self.source.startswith("git://")
+        ):
+            result = run_command(
+                ["git", "ls-remote", "--exit-code", self.source],
+                timeout=30
+            )
+            if not result.success:
+                issues.append(f"Repository not accessible: {self.source}")
+                if "Permission denied" in str(result.stderr):
+                    issues.append("Check SSH key configuration: wasm setup ssh --test")
+                checks_passed = False
+
+        # 3. Check disk space (require at least 1GB free)
+        import shutil
+        try:
+            apps_dir = self.config.apps_directory
+            if apps_dir.exists():
+                stat = shutil.disk_usage(str(apps_dir))
+                free_gb = stat.free / (1024 ** 3)
+                if free_gb < 1.0:
+                    issues.append(f"Insufficient disk space: {free_gb:.1f}GB free (need 1GB minimum)")
+                    checks_passed = False
+        except Exception as e:
+            self.logger.debug(f"Could not check disk space: {e}")
+
+        # 4. Check if port is available
+        if self.port:
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                result = sock.connect_ex(('127.0.0.1', self.port))
+                if result == 0:
+                    # Port is in use - check if it's our own service
+                    existing_app = self.store.get_app(self.domain)
+                    if not existing_app or existing_app.port != self.port:
+                        issues.append(f"Port {self.port} is already in use")
+                        checks_passed = False
+            finally:
+                sock.close()
+
+        # 5. Check webserver is running
+        try:
+            if self.webserver == "nginx":
+                manager = NginxManager(verbose=self.verbose)
+            else:
+                manager = ApacheManager(verbose=self.verbose)
+
+            if not manager.is_running():
+                issues.append(f"{self.webserver} is not running")
+                checks_passed = False
+        except Exception as e:
+            self.logger.debug(f"Could not check webserver status: {e}")
+
+        if not checks_passed:
+            details = "\n".join(f"  - {issue}" for issue in issues)
+            raise DeploymentError(
+                "Pre-flight checks failed",
+                details=f"The following issues were found:\n{details}"
+            )
+
+        self.logger.debug("All pre-flight checks passed")
+        return True
+
+    def rollback(self, keep_files: bool = False) -> bool:
+        """
+        Rollback a partial deployment.
+
+        Cleans up any resources created during a failed deployment:
+        - Systemd service (if created)
+        - Web server configuration (if created)
+        - Application files (if keep_files=False)
+        - Store records
+
+        Args:
+            keep_files: If True, preserve the application files.
+
+        Returns:
+            True if rollback completed successfully.
+        """
+        self.logger.debug("Rolling back partial deployment...")
+        errors = []
+
+        # 1. Stop and remove service if it exists
+        try:
+            if self.app_name:
+                status = self.service_manager.status(self.app_name)
+                if status.get("exists"):
+                    self.logger.debug(f"Removing service: {self.app_name}")
+                    try:
+                        self.service_manager.stop(self.app_name)
+                    except Exception:
+                        pass  # Service might not be running
+                    self.service_manager.delete_service(self.app_name)
+        except Exception as e:
+            errors.append(f"Service cleanup failed: {e}")
+            self.logger.debug(f"Service cleanup error: {e}")
+
+        # 2. Remove web server configuration
+        try:
+            if self.domain and self.webserver:
+                if self.webserver == "nginx":
+                    manager = NginxManager(verbose=self.verbose)
+                else:
+                    manager = ApacheManager(verbose=self.verbose)
+
+                if manager.site_exists(self.domain):
+                    self.logger.debug(f"Removing site config: {self.domain}")
+                    manager.disable_site(self.domain)
+                    manager.delete_site(self.domain)
+                    manager.reload()
+        except Exception as e:
+            errors.append(f"Site cleanup failed: {e}")
+            self.logger.debug(f"Site cleanup error: {e}")
+
+        # 3. Remove application files
+        if not keep_files and self.app_path and self.app_path.exists():
+            try:
+                import shutil
+                self.logger.debug(f"Removing app files: {self.app_path}")
+                shutil.rmtree(self.app_path)
+            except Exception as e:
+                errors.append(f"File cleanup failed: {e}")
+                self.logger.debug(f"File cleanup error: {e}")
+
+        # 4. Clean up store records
+        try:
+            if self.domain:
+                # Remove service record
+                if self.app_name:
+                    service = self.store.get_service(self.app_name)
+                    if service:
+                        self.store.delete_service(service.id)
+
+                # Remove site record
+                site = self.store.get_site(self.domain)
+                if site:
+                    self.store.delete_site(site.id)
+
+                # Remove or update app record
+                app = self.store.get_app(self.domain)
+                if app:
+                    self.store.delete_app(app.id)
+        except Exception as e:
+            errors.append(f"Store cleanup failed: {e}")
+            self.logger.debug(f"Store cleanup error: {e}")
+
+        if errors:
+            self.logger.debug(f"Rollback completed with {len(errors)} errors")
+        else:
+            self.logger.debug("Rollback completed successfully")
+
+        return len(errors) == 0
+
     def pre_install(self) -> bool:
         """
         Pre-installation hook.
@@ -1044,20 +1018,27 @@ class BaseDeployer(ABC):
     def deploy(self, total_steps: int = 7) -> bool:
         """
         Run the full deployment workflow.
-        
+
         Args:
             total_steps: Total number of deployment steps.
-            
+
         Returns:
             True if deployment was successful.
         """
         from wasm.core.logger import Icons
         from wasm.core.exceptions import CertificateError
         from datetime import datetime
-        
+
         # Track if SSL was successfully obtained
         ssl_obtained = False
-        
+
+        # Track if this is a new deployment (for rollback)
+        is_new_deployment = not self.store.get_app(self.domain)
+
+        # Pre-flight checks (validation before starting)
+        self.logger.debug("Running pre-flight validation...")
+        self.pre_flight_check()
+
         # Register app in store at the start
         app = self._register_app_in_store(AppStatus.DEPLOYING.value)
         
@@ -1117,19 +1098,15 @@ class BaseDeployer(ABC):
             
             # Health check
             if self.health_check():
-                self.logger.success(f"Application deployed successfully!")
-                self.logger.blank()
-                protocol = "https" if ssl_obtained else "http"
-                self.logger.key_value("URL", f"{protocol}://{self.domain}")
-                self.logger.key_value("Service", self.app_name)
-                self.logger.key_value("Port", str(self.port))
-                if self.ssl and not ssl_obtained:
-                    self.logger.blank()
-                    self.logger.warning("SSL was requested but could not be obtained.")
-                    self.logger.info("To add SSL later, run: wasm cert create -d " + self.domain)
+                self._show_deployment_summary(ssl_obtained)
                 return True
             else:
                 self.logger.warning("Application started but health check failed")
+                self._show_deployment_summary(ssl_obtained)
+                self.logger.blank()
+                self.logger.info("Troubleshooting commands:")
+                self.logger.info(f"  wasm logs {self.domain}        # View application logs")
+                self.logger.info(f"  wasm status {self.domain}      # Check service status")
                 return True  # Still consider it successful
                 
         except Exception as e:
@@ -1137,8 +1114,73 @@ class BaseDeployer(ABC):
             app.status = AppStatus.FAILED.value
             self.store.update_app(app)
             self.logger.error(f"Deployment failed: {e}")
+
+            # Rollback partial deployment for new apps
+            if is_new_deployment:
+                self.logger.warning("Rolling back partial deployment...")
+                try:
+                    self.rollback(keep_files=False)
+                    self.logger.info("Rollback completed successfully")
+                except Exception as rollback_error:
+                    self.logger.debug(f"Rollback error: {rollback_error}")
+                    self.logger.warning("Rollback had some errors. Manual cleanup may be needed.")
+
             raise
     
+    def _show_deployment_summary(self, ssl_obtained: bool) -> None:
+        """
+        Show deployment summary with useful information.
+
+        Args:
+            ssl_obtained: Whether SSL certificate was obtained.
+        """
+        import socket
+
+        self.logger.success("Application deployed successfully!")
+        self.logger.blank()
+
+        # Basic info
+        protocol = "https" if ssl_obtained else "http"
+        self.logger.key_value("URL", f"{protocol}://{self.domain}")
+        self.logger.key_value("Service", f"wasm-{self.app_name}")
+        self.logger.key_value("Port", str(self.port))
+        self.logger.key_value("App Path", str(self.app_path))
+
+        # Get server IP for DNS configuration
+        try:
+            hostname = socket.gethostname()
+            # Try to get the public IP
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.connect(("8.8.8.8", 80))
+                server_ip = s.getsockname()[0]
+            finally:
+                s.close()
+            self.logger.key_value("Server IP", server_ip)
+        except Exception:
+            pass
+
+        # SSL status
+        if self.ssl and not ssl_obtained:
+            self.logger.blank()
+            self.logger.warning("SSL was requested but could not be obtained.")
+            self.logger.info("To add SSL later, run: wasm cert create -d " + self.domain)
+
+        # Useful commands
+        self.logger.blank()
+        self.logger.info("Useful commands:")
+        self.logger.info(f"  wasm status {self.domain}      # Check application status")
+        self.logger.info(f"  wasm logs {self.domain}        # View application logs")
+        self.logger.info(f"  wasm restart {self.domain}     # Restart the application")
+        self.logger.info(f"  wasm update {self.domain}      # Update from source")
+
+        # DNS reminder if SSL failed
+        if self.ssl and not ssl_obtained:
+            self.logger.blank()
+            self.logger.info("DNS Configuration (for SSL):")
+            self.logger.info(f"  Add an A record pointing {self.domain} to your server IP")
+            self.logger.info(f"  Then run: wasm cert create -d {self.domain}")
+
     def _register_app_in_store(self, status: str) -> App:
         """
         Register or update application in persistent store.

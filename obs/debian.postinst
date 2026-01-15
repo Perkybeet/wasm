@@ -31,6 +31,23 @@ case "$1" in
             chown root:wasm /etc/wasm/config.yaml 2>/dev/null || true
             chmod 640 /etc/wasm/config.yaml 2>/dev/null || true
         fi
+
+        # Upgrade config file with new defaults (preserves user values)
+        if [ -f /etc/wasm/config.yaml ]; then
+            echo "Upgrading configuration with new defaults..."
+            wasm config upgrade --quiet 2>/dev/null || true
+        fi
+
+        # Update wasm-monitor service if it exists and is enabled
+        if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
+            echo "Updating wasm-monitor service..."
+            # Reinstall service file with new version
+            wasm monitor install >/dev/null 2>&1 || true
+            # Reload systemd and restart service
+            systemctl daemon-reload
+            systemctl restart wasm-monitor.service || true
+            echo "wasm-monitor service updated and restarted"
+        fi
         ;;
     
     abort-upgrade|abort-remove|abort-deconfigure)

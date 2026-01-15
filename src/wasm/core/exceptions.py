@@ -238,3 +238,17 @@ class DatabaseBackupError(DatabaseError):
 class DatabaseQueryError(DatabaseError):
     """Raised when a database query fails."""
     pass
+
+
+class SecurityError(WASMError):
+    """
+    Raised when a security-sensitive operation is attempted with untrusted input.
+
+    Used to prevent command injection and other security vulnerabilities.
+    """
+    pass
+
+
+class BackupError(WASMError):
+    """Raised when backup operations fail."""
+    pass

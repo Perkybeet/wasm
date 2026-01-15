@@ -19,18 +19,28 @@ from wasm.core.logger import Logger
 from wasm.core.utils import run_command, run_command_sudo, write_file
 from wasm.monitor.ai_analyzer import AIProcessAnalyzer, AnalysisResult, ProcessInfo
 from wasm.monitor.email_notifier import EmailNotifier, ThreatReport
+from wasm.monitor.threat_store import ThreatStore
+
+
+# Default configuration values (exported for use in other modules)
+DEFAULT_SCAN_INTERVAL = 30  # Local scan every 30 seconds
+DEFAULT_AI_INTERVAL = 3600  # AI analysis every hour
+DEFAULT_CPU_THRESHOLD = 80.0
+DEFAULT_MEMORY_THRESHOLD = 80.0
 
 
 @dataclass
 class MonitorConfig:
     """Process monitor configuration."""
-    
+
     enabled: bool = False
-    scan_interval: int = 30  # Local scan every 30 seconds (was 3600)
-    ai_interval: int = 3600  # AI analysis every hour
-    cpu_threshold: float = 80.0
-    memory_threshold: float = 80.0
+    scan_interval: int = DEFAULT_SCAN_INTERVAL
+    ai_interval: int = DEFAULT_AI_INTERVAL
+    cpu_threshold: float = DEFAULT_CPU_THRESHOLD
+    memory_threshold: float = DEFAULT_MEMORY_THRESHOLD
     auto_terminate: bool = True
+    # Note: terminate_malicious_only is enforced in _mitigate_threat()
+    # which only terminates processes with threat_level == "malicious"
     terminate_malicious_only: bool = True
     use_ai: bool = True
     dry_run: bool = False
@@ -70,7 +80,8 @@ class ProcessMonitor:
         
         self.analyzer = AIProcessAnalyzer(verbose=verbose)
         self.notifier = EmailNotifier(verbose=verbose)
-        
+        self.threat_store = ThreatStore(verbose=verbose)
+
         self._running = False
         self._terminated_pids: Set[int] = set()
     
@@ -78,10 +89,18 @@ class ProcessMonitor:
         """Load monitor configuration from global config."""
         return MonitorConfig(
             enabled=self.global_config.get("monitor.enabled", False),
-            scan_interval=self.global_config.get("monitor.scan_interval", 30),
-            ai_interval=self.global_config.get("monitor.ai_interval", 3600),
-            cpu_threshold=self.global_config.get("monitor.cpu_threshold", 80.0),
-            memory_threshold=self.global_config.get("monitor.memory_threshold", 80.0),
+            scan_interval=self.global_config.get(
+                "monitor.scan_interval", DEFAULT_SCAN_INTERVAL
+            ),
+            ai_interval=self.global_config.get(
+                "monitor.ai_interval", DEFAULT_AI_INTERVAL
+            ),
+            cpu_threshold=self.global_config.get(
+                "monitor.cpu_threshold", DEFAULT_CPU_THRESHOLD
+            ),
+            memory_threshold=self.global_config.get(
+                "monitor.memory_threshold", DEFAULT_MEMORY_THRESHOLD
+            ),
             auto_terminate=self.global_config.get("monitor.auto_terminate", True),
             terminate_malicious_only=self.global_config.get(
                 "monitor.terminate_malicious_only", True
@@ -168,46 +187,111 @@ class ProcessMonitor:
             # Fallback to ps command if psutil is not available
             self.logger.warning("psutil not available, using fallback method")
             processes = self._get_processes_fallback()
-        
+
+        # Log processes exceeding thresholds (informational)
+        high_resource = [
+            p for p in processes
+            if p.cpu_percent > self.config.cpu_threshold
+            or p.memory_percent > self.config.memory_threshold
+        ]
+        if high_resource:
+            self.logger.debug(
+                f"Found {len(high_resource)} processes exceeding resource thresholds "
+                f"(CPU>{self.config.cpu_threshold}% or MEM>{self.config.memory_threshold}%)"
+            )
+            for p in high_resource[:5]:  # Log top 5
+                self.logger.debug(
+                    f"  - {p.name} (PID {p.pid}): CPU={p.cpu_percent:.1f}%, "
+                    f"MEM={p.memory_percent:.1f}%"
+                )
+
         return processes
     
     def _get_processes_fallback(self) -> List[ProcessInfo]:
         """
         Get processes using ps command (fallback method).
-        
+
+        Note: This fallback provides limited information compared to psutil.
+        Fields like connections, open_files, cwd, parent_name, create_time,
+        and num_threads will be empty or default values.
+
         Returns:
-            List of ProcessInfo objects.
+            List of ProcessInfo objects with limited data.
         """
         processes = []
-        
+
+        # Use extended ps format to get more info including status
         result = run_command([
-            "ps", "aux", "--no-headers"
+            "ps", "-eo", "pid,user,%cpu,%mem,stat,args", "--no-headers"
         ])
-        
+
         if not result.success:
+            self.logger.warning(f"ps fallback failed: {result.stderr}")
             return processes
-        
+
         for line in result.stdout.strip().split('\n'):
             if not line:
                 continue
-            
-            parts = line.split(None, 10)
-            if len(parts) < 11:
+
+            parts = line.split(None, 5)
+            if len(parts) < 5:
                 continue
-            
+
             try:
+                command = parts[5] if len(parts) > 5 else ""
+                # Extract process name from command (first word, basename)
+                name = ""
+                if command:
+                    first_word = command.split()[0]
+                    name = first_word.split('/')[-1]
+
                 processes.append(ProcessInfo(
-                    pid=int(parts[1]),
-                    name=parts[10].split()[0] if parts[10] else "",
-                    user=parts[0],
+                    pid=int(parts[0]),
+                    name=name,
+                    user=parts[1],
                     cpu_percent=float(parts[2]),
                     memory_percent=float(parts[3]),
-                    command=parts[10],
+                    command=command,
+                    status=self._parse_ps_stat(parts[4]),
+                    # Fields not available in fallback
+                    cwd="",
+                    connections=[],
+                    open_files=[],
+                    create_time=None,
+                    parent_pid=None,
+                    parent_name=None,
+                    num_threads=1,
                 ))
-            except (ValueError, IndexError):
+            except (ValueError, IndexError) as e:
+                self.logger.debug(f"Failed to parse process line: {e}")
                 continue
-        
+
         return processes
+
+    def _parse_ps_stat(self, stat: str) -> str:
+        """
+        Parse ps STAT field to human-readable status.
+
+        Args:
+            stat: The STAT field from ps output (e.g., "Ss", "R+", "Sl").
+
+        Returns:
+            Human-readable status string.
+        """
+        if not stat:
+            return "unknown"
+        first_char = stat[0].upper()
+        status_map = {
+            'R': 'running',
+            'S': 'sleeping',
+            'D': 'disk-sleep',
+            'Z': 'zombie',
+            'T': 'stopped',
+            'I': 'idle',
+            'W': 'waiting',
+            'X': 'dead',
+        }
+        return status_map.get(first_char, 'unknown')
     
     def _terminate_process(
         self,
@@ -531,8 +615,15 @@ class ProcessMonitor:
         if not results:
             self.logger.success("No threats detected")
             return []
-        
-        self.logger.warning(f"Detected {len(results)} potential threats")
+
+        # Log analysis summary
+        summary = self.analyzer.get_analysis_summary(results)
+        self.logger.warning(
+            f"Detected {summary['total_threats']} threats: "
+            f"{summary['malicious_count']} malicious, "
+            f"{summary['suspicious_count']} suspicious "
+            f"(avg confidence: {summary['avg_confidence']:.1%})"
+        )
         
         # Separate malicious from suspicious
         malicious_results = [r for r in results if r.threat_level == "malicious"]
@@ -603,16 +694,24 @@ class ProcessMonitor:
                 action_taken="Monitoring only (suspicious, not confirmed malicious)",
             ))
         
-        # STEP 3: Send MITIGATION report only if we actually terminated something
-        if mitigation_performed:
-            self.logger.info("Sending mitigation report...")
+        # STEP 3: Send final report for audit purposes
+        # Always send if there were any threats (for audit trail)
+        if final_reports:
+            report_type = "mitigation" if mitigation_performed else "audit"
+            self.logger.info(f"Sending {report_type} report ({len(final_reports)} threat(s))...")
             try:
                 self.notifier.send_threat_alert(final_reports, is_final=True)
             except Exception as e:
-                self.logger.error(f"Failed to send mitigation report: {e}")
-        else:
-            self.logger.info("No malicious processes terminated - skipping mitigation report")
-        
+                self.logger.error(f"Failed to send {report_type} report: {e}")
+
+        # STEP 4: Persist threats to database for audit
+        if final_reports:
+            try:
+                saved_ids = self.threat_store.save_threats(final_reports)
+                self.logger.debug(f"Persisted {len(saved_ids)} threat(s) to database")
+            except Exception as e:
+                self.logger.error(f"Failed to persist threats: {e}")
+
         return final_reports
     
     def run(self) -> None:

@@ -16,6 +16,9 @@ recursive-include src/wasm/web/static *
 # Include documentation
 recursive-include docs *.md *.png *.jpg *.svg
 
+# Include man pages
+recursive-include man *
+
 # Exclude everything else
 exclude Makefile
 exclude pytest.ini

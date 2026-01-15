@@ -5,12 +5,17 @@ Provides endpoints for the AI-powered process monitor.
 """
 
 import logging
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Request, HTTPException, Depends
 from pydantic import BaseModel
 
 from wasm.web.api.auth import get_current_session
+from wasm.monitor import (
+    DEFAULT_SCAN_INTERVAL,
+    DEFAULT_CPU_THRESHOLD,
+    DEFAULT_MEMORY_THRESHOLD,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,12 +53,22 @@ class ScanResult(BaseModel):
     reason: Optional[str] = None
 
 
+class ScanSummary(BaseModel):
+    """Summary of scan analysis."""
+    total_threats: int
+    malicious_count: int
+    suspicious_count: int
+    avg_confidence: float
+    recommended_terminations: int
+
+
 class ScanResponse(BaseModel):
     """Response from a scan."""
     scanned: int
     suspicious: int
     terminated: int
     results: List[ScanResult]
+    summary: Optional[ScanSummary] = None
 
 
 @router.get("/status", response_model=MonitorStatus)
@@ -105,9 +120,9 @@ async def get_monitor_config(
     monitor_config = config.get("monitor", {})
     
     return MonitorConfig(
-        scan_interval=monitor_config.get("scan_interval", 3600),
-        cpu_threshold=monitor_config.get("cpu_threshold", 80.0),
-        memory_threshold=monitor_config.get("memory_threshold", 80.0),
+        scan_interval=monitor_config.get("scan_interval", DEFAULT_SCAN_INTERVAL),
+        cpu_threshold=monitor_config.get("cpu_threshold", DEFAULT_CPU_THRESHOLD),
+        memory_threshold=monitor_config.get("memory_threshold", DEFAULT_MEMORY_THRESHOLD),
         auto_terminate=monitor_config.get("auto_terminate", True),
         terminate_malicious_only=monitor_config.get("terminate_malicious_only", True),
         use_ai=monitor_config.get("use_ai", True),
@@ -208,16 +223,31 @@ async def run_scan(
         analyze_all: Analyze ALL processes with AI (expensive, use sparingly).
     """
     try:
-        from wasm.monitor.process_monitor import ProcessMonitor, MonitorConfig
+        from wasm.monitor.process_monitor import ProcessMonitor
+        from wasm.monitor import MonitorConfig
     except ImportError:
         raise HTTPException(
             status_code=500,
             detail="Monitor module not available. Install with: pip install wasm-cli[monitor]"
         )
-    
+
     try:
-        # Create config with dry_run setting
-        config = MonitorConfig(dry_run=dry_run)
+        # Load global config and merge with request parameters
+        from wasm.core.config import Config
+        global_config = Config()
+        monitor_settings = global_config.get("monitor", {})
+
+        # Create config respecting global settings, override dry_run from request
+        config = MonitorConfig(
+            enabled=True,  # Always enabled for single scan
+            scan_interval=0,  # Single scan, no interval
+            auto_terminate=monitor_settings.get("auto_terminate", True),
+            terminate_malicious_only=monitor_settings.get("terminate_malicious_only", True),
+            use_ai=monitor_settings.get("use_ai", True),
+            cpu_threshold=monitor_settings.get("cpu_threshold", DEFAULT_CPU_THRESHOLD),
+            memory_threshold=monitor_settings.get("memory_threshold", DEFAULT_MEMORY_THRESHOLD),
+            dry_run=dry_run,  # Override from request parameter
+        )
         monitor = ProcessMonitor(config=config, verbose=False)
         
         # Run threat scan with force_ai and analyze_all options
@@ -251,12 +281,27 @@ async def run_scan(
             total_processes = len(list(psutil.process_iter()))
         except (ImportError, Exception):
             total_processes = len(scan_results)
-        
+
+        # Generate summary if there were threats
+        summary = None
+        if threat_reports:
+            malicious = sum(1 for r in threat_reports if r.threat_level == "malicious")
+            suspicious = sum(1 for r in threat_reports if r.threat_level == "suspicious")
+            avg_conf = sum(r.confidence for r in threat_reports) / len(threat_reports)
+            summary = ScanSummary(
+                total_threats=len(threat_reports),
+                malicious_count=malicious,
+                suspicious_count=suspicious,
+                avg_confidence=avg_conf,
+                recommended_terminations=malicious,  # Only malicious are auto-terminated
+            )
+
         return ScanResponse(
             scanned=total_processes,
             suspicious=suspicious_count,
             terminated=terminated_count,
-            results=scan_results[:50]  # Limit results
+            results=scan_results[:50],  # Limit results
+            summary=summary,
         )
     except Exception as e:
         logger.error(f"Failed to run process scan: {e}", exc_info=True)
@@ -494,3 +539,112 @@ async def test_email(
         if "Details:" in error_msg:
             error_msg = error_msg.split("Details:")[0].strip()
         raise HTTPException(status_code=500, detail=f"Failed to send test email: {error_msg}")
+
+
+class ThreatHistoryItem(BaseModel):
+    """A threat from history."""
+    id: int
+    timestamp: str
+    pid: int
+    process_name: str
+    user: Optional[str]
+    cpu_percent: Optional[float]
+    memory_percent: Optional[float]
+    command: Optional[str]
+    threat_level: str
+    confidence: Optional[float]
+    reason: Optional[str]
+    action_taken: Optional[str]
+    resolved: bool
+
+
+class ThreatHistoryResponse(BaseModel):
+    """Response with threat history."""
+    threats: List[ThreatHistoryItem]
+    count: int
+    stats: Optional[Dict[str, int]] = None
+
+
+@router.get("/threats/history", response_model=ThreatHistoryResponse)
+async def get_threat_history(
+    request: Request,
+    limit: int = 50,
+    include_resolved: bool = False,
+    threat_level: Optional[str] = None,
+    session: dict = Depends(get_current_session)
+):
+    """
+    Get historical threats from the database.
+
+    Args:
+        limit: Maximum number of threats to return (default 50).
+        include_resolved: Include resolved threats (default False).
+        threat_level: Filter by threat level (malicious, suspicious).
+    """
+    try:
+        from wasm.monitor import ThreatStore
+
+        store = ThreatStore(verbose=False)
+        threats = store.get_recent_threats(
+            limit=limit,
+            include_resolved=include_resolved,
+            threat_level=threat_level,
+        )
+        stats = store.get_stats()
+
+        return ThreatHistoryResponse(
+            threats=[ThreatHistoryItem(**t) for t in threats],
+            count=len(threats),
+            stats=stats,
+        )
+    except ImportError:
+        raise HTTPException(
+            status_code=500,
+            detail="Monitor module not available"
+        )
+    except Exception as e:
+        logger.error(f"Failed to get threat history: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get threat history: {str(e)}"
+        )
+
+
+@router.post("/threats/{threat_id}/resolve")
+async def resolve_threat(
+    request: Request,
+    threat_id: int,
+    session: dict = Depends(get_current_session)
+):
+    """
+    Mark a threat as resolved.
+
+    Args:
+        threat_id: The ID of the threat to resolve.
+    """
+    try:
+        from wasm.monitor import ThreatStore
+
+        store = ThreatStore(verbose=False)
+        success = store.mark_resolved(threat_id)
+
+        if success:
+            return {"success": True, "message": f"Threat #{threat_id} marked as resolved"}
+        else:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Threat #{threat_id} not found"
+            )
+    except ImportError:
+        raise HTTPException(
+            status_code=500,
+            detail="Monitor module not available"
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to resolve threat: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to resolve threat: {str(e)}"
+        )

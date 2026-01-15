@@ -134,6 +134,53 @@ def run_command_sudo(
     return run_command(cmd_list, cwd=cwd, env=env, timeout=timeout)
 
 
+# Whitelist of trusted installer URLs
+TRUSTED_INSTALLER_URLS = frozenset([
+    "https://deb.nodesource.com/setup_20.x",
+    "https://deb.nodesource.com/setup_22.x",
+    "https://bun.sh/install",
+    "https://get.pnpm.io/install.sh",
+])
+
+
+def run_trusted_installer(
+    url: str,
+    timeout: Optional[int] = 300,
+) -> CommandResult:
+    """
+    Execute a trusted installation script via curl | bash.
+
+    Only allows whitelisted URLs to prevent command injection.
+    This function is designed for installing well-known development tools
+    (Node.js, Bun, pnpm) from their official sources.
+
+    Args:
+        url: URL of the installer script (must be in whitelist).
+        timeout: Command timeout in seconds (default: 5 minutes).
+
+    Returns:
+        CommandResult with execution results.
+
+    Raises:
+        SecurityError: If URL is not in the trusted whitelist.
+    """
+    from wasm.core.exceptions import SecurityError
+
+    if url not in TRUSTED_INSTALLER_URLS:
+        raise SecurityError(
+            f"Untrusted installer URL: {url}",
+            f"Only the following URLs are allowed:\n"
+            + "\n".join(f"  - {u}" for u in sorted(TRUSTED_INSTALLER_URLS))
+        )
+
+    # Use shell=True only for pipe, but URL is validated above
+    return run_command(
+        f"curl -fsSL '{url}' | bash",
+        shell=True,
+        timeout=timeout,
+    )
+
+
 def command_exists(command: str) -> bool:
     """
     Check if a command exists in PATH.

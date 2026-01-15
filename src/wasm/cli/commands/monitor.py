@@ -9,6 +9,11 @@ from argparse import Namespace
 
 from wasm.core.logger import Logger
 from wasm.core.exceptions import WASMError, MonitorError, EmailError
+from wasm.monitor import (
+    DEFAULT_SCAN_INTERVAL,
+    DEFAULT_CPU_THRESHOLD,
+    DEFAULT_MEMORY_THRESHOLD,
+)
 
 
 def handle_monitor(args: Namespace) -> int:
@@ -348,9 +353,9 @@ def _handle_config(args: Namespace) -> int:
     # General settings
     logger.info("")
     logger.key_value("Enabled", str(config.get("monitor.enabled", False)))
-    logger.key_value("Scan Interval", f"{config.get('monitor.scan_interval', 3600)}s")
-    logger.key_value("CPU Threshold", f"{config.get('monitor.cpu_threshold', 80.0)}%")
-    logger.key_value("Memory Threshold", f"{config.get('monitor.memory_threshold', 80.0)}%")
+    logger.key_value("Scan Interval", f"{config.get('monitor.scan_interval', DEFAULT_SCAN_INTERVAL)}s")
+    logger.key_value("CPU Threshold", f"{config.get('monitor.cpu_threshold', DEFAULT_CPU_THRESHOLD)}%")
+    logger.key_value("Memory Threshold", f"{config.get('monitor.memory_threshold', DEFAULT_MEMORY_THRESHOLD)}%")
     
     # Actions
     logger.info("")

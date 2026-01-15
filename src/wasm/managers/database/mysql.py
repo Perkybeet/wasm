@@ -6,10 +6,13 @@
 MySQL/MariaDB database manager for WASM.
 """
 
+import os
 import re
+import tempfile
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Generator, List, Optional
 
 from wasm.core.exceptions import (
     DatabaseError,
@@ -56,6 +59,74 @@ class MySQLManager(BaseDatabaseManager):
         super().__init__(verbose=verbose)
         self._detect_variant()
     
+    # ==================== SQL Escaping (Security) ====================
+
+    @staticmethod
+    def _escape_identifier(value: str) -> str:
+        """
+        Escape a SQL identifier (database name, username, etc.) for MySQL.
+
+        Uses backticks and escapes any backticks in the value.
+        This prevents SQL injection in identifiers.
+        """
+        return "`" + value.replace("`", "``") + "`"
+
+    @staticmethod
+    def _escape_literal(value: str) -> str:
+        """
+        Escape a SQL string literal for MySQL.
+
+        Escapes single quotes by doubling them.
+        This prevents SQL injection in string values.
+        """
+        return "'" + value.replace("\\", "\\\\").replace("'", "''") + "'"
+
+    @contextmanager
+    def _secure_credentials(self) -> Generator[List[str], None, None]:
+        """
+        Context manager that provides MySQL credentials securely.
+
+        Creates a temporary config file instead of passing password
+        on the command line (which would be visible in ps aux).
+
+        Yields:
+            List of command line arguments to use for MySQL authentication.
+        """
+        creds = self.config.get("databases", {}).get("credentials", {}).get("mysql", {})
+        user = creds.get("user")
+        password = creds.get("password")
+
+        if not password:
+            # No password configured, just yield user flag if set
+            if user:
+                yield ["-u", user]
+            else:
+                yield []
+            return
+
+        # Create a temporary config file with credentials
+        # This avoids exposing the password in ps aux
+        fd, config_path = tempfile.mkstemp(prefix="wasm_mysql_", suffix=".cnf")
+        try:
+            config_content = "[client]\n"
+            if user:
+                config_content += f"user={user}\n"
+            config_content += f"password={password}\n"
+
+            os.write(fd, config_content.encode())
+            os.close(fd)
+
+            # Set restrictive permissions
+            os.chmod(config_path, 0o600)
+
+            yield [f"--defaults-extra-file={config_path}"]
+        finally:
+            # Clean up the temporary file
+            try:
+                os.unlink(config_path)
+            except OSError:
+                pass
+
     def _detect_variant(self) -> None:
         """Detect if MySQL or MariaDB is installed."""
         # Check for MariaDB first
@@ -155,8 +226,8 @@ class MySQLManager(BaseDatabaseManager):
         # Stop service
         try:
             self.stop()
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.warning(f"Could not stop service during uninstall: {e}")
         
         action = "purge" if purge else "remove"
         
@@ -182,35 +253,25 @@ class MySQLManager(BaseDatabaseManager):
     ) -> tuple[bool, str]:
         """
         Execute SQL command.
-        
+
         Args:
             sql: SQL command.
             database: Database to use.
             return_output: Return query output.
-            
+
         Returns:
             Tuple of (success, output).
         """
-        cmd = ["mysql", "-N", "-B"]
-        
-        # Add credentials if configured
-        # Note: Config is loaded from /etc/wasm/config.yaml
-        # Users should ensure this file is readable only by root if it contains passwords
-        creds = self.config.get("databases", {}).get("credentials", {}).get("mysql", {})
-        user = creds.get("user")
-        password = creds.get("password")
-        
-        if user:
-            cmd.extend(["-u", user])
-        if password:
-            cmd.extend([f"-p{password}"])
-            
-        if database:
-            cmd.extend(["-D", database])
-        cmd.extend(["-e", sql])
-        
-        result = self._run_sudo(cmd)
-        return result.success, result.stdout if result.success else result.stderr
+        with self._secure_credentials() as cred_args:
+            cmd = ["mysql", "-N", "-B"]
+            cmd.extend(cred_args)
+
+            if database:
+                cmd.extend(["-D", database])
+            cmd.extend(["-e", sql])
+
+            result = self._run_sudo(cmd)
+            return result.success, result.stdout if result.success else result.stderr
     
     # ==================== Database Management ====================
     
@@ -227,8 +288,10 @@ class MySQLManager(BaseDatabaseManager):
         
         charset = encoding or "utf8mb4"
         collation = kwargs.get("collation", "utf8mb4_unicode_ci")
-        
-        sql = f"CREATE DATABASE `{name}` CHARACTER SET {charset} COLLATE {collation};"
+
+        # Use escaped identifier to prevent SQL injection
+        safe_name = self._escape_identifier(name)
+        sql = f"CREATE DATABASE {safe_name} CHARACTER SET {charset} COLLATE {collation};"
         success, output = self._execute_sql(sql)
         
         if not success:
@@ -247,8 +310,10 @@ class MySQLManager(BaseDatabaseManager):
             if force:
                 return True
             raise DatabaseNotFoundError(f"Database '{name}' does not exist")
-        
-        sql = f"DROP DATABASE `{name}`;"
+
+        # Use escaped identifier to prevent SQL injection
+        safe_name = self._escape_identifier(name)
+        sql = f"DROP DATABASE {safe_name};"
         success, output = self._execute_sql(sql)
         
         if not success:
@@ -259,7 +324,9 @@ class MySQLManager(BaseDatabaseManager):
     
     def database_exists(self, name: str) -> bool:
         """Check if a database exists."""
-        sql = f"SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = '{name}';"
+        # Use escaped literal to prevent SQL injection
+        safe_name = self._escape_literal(name)
+        sql = f"SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = {safe_name};"
         success, output = self._execute_sql(sql)
         return success and name in output
     
@@ -303,17 +370,20 @@ class MySQLManager(BaseDatabaseManager):
         """Get detailed database information."""
         if not self.database_exists(name):
             raise DatabaseNotFoundError(f"Database '{name}' does not exist")
-        
+
+        # Use escaped literal to prevent SQL injection
+        safe_name = self._escape_literal(name)
+
         # Get size and table count
         sql = f"""
-            SELECT 
+            SELECT
                 SUM(DATA_LENGTH + INDEX_LENGTH) as size,
                 COUNT(*) as tables
-            FROM INFORMATION_SCHEMA.TABLES 
-            WHERE TABLE_SCHEMA = '{name}';
+            FROM INFORMATION_SCHEMA.TABLES
+            WHERE TABLE_SCHEMA = {safe_name};
         """
         success, output = self._execute_sql(sql)
-        
+
         size = None
         tables = 0
         if success and output.strip():
@@ -325,9 +395,9 @@ class MySQLManager(BaseDatabaseManager):
                     tables = int(parts[1]) if parts[1] else 0
                 except (ValueError, TypeError):
                     pass
-        
+
         # Get encoding
-        sql = f"SELECT DEFAULT_CHARACTER_SET_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = '{name}';"
+        sql = f"SELECT DEFAULT_CHARACTER_SET_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = {safe_name};"
         success, output = self._execute_sql(sql)
         encoding = output.strip() if success else None
         
@@ -360,10 +430,14 @@ class MySQLManager(BaseDatabaseManager):
         """Create a new MySQL user."""
         if self.user_exists(username, host):
             raise DatabaseUserError(f"User '{username}'@'{host}' already exists")
-        
+
         password = password or self.generate_password()
-        
-        sql = f"CREATE USER '{username}'@'{host}' IDENTIFIED BY '{password}';"
+
+        # Use escaped literals to prevent SQL injection
+        safe_username = self._escape_literal(username)
+        safe_host = self._escape_literal(host)
+        safe_password = self._escape_literal(password)
+        sql = f"CREATE USER {safe_username}@{safe_host} IDENTIFIED BY {safe_password};"
         success, output = self._execute_sql(sql)
         
         if not success:
@@ -386,8 +460,11 @@ class MySQLManager(BaseDatabaseManager):
         """Drop a MySQL user."""
         if not self.user_exists(username, host):
             raise DatabaseUserError(f"User '{username}'@'{host}' does not exist")
-        
-        sql = f"DROP USER '{username}'@'{host}';"
+
+        # Use escaped literals to prevent SQL injection
+        safe_username = self._escape_literal(username)
+        safe_host = self._escape_literal(host)
+        sql = f"DROP USER {safe_username}@{safe_host};"
         success, output = self._execute_sql(sql)
         
         if not success:
@@ -400,7 +477,10 @@ class MySQLManager(BaseDatabaseManager):
     
     def user_exists(self, username: str, host: str = "localhost") -> bool:
         """Check if a user exists."""
-        sql = f"SELECT User FROM mysql.user WHERE User = '{username}' AND Host = '{host}';"
+        # Use escaped literals to prevent SQL injection
+        safe_username = self._escape_literal(username)
+        safe_host = self._escape_literal(host)
+        sql = f"SELECT User FROM mysql.user WHERE User = {safe_username} AND Host = {safe_host};"
         success, output = self._execute_sql(sql)
         return success and username in output
     
@@ -435,8 +515,12 @@ class MySQLManager(BaseDatabaseManager):
     ) -> bool:
         """Grant privileges to a user on a database."""
         privs = ", ".join(privileges) if privileges else "ALL PRIVILEGES"
-        
-        sql = f"GRANT {privs} ON `{database}`.* TO '{username}'@'{host}';"
+
+        # Use escaped identifiers and literals to prevent SQL injection
+        safe_database = self._escape_identifier(database)
+        safe_username = self._escape_literal(username)
+        safe_host = self._escape_literal(host)
+        sql = f"GRANT {privs} ON {safe_database}.* TO {safe_username}@{safe_host};"
         success, output = self._execute_sql(sql)
         
         if not success:
@@ -456,8 +540,12 @@ class MySQLManager(BaseDatabaseManager):
     ) -> bool:
         """Revoke privileges from a user on a database."""
         privs = ", ".join(privileges) if privileges else "ALL PRIVILEGES"
-        
-        sql = f"REVOKE {privs} ON `{database}`.* FROM '{username}'@'{host}';"
+
+        # Use escaped identifiers and literals to prevent SQL injection
+        safe_database = self._escape_identifier(database)
+        safe_username = self._escape_literal(username)
+        safe_host = self._escape_literal(host)
+        sql = f"REVOKE {privs} ON {safe_database}.* FROM {safe_username}@{safe_host};"
         success, output = self._execute_sql(sql)
         
         if not success:

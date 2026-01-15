@@ -36,8 +36,9 @@ class InteractiveMode:
         
         if not HAS_INQUIRER:
             raise WASMError(
-                "Interactive mode requires 'inquirer' package.\n"
-                "Install with: pip install inquirer"
+                "Interactive mode requires 'inquirer' package.",
+                "Install with: pip install wasm-cli[interactive]\n"
+                "Or: pip install inquirer"
             )
     
     def run(self) -> int:

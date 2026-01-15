@@ -52,7 +52,7 @@ _wasm_all_sites() {
     local sites=()
     local nginx_dir="/etc/nginx/sites-available"
     local apache_dir="/etc/apache2/sites-available"
-    
+
     if [[ -d "$nginx_dir" ]]; then
         for site in "$nginx_dir"/*; do
             if [[ -f "$site" && "$(basename "$site")" != "default" ]]; then
@@ -60,7 +60,7 @@ _wasm_all_sites() {
             fi
         done 2>/dev/null
     fi
-    
+
     if [[ -d "$apache_dir" ]]; then
         for site in "$apache_dir"/*.conf; do
             if [[ -f "$site" ]]; then
@@ -84,11 +84,24 @@ _wasm_certs() {
     _describe -t certs 'SSL certificates' certs
 }
 
+_wasm_backups() {
+    local backups=()
+    local backup_dir="/var/www/backups"
+    if [[ -d "$backup_dir" ]]; then
+        for backup in "$backup_dir"/*.tar.gz; do
+            if [[ -f "$backup" ]]; then
+                backups+=("$(basename "$backup" .tar.gz)")
+            fi
+        done 2>/dev/null
+    fi
+    _describe -t backups 'backup IDs' backups
+}
+
 # Main completion function
 _wasm() {
     local context state state_descr line
     typeset -A opt_args
-    
+
     local -a global_opts
     global_opts=(
         '(-h --help)'{-h,--help}'[Show help message]'
@@ -96,13 +109,16 @@ _wasm() {
         '(-v --verbose)'{-v,--verbose}'[Enable verbose output]'
         '(-i --interactive)'{-i,--interactive}'[Run in interactive mode]'
         '--no-color[Disable colored output]'
+        '--dry-run[Show what would be done without making changes]'
+        '--json[Output results in JSON format]'
+        '--changelog[Show changelog for current version]'
     )
-    
+
     _arguments -C \
         $global_opts \
         '1: :->command' \
         '*:: :->args' && return 0
-    
+
     case $state in
         command)
             local -a commands
@@ -124,6 +140,7 @@ _wasm() {
                 'remove:Delete an application'
                 'rm:Delete an application'
                 'logs:View application logs'
+                'health:Check system health and diagnose issues'
                 # Sub-command groups
                 'site:Manage web server sites'
                 'service:Manage systemd services'
@@ -132,6 +149,16 @@ _wasm() {
                 'ssl:Manage SSL certificates'
                 'certificate:Manage SSL certificates'
                 'setup:Initial setup and configuration'
+                'backup:Manage application backups'
+                'bak:Manage application backups'
+                'rollback:Rollback an application to a previous state'
+                'rb:Rollback an application to a previous state'
+                'db:Database management'
+                'database:Database management'
+                'web:Web dashboard interface'
+                'store:Manage WASM persistence store'
+                'monitor:AI-powered process security monitoring'
+                'mon:AI-powered process security monitoring'
             )
             _describe -t commands 'wasm commands' commands
             ;;
@@ -150,13 +177,13 @@ _wasm() {
                         '--env-file[Path to environment file]:env file:_files' \
                         '(--pm --package-manager)'{--pm,--package-manager}'[Package manager to use]:pm:(npm pnpm bun auto)'
                     ;;
-                
+
                 # Webapp status/restart/stop/start
                 status|info|restart|stop|start)
                     _arguments \
                         '1:application:_wasm_apps'
                     ;;
-                
+
                 # Webapp update
                 update|upgrade)
                     _arguments \
@@ -165,15 +192,15 @@ _wasm() {
                         '(-b --branch)'{-b,--branch}'[Git branch]:branch:' \
                         '(--pm --package-manager)'{--pm,--package-manager}'[Package manager]:pm:(npm pnpm bun auto)'
                     ;;
-                
+
                 # Webapp delete
                 delete|remove|rm)
                     _arguments \
                         '1:application:_wasm_apps' \
-                        '(-f --force)'{-f,--force}'[Skip confirmation]' \
+                        '(-f --force -y)'{-f,--force,-y}'[Skip confirmation]' \
                         '--keep-files[Keep application files]'
                     ;;
-                
+
                 # Webapp logs
                 logs)
                     _arguments \
@@ -181,7 +208,12 @@ _wasm() {
                         '(-f --follow)'{-f,--follow}'[Follow log output]' \
                         '(-n --lines)'{-n,--lines}'[Number of lines]:lines:'
                     ;;
-                
+
+                # Health command (no subcommands)
+                health)
+                    # No additional arguments
+                    ;;
+
                 # Site subcommands
                 site)
                     local -a site_commands
@@ -197,11 +229,11 @@ _wasm() {
                         'show:Show site configuration'
                         'cat:Show site configuration'
                     )
-                    
+
                     _arguments -C \
                         '1: :->site_action' \
                         '*:: :->site_args'
-                    
+
                     case $state in
                         site_action)
                             _describe -t commands 'site commands' site_commands
@@ -225,13 +257,13 @@ _wasm() {
                                 delete|remove|rm)
                                     _arguments \
                                         '1:site:_wasm_all_sites' \
-                                        '(-f --force)'{-f,--force}'[Skip confirmation]'
+                                        '(-f --force -y)'{-f,--force,-y}'[Skip confirmation]'
                                     ;;
                             esac
                             ;;
                     esac
                     ;;
-                
+
                 # Service subcommands
                 service|svc)
                     local -a service_commands
@@ -249,11 +281,11 @@ _wasm() {
                         'remove:Delete a service'
                         'rm:Delete a service'
                     )
-                    
+
                     _arguments -C \
                         '1: :->service_action' \
                         '*:: :->service_args'
-                    
+
                     case $state in
                         service_action)
                             _describe -t commands 'service commands' service_commands
@@ -284,13 +316,13 @@ _wasm() {
                                 delete|remove|rm)
                                     _arguments \
                                         '1:service:_wasm_services' \
-                                        '(-f --force)'{-f,--force}'[Skip confirmation]'
+                                        '(-f --force -y)'{-f,--force,-y}'[Skip confirmation]'
                                     ;;
                             esac
                             ;;
                     esac
                     ;;
-                
+
                 # Cert subcommands
                 cert|ssl|certificate)
                     local -a cert_commands
@@ -308,11 +340,11 @@ _wasm() {
                         'remove:Delete a certificate'
                         'rm:Delete a certificate'
                     )
-                    
+
                     _arguments -C \
                         '1: :->cert_action' \
                         '*:: :->cert_args'
-                    
+
                     case $state in
                         cert_action)
                             _describe -t commands 'cert commands' cert_commands
@@ -352,7 +384,7 @@ _wasm() {
                             ;;
                     esac
                     ;;
-                
+
                 # Setup subcommands
                 setup)
                     local -a setup_commands
@@ -360,12 +392,14 @@ _wasm() {
                         'init:Initialize WASM directories and configuration'
                         'completions:Install shell completions'
                         'permissions:Check permission status'
+                        'ssh:Setup SSH key for Git authentication'
+                        'doctor:Run system diagnostics and check for issues'
                     )
-                    
+
                     _arguments -C \
                         '1: :->setup_action' \
                         '*:: :->setup_args'
-                    
+
                     case $state in
                         setup_action)
                             _describe -t commands 'setup commands' setup_commands
@@ -377,7 +411,386 @@ _wasm() {
                                         '(-s --shell)'{-s,--shell}'[Shell type]:shell:(bash zsh fish)' \
                                         '(-u --user-only)'{-u,--user-only}'[Install for current user only]'
                                     ;;
-                                init|permissions)
+                                ssh)
+                                    _arguments \
+                                        '(-g --generate)'{-g,--generate}'[Generate a new SSH key if none exists]' \
+                                        '(-t --type)'{-t,--type}'[Type of SSH key to generate]:key_type:(ed25519 rsa ecdsa)' \
+                                        '(-T --test)'{-T,--test}'[Test SSH connection to a host]:host:(github.com gitlab.com bitbucket.org)' \
+                                        '(-S --show)'{-S,--show}'[Show the public key]'
+                                    ;;
+                                init|permissions|doctor)
+                                    # No additional arguments
+                                    ;;
+                            esac
+                            ;;
+                    esac
+                    ;;
+
+                # Backup subcommands
+                backup|bak)
+                    local -a backup_commands
+                    backup_commands=(
+                        'create:Create a backup of an application'
+                        'new:Create a backup of an application'
+                        'list:List backups'
+                        'ls:List backups'
+                        'restore:Restore from a backup'
+                        'delete:Delete a backup'
+                        'remove:Delete a backup'
+                        'rm:Delete a backup'
+                        'verify:Verify a backup'\''s integrity'
+                        'check:Verify a backup'\''s integrity'
+                        'info:Show detailed backup information'
+                        'show:Show detailed backup information'
+                        'storage:Show backup storage usage'
+                    )
+
+                    _arguments -C \
+                        '1: :->backup_action' \
+                        '*:: :->backup_args'
+
+                    case $state in
+                        backup_action)
+                            _describe -t commands 'backup commands' backup_commands
+                            ;;
+                        backup_args)
+                            case $words[1] in
+                                create|new)
+                                    _arguments \
+                                        '1:application:_wasm_apps' \
+                                        '(-m --description)'{-m,--description}'[Description or note for this backup]:description:' \
+                                        '--no-env[Exclude .env files from backup]' \
+                                        '--include-node-modules[Include node_modules (warning: large!)]' \
+                                        '--include-build[Include build artifacts (.next, dist, build)]' \
+                                        '(-t --tags)'{-t,--tags}'[Comma-separated tags for the backup]:tags:'
+                                    ;;
+                                list|ls)
+                                    _arguments \
+                                        '1:application:_wasm_apps' \
+                                        '(-t --tags)'{-t,--tags}'[Filter by tags (comma-separated)]:tags:' \
+                                        '(-n --limit)'{-n,--limit}'[Maximum number of backups to show]:limit:' \
+                                        '--json[Output in JSON format]'
+                                    ;;
+                                restore)
+                                    _arguments \
+                                        '1:backup:_wasm_backups' \
+                                        '--target-domain[Restore to a different domain]:domain:_wasm_apps' \
+                                        '--no-env[Don'\''t restore .env files (keep current)]' \
+                                        '--no-verify[Skip checksum verification]' \
+                                        '(-f --force)'{-f,--force}'[Skip confirmation prompt]'
+                                    ;;
+                                delete|remove|rm)
+                                    _arguments \
+                                        '1:backup:_wasm_backups' \
+                                        '(-f --force -y)'{-f,--force,-y}'[Skip confirmation]'
+                                    ;;
+                                verify|check)
+                                    _arguments \
+                                        '1:backup:_wasm_backups'
+                                    ;;
+                                info|show)
+                                    _arguments \
+                                        '1:backup:_wasm_backups' \
+                                        '--json[Output in JSON format]'
+                                    ;;
+                                storage)
+                                    _arguments \
+                                        '--json[Output in JSON format]'
+                                    ;;
+                            esac
+                            ;;
+                    esac
+                    ;;
+
+                # Rollback command
+                rollback|rb)
+                    _arguments \
+                        '1:application:_wasm_apps' \
+                        '2:backup:_wasm_backups' \
+                        '--no-rebuild[Don'\''t rebuild after restore]'
+                    ;;
+
+                # DB subcommands
+                db|database)
+                    local -a db_commands
+                    db_commands=(
+                        'install:Install a database engine'
+                        'uninstall:Uninstall a database engine'
+                        'status:Show database engine status'
+                        'start:Start a database engine'
+                        'stop:Stop a database engine'
+                        'restart:Restart a database engine'
+                        'engines:List available database engines'
+                        'create:Create a new database'
+                        'drop:Drop a database'
+                        'list:List databases'
+                        'ls:List databases'
+                        'info:Show database information'
+                        'user-create:Create a database user'
+                        'user-delete:Delete a database user'
+                        'user-list:List database users'
+                        'grant:Grant privileges to a user'
+                        'revoke:Revoke privileges from a user'
+                        'backup:Backup a database'
+                        'restore:Restore a database from backup'
+                        'backups:List available backups'
+                        'query:Execute a query'
+                        'connect:Connect to a database interactively'
+                        'connection-string:Generate a connection string'
+                        'config:Configure database engine credentials'
+                    )
+
+                    local -a db_engines
+                    db_engines=(mysql postgresql redis mongodb)
+
+                    _arguments -C \
+                        '1: :->db_action' \
+                        '*:: :->db_args'
+
+                    case $state in
+                        db_action)
+                            _describe -t commands 'db commands' db_commands
+                            ;;
+                        db_args)
+                            case $words[1] in
+                                install|start|stop|restart)
+                                    _arguments \
+                                        '1:engine:(mysql postgresql redis mongodb)'
+                                    ;;
+                                uninstall)
+                                    _arguments \
+                                        '1:engine:(mysql postgresql redis mongodb)' \
+                                        '--purge[Remove all data and configuration]' \
+                                        '(-f --force -y)'{-f,--force,-y}'[Skip confirmation]'
+                                    ;;
+                                status)
+                                    _arguments \
+                                        '1:engine:(mysql postgresql redis mongodb)' \
+                                        '--json[Output in JSON format]'
+                                    ;;
+                                engines)
+                                    _arguments \
+                                        '--json[Output in JSON format]'
+                                    ;;
+                                create)
+                                    _arguments \
+                                        '1:database name:' \
+                                        '(-e --engine)'{-e,--engine}'[Database engine]:engine:(mysql postgresql redis mongodb)' \
+                                        '(-o --owner)'{-o,--owner}'[Database owner (user)]:owner:' \
+                                        '--encoding[Character encoding]:encoding:(UTF8 LATIN1 SQL_ASCII)'
+                                    ;;
+                                drop)
+                                    _arguments \
+                                        '1:database name:' \
+                                        '(-e --engine)'{-e,--engine}'[Database engine]:engine:(mysql postgresql redis mongodb)' \
+                                        '(-f --force -y)'{-f,--force,-y}'[Skip confirmation]'
+                                    ;;
+                                list|ls)
+                                    _arguments \
+                                        '(-e --engine)'{-e,--engine}'[Database engine]:engine:(mysql postgresql redis mongodb)' \
+                                        '--json[Output in JSON format]'
+                                    ;;
+                                info)
+                                    _arguments \
+                                        '1:database name:' \
+                                        '(-e --engine)'{-e,--engine}'[Database engine]:engine:(mysql postgresql redis mongodb)' \
+                                        '--json[Output in JSON format]'
+                                    ;;
+                                user-create)
+                                    _arguments \
+                                        '1:username:' \
+                                        '(-e --engine)'{-e,--engine}'[Database engine]:engine:(mysql postgresql redis mongodb)' \
+                                        '(-p --password)'{-p,--password}'[Password (generated if not provided)]:password:' \
+                                        '(-d --database)'{-d,--database}'[Grant access to this database]:database:' \
+                                        '--host[Host restriction]:host:'
+                                    ;;
+                                user-delete)
+                                    _arguments \
+                                        '1:username:' \
+                                        '(-e --engine)'{-e,--engine}'[Database engine]:engine:(mysql postgresql redis mongodb)' \
+                                        '--host[Host restriction]:host:' \
+                                        '(-f --force -y)'{-f,--force,-y}'[Skip confirmation]'
+                                    ;;
+                                user-list)
+                                    _arguments \
+                                        '(-e --engine)'{-e,--engine}'[Database engine]:engine:(mysql postgresql redis mongodb)' \
+                                        '--json[Output in JSON format]'
+                                    ;;
+                                grant|revoke)
+                                    _arguments \
+                                        '1:username:' \
+                                        '2:database name:' \
+                                        '(-e --engine)'{-e,--engine}'[Database engine]:engine:(mysql postgresql redis mongodb)' \
+                                        '--privileges[Comma-separated list of privileges]:privileges:' \
+                                        '--host[Host restriction]:host:'
+                                    ;;
+                                backup)
+                                    _arguments \
+                                        '1:database name:' \
+                                        '(-e --engine)'{-e,--engine}'[Database engine]:engine:(mysql postgresql redis mongodb)' \
+                                        '(-o --output)'{-o,--output}'[Output file path]:output:_files' \
+                                        '--no-compress[Don'\''t compress the backup]'
+                                    ;;
+                                restore)
+                                    _arguments \
+                                        '1:database name:' \
+                                        '2:backup file:_files' \
+                                        '(-e --engine)'{-e,--engine}'[Database engine]:engine:(mysql postgresql redis mongodb)' \
+                                        '--drop[Drop existing database before restore]' \
+                                        '(-f --force -y)'{-f,--force,-y}'[Skip confirmation]'
+                                    ;;
+                                backups)
+                                    _arguments \
+                                        '(-e --engine)'{-e,--engine}'[Database engine]:engine:(mysql postgresql redis mongodb)' \
+                                        '(-d --database)'{-d,--database}'[Filter by database name]:database:' \
+                                        '--json[Output in JSON format]'
+                                    ;;
+                                query)
+                                    _arguments \
+                                        '1:database name:' \
+                                        '2:query:' \
+                                        '(-e --engine)'{-e,--engine}'[Database engine]:engine:(mysql postgresql redis mongodb)'
+                                    ;;
+                                connect)
+                                    _arguments \
+                                        '(-e --engine)'{-e,--engine}'[Database engine]:engine:(mysql postgresql redis mongodb)' \
+                                        '(-d --database)'{-d,--database}'[Database name]:database:' \
+                                        '(-u --username)'{-u,--username}'[Username]:username:'
+                                    ;;
+                                connection-string)
+                                    _arguments \
+                                        '1:database name:' \
+                                        '2:username:' \
+                                        '(-e --engine)'{-e,--engine}'[Database engine]:engine:(mysql postgresql redis mongodb)' \
+                                        '(-p --password)'{-p,--password}'[Password]:password:' \
+                                        '--host[Host]:host:'
+                                    ;;
+                                config)
+                                    _arguments \
+                                        '(-e --engine)'{-e,--engine}'[Database engine]:engine:(mysql postgresql redis mongodb)' \
+                                        '(-u --user)'{-u,--user}'[Admin username]:user:' \
+                                        '(-p --password)'{-p,--password}'[Admin password]:password:'
+                                    ;;
+                            esac
+                            ;;
+                    esac
+                    ;;
+
+                # Web subcommands
+                web)
+                    local -a web_commands
+                    web_commands=(
+                        'start:Start the web dashboard server'
+                        'stop:Stop the web dashboard server'
+                        'status:Show web dashboard status'
+                        'restart:Restart the web dashboard server'
+                        'token:Manage access tokens'
+                        'install:Install web dashboard dependencies'
+                    )
+
+                    _arguments -C \
+                        '1: :->web_action' \
+                        '*:: :->web_args'
+
+                    case $state in
+                        web_action)
+                            _describe -t commands 'web commands' web_commands
+                            ;;
+                        web_args)
+                            case $words[1] in
+                                start|restart)
+                                    _arguments \
+                                        '(-H --host)'{-H,--host}'[Host to bind to]:host:(127.0.0.1 0.0.0.0 localhost)' \
+                                        '(-p --port)'{-p,--port}'[Port to listen on]:port:' \
+                                        '(-d --daemon)'{-d,--daemon}'[Run in background as daemon]'
+                                    ;;
+                                stop|status)
+                                    # No additional arguments
+                                    ;;
+                                token)
+                                    _arguments \
+                                        '(-r --regenerate)'{-r,--regenerate}'[Generate a new access token]'
+                                    ;;
+                                install)
+                                    _arguments \
+                                        '--apt[Use apt to install system packages]' \
+                                        '--pip[Use pip to install user packages]'
+                                    ;;
+                            esac
+                            ;;
+                    esac
+                    ;;
+
+                # Store subcommands
+                store)
+                    local -a store_commands
+                    store_commands=(
+                        'init:Initialize or reinitialize the store database'
+                        'stats:Show store statistics'
+                        'import:Import legacy apps from systemd services and nginx configs'
+                        'export:Export store data to JSON'
+                        'sync:Sync store with actual systemd service states'
+                        'path:Show the database file path'
+                    )
+
+                    _arguments -C \
+                        '1: :->store_action' \
+                        '*:: :->store_args'
+
+                    case $state in
+                        store_action)
+                            _describe -t commands 'store commands' store_commands
+                            ;;
+                        store_args)
+                            case $words[1] in
+                                stats)
+                                    _arguments \
+                                        '--json[Output as JSON]'
+                                    ;;
+                                export)
+                                    _arguments \
+                                        '(-o --output)'{-o,--output}'[Output file (stdout if not specified)]:output:_files'
+                                    ;;
+                                init|import|sync|path)
+                                    # No additional arguments
+                                    ;;
+                            esac
+                            ;;
+                    esac
+                    ;;
+
+                # Monitor subcommands
+                monitor|mon)
+                    local -a monitor_commands
+                    monitor_commands=(
+                        'status:Show monitor service status'
+                        'scan:Run a single security scan'
+                        'run:Run monitor continuously (foreground)'
+                        'enable:Enable monitor (installs dependencies and service if needed)'
+                        'install:Install monitor service only (without enabling)'
+                        'disable:Disable and stop monitor service'
+                        'uninstall:Uninstall monitor service'
+                        'test-email:Send a test email to verify notification settings'
+                        'config:Show current monitor configuration'
+                    )
+
+                    _arguments -C \
+                        '1: :->monitor_action' \
+                        '*:: :->monitor_args'
+
+                    case $state in
+                        monitor_action)
+                            _describe -t commands 'monitor commands' monitor_commands
+                            ;;
+                        monitor_args)
+                            case $words[1] in
+                                scan)
+                                    _arguments \
+                                        '--dry-run[Don'\''t terminate processes, just report]' \
+                                        '--force-ai[Force AI analysis even if no suspicious processes are found]' \
+                                        '--all[Analyze ALL processes with AI (expensive, use sparingly)]'
+                                    ;;
+                                status|run|enable|install|disable|uninstall|test-email|config)
                                     # No additional arguments
                                     ;;
                             esac

@@ -304,7 +304,7 @@ class JobManager:
             try:
                 self._subscribers[job_id].remove(callback)
             except ValueError:
-                pass
+                pass  # Callback was not subscribed, ignore
     
     def _notify_subscribers(self, job: Job):
         """Notify all subscribers of a job update."""

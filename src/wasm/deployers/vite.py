@@ -169,6 +169,18 @@ class ViteDeployer(BaseDeployer):
         if self.is_ssr:
             return super().start()
         return True
+
+    def stop(self) -> bool:
+        """Stop service only if SSR mode."""
+        if self.is_ssr:
+            return super().stop()
+        return True
+
+    def restart(self) -> bool:
+        """Restart service only if SSR mode."""
+        if self.is_ssr:
+            return super().restart()
+        return True
     
     def health_check(self, retries: int = 5, delay: float = 2.0) -> bool:
         """Check if the static site is accessible."""

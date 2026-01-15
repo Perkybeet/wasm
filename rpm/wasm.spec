@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.13.16
+Version:        0.14.0
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -25,7 +25,8 @@ BuildRequires:  python3-pip
 BuildRequires:  python3-wheel
 Requires:       python3-jinja2 >= 3.1.0
 Requires:       python3-pyyaml >= 6.0
-Requires:       python3-inquirer >= 3.1.0
+# inquirer is optional (for interactive mode)
+Suggests:       python3-inquirer >= 3.1.0
 %endif
 
 # openSUSE specific
@@ -118,51 +119,69 @@ echo ""
 echo "Note: You may need to install python3-inquirer via pip:"
 echo "  pip3 install inquirer"
 
+# Upgrade config file with new defaults (preserves user values)
+if [ -f /etc/wasm/config.yaml ]; then
+    echo ""
+    echo "Upgrading configuration with new defaults..."
+    wasm config upgrade --quiet 2>/dev/null || true
+fi
+
+# Update wasm-monitor service if it exists and is enabled
+if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
+    echo ""
+    echo "Updating wasm-monitor service..."
+    wasm monitor install >/dev/null 2>&1 || true
+    systemctl daemon-reload
+    systemctl restart wasm-monitor.service 2>/dev/null || true
+    echo "wasm-monitor service updated and restarted"
+fi
+
 %changelog
-* Tue Jan 14 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.16-1
+* Wed Jan 15 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.14.0-1
+- Feature: New 'wasm health' command for system diagnostics
+- Feature: New 'wasm config' command (upgrade, show, path)
+- Feature: Automatic config migration on package upgrade
+- Feature: Persistent threat storage with SQLite (threat_store.py)
+- Feature: New API endpoints /api/monitor/threats/history and resolve
+- Fix: Monitor module duplicate return statement (dead code)
+- Fix: Inconsistent scan_interval defaults (30s local, 3600s AI)
+- Fix: API /scan now respects global config (auto_terminate, use_ai)
+- Fix: CPU/Memory thresholds now used for logging and alerts
+- Enhancement: Monitor frontend uses WebSocket instead of HTTP polling
+- Enhancement: Auto-update wasm-monitor service on package upgrade
+- Enhancement: Improved process fallback with better ps parsing
+- Enhancement: Notification report includes all threats for audit
+
+* Wed Jan 15 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.16-1
 - Fix: Move python3-inquirer from Depends to Recommends
 - Fix: Package installs on systems without python3-inquirer in repos
 - Enhancement: Interactive mode now optional (install inquirer via pip)
 
 * Wed Jan 15 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.15-1
 - Enhancement: Set update checker interval to instant (CHECK_INTERVAL = 0)
-- Enhancement: Change update notification color to softer yellow (\033[33m)
-- Enhancement: Update notifications more visible but less aggressive
+- Enhancement: Change update notification color to softer yellow
 - Feature: Add --changelog flag to view current version changelog
 - Feature: New version.py module for version information display
-- Enhancement: Users can see changelog without visiting GitHub
-- Enhancement: Fallback to GitHub release notes if changelog unavailable
-- docs: Document OBS build failure prevention in CLAUDE.md
-- docs: Add comprehensive OBS Package Management section
 
 * Wed Jan 15 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.14-1
 - Fix: OBS build failures - add missing python3-inquirer dependency
-- Fix: Update debian.changelog and RPM spec changelog for 0.13.13
 - Enhancement: Ensure all OBS package dependencies are declared
 
 * Wed Jan 15 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.13-1
 - Fix: Critical bare except clause in monitor API
 - Fix: Static apps (Vite) trying to restart non-existent services
-- Fix: Update checker now detects installation method (pip/apt/dnf/etc)
-- Fix: APT package name in update checker (wasm vs wasm-cli)
-- Enhancement: Comprehensive logging for silent exception catches
-- Enhancement: Contextual HTTP error messages in API endpoints
-- Enhancement: Error handling for file operations (env files, journalctl)
+- Fix: Update checker now detects installation method
 - Feature: Update banner in web dashboard
 - Feature: /api/system/version endpoint for update checking
 
 * Tue Jan 14 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.12-1
 - chore: Clean distribution packages (remove Docker files, dev tools)
-- docs: Rewrite README professionally without emojis
 - feat: Add .gitattributes to exclude dev files from git archive
 - feat: Add MANIFEST.in to control PyPI source distribution
-- Package cleanup: removed Dockerfile*, docker/, docker-compose.obs.yml
 
 * Tue Jan 14 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.11-1
-- Fix: Environment variables with quotes now properly stripped from .env files
-- Fix: Systemd service files no longer have double-quoted env vars
+- Fix: Environment variables with quotes properly stripped from .env files
 - Feature: Automatic update checker via GitHub Releases API
-- Feature: Update notifications shown every hour (cached, non-blocking)
 - Enhancement: Update checker runs post-command to avoid delays
 
 * Wed Jan 08 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.7-1

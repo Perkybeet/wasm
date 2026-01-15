@@ -10,6 +10,7 @@ users, or SQL queries. Instead, it uses numbered databases (0-15 by default)
 and authentication is global.
 """
 
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -103,8 +104,8 @@ class RedisManager(BaseDatabaseManager):
         # Stop service
         try:
             self.stop()
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.warning(f"Could not stop service during uninstall: {e}")
         
         action = "purge" if purge else "remove"
         
@@ -127,22 +128,25 @@ class RedisManager(BaseDatabaseManager):
     ) -> tuple[bool, str]:
         """
         Execute Redis CLI command.
-        
+
         Args:
             *args: Redis command arguments.
             db: Database number.
-            
+
         Returns:
             Tuple of (success, output).
         """
         cmd = ["redis-cli", "-n", str(db)]
-        
-        if self._password:
-            cmd.extend(["-a", self._password])
-        
         cmd.extend(args)
-        
-        result = self._run(cmd)
+
+        # Use REDISCLI_AUTH environment variable instead of -a flag
+        # This prevents the password from being visible in ps aux
+        env = None
+        if self._password:
+            env = os.environ.copy()
+            env["REDISCLI_AUTH"] = self._password
+
+        result = self._run(cmd, env=env)
         return result.success, result.stdout if result.success else result.stderr
     
     def get_status(self) -> Dict[str, Any]:

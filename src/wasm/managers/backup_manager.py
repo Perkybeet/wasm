@@ -499,8 +499,8 @@ class BackupManager:
                     if result.success:
                         data = json.loads(result.stdout)
                         return BackupMetadata.from_dict(data)
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.logger.debug(f"Could not read backup metadata {metadata_file}: {e}")
         
         return None
     
@@ -584,8 +584,8 @@ class BackupManager:
                 if service_was_running:
                     self.logger.debug(f"Stopping service: {app_name}")
                     self.service_manager.stop(app_name)
-            except Exception:
-                pass
+            except Exception as e:
+                self.logger.warning(f"Could not stop service before restore: {e}")
         
         # Run pre-restore hook
         if pre_restore_hook:
@@ -602,49 +602,80 @@ class BackupManager:
             if result.success:
                 env_backup = result.stdout
         
-        # Create temporary extraction directory
+        # Create temporary extraction directory and backup current state
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
-            
-            # Extract backup
-            self.logger.debug(f"Extracting backup to {tmp_path}")
-            result = run_command_sudo([
-                "tar", "-xzf", str(backup_file), "-C", str(tmp_path)
-            ])
-            
-            if not result.success:
-                raise BackupError(f"Failed to extract backup: {result.stderr}")
-            
-            # Find extracted app directory
-            extracted_dirs = list(tmp_path.iterdir())
-            if not extracted_dirs:
-                raise BackupError("Backup archive is empty")
-            
-            extracted_path = extracted_dirs[0]
-            
-            # Remove current app directory
-            if app_path.exists():
-                self.logger.debug(f"Removing current app: {app_path}")
-                remove_directory(app_path, sudo=True)
-            
-            # Move extracted content to app path
-            self.logger.debug(f"Moving restored content to {app_path}")
-            
-            # Ensure parent exists
-            run_command_sudo(["mkdir", "-p", str(app_path.parent)])
-            
-            # If restoring to different domain, rename
-            if source_app_name != app_name:
+            current_backup_path = tmp_path / "current_backup"
+            extracted_path = None
+
+            # Step 1: Backup current app directory if it exists (for rollback)
+            had_existing_app = app_path.exists()
+            if had_existing_app:
+                self.logger.debug(f"Creating temporary backup of current state")
+                result = run_command_sudo([
+                    "cp", "-a", str(app_path), str(current_backup_path)
+                ])
+                if not result.success:
+                    self.logger.warning(f"Could not create safety backup: {result.stderr}")
+                    # Continue anyway, but mark that we don't have a backup
+                    had_existing_app = False
+
+            try:
+                # Step 2: Extract backup to temp directory
+                extract_path = tmp_path / "extracted"
+                run_command_sudo(["mkdir", "-p", str(extract_path)])
+
+                self.logger.debug(f"Extracting backup to {extract_path}")
+                result = run_command_sudo([
+                    "tar", "-xzf", str(backup_file), "-C", str(extract_path)
+                ])
+
+                if not result.success:
+                    raise BackupError(f"Failed to extract backup: {result.stderr}")
+
+                # Find extracted app directory
+                result = run_command_sudo(["ls", str(extract_path)])
+                if not result.success or not result.stdout.strip():
+                    raise BackupError("Backup archive is empty")
+
+                extracted_dir_name = result.stdout.strip().split('\n')[0]
+                extracted_path = extract_path / extracted_dir_name
+
+                # Step 3: Remove current app directory
+                if app_path.exists():
+                    self.logger.debug(f"Removing current app: {app_path}")
+                    remove_directory(app_path, sudo=True)
+
+                # Step 4: Move extracted content to app path
+                self.logger.debug(f"Moving restored content to {app_path}")
+
+                # Ensure parent exists
+                run_command_sudo(["mkdir", "-p", str(app_path.parent)])
+
                 result = run_command_sudo([
                     "mv", str(extracted_path), str(app_path)
                 ])
-            else:
-                result = run_command_sudo([
-                    "mv", str(extracted_path), str(app_path)
-                ])
-            
-            if not result.success:
-                raise BackupError(f"Failed to restore files: {result.stderr}")
+
+                if not result.success:
+                    raise BackupError(f"Failed to restore files: {result.stderr}")
+
+            except Exception as e:
+                # Rollback: restore the original app directory if we had a backup
+                if had_existing_app and current_backup_path.exists():
+                    self.logger.warning(f"Restore failed, rolling back to previous state...")
+                    try:
+                        # Remove any partial restore
+                        if app_path.exists():
+                            remove_directory(app_path, sudo=True)
+                        # Restore original
+                        run_command_sudo([
+                            "mv", str(current_backup_path), str(app_path)
+                        ])
+                        self.logger.info("Rollback successful - original state restored")
+                    except Exception as rollback_error:
+                        self.logger.error(f"Rollback failed: {rollback_error}")
+                        self.logger.error("Manual intervention may be required")
+                raise
         
         # Restore .env backup if we had one
         if env_backup:

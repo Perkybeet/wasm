@@ -131,7 +131,15 @@ def main() -> int:
             print("Use: wasm store --help", file=sys.stderr)
             return 1
         return handle_store(args)
-    
+
+    elif command == "health":
+        from wasm.cli.commands.health import handle_health
+        return handle_health(args)
+
+    elif command == "config":
+        from wasm.cli.commands.config import handle_config
+        return handle_config(args)
+
     else:
         print(f"Unknown command: {command}", file=sys.stderr)
         return 1
@@ -139,14 +147,22 @@ def main() -> int:
 
 def cli():
     """CLI entry point for setuptools console_scripts."""
-    exit_code = main()
-
-    # Check for updates after command execution (non-blocking)
+    # Start update check in background immediately
+    # This runs in parallel while the command executes
     try:
         from wasm.core.update_checker import UpdateChecker
-        UpdateChecker.check_for_updates()
+        UpdateChecker.start_background_check()
     except Exception:
-        # Silently ignore any errors during update check
+        pass
+
+    # Execute the main command
+    exit_code = main()
+
+    # Show update notification if available
+    # Wait up to 0.3s for background check to complete (usually done by now)
+    try:
+        UpdateChecker.show_update_if_available(timeout=0.3)
+    except Exception:
         pass
 
     sys.exit(exit_code)

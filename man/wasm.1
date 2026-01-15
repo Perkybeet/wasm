@@ -1,0 +1,521 @@
+.\" Man page for WASM - Web App System Management
+.\" Generated for WASM v0.13.16
+.\"
+.TH WASM 1 "January 2026" "WASM" "User Commands"
+.SH NAME
+wasm \- Web App System Management
+.SH SYNOPSIS
+.B wasm
+[\fIOPTIONS\fR] \fICOMMAND\fR [\fIARGS\fR...]
+.SH DESCRIPTION
+.B WASM
+(Web App System Management) is a CLI tool for deploying and managing
+web applications on Linux servers. It automates the entire deployment process:
+Git repository cloning, dependency installation, build, systemd service
+configuration, Nginx/Apache reverse proxy configuration, and SSL certificate
+acquisition with Let's Encrypt.
+.PP
+Supported application types:
+.RS
+.IP "\fBnextjs\fR" 12
+Next.js applications (React SSR)
+.IP "\fBnodejs\fR" 12
+Generic Node.js applications
+.IP "\fBvite\fR" 12
+Vite applications (React, Vue, Svelte)
+.IP "\fBpython\fR" 12
+Python applications (Flask, FastAPI, Django)
+.IP "\fBstatic\fR" 12
+Static sites (HTML/CSS/JS)
+.IP "\fBauto\fR" 12
+Automatic type detection
+.RE
+.SH OPTIONS
+Global options go \fBBEFORE\fR the command:
+.TP
+.BR \-V ", " \-\-version
+Show WASM version and exit.
+.TP
+.BR \-v ", " \-\-verbose
+Enable verbose output (debug).
+.TP
+.BR \-i ", " \-\-interactive
+Run in interactive mode with menus.
+.TP
+.BR \-\-no\-color
+Disable colored output.
+.TP
+.BR \-\-dry\-run
+Show what actions would be performed without executing them.
+Useful for verifying before destructive operations.
+.TP
+.BR \-\-json
+Produce output in JSON format.
+Useful for script integration.
+.TP
+.BR \-\-changelog
+Show the changelog for the current version.
+.SH COMMANDS
+.SS Main commands (web applications)
+.TP
+.BR create ", " new ", " deploy
+Deploy a new web application.
+.RS
+.TP
+.BR \-d ", " \-\-domain " \fIDOMAIN\fR"
+Application domain (required).
+.TP
+.BR \-s ", " \-\-source " \fISOURCE\fR"
+Git repository URL or local path (required).
+.TP
+.BR \-t ", " \-\-type " \fITYPE\fR"
+Application type: nextjs, nodejs, vite, python, static, auto.
+.TP
+.BR \-p ", " \-\-port " \fIPORT\fR"
+Port the application will run on (default: 3000).
+.TP
+.BR \-w ", " \-\-webserver " \fISERVER\fR"
+Web server: nginx or apache (default: nginx).
+.TP
+.BR \-b ", " \-\-branch " \fIBRANCH\fR"
+Git branch to deploy (default: main).
+.TP
+.BR \-\-no\-ssl
+Do not configure SSL certificate.
+.TP
+.BR \-\-env\-file " \fIFILE\fR"
+Environment variables file for the application.
+.TP
+.BR \-\-pm ", " \-\-package\-manager " \fIPM\fR"
+Package manager: npm, pnpm, bun, auto.
+.RE
+.TP
+.BR list ", " ls
+List all deployed applications.
+.TP
+.BR status ", " info " \fIDOMAIN\fR"
+Show detailed status of an application.
+.TP
+.BR start " \fIDOMAIN\fR"
+Start a stopped application.
+.TP
+.BR stop " \fIDOMAIN\fR"
+Stop a running application.
+.TP
+.BR restart " \fIDOMAIN\fR"
+Restart an application.
+.TP
+.BR update ", " upgrade " \fIDOMAIN\fR"
+Update application: git pull, reinstall dependencies, rebuild.
+.RS
+.TP
+.BR \-b ", " \-\-branch " \fIBRANCH\fR"
+Switch to a different branch.
+.TP
+.BR \-\-pm ", " \-\-package\-manager " \fIPM\fR"
+Use a different package manager.
+.RE
+.TP
+.BR delete ", " remove ", " rm " \fIDOMAIN\fR"
+Completely delete an application.
+.RS
+.TP
+.BR \-f ", " \-\-force ", " \-y
+Skip confirmation.
+.TP
+.BR \-\-keep\-files
+Keep application files.
+.RE
+.TP
+.BR logs " \fIDOMAIN\fR"
+View application logs.
+.RS
+.TP
+.BR \-f ", " \-\-follow
+Follow logs in real time.
+.TP
+.BR \-n ", " \-\-lines " \fIN\fR"
+Number of lines to show.
+.RE
+.TP
+.B health
+Run system diagnostics: disk space, service status,
+SSL certificates, memory usage.
+.SS Website management (site)
+.TP
+.B site create
+Create Nginx/Apache site configuration.
+.TP
+.B site list
+List all configured sites.
+.TP
+.B site enable \fISITE\fR
+Enable a site.
+.TP
+.B site disable \fISITE\fR
+Disable a site.
+.TP
+.B site show \fISITE\fR
+Show site configuration.
+.TP
+.B site delete \fISITE\fR
+Delete a site.
+.SS Systemd service management (service, svc)
+.TP
+.B service create
+Create a new systemd service.
+.TP
+.B service list
+List services managed by WASM.
+.TP
+.B service status \fINAME\fR
+View service status.
+.TP
+.B service start \fINAME\fR
+Start a service.
+.TP
+.B service stop \fINAME\fR
+Stop a service.
+.TP
+.B service restart \fINAME\fR
+Restart a service.
+.TP
+.B service logs \fINAME\fR
+View service logs.
+.TP
+.B service delete \fINAME\fR
+Delete a service.
+.SS SSL certificate management (cert, ssl)
+.TP
+.B cert create
+Obtain a new SSL certificate via Let's Encrypt.
+.RS
+.TP
+.BR \-d ", " \-\-domain " \fIDOMAIN\fR"
+Domain(s) for the certificate.
+.TP
+.BR \-e ", " \-\-email " \fIEMAIL\fR"
+Email for Let's Encrypt notifications.
+.TP
+.BR \-\-standalone
+Use standalone mode (port 80 must be free).
+.TP
+.BR \-\-nginx
+Use Nginx plugin (recommended if Nginx is installed).
+.TP
+.BR \-\-apache
+Use Apache plugin.
+.RE
+.TP
+.B cert list
+List all certificates.
+.TP
+.B cert info \fIDOMAIN\fR
+Show detailed certificate information.
+.TP
+.B cert renew
+Renew certificates close to expiration.
+.TP
+.B cert revoke \fIDOMAIN\fR
+Revoke a certificate.
+.TP
+.B cert delete \fIDOMAIN\fR
+Delete a certificate.
+.SS Database management (db, database)
+.TP
+.B db install \fIENGINE\fR
+Install database engine: mysql, postgresql, redis, mongodb.
+.TP
+.B db uninstall \fIENGINE\fR
+Uninstall database engine.
+.TP
+.B db status \fIENGINE\fR
+View engine status.
+.TP
+.B db start|stop|restart \fIENGINE\fR
+Control engine service.
+.TP
+.B db engines
+List available engines and their status.
+.TP
+.B db create \fINAME\fR
+Create a new database.
+.TP
+.B db drop \fINAME\fR
+Delete a database.
+.TP
+.B db list
+List databases.
+.TP
+.B db user\-create \fIUSER\fR
+Create database user.
+.TP
+.B db user\-delete \fIUSER\fR
+Delete database user.
+.TP
+.B db user\-list
+List database users.
+.TP
+.B db grant \fIUSER\fR \fIDATABASE\fR
+Grant privileges to a user.
+.TP
+.B db revoke \fIUSER\fR \fIDATABASE\fR
+Revoke privileges from a user.
+.TP
+.B db backup \fINAME\fR
+Create database backup.
+.TP
+.B db restore \fINAME\fR \fIFILE\fR
+Restore database from backup.
+.TP
+.B db connect
+Connect interactively to a database.
+.TP
+.B db connection\-string \fINAME\fR \fIUSER\fR
+Generate connection string for the application.
+.TP
+.B db config
+Configure engine credentials.
+.SS Backup and restore (backup, bak)
+.TP
+.B backup create \fIDOMAIN\fR
+Create application backup.
+.RS
+.TP
+.BR \-m ", " \-\-description " \fITEXT\fR"
+Description or note for the backup.
+.TP
+.BR \-\-no\-env
+Exclude .env files from backup.
+.TP
+.BR \-\-include\-node\-modules
+Include node_modules (significantly increases size).
+.TP
+.BR \-t ", " \-\-tags " \fITAGS\fR"
+Comma-separated tags to organize backups.
+.RE
+.TP
+.B backup list [\fIDOMAIN\fR]
+List available backups.
+.TP
+.B backup restore \fIBACKUP_ID\fR
+Restore from a backup.
+.TP
+.B backup verify \fIBACKUP_ID\fR
+Verify backup integrity.
+.TP
+.B backup info \fIBACKUP_ID\fR
+Show detailed backup information.
+.TP
+.B backup delete \fIBACKUP_ID\fR
+Delete a backup.
+.TP
+.B backup storage
+Show backup storage usage.
+.TP
+.BR rollback ", " rb " \fIDOMAIN\fR [\fIBACKUP_ID\fR]"
+Restore application to a previous backup.
+If BACKUP_ID is not specified, uses the most recent.
+.SS Web dashboard (web)
+.TP
+.B web start
+Start the web dashboard server.
+.RS
+.TP
+.BR \-H ", " \-\-host " \fIHOST\fR"
+Host to listen on (default: 127.0.0.1).
+.TP
+.BR \-p ", " \-\-port " \fIPORT\fR"
+Port to listen on (default: 8080).
+.TP
+.BR \-d ", " \-\-daemon
+Run in background.
+.RE
+.TP
+.B web stop
+Stop the web dashboard.
+.TP
+.B web status
+View dashboard status.
+.TP
+.B web token
+Show access token.
+.RS
+.TP
+.BR \-r ", " \-\-regenerate
+Generate new access token.
+.RE
+.TP
+.B web install
+Install dashboard dependencies.
+.SS Initial setup (setup)
+.TP
+.B setup init
+Initialize WASM directories and configuration.
+Must be run with sudo the first time.
+.TP
+.B setup completions
+Install shell autocompletion (Bash, Zsh, Fish).
+.RS
+.TP
+.BR \-s ", " \-\-shell " \fISHELL\fR"
+Specific shell: bash, zsh, fish.
+.TP
+.BR \-u ", " \-\-user\-only
+Install only for current user (without sudo).
+.RE
+.TP
+.B setup permissions
+Verify required permissions.
+.TP
+.B setup ssh
+Configure SSH key for Git authentication.
+.RS
+.TP
+.BR \-g ", " \-\-generate
+Generate new key if it doesn't exist.
+.TP
+.BR \-t ", " \-\-type " \fITYPE\fR"
+Key type: ed25519, rsa, ecdsa.
+.TP
+.BR \-T ", " \-\-test " \fIHOST\fR"
+Test SSH connection to a host.
+.TP
+.BR \-S ", " \-\-show
+Show the public key.
+.RE
+.TP
+.B setup doctor
+Run system diagnostics.
+.SS Internal store (store)
+.TP
+.B store init
+Initialize internal database.
+.TP
+.B store stats
+Show store statistics.
+.TP
+.B store import
+Import legacy apps from systemd/nginx.
+.TP
+.B store export
+Export data to JSON.
+.TP
+.B store sync
+Sync with current service state.
+.TP
+.B store path
+Show database file path.
+.SS Security monitor (monitor, mon)
+.TP
+.B monitor status
+View monitoring service status.
+.TP
+.B monitor scan
+Run a security scan.
+.TP
+.B monitor enable
+Enable security monitor.
+.TP
+.B monitor disable
+Disable monitor.
+.TP
+.B monitor test\-email
+Send test email.
+.TP
+.B monitor config
+Show current configuration.
+.SH FILES
+.TP
+.I /var/www/apps/
+Directory where applications are deployed.
+.TP
+.I /var/www/backups/
+Application backups directory.
+.TP
+.I /etc/wasm/
+WASM global configuration.
+.TP
+.I ~/.config/wasm/
+WASM user configuration.
+.TP
+.I /var/lib/wasm/store.db
+SQLite database with app information.
+.SH ENVIRONMENT
+.TP
+.B WASM_CONFIG_DIR
+Configuration directory (default: ~/.config/wasm).
+.TP
+.B WASM_APPS_DIR
+Applications directory (default: /var/www/apps).
+.TP
+.B WASM_BACKUPS_DIR
+Backups directory (default: /var/www/backups).
+.SH EXAMPLES
+Deploy a Next.js application:
+.RS
+.nf
+wasm create -d example.com -s git@github.com:user/app.git -t nextjs
+.fi
+.RE
+.PP
+See what delete would do without executing:
+.RS
+.nf
+wasm --dry-run delete example.com
+.fi
+.RE
+.PP
+List applications in JSON format:
+.RS
+.nf
+wasm --json list
+.fi
+.RE
+.PP
+Install MySQL and create a database:
+.RS
+.nf
+wasm db install mysql
+wasm db create myapp_db
+wasm db user-create myapp_user -d myapp_db
+.fi
+.RE
+.PP
+Create backup and restore:
+.RS
+.nf
+wasm backup create example.com -m "Before update"
+wasm backup restore backup_id_here
+.fi
+.RE
+.PP
+Get SSL certificate:
+.RS
+.nf
+wasm cert create -d example.com -e admin@example.com --nginx
+.fi
+.RE
+.SH EXIT STATUS
+.TP
+.B 0
+Successful operation.
+.TP
+.B 1
+General error or operation failure.
+.SH SEE ALSO
+.BR systemctl (1),
+.BR nginx (8),
+.BR apache2 (8),
+.BR certbot (1),
+.BR git (1)
+.SH BUGS
+Report bugs at: https://github.com/Perkybeet/wasm/issues
+.SH AUTHOR
+Yago Lopez Prado <https://github.com/Perkybeet>
+.SH COPYRIGHT
+Copyright (c) 2024-2025 Yago Lopez Prado.
+.br
+Licensed under WASM-NCSAL 1.0 (Non-commercial, source-available).
+.br
+https://github.com/Perkybeet/wasm/blob/main/LICENSE

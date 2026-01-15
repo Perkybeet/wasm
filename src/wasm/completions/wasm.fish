@@ -34,7 +34,7 @@ end
 function __wasm_get_sites
     set -l nginx_dir "/etc/nginx/sites-available"
     set -l apache_dir "/etc/apache2/sites-available"
-    
+
     if test -d "$nginx_dir"
         for site in $nginx_dir/*
             if test -f "$site"; and test (basename "$site") != "default"
@@ -42,7 +42,7 @@ function __wasm_get_sites
             end
         end 2>/dev/null
     end
-    
+
     if test -d "$apache_dir"
         for site in $apache_dir/*.conf
             if test -f "$site"
@@ -58,6 +58,17 @@ function __wasm_get_certs
         for cert in $live_dir/*/
             if test -d "$cert"
                 basename "$cert"
+            end
+        end 2>/dev/null
+    end
+end
+
+function __wasm_get_backups
+    set -l backup_dir "/var/www/backups"
+    if test -d "$backup_dir"
+        for backup in $backup_dir/*.tar.gz
+            if test -f "$backup"
+                basename "$backup" .tar.gz
             end
         end 2>/dev/null
     end
@@ -82,7 +93,7 @@ end
 function __wasm_using_subcommand
     set -l cmd (commandline -opc)
     if test (count $cmd) -ge 3
-        if contains -- $cmd[2] site service svc cert ssl certificate setup
+        if contains -- $cmd[2] site service svc cert ssl certificate setup backup bak db database web store monitor mon
             if contains -- $cmd[3] $argv
                 return 0
             end
@@ -97,6 +108,9 @@ complete -c wasm -s V -l version -d 'Show version'
 complete -c wasm -s v -l verbose -d 'Enable verbose output'
 complete -c wasm -s i -l interactive -d 'Run in interactive mode'
 complete -c wasm -l no-color -d 'Disable colored output'
+complete -c wasm -l dry-run -d 'Show what would be done without making changes'
+complete -c wasm -l json -d 'Output results in JSON format'
+complete -c wasm -l changelog -d 'Show changelog for current version'
 
 # Main commands
 complete -c wasm -n __wasm_needs_command -a create -d 'Deploy a new web application'
@@ -115,6 +129,7 @@ complete -c wasm -n __wasm_needs_command -a delete -d 'Delete an application'
 complete -c wasm -n __wasm_needs_command -a remove -d 'Delete an application'
 complete -c wasm -n __wasm_needs_command -a rm -d 'Delete an application'
 complete -c wasm -n __wasm_needs_command -a logs -d 'View application logs'
+complete -c wasm -n __wasm_needs_command -a health -d 'Check system health and diagnose issues'
 complete -c wasm -n __wasm_needs_command -a site -d 'Manage web server sites'
 complete -c wasm -n __wasm_needs_command -a service -d 'Manage systemd services'
 complete -c wasm -n __wasm_needs_command -a svc -d 'Manage systemd services'
@@ -122,6 +137,16 @@ complete -c wasm -n __wasm_needs_command -a cert -d 'Manage SSL certificates'
 complete -c wasm -n __wasm_needs_command -a ssl -d 'Manage SSL certificates'
 complete -c wasm -n __wasm_needs_command -a certificate -d 'Manage SSL certificates'
 complete -c wasm -n __wasm_needs_command -a setup -d 'Initial setup and configuration'
+complete -c wasm -n __wasm_needs_command -a backup -d 'Manage application backups'
+complete -c wasm -n __wasm_needs_command -a bak -d 'Manage application backups'
+complete -c wasm -n __wasm_needs_command -a rollback -d 'Rollback an application to a previous state'
+complete -c wasm -n __wasm_needs_command -a rb -d 'Rollback an application to a previous state'
+complete -c wasm -n __wasm_needs_command -a db -d 'Database management'
+complete -c wasm -n __wasm_needs_command -a database -d 'Database management'
+complete -c wasm -n __wasm_needs_command -a web -d 'Web dashboard interface'
+complete -c wasm -n __wasm_needs_command -a store -d 'Manage WASM persistence store'
+complete -c wasm -n __wasm_needs_command -a monitor -d 'AI-powered process security monitoring'
+complete -c wasm -n __wasm_needs_command -a mon -d 'AI-powered process security monitoring'
 
 # create/new/deploy options
 complete -c wasm -n '__wasm_using_command create new deploy' -s d -l domain -d 'Target domain name'
@@ -146,12 +171,17 @@ complete -c wasm -n '__wasm_using_command update upgrade' -l pm -l package-manag
 # delete/remove/rm options
 complete -c wasm -n '__wasm_using_command delete remove rm' -xa '(__wasm_get_apps)' -d 'Application'
 complete -c wasm -n '__wasm_using_command delete remove rm' -s f -l force -d 'Skip confirmation'
+complete -c wasm -n '__wasm_using_command delete remove rm' -s y -d 'Skip confirmation'
 complete -c wasm -n '__wasm_using_command delete remove rm' -l keep-files -d 'Keep application files'
 
 # logs options
 complete -c wasm -n '__wasm_using_command logs' -xa '(__wasm_get_apps)' -d 'Application'
 complete -c wasm -n '__wasm_using_command logs' -s f -l follow -d 'Follow log output'
 complete -c wasm -n '__wasm_using_command logs' -s n -l lines -d 'Number of lines'
+
+# rollback options
+complete -c wasm -n '__wasm_using_command rollback rb' -xa '(__wasm_get_apps)' -d 'Application'
+complete -c wasm -n '__wasm_using_command rollback rb' -l no-rebuild -d 'Don\'t rebuild after restore'
 
 # site subcommands
 complete -c wasm -n '__wasm_using_command site' -a create -d 'Create a new site configuration'
@@ -260,7 +290,197 @@ complete -c wasm -n '__wasm_using_subcommand delete remove rm; and __wasm_using_
 complete -c wasm -n '__wasm_using_command setup' -a init -d 'Initialize WASM directories and configuration'
 complete -c wasm -n '__wasm_using_command setup' -a completions -d 'Install shell completions'
 complete -c wasm -n '__wasm_using_command setup' -a permissions -d 'Check permission status'
+complete -c wasm -n '__wasm_using_command setup' -a ssh -d 'Setup SSH key for Git authentication'
+complete -c wasm -n '__wasm_using_command setup' -a doctor -d 'Run system diagnostics and check for issues'
 
 # setup completions options
 complete -c wasm -n '__wasm_using_subcommand completions; and __wasm_using_command setup' -s s -l shell -xa 'bash zsh fish' -d 'Shell type'
 complete -c wasm -n '__wasm_using_subcommand completions; and __wasm_using_command setup' -s u -l user-only -d 'Install for current user only'
+
+# setup ssh options
+complete -c wasm -n '__wasm_using_subcommand ssh; and __wasm_using_command setup' -s g -l generate -d 'Generate a new SSH key if none exists'
+complete -c wasm -n '__wasm_using_subcommand ssh; and __wasm_using_command setup' -s t -l type -xa 'ed25519 rsa ecdsa' -d 'Type of SSH key to generate'
+complete -c wasm -n '__wasm_using_subcommand ssh; and __wasm_using_command setup' -s T -l test -xa 'github.com gitlab.com bitbucket.org' -d 'Test SSH connection to a host'
+complete -c wasm -n '__wasm_using_subcommand ssh; and __wasm_using_command setup' -s S -l show -d 'Show the public key'
+
+# backup subcommands
+complete -c wasm -n '__wasm_using_command backup bak' -a create -d 'Create a backup of an application'
+complete -c wasm -n '__wasm_using_command backup bak' -a new -d 'Create a backup of an application'
+complete -c wasm -n '__wasm_using_command backup bak' -a list -d 'List backups'
+complete -c wasm -n '__wasm_using_command backup bak' -a ls -d 'List backups'
+complete -c wasm -n '__wasm_using_command backup bak' -a restore -d 'Restore from a backup'
+complete -c wasm -n '__wasm_using_command backup bak' -a delete -d 'Delete a backup'
+complete -c wasm -n '__wasm_using_command backup bak' -a remove -d 'Delete a backup'
+complete -c wasm -n '__wasm_using_command backup bak' -a rm -d 'Delete a backup'
+complete -c wasm -n '__wasm_using_command backup bak' -a verify -d 'Verify a backup\'s integrity'
+complete -c wasm -n '__wasm_using_command backup bak' -a check -d 'Verify a backup\'s integrity'
+complete -c wasm -n '__wasm_using_command backup bak' -a info -d 'Show detailed backup information'
+complete -c wasm -n '__wasm_using_command backup bak' -a show -d 'Show detailed backup information'
+complete -c wasm -n '__wasm_using_command backup bak' -a storage -d 'Show backup storage usage'
+
+# backup create options
+complete -c wasm -n '__wasm_using_subcommand create new; and __wasm_using_command backup bak' -xa '(__wasm_get_apps)' -d 'Application'
+complete -c wasm -n '__wasm_using_subcommand create new; and __wasm_using_command backup bak' -s m -l description -d 'Description or note for this backup'
+complete -c wasm -n '__wasm_using_subcommand create new; and __wasm_using_command backup bak' -l no-env -d 'Exclude .env files from backup'
+complete -c wasm -n '__wasm_using_subcommand create new; and __wasm_using_command backup bak' -l include-node-modules -d 'Include node_modules (warning: large!)'
+complete -c wasm -n '__wasm_using_subcommand create new; and __wasm_using_command backup bak' -l include-build -d 'Include build artifacts'
+complete -c wasm -n '__wasm_using_subcommand create new; and __wasm_using_command backup bak' -s t -l tags -d 'Comma-separated tags for the backup'
+
+# backup list options
+complete -c wasm -n '__wasm_using_subcommand list ls; and __wasm_using_command backup bak' -xa '(__wasm_get_apps)' -d 'Application'
+complete -c wasm -n '__wasm_using_subcommand list ls; and __wasm_using_command backup bak' -s t -l tags -d 'Filter by tags'
+complete -c wasm -n '__wasm_using_subcommand list ls; and __wasm_using_command backup bak' -s n -l limit -d 'Maximum number of backups to show'
+complete -c wasm -n '__wasm_using_subcommand list ls; and __wasm_using_command backup bak' -l json -d 'Output in JSON format'
+
+# backup restore options
+complete -c wasm -n '__wasm_using_subcommand restore; and __wasm_using_command backup bak' -xa '(__wasm_get_backups)' -d 'Backup'
+complete -c wasm -n '__wasm_using_subcommand restore; and __wasm_using_command backup bak' -l target-domain -xa '(__wasm_get_apps)' -d 'Restore to a different domain'
+complete -c wasm -n '__wasm_using_subcommand restore; and __wasm_using_command backup bak' -l no-env -d 'Don\'t restore .env files'
+complete -c wasm -n '__wasm_using_subcommand restore; and __wasm_using_command backup bak' -l no-verify -d 'Skip checksum verification'
+complete -c wasm -n '__wasm_using_subcommand restore; and __wasm_using_command backup bak' -s f -l force -d 'Skip confirmation prompt'
+
+# backup delete options
+complete -c wasm -n '__wasm_using_subcommand delete remove rm; and __wasm_using_command backup bak' -xa '(__wasm_get_backups)' -d 'Backup'
+complete -c wasm -n '__wasm_using_subcommand delete remove rm; and __wasm_using_command backup bak' -s f -l force -d 'Skip confirmation'
+
+# backup verify/info options
+complete -c wasm -n '__wasm_using_subcommand verify check info show; and __wasm_using_command backup bak' -xa '(__wasm_get_backups)' -d 'Backup'
+complete -c wasm -n '__wasm_using_subcommand info show; and __wasm_using_command backup bak' -l json -d 'Output in JSON format'
+
+# backup storage options
+complete -c wasm -n '__wasm_using_subcommand storage; and __wasm_using_command backup bak' -l json -d 'Output in JSON format'
+
+# db subcommands
+complete -c wasm -n '__wasm_using_command db database' -a install -d 'Install a database engine'
+complete -c wasm -n '__wasm_using_command db database' -a uninstall -d 'Uninstall a database engine'
+complete -c wasm -n '__wasm_using_command db database' -a status -d 'Show database engine status'
+complete -c wasm -n '__wasm_using_command db database' -a start -d 'Start a database engine'
+complete -c wasm -n '__wasm_using_command db database' -a stop -d 'Stop a database engine'
+complete -c wasm -n '__wasm_using_command db database' -a restart -d 'Restart a database engine'
+complete -c wasm -n '__wasm_using_command db database' -a engines -d 'List available database engines'
+complete -c wasm -n '__wasm_using_command db database' -a create -d 'Create a new database'
+complete -c wasm -n '__wasm_using_command db database' -a drop -d 'Drop a database'
+complete -c wasm -n '__wasm_using_command db database' -a list -d 'List databases'
+complete -c wasm -n '__wasm_using_command db database' -a ls -d 'List databases'
+complete -c wasm -n '__wasm_using_command db database' -a info -d 'Show database information'
+complete -c wasm -n '__wasm_using_command db database' -a user-create -d 'Create a database user'
+complete -c wasm -n '__wasm_using_command db database' -a user-delete -d 'Delete a database user'
+complete -c wasm -n '__wasm_using_command db database' -a user-list -d 'List database users'
+complete -c wasm -n '__wasm_using_command db database' -a grant -d 'Grant privileges to a user'
+complete -c wasm -n '__wasm_using_command db database' -a revoke -d 'Revoke privileges from a user'
+complete -c wasm -n '__wasm_using_command db database' -a backup -d 'Backup a database'
+complete -c wasm -n '__wasm_using_command db database' -a restore -d 'Restore a database from backup'
+complete -c wasm -n '__wasm_using_command db database' -a backups -d 'List available backups'
+complete -c wasm -n '__wasm_using_command db database' -a query -d 'Execute a query'
+complete -c wasm -n '__wasm_using_command db database' -a connect -d 'Connect to a database interactively'
+complete -c wasm -n '__wasm_using_command db database' -a connection-string -d 'Generate a connection string'
+complete -c wasm -n '__wasm_using_command db database' -a config -d 'Configure database engine credentials'
+
+# db engine options
+complete -c wasm -n '__wasm_using_subcommand install start stop restart; and __wasm_using_command db database' -xa 'mysql postgresql redis mongodb' -d 'Database engine'
+complete -c wasm -n '__wasm_using_subcommand uninstall; and __wasm_using_command db database' -xa 'mysql postgresql redis mongodb' -d 'Database engine'
+complete -c wasm -n '__wasm_using_subcommand uninstall; and __wasm_using_command db database' -l purge -d 'Remove all data and configuration'
+complete -c wasm -n '__wasm_using_subcommand uninstall; and __wasm_using_command db database' -s f -l force -d 'Skip confirmation'
+complete -c wasm -n '__wasm_using_subcommand status; and __wasm_using_command db database' -xa 'mysql postgresql redis mongodb' -d 'Database engine'
+complete -c wasm -n '__wasm_using_subcommand status engines; and __wasm_using_command db database' -l json -d 'Output in JSON format'
+
+# db create/drop/info options
+complete -c wasm -n '__wasm_using_subcommand create drop info; and __wasm_using_command db database' -s e -l engine -xa 'mysql postgresql redis mongodb' -d 'Database engine'
+complete -c wasm -n '__wasm_using_subcommand create; and __wasm_using_command db database' -s o -l owner -d 'Database owner (user)'
+complete -c wasm -n '__wasm_using_subcommand create; and __wasm_using_command db database' -l encoding -xa 'UTF8 LATIN1 SQL_ASCII' -d 'Character encoding'
+complete -c wasm -n '__wasm_using_subcommand drop; and __wasm_using_command db database' -s f -l force -d 'Skip confirmation'
+complete -c wasm -n '__wasm_using_subcommand info; and __wasm_using_command db database' -l json -d 'Output in JSON format'
+
+# db list options
+complete -c wasm -n '__wasm_using_subcommand list ls; and __wasm_using_command db database' -s e -l engine -xa 'mysql postgresql redis mongodb' -d 'Database engine'
+complete -c wasm -n '__wasm_using_subcommand list ls; and __wasm_using_command db database' -l json -d 'Output in JSON format'
+
+# db user options
+complete -c wasm -n '__wasm_using_subcommand user-create user-delete user-list; and __wasm_using_command db database' -s e -l engine -xa 'mysql postgresql redis mongodb' -d 'Database engine'
+complete -c wasm -n '__wasm_using_subcommand user-create; and __wasm_using_command db database' -s p -l password -d 'Password (generated if not provided)'
+complete -c wasm -n '__wasm_using_subcommand user-create; and __wasm_using_command db database' -s d -l database -d 'Grant access to this database'
+complete -c wasm -n '__wasm_using_subcommand user-create user-delete; and __wasm_using_command db database' -l host -d 'Host restriction'
+complete -c wasm -n '__wasm_using_subcommand user-delete; and __wasm_using_command db database' -s f -l force -d 'Skip confirmation'
+complete -c wasm -n '__wasm_using_subcommand user-list; and __wasm_using_command db database' -l json -d 'Output in JSON format'
+
+# db grant/revoke options
+complete -c wasm -n '__wasm_using_subcommand grant revoke; and __wasm_using_command db database' -s e -l engine -xa 'mysql postgresql redis mongodb' -d 'Database engine'
+complete -c wasm -n '__wasm_using_subcommand grant revoke; and __wasm_using_command db database' -l privileges -d 'Comma-separated list of privileges'
+complete -c wasm -n '__wasm_using_subcommand grant revoke; and __wasm_using_command db database' -l host -d 'Host restriction'
+
+# db backup/restore options
+complete -c wasm -n '__wasm_using_subcommand backup restore; and __wasm_using_command db database' -s e -l engine -xa 'mysql postgresql redis mongodb' -d 'Database engine'
+complete -c wasm -n '__wasm_using_subcommand backup; and __wasm_using_command db database' -s o -l output -d 'Output file path'
+complete -c wasm -n '__wasm_using_subcommand backup; and __wasm_using_command db database' -l no-compress -d 'Don\'t compress the backup'
+complete -c wasm -n '__wasm_using_subcommand restore; and __wasm_using_command db database' -l drop -d 'Drop existing database before restore'
+complete -c wasm -n '__wasm_using_subcommand restore; and __wasm_using_command db database' -s f -l force -d 'Skip confirmation'
+
+# db backups options
+complete -c wasm -n '__wasm_using_subcommand backups; and __wasm_using_command db database' -s e -l engine -xa 'mysql postgresql redis mongodb' -d 'Database engine'
+complete -c wasm -n '__wasm_using_subcommand backups; and __wasm_using_command db database' -s d -l database -d 'Filter by database name'
+complete -c wasm -n '__wasm_using_subcommand backups; and __wasm_using_command db database' -l json -d 'Output in JSON format'
+
+# db query/connect options
+complete -c wasm -n '__wasm_using_subcommand query connect; and __wasm_using_command db database' -s e -l engine -xa 'mysql postgresql redis mongodb' -d 'Database engine'
+complete -c wasm -n '__wasm_using_subcommand connect; and __wasm_using_command db database' -s d -l database -d 'Database name'
+complete -c wasm -n '__wasm_using_subcommand connect; and __wasm_using_command db database' -s u -l username -d 'Username'
+
+# db connection-string options
+complete -c wasm -n '__wasm_using_subcommand connection-string; and __wasm_using_command db database' -s e -l engine -xa 'mysql postgresql redis mongodb' -d 'Database engine'
+complete -c wasm -n '__wasm_using_subcommand connection-string; and __wasm_using_command db database' -s p -l password -d 'Password'
+complete -c wasm -n '__wasm_using_subcommand connection-string; and __wasm_using_command db database' -l host -d 'Host'
+
+# db config options
+complete -c wasm -n '__wasm_using_subcommand config; and __wasm_using_command db database' -s e -l engine -xa 'mysql postgresql redis mongodb' -d 'Database engine'
+complete -c wasm -n '__wasm_using_subcommand config; and __wasm_using_command db database' -s u -l user -d 'Admin username'
+complete -c wasm -n '__wasm_using_subcommand config; and __wasm_using_command db database' -s p -l password -d 'Admin password'
+
+# web subcommands
+complete -c wasm -n '__wasm_using_command web' -a start -d 'Start the web dashboard server'
+complete -c wasm -n '__wasm_using_command web' -a stop -d 'Stop the web dashboard server'
+complete -c wasm -n '__wasm_using_command web' -a status -d 'Show web dashboard status'
+complete -c wasm -n '__wasm_using_command web' -a restart -d 'Restart the web dashboard server'
+complete -c wasm -n '__wasm_using_command web' -a token -d 'Manage access tokens'
+complete -c wasm -n '__wasm_using_command web' -a install -d 'Install web dashboard dependencies'
+
+# web start/restart options
+complete -c wasm -n '__wasm_using_subcommand start restart; and __wasm_using_command web' -s H -l host -xa '127.0.0.1 0.0.0.0 localhost' -d 'Host to bind to'
+complete -c wasm -n '__wasm_using_subcommand start restart; and __wasm_using_command web' -s p -l port -d 'Port to listen on'
+complete -c wasm -n '__wasm_using_subcommand start restart; and __wasm_using_command web' -s d -l daemon -d 'Run in background as daemon'
+
+# web token options
+complete -c wasm -n '__wasm_using_subcommand token; and __wasm_using_command web' -s r -l regenerate -d 'Generate a new access token'
+
+# web install options
+complete -c wasm -n '__wasm_using_subcommand install; and __wasm_using_command web' -l apt -d 'Use apt to install system packages'
+complete -c wasm -n '__wasm_using_subcommand install; and __wasm_using_command web' -l pip -d 'Use pip to install user packages'
+
+# store subcommands
+complete -c wasm -n '__wasm_using_command store' -a init -d 'Initialize or reinitialize the store database'
+complete -c wasm -n '__wasm_using_command store' -a stats -d 'Show store statistics'
+complete -c wasm -n '__wasm_using_command store' -a import -d 'Import legacy apps from systemd services and nginx configs'
+complete -c wasm -n '__wasm_using_command store' -a export -d 'Export store data to JSON'
+complete -c wasm -n '__wasm_using_command store' -a sync -d 'Sync store with actual systemd service states'
+complete -c wasm -n '__wasm_using_command store' -a path -d 'Show the database file path'
+
+# store stats options
+complete -c wasm -n '__wasm_using_subcommand stats; and __wasm_using_command store' -l json -d 'Output as JSON'
+
+# store export options
+complete -c wasm -n '__wasm_using_subcommand export; and __wasm_using_command store' -s o -l output -d 'Output file (stdout if not specified)'
+
+# monitor subcommands
+complete -c wasm -n '__wasm_using_command monitor mon' -a status -d 'Show monitor service status'
+complete -c wasm -n '__wasm_using_command monitor mon' -a scan -d 'Run a single security scan'
+complete -c wasm -n '__wasm_using_command monitor mon' -a run -d 'Run monitor continuously (foreground)'
+complete -c wasm -n '__wasm_using_command monitor mon' -a enable -d 'Enable monitor (installs dependencies and service if needed)'
+complete -c wasm -n '__wasm_using_command monitor mon' -a install -d 'Install monitor service only (without enabling)'
+complete -c wasm -n '__wasm_using_command monitor mon' -a disable -d 'Disable and stop monitor service'
+complete -c wasm -n '__wasm_using_command monitor mon' -a uninstall -d 'Uninstall monitor service'
+complete -c wasm -n '__wasm_using_command monitor mon' -a test-email -d 'Send a test email to verify notification settings'
+complete -c wasm -n '__wasm_using_command monitor mon' -a config -d 'Show current monitor configuration'
+
+# monitor scan options
+complete -c wasm -n '__wasm_using_subcommand scan; and __wasm_using_command monitor mon' -l dry-run -d 'Don\'t terminate processes, just report'
+complete -c wasm -n '__wasm_using_subcommand scan; and __wasm_using_command monitor mon' -l force-ai -d 'Force AI analysis even if no suspicious processes are found'
+complete -c wasm -n '__wasm_using_subcommand scan; and __wasm_using_command monitor mon' -l all -d 'Analyze ALL processes with AI (expensive, use sparingly)'

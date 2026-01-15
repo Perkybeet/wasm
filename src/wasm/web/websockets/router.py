@@ -112,9 +112,9 @@ async def websocket_logs(
                             "data": f"journalctl: {error_msg}"
                         })
             except asyncio.TimeoutError:
-                pass
+                pass  # No stderr available yet, this is normal
             except Exception:
-                pass
+                pass  # WebSocket may be closed, ignore
         
         await check_stderr()
         
@@ -136,7 +136,7 @@ async def websocket_logs(
                             "data": log_line
                         })
                 except Exception:
-                    break
+                    break  # Connection closed or process terminated
         
         # Handle incoming messages (for ping/pong or commands)
         async def handle_messages():
@@ -185,7 +185,7 @@ async def websocket_logs(
                 try:
                     process.kill()
                 except Exception:
-                    pass
+                    pass  # Process already terminated
         
         # Remove from connections
         if domain in _log_connections:
@@ -194,7 +194,7 @@ async def websocket_logs(
         try:
             await websocket.close()
         except Exception:
-            pass
+            pass  # WebSocket already closed
 
 
 @router.websocket("/system")

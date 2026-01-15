@@ -27,26 +27,40 @@ WEBAPP_ACTIONS = [
 def create_parser() -> argparse.ArgumentParser:
     """
     Create the main argument parser for WASM.
-    
+
     Returns:
         Configured ArgumentParser instance.
     """
+    description = f"""WASM - Web App System Management v{__version__}
+
+CLI tool for deploying and managing web applications on Linux servers.
+Automates: Git clone, build, systemd, Nginx/Apache, SSL (Let's Encrypt).
+
+Supported app types: nextjs, nodejs, vite, python, static
+
+QUICK START:
+  wasm setup init              Initialize directories (first time, requires sudo)
+  wasm setup completions       Install shell autocompletion
+  wasm create -d example.com -s git@github.com:user/repo.git -t nextjs"""
+
+    epilog = """EXAMPLES:
+  wasm create -d example.com -s git@github.com:user/app.git -t nextjs
+  wasm --dry-run delete example.com
+  wasm --json list
+  wasm db install mysql
+  wasm backup create example.com
+
+DOCUMENTATION:
+  man wasm                     Full manual
+  wasm <command> --help        Command-specific help
+  https://github.com/Perkybeet/wasm
+"""
+
     parser = argparse.ArgumentParser(
         prog="wasm",
-        description="WASM - Web App System Management\n"
-                   "Deploy, manage, and monitor web applications with ease.",
+        description=description,
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  wasm create -d example.com -s git@github.com:user/app.git -t nextjs
-  wasm list
-  wasm status example.com
-  wasm site list
-  wasm service status myapp
-  wasm cert create -d example.com
-
-For more information, visit: https://github.com/Perkybeet/wasm
-        """,
+        epilog=epilog,
     )
     
     # Global arguments
@@ -75,7 +89,17 @@ For more information, visit: https://github.com/Perkybeet/wasm
         action="store_true",
         help="Disable colored output",
     )
-    
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be done without making changes",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output results in JSON format",
+    )
+
     # Subparsers for commands
     subparsers = parser.add_subparsers(
         dest="command",
@@ -116,8 +140,22 @@ For more information, visit: https://github.com/Perkybeet/wasm
     
     # Web interface commands
     _add_web_parser(subparsers)
-    
+
+    # Health check command
+    _add_health_parser(subparsers)
+
+    # Config management command
+    _add_config_parser(subparsers)
+
     return parser
+
+
+def _add_health_parser(subparsers) -> None:
+    """Add health check command."""
+    health_parser = subparsers.add_parser(
+        "health",
+        help="Check system health and diagnose issues",
+    )
 
 
 def _add_webapp_commands(subparsers) -> None:
@@ -1647,13 +1685,51 @@ def _add_store_parser(subparsers) -> None:
     )
 
 
+def _add_config_parser(subparsers) -> None:
+    """Add config management command."""
+    config = subparsers.add_parser(
+        "config",
+        help="Manage WASM configuration",
+        description="Commands for managing WASM configuration files.",
+    )
+
+    config_sub = config.add_subparsers(
+        dest="action",
+        title="config commands",
+    )
+
+    # config upgrade
+    upgrade = config_sub.add_parser(
+        "upgrade",
+        help="Upgrade config file with new defaults",
+        description="Add new configuration options while preserving existing values.",
+    )
+    upgrade.add_argument(
+        "--quiet", "-q",
+        action="store_true",
+        help="Suppress output (for scripts)",
+    )
+
+    # config show
+    config_sub.add_parser(
+        "show",
+        help="Show current configuration",
+    )
+
+    # config path
+    config_sub.add_parser(
+        "path",
+        help="Show config file path",
+    )
+
+
 def parse_args(args: Optional[list] = None) -> argparse.Namespace:
     """
     Parse command line arguments.
-    
+
     Args:
         args: Arguments to parse (defaults to sys.argv).
-        
+
     Returns:
         Parsed arguments namespace.
     """

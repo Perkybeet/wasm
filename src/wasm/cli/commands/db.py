@@ -934,9 +934,10 @@ def _db_connect(args: Namespace, verbose: bool) -> int:
         
         logger.info(f"Connecting to {manager.DISPLAY_NAME}...")
         logger.info(f"Command: {' '.join(cmd)}")
-        
+
         # Execute interactively
-        return subprocess.call(cmd)
+        result = subprocess.run(cmd)
+        return result.returncode
     except Exception as e:
         logger.error(str(e))
         return 1

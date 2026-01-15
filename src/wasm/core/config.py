@@ -55,7 +55,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "monitor": {
         "enabled": False,
-        "scan_interval": 3600,  # 1 hour in seconds
+        "scan_interval": 30,  # Local pattern scan every 30 seconds
+        "ai_interval": 3600,  # AI analysis every 1 hour
         "cpu_threshold": 80.0,
         "memory_threshold": 80.0,
         "auto_terminate": True,
@@ -295,3 +296,86 @@ class Config:
     def to_dict(self) -> Dict[str, Any]:
         """Return configuration as dictionary."""
         return self._config.copy()
+
+    def upgrade(self, path: Optional[Path] = None) -> Dict[str, Any]:
+        """
+        Upgrade configuration file with new defaults.
+
+        Merges DEFAULT_CONFIG with user's existing config, preserving
+        user values while adding new keys from defaults.
+
+        Args:
+            path: Optional path to config file. Defaults to global config path.
+
+        Returns:
+            Dictionary with upgrade results:
+            - added_keys: List of new keys added
+            - removed_keys: List of keys no longer in defaults (kept in file)
+            - upgraded: Boolean indicating if file was modified
+        """
+        config_path = path or DEFAULT_CONFIG_PATH
+
+        # Load user's current config (raw, without merging defaults)
+        user_config: Dict[str, Any] = {}
+        if config_path.exists():
+            try:
+                with open(config_path, "r") as f:
+                    user_config = yaml.safe_load(f) or {}
+            except Exception:
+                user_config = {}
+
+        # Find keys that need to be added
+        added_keys = self._find_missing_keys(DEFAULT_CONFIG, user_config)
+
+        # Merge: defaults first, then user config (user wins)
+        merged_config = self._deep_merge(DEFAULT_CONFIG.copy(), user_config)
+
+        # Only save if there are new keys
+        if added_keys:
+            try:
+                config_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(config_path, "w") as f:
+                    yaml.dump(merged_config, f, default_flow_style=False, sort_keys=False)
+
+                # Reload to use new config
+                self._config = merged_config
+            except Exception as e:
+                return {
+                    "added_keys": [],
+                    "upgraded": False,
+                    "error": str(e),
+                }
+
+        return {
+            "added_keys": added_keys,
+            "upgraded": len(added_keys) > 0,
+        }
+
+    def _find_missing_keys(
+        self, defaults: Dict, user: Dict, prefix: str = ""
+    ) -> list:
+        """
+        Find keys in defaults that are missing from user config.
+
+        Args:
+            defaults: Default configuration dictionary.
+            user: User's configuration dictionary.
+            prefix: Current key prefix for nested keys.
+
+        Returns:
+            List of missing key paths (dot notation).
+        """
+        missing = []
+
+        for key, value in defaults.items():
+            full_key = f"{prefix}.{key}" if prefix else key
+
+            if key not in user:
+                missing.append(full_key)
+            elif isinstance(value, dict) and isinstance(user.get(key), dict):
+                # Recurse into nested dicts
+                missing.extend(
+                    self._find_missing_keys(value, user[key], full_key)
+                )
+
+        return missing

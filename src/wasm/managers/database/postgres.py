@@ -50,7 +50,29 @@ class PostgresManager(BaseDatabaseManager):
     def __init__(self, verbose: bool = False):
         """Initialize PostgreSQL manager."""
         super().__init__(verbose=verbose)
-    
+
+    # ==================== SQL Escaping (Security) ====================
+
+    @staticmethod
+    def _escape_identifier(value: str) -> str:
+        """
+        Escape a SQL identifier (database name, username, etc.) for PostgreSQL.
+
+        Uses double quotes and escapes any double quotes in the value.
+        This prevents SQL injection in identifiers.
+        """
+        return '"' + value.replace('"', '""') + '"'
+
+    @staticmethod
+    def _escape_literal(value: str) -> str:
+        """
+        Escape a SQL string literal for PostgreSQL.
+
+        Escapes single quotes by doubling them and backslashes.
+        This prevents SQL injection in string values.
+        """
+        return "'" + value.replace("'", "''") + "'"
+
     def is_installed(self) -> bool:
         """Check if PostgreSQL is installed."""
         result = self._run(["which", "psql"])
@@ -99,8 +121,8 @@ class PostgresManager(BaseDatabaseManager):
         # Stop service
         try:
             self.stop()
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.warning(f"Could not stop service during uninstall: {e}")
         
         action = "purge" if purge else "remove"
         
@@ -154,15 +176,18 @@ class PostgresManager(BaseDatabaseManager):
         """Create a new PostgreSQL database."""
         if self.database_exists(name):
             raise DatabaseExistsError(f"Database '{name}' already exists")
-        
+
         encoding = encoding or "UTF8"
         template = kwargs.get("template", "template0")
-        
-        sql = f"CREATE DATABASE \"{name}\" ENCODING '{encoding}' TEMPLATE {template}"
-        
+
+        # Use escaped identifier to prevent SQL injection
+        safe_name = self._escape_identifier(name)
+        sql = f"CREATE DATABASE {safe_name} ENCODING '{encoding}' TEMPLATE {template}"
+
         if owner:
-            sql += f" OWNER \"{owner}\""
-        
+            safe_owner = self._escape_identifier(owner)
+            sql += f" OWNER {safe_owner}"
+
         sql += ";"
         
         success, output = self._execute_sql(sql)
@@ -179,14 +204,18 @@ class PostgresManager(BaseDatabaseManager):
             if force:
                 return True
             raise DatabaseNotFoundError(f"Database '{name}' does not exist")
-        
+
+        # Use escaped values to prevent SQL injection
+        safe_name_literal = self._escape_literal(name)
+        safe_name_ident = self._escape_identifier(name)
+
         # Terminate existing connections if force
         if force:
             self._execute_sql(
-                f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{name}';"
+                f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = {safe_name_literal};"
             )
-        
-        sql = f"DROP DATABASE \"{name}\";"
+
+        sql = f"DROP DATABASE {safe_name_ident};"
         success, output = self._execute_sql(sql)
         
         if not success:
@@ -197,7 +226,9 @@ class PostgresManager(BaseDatabaseManager):
     
     def database_exists(self, name: str) -> bool:
         """Check if a database exists."""
-        sql = f"SELECT 1 FROM pg_database WHERE datname = '{name}';"
+        # Use escaped literal to prevent SQL injection
+        safe_name = self._escape_literal(name)
+        sql = f"SELECT 1 FROM pg_database WHERE datname = {safe_name};"
         success, output = self._execute_sql(sql)
         return success and "1" in output
     
@@ -242,24 +273,27 @@ class PostgresManager(BaseDatabaseManager):
         """Get detailed database information."""
         if not self.database_exists(name):
             raise DatabaseNotFoundError(f"Database '{name}' does not exist")
-        
+
+        # Use escaped literal to prevent SQL injection
+        safe_name = self._escape_literal(name)
+
         # Get database info
         sql = f"""
-            SELECT 
+            SELECT
                 datname,
                 pg_encoding_to_char(encoding),
-                pg_database_size('{name}'),
+                pg_database_size({safe_name}),
                 r.rolname as owner
             FROM pg_database d
             JOIN pg_roles r ON d.datdba = r.oid
-            WHERE datname = '{name}';
+            WHERE datname = {safe_name};
         """
         success, output = self._execute_sql(sql)
-        
+
         encoding = None
         size = None
         owner = None
-        
+
         if success and output.strip():
             parts = output.strip().split("|")
             if len(parts) >= 4:
@@ -269,9 +303,9 @@ class PostgresManager(BaseDatabaseManager):
                 except (ValueError, TypeError):
                     pass
                 owner = parts[3]
-        
+
         # Get table count
-        sql = f"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_catalog = '{name}';"
+        sql = f"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_catalog = {safe_name};"
         success, output = self._execute_sql(sql, database=name)
         tables = 0
         if success:
@@ -310,9 +344,9 @@ class PostgresManager(BaseDatabaseManager):
         """Create a new PostgreSQL user (role)."""
         if self.user_exists(username):
             raise DatabaseUserError(f"User '{username}' already exists")
-        
+
         password = password or self.generate_password()
-        
+
         # Build CREATE ROLE command
         options = ["LOGIN"]
         if kwargs.get("superuser"):
@@ -321,8 +355,11 @@ class PostgresManager(BaseDatabaseManager):
             options.append("CREATEDB")
         if kwargs.get("createrole"):
             options.append("CREATEROLE")
-        
-        sql = f"CREATE ROLE \"{username}\" WITH {' '.join(options)} PASSWORD '{password}';"
+
+        # Use escaped values to prevent SQL injection
+        safe_username = self._escape_identifier(username)
+        safe_password = self._escape_literal(password)
+        sql = f"CREATE ROLE {safe_username} WITH {' '.join(options)} PASSWORD {safe_password};"
         success, output = self._execute_sql(sql)
         
         if not success:
@@ -342,8 +379,10 @@ class PostgresManager(BaseDatabaseManager):
         """Drop a PostgreSQL user (role)."""
         if not self.user_exists(username):
             raise DatabaseUserError(f"User '{username}' does not exist")
-        
-        sql = f"DROP ROLE \"{username}\";"
+
+        # Use escaped identifier to prevent SQL injection
+        safe_username = self._escape_identifier(username)
+        sql = f"DROP ROLE {safe_username};"
         success, output = self._execute_sql(sql)
         
         if not success:
@@ -354,7 +393,9 @@ class PostgresManager(BaseDatabaseManager):
     
     def user_exists(self, username: str, host: str = "localhost") -> bool:
         """Check if a user exists."""
-        sql = f"SELECT 1 FROM pg_roles WHERE rolname = '{username}';"
+        # Use escaped literal to prevent SQL injection
+        safe_username = self._escape_literal(username)
+        sql = f"SELECT 1 FROM pg_roles WHERE rolname = {safe_username};"
         success, output = self._execute_sql(sql)
         return success and "1" in output
     
@@ -403,15 +444,19 @@ class PostgresManager(BaseDatabaseManager):
     ) -> bool:
         """Grant privileges to a user on a database."""
         privs = ", ".join(privileges) if privileges else "ALL PRIVILEGES"
-        
-        sql = f"GRANT {privs} ON DATABASE \"{database}\" TO \"{username}\";"
+
+        # Use escaped identifiers to prevent SQL injection
+        safe_database = self._escape_identifier(database)
+        safe_username = self._escape_identifier(username)
+
+        sql = f"GRANT {privs} ON DATABASE {safe_database} TO {safe_username};"
         success, output = self._execute_sql(sql)
-        
+
         if not success:
             raise DatabaseUserError(f"Failed to grant privileges", output)
-        
+
         # Also grant on all tables in public schema
-        sql = f"GRANT {privs} ON ALL TABLES IN SCHEMA public TO \"{username}\";"
+        sql = f"GRANT {privs} ON ALL TABLES IN SCHEMA public TO {safe_username};"
         self._execute_sql(sql, database=database)
         
         self.logger.info(f"Granted {privs} on {database} to {username}")
@@ -426,8 +471,12 @@ class PostgresManager(BaseDatabaseManager):
     ) -> bool:
         """Revoke privileges from a user on a database."""
         privs = ", ".join(privileges) if privileges else "ALL PRIVILEGES"
-        
-        sql = f"REVOKE {privs} ON DATABASE \"{database}\" FROM \"{username}\";"
+
+        # Use escaped identifiers to prevent SQL injection
+        safe_database = self._escape_identifier(database)
+        safe_username = self._escape_identifier(username)
+
+        sql = f"REVOKE {privs} ON DATABASE {safe_database} FROM {safe_username};"
         success, output = self._execute_sql(sql)
         
         if not success:

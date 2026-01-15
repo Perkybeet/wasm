@@ -111,3 +111,6 @@ debian/*.log
 
 # GitHub Copilot
 .github/copilot-instructions.md
+
+# Local development scripts
+install-local.sh
