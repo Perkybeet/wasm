@@ -639,7 +639,7 @@ def _handle_delete(args: Namespace) -> int:
         try:
             status = service_manager.status(app_name)
             if status.get("exists"):
-                logger.key_value("Stop and remove service", f"wasm-{app_name}")
+                logger.key_value("Stop and remove service", app_name)
         except Exception:
             pass
 
@@ -734,9 +734,9 @@ def _handle_logs(args: Namespace) -> int:
     domain = validate_domain(args.domain)
     app_name = domain_to_app_name(domain)
     
-    # Get service name (ServiceManager adds prefix internally)
-    service_name = f"wasm-{app_name}"
-    
+    # Get resolved service name (handles both legacy wasm-* and new format)
+    service_name = service_manager._resolve_service_name(app_name)
+
     if args.follow:
         # Use journalctl directly for follow mode
         import subprocess

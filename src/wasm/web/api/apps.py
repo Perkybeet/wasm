@@ -104,7 +104,7 @@ async def list_apps(
         # Get service from store by app_id
         service = store.get_service_by_app_id(app.id) if app.id else None
         if service:
-            status = service_manager.get_status(service.name.replace("wasm-", ""))
+            status = service_manager.get_status(service.name)
             active = status.get("active", False)
             enabled = status.get("enabled", False)
             pid = status.get("pid")
@@ -158,7 +158,7 @@ async def get_app(
     service = store.get_service_by_app_id(app.id) if app.id else None
     if service:
         service_manager = ServiceManager(verbose=False)
-        status = service_manager.get_status(service.name.replace("wasm-", ""))
+        status = service_manager.get_status(service.name)
         active = status.get("active", False)
         enabled = status.get("enabled", False)
         pid = status.get("pid")
@@ -356,9 +356,11 @@ async def get_app_logs(
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
     
+    from wasm.managers.service_manager import ServiceManager
     app_name = domain_to_app_name(validated_domain)
-    service_name = f"wasm-{app_name}"
-    
+    service_manager = ServiceManager(verbose=False)
+    service_name = service_manager._resolve_service_name(app_name)
+
     try:
         result = subprocess.run(
             ["journalctl", "-u", service_name, "-n", str(lines), "--no-pager"],

@@ -219,12 +219,27 @@ def sanitize_name(name: str) -> str:
 def domain_to_app_name(domain: str) -> str:
     """
     Convert a domain to an application name.
-    
+
     Args:
         domain: Domain name (e.g., "myapp.example.com").
-        
+
     Returns:
-        Application name (e.g., "wasm-myapp-example-com").
+        Application name (e.g., "myapp-example-com").
+    """
+    return sanitize_name(domain)
+
+
+def legacy_app_name(domain: str) -> str:
+    """
+    Get legacy app name format (with wasm- prefix).
+
+    Used for backwards compatibility with apps created before v0.14.1.
+
+    Args:
+        domain: Domain name (e.g., "myapp.example.com").
+
+    Returns:
+        Legacy application name (e.g., "wasm-myapp-example-com").
     """
     return f"wasm-{sanitize_name(domain)}"
 

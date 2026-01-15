@@ -18,18 +18,19 @@ from wasm.managers.base_manager import BaseManager
 class ServiceManager(BaseManager):
     """
     Manager for systemd services.
-    
+
     Handles creating, starting, stopping, and managing systemd services.
     """
-    
+
     SYSTEMD_DIR = SYSTEMD_DIR
-    SERVICE_PREFIX = "wasm-"
-    
+    SERVICE_PREFIX = ""  # New services don't use prefix
+    LEGACY_PREFIX = "wasm-"  # For backwards compatibility
+
     def __init__(self, verbose: bool = False):
         """Initialize service manager."""
         super().__init__(verbose=verbose)
         self.store = get_store()
-        
+
         try:
             self.jinja_env = Environment(
                 loader=PackageLoader("wasm", "templates/systemd"),
@@ -38,12 +39,12 @@ class ServiceManager(BaseManager):
             )
         except Exception:
             self.jinja_env = None
-    
+
     def is_installed(self) -> bool:
         """Check if systemd is available."""
         result = self._run(["which", "systemctl"])
         return result.success
-    
+
     def get_version(self) -> Optional[str]:
         """Get systemd version."""
         result = self._run(["systemctl", "--version"])
@@ -52,32 +53,77 @@ class ServiceManager(BaseManager):
             if match:
                 return match.group(1)
         return None
-    
+
     def _get_service_name(self, name: str) -> str:
         """
-        Get full service name with prefix.
-        
+        Get service name for new services (no prefix).
+
         Args:
             name: Base service name.
-            
+
         Returns:
-            Full service name.
+            Service name without prefix.
         """
-        if name.startswith(self.SERVICE_PREFIX):
-            return name
-        return f"{self.SERVICE_PREFIX}{name}"
-    
+        # Strip legacy prefix if present
+        if name.startswith(self.LEGACY_PREFIX):
+            return name[len(self.LEGACY_PREFIX):]
+        return name
+
+    def _resolve_service_name(self, name: str) -> str:
+        """
+        Resolve actual service name, checking both new and legacy formats.
+
+        For backwards compatibility, checks if legacy (wasm-*) service exists
+        and returns that if found. Otherwise returns the new format.
+
+        Args:
+            name: Base service name.
+
+        Returns:
+            Actual service name (may have legacy prefix if exists).
+        """
+        base_name = self._get_service_name(name)
+
+        # Check if legacy service exists
+        legacy_name = f"{self.LEGACY_PREFIX}{base_name}"
+        legacy_file = self.SYSTEMD_DIR / f"{legacy_name}.service"
+        if legacy_file.exists():
+            return legacy_name
+
+        # Check if new format exists
+        new_file = self.SYSTEMD_DIR / f"{base_name}.service"
+        if new_file.exists():
+            return base_name
+
+        # Neither exists, return new format for creation
+        return base_name
+
     def _get_service_file(self, name: str) -> Path:
         """
-        Get service file path.
-        
+        Get service file path for new services.
+
         Args:
             name: Service name.
-            
+
         Returns:
             Path to service file.
         """
         service_name = self._get_service_name(name)
+        if not service_name.endswith(".service"):
+            service_name = f"{service_name}.service"
+        return self.SYSTEMD_DIR / service_name
+
+    def _resolve_service_file(self, name: str) -> Path:
+        """
+        Resolve service file path, checking both new and legacy formats.
+
+        Args:
+            name: Service name.
+
+        Returns:
+            Path to existing service file (or new format if none exists).
+        """
+        service_name = self._resolve_service_name(name)
         if not service_name.endswith(".service"):
             service_name = f"{service_name}.service"
         return self.SYSTEMD_DIR / service_name
@@ -153,14 +199,14 @@ class ServiceManager(BaseManager):
     def get_status(self, name: str) -> Dict:
         """
         Get service status.
-        
+
         Args:
             name: Service name.
-            
+
         Returns:
             Dictionary with status information.
         """
-        service_name = self._get_service_name(name)
+        service_name = self._resolve_service_name(name)
         
         # Check if active
         result = self._run(["systemctl", "is-active", service_name])
@@ -285,16 +331,16 @@ class ServiceManager(BaseManager):
         Returns:
             True if service was deleted.
         """
-        service_name = self._get_service_name(name)
-        
+        service_name = self._resolve_service_name(name)
+
         # Stop service if running
         self.stop(name)
-        
+
         # Disable service
         self.disable(name)
-        
+
         # Remove service file
-        service_file = self._get_service_file(name)
+        service_file = self._resolve_service_file(name)
         if service_file.exists():
             if not remove_file(service_file, sudo=True):
                 raise ServiceError(f"Failed to delete service: {service_name}")
@@ -314,14 +360,14 @@ class ServiceManager(BaseManager):
     def start(self, name: str) -> bool:
         """
         Start a service.
-        
+
         Args:
             name: Service name.
-            
+
         Returns:
             True if service started successfully.
         """
-        service_name = self._get_service_name(name)
+        service_name = self._resolve_service_name(name)
         result = self._run_sudo(["systemctl", "start", service_name])
         
         if not result.success:
@@ -341,14 +387,14 @@ class ServiceManager(BaseManager):
     def stop(self, name: str) -> bool:
         """
         Stop a service.
-        
+
         Args:
             name: Service name.
-            
+
         Returns:
             True if service stopped successfully.
         """
-        service_name = self._get_service_name(name)
+        service_name = self._resolve_service_name(name)
         result = self._run_sudo(["systemctl", "stop", service_name])
         
         # Update store status
@@ -362,14 +408,14 @@ class ServiceManager(BaseManager):
     def restart(self, name: str) -> bool:
         """
         Restart a service.
-        
+
         Args:
             name: Service name.
-            
+
         Returns:
             True if service restarted successfully.
         """
-        service_name = self._get_service_name(name)
+        service_name = self._resolve_service_name(name)
         result = self._run_sudo(["systemctl", "restart", service_name])
         
         if not result.success:
@@ -389,14 +435,14 @@ class ServiceManager(BaseManager):
     def enable(self, name: str) -> bool:
         """
         Enable a service to start on boot.
-        
+
         Args:
             name: Service name.
-            
+
         Returns:
             True if service was enabled.
         """
-        service_name = self._get_service_name(name)
+        service_name = self._resolve_service_name(name)
         result = self._run_sudo(["systemctl", "enable", service_name])
         
         # Update store
@@ -413,14 +459,14 @@ class ServiceManager(BaseManager):
     def disable(self, name: str) -> bool:
         """
         Disable a service from starting on boot.
-        
+
         Args:
             name: Service name.
-            
+
         Returns:
             True if service was disabled.
         """
-        service_name = self._get_service_name(name)
+        service_name = self._resolve_service_name(name)
         result = self._run_sudo(["systemctl", "disable", service_name])
         
         # Update store
@@ -442,16 +488,16 @@ class ServiceManager(BaseManager):
     ) -> str:
         """
         Get service logs.
-        
+
         Args:
             name: Service name.
             lines: Number of lines to return.
             follow: Follow log output (not supported in this method).
-            
+
         Returns:
             Log output.
         """
-        service_name = self._get_service_name(name)
+        service_name = self._resolve_service_name(name)
         
         cmd = ["journalctl", "-u", service_name, "-n", str(lines), "--no-pager"]
         result = self._run(cmd)

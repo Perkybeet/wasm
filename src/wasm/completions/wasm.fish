@@ -31,9 +31,14 @@ function __wasm_get_apps
         for app in $apps_dir/*/
             if test -d "$app"
                 set -l name (basename "$app")
-                # Convert wasm-example-com to example.com
+                # Convert directory name to domain format
+                # Legacy: wasm-example-com -> example.com
+                # New: example-com -> example.com
                 if string match -q 'wasm-*' "$name"
                     string replace 'wasm-' '' "$name" | string replace -a '-' '.'
+                else if string match -q '*-*' "$name"
+                    # New format: convert hyphens to dots
+                    string replace -a '-' '.' "$name"
                 else
                     echo "$name"
                 end

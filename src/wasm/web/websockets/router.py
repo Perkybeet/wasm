@@ -58,8 +58,10 @@ async def websocket_logs(
     
     await websocket.accept()
     
+    from wasm.managers.service_manager import ServiceManager
     app_name = domain_to_app_name(domain)
-    service_name = f"wasm-{app_name}"
+    service_manager = ServiceManager(verbose=False)
+    service_name = service_manager._resolve_service_name(app_name)
     
     # Add to connections
     if domain not in _log_connections:

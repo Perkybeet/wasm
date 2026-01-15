@@ -71,11 +71,8 @@ async def list_services(
     
     result = []
     for svc in stored_services:
-        if wasm_only and not svc.name.startswith("wasm-"):
-            continue
-        
-        # Get live status from systemd
-        live_status = service_manager.get_status(svc.name.replace("wasm-", ""))
+        # Get live status from systemd (ServiceManager resolves name automatically)
+        live_status = service_manager.get_status(svc.name)
         
         result.append(ServiceInfo(
             name=svc.name,
@@ -105,16 +102,16 @@ async def get_service(
     store = get_store()
     service_manager = ServiceManager(verbose=False)
     
-    # Handle both wasm-prefixed and non-prefixed names
+    # Handle both prefixed and non-prefixed names for backwards compatibility
     svc = store.get_service(name)
     if not svc:
         svc = store.get_service(f"wasm-{name}")
-    
+
     if not svc:
         raise HTTPException(status_code=404, detail=f"Service not found: {name}")
-    
-    # Get live status from systemd
-    live_status = service_manager.get_status(svc.name.replace("wasm-", ""))
+
+    # Get live status from systemd (ServiceManager resolves name automatically)
+    live_status = service_manager.get_status(svc.name)
     
     return ServiceInfo(
         name=svc.name,
@@ -140,7 +137,7 @@ async def start_service(
     from wasm.managers.service_manager import ServiceManager
     
     service_manager = ServiceManager(verbose=False)
-    app_name = name.replace("wasm-", "")
+    app_name = name
     
     status = service_manager.get_status(app_name)
     if not status["exists"]:
@@ -169,7 +166,7 @@ async def stop_service(
     from wasm.managers.service_manager import ServiceManager
     
     service_manager = ServiceManager(verbose=False)
-    app_name = name.replace("wasm-", "")
+    app_name = name
     
     status = service_manager.get_status(app_name)
     if not status["exists"]:
@@ -198,7 +195,7 @@ async def restart_service(
     from wasm.managers.service_manager import ServiceManager
     
     service_manager = ServiceManager(verbose=False)
-    app_name = name.replace("wasm-", "")
+    app_name = name
     
     status = service_manager.get_status(app_name)
     if not status["exists"]:
@@ -227,7 +224,7 @@ async def enable_service(
     from wasm.managers.service_manager import ServiceManager
     
     service_manager = ServiceManager(verbose=False)
-    app_name = name.replace("wasm-", "")
+    app_name = name
     
     status = service_manager.get_status(app_name)
     if not status["exists"]:
@@ -256,7 +253,7 @@ async def disable_service(
     from wasm.managers.service_manager import ServiceManager
     
     service_manager = ServiceManager(verbose=False)
-    app_name = name.replace("wasm-", "")
+    app_name = name
     
     status = service_manager.get_status(app_name)
     if not status["exists"]:
@@ -283,8 +280,10 @@ async def get_service_logs(
     """
     Get service logs from journalctl.
     """
-    service_name = name if name.startswith("wasm-") else f"wasm-{name}"
-    
+    from wasm.managers.service_manager import ServiceManager
+    service_manager = ServiceManager(verbose=False)
+    service_name = service_manager._resolve_service_name(name)
+
     try:
         result = subprocess.run(
             ["journalctl", "-u", service_name, "-n", str(lines), "--no-pager"],
@@ -315,8 +314,10 @@ async def get_service_config(
     Get the systemd unit file content for a service.
     """
     from pathlib import Path
-    
-    service_name = name if name.startswith("wasm-") else f"wasm-{name}"
+    from wasm.managers.service_manager import ServiceManager
+
+    service_manager = ServiceManager(verbose=False)
+    service_name = service_manager._resolve_service_name(name)
     service_path = Path(f"/etc/systemd/system/{service_name}.service")
     
     if not service_path.exists():
@@ -349,8 +350,10 @@ async def update_service_config(
     Update the systemd unit file content for a service.
     """
     from pathlib import Path
-    
-    service_name = name if name.startswith("wasm-") else f"wasm-{name}"
+    from wasm.managers.service_manager import ServiceManager
+
+    service_manager = ServiceManager(verbose=False)
+    service_name = service_manager._resolve_service_name(name)
     service_path = Path(f"/etc/systemd/system/{service_name}.service")
     
     if not service_path.exists():
@@ -382,8 +385,9 @@ async def create_service(
     Create a new systemd service.
     """
     from pathlib import Path
-    
-    service_name = data.name if data.name.startswith("wasm-") else f"wasm-{data.name}"
+
+    # New services don't use wasm- prefix
+    service_name = data.name
     service_path = Path(f"/etc/systemd/system/{service_name}.service")
     
     if service_path.exists():
@@ -455,8 +459,10 @@ async def delete_service(
     Delete a systemd service.
     """
     from pathlib import Path
-    
-    service_name = name if name.startswith("wasm-") else f"wasm-{name}"
+    from wasm.managers.service_manager import ServiceManager
+
+    service_manager = ServiceManager(verbose=False)
+    service_name = service_manager._resolve_service_name(name)
     service_path = Path(f"/etc/systemd/system/{service_name}.service")
     
     if not service_path.exists():

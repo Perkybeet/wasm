@@ -899,9 +899,9 @@ class BaseDeployer(ABC):
         app = self.store.get_app(self.domain)
         app_id = app.id if app else None
         
-        # Service name without prefix (store handles that)
+        # Service name (no prefix for new format)
         service_name = self.app_name
-        service_file = SYSTEMD_DIR / f"wasm-{self.app_name}.service"
+        service_file = SYSTEMD_DIR / f"{self.app_name}.service"
         
         existing_service = self.store.get_service(service_name)
         
@@ -1142,7 +1142,7 @@ class BaseDeployer(ABC):
         # Basic info
         protocol = "https" if ssl_obtained else "http"
         self.logger.key_value("URL", f"{protocol}://{self.domain}")
-        self.logger.key_value("Service", f"wasm-{self.app_name}")
+        self.logger.key_value("Service", self.app_name)
         self.logger.key_value("Port", str(self.port))
         self.logger.key_value("App Path", str(self.app_path))
 

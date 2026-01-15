@@ -34,9 +34,14 @@ _wasm_get_apps() {
             if [[ -d "$app" ]]; then
                 local name
                 name=$(basename "$app")
-                # Convert wasm-example-com to example.com
+                # Convert directory name to domain format
+                # Legacy: wasm-example-com -> example.com
+                # New: example-com -> example.com
                 if [[ "$name" == wasm-* ]]; then
                     echo "${name#wasm-}" | tr '-' '.'
+                elif [[ "$name" == *-* ]]; then
+                    # New format: convert hyphens to dots
+                    echo "$name" | tr '-' '.'
                 else
                     echo "$name"
                 fi

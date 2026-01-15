@@ -313,13 +313,29 @@ def _store_import(args: Namespace, verbose: bool) -> int:
     else:
         logger.step(2, 3, "No Apache sites found")
     
-    # 3. Import from systemd services (wasm-* prefix)
+    # 3. Import from systemd services (both legacy wasm-* and new format)
     logger.step(3, 3, "Scanning systemd services")
     if SYSTEMD_DIR.exists():
-        for service_file in SYSTEMD_DIR.glob("wasm-*.service"):
+        # Find all potential WASM service files
+        service_files = list(SYSTEMD_DIR.glob("wasm-*.service"))
+        # Also check for services matching domain pattern (new format)
+        for sf in SYSTEMD_DIR.glob("*.service"):
+            name = sf.stem
+            # Skip if already found as wasm-* or if it's a system service
+            if name.startswith("wasm-") or not "-" in name:
+                continue
+            # Check if it looks like a domain-based name (has hyphen, no @ or other special chars)
+            if "@" not in name and name.count("-") >= 1:
+                service_files.append(sf)
+
+        for service_file in service_files:
             # Extract app name from service file name
-            service_name = service_file.stem  # wasm-example-com
-            app_name = service_name[5:]  # example-com (remove wasm- prefix)
+            service_name = service_file.stem
+            # Handle both legacy (wasm-example-com) and new format (example-com)
+            if service_name.startswith("wasm-"):
+                app_name = service_name[5:]  # Remove wasm- prefix
+            else:
+                app_name = service_name
             
             if store.get_service(app_name):
                 continue

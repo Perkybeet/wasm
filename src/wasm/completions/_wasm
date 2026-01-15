@@ -32,9 +32,14 @@ _wasm_apps() {
                 if [[ -d "$app" ]]; then
                     local name
                     name=$(basename "$app")
-                    # Convert wasm-example-com to example.com
+                    # Convert directory name to domain format
+                    # Legacy: wasm-example-com -> example.com
+                    # New: example-com -> example.com
                     if [[ "$name" == wasm-* ]]; then
                         apps+=("${${name#wasm-}//\-/.}")
+                    elif [[ "$name" == *-* ]]; then
+                        # New format: convert hyphens to dots
+                        apps+=("${name//\-/.}")
                     else
                         apps+=("$name")
                     fi
