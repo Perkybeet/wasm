@@ -14,14 +14,33 @@
 
 # Helper functions
 _wasm_apps() {
-    local apps_dir="/var/www/apps"
     local apps=()
-    if [[ -d "$apps_dir" ]]; then
-        for app in "$apps_dir"/*/; do
-            if [[ -d "$app" ]]; then
-                apps+=("$(basename "$app")")
-            fi
-        done 2>/dev/null
+
+    # Try to get domains from SQLite store (fast and accurate)
+    local db_path="/var/lib/wasm/wasm.db"
+    if [[ ! -f "$db_path" ]]; then
+        db_path="$HOME/.local/share/wasm/wasm.db"
+    fi
+
+    if [[ -f "$db_path" ]] && command -v sqlite3 &>/dev/null; then
+        apps=(${(f)"$(sqlite3 "$db_path" "SELECT domain FROM apps" 2>/dev/null)"})
+    else
+        # Fallback: list app directories and convert names to domains
+        local apps_dir="/var/www/apps"
+        if [[ -d "$apps_dir" ]]; then
+            for app in "$apps_dir"/*/; do
+                if [[ -d "$app" ]]; then
+                    local name
+                    name=$(basename "$app")
+                    # Convert wasm-example-com to example.com
+                    if [[ "$name" == wasm-* ]]; then
+                        apps+=("${${name#wasm-}//\-/.}")
+                    else
+                        apps+=("$name")
+                    fi
+                fi
+            done 2>/dev/null
+        fi
     fi
     _describe -t apps 'deployed applications' apps
 }

@@ -14,11 +14,29 @@ complete -c wasm -f
 
 # Helper functions
 function __wasm_get_apps
+    # Try to get domains from SQLite store (fast and accurate)
+    set -l db_path "/var/lib/wasm/wasm.db"
+    if not test -f "$db_path"
+        set db_path "$HOME/.local/share/wasm/wasm.db"
+    end
+
+    if test -f "$db_path"; and command -v sqlite3 >/dev/null
+        sqlite3 "$db_path" "SELECT domain FROM apps" 2>/dev/null
+        return
+    end
+
+    # Fallback: list app directories and convert names to domains
     set -l apps_dir "/var/www/apps"
     if test -d "$apps_dir"
         for app in $apps_dir/*/
             if test -d "$app"
-                basename "$app"
+                set -l name (basename "$app")
+                # Convert wasm-example-com to example.com
+                if string match -q 'wasm-*' "$name"
+                    string replace 'wasm-' '' "$name" | string replace -a '-' '.'
+                else
+                    echo "$name"
+                end
             end
         end 2>/dev/null
     end
