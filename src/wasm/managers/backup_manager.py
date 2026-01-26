@@ -743,7 +743,7 @@ class BackupManager:
         Args:
             app_name: Application name.
         """
-        backups = self.list_backups(domain=app_name.replace("-", ".").replace("wasm-", ""))
+        backups = self.list_backups(domain=app_name.replace("wasm-", "").replace("-", "."))
         
         if len(backups) > self.max_backups:
             # Delete oldest backups

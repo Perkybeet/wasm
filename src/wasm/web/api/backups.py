@@ -271,19 +271,11 @@ async def restore_backup(
         
         # Determine target domain
         target_domain = data.target_domain or backup.domain
-        
-        # Find or create target path
-        from wasm.core.config import Config
-        from wasm.core.utils import domain_to_app_name
-        
-        config = Config()
-        app_name = domain_to_app_name(target_domain)
-        target_path = config.apps_dir / app_name
-        
+
         # Perform restore
         success = manager.restore(
             backup_id=backup_id,
-            target_path=target_path
+            target_domain=target_domain
         )
         
         if success:
