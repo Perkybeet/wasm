@@ -46,6 +46,9 @@ class BackupMetadata:
     description: str
     includes_env: bool
     includes_node_modules: bool
+    includes_build: bool = False
+    includes_databases: bool = False
+    database_backups: List[Dict[str, Any]] = field(default_factory=list)
     git_commit: Optional[str] = None
     git_branch: Optional[str] = None
     checksum: Optional[str] = None
@@ -64,6 +67,9 @@ class BackupMetadata:
             "description": self.description,
             "includes_env": self.includes_env,
             "includes_node_modules": self.includes_node_modules,
+            "includes_build": self.includes_build,
+            "includes_databases": self.includes_databases,
+            "database_backups": self.database_backups,
             "git_commit": self.git_commit,
             "git_branch": self.git_branch,
             "checksum": self.checksum,
@@ -84,6 +90,9 @@ class BackupMetadata:
             description=data.get("description", ""),
             includes_env=data.get("includes_env", False),
             includes_node_modules=data.get("includes_node_modules", False),
+            includes_build=data.get("includes_build", False),
+            includes_databases=data.get("includes_databases", False),
+            database_backups=data.get("database_backups", []),
             git_commit=data.get("git_commit"),
             git_branch=data.get("git_branch"),
             checksum=data.get("checksum"),
@@ -269,24 +278,26 @@ class BackupManager:
         include_env: bool = True,
         include_node_modules: bool = False,
         include_build: bool = False,
+        include_databases: bool = False,
         tags: Optional[List[str]] = None,
         pre_backup_hook: Optional[str] = None,
     ) -> BackupMetadata:
         """
         Create a backup of an application.
-        
+
         Args:
             domain: Domain name of the application.
             description: Optional description for the backup.
             include_env: Include .env files in backup.
             include_node_modules: Include node_modules (large!).
             include_build: Include build artifacts.
+            include_databases: Include associated database dumps.
             tags: Optional tags for the backup.
             pre_backup_hook: Optional command to run before backup.
-            
+
         Returns:
             BackupMetadata for the created backup.
-            
+
         Raises:
             BackupError: If backup fails.
         """
@@ -378,6 +389,11 @@ class BackupManager:
         result = run_command_sudo(["sha256sum", str(backup_file)])
         checksum = result.stdout.split()[0] if result.success else None
         
+        # Backup associated databases if requested
+        database_backups = []
+        if include_databases:
+            database_backups = self._backup_databases(domain)
+
         # Create metadata
         metadata = BackupMetadata(
             id=backup_id,
@@ -390,6 +406,9 @@ class BackupManager:
             description=description,
             includes_env=include_env,
             includes_node_modules=include_node_modules,
+            includes_build=include_build,
+            includes_databases=include_databases,
+            database_backups=database_backups,
             git_commit=git_commit,
             git_branch=git_branch,
             checksum=checksum,
@@ -415,29 +434,33 @@ class BackupManager:
     def list_backups(
         self,
         domain: Optional[str] = None,
+        app_name: Optional[str] = None,
         tags: Optional[List[str]] = None,
         limit: Optional[int] = None,
     ) -> List[BackupMetadata]:
         """
         List backups for an application or all applications.
-        
+
         Args:
             domain: Filter by domain (None for all).
+            app_name: Filter by app name directly (alternative to domain).
             tags: Filter by tags.
             limit: Maximum number of backups to return.
-            
+
         Returns:
             List of BackupMetadata objects.
         """
         backups = []
-        
+
         if not self.backup_dir.exists():
             return backups
-        
+
         # Determine which directories to scan
-        if domain:
-            app_name = domain_to_app_name(domain)
+        if app_name:
             dirs_to_scan = [self._get_app_backup_dir(app_name)]
+        elif domain:
+            resolved_app_name = domain_to_app_name(domain)
+            dirs_to_scan = [self._get_app_backup_dir(resolved_app_name)]
         else:
             dirs_to_scan = [d for d in self.backup_dir.iterdir() if d.is_dir()]
         
@@ -739,11 +762,11 @@ class BackupManager:
     def _rotate_backups(self, app_name: str) -> None:
         """
         Rotate old backups to keep only the most recent ones.
-        
+
         Args:
             app_name: Application name.
         """
-        backups = self.list_backups(domain=app_name.replace("wasm-", "").replace("-", "."))
+        backups = self.list_backups(app_name=app_name)
         
         if len(backups) > self.max_backups:
             # Delete oldest backups
@@ -753,7 +776,78 @@ class BackupManager:
                     self.logger.debug(f"Rotated old backup: {backup.id}")
                 except Exception as e:
                     self.logger.warning(f"Failed to rotate backup {backup.id}: {e}")
-    
+
+    def _backup_databases(self, domain: str) -> List[Dict[str, Any]]:
+        """
+        Backup databases associated with an application.
+
+        Args:
+            domain: Domain name of the application.
+
+        Returns:
+            List of database backup info dictionaries.
+        """
+        database_backups = []
+
+        try:
+            from wasm.core.store import WASMStore
+            from wasm.managers.database.registry import DatabaseRegistry
+        except ImportError as e:
+            self.logger.warning(f"Database backup not available: {e}")
+            return database_backups
+
+        try:
+            store = WASMStore()
+            app = store.get_app_by_domain(domain)
+
+            if not app or not app.id:
+                self.logger.debug(f"No app found in store for {domain}")
+                return database_backups
+
+            databases = store.list_databases(app_id=app.id)
+
+            if not databases:
+                self.logger.debug(f"No databases associated with {domain}")
+                return database_backups
+
+            self.logger.info(f"Backing up {len(databases)} database(s) for {domain}")
+
+            for db in databases:
+                try:
+                    manager = DatabaseRegistry.get(db.engine, verbose=self.verbose)
+
+                    if not manager:
+                        self.logger.warning(f"No manager available for {db.engine}")
+                        continue
+
+                    if not manager.is_installed():
+                        self.logger.warning(
+                            f"{db.engine} not installed, skipping {db.name}"
+                        )
+                        continue
+
+                    backup_info = manager.backup(database=db.name, compress=True)
+
+                    database_backups.append({
+                        "engine": db.engine,
+                        "name": db.name,
+                        "backup_path": str(backup_info.path),
+                        "size_bytes": backup_info.size,
+                        "created": backup_info.created.isoformat(),
+                    })
+
+                    self.logger.info(f"  Backed up {db.engine} database: {db.name}")
+
+                except Exception as e:
+                    self.logger.warning(
+                        f"  Failed to backup {db.engine} '{db.name}': {e}"
+                    )
+
+        except Exception as e:
+            self.logger.warning(f"Database backup failed: {e}")
+
+        return database_backups
+
     def verify(self, backup_id: str) -> Dict[str, Any]:
         """
         Verify a backup's integrity.
@@ -795,7 +889,7 @@ class BackupManager:
                     results["valid"] = False
                     results["errors"].append("Checksum mismatch")
                 else:
-                    results["checksum_verified"] = True
+                    results["checksum_ok"] = True
             else:
                 results["warnings"].append("Could not verify checksum")
         else:
@@ -807,7 +901,7 @@ class BackupManager:
             results["valid"] = False
             results["errors"].append("Archive is corrupted")
         else:
-            results["archive_valid"] = True
+            results["files_ok"] = True
             results["file_count"] = len(result.stdout.strip().split("\n"))
         
         return results

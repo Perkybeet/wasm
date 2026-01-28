@@ -909,6 +909,11 @@ def _add_backup_parser(subparsers) -> None:
         help="Include build artifacts (.next, dist, build)",
     )
     create.add_argument(
+        "--include-databases", "--include-db",
+        action="store_true",
+        help="Include associated database dumps in backup",
+    )
+    create.add_argument(
         "--tags", "-t",
         help="Comma-separated tags for the backup",
     )

@@ -105,6 +105,7 @@ def _backup_create(args: Namespace, verbose: bool) -> int:
     include_env = not getattr(args, "no_env", False)
     include_node_modules = getattr(args, "include_node_modules", False)
     include_build = getattr(args, "include_build", False)
+    include_databases = getattr(args, "include_databases", False)
     tags = getattr(args, "tags", None)
     
     if not domain:
@@ -127,6 +128,7 @@ def _backup_create(args: Namespace, verbose: bool) -> int:
             include_env=include_env,
             include_node_modules=include_node_modules,
             include_build=include_build,
+            include_databases=include_databases,
             tags=tag_list,
         )
         
@@ -135,7 +137,13 @@ def _backup_create(args: Namespace, verbose: bool) -> int:
         logger.info(f"  Size: {metadata.size_human}")
         if metadata.git_commit:
             logger.info(f"  Commit: {metadata.git_commit} ({metadata.git_branch})")
-        
+        if metadata.database_backups:
+            db_count = len(metadata.database_backups)
+            logger.info(f"  Databases: {db_count} backed up")
+            for db_info in metadata.database_backups:
+                size_mb = db_info.get("size_bytes", 0) / (1024 * 1024)
+                logger.info(f"    - {db_info['engine']}/{db_info['name']} ({size_mb:.1f} MB)")
+
         return 0
         
     except BackupError as e:
@@ -195,7 +203,7 @@ def _backup_list(args: Namespace, verbose: bool) -> int:
                 by_domain[backup.domain].append(backup)
             
             for dom, dom_backups in by_domain.items():
-                logger.info(f"\n📦 {dom}")
+                logger.info(f"\n[{dom}]")
                 _print_backup_table(dom_backups, logger, indent=True)
         
         return 0
@@ -226,7 +234,7 @@ def _print_backup_table(backups, logger, indent: bool = False):
             desc_str = f" - {backup.description}"
         
         logger.info(
-            f"{prefix}• {backup.id}: {backup.size_human}, "
+            f"{prefix}- {backup.id}: {backup.size_human}, "
             f"{backup.age}{commit_str}{tags_str}{desc_str}"
         )
 
@@ -359,17 +367,17 @@ def _backup_verify(args: Namespace, verbose: bool) -> int:
         
         if result["valid"]:
             logger.success("Backup is valid")
-            if result.get("checksum_verified"):
-                logger.info("  ✓ Checksum verified")
-            if result.get("archive_valid"):
-                logger.info(f"  ✓ Archive valid ({result.get('file_count', '?')} files)")
+            if result.get("checksum_ok"):
+                logger.info("  [OK] Checksum verified")
+            if result.get("files_ok"):
+                logger.info(f"  [OK] Archive valid ({result.get('file_count', '?')} files)")
         else:
             logger.error("Backup is invalid")
             for err in result["errors"]:
-                logger.error(f"  ✗ {err}")
-        
+                logger.error(f"  [ERROR] {err}")
+
         for warn in result.get("warnings", []):
-            logger.warning(f"  ⚠ {warn}")
+            logger.warning(f"  [WARN] {warn}")
         
         return 0 if result["valid"] else 1
         

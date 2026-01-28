@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.14.0
+Version:        0.14.1
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -137,6 +137,15 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
 fi
 
 %changelog
+* Tue Jan 28 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.14.1-1
+- Fix: API verify() returns correct keys (checksum_ok, files_ok)
+- Fix: BackupMetadata now persists includes_build field
+- Fix: Backup rotation uses direct app_name lookup
+- Fix: Remove non-ASCII characters from CLI output
+- Feature: Database backup integration (MySQL, PostgreSQL, MongoDB, Redis)
+- Feature: New --include-databases flag for backup create
+- Enhancement: API and CLI now expose all backup options
+
 * Wed Jan 15 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.14.0-1
 - Feature: New 'wasm health' command for system diagnostics
 - Feature: New 'wasm config' command (upgrade, show, path)

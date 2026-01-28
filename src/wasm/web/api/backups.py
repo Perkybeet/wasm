@@ -4,7 +4,7 @@ Backups API endpoints.
 Provides endpoints for managing application backups.
 """
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from pathlib import Path
 
 from fastapi import APIRouter, Request, HTTPException, Depends, Query
@@ -24,10 +24,16 @@ class BackupInfo(BaseModel):
     size: int
     size_human: str
     age: str
+    description: str = ""
     app_type: Optional[str] = None
+    includes_env: bool = False
+    includes_node_modules: bool = False
+    includes_build: bool = False
     has_database: bool = False
+    database_backups: List[Dict[str, Any]] = Field(default_factory=list)
     git_commit: Optional[str] = None
     git_branch: Optional[str] = None
+    tags: List[str] = Field(default_factory=list)
 
 
 class BackupListResponse(BaseModel):
@@ -48,8 +54,12 @@ class BackupStorageResponse(BaseModel):
 class CreateBackupRequest(BaseModel):
     """Request to create a new backup."""
     domain: str = Field(..., description="Domain of the app to backup")
-    include_database: bool = Field(default=True, description="Include database in backup")
-    compress: bool = Field(default=True, description="Compress the backup")
+    description: str = Field(default="", description="Description for the backup")
+    include_env: bool = Field(default=True, description="Include .env files")
+    include_node_modules: bool = Field(default=False, description="Include node_modules (large!)")
+    include_build: bool = Field(default=False, description="Include build artifacts")
+    include_database: bool = Field(default=False, description="Include database dumps")
+    tags: List[str] = Field(default_factory=list, description="Tags for the backup")
 
 
 class RestoreBackupRequest(BaseModel):
@@ -96,10 +106,16 @@ async def list_backups(
                 size=backup.size_bytes,
                 size_human=backup.size_human,
                 age=backup.age,
+                description=backup.description,
                 app_type=backup.app_type,
-                has_database=False,  # BackupMetadata doesn't track this
+                includes_env=backup.includes_env,
+                includes_node_modules=backup.includes_node_modules,
+                includes_build=backup.includes_build,
+                has_database=backup.includes_databases,
+                database_backups=backup.database_backups,
                 git_commit=backup.git_commit,
-                git_branch=backup.git_branch
+                git_branch=backup.git_branch,
+                tags=backup.tags
             ))
         
         return BackupListResponse(
@@ -178,10 +194,16 @@ async def get_backup(
             size=backup.size_bytes,
             size_human=backup.size_human,
             age=backup.age,
+            description=backup.description,
             app_type=backup.app_type,
-            has_database=False,  # BackupMetadata doesn't track this
+            includes_env=backup.includes_env,
+            includes_node_modules=backup.includes_node_modules,
+            includes_build=backup.includes_build,
+            has_database=backup.includes_databases,
+            database_backups=backup.database_backups,
             git_commit=backup.git_commit,
-            git_branch=backup.git_branch
+            git_branch=backup.git_branch,
+            tags=backup.tags
         )
     except HTTPException:
         raise
@@ -214,6 +236,12 @@ async def create_backup(
         
         backup_meta = manager.create(
             domain=data.domain,
+            description=data.description,
+            include_env=data.include_env,
+            include_node_modules=data.include_node_modules,
+            include_build=data.include_build,
+            include_databases=data.include_database,
+            tags=data.tags,
         )
         
         return BackupActionResponse(
