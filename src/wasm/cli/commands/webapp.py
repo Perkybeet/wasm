@@ -202,10 +202,14 @@ def _handle_create(args: Namespace) -> int:
     logger.key_value("Package Manager", package_manager)
     logger.key_value("SSL", "Yes" if not args.no_ssl else "No")
     logger.blank()
-    
+
+    # Handle monorepo deployments specially
+    if app_type == "monorepo":
+        return _handle_monorepo_create(args, domain, env_vars, logger)
+
     # Get deployer
     deployer = get_deployer(app_type, verbose=args.verbose)
-    
+
     # Configure deployer
     deployer.configure(
         domain=domain,
@@ -217,10 +221,51 @@ def _handle_create(args: Namespace) -> int:
         env_vars=env_vars,
         package_manager=package_manager,
     )
-    
+
     # Run deployment
     deployer.deploy()
-    
+
+    return 0
+
+
+def _handle_monorepo_create(args: Namespace, domain: str, env_vars: Dict, logger: Logger) -> int:
+    """Handle monorepo deployment specially."""
+    from wasm.deployers.monorepo import MonorepoDeployer
+
+    # Parse subdomain overrides
+    subdomain_overrides = {}
+    if getattr(args, "subdomains", None):
+        for mapping in args.subdomains:
+            if ":" in mapping:
+                app_name, subdomain = mapping.split(":", 1)
+                subdomain_overrides[app_name] = subdomain
+            else:
+                logger.warning(f"Invalid subdomain mapping: {mapping} (expected app:subdomain)")
+
+    # Get workspace filter
+    workspace_filter = getattr(args, "workspaces", None)
+
+    # Get skip_database flag
+    skip_database = getattr(args, "no_database", False)
+
+    # Create and configure deployer
+    deployer = MonorepoDeployer(verbose=args.verbose)
+
+    deployer.configure(
+        domain=domain,
+        source=args.source,
+        webserver=args.webserver,
+        ssl=not args.no_ssl,
+        branch=args.branch,
+        env_vars=env_vars,
+        subdomain_overrides=subdomain_overrides,
+        workspace_filter=workspace_filter,
+        skip_database=skip_database,
+    )
+
+    # Run deployment
+    deployer.deploy()
+
     return 0
 
 
@@ -457,7 +502,7 @@ def _handle_start(args: Namespace) -> int:
 def _handle_update(args: Namespace) -> int:
     """
     Handle webapp update command with zero-downtime strategy.
-    
+
     Strategy:
     1. Create pre-update backup (for rollback)
     2. Pull/fetch new code
@@ -468,11 +513,24 @@ def _handle_update(args: Namespace) -> int:
     """
     logger = Logger(verbose=args.verbose)
     config = Config()
-    
+
+    from wasm.core.store import get_store
+    store = get_store()
+
     domain = validate_domain(args.domain)
-    app_name = domain_to_app_name(domain)
-    app_path = config.apps_directory / app_name
-    
+
+    # Consultar BD primero para obtener el app_path real
+    app = store.get_app(domain)
+
+    if app and app.app_path:
+        # Usar el path almacenado en la BD (soporta apps legacy con prefijo wasm-)
+        app_path = Path(app.app_path)
+        app_name = app_path.name
+    else:
+        # Fallback para apps no registradas en BD
+        app_name = domain_to_app_name(domain)
+        app_path = config.apps_directory / app_name
+
     if not app_path.exists():
         raise WASMError(f"Application not found: {domain}")
     

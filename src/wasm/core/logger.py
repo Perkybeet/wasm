@@ -63,6 +63,8 @@ class Icons:
     CLOCK = "⏱"
     FOLDER = "📁"
     FILE = "📄"
+    DATABASE = "🗄️"
+    SEARCH = "🔍"
 
 
 class LogLevel(Enum):

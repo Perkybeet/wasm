@@ -36,7 +36,7 @@ def create_parser() -> argparse.ArgumentParser:
 CLI tool for deploying and managing web applications on Linux servers.
 Automates: Git clone, build, systemd, Nginx/Apache, SSL (Let's Encrypt).
 
-Supported app types: nextjs, nodejs, vite, python, static
+Supported app types: nextjs, nodejs, vite, python, static, monorepo
 
 QUICK START:
   wasm setup init              Initialize directories (first time, requires sudo)
@@ -179,7 +179,7 @@ def _add_webapp_commands(subparsers) -> None:
     )
     create.add_argument(
         "--type", "-t",
-        choices=["nextjs", "nodejs", "vite", "python", "static", "auto"],
+        choices=["nextjs", "nodejs", "vite", "python", "static", "monorepo", "auto"],
         default="auto",
         help="Application type (default: auto-detect)",
     )
@@ -213,7 +213,26 @@ def _add_webapp_commands(subparsers) -> None:
         default="auto",
         help="Package manager to use (default: auto-detect)",
     )
-    
+
+    # Monorepo-specific options
+    create.add_argument(
+        "--subdomains",
+        nargs="+",
+        metavar="APP:SUBDOMAIN",
+        help="Subdomain mapping for monorepo apps (e.g., erp-backend:api web-gateway:app)",
+    )
+    create.add_argument(
+        "--workspaces",
+        nargs="+",
+        metavar="NAME",
+        help="Specific workspace apps to deploy (default: all)",
+    )
+    create.add_argument(
+        "--no-database",
+        action="store_true",
+        help="Skip database provisioning for monorepo",
+    )
+
     # list (alias: ls)
     subparsers.add_parser(
         "list",

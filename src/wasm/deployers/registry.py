@@ -136,6 +136,8 @@ def detect_app_type(path: Path, verbose: bool = False) -> Optional[str]:
 
 def _import_deployers() -> None:
     """Import all deployer modules to trigger registration."""
+    # Monorepo must be imported first for detection priority
+    from wasm.deployers import monorepo
     from wasm.deployers import nextjs
     from wasm.deployers import nodejs
     from wasm.deployers import vite

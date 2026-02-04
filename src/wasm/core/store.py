@@ -35,6 +35,7 @@ class AppType(str, Enum):
     PYTHON = "python"
     VITE = "vite"
     STATIC = "static"
+    MONOREPO = "monorepo"
     UNKNOWN = "unknown"
 
 
@@ -209,6 +210,31 @@ class DatabaseUser:
     def from_row(cls, row: sqlite3.Row) -> "DatabaseUser":
         """Create from database row."""
         return cls(**dict(row))
+
+
+@dataclass
+class MonorepoWorkspace:
+    """
+    Configuration for a workspace app within a monorepo.
+
+    Used by MonorepoDeployer to track individual apps in a Turborepo/pnpm
+    workspace monorepo.
+    """
+    name: str = ""
+    path: str = ""
+    app_type: str = AppType.UNKNOWN.value
+    subdomain: str = ""
+    port: int = 3000
+    start_command: Optional[str] = None
+    health_check: str = "/"
+    env_vars: Dict[str, str] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        d = asdict(self)
+        if isinstance(d.get('env_vars'), dict):
+            d['env_vars'] = json.dumps(d['env_vars'])
+        return d
 
 
 # Schema version for migrations
