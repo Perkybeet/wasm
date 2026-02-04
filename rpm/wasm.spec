@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.14.1
+Version:        0.14.2
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -137,6 +137,12 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
 fi
 
 %changelog
+* Tue Feb 04 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.14.2-1
+- Feature: Add MonorepoDeployer for Turborepo/pnpm workspace deployments
+- Feature: New CLI options --subdomains, --workspaces, --no-database
+- Fix: Update command now queries database for app_path (supports legacy apps)
+- Add workspace and turbo helpers for monorepo detection
+
 * Tue Jan 28 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.14.1-1
 - Fix: API verify() returns correct keys (checksum_ok, files_ok)
 - Fix: BackupMetadata now persists includes_build field
