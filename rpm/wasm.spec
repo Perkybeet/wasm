@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.14.3
+Version:        0.14.4
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -137,6 +137,10 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
 fi
 
 %changelog
+* Thu Feb 06 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.14.4-1
+- Fix: service_exists() not finding legacy wasm- prefixed services
+- Fix: Update command fails to restart legacy services
+
 * Thu Feb 06 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.14.3-1
 - Fix: Monorepo detection too aggressive (single Next.js apps misdetected)
 - Fix: Update command crashes with MonorepoDeployer (missing pre_install)

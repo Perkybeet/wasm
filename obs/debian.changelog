@@ -1,3 +1,11 @@
+wasm (0.14.4-1) unstable; urgency=medium
+
+  * Fix: service_exists() not finding legacy wasm- prefixed services
+  * Fix: Update command fails to restart legacy services
+  * Fix: get_service_config() not reading legacy service files
+
+ -- Yago Lopez Prado <yago.lopez.adeje@gmail.com>  Thu, 06 Feb 2026 15:00:00 +0000
+
 wasm (0.14.3-1) unstable; urgency=medium
 
   * Fix: Monorepo detection too aggressive (single Next.js apps misdetected)

@@ -140,15 +140,15 @@ class ServiceManager(BaseManager):
     
     def service_exists(self, name: str) -> bool:
         """
-        Check if a service exists.
-        
+        Check if a service exists (new or legacy format).
+
         Args:
             name: Service name.
-            
+
         Returns:
             True if service exists.
         """
-        service_file = self._get_service_file(name)
+        service_file = self._resolve_service_file(name)
         return service_file.exists()
     
     def list_services(self, all_services: bool = False) -> List[Dict]:
@@ -507,12 +507,12 @@ class ServiceManager(BaseManager):
     def get_service_config(self, name: str) -> Optional[str]:
         """
         Get service configuration content.
-        
+
         Args:
             name: Service name.
-            
+
         Returns:
             Service file content or None.
         """
-        service_file = self._get_service_file(name)
+        service_file = self._resolve_service_file(name)
         return read_file(service_file, sudo=True)
