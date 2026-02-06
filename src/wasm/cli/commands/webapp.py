@@ -594,22 +594,28 @@ def _handle_update(args: Namespace) -> int:
     else:
         logger.substep(f"Detected: {app_type}")
     
+    # Handle monorepo updates with dedicated flow
+    if app_type == "monorepo":
+        return _handle_monorepo_update(
+            args, app_path, app_name, domain, logger, total_steps
+        )
+
     deployer = get_deployer(app_type, verbose=args.verbose)
     deployer.app_path = app_path
     deployer.app_name = app_name
     deployer.domain = domain
     deployer._package_manager = package_manager
-    
+
     # Run pre_install to detect package manager and prisma
     deployer.pre_install()
     logger.substep(f"Package manager: {deployer.package_manager}")
     if deployer.has_prisma:
         logger.substep("Prisma detected")
-    
+
     # Step 4: Install dependencies (without stopping the app)
     logger.step(4, total_steps, "Installing dependencies")
     deployer.install_dependencies()
-    
+
     # Step 5: Generate Prisma and run migrations if needed
     if deployer.has_prisma:
         logger.step(5, total_steps, "Updating Prisma")
@@ -617,11 +623,11 @@ def _handle_update(args: Namespace) -> int:
         deployer.run_prisma_migrate(deploy=True)
     else:
         logger.step(5, total_steps, "Prisma not detected, skipping")
-    
+
     # Step 6: Build application (without stopping the app)
     logger.step(6, total_steps, "Building application")
     deployer.build()
-    
+
     # Step 7: Restart service (only if not static)
     logger.step(7, total_steps, "Restarting application")
     service_manager = ServiceManager(verbose=args.verbose)
@@ -660,7 +666,71 @@ def _handle_update(args: Namespace) -> int:
             else:
                 logger.warning("Application restarted but may not be running correctly")
                 logger.info(f"Check logs with: wasm logs {domain}")
-    
+
+    return 0
+
+
+def _handle_monorepo_update(args, app_path, app_name, domain, logger, total_steps):
+    """Handle update for monorepo applications."""
+    from wasm.deployers.monorepo import MonorepoDeployer
+
+    deployer = MonorepoDeployer(verbose=args.verbose)
+    deployer.app_path = app_path
+    deployer.app_name = app_name
+    deployer.domain = domain
+    deployer.package_manager = "pnpm"
+
+    # Step 4: Install dependencies
+    logger.step(4, total_steps, "Installing dependencies")
+    deployer._install_dependencies()
+
+    # Step 5: Run Prisma migrations
+    logger.step(5, total_steps, "Running database migrations")
+    deployer._run_prisma_migrations()
+
+    # Step 6: Build all workspaces
+    logger.step(6, total_steps, "Building applications")
+    deployer._set_permissions()
+    deployer._build_all()
+
+    # Step 7: Restart all workspace services
+    logger.step(7, total_steps, "Restarting applications")
+    service_manager = ServiceManager(verbose=args.verbose)
+
+    # Find all services for this monorepo
+    from wasm.core.store import get_store
+    store = get_store()
+    app = store.get_app(domain)
+
+    restarted = []
+    if app:
+        all_services = store.list_services()
+        services = [s for s in all_services if s.app_id == app.id]
+        for service in services:
+            logger.substep(f"Restarting {service.name}")
+            try:
+                service_manager.restart(service.name)
+                restarted.append(service.name)
+            except Exception as e:
+                logger.warning(f"Failed to restart {service.name}: {e}")
+    else:
+        # Fallback: restart by app_name pattern
+        status = service_manager.get_status(app_name)
+        if status.get("exists"):
+            service_manager.restart(app_name)
+            restarted.append(app_name)
+
+    if restarted:
+        import time
+        time.sleep(3)
+        logger.success(f"Monorepo updated successfully: {domain}")
+        logger.blank()
+        for name in restarted:
+            logger.key_value("Restarted", name)
+    else:
+        logger.warning("No services found to restart")
+        logger.info(f"Try redeploying: wasm create -d {domain}")
+
     return 0
 
 

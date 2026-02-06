@@ -187,32 +187,46 @@ class MonorepoDeployer:
         """
         Detect if path contains a Turborepo/pnpm monorepo.
 
+        Requires turbo.json AND workspace configuration AND at least 2
+        deployable applications in apps/ to distinguish from single apps
+        that use Turborepo for build caching.
+
         Args:
             path: Path to check.
 
         Returns:
             True if this deployer can handle the project.
         """
-        # Check for turbo.json
-        if (path / "turbo.json").exists():
-            return True
+        # Must have turbo.json (primary monorepo build tool)
+        if not (path / "turbo.json").exists():
+            return False
 
-        # Check for pnpm-workspace.yaml
-        if (path / "pnpm-workspace.yaml").exists():
-            return True
+        # Must have workspace configuration
+        has_workspace_config = (path / "pnpm-workspace.yaml").exists()
+        if not has_workspace_config:
+            package_json = path / "package.json"
+            if package_json.exists():
+                try:
+                    with open(package_json) as f:
+                        pkg = json.load(f)
+                        has_workspace_config = "workspaces" in pkg
+                except (json.JSONDecodeError, OSError):
+                    pass
 
-        # Check package.json for workspaces field
-        package_json = path / "package.json"
-        if package_json.exists():
-            try:
-                with open(package_json) as f:
-                    pkg = json.load(f)
-                    if "workspaces" in pkg:
-                        return True
-            except (json.JSONDecodeError, OSError):
-                pass
+        if not has_workspace_config:
+            return False
 
-        return False
+        # Must have multiple deployable apps in apps/ directory
+        apps_dir = path / "apps"
+        if not apps_dir.is_dir():
+            return False
+
+        app_count = sum(
+            1 for d in apps_dir.iterdir()
+            if d.is_dir() and (d / "package.json").exists()
+        )
+
+        return app_count >= 2
 
     def _run(
         self,

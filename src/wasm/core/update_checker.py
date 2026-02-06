@@ -45,7 +45,10 @@ class UpdateChecker:
             if cls._is_cache_valid():
                 cached_data = cls._read_cache()
                 if cached_data and cached_data.get("has_update"):
-                    cls._update_version = cached_data["latest_version"]
+                    cached_version = cached_data["latest_version"]
+                    # Re-verify against current version (user may have updated)
+                    if cls._is_newer_version(cached_version, __version__):
+                        cls._update_version = cached_version
                 return
 
             # Start background thread for network request
@@ -270,28 +273,17 @@ class UpdateChecker:
             if pipx_path.exists():
                 return "pipx"
 
-            # Check if installed with pip in current Python environment
-            result = subprocess.run(
-                [sys.executable, "-m", "pip", "show", "wasm-cli"],
-                capture_output=True,
-                text=True,
-                timeout=2
-            )
-            if result.returncode == 0:
-                # Check if installed in editable mode (from source)
-                if "Editable project location:" in result.stdout or "-e " in result.stdout:
-                    return "source"
-                return "pip"
+            # Check system package managers BEFORE pip, since system packages
+            # install Python files that pip can also detect (false positive)
 
-            # Check system package managers
             # APT (Ubuntu, Debian) - package is called "wasm" not "wasm-cli"
             if Path("/var/lib/dpkg/status").exists():
                 result = subprocess.run(
-                    ["dpkg", "-l", "wasm"],
+                    ["dpkg", "-s", "wasm"],
                     capture_output=True,
                     timeout=2
                 )
-                if result.returncode == 0 and b"wasm" in result.stdout:
+                if result.returncode == 0:
                     return "apt"
 
             # DNF/YUM (Fedora, RHEL, CentOS)
@@ -318,6 +310,19 @@ class UpdateChecker:
                     return "zypper"
             except FileNotFoundError:
                 pass
+
+            # Check pip (after system package managers)
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "show", "wasm-cli"],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            if result.returncode == 0:
+                # Check if installed in editable mode (from source)
+                if "Editable project location:" in result.stdout or "-e " in result.stdout:
+                    return "source"
+                return "pip"
 
         except Exception as e:
             logger.debug(f"Failed to detect installation method: {e}")

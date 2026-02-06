@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.14.2
+Version:        0.14.3
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -137,6 +137,13 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
 fi
 
 %changelog
+* Thu Feb 06 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.14.3-1
+- Fix: Monorepo detection too aggressive (single Next.js apps misdetected)
+- Fix: Update command crashes with MonorepoDeployer (missing pre_install)
+- Fix: Update checker shows false positive when already on latest version
+- Fix: Update checker recommends pip when installed via apt/dnf
+- Fix: Release workflow supports manual re-trigger via workflow_dispatch
+
 * Tue Feb 04 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.14.2-1
 - Feature: Add MonorepoDeployer for Turborepo/pnpm workspace deployments
 - Feature: New CLI options --subdomains, --workspaces, --no-database
