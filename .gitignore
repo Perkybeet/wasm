@@ -29,6 +29,7 @@ MANIFEST
 # PyInstaller
 *.manifest
 *.spec
+!rpm/*.spec
 
 # Installer logs
 pip-log.txt
@@ -114,3 +115,9 @@ debian/*.log
 
 # Local development scripts
 install-local.sh
+
+# Claude Code
+.claude/
+
+# Ruff linter cache
+.ruff_cache/

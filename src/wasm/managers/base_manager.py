@@ -57,10 +57,8 @@ class BaseManager(ABC):
         """
         self.logger.debug(f"Running: {' '.join(command)}")
         result = run_command(command, cwd=cwd, env=env, timeout=timeout)
-        
-        if not result.success:
-            self.logger.debug(f"Command failed: {result.stderr}")
-        
+        self.logger.command_output(result.stdout, result.stderr)
+
         return result
     
     def _run_sudo(
@@ -84,10 +82,8 @@ class BaseManager(ABC):
         """
         self.logger.debug(f"Running (sudo): {' '.join(command)}")
         result = run_command_sudo(command, cwd=cwd, env=env, timeout=timeout)
-        
-        if not result.success:
-            self.logger.debug(f"Command failed: {result.stderr}")
-        
+        self.logger.command_output(result.stdout, result.stderr)
+
         return result
     
     @abstractmethod

@@ -187,16 +187,34 @@ class Logger:
     def debug(self, message: str) -> None:
         """
         Log a debug message (only shown in verbose mode).
-        
+
         Args:
             message: Debug message.
         """
         if not self.verbose:
             return
-        
+
         prefix = self._colorize("[DEBUG]", Colors.GRAY)
         msg = self._colorize(message, Colors.GRAY)
         self._write(f"      {prefix} {msg}")
+
+    def command_output(self, stdout: str, stderr: str) -> None:
+        """
+        Log command stdout/stderr (only shown in verbose mode).
+
+        Args:
+            stdout: Command standard output.
+            stderr: Command standard error output.
+        """
+        if not self.verbose:
+            return
+
+        for stream in (stdout, stderr):
+            if not stream or not stream.strip():
+                continue
+            for line in stream.rstrip("\n").split("\n"):
+                text = self._colorize(f"        {line}", Colors.GRAY)
+                self._write(text)
     
     def info(self, message: str) -> None:
         """

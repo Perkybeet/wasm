@@ -9,7 +9,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="wasm-cli",
-    version="0.15.0",
+    version="0.15.1",
     description="Web App System Management - Deploy and manage web applications on Linux servers",
     author="Yago López Prado",
     author_email="yago.lopez.adeje@gmail.com",
@@ -24,10 +24,33 @@ setup(
     ],
     extras_require={
         "interactive": ["inquirer>=3.1.0"],
+        "web": [
+            "fastapi>=0.109.0",
+            "uvicorn[standard]>=0.27.0",
+            "python-jose[cryptography]>=3.3.0",
+            "passlib[bcrypt]>=1.7.4",
+            "psutil>=5.9.0",
+            "aiofiles>=23.0.0",
+        ],
+        "monitor": [
+            "psutil>=5.9.0",
+            "httpx>=0.25.0",
+        ],
+        "all": [
+            "inquirer>=3.1.0",
+            "rich>=13.0",
+            "psutil>=5.9.0",
+            "httpx>=0.25.0",
+            "fastapi>=0.109.0",
+            "uvicorn[standard]>=0.27.0",
+            "python-jose[cryptography]>=3.3.0",
+            "passlib[bcrypt]>=1.7.4",
+            "aiofiles>=23.0.0",
+        ],
     },
     entry_points={
         "console_scripts": [
-            "wasm=wasm.main:main",
+            "wasm=wasm.main:cli",
         ],
     },
     data_files=[

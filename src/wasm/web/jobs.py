@@ -17,6 +17,13 @@ from enum import Enum
 from typing import Dict, List, Optional, Callable, Any
 from pathlib import Path
 
+from wasm.core.exceptions import (
+    BackupError,
+    CertificateError,
+    DeploymentError,
+    RollbackError,
+)
+
 
 class JobStatus(str, Enum):
     """Job execution status."""
@@ -477,12 +484,12 @@ def deploy_app_job(
         
         if job_context.is_cancelled:
             process.terminate()
-            raise Exception("Job cancelled by user")
-    
+            raise DeploymentError("Job cancelled by user")
+
     process.wait()
-    
+
     if process.returncode != 0:
-        raise Exception(f"Deployment failed with exit code {process.returncode}")
+        raise DeploymentError(f"Deployment failed with exit code {process.returncode}")
     
     job_context.update("Deployment complete", 100)
     
@@ -523,10 +530,10 @@ def update_app_job(
     process.wait()
     
     if process.returncode != 0:
-        raise Exception(f"Update failed with exit code {process.returncode}")
-    
+        raise DeploymentError(f"Update failed with exit code {process.returncode}")
+
     job_context.update("Update complete", 100)
-    
+
     return {"domain": domain, "status": "updated"}
 
 
@@ -566,10 +573,10 @@ def delete_app_job(
     process.wait()
     
     if process.returncode != 0:
-        raise Exception(f"Deletion failed with exit code {process.returncode}")
-    
+        raise DeploymentError(f"Deletion failed with exit code {process.returncode}")
+
     job_context.update("Deletion complete", 100)
-    
+
     return {"domain": domain, "status": "deleted"}
 
 
@@ -605,10 +612,10 @@ def backup_app_job(
     process.wait()
     
     if process.returncode != 0:
-        raise Exception(f"Backup failed with exit code {process.returncode}")
-    
+        raise BackupError(f"Backup failed with exit code {process.returncode}")
+
     job_context.update("Backup complete", 100)
-    
+
     return {"domain": domain, "status": "backup_created", "path": backup_path}
 
 
@@ -644,10 +651,10 @@ def rollback_app_job(
     process.wait()
     
     if process.returncode != 0:
-        raise Exception(f"Rollback failed with exit code {process.returncode}")
-    
+        raise RollbackError(f"Rollback failed with exit code {process.returncode}")
+
     job_context.update("Rollback complete", 100)
-    
+
     return {"domain": domain, "status": "rolled_back"}
 
 
@@ -683,8 +690,8 @@ def cert_create_job(
     process.wait()
     
     if process.returncode != 0:
-        raise Exception(f"Certificate creation failed with exit code {process.returncode}")
-    
+        raise CertificateError(f"Certificate creation failed with exit code {process.returncode}")
+
     job_context.update("Certificate created", 100)
-    
+
     return {"domain": domain, "status": "certificate_created"}

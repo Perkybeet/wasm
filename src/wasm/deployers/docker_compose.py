@@ -105,6 +105,27 @@ class DockerComposeDeployer:
         self.services: List[DockerComposeService] = []
         self.compose_path = None
 
+    # Framework config files that indicate docker-compose.yml is likely
+    # just for local development (databases, caches, etc.)
+    FRAMEWORK_CONFIG_FILES = [
+        # Next.js
+        "next.config.js", "next.config.mjs", "next.config.ts",
+        # Vite
+        "vite.config.js", "vite.config.ts", "vite.config.mjs",
+        # Angular
+        "angular.json",
+        # Nuxt
+        "nuxt.config.js", "nuxt.config.ts",
+        # Svelte
+        "svelte.config.js",
+        # Astro
+        "astro.config.mjs", "astro.config.ts",
+        # Remix
+        "remix.config.js", "remix.config.ts",
+        # Django
+        "manage.py",
+    ]
+
     @classmethod
     def detect(cls, path: Path) -> bool:
         """
@@ -113,7 +134,8 @@ class DockerComposeDeployer:
         Detection priority:
         - If docker-compose.prod.yml exists -> True (strong signal)
         - If only docker-compose.yml exists AND monorepo signals -> False
-        - If only docker-compose.yml exists without monorepo -> True
+        - If only docker-compose.yml exists AND framework config files -> False
+        - If only docker-compose.yml exists without other signals -> True
 
         Args:
             path: Path to check.
@@ -145,6 +167,14 @@ class DockerComposeDeployer:
                 app_count = sum(1 for d in apps_dir.iterdir() if d.is_dir())
                 if app_count >= 2:
                     return False
+
+        # Check for framework config files - if present, docker-compose.yml
+        # is likely just for local development (databases, caches, etc.)
+        has_framework = any(
+            (path / f).exists() for f in cls.FRAMEWORK_CONFIG_FILES
+        )
+        if has_framework:
+            return False
 
         return True
 

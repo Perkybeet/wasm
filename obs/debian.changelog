@@ -1,3 +1,17 @@
+wasm (0.15.1-1) unstable; urgency=medium
+
+  * Fix: Python deployer compatibility with Python 3.10 (os.walk instead of Path.walk)
+  * Fix: Django WSGI/ASGI detection break placement
+  * Fix: Docker Compose false-positive detection when framework config files present
+  * Enhancement: Update command uses stored app type from database
+  * Enhancement: Verbose command output logging via Logger.command_output()
+  * Enhancement: Web jobs use specific WASM exceptions instead of bare Exception
+  * Enhancement: Web server uses logging module instead of print()
+  * Enhancement: setup.py adds web/monitor/all extras and fixes entry point
+  * Enhancement: .gitignore updated for rpm/*.spec, .claude/, .ruff_cache/
+
+ -- Yago Lopez Prado <yago.lopez.adeje@gmail.com>  Mon, 09 Mar 2026 12:00:00 +0000
+
 wasm (0.15.0-1) unstable; urgency=medium
 
   * Feature: Add Docker Compose deployer with full deployment lifecycle

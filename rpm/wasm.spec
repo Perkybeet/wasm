@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.15.0
+Version:        0.15.1
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -137,6 +137,17 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
 fi
 
 %changelog
+* Mon Mar 09 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.15.1-1
+- Fix: Python deployer compatibility with Python 3.10 (os.walk instead of Path.walk)
+- Fix: Django WSGI/ASGI detection break placement
+- Fix: Docker Compose false-positive detection when framework config files present
+- Enhancement: Update command uses stored app type from database
+- Enhancement: Verbose command output logging via Logger.command_output()
+- Enhancement: Web jobs use specific WASM exceptions instead of bare Exception
+- Enhancement: Web server uses logging module instead of print()
+- Enhancement: setup.py adds web/monitor/all extras and fixes entry point
+- Enhancement: .gitignore updated for rpm/*.spec, .claude/, .ruff_cache/
+
 * Mon Mar 09 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.15.0-1
 - Feature: Add Docker Compose deployer with full deployment lifecycle
 - Feature: Add environment variable manager with .env.example discovery and secret auto-generation

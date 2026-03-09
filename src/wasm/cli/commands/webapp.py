@@ -616,12 +616,19 @@ def _handle_update(args: Namespace) -> int:
     
     # Step 3: Detect app type and configure deployer
     logger.step(3, total_steps, "Detecting application type")
-    app_type = detect_app_type(app_path, verbose=args.verbose)
-    if not app_type:
-        app_type = "nodejs"
-        logger.substep(f"Using default: {app_type}")
-    else:
+
+    # Prefer stored app type from database (initial deploy already determined it correctly)
+    stored_type = app.app_type if app else None
+    if stored_type and stored_type != "unknown":
+        app_type = stored_type
         logger.substep(f"Detected: {app_type}")
+    else:
+        app_type = detect_app_type(app_path, verbose=args.verbose)
+        if not app_type:
+            app_type = "nodejs"
+            logger.substep(f"Using default: {app_type}")
+        else:
+            logger.substep(f"Detected: {app_type}")
     
     # Handle monorepo updates with dedicated flow
     if app_type == "monorepo":

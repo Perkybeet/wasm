@@ -160,18 +160,20 @@ class BaseDeployer(ABC):
     ):
         """Run a command and return result."""
         self.logger.debug(f"Running: {' '.join(command)}")
-        
+
         # Merge environment variables
         run_env = self.env_vars.copy()
         if env:
             run_env.update(env)
-        
-        return run_command(
+
+        result = run_command(
             command,
             cwd=cwd or self.app_path,
             env=run_env if run_env else None,
             timeout=timeout,
         )
+        self.logger.command_output(result.stdout, result.stderr)
+        return result
     
     def _detect_package_manager(self) -> str:
         """

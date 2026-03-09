@@ -2,6 +2,7 @@
 Python deployer for WASM.
 """
 
+import os
 from pathlib import Path
 from typing import Dict, List
 import re
@@ -80,7 +81,8 @@ class PythonDeployer(BaseDeployer):
         # Check for common patterns
         if self.framework == "django":
             # Look for wsgi.py or asgi.py
-            for root, dirs, files in (self.app_path).walk():
+            for root, dirs, files in os.walk(self.app_path):
+                root = Path(root)
                 if "wsgi.py" in files:
                     # Get module path
                     rel_path = root.relative_to(self.app_path)
@@ -90,7 +92,6 @@ class PythonDeployer(BaseDeployer):
                     rel_path = root.relative_to(self.app_path)
                     module = str(rel_path).replace("/", ".")
                     asgi_app = f"{module}.asgi:application"
-                break
         
         elif self.framework == "flask":
             # Check for app.py, main.py, or __init__.py
