@@ -121,6 +121,7 @@ class Router {
             logs: 'Logs',
             jobs: 'Jobs',
             backups: 'Backups',
+            databases: 'Databases',
             config: 'Settings'
         };
         return titles[pageName] || pageName.charAt(0).toUpperCase() + pageName.slice(1);

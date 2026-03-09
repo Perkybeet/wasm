@@ -30,7 +30,13 @@ from wasm.managers.apache_manager import ApacheManager
 from wasm.managers.service_manager import ServiceManager
 from wasm.managers.cert_manager import CertManager
 from wasm.managers.source_manager import SourceManager
-from wasm.deployers.helpers import PackageManagerHelper, PathResolver, PrismaHelper
+from wasm.deployers.helpers import (
+    PackageManagerHelper,
+    PathResolver,
+    PrismaHelper,
+    EnvManager,
+    NginxConfigBuilder,
+)
 
 
 # Type for package managers
@@ -98,6 +104,13 @@ class BaseDeployer(ABC):
         
         # Prisma support
         self.has_prisma: bool = False
+
+        # Advanced nginx config (detected from wasm.nginx.yaml)
+        self._nginx_config_builder = NginxConfigBuilder(verbose=verbose)
+        self._nginx_advanced_config = None
+
+        # Env manager
+        self._env_manager = EnvManager(verbose=verbose)
     
     def configure(
         self,
@@ -365,10 +378,15 @@ class BaseDeployer(ABC):
     def get_nginx_template(self) -> str:
         """
         Get the Nginx template name for this app type.
-        
+
+        Returns "advanced" if a wasm.nginx.yaml config was detected,
+        otherwise returns the default "proxy" template.
+
         Returns:
             Template name.
         """
+        if self._nginx_advanced_config is not None:
+            return "advanced"
         return "proxy"
     
     def get_apache_template(self) -> str:
@@ -383,10 +401,21 @@ class BaseDeployer(ABC):
     def get_template_context(self) -> Dict:
         """
         Get template context for configuration files.
-        
+
+        If an advanced nginx config is detected, returns the
+        context built by NginxConfigBuilder instead.
+
         Returns:
             Context dictionary.
         """
+        if self._nginx_advanced_config is not None:
+            return self._nginx_config_builder.build_context(
+                self._nginx_advanced_config,
+                self.domain,
+                ssl=self.ssl,
+                app_path=str(self.app_path),
+            )
+
         return {
             "domain": self.domain,
             "port": self.port,
@@ -396,6 +425,72 @@ class BaseDeployer(ABC):
             "health_check": self.get_health_check(),
         }
     
+    def _detect_nginx_config(self) -> None:
+        """
+        Detect and parse wasm.nginx.yaml if present.
+
+        Sets self._nginx_advanced_config if a valid config file is found.
+        """
+        if not self.app_path or not self.app_path.exists():
+            return
+
+        config_path = self._nginx_config_builder.detect(self.app_path)
+        if config_path:
+            self.logger.debug(f"Found advanced nginx config: {config_path}")
+            self._nginx_advanced_config = self._nginx_config_builder.parse(config_path)
+
+            errors = self._nginx_config_builder.validate(self._nginx_advanced_config)
+            if errors:
+                self.logger.warning(f"Nginx config validation errors: {', '.join(errors)}")
+                self._nginx_advanced_config = None
+
+    def _should_configure_env(self) -> bool:
+        """
+        Check if automatic env configuration should run.
+
+        Returns True if .env.example exists and no --env-file was provided.
+
+        Returns:
+            True if env configuration should be performed.
+        """
+        if not self.app_path or not self.app_path.exists():
+            return False
+
+        # Skip if user already provided env vars
+        if self.env_vars:
+            return False
+
+        # Check for .env.example
+        return (self.app_path / ".env.example").exists()
+
+    def _configure_env(self) -> None:
+        """
+        Auto-configure environment variables using EnvManager.
+
+        Discovers variables from .env.example, fills them
+        non-interactively (defaults + auto-generated secrets),
+        and writes the .env file.
+        """
+        variables = self._env_manager.discover(self.app_path)
+        if not variables:
+            return
+
+        self.logger.debug(f"Discovered {len(variables)} env variables")
+
+        # Use non-interactive mode (defaults + auto-generated secrets)
+        values = self._env_manager.prompt_non_interactive(variables)
+
+        # Merge with any existing env vars (CLI-provided take precedence)
+        for key, val in self.env_vars.items():
+            values[key] = val
+
+        # Write .env file
+        self._env_manager.write_env_files(self.app_path, values)
+        self.logger.substep("Created .env from .env.example")
+
+        # Update env_vars so they're available for systemd
+        self.env_vars.update(values)
+
     def check_dependencies(self) -> bool:
         """
         Check if system dependencies are installed.
@@ -1046,7 +1141,12 @@ class BaseDeployer(ABC):
             # Step 1: Fetch source
             self.logger.step(1, total_steps, "Fetching source code", Icons.DOWNLOAD)
             self.fetch_source()
-            
+
+            # Post-fetch: detect advanced nginx config and auto-configure env
+            self._detect_nginx_config()
+            if self._should_configure_env():
+                self._configure_env()
+
             # Step 2: Install dependencies
             self.logger.step(2, total_steps, "Installing dependencies", Icons.PACKAGE)
             self.install_dependencies()

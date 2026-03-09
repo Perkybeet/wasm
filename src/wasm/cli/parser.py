@@ -36,7 +36,7 @@ def create_parser() -> argparse.ArgumentParser:
 CLI tool for deploying and managing web applications on Linux servers.
 Automates: Git clone, build, systemd, Nginx/Apache, SSL (Let's Encrypt).
 
-Supported app types: nextjs, nodejs, vite, python, static, monorepo
+Supported app types: nextjs, nodejs, vite, python, static, monorepo, docker-compose
 
 QUICK START:
   wasm setup init              Initialize directories (first time, requires sudo)
@@ -147,6 +147,9 @@ DOCUMENTATION:
     # Config management command
     _add_config_parser(subparsers)
 
+    # Env management command
+    _add_env_parser(subparsers)
+
     return parser
 
 
@@ -179,7 +182,7 @@ def _add_webapp_commands(subparsers) -> None:
     )
     create.add_argument(
         "--type", "-t",
-        choices=["nextjs", "nodejs", "vite", "python", "static", "monorepo", "auto"],
+        choices=["nextjs", "nodejs", "vite", "python", "static", "monorepo", "docker-compose", "auto"],
         default="auto",
         help="Application type (default: auto-detect)",
     )
@@ -231,6 +234,18 @@ def _add_webapp_commands(subparsers) -> None:
         "--no-database",
         action="store_true",
         help="Skip database provisioning for monorepo",
+    )
+
+    # Docker Compose-specific options
+    create.add_argument(
+        "--compose-file",
+        help="Docker Compose file to use (default: auto-detect)",
+    )
+    create.add_argument(
+        "--compose-profiles",
+        nargs="+",
+        metavar="PROFILE",
+        help="Docker Compose profiles to activate",
     )
 
     # list (alias: ls)
@@ -936,7 +951,34 @@ def _add_backup_parser(subparsers) -> None:
         "--tags", "-t",
         help="Comma-separated tags for the backup",
     )
-    
+    create.add_argument(
+        "--include-docker-volumes",
+        action="store_true",
+        help="Include Docker volumes in backup",
+    )
+    create.add_argument(
+        "--schemas",
+        nargs="+",
+        metavar="SCHEMA",
+        help="Specific PostgreSQL schemas to backup",
+    )
+    create.add_argument(
+        "--redis-method",
+        choices=["rdb", "aof"],
+        default="rdb",
+        help="Redis backup method (default: rdb)",
+    )
+    create.add_argument(
+        "--retention-count",
+        type=int,
+        help="Maximum number of backups to keep",
+    )
+    create.add_argument(
+        "--retention-days",
+        type=int,
+        help="Maximum age of backups in days",
+    )
+
     # backup list
     list_cmd = backup_sub.add_parser(
         "list",
@@ -1044,6 +1086,62 @@ def _add_backup_parser(subparsers) -> None:
         "--json",
         action="store_true",
         help="Output in JSON format",
+    )
+
+    # backup schedule (nested subcommand)
+    schedule = backup_sub.add_parser(
+        "schedule",
+        help="Manage backup schedules",
+    )
+    schedule_sub = schedule.add_subparsers(
+        dest="schedule_action",
+        title="schedule actions",
+        metavar="<action>",
+    )
+
+    # backup schedule create
+    sched_create = schedule_sub.add_parser(
+        "create",
+        help="Create a backup schedule",
+    )
+    sched_create.add_argument(
+        "domain",
+        help="Application domain",
+    )
+    sched_create.add_argument(
+        "--schedule",
+        default="daily",
+        help="Schedule: hourly, daily, weekly, monthly, or systemd OnCalendar format (default: daily)",
+    )
+    sched_create.add_argument(
+        "--retention-count",
+        type=int,
+        default=7,
+        help="Maximum number of backups to keep (default: 7)",
+    )
+    sched_create.add_argument(
+        "--retention-days",
+        type=int,
+        default=30,
+        help="Maximum age of backups in days (default: 30)",
+    )
+
+    # backup schedule list
+    schedule_sub.add_parser(
+        "list",
+        aliases=["ls"],
+        help="List backup schedules",
+    )
+
+    # backup schedule delete
+    sched_delete = schedule_sub.add_parser(
+        "delete",
+        aliases=["remove", "rm"],
+        help="Delete a backup schedule",
+    )
+    sched_delete.add_argument(
+        "domain",
+        help="Application domain",
     )
 
 
@@ -1744,6 +1842,63 @@ def _add_config_parser(subparsers) -> None:
     config_sub.add_parser(
         "path",
         help="Show config file path",
+    )
+
+
+def _add_env_parser(subparsers) -> None:
+    """Add env subcommands."""
+    env = subparsers.add_parser(
+        "env",
+        help="Manage application environment variables",
+        description="Configure, show, and export environment variables",
+    )
+
+    env_sub = env.add_subparsers(
+        dest="action",
+        title="actions",
+        metavar="<action>",
+    )
+
+    # env configure
+    configure = env_sub.add_parser(
+        "configure",
+        aliases=["config", "setup"],
+        help="Interactively configure environment variables",
+    )
+    configure.add_argument(
+        "domain",
+        help="Application domain",
+    )
+
+    # env show
+    show = env_sub.add_parser(
+        "show",
+        aliases=["list", "ls"],
+        help="Display current environment variables",
+    )
+    show.add_argument(
+        "domain",
+        help="Application domain",
+    )
+    show.add_argument(
+        "--unmask",
+        action="store_true",
+        help="Show secret values unmasked",
+    )
+
+    # env export
+    export = env_sub.add_parser(
+        "export",
+        help="Export environment variables to file",
+    )
+    export.add_argument(
+        "domain",
+        help="Application domain",
+    )
+    export.add_argument(
+        "--output", "-o",
+        default=".env",
+        help="Output file path (default: .env)",
     )
 
 

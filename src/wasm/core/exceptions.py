@@ -252,3 +252,13 @@ class SecurityError(WASMError):
 class BackupError(WASMError):
     """Raised when backup operations fail."""
     pass
+
+
+class DockerError(WASMError):
+    """Raised when Docker operations fail."""
+    pass
+
+
+class EnvConfigError(WASMError):
+    """Raised when environment configuration fails."""
+    pass

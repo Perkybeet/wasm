@@ -21,6 +21,7 @@ from wasm.cli.commands.monitor import handle_monitor
 from wasm.cli.commands.backup import handle_backup, handle_rollback
 from wasm.cli.commands.web import handle_web
 from wasm.cli.commands.db import handle_db
+from wasm.cli.commands.env import handle_env
 from wasm.core.logger import Logger
 from wasm.core.exceptions import WASMError
 
@@ -124,6 +125,13 @@ def main() -> int:
             return 1
         return handle_db(args)
     
+    elif command == "env":
+        if not args.action:
+            print("Error: env requires an action", file=sys.stderr)
+            print("Use: wasm env --help", file=sys.stderr)
+            return 1
+        return handle_env(args)
+
     elif command == "store":
         from wasm.cli.commands.store import handle_store
         if not args.action:

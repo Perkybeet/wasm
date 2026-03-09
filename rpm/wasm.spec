@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.14.4
+Version:        0.15.0
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -137,6 +137,19 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
 fi
 
 %changelog
+* Mon Mar 09 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.15.0-1
+- Feature: Add Docker Compose deployer with full deployment lifecycle
+- Feature: Add environment variable manager with .env.example discovery and secret auto-generation
+- Feature: Add advanced Nginx configuration builder with multi-route proxying via wasm.nginx.yaml
+- Feature: Add backup scheduler with systemd timer integration
+- Feature: Add wasm env CLI command for configure, show, and export operations
+- Feature: Add wasm backup schedule CLI subcommand for create, list, and delete
+- Enhancement: Add DockerError exception type for Docker-related failures
+- Enhancement: Add DOCKER_COMPOSE app type to store and registry
+- Enhancement: Update web dashboard UI with improved styling and page components
+- Enhancement: Add create_advanced_site method to NginxManager
+- Enhancement: Improve PostgreSQL and Redis database managers
+
 * Thu Feb 06 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.14.4-1
 - Fix: service_exists() not finding legacy wasm- prefixed services
 - Fix: Update command fails to restart legacy services

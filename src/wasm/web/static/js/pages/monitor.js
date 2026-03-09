@@ -10,6 +10,7 @@ import { ws } from '../core/websocket.js';
 // Process list update interval (less frequent than metrics)
 const PROCESS_UPDATE_INTERVAL = 30000;  // 30 seconds
 let processIntervalId = null;
+let statusIntervalId = null;
 let wsConnected = false;
 
 // Store processes data for filtering
@@ -121,7 +122,7 @@ function startRealTimeUpdates() {
     }, PROCESS_UPDATE_INTERVAL);
 
     // Also poll status periodically as backup
-    setInterval(() => {
+    statusIntervalId = setInterval(() => {
         loadStatus();
     }, PROCESS_UPDATE_INTERVAL);
 }
@@ -149,6 +150,11 @@ function startPollingFallback() {
     if (wsConnected) return;  // Don't start if WS reconnected
 
     console.log('[Monitor] Falling back to HTTP polling');
+    // Clear existing interval before starting new one
+    if (processIntervalId) {
+        clearInterval(processIntervalId);
+        processIntervalId = null;
+    }
     // Use a longer interval for fallback polling
     processIntervalId = setInterval(() => {
         loadStatus();
@@ -163,6 +169,10 @@ export function stopRealTimeUpdates() {
     if (processIntervalId) {
         clearInterval(processIntervalId);
         processIntervalId = null;
+    }
+    if (statusIntervalId) {
+        clearInterval(statusIntervalId);
+        statusIntervalId = null;
     }
     // Disconnect WebSocket
     ws.close('system');
@@ -352,7 +362,7 @@ export async function loadProcesses() {
         const sortBy = sortSelect?.value || 'cpu';
         const limit = parseInt(limitSelect?.value || '100', 10);
         
-        const data = await api.getProcesses(limit, sortBy);
+        const data = await api.getMonitorProcesses(limit, sortBy);
         currentProcesses = data.processes || [];
         
         renderProcessesList();

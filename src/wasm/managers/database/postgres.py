@@ -509,7 +509,17 @@ class PostgresManager(BaseDatabaseManager):
         self._run_sudo(["mkdir", "-p", str(backup_path.parent)])
         
         format_opt = kwargs.get("format", "plain")  # plain, custom, directory, tar
-        
+
+        # Handle per-schema backup
+        schemas = kwargs.get("schemas")
+        if schemas:
+            results = []
+            for schema in schemas:
+                info = self.backup_schema(database, schema, compress=compress)
+                results.append(info)
+            # Return info for the last schema (caller should use backup_all_schemas for full results)
+            return results[-1] if results else self.backup_schema(database, schemas[0], compress=compress)
+
         if compress and format_opt == "plain":
             # Pipe through gzip
             full_cmd = f"sudo -u postgres pg_dump {database} | gzip > {backup_path}"
@@ -538,7 +548,147 @@ class PostgresManager(BaseDatabaseManager):
             created=datetime.now(),
             compressed=compress,
         )
-    
+
+    def list_schemas(self, database: str) -> List[str]:
+        """
+        List non-system schemas in a database.
+
+        Args:
+            database: Database name.
+
+        Returns:
+            List of schema names, excluding pg_* and information_schema.
+
+        Raises:
+            DatabaseNotFoundError: If database does not exist.
+        """
+        if not self.database_exists(database):
+            raise DatabaseNotFoundError(f"Database '{database}' does not exist")
+
+        sql = (
+            "SELECT schema_name FROM information_schema.schemata "
+            "WHERE schema_name NOT LIKE 'pg_%' "
+            "AND schema_name != 'information_schema' "
+            "ORDER BY schema_name;"
+        )
+        success, output = self._execute_sql(sql, database=database)
+
+        if not success:
+            return []
+
+        schemas = []
+        for line in output.strip().split("\n"):
+            line = line.strip()
+            if line:
+                schemas.append(line)
+        return schemas
+
+    def backup_schema(
+        self,
+        database: str,
+        schema: str,
+        output_path: Optional[Path] = None,
+        compress: bool = True,
+    ) -> BackupInfo:
+        """
+        Backup a single schema from a PostgreSQL database.
+
+        Args:
+            database: Database name.
+            schema: Schema name to backup.
+            output_path: Optional output path.
+            compress: Whether to compress the backup.
+
+        Returns:
+            BackupInfo for the created backup.
+
+        Raises:
+            DatabaseNotFoundError: If database does not exist.
+            DatabaseBackupError: If backup fails.
+        """
+        if not self.database_exists(database):
+            raise DatabaseNotFoundError(f"Database '{database}' does not exist")
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{self.ENGINE_NAME}-{database}-{schema}-{timestamp}.sql"
+        if compress:
+            filename += ".gz"
+
+        backup_path = output_path or (self.BACKUP_DIR / filename)
+        self._run_sudo(["mkdir", "-p", str(backup_path.parent)])
+
+        if compress:
+            full_cmd = f"sudo -u postgres pg_dump --schema={schema} {database} | gzip > {backup_path}"
+            result = self._run(["bash", "-c", full_cmd])
+        else:
+            result = self._run([
+                "sudo", "-u", "postgres", "pg_dump",
+                f"--schema={schema}", database,
+                "-f", str(backup_path),
+            ])
+
+        if not result.success:
+            raise DatabaseBackupError(
+                f"Failed to backup schema '{schema}' from '{database}'",
+                result.stderr,
+            )
+
+        stat_result = self._run(["stat", "-c", "%s", str(backup_path)])
+        size = int(stat_result.stdout.strip()) if stat_result.success else 0
+
+        self.logger.info(f"Created schema backup: {backup_path}")
+
+        return BackupInfo(
+            path=backup_path,
+            database=f"{database}/{schema}",
+            engine=self.ENGINE_NAME,
+            size=size,
+            created=datetime.now(),
+            compressed=compress,
+        )
+
+    def backup_all_schemas(
+        self,
+        database: str,
+        output_dir: Optional[Path] = None,
+        compress: bool = True,
+    ) -> List[BackupInfo]:
+        """
+        Backup all non-system schemas from a database individually.
+
+        Args:
+            database: Database name.
+            output_dir: Directory for backup files.
+            compress: Whether to compress backups.
+
+        Returns:
+            List of BackupInfo for each schema backup.
+
+        Raises:
+            DatabaseNotFoundError: If database does not exist.
+        """
+        schemas = self.list_schemas(database)
+        if not schemas:
+            self.logger.info(f"No user schemas found in {database}")
+            return []
+
+        backup_dir = output_dir or self.BACKUP_DIR
+        backups = []
+
+        for schema in schemas:
+            try:
+                backup = self.backup_schema(
+                    database=database,
+                    schema=schema,
+                    output_path=backup_dir / f"{self.ENGINE_NAME}-{database}-{schema}-{datetime.now().strftime('%Y%m%d_%H%M%S')}.sql{'gz' if compress else ''}",
+                    compress=compress,
+                )
+                backups.append(backup)
+            except DatabaseBackupError as e:
+                self.logger.warning(f"Failed to backup schema {schema}: {e}")
+
+        return backups
+
     def restore(
         self,
         database: str,

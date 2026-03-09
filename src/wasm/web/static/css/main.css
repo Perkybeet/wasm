@@ -652,7 +652,34 @@ body {
 }
 
 .light-theme .log-container {
-    background: #1e293b;
+    background: #f1f5f9;
+    color: #1e293b;
+}
+
+.light-theme .log-line {
+    color: #334155;
+}
+
+.light-theme .log-line:hover {
+    background: #e2e8f0;
+}
+
+.light-theme .modal-content {
+    background: var(--bg-primary);
+}
+
+.light-theme .form-select {
+    background: var(--bg-tertiary);
+    border-color: #cbd5e1;
+    color: var(--text-primary);
+}
+
+.light-theme table th {
+    color: var(--text-secondary);
+}
+
+.light-theme table td {
+    border-color: var(--bg-tertiary);
 }
 
 .light-theme header {

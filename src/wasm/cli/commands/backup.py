@@ -29,6 +29,8 @@ def handle_backup(args: Namespace) -> int:
         return _backup_info(args, verbose)
     elif action == "storage":
         return _backup_storage(args, verbose)
+    elif action == "schedule":
+        return _backup_schedule(args, verbose)
     else:
         logger = Logger(verbose=verbose)
         logger.error(f"Unknown backup action: {action}")
@@ -480,9 +482,120 @@ def _backup_storage(args: Namespace, verbose: bool) -> int:
                 app_str = f"{app_bytes:.1f} TB"
             
             logger.info(f"  {app_name}: {app_str} ({app_usage['count']} backups)")
-        
+
         return 0
-        
+
     except Exception as e:
         logger.error(f"Error: {e}")
+        return 1
+
+
+def _backup_schedule(args: Namespace, verbose: bool) -> int:
+    """Handle backup schedule subcommands."""
+    logger = Logger(verbose=verbose)
+    schedule_action = getattr(args, "schedule_action", None)
+
+    if not schedule_action:
+        logger.error("Schedule requires an action: create, list, or delete")
+        return 1
+
+    if schedule_action == "create":
+        return _backup_schedule_create(args, verbose)
+    elif schedule_action in ("list", "ls"):
+        return _backup_schedule_list(args, verbose)
+    elif schedule_action in ("delete", "remove", "rm"):
+        return _backup_schedule_delete(args, verbose)
+    else:
+        logger.error(f"Unknown schedule action: {schedule_action}")
+        return 1
+
+
+def _backup_schedule_create(args: Namespace, verbose: bool) -> int:
+    """Create a backup schedule."""
+    logger = Logger(verbose=verbose)
+
+    domain = getattr(args, "domain", None)
+    schedule = getattr(args, "schedule", "daily")
+    retention_count = getattr(args, "retention_count", 7)
+    retention_days = getattr(args, "retention_days", 30)
+
+    if not domain:
+        logger.error("Domain is required")
+        return 1
+
+    try:
+        from wasm.managers.backup_scheduler import BackupScheduler, BackupSchedule
+        from wasm.core.utils import domain_to_app_name
+
+        scheduler = BackupScheduler(verbose=verbose)
+        backup_schedule = BackupSchedule(
+            domain=domain,
+            app_name=domain_to_app_name(domain),
+            schedule=schedule,
+            retention_count=retention_count,
+            retention_days=retention_days,
+        )
+
+        scheduler.create_schedule(backup_schedule)
+        logger.success(f"Backup schedule created for {domain}")
+        logger.info(f"  Schedule: {backup_schedule.on_calendar}")
+        logger.info(f"  Retention: {retention_count} backups / {retention_days} days")
+        return 0
+
+    except Exception as e:
+        logger.error(f"Failed to create schedule: {e}")
+        if verbose:
+            import traceback
+            traceback.print_exc()
+        return 1
+
+
+def _backup_schedule_list(args: Namespace, verbose: bool) -> int:
+    """List backup schedules."""
+    logger = Logger(verbose=verbose)
+
+    try:
+        from wasm.managers.backup_scheduler import BackupScheduler
+
+        scheduler = BackupScheduler(verbose=verbose)
+        schedules = scheduler.list_schedules()
+
+        if not schedules:
+            logger.info("No backup schedules found")
+            return 0
+
+        logger.header("Backup Schedules")
+        for sched in schedules:
+            logger.info(
+                f"  {sched['app_name']}: "
+                f"next={sched.get('next_run', '?')} "
+                f"last={sched.get('last_run', 'never')}"
+            )
+
+        return 0
+
+    except Exception as e:
+        logger.error(f"Failed to list schedules: {e}")
+        return 1
+
+
+def _backup_schedule_delete(args: Namespace, verbose: bool) -> int:
+    """Delete a backup schedule."""
+    logger = Logger(verbose=verbose)
+
+    domain = getattr(args, "domain", None)
+    if not domain:
+        logger.error("Domain is required")
+        return 1
+
+    try:
+        from wasm.managers.backup_scheduler import BackupScheduler
+
+        scheduler = BackupScheduler(verbose=verbose)
+        scheduler.remove_schedule(domain)
+        logger.success(f"Backup schedule removed for {domain}")
+        return 0
+
+    except Exception as e:
+        logger.error(f"Failed to remove schedule: {e}")
         return 1

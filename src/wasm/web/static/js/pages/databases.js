@@ -7,7 +7,7 @@
  */
 
 import { api } from '../core/api.js';
-import { showToast, showModal, hideModal, setLoading, setEmpty, setError, confirm } from '../core/ui.js';
+import { showToast, showModal, hideModal, setLoading, setEmpty, setError, confirm, escapeHtml } from '../core/ui.js';
 
 // State
 let engines = [];
@@ -1041,15 +1041,6 @@ export async function revokePrivileges(event) {
     } catch (error) {
         showToast(`Failed to revoke privileges: ${error.message}`, 'error');
     }
-}
-
-// ==================== Helpers ====================
-
-function escapeHtml(text) {
-    if (!text) return '';
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
 }
 
 // Export for global access

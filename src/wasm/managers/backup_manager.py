@@ -48,7 +48,10 @@ class BackupMetadata:
     includes_node_modules: bool
     includes_build: bool = False
     includes_databases: bool = False
+    includes_docker_volumes: bool = False
     database_backups: List[Dict[str, Any]] = field(default_factory=list)
+    docker_volume_backups: List[Dict[str, Any]] = field(default_factory=list)
+    schema_backups: List[Dict[str, Any]] = field(default_factory=list)
     git_commit: Optional[str] = None
     git_branch: Optional[str] = None
     checksum: Optional[str] = None
@@ -69,7 +72,10 @@ class BackupMetadata:
             "includes_node_modules": self.includes_node_modules,
             "includes_build": self.includes_build,
             "includes_databases": self.includes_databases,
+            "includes_docker_volumes": self.includes_docker_volumes,
             "database_backups": self.database_backups,
+            "docker_volume_backups": self.docker_volume_backups,
+            "schema_backups": self.schema_backups,
             "git_commit": self.git_commit,
             "git_branch": self.git_branch,
             "checksum": self.checksum,
@@ -92,7 +98,10 @@ class BackupMetadata:
             includes_node_modules=data.get("includes_node_modules", False),
             includes_build=data.get("includes_build", False),
             includes_databases=data.get("includes_databases", False),
+            includes_docker_volumes=data.get("includes_docker_volumes", False),
             database_backups=data.get("database_backups", []),
+            docker_volume_backups=data.get("docker_volume_backups", []),
+            schema_backups=data.get("schema_backups", []),
             git_commit=data.get("git_commit"),
             git_branch=data.get("git_branch"),
             checksum=data.get("checksum"),
@@ -279,6 +288,11 @@ class BackupManager:
         include_node_modules: bool = False,
         include_build: bool = False,
         include_databases: bool = False,
+        include_docker_volumes: bool = False,
+        schemas: Optional[List[str]] = None,
+        redis_method: str = "rdb",
+        retention_count: Optional[int] = None,
+        retention_days: Optional[int] = None,
         tags: Optional[List[str]] = None,
         pre_backup_hook: Optional[str] = None,
     ) -> BackupMetadata:
@@ -292,6 +306,11 @@ class BackupManager:
             include_node_modules: Include node_modules (large!).
             include_build: Include build artifacts.
             include_databases: Include associated database dumps.
+            include_docker_volumes: Include Docker named volumes.
+            schemas: PostgreSQL schemas to backup (None = all).
+            redis_method: Redis backup method ("rdb" or "aof").
+            retention_count: Max backups to keep (overrides default).
+            retention_days: Max age in days for backups.
             tags: Optional tags for the backup.
             pre_backup_hook: Optional command to run before backup.
 
@@ -391,8 +410,18 @@ class BackupManager:
         
         # Backup associated databases if requested
         database_backups = []
+        schema_backup_list = []
         if include_databases:
             database_backups = self._backup_databases(domain)
+
+        # Backup Docker volumes if requested
+        docker_volume_backup_list = []
+        if include_docker_volumes:
+            volumes = self._discover_docker_volumes(app_path)
+            if volumes:
+                docker_volume_backup_list = self._backup_docker_volumes(
+                    domain, volumes, app_backup_dir
+                )
 
         # Create metadata
         metadata = BackupMetadata(
@@ -408,27 +437,37 @@ class BackupManager:
             includes_node_modules=include_node_modules,
             includes_build=include_build,
             includes_databases=include_databases,
+            includes_docker_volumes=include_docker_volumes,
             database_backups=database_backups,
+            docker_volume_backups=docker_volume_backup_list,
+            schema_backups=schema_backup_list,
             git_commit=git_commit,
             git_branch=git_branch,
             checksum=checksum,
             tags=tags or [],
         )
-        
+
         # Save metadata
         metadata_content = json.dumps(metadata.to_dict(), indent=2)
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
             tmp.write(metadata_content)
             tmp_meta_path = Path(tmp.name)
-        
+
         run_command_sudo(["mv", str(tmp_meta_path), str(metadata_file)])
         run_command_sudo(["chmod", "644", str(metadata_file)])
-        
-        # Rotate old backups
-        self._rotate_backups(app_name)
-        
+
+        # Rotate backups using policy if specified, otherwise default
+        if retention_count is not None or retention_days is not None:
+            self.rotate_by_policy(
+                app_name,
+                max_count=retention_count or self.max_backups,
+                max_age_days=retention_days,
+            )
+        else:
+            self._rotate_backups(app_name)
+
         self.logger.debug(f"Backup created: {backup_file} ({metadata.size_human})")
-        
+
         return metadata
     
     def list_backups(
@@ -767,7 +806,7 @@ class BackupManager:
             app_name: Application name.
         """
         backups = self.list_backups(app_name=app_name)
-        
+
         if len(backups) > self.max_backups:
             # Delete oldest backups
             for backup in backups[self.max_backups:]:
@@ -776,6 +815,134 @@ class BackupManager:
                     self.logger.debug(f"Rotated old backup: {backup.id}")
                 except Exception as e:
                     self.logger.warning(f"Failed to rotate backup {backup.id}: {e}")
+
+    def rotate_by_policy(
+        self,
+        app_name: str,
+        max_count: Optional[int] = None,
+        max_age_days: Optional[int] = None,
+    ) -> int:
+        """
+        Rotate backups based on count and/or age policy.
+
+        Args:
+            app_name: Application name.
+            max_count: Maximum number of backups to keep.
+            max_age_days: Maximum age of backups in days.
+
+        Returns:
+            Number of backups deleted.
+        """
+        backups = self.list_backups(app_name=app_name)
+        deleted = 0
+
+        # Delete by age first
+        if max_age_days:
+            from datetime import timedelta
+            cutoff = datetime.now() - timedelta(days=max_age_days)
+            for backup in backups:
+                try:
+                    created = datetime.fromisoformat(backup.created_at)
+                    if created < cutoff:
+                        self.delete(backup.id)
+                        deleted += 1
+                        self.logger.debug(f"Rotated old backup (age): {backup.id}")
+                except Exception as e:
+                    self.logger.warning(f"Failed to rotate backup {backup.id}: {e}")
+
+        # Then by count (re-fetch after age-based deletion)
+        if max_count:
+            remaining = self.list_backups(app_name=app_name)
+            if len(remaining) > max_count:
+                for backup in remaining[max_count:]:
+                    try:
+                        self.delete(backup.id)
+                        deleted += 1
+                        self.logger.debug(f"Rotated old backup (count): {backup.id}")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to rotate backup {backup.id}: {e}")
+
+        return deleted
+
+    def _backup_docker_volumes(
+        self,
+        domain: str,
+        volume_names: List[str],
+        output_dir: Path,
+    ) -> List[Dict[str, Any]]:
+        """
+        Backup Docker volumes.
+
+        Uses a temporary Alpine container to tar the volume contents.
+
+        Args:
+            domain: Application domain.
+            volume_names: List of Docker volume names.
+            output_dir: Directory to store volume backups.
+
+        Returns:
+            List of volume backup info dictionaries.
+        """
+        volume_backups = []
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        for vol_name in volume_names:
+            backup_file = output_dir / f"volume-{vol_name}-{timestamp}.tar.gz"
+
+            result = run_command([
+                "docker", "run", "--rm",
+                "-v", f"{vol_name}:/data:ro",
+                "-v", f"{output_dir}:/backup",
+                "alpine",
+                "tar", "czf", f"/backup/{backup_file.name}", "-C", "/data", ".",
+            ])
+
+            if result.success:
+                stat_result = run_command(["stat", "-c", "%s", str(backup_file)])
+                size = int(stat_result.stdout.strip()) if stat_result.success else 0
+
+                volume_backups.append({
+                    "volume": vol_name,
+                    "path": str(backup_file),
+                    "size_bytes": size,
+                })
+                self.logger.debug(f"Backed up volume: {vol_name}")
+            else:
+                self.logger.warning(f"Failed to backup volume {vol_name}: {result.stderr}")
+
+        return volume_backups
+
+    def _discover_docker_volumes(self, app_path: Path) -> List[str]:
+        """
+        Discover Docker volumes from a compose file.
+
+        Args:
+            app_path: Application path containing compose file.
+
+        Returns:
+            List of named volume names.
+        """
+        try:
+            import yaml
+        except ImportError:
+            return []
+
+        for compose_name in [
+            "docker-compose.prod.yml", "docker-compose.yml", "compose.yml",
+            "docker-compose.prod.yaml", "docker-compose.yaml", "compose.yaml",
+        ]:
+            compose_file = app_path / compose_name
+            if compose_file.exists():
+                try:
+                    data = yaml.safe_load(compose_file.read_text())
+                    volumes = data.get("volumes", {})
+                    if isinstance(volumes, dict):
+                        return list(volumes.keys())
+                except Exception:
+                    pass
+                break
+
+        return []
 
     def _backup_databases(self, domain: str) -> List[Dict[str, Any]]:
         """

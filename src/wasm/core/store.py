@@ -36,6 +36,7 @@ class AppType(str, Enum):
     VITE = "vite"
     STATIC = "static"
     MONOREPO = "monorepo"
+    DOCKER_COMPOSE = "docker-compose"
     UNKNOWN = "unknown"
 
 

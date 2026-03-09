@@ -3,6 +3,7 @@
 from wasm.deployers.base import BaseDeployer
 from wasm.deployers.registry import DeployerRegistry, get_deployer, detect_app_type
 from wasm.deployers.monorepo import MonorepoDeployer
+from wasm.deployers.docker_compose import DockerComposeDeployer
 
 __all__ = [
     "BaseDeployer",
@@ -10,4 +11,5 @@ __all__ = [
     "get_deployer",
     "detect_app_type",
     "MonorepoDeployer",
+    "DockerComposeDeployer",
 ]

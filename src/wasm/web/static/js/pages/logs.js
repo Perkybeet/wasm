@@ -108,4 +108,14 @@ export function getCurrentConnection() {
     return currentLogWs;
 }
 
-export default { load, switchStream, clear, getCurrentConnection };
+/**
+ * Cleanup when leaving page
+ */
+export function cleanup() {
+    if (currentLogWs) {
+        ws.close(`logs-${currentLogWs.domain}`);
+        currentLogWs = null;
+    }
+}
+
+export default { load, switchStream, clear, getCurrentConnection, cleanup };

@@ -232,7 +232,32 @@ class NginxManager(BaseManager):
         
         self.logger.debug(f"Created site configuration: {config_path}")
         return True
-    
+
+    def create_advanced_site(
+        self,
+        domain: str,
+        config: "NginxAdvancedConfig",
+        ssl: bool = False,
+        app_path: str = "",
+    ) -> bool:
+        """
+        Create an advanced multi-route Nginx site configuration.
+
+        Args:
+            domain: Domain name.
+            config: Advanced Nginx configuration.
+            ssl: Whether SSL is enabled.
+            app_path: Application path.
+
+        Returns:
+            True if site was created successfully.
+        """
+        from wasm.deployers.helpers.nginx_config import NginxConfigBuilder
+
+        builder = NginxConfigBuilder(verbose=self.verbose)
+        context = builder.build_context(config, domain, ssl, app_path)
+        return self.create_site(domain, template="advanced", context=context)
+
     def enable_site(self, domain: str) -> bool:
         """
         Enable a site by creating symlink.

@@ -150,10 +150,10 @@ class WasmAPI {
     disableMonitor() { return this.post('/api/monitor/disable'); }
     startMonitor() { return this.post('/api/monitor/start'); }
     stopMonitor() { return this.post('/api/monitor/stop'); }
-    getProcesses(limit = 50, sortBy = 'cpu') {
+    getMonitorProcesses(limit = 50, sortBy = 'cpu') {
         return this.get(`/api/monitor/processes?limit=${limit}&sort_by=${sortBy}`);
     }
-    killProcess(pid, signal = 15) {
+    killMonitorProcess(pid, signal = 15) {
         return this.post(`/api/system/processes/${pid}/kill?signal=${signal}`);
     }
 

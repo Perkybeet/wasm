@@ -207,6 +207,10 @@ def _handle_create(args: Namespace) -> int:
     if app_type == "monorepo":
         return _handle_monorepo_create(args, domain, env_vars, logger)
 
+    # Handle docker-compose deployments specially
+    if app_type == "docker-compose":
+        return _handle_docker_compose_create(args, domain, env_vars, logger)
+
     # Get deployer
     deployer = get_deployer(app_type, verbose=args.verbose)
 
@@ -264,6 +268,31 @@ def _handle_monorepo_create(args: Namespace, domain: str, env_vars: Dict, logger
     )
 
     # Run deployment
+    deployer.deploy()
+
+    return 0
+
+
+def _handle_docker_compose_create(
+    args: Namespace, domain: str, env_vars: Dict, logger: Logger
+) -> int:
+    """Handle Docker Compose deployment."""
+    from wasm.deployers.docker_compose import DockerComposeDeployer
+
+    deployer = DockerComposeDeployer(verbose=args.verbose)
+
+    deployer.configure(
+        domain=domain,
+        source=args.source,
+        webserver=args.webserver,
+        ssl=not args.no_ssl,
+        branch=args.branch,
+        env_vars=env_vars,
+        compose_file=getattr(args, "compose_file", None),
+        compose_profiles=getattr(args, "compose_profiles", None),
+        port=args.port,
+    )
+
     deployer.deploy()
 
     return 0
@@ -600,6 +629,12 @@ def _handle_update(args: Namespace) -> int:
             args, app_path, app_name, domain, logger, total_steps
         )
 
+    # Handle docker-compose updates
+    if app_type == "docker-compose":
+        return _handle_docker_compose_update(
+            args, app_path, app_name, domain, logger
+        )
+
     deployer = get_deployer(app_type, verbose=args.verbose)
     deployer.app_path = app_path
     deployer.app_name = app_name
@@ -734,6 +769,38 @@ def _handle_monorepo_update(args, app_path, app_name, domain, logger, total_step
     return 0
 
 
+def _handle_docker_compose_update(args, app_path, app_name, domain, logger):
+    """Handle update for Docker Compose applications."""
+    from wasm.deployers.docker_compose import DockerComposeDeployer
+
+    deployer = DockerComposeDeployer(verbose=args.verbose)
+    deployer.app_path = app_path
+    deployer.app_name = app_name
+    deployer.domain = domain
+
+    # Discover compose file
+    deployer._discover_compose_file()
+
+    logger.step(4, 5, "Rebuilding Docker images")
+    deployer._build_images()
+
+    logger.step(5, 5, "Restarting containers")
+    from wasm.core.utils import run_command
+    cmd = ["docker", "compose"]
+    if deployer.compose_path:
+        cmd.extend(["-f", str(deployer.compose_path)])
+    cmd.extend(["up", "-d", "--remove-orphans"])
+    result = run_command(cmd, cwd=app_path, timeout=300000)
+
+    if result.success:
+        logger.success(f"Docker Compose app updated: {domain}")
+    else:
+        logger.warning("Update may have issues. Check with: docker compose ps")
+        logger.warning(result.stderr)
+
+    return 0
+
+
 def _handle_delete(args: Namespace) -> int:
     """Handle webapp delete command."""
     logger = Logger(verbose=args.verbose)
@@ -807,8 +874,22 @@ def _handle_delete(args: Namespace) -> int:
 
     total_steps = 5
 
-    # Stop and delete service
-    logger.step(1, total_steps, "Stopping service")
+    # Stop Docker Compose containers if applicable
+    if app and app.app_type == "docker-compose":
+        logger.step(1, total_steps, "Stopping Docker Compose containers")
+        from wasm.core.utils import run_command as _run_cmd
+        for compose_name in ["docker-compose.prod.yml", "docker-compose.yml", "compose.yml"]:
+            compose_file = app_path / compose_name
+            if compose_file.exists():
+                _run_cmd(
+                    ["docker", "compose", "-f", str(compose_file), "down", "--remove-orphans"],
+                    cwd=app_path,
+                )
+                break
+    else:
+        logger.step(1, total_steps, "Stopping service")
+
+    # Delete systemd service
     service_manager = ServiceManager(verbose=args.verbose)
     try:
         service_manager.delete_service(app_name)
@@ -858,10 +939,45 @@ def _handle_logs(args: Namespace) -> int:
     """Handle webapp logs command."""
     logger = Logger(verbose=args.verbose)
     service_manager = ServiceManager(verbose=args.verbose)
-    
+
     domain = validate_domain(args.domain)
     app_name = domain_to_app_name(domain)
-    
+
+    # Check if this is a docker-compose app
+    from wasm.core.store import get_store
+    store = get_store()
+    app = store.get_app(domain)
+
+    if app and app.app_type == "docker-compose":
+        config = Config()
+        app_path = Path(app.app_path) if app.app_path else config.apps_directory / app_name
+        from wasm.core.utils import run_command as _run_cmd
+        import subprocess
+
+        # Find compose file
+        compose_file = None
+        for name in ["docker-compose.prod.yml", "docker-compose.yml", "compose.yml"]:
+            cf = app_path / name
+            if cf.exists():
+                compose_file = str(cf)
+                break
+
+        cmd = ["docker", "compose"]
+        if compose_file:
+            cmd.extend(["-f", compose_file])
+        cmd.extend(["logs", "--tail", str(args.lines)])
+
+        if args.follow:
+            cmd.append("-f")
+            try:
+                subprocess.run(cmd, cwd=app_path)
+            except KeyboardInterrupt:
+                pass
+        else:
+            result = _run_cmd(cmd, cwd=app_path)
+            print(result.stdout if result.success else result.stderr)
+        return 0
+
     # Get resolved service name (handles both legacy wasm-* and new format)
     service_name = service_manager._resolve_service_name(app_name)
 

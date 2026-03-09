@@ -144,6 +144,26 @@ NODEJS_DEPENDENCIES: List[Dependency] = [
     ),
 ]
 
+# Docker dependencies
+DOCKER_DEPENDENCIES: List[Dependency] = [
+    Dependency(
+        name="docker",
+        command="docker",
+        description="Container runtime",
+        required=False,
+        category="docker",
+        install_apt="docker.io",
+    ),
+    Dependency(
+        name="docker-compose",
+        command="docker",
+        description="Docker Compose (v2 plugin)",
+        required=False,
+        category="docker",
+        version_flag="compose version",
+    ),
+]
+
 # Python dependencies
 PYTHON_DEPENDENCIES: List[Dependency] = [
     Dependency(
@@ -185,6 +205,7 @@ class DependencyChecker:
         "webserver": WEBSERVER_DEPENDENCIES,
         "nodejs": NODEJS_DEPENDENCIES,
         "python": PYTHON_DEPENDENCIES,
+        "docker": DOCKER_DEPENDENCIES,
     }
     
     # Package manager info
@@ -404,6 +425,21 @@ class DependencyChecker:
                             f"Use --pm to specify one, or install {required_pm}."
                         )
         
+        elif app_type == "docker-compose":
+            # Need Docker and Docker Compose
+            if not self.check_command("docker"):
+                missing.append("docker: Docker is required for docker-compose deployments")
+            else:
+                # Verify Docker daemon is running
+                result = run_command(["docker", "info"])
+                if not result.success:
+                    missing.append("docker: Docker daemon is not running. Start with: sudo systemctl start docker")
+
+                # Check Docker Compose v2
+                result = run_command(["docker", "compose", "version"])
+                if not result.success:
+                    missing.append("docker compose: Docker Compose v2 plugin is required")
+
         elif app_type == "python":
             if not self.check_command("python3"):
                 missing.append("python3: Python 3 runtime is required for this app type")

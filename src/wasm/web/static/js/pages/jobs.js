@@ -155,7 +155,7 @@ export function hideDetails() {
  * Cancel a job
  */
 export async function cancel(jobId) {
-    if (!confirm('Are you sure you want to cancel this job?')) return;
+    if (!await confirm('Are you sure you want to cancel this job?')) return;
 
     try {
         await api.cancelJob(jobId);
@@ -186,7 +186,7 @@ export function startWebSocket() {
 
     console.log('[Jobs] Starting all-jobs WebSocket');
     jobsWs = ws.connectAllJobs(
-        (data) => {
+        async (data) => {
             console.log('[Jobs] All-jobs WebSocket message:', data);
             if (data.type === 'job_update') {
                 // Update job card in place if on jobs page
@@ -195,7 +195,10 @@ export function startWebSocket() {
                     updateJobCard(data.job);
                 }
                 // Update badge
-                updateActiveJobsBadge(data.job.status === 'running' || data.job.status === 'pending' ? -1 : null);
+                try {
+                    const activeData = await api.getActiveJobs();
+                    updateActiveJobsBadge(activeData.active);
+                } catch (e) { /* ignore badge update failure */ }
             } else if (data.type === 'connected') {
                 updateActiveJobsBadge(data.active);
             }
@@ -218,6 +221,17 @@ export async function checkActive() {
     }
 }
 
+/**
+ * Cleanup when leaving page
+ */
+export function cleanup() {
+    if (currentJobWs) {
+        currentJobWs.close();
+        currentJobWs = null;
+    }
+    currentJobId = null;
+}
+
 export default {
     load,
     filter,
@@ -226,5 +240,6 @@ export default {
     cancel,
     cancelCurrent,
     startWebSocket,
-    checkActive
+    checkActive,
+    cleanup
 };

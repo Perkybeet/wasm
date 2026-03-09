@@ -121,7 +121,7 @@ export function viewLogs(domain) {
  * Delete app
  */
 export async function remove(domain) {
-    if (!confirm(`Are you sure you want to delete ${domain}? This will remove the application, files, and SSL certificates.`)) {
+    if (!await confirm(`Are you sure you want to delete ${domain}? This will remove the application, files, and SSL certificates.`)) {
         return;
     }
 

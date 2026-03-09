@@ -443,10 +443,14 @@ class RedisManager(BaseDatabaseManager):
     ) -> BackupInfo:
         """
         Create a Redis backup using BGSAVE/RDB dump.
-        
+
         For Redis, we backup the entire instance, not individual databases.
         The database parameter is ignored.
         """
+        method = kwargs.get("method", "rdb")
+        if method == "aof":
+            return self.backup_aof(output_path=output_path, compress=compress)
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{self.ENGINE_NAME}-dump-{timestamp}.rdb"
         if compress:
@@ -498,7 +502,89 @@ class RedisManager(BaseDatabaseManager):
             created=datetime.now(),
             compressed=compress,
         )
-    
+
+    def backup_aof(
+        self,
+        output_path: Optional[Path] = None,
+        compress: bool = True,
+    ) -> BackupInfo:
+        """
+        Create a Redis backup using AOF (Append Only File) rewrite.
+
+        Triggers BGREWRITEAOF and copies the resulting AOF file.
+
+        Args:
+            output_path: Optional output path for the backup.
+            compress: Whether to compress the backup.
+
+        Returns:
+            BackupInfo for the created backup.
+
+        Raises:
+            DatabaseBackupError: If backup fails.
+        """
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{self.ENGINE_NAME}-aof-{timestamp}.aof"
+        if compress:
+            filename += ".gz"
+
+        backup_path = output_path or (self.BACKUP_DIR / filename)
+        self._run_sudo(["mkdir", "-p", str(backup_path.parent)])
+
+        # Trigger AOF rewrite
+        success, output = self._execute_redis("BGREWRITEAOF")
+        if not success:
+            raise DatabaseBackupError("Failed to trigger AOF rewrite", output)
+
+        # Wait for rewrite to complete
+        import time
+        for _ in range(60):
+            success, info_output = self._execute_redis("INFO", "persistence")
+            if success and "aof_rewrite_in_progress:0" in info_output:
+                break
+            time.sleep(1)
+
+        # Find AOF file location
+        aof_file = None
+        success, config_output = self._execute_redis("CONFIG", "GET", "appendfilename")
+        if success:
+            parts = config_output.strip().split("\n")
+            if len(parts) >= 2:
+                aof_filename = parts[1].strip()
+                # Check appenddirname for Redis 7+
+                success2, dir_output = self._execute_redis("CONFIG", "GET", "appenddirname")
+                if success2:
+                    dir_parts = dir_output.strip().split("\n")
+                    if len(dir_parts) >= 2 and dir_parts[1].strip():
+                        aof_file = self.DATA_DIR / dir_parts[1].strip() / aof_filename
+                if not aof_file or not aof_file.exists():
+                    aof_file = self.DATA_DIR / aof_filename
+
+        if not aof_file:
+            aof_file = self.DATA_DIR / "appendonly.aof"
+
+        if compress:
+            result = self._run_sudo(["bash", "-c", f"gzip -c {aof_file} > {backup_path}"])
+        else:
+            result = self._run_sudo(["cp", str(aof_file), str(backup_path)])
+
+        if not result.success:
+            raise DatabaseBackupError("Failed to copy AOF backup file", result.stderr)
+
+        stat_result = self._run(["stat", "-c", "%s", str(backup_path)])
+        size = int(stat_result.stdout.strip()) if stat_result.success else 0
+
+        self.logger.info(f"Created AOF backup: {backup_path}")
+
+        return BackupInfo(
+            path=backup_path,
+            database="all",
+            engine=self.ENGINE_NAME,
+            size=size,
+            created=datetime.now(),
+            compressed=compress,
+        )
+
     def restore(
         self,
         database: str,

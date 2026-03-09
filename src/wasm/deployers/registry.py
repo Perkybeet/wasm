@@ -138,6 +138,8 @@ def _import_deployers() -> None:
     """Import all deployer modules to trigger registration."""
     # Monorepo must be imported first for detection priority
     from wasm.deployers import monorepo
+    # Docker Compose after monorepo but before individual deployers
+    from wasm.deployers import docker_compose
     from wasm.deployers import nextjs
     from wasm.deployers import nodejs
     from wasm.deployers import vite

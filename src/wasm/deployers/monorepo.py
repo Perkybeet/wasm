@@ -621,7 +621,16 @@ class MonorepoDeployer:
             self.logger.debug("Database manager not available")
 
     def _configure_environment(self) -> None:
-        """Configure environment variables for all workspaces."""
+        """Configure environment variables for all workspaces.
+
+        Uses EnvManager to discover variables from .env.example files,
+        auto-generate secrets, and write .env files. Falls back to
+        manual configuration for database URLs and workspace ports.
+        """
+        from wasm.deployers.helpers import EnvManager
+
+        env_manager = EnvManager(verbose=self.verbose)
+
         # Build database URLs
         if "postgresql" in self.databases:
             db = self.databases["postgresql"]
@@ -636,6 +645,16 @@ class MonorepoDeployer:
 
         # Global environment
         self.env_vars["NODE_ENV"] = "production"
+
+        # Discover variables from .env.example files
+        discovered = env_manager.discover(self.app_path)
+        if discovered:
+            self.logger.substep(f"Discovered {len(discovered)} env variables")
+            auto_values = env_manager.prompt_non_interactive(discovered)
+            # CLI-provided and database env vars take precedence
+            for key, val in self.env_vars.items():
+                auto_values[key] = val
+            self.env_vars.update(auto_values)
 
         # Create .env files for each workspace
         for ws in self.workspaces:
