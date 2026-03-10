@@ -211,9 +211,14 @@ jobs:
           OBS_USER: ${{ secrets.OBS_USER }}
           OBS_PASS: ${{ secrets.OBS_PASS }}
         run: |
+          if [ -z "${OBS_USER}" ] || [ -z "${OBS_PASS}" ]; then
+            echo "::error::OBS_USER or OBS_PASS secrets are not set. Update them in GitHub repository settings."
+            exit 1
+          fi
+
           # Create config in both locations for compatibility
           mkdir -p ~/.config/osc
-          
+
           # Write config
           cat > ~/.oscrc << OSCEOF
           [general]
@@ -224,20 +229,21 @@ jobs:
           pass = ${OBS_PASS}
           trusted_prj = openSUSE:Factory openSUSE:Tumbleweed
           OSCEOF
-          
+
           # Remove leading spaces from heredoc
           sed -i 's/^          //' ~/.oscrc
           chmod 600 ~/.oscrc
-          
+
           # Symlink to config dir
           ln -sf ~/.oscrc ~/.config/osc/oscrc
-          
-          # Debug: show config (without password)
-          echo "=== OSC Config (sanitized) ==="
-          grep -v "^pass" ~/.oscrc
-          echo "pass = ********"
-          echo "=== Testing OSC connection ==="
-          osc api /about || echo "Connection test failed"
+
+          # Verify credentials work before proceeding
+          echo "=== Testing OBS connection ==="
+          if ! osc api /about > /dev/null 2>&1; then
+            echo "::error::OBS authentication failed (403 Forbidden). The OBS_PASS secret is likely expired. Update it at: https://github.com/Perkybeet/wasm/settings/secrets/actions"
+            exit 1
+          fi
+          echo "OBS connection verified successfully."
 
       - name: Get version
         id: version

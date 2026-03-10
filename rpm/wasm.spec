@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.15.1
+Version:        0.15.2
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -137,6 +137,10 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
 fi
 
 %changelog
+* Tue Mar 10 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.15.2-1
+- Fix: Web interface token display uses print() for reliable visibility
+- Enhancement: Release workflow validates OBS credentials before proceeding
+
 * Mon Mar 09 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.15.1-1
 - Fix: Python deployer compatibility with Python 3.10 (os.walk instead of Path.walk)
 - Fix: Django WSGI/ASGI detection break placement

@@ -1,3 +1,10 @@
+wasm (0.15.2-1) unstable; urgency=medium
+
+  * Fix: Web interface token display uses print() for reliable visibility
+  * Enhancement: Release workflow validates OBS credentials before proceeding
+
+ -- Yago Lopez Prado <yago.lopez.adeje@gmail.com>  Tue, 10 Mar 2026 12:00:00 +0000
+
 wasm (0.15.1-1) unstable; urgency=medium
 
   * Fix: Python deployer compatibility with Python 3.10 (os.walk instead of Path.walk)

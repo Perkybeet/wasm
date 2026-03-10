@@ -420,19 +420,16 @@ def run_server(
     
     if show_token:
         local_ip = get_local_ip() if host == "0.0.0.0" else host
-        logger.info("")
-        logger.info("=" * 60)
-        logger.info("WASM Web Interface")
-        logger.info("=" * 60)
-        logger.info("Access Token: %s", master_token)
-        logger.info("Server: http://%s:%s", local_ip, port)
-        logger.info("Quick Login: http://%s:%s/login?token=%s", local_ip, port, master_token)
-        logger.info("Keep this token secure! It grants full access to WASM.")
-        logger.info("=" * 60)
-    
-    # Flush stdout to ensure token is displayed before uvicorn starts
-    import sys
-    sys.stdout.flush()
+        print()
+        print("=" * 60)
+        print("WASM Web Interface")
+        print("=" * 60)
+        print(f"Access Token: {master_token}")
+        print(f"Server: http://{local_ip}:{port}")
+        print(f"Quick Login: http://{local_ip}:{port}/login?token={master_token}")
+        print("Keep this token secure! It grants full access to WASM.")
+        print("=" * 60)
+        print(flush=True)
     
     # Run server
     uvicorn.run(
