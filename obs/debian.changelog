@@ -1,3 +1,14 @@
+wasm (0.15.3-1) unstable; urgency=medium
+
+  * Fix: SourceManager.fetch() parameter mismatch in Docker Compose deployer
+  * Fix: ServiceManager.create_service() API mismatch in Docker Compose deployer
+  * Fix: Docker Compose build/update timeouts (600000s to 600s/300s)
+  * Feature: Headless worker support for Docker Compose apps with no exposed ports
+  * Enhancement: Add _PASS pattern to EnvManager secret detection
+  * Enhancement: ServiceManager.create_service() accepts extra template context
+
+ -- Yago Lopez Prado <yago.lopez.adeje@gmail.com>  Wed, 11 Mar 2026 12:00:00 +0000
+
 wasm (0.15.2-1) unstable; urgency=medium
 
   * Fix: Web interface token display uses print() for reliable visibility

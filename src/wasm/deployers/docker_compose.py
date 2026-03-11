@@ -216,11 +216,20 @@ class DockerComposeDeployer:
         self.compose_profiles = compose_profiles or []
         self.port = port
 
+    def _is_headless(self) -> bool:
+        """
+        Check if the application has no web-facing services.
+
+        Returns:
+            True if no services expose ports (headless/worker mode).
+        """
+        return not any(svc.is_web for svc in self.services)
+
     def deploy(self) -> None:
         """
         Execute the full deployment workflow.
 
-        Steps:
+        For web-facing apps (services with ports):
         1. Fetch source code
         2. Discover compose file
         3. Parse compose services
@@ -230,6 +239,9 @@ class DockerComposeDeployer:
         7. Obtain SSL certificate
         8. Create systemd service
         9. Start and verify
+
+        For headless/worker apps (no exposed ports):
+        Steps 6 and 7 are skipped automatically.
 
         Raises:
             DeploymentError: If any deployment step fails.
@@ -246,17 +258,26 @@ class DockerComposeDeployer:
             self.logger.step(3, total_steps, "Parsing compose services")
             self._parse_compose_services()
 
+            headless = self._is_headless()
+
             self.logger.step(4, total_steps, "Configuring environment")
             self._configure_environment()
 
             self.logger.step(5, total_steps, "Building Docker images")
             self._build_images()
 
-            self.logger.step(6, total_steps, "Creating site configuration")
-            self._create_site()
+            if headless:
+                self.logger.step(6, total_steps, "Skipping Nginx (headless worker)")
+                self.logger.substep("No services expose ports, web server not needed")
+                self.logger.step(7, total_steps, "Skipping SSL (headless worker)")
+                self.logger.substep("No web-facing services, certificate not needed")
+                self.ssl = False
+            else:
+                self.logger.step(6, total_steps, "Creating site configuration")
+                self._create_site()
 
-            self.logger.step(7, total_steps, "Obtaining SSL certificate")
-            self._obtain_certificate()
+                self.logger.step(7, total_steps, "Obtaining SSL certificate")
+                self._obtain_certificate()
 
             self.logger.step(8, total_steps, "Creating systemd service")
             self._create_systemd_service()
@@ -273,7 +294,10 @@ class DockerComposeDeployer:
             self.logger.key_value("Path", str(self.app_path))
             self.logger.key_value("Compose File", str(self.compose_path.name))
             self.logger.key_value("Services", str(len(self.services)))
-            self.logger.key_value("SSL", "Yes" if self.ssl else "No")
+            if headless:
+                self.logger.key_value("Mode", "Headless worker (no web server)")
+            else:
+                self.logger.key_value("SSL", "Yes" if self.ssl else "No")
 
         except Exception as e:
             self.logger.error(f"Deployment failed: {e}")
@@ -285,7 +309,7 @@ class DockerComposeDeployer:
         source_manager = SourceManager(verbose=self.verbose)
         source_manager.fetch(
             source=self.source,
-            target=self.app_path,
+            destination=self.app_path,
             branch=self.branch,
         )
         self.logger.substep(f"Source fetched to {self.app_path}")
@@ -407,7 +431,7 @@ class DockerComposeDeployer:
         if no_cache:
             cmd.append("--no-cache")
 
-        result = run_command(cmd, cwd=self.app_path, timeout=600000)
+        result = run_command(cmd, cwd=self.app_path, timeout=600)
         if not result.success:
             raise DockerError(
                 "Failed to build Docker images",
@@ -561,14 +585,11 @@ class DockerComposeDeployer:
 
         service_manager.create_service(
             name=self.app_name,
+            working_directory=str(self.app_path),
+            description=f"Docker Compose app: {self.domain}",
+            environment=service_env,
             template="docker-compose",
-            context={
-                "name": self.app_name,
-                "description": f"Docker Compose app: {self.domain}",
-                "working_directory": str(self.app_path),
-                "environment": service_env,
-                "compose_file": compose_file_rel,
-            },
+            compose_file=compose_file_rel,
         )
         self.logger.substep(f"Created systemd service: {self.app_name}")
 
@@ -638,7 +659,8 @@ class DockerComposeDeployer:
 
     def _register_app(self) -> None:
         """Register the application in the WASM store."""
-        primary_port = self._get_primary_port()
+        headless = self._is_headless()
+        primary_port = 0 if headless else self._get_primary_port()
 
         app = App(
             domain=self.domain,
@@ -647,7 +669,7 @@ class DockerComposeDeployer:
             branch=self.branch,
             port=primary_port,
             app_path=str(self.app_path),
-            webserver=self.webserver,
+            webserver="" if headless else self.webserver,
             ssl_enabled=self.ssl,
             status=AppStatus.RUNNING.value,
             env_vars=self.env_vars,
@@ -676,14 +698,15 @@ class DockerComposeDeployer:
         except Exception:
             pass
 
-        # Remove nginx config
-        try:
-            nginx = NginxManager(verbose=self.verbose)
-            if nginx.site_exists(self.domain):
-                nginx.delete_site(self.domain)
-                nginx.reload()
-        except Exception:
-            pass
+        # Remove nginx config (only if web-facing)
+        if not self._is_headless():
+            try:
+                nginx = NginxManager(verbose=self.verbose)
+                if nginx.site_exists(self.domain):
+                    nginx.delete_site(self.domain)
+                    nginx.reload()
+            except Exception:
+                pass
 
         # Remove app directory
         if self.app_path.exists():
@@ -791,7 +814,7 @@ class DockerComposeDeployer:
             cmd.extend(["-f", str(self.compose_path)])
         cmd.extend(["up", "-d", "--remove-orphans"])
 
-        result = run_command(cmd, cwd=self.app_path, timeout=300000)
+        result = run_command(cmd, cwd=self.app_path, timeout=300)
         if not result.success:
             raise DockerError("Failed to update containers", result.stderr)
 

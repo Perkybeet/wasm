@@ -238,41 +238,43 @@ class ServiceManager(BaseManager):
     def create_service(
         self,
         name: str,
-        command: str,
-        working_directory: str,
+        command: str = "",
+        working_directory: str = "",
         user: Optional[str] = None,
         group: Optional[str] = None,
         environment: Optional[Dict[str, str]] = None,
         description: Optional[str] = None,
         template: str = "app",
+        **kwargs,
     ) -> bool:
         """
         Create a new systemd service.
-        
+
         Args:
             name: Service name.
-            command: Command to execute.
+            command: Command to execute (not required for docker-compose template).
             working_directory: Working directory for the service.
             user: User to run service as.
             group: Group to run service as.
             environment: Environment variables.
             description: Service description.
             template: Template name.
-            
+            **kwargs: Extra context variables passed to the template.
+
         Returns:
             True if service was created successfully.
-            
+
         Raises:
             ServiceError: If creation fails.
         """
         service_name = self._get_service_name(name)
-        
+
         if self.service_exists(name):
             raise ServiceError(f"Service already exists: {service_name}")
-        
+
         if not self.jinja_env:
             raise ServiceError("Template environment not initialized")
-        
+
         # Prepare context
         ctx = {
             "name": service_name,
@@ -283,6 +285,7 @@ class ServiceManager(BaseManager):
             "group": group or self.config.service_group,
             "environment": environment or {},
         }
+        ctx.update(kwargs)
         
         # Render template
         try:

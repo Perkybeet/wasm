@@ -113,7 +113,7 @@ class EnvManager:
 
     # Secret detection patterns
     SECRET_PATTERNS = [
-        "PASSWORD", "SECRET", "TOKEN", "API_KEY", "PRIVATE_KEY",
+        "PASSWORD", "_PASS", "SECRET", "TOKEN", "API_KEY", "PRIVATE_KEY",
         "ENCRYPTION_KEY", "SIGNING_KEY", "ACCESS_KEY", "SECRET_KEY",
         "CLIENT_SECRET", "WEBHOOK_SECRET",
     ]

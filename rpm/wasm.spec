@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.15.2
+Version:        0.15.3
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -137,6 +137,14 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
 fi
 
 %changelog
+* Wed Mar 11 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.15.3-1
+- Fix: SourceManager.fetch() parameter mismatch in Docker Compose deployer
+- Fix: ServiceManager.create_service() API mismatch in Docker Compose deployer
+- Fix: Docker Compose build/update timeouts (600000s to 600s/300s)
+- Feature: Headless worker support for Docker Compose apps with no exposed ports
+- Enhancement: Add _PASS pattern to EnvManager secret detection
+- Enhancement: ServiceManager.create_service() accepts extra template context
+
 * Tue Mar 10 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.15.2-1
 - Fix: Web interface token display uses print() for reliable visibility
 - Enhancement: Release workflow validates OBS credentials before proceeding
