@@ -102,29 +102,30 @@ def _handle_create(args: Namespace) -> int:
     if not no_ssl:
         cert_manager = CertManager(verbose=args.verbose)
         if cert_manager.is_installed():
-            # Check if a valid certificate already exists
+            additional_domains = None
+            if include_www:
+                additional_domains = [f"www.{domain}"]
+
+            # Check if a valid certificate already exists and covers all domains
             if cert_manager.cert_exists(domain):
                 test = cert_manager.test_cert(domain)
                 if test.get("valid"):
-                    logger.info(f"Valid SSL certificate found for {domain}")
-                    ssl_obtained = True
+                    all_required = [domain] + (additional_domains or [])
+                    if cert_manager.cert_covers_domains(domain, all_required):
+                        logger.info(f"Valid SSL certificate found covering all domains")
+                        ssl_obtained = True
+                    else:
+                        logger.info("Existing certificate does not cover all domains, expanding...")
                 else:
-                    logger.warning(f"Existing certificate invalid, obtaining new one...")
+                    logger.warning("Existing certificate invalid, obtaining new one...")
 
             if not ssl_obtained:
                 logger.info(f"Obtaining SSL certificate for {domain}...")
                 try:
-                    additional_domains = None
-                    if include_www:
-                        additional_domains = [f"www.{domain}"]
-
-                    nginx = args.webserver == "nginx"
-                    apache = args.webserver == "apache"
-
                     cert_manager.obtain(
                         domain,
-                        nginx=nginx,
-                        apache=apache,
+                        nginx=args.webserver == "nginx",
+                        apache=args.webserver == "apache",
                         additional_domains=additional_domains,
                     )
                     ssl_obtained = True

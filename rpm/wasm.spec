@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.15.7
+Version:        0.15.8
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -137,6 +137,11 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
 fi
 
 %changelog
+* Fri Mar 20 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.15.8-1
+- Feature: Auto-verify and expand SSL certificates for www subdomain coverage
+- Enhancement: cert_manager.obtain() checks domain coverage before skipping existing certs
+- Enhancement: Site create verifies existing certs cover all required domains including www
+
 * Fri Mar 20 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.15.7-1
 - Fix: Site create fails with "site already exists" when config file remains after deletion
 - Fix: Site create SSL step fails with "site already exists" on second create_site call

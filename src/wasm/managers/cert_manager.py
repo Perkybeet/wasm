@@ -130,6 +130,27 @@ class CertManager(BaseManager):
         
         return None
     
+    def cert_covers_domains(self, domain: str, required_domains: List[str]) -> bool:
+        """
+        Check if an existing certificate covers all required domains.
+
+        Args:
+            domain: Primary domain (certificate name).
+            required_domains: List of domains that must be covered.
+
+        Returns:
+            True if all required domains are covered.
+        """
+        info = self.get_cert_info(domain)
+        if not info:
+            return False
+
+        cert_domains = info.get("domains", [])
+        for d in required_domains:
+            if d not in cert_domains:
+                return False
+        return True
+
     def _check_certbot_plugin(self, plugin: str) -> bool:
         """
         Check if a certbot plugin is available.
@@ -178,10 +199,18 @@ class CertManager(BaseManager):
             CertificateError: If certificate issuance fails.
         """
         if self.cert_exists(domain) and not dry_run:
-            if not expand or not additional_domains:
+            # If additional domains requested, check if cert already covers them
+            if additional_domains:
+                all_required = [domain] + additional_domains
+                if self.cert_covers_domains(domain, all_required):
+                    self.logger.info(f"Certificate already covers all domains: {', '.join(all_required)}")
+                    return True
+                # Cert exists but doesn't cover all domains - need to expand
+                self.logger.info(f"Expanding certificate to include: {', '.join(additional_domains)}")
+                expand = True
+            elif not expand:
                 self.logger.warning(f"Certificate already exists for {domain}")
                 return True
-            self.logger.info(f"Expanding certificate for {domain}")
         
         # Build command
         cmd = ["certbot", "certonly"]
