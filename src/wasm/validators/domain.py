@@ -168,6 +168,28 @@ def get_domain_parts(domain: str) -> dict:
         }
 
 
+def should_include_www(domain: str) -> bool:
+    """
+    Determine if www subdomain should be included for a domain.
+
+    Returns True for base domains like example.com.
+    Returns False for subdomains (api.example.com), www domains
+    (www.example.com), and single-label domains (localhost).
+
+    Args:
+        domain: Domain to check.
+
+    Returns:
+        True if www.domain should be included.
+    """
+    parts = domain.lower().strip().split(".")
+    if len(parts) != 2:
+        return False
+    if parts[0] == "www":
+        return False
+    return True
+
+
 def is_subdomain(domain: str) -> bool:
     """
     Check if a domain is a subdomain.

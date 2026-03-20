@@ -155,10 +155,11 @@ class CertManager(BaseManager):
         apache: bool = False,
         dry_run: bool = False,
         additional_domains: Optional[List[str]] = None,
+        expand: bool = False,
     ) -> bool:
         """
         Obtain a new certificate.
-        
+
         Args:
             domain: Primary domain name.
             email: Email for registration and recovery.
@@ -168,16 +169,19 @@ class CertManager(BaseManager):
             apache: Use apache plugin.
             dry_run: Test certificate issuance.
             additional_domains: Additional domains for the certificate.
-            
+            expand: Expand existing certificate to include additional domains.
+
         Returns:
             True if certificate was obtained successfully.
-            
+
         Raises:
             CertificateError: If certificate issuance fails.
         """
         if self.cert_exists(domain) and not dry_run:
-            self.logger.warning(f"Certificate already exists for {domain}")
-            return True
+            if not expand or not additional_domains:
+                self.logger.warning(f"Certificate already exists for {domain}")
+                return True
+            self.logger.info(f"Expanding certificate for {domain}")
         
         # Build command
         cmd = ["certbot", "certonly"]
@@ -244,6 +248,10 @@ class CertManager(BaseManager):
             for d in additional_domains:
                 cmd.extend(["-d", d])
         
+        # Expand existing certificate
+        if expand and self.cert_exists(domain):
+            cmd.append("--expand")
+
         # Dry run
         if dry_run:
             cmd.append("--dry-run")

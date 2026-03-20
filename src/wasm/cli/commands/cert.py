@@ -85,6 +85,7 @@ def _handle_create(args: Namespace) -> int:
         apache=args.apache,
         dry_run=args.dry_run,
         additional_domains=additional_domains,
+        expand=getattr(args, "expand", False),
     )
     
     if args.dry_run:

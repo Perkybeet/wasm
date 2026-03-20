@@ -1,3 +1,16 @@
+wasm (0.15.4-1) unstable; urgency=medium
+
+  * Fix: Interactive mode crashes due to missing Namespace attributes (6 bugs)
+  * Fix: Service create uses wrong attribute name (command vs exec_command)
+  * Fix: Webapp delete, logs, update missing required attributes
+  * Fix: Service logs and cert revoke missing required attributes
+  * Feature: Add --www flag for including www subdomain in SSL certificates
+  * Feature: Add --expand flag for expanding existing SSL certificates
+  * Enhancement: Interactive mode prompts for log lines, follow mode, and branch
+  * Enhancement: Nginx/Apache templates support server_names with www
+
+ -- Yago Lopez Prado <yago.lopez.adeje@gmail.com>  Fri, 20 Mar 2026 12:00:00 +0000
+
 wasm (0.15.3-1) unstable; urgency=medium
 
   * Fix: SourceManager.fetch() parameter mismatch in Docker Compose deployer

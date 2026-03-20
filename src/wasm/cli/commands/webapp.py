@@ -201,6 +201,11 @@ def _handle_create(args: Namespace) -> int:
     logger.key_value("Port", str(port))
     logger.key_value("Package Manager", package_manager)
     logger.key_value("SSL", "Yes" if not args.no_ssl else "No")
+    include_www = getattr(args, "www", False)
+    if not args.no_ssl and include_www:
+        from wasm.validators.domain import should_include_www
+        if should_include_www(domain):
+            logger.key_value("WWW", f"www.{domain} included")
     logger.blank()
 
     # Handle monorepo deployments specially
@@ -224,6 +229,7 @@ def _handle_create(args: Namespace) -> int:
         branch=args.branch,
         env_vars=env_vars,
         package_manager=package_manager,
+        include_www=getattr(args, "www", False),
     )
 
     # Run deployment

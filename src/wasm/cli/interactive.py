@@ -123,13 +123,16 @@ class InteractiveMode:
             return self._run_webapp_command("list")
         elif action == "logs":
             domain = self._prompt_domain("Enter application domain")
-            return self._run_webapp_command("logs", domain)
-        elif action in ["status", "update", "restart", "stop", "start"]:
+            return self._webapp_logs(domain)
+        elif action == "update":
+            domain = self._prompt_domain("Enter application domain")
+            return self._webapp_update(domain)
+        elif action in ["status", "restart", "stop", "start"]:
             domain = self._prompt_domain("Enter application domain")
             return self._run_webapp_command(action, domain)
         elif action == "delete":
             domain = self._prompt_domain("Enter application domain")
-            return self._run_webapp_command("delete", domain, force=True)
+            return self._run_webapp_command("delete", domain, force=True, keep_files=False)
         
         return 0
     
@@ -216,7 +219,21 @@ class InteractiveMode:
         answers = inquirer.prompt(questions, theme=GreenPassion())
         if not answers:
             return 0
-        
+
+        # Ask about www if SSL enabled and domain is a base domain
+        from wasm.validators.domain import should_include_www
+        include_www = False
+        if answers["ssl"] and should_include_www(answers["domain"]):
+            www_questions = [
+                inquirer.Confirm(
+                    "include_www",
+                    message=f"Include www.{answers['domain']} in certificate and web server config?",
+                    default=True,
+                ),
+            ]
+            www_answers = inquirer.prompt(www_questions, theme=GreenPassion())
+            include_www = www_answers.get("include_www", True) if www_answers else False
+
         # Build arguments
         from argparse import Namespace
         args = Namespace(
@@ -230,11 +247,59 @@ class InteractiveMode:
             branch=answers["branch"] or None,
             no_ssl=not answers["ssl"],
             env_file=answers["env_file"] or None,
+            www=include_www,
         )
-        
+
         from wasm.cli.commands.webapp import handle_webapp
         return handle_webapp(args)
     
+    def _webapp_logs(self, domain: str) -> int:
+        """Handle webapp logs flow with interactive prompts."""
+        questions = [
+            inquirer.Text(
+                "lines",
+                message="Number of log lines to show",
+                default="50",
+                validate=lambda _, x: x.isdigit() and int(x) > 0 or "Must be a positive number",
+            ),
+            inquirer.Confirm(
+                "follow",
+                message="Follow log output in real time?",
+                default=False,
+            ),
+        ]
+
+        answers = inquirer.prompt(questions, theme=GreenPassion())
+        if not answers:
+            return 0
+
+        return self._run_webapp_command(
+            "logs",
+            domain,
+            lines=int(answers["lines"]),
+            follow=answers["follow"],
+        )
+
+    def _webapp_update(self, domain: str) -> int:
+        """Handle webapp update flow with interactive prompts."""
+        questions = [
+            inquirer.Text(
+                "branch",
+                message="Git branch to update from (leave empty for default)",
+                default="",
+            ),
+        ]
+
+        answers = inquirer.prompt(questions, theme=GreenPassion())
+        if not answers:
+            return 0
+
+        return self._run_webapp_command(
+            "update",
+            domain,
+            branch=answers["branch"] or None,
+        )
+
     def _site_flow(self) -> int:
         """Handle site interactive flow."""
         questions = [
@@ -348,7 +413,10 @@ class InteractiveMode:
             return self._service_create()
         elif action == "list":
             return self._run_command("service", "list")
-        elif action in ["status", "start", "stop", "restart", "logs", "delete"]:
+        elif action == "logs":
+            name = self._prompt_text("Enter service name")
+            return self._service_logs(name)
+        elif action in ["status", "start", "stop", "restart", "delete"]:
             name = self._prompt_text("Enter service name")
             if action == "delete":
                 return self._run_command("service", action, name, force=True)
@@ -395,7 +463,7 @@ class InteractiveMode:
             verbose=self.verbose,
             action="create",
             name=answers["name"],
-            command=answers["command"],
+            exec_command=answers["command"],
             directory=answers["directory"],
             user=answers["user"],
             description=answers["description"] or None,
@@ -404,6 +472,34 @@ class InteractiveMode:
         from wasm.cli.commands.service import handle_service
         return handle_service(args)
     
+    def _service_logs(self, name: str) -> int:
+        """Handle service logs flow with interactive prompts."""
+        questions = [
+            inquirer.Text(
+                "lines",
+                message="Number of log lines to show",
+                default="50",
+                validate=lambda _, x: x.isdigit() and int(x) > 0 or "Must be a positive number",
+            ),
+            inquirer.Confirm(
+                "follow",
+                message="Follow log output in real time?",
+                default=False,
+            ),
+        ]
+
+        answers = inquirer.prompt(questions, theme=GreenPassion())
+        if not answers:
+            return 0
+
+        return self._run_command(
+            "service",
+            "logs",
+            name,
+            lines=int(answers["lines"]),
+            follow=answers["follow"],
+        )
+
     def _cert_flow(self) -> int:
         """Handle cert interactive flow."""
         questions = [
@@ -437,6 +533,8 @@ class InteractiveMode:
             domain = self._prompt_domain("Enter domain name")
             if action == "delete":
                 return self._run_command("cert", action, domain, force=True)
+            elif action == "revoke":
+                return self._run_command("cert", action, domain, delete=True)
             return self._run_command("cert", action, domain)
         
         return 0

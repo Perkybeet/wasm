@@ -207,6 +207,11 @@ def _add_webapp_commands(subparsers) -> None:
         help="Skip SSL certificate configuration",
     )
     create.add_argument(
+        "--www",
+        action="store_true",
+        help="Include www subdomain in SSL certificate and web server config",
+    )
+    create.add_argument(
         "--env-file",
         help="Path to environment file",
     )
@@ -659,7 +664,12 @@ def _add_cert_parser(subparsers) -> None:
         action="store_true",
         help="Test without obtaining",
     )
-    
+    create.add_argument(
+        "--expand",
+        action="store_true",
+        help="Expand existing certificate to include additional domains",
+    )
+
     # cert list
     cert_sub.add_parser(
         "list",

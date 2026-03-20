@@ -8,6 +8,7 @@ from wasm.validators.domain import (
     check_domain,
     get_domain_parts,
     is_subdomain,
+    should_include_www,
 )
 from wasm.core.exceptions import DomainError
 
@@ -122,3 +123,31 @@ class TestIsSubdomain:
         """Test non-subdomain detection."""
         assert is_subdomain("example.com") is False
         assert is_subdomain("localhost") is False
+
+
+class TestShouldIncludeWww:
+    """Tests for should_include_www function."""
+
+    def test_base_domain_returns_true(self):
+        """Test that base domains return True."""
+        assert should_include_www("example.com") is True
+        assert should_include_www("picocnia.com") is True
+        assert should_include_www("mysite.org") is True
+
+    def test_subdomain_returns_false(self):
+        """Test that subdomains return False."""
+        assert should_include_www("api.example.com") is False
+        assert should_include_www("blog.example.com") is False
+        assert should_include_www("a.b.example.com") is False
+
+    def test_www_domain_returns_false(self):
+        """Test that www domains return False."""
+        assert should_include_www("www.example.com") is False
+
+    def test_single_label_returns_false(self):
+        """Test that single-label domains return False."""
+        assert should_include_www("localhost") is False
+
+    def test_compound_tld_returns_false(self):
+        """Test that compound TLDs (3+ parts) return False."""
+        assert should_include_www("example.co.uk") is False

@@ -95,6 +95,7 @@ class BaseDeployer(ABC):
         self.app_name: Optional[str] = None
         self.webserver: str = "nginx"
         self.ssl: bool = True
+        self.include_www: bool = False
         self.branch: Optional[str] = None
         self.env_vars: Dict[str, str] = {}
         
@@ -123,10 +124,11 @@ class BaseDeployer(ABC):
         env_vars: Optional[Dict[str, str]] = None,
         app_path: Optional[Path] = None,
         package_manager: PackageManager = "auto",
+        include_www: bool = False,
     ) -> None:
         """
         Configure the deployer.
-        
+
         Args:
             domain: Target domain.
             source: Source URL or path.
@@ -137,12 +139,16 @@ class BaseDeployer(ABC):
             env_vars: Environment variables.
             app_path: Custom application path.
             package_manager: Package manager to use (npm/pnpm/bun/auto).
+            include_www: Include www subdomain in certificate and web server config.
         """
+        from wasm.validators.domain import should_include_www
+
         self.domain = domain
         self.source = source
         self.port = port or self.DEFAULT_PORT
         self.webserver = webserver
         self.ssl = ssl
+        self.include_www = include_www and should_include_www(domain)
         self.branch = branch
         self.env_vars = env_vars or {}
         self._package_manager = package_manager
@@ -410,16 +416,23 @@ class BaseDeployer(ABC):
         Returns:
             Context dictionary.
         """
+        server_names = self.domain
+        if self.include_www:
+            server_names = f"{self.domain} www.{self.domain}"
+
         if self._nginx_advanced_config is not None:
-            return self._nginx_config_builder.build_context(
+            ctx = self._nginx_config_builder.build_context(
                 self._nginx_advanced_config,
                 self.domain,
                 ssl=self.ssl,
                 app_path=str(self.app_path),
             )
+            ctx["server_names"] = server_names
+            return ctx
 
         return {
             "domain": self.domain,
+            "server_names": server_names,
             "port": self.port,
             "app_path": str(self.app_path),
             "app_name": self.app_name,
@@ -1025,25 +1038,32 @@ class BaseDeployer(ABC):
     def obtain_certificate(self) -> bool:
         """
         Obtain SSL certificate.
-        
+
         Returns:
             True if successful.
         """
         if not self.ssl:
             return True
-        
+
         self.logger.substep(f"Domain: {self.domain}")
-        
+
+        additional_domains = None
+        if self.include_www:
+            www_domain = f"www.{self.domain}"
+            additional_domains = [www_domain]
+            self.logger.substep(f"Including: {www_domain}")
+
         # Use nginx plugin if using nginx
         nginx = self.webserver == "nginx"
         apache = self.webserver == "apache"
-        
+
         self.cert_manager.obtain(
             self.domain,
             nginx=nginx,
             apache=apache,
+            additional_domains=additional_domains,
         )
-        
+
         return True
     
     def start(self) -> bool:

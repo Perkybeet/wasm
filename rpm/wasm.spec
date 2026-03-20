@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.15.3
+Version:        0.15.4
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -137,6 +137,16 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
 fi
 
 %changelog
+* Fri Mar 20 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.15.4-1
+- Fix: Interactive mode crashes due to missing Namespace attributes (6 bugs)
+- Fix: Service create uses wrong attribute name (command vs exec_command)
+- Fix: Webapp delete, logs, update missing required attributes
+- Fix: Service logs and cert revoke missing required attributes
+- Feature: Add --www flag for including www subdomain in SSL certificates
+- Feature: Add --expand flag for expanding existing SSL certificates
+- Enhancement: Interactive mode prompts for log lines, follow mode, and branch
+- Enhancement: Nginx/Apache templates support server_names with www
+
 * Wed Mar 11 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.15.3-1
 - Fix: SourceManager.fetch() parameter mismatch in Docker Compose deployer
 - Fix: ServiceManager.create_service() API mismatch in Docker Compose deployer

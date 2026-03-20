@@ -3,6 +3,9 @@
 
 <VirtualHost *:80>
     ServerName {{ domain }}
+{% if server_names is defined and server_names != domain %}
+    ServerAlias www.{{ domain }}
+{% endif %}
     ServerAdmin webmaster@{{ domain }}
 
 {% if ssl %}
@@ -14,6 +17,9 @@
 
 <VirtualHost *:443>
     ServerName {{ domain }}
+{% if server_names is defined and server_names != domain %}
+    ServerAlias www.{{ domain }}
+{% endif %}
     ServerAdmin webmaster@{{ domain }}
 
     # SSL Configuration
