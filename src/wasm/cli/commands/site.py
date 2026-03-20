@@ -89,8 +89,12 @@ def _handle_create(args: Namespace) -> int:
     }
 
     logger.info(f"Creating site: {domain}")
-    manager.create_site(domain, template=args.template, context=context)
-    manager.enable_site(domain)
+    if manager.site_exists(domain):
+        logger.info("Site config already exists, updating...")
+        manager.update_site(domain, template=args.template, context=context)
+    else:
+        manager.create_site(domain, template=args.template, context=context)
+        manager.enable_site(domain)
     manager.reload()
 
     # Step 2: Obtain SSL certificate if requested
@@ -131,14 +135,14 @@ def _handle_create(args: Namespace) -> int:
             logger.warning("Certbot not installed, skipping SSL")
             logger.info("Install with: sudo apt install certbot")
 
-    # Step 3: Recreate site config with SSL if certificate was obtained
+    # Step 3: Update site config with SSL if certificate was obtained
     if ssl_obtained:
         cert_paths = cert_manager.get_cert_path(domain)
         context["ssl"] = True
         context["ssl_certificate"] = str(cert_paths["fullchain"])
         context["ssl_certificate_key"] = str(cert_paths["privkey"])
 
-        manager.create_site(domain, template=args.template, context=context)
+        manager.update_site(domain, template=args.template, context=context)
         manager.reload()
         logger.success(f"Site created with SSL: {domain}")
     else:

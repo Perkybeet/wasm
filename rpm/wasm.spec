@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.15.6
+Version:        0.15.7
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -137,6 +137,11 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
 fi
 
 %changelog
+* Fri Mar 20 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.15.7-1
+- Fix: Site create fails with "site already exists" when config file remains after deletion
+- Fix: Site create SSL step fails with "site already exists" on second create_site call
+- Enhancement: Site create updates existing config instead of failing
+
 * Fri Mar 20 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.15.6-1
 - Feature: Site create now obtains SSL certificates automatically
 - Feature: Add --no-ssl flag to site create to skip SSL
