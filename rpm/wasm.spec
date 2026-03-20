@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.15.5
+Version:        0.15.6
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -137,6 +137,12 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
 fi
 
 %changelog
+* Fri Mar 20 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.15.6-1
+- Feature: Site create now obtains SSL certificates automatically
+- Feature: Add --no-ssl flag to site create to skip SSL
+- Enhancement: Site create reuses existing valid certificates instead of re-obtaining
+- Enhancement: Interactive site create prompts for SSL configuration
+
 * Fri Mar 20 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.15.5-1
 - Feature: Add --www flag to site create for www subdomain in web server config
 - Enhancement: Interactive site create prompts for www inclusion

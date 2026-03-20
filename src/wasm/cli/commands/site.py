@@ -69,19 +69,22 @@ def _handle_create(args: Namespace) -> int:
     logger = Logger(verbose=args.verbose)
 
     from wasm.validators.domain import should_include_www
+    from wasm.managers.cert_manager import CertManager
 
     domain = validate_domain(args.domain)
     manager = _get_manager(args.webserver, verbose=args.verbose)
-
+    no_ssl = getattr(args, "no_ssl", False)
     include_www = getattr(args, "www", False) and should_include_www(domain)
+
     server_names = domain
     if include_www:
         server_names = f"{domain} www.{domain}"
         logger.info(f"Including www.{domain}")
 
+    # Step 1: Create site without SSL (needed for certbot webroot validation)
     context = {
         "port": args.port,
-        "ssl": False,  # SSL will be handled separately
+        "ssl": False,
         "server_names": server_names,
     }
 
@@ -89,8 +92,58 @@ def _handle_create(args: Namespace) -> int:
     manager.create_site(domain, template=args.template, context=context)
     manager.enable_site(domain)
     manager.reload()
-    
-    logger.success(f"Site created and enabled: {domain}")
+
+    # Step 2: Obtain SSL certificate if requested
+    ssl_obtained = False
+    if not no_ssl:
+        cert_manager = CertManager(verbose=args.verbose)
+        if cert_manager.is_installed():
+            # Check if a valid certificate already exists
+            if cert_manager.cert_exists(domain):
+                test = cert_manager.test_cert(domain)
+                if test.get("valid"):
+                    logger.info(f"Valid SSL certificate found for {domain}")
+                    ssl_obtained = True
+                else:
+                    logger.warning(f"Existing certificate invalid, obtaining new one...")
+
+            if not ssl_obtained:
+                logger.info(f"Obtaining SSL certificate for {domain}...")
+                try:
+                    additional_domains = None
+                    if include_www:
+                        additional_domains = [f"www.{domain}"]
+
+                    nginx = args.webserver == "nginx"
+                    apache = args.webserver == "apache"
+
+                    cert_manager.obtain(
+                        domain,
+                        nginx=nginx,
+                        apache=apache,
+                        additional_domains=additional_domains,
+                    )
+                    ssl_obtained = True
+                except WASMError as e:
+                    logger.warning(f"SSL certificate failed: {e}")
+                    logger.info("Site created without SSL. You can add it later with: wasm cert create")
+        else:
+            logger.warning("Certbot not installed, skipping SSL")
+            logger.info("Install with: sudo apt install certbot")
+
+    # Step 3: Recreate site config with SSL if certificate was obtained
+    if ssl_obtained:
+        cert_paths = cert_manager.get_cert_path(domain)
+        context["ssl"] = True
+        context["ssl_certificate"] = str(cert_paths["fullchain"])
+        context["ssl_certificate_key"] = str(cert_paths["privkey"])
+
+        manager.create_site(domain, template=args.template, context=context)
+        manager.reload()
+        logger.success(f"Site created with SSL: {domain}")
+    else:
+        logger.success(f"Site created: {domain}")
+
     return 0
 
 

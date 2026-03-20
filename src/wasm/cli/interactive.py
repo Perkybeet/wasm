@@ -365,20 +365,25 @@ class InteractiveMode:
                 default="3000",
                 validate=lambda _, x: check_port(x) or "Invalid port",
             ),
+            inquirer.Confirm(
+                "ssl",
+                message="Configure SSL certificate?",
+                default=True,
+            ),
         ]
-        
+
         answers = inquirer.prompt(questions, theme=GreenPassion())
         if not answers:
             return 0
 
-        # Ask about www if domain is a base domain
+        # Ask about www if SSL enabled and domain is a base domain
         from wasm.validators.domain import should_include_www
         include_www = False
-        if should_include_www(answers["domain"]):
+        if answers["ssl"] and should_include_www(answers["domain"]):
             www_questions = [
                 inquirer.Confirm(
                     "include_www",
-                    message=f"Include www.{answers['domain']} in web server config?",
+                    message=f"Include www.{answers['domain']} in certificate and web server config?",
                     default=True,
                 ),
             ]
@@ -393,6 +398,7 @@ class InteractiveMode:
             webserver=answers["webserver"],
             template=answers["template"],
             port=int(answers["port"]),
+            no_ssl=not answers["ssl"],
             www=include_www,
         )
 

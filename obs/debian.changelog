@@ -1,3 +1,12 @@
+wasm (0.15.6-1) unstable; urgency=medium
+
+  * Feature: Site create now obtains SSL certificates automatically
+  * Feature: Add --no-ssl flag to site create to skip SSL
+  * Enhancement: Site create reuses existing valid certificates instead of re-obtaining
+  * Enhancement: Interactive site create prompts for SSL configuration
+
+ -- Yago Lopez Prado <yago.lopez.adeje@gmail.com>  Fri, 20 Mar 2026 13:00:00 +0000
+
 wasm (0.15.5-1) unstable; urgency=medium
 
   * Feature: Add --www flag to site create for www subdomain in web server config

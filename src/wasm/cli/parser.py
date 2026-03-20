@@ -411,9 +411,14 @@ def _add_site_parser(subparsers) -> None:
         help="Backend port for proxy",
     )
     create.add_argument(
+        "--no-ssl",
+        action="store_true",
+        help="Skip SSL certificate configuration",
+    )
+    create.add_argument(
         "--www",
         action="store_true",
-        help="Include www subdomain in web server config",
+        help="Include www subdomain in SSL certificate and web server config",
     )
 
     # site list
