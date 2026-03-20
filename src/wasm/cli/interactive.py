@@ -370,7 +370,21 @@ class InteractiveMode:
         answers = inquirer.prompt(questions, theme=GreenPassion())
         if not answers:
             return 0
-        
+
+        # Ask about www if domain is a base domain
+        from wasm.validators.domain import should_include_www
+        include_www = False
+        if should_include_www(answers["domain"]):
+            www_questions = [
+                inquirer.Confirm(
+                    "include_www",
+                    message=f"Include www.{answers['domain']} in web server config?",
+                    default=True,
+                ),
+            ]
+            www_answers = inquirer.prompt(www_questions, theme=GreenPassion())
+            include_www = www_answers.get("include_www", True) if www_answers else False
+
         from argparse import Namespace
         args = Namespace(
             verbose=self.verbose,
@@ -379,8 +393,9 @@ class InteractiveMode:
             webserver=answers["webserver"],
             template=answers["template"],
             port=int(answers["port"]),
+            www=include_www,
         )
-        
+
         from wasm.cli.commands.site import handle_site
         return handle_site(args)
     

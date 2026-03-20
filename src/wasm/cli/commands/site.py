@@ -67,15 +67,24 @@ def _get_manager(webserver: str, verbose: bool = False):
 def _handle_create(args: Namespace) -> int:
     """Handle site create command."""
     logger = Logger(verbose=args.verbose)
-    
+
+    from wasm.validators.domain import should_include_www
+
     domain = validate_domain(args.domain)
     manager = _get_manager(args.webserver, verbose=args.verbose)
-    
+
+    include_www = getattr(args, "www", False) and should_include_www(domain)
+    server_names = domain
+    if include_www:
+        server_names = f"{domain} www.{domain}"
+        logger.info(f"Including www.{domain}")
+
     context = {
         "port": args.port,
         "ssl": False,  # SSL will be handled separately
+        "server_names": server_names,
     }
-    
+
     logger.info(f"Creating site: {domain}")
     manager.create_site(domain, template=args.template, context=context)
     manager.enable_site(domain)

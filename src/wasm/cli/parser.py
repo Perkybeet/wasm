@@ -410,7 +410,12 @@ def _add_site_parser(subparsers) -> None:
         default=3000,
         help="Backend port for proxy",
     )
-    
+    create.add_argument(
+        "--www",
+        action="store_true",
+        help="Include www subdomain in web server config",
+    )
+
     # site list
     list_cmd = site_sub.add_parser(
         "list",

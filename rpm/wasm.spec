@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.15.4
+Version:        0.15.5
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -137,6 +137,10 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
 fi
 
 %changelog
+* Fri Mar 20 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.15.5-1
+- Feature: Add --www flag to site create for www subdomain in web server config
+- Enhancement: Interactive site create prompts for www inclusion
+
 * Fri Mar 20 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.15.4-1
 - Fix: Interactive mode crashes due to missing Namespace attributes (6 bugs)
 - Fix: Service create uses wrong attribute name (command vs exec_command)
