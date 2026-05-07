@@ -555,12 +555,26 @@ class BaseDeployer(ABC):
             self.source.startswith("http://") or
             self.source.startswith("git://")
         ):
+            # Run git ls-remote from a directory that is guaranteed to exist.
+            # The shell's cwd may have been removed by a previous `wasm
+            # remove`; subprocess would inherit that invalid cwd and git would
+            # abort with "Unable to read current working directory", surfaced
+            # to users as an opaque "Repository not accessible" error.
+            safe_cwd = Path.home() if Path.home().exists() else Path("/tmp")
             result = run_command(
                 ["git", "ls-remote", "--exit-code", self.source],
-                timeout=30
+                cwd=safe_cwd,
+                timeout=30,
             )
             if not result.success:
-                issues.append(f"Repository not accessible: {self.source}")
+                stderr_excerpt = (result.stderr or "").strip().splitlines()
+                detail = stderr_excerpt[0] if stderr_excerpt else ""
+                if detail:
+                    issues.append(
+                        f"Repository not accessible: {self.source} ({detail})"
+                    )
+                else:
+                    issues.append(f"Repository not accessible: {self.source}")
                 if "Permission denied" in str(result.stderr):
                     issues.append("Check SSH key configuration: wasm setup ssh --test")
                 checks_passed = False

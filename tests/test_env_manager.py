@@ -230,6 +230,81 @@ class TestNonInteractivePrompt:
         result = env_manager.prompt_non_interactive(variables)
         assert result["JWT_SECRET"] == "my-fixed-secret"
 
+    def test_regenerates_secret_with_your_prefix_placeholder(self, env_manager):
+        variables = [
+            EnvVariable(
+                name="NEXTAUTH_SECRET",
+                secret=True,
+                default="your-secret-key-here",
+            ),
+        ]
+        result = env_manager.prompt_non_interactive(variables)
+        assert result["NEXTAUTH_SECRET"] != "your-secret-key-here"
+        assert len(result["NEXTAUTH_SECRET"]) > 10
+
+    def test_regenerates_secret_with_angle_bracket_placeholder(self, env_manager):
+        variables = [
+            EnvVariable(
+                name="CLIENT_SECRET",
+                secret=True,
+                default="<your-client-secret>",
+            ),
+        ]
+        result = env_manager.prompt_non_interactive(variables)
+        assert result["CLIENT_SECRET"] != "<your-client-secret>"
+        assert "<" not in result["CLIENT_SECRET"]
+
+    def test_regenerates_secret_with_changeme_placeholder(self, env_manager):
+        variables = [
+            EnvVariable(name="API_TOKEN", secret=True, default="changeme"),
+        ]
+        result = env_manager.prompt_non_interactive(variables)
+        assert result["API_TOKEN"] != "changeme"
+
+    def test_keeps_non_secret_placeholder_default(self, env_manager):
+        """Non-secret placeholders are preserved (warning only) for compat."""
+        variables = [
+            EnvVariable(
+                name="DATABASE_URL",
+                secret=False,
+                default="mysql://user:password@localhost:3306/db",
+            ),
+        ]
+        result = env_manager.prompt_non_interactive(variables)
+        assert result["DATABASE_URL"] == "mysql://user:password@localhost:3306/db"
+
+
+class TestPlaceholderDetection:
+    """Tests for placeholder default detection."""
+
+    def test_your_prefix_is_placeholder(self, env_manager):
+        assert env_manager._is_placeholder("your-secret") is True
+        assert env_manager._is_placeholder("YOUR-SECRET") is True
+        assert env_manager._is_placeholder("your_app_password") is True
+
+    def test_angle_brackets_are_placeholder(self, env_manager):
+        assert env_manager._is_placeholder("<token>") is True
+
+    def test_changeme_is_placeholder(self, env_manager):
+        assert env_manager._is_placeholder("changeme") is True
+        assert env_manager._is_placeholder("change-me") is True
+        assert env_manager._is_placeholder("CHANGE_ME") is True
+
+    def test_user_password_url_is_placeholder(self, env_manager):
+        url = "mysql://user:password@localhost:3306/db"
+        assert env_manager._is_placeholder(url) is True
+
+    def test_empty_value_is_not_placeholder(self, env_manager):
+        assert env_manager._is_placeholder("") is False
+
+    def test_real_value_is_not_placeholder(self, env_manager):
+        assert env_manager._is_placeholder("3000") is False
+        assert env_manager._is_placeholder("production") is False
+        assert env_manager._is_placeholder("my-fixed-secret") is False
+        assert env_manager._is_placeholder(
+            "postgresql://app:K8j2x@db.example.com/app"
+        ) is False
+
 
 class TestEnvFileWriting:
     """Tests for .env file writing."""
