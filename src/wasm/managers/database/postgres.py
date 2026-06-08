@@ -181,9 +181,14 @@ class PostgresManager(BaseDatabaseManager):
         encoding = encoding or "UTF8"
         template = kwargs.get("template", "template0")
 
-        # Use escaped identifier to prevent SQL injection
+        # Validate/escape every interpolated value to prevent SQL injection.
+        # Encoding names are a fixed alphanumeric vocabulary; the template is an
+        # identifier, so escape it the same way as the database name.
+        if not re.match(r"^[A-Za-z0-9_]+$", encoding):
+            raise DatabaseError(f"Invalid encoding: {encoding!r}")
         safe_name = self._escape_identifier(name)
-        sql = f"CREATE DATABASE {safe_name} ENCODING '{encoding}' TEMPLATE {template}"
+        safe_template = self._escape_identifier(template)
+        sql = f"CREATE DATABASE {safe_name} ENCODING '{encoding}' TEMPLATE {safe_template}"
 
         if owner:
             safe_owner = self._escape_identifier(owner)
@@ -444,7 +449,7 @@ class PostgresManager(BaseDatabaseManager):
         host: str = "localhost",
     ) -> bool:
         """Grant privileges to a user on a database."""
-        privs = ", ".join(privileges) if privileges else "ALL PRIVILEGES"
+        privs = self._safe_privileges(privileges)
 
         # Use escaped identifiers to prevent SQL injection
         safe_database = self._escape_identifier(database)
@@ -471,7 +476,7 @@ class PostgresManager(BaseDatabaseManager):
         host: str = "localhost",
     ) -> bool:
         """Revoke privileges from a user on a database."""
-        privs = ", ".join(privileges) if privileges else "ALL PRIVILEGES"
+        privs = self._safe_privileges(privileges)
 
         # Use escaped identifiers to prevent SQL injection
         safe_database = self._escape_identifier(database)

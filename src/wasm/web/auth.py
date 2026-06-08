@@ -11,6 +11,7 @@ Implements secure token-based authentication with:
 
 import hashlib
 import hmac
+import logging
 import os
 import secrets
 import time
@@ -20,6 +21,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set
 
 from jose import JWTError, jwt
+
+from wasm.core.utils import write_private_file
+
+logger = logging.getLogger(__name__)
+
+# JWT issuer claim, validated on decode so tokens from another context are rejected.
+JWT_ISSUER = "wasm-web"
 
 # Security constants
 TOKEN_LENGTH = 32
@@ -53,6 +61,10 @@ class SecurityConfig:
     token_expiration_hours: int = JWT_EXPIRATION_HOURS
     require_https: bool = False
     ip_whitelist: List[str] = field(default_factory=list)
+    # Only honour X-Forwarded-For/X-Real-IP when the direct peer is one of these
+    # addresses. Empty (default) means proxy headers are never trusted, so a
+    # client cannot spoof its IP to evade rate limiting / brute-force lockout.
+    trusted_proxies: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -259,24 +271,25 @@ class TokenManager:
     def _save_master_token(self) -> None:
         """Save master token securely to disk."""
         try:
-            # Create directory if needed
-            TOKEN_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            
             # Hash the token before storing
             token_hash = hashlib.sha256(
                 (self._master_token + self._secret_key).encode()
             ).hexdigest()
-            
-            # Write with restricted permissions
-            TOKEN_FILE_PATH.write_text(token_hash)
-            os.chmod(TOKEN_FILE_PATH, 0o600)
-            
-            # Save secret key too
-            SECRET_FILE_PATH.write_text(self._secret_key)
-            os.chmod(SECRET_FILE_PATH, 0o600)
+
+            # Write secrets that are private (0600) from creation, so there is no
+            # window where the JWT signing key is world-readable.
+            write_private_file(TOKEN_FILE_PATH, token_hash)
+            write_private_file(SECRET_FILE_PATH, self._secret_key)
         except PermissionError:
-            # Running as non-root, store in memory only
-            pass
+            # Running as non-root: the signing key cannot be persisted, so it is
+            # regenerated on every start and all sessions become invalid across
+            # restarts. Warn loudly instead of failing silently.
+            logger.warning(
+                "Could not persist web secret to %s (permission denied). "
+                "The JWT signing key will not survive a restart; run the web "
+                "interface as root or pre-create the file with mode 0600.",
+                SECRET_FILE_PATH,
+            )
     
     def _load_master_token_hash(self) -> Optional[str]:
         """Load the master token hash from disk."""
@@ -337,7 +350,7 @@ class TokenManager:
             "ip": client_ip,
             "iat": now.timestamp(),
             "exp": expires.timestamp(),
-            "iss": "wasm-web",
+            "iss": JWT_ISSUER,
         }
         
         return jwt.encode(payload, self._secret_key, algorithm=JWT_ALGORITHM)
@@ -357,9 +370,11 @@ class TokenManager:
             payload = jwt.decode(
                 token,
                 self._secret_key,
-                algorithms=[JWT_ALGORITHM]
+                algorithms=[JWT_ALGORITHM],
+                issuer=JWT_ISSUER,
+                options={"require": ["exp", "iss"]},
             )
-            
+
             # Verify session is active
             session_id = payload.get("sid")
             if session_id not in self._active_sessions:
@@ -413,34 +428,46 @@ class TokenManager:
         return self.generate_master_token(save=True)
 
 
-def get_client_ip(request) -> str:
+def get_client_ip(request, trusted_proxies: Optional[List[str]] = None) -> str:
     """
     Extract the real client IP from a request.
-    
-    Handles X-Forwarded-For and X-Real-IP headers for
-    requests behind reverse proxies.
-    
+
+    X-Forwarded-For / X-Real-IP headers are client-controlled, so they are only
+    honoured when the direct peer (``request.client.host``) is a configured
+    trusted proxy. Otherwise the direct peer address is used. This prevents a
+    client from spoofing its IP to bypass rate limiting and brute-force lockout.
+
     Args:
         request: FastAPI/Starlette request object.
-        
+        trusted_proxies: Addresses whose forwarding headers may be trusted.
+            Defaults to none (proxy headers ignored).
+
     Returns:
         The client's IP address.
     """
-    # Check for proxy headers
-    forwarded_for = request.headers.get("X-Forwarded-For")
-    if forwarded_for:
-        # Take the first IP in the chain
-        return forwarded_for.split(",")[0].strip()
-    
-    real_ip = request.headers.get("X-Real-IP")
-    if real_ip:
-        return real_ip.strip()
-    
-    # Fall back to direct client IP
-    if request.client:
-        return request.client.host
-    
-    return "unknown"
+    direct_ip = request.client.host if request.client else "unknown"
+
+    # Fall back to the configured trusted proxy list when the caller did not
+    # pass one explicitly. Lazy import avoids an auth<->server import cycle.
+    if trusted_proxies is None:
+        try:
+            from wasm.web.server import _security_config
+            if _security_config is not None:
+                trusted_proxies = _security_config.trusted_proxies
+        except Exception:
+            trusted_proxies = None
+
+    if trusted_proxies and direct_ip in trusted_proxies:
+        forwarded_for = request.headers.get("X-Forwarded-For")
+        if forwarded_for:
+            # Take the first IP in the chain
+            return forwarded_for.split(",")[0].strip()
+
+        real_ip = request.headers.get("X-Real-IP")
+        if real_ip:
+            return real_ip.strip()
+
+    return direct_ip
 
 
 def is_safe_path(path: str) -> bool:

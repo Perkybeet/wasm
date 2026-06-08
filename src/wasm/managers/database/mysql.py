@@ -515,7 +515,7 @@ class MySQLManager(BaseDatabaseManager):
         host: str = "localhost",
     ) -> bool:
         """Grant privileges to a user on a database."""
-        privs = ", ".join(privileges) if privileges else "ALL PRIVILEGES"
+        privs = self._safe_privileges(privileges)
 
         # Use escaped identifiers and literals to prevent SQL injection
         safe_database = self._escape_identifier(database)
@@ -540,7 +540,7 @@ class MySQLManager(BaseDatabaseManager):
         host: str = "localhost",
     ) -> bool:
         """Revoke privileges from a user on a database."""
-        privs = ", ".join(privileges) if privileges else "ALL PRIVILEGES"
+        privs = self._safe_privileges(privileges)
 
         # Use escaped identifiers and literals to prevent SQL injection
         safe_database = self._escape_identifier(database)

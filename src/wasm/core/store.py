@@ -418,6 +418,12 @@ class WASMStore:
                 str(self._db_path),
                 check_same_thread=False,
             )
+            # The store persists service environment values (may contain secrets);
+            # keep the database file private to its owner.
+            try:
+                self._db_path.chmod(0o600)
+            except OSError:
+                pass
             self._local.connection.row_factory = sqlite3.Row
             # Enable foreign keys
             self._local.connection.execute("PRAGMA foreign_keys = ON")

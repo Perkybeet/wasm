@@ -11,6 +11,7 @@ secret auto-generation, and interactive configuration.
 """
 
 import json
+import os
 import secrets
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -499,6 +500,18 @@ class EnvManager:
             # Don't quote values for systemd compatibility
             lines.append(f"{key}={value}")
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        # The .env holds auto-generated secrets (DB passwords, *_SECRET). Restrict
+        # it to its owner and inherit the app directory's owner so the service
+        # user can still read it, while other local users cannot.
+        try:
+            st = path.parent.stat()
+            os.chown(path, st.st_uid, st.st_gid)
+        except (OSError, PermissionError):
+            pass
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
         self.logger.debug(f"Wrote env file: {path}")
 
     def save_config(self, app_path: Path, config: EnvConfig) -> None:

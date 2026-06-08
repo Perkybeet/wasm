@@ -285,6 +285,12 @@ class Config:
             save_path.parent.mkdir(parents=True, exist_ok=True)
             with open(save_path, "w") as f:
                 yaml.dump(self._config, f, default_flow_style=False)
+            # Config holds SMTP/OpenAI/DB credentials: never world-readable.
+            # 0640 keeps it readable by the wasm group (matches package postinst).
+            try:
+                save_path.chmod(0o640)
+            except OSError:
+                pass
             return True
         except Exception:
             return False

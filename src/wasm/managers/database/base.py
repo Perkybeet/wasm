@@ -145,11 +145,46 @@ class BaseDatabaseManager(BaseManager):
             except Exception as e:
                 self.logger.debug(f"Failed to create backup directory {self.BACKUP_DIR}: {e}")
     
+    # SQL privilege keywords that may appear in a GRANT/REVOKE. Privileges cannot
+    # be passed as bound parameters, so they are validated against this allowlist
+    # to prevent SQL injection via the privilege list.
+    _VALID_PRIVILEGES = frozenset({
+        "SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES",
+        "TRIGGER", "CREATE", "CONNECT", "TEMPORARY", "TEMP", "EXECUTE", "USAGE",
+        "DROP", "ALTER", "INDEX", "GRANT OPTION", "LOCK TABLES", "SHOW VIEW",
+        "CREATE VIEW", "CREATE ROUTINE", "ALTER ROUTINE", "EVENT", "RELOAD",
+        "ALL", "ALL PRIVILEGES",
+    })
+
+    @classmethod
+    def _safe_privileges(cls, privileges: Optional[List[str]]) -> str:
+        """
+        Validate and join a privilege list for use in GRANT/REVOKE.
+
+        Args:
+            privileges: Requested privilege keywords, or None for ALL PRIVILEGES.
+
+        Returns:
+            A comma-separated privilege string safe to interpolate into SQL.
+
+        Raises:
+            DatabaseUserError: If any privilege is not a known SQL keyword.
+        """
+        if not privileges:
+            return "ALL PRIVILEGES"
+        safe = []
+        for priv in privileges:
+            token = " ".join(str(priv).strip().upper().split())
+            if token not in cls._VALID_PRIVILEGES:
+                raise DatabaseUserError(f"Invalid privilege: {priv!r}")
+            safe.append(token)
+        return ", ".join(safe)
+
     @staticmethod
     def generate_password(length: int = 24) -> str:
         """
         Generate a secure random password.
-        
+
         Args:
             length: Password length.
             

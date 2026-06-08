@@ -216,6 +216,29 @@ def sanitize_name(name: str) -> str:
     return sanitized
 
 
+def write_private_file(path: Union[str, Path], content: str) -> None:
+    """
+    Write content to a file that is private (mode 0600) from creation.
+
+    Opens with mode 0600 and fchmod()s the descriptor before writing, so there
+    is no window during which the file is world-readable, even if it already
+    existed with looser permissions. Used for secrets such as the JWT signing
+    key and the master token hash.
+
+    Args:
+        path: Destination file path.
+        content: Text content to write.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, content.encode())
+    finally:
+        os.close(fd)
+
+
 def domain_to_app_name(domain: str) -> str:
     """
     Convert a domain to an application name.

@@ -426,7 +426,10 @@ def run_server(
         print("=" * 60)
         print(f"Access Token: {master_token}")
         print(f"Server: http://{local_ip}:{port}")
-        print(f"Quick Login: http://{local_ip}:{port}/login?token={master_token}")
+        # Do not build a /login?token=... URL: tokens in URLs leak into proxy
+        # access logs, browser history and Referer headers. Paste the token into
+        # the login form instead.
+        print(f"Login at:  http://{local_ip}:{port}/login")
         print("Keep this token secure! It grants full access to WASM.")
         print("=" * 60)
         print(flush=True)

@@ -296,9 +296,10 @@ class ServiceManager(BaseManager):
         except Exception as e:
             raise TemplateError(f"Template rendering failed: {e}")
         
-        # Write service file
+        # Write service file. The unit may carry Environment= secrets, so it must
+        # not be world-readable; 0640 is enough for systemd (runs as root) to read.
         service_file = self._get_service_file(name)
-        if not write_file(service_file, service_content, sudo=True):
+        if not write_file(service_file, service_content, sudo=True, mode=0o640):
             raise ServiceError(f"Failed to write service file: {service_file}")
         
         # Reload daemon

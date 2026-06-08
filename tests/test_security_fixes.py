@@ -171,5 +171,153 @@ class TestDatabaseShellEscaping(unittest.TestCase):
             self.assertIn(shlex.quote(self.EVIL), "\n".join(scripts))
 
 
+class TestPrivilegeValidation(unittest.TestCase):
+    """V6: GRANT/REVOKE privilege lists are validated against an allowlist."""
+
+    def test_accepts_known_privileges(self):
+        from wasm.managers.database.postgres import PostgresManager
+
+        self.assertEqual(PostgresManager._safe_privileges(None), "ALL PRIVILEGES")
+        self.assertEqual(
+            PostgresManager._safe_privileges(["select", "insert", "all privileges"]),
+            "SELECT, INSERT, ALL PRIVILEGES",
+        )
+
+    def test_rejects_injection_in_privilege_list(self):
+        from wasm.managers.database.postgres import PostgresManager
+        from wasm.core.exceptions import DatabaseUserError
+
+        for bad in ["SELECT; DROP DATABASE x", "ALL TO attacker", "1=1"]:
+            with self.assertRaises(DatabaseUserError):
+                PostgresManager._safe_privileges([bad])
+
+
+class TestPostgresCreateDatabase(unittest.TestCase):
+    """V6: encoding is charset-checked and template is escaped as an identifier."""
+
+    def test_rejects_malicious_encoding(self):
+        from wasm.managers.database.postgres import PostgresManager
+        from wasm.core.exceptions import DatabaseError
+
+        with patch.object(PostgresManager, "_ensure_backup_dir", lambda self: None), \
+             patch.object(PostgresManager, "database_exists", lambda self, n: False):
+            mgr = PostgresManager(verbose=False)
+            with self.assertRaises(DatabaseError):
+                mgr.create_database("db", encoding="UTF8'; DROP DATABASE x; --")
+
+    def test_escapes_template_identifier(self):
+        from wasm.managers.database.postgres import PostgresManager
+
+        captured = {}
+
+        def fake_exec(self, sql, database=None):
+            captured["sql"] = sql
+            return True, ""
+
+        with patch.object(PostgresManager, "_ensure_backup_dir", lambda self: None), \
+             patch.object(PostgresManager, "database_exists", lambda self, n: False), \
+             patch.object(PostgresManager, "_execute_sql", fake_exec), \
+             patch.object(PostgresManager, "get_database_info", lambda self, n: None):
+            mgr = PostgresManager(verbose=False)
+            mgr.create_database("db", template='t"; DROP DATABASE x; --')
+
+        sql = captured["sql"]
+        # The template is wrapped/escaped as a quoted identifier, so the ';'
+        # cannot terminate the CREATE DATABASE statement.
+        self.assertIn('"t""; DROP DATABASE x; --"', sql)
+
+
+class TestPrivateFile(unittest.TestCase):
+    """V7: secrets are written with mode 0600, even over a looser pre-existing file."""
+
+    def test_write_private_file_mode(self):
+        import os
+        import stat
+        from wasm.core.utils import write_private_file
+
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "secret"
+            p.write_text("old")
+            os.chmod(p, 0o644)  # pre-existing world-readable file
+            write_private_file(p, "supersecret")
+            self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o600)
+            self.assertEqual(p.read_text(), "supersecret")
+
+
+class TestMongoJsEscaping(unittest.TestCase):
+    """V9: user/db values are JSON-escaped before going into the mongo JS."""
+
+    def test_create_user_escapes_quotes(self):
+        from wasm.managers.database.mongodb import MongoDBManager
+        import json
+
+        captured = []
+        with patch.object(MongoDBManager, "_ensure_backup_dir", lambda self: None), \
+             patch.object(MongoDBManager, "user_exists", lambda self, u, host="localhost": False):
+            mgr = MongoDBManager(verbose=False)
+            mgr._execute_mongo = lambda cmd, database="admin": (captured.append(cmd), (True, ""))[1]
+            evil = "x', pwd:'y', roles:[{role:'root',db:'admin'}]});//"
+            mgr.create_user(evil, password="p'q")
+
+        js = captured[0]
+        # The username appears only as a JSON-escaped string literal.
+        self.assertIn(json.dumps(evil), js)
+        # The injected role payload is not present outside the escaped literal.
+        self.assertNotIn("roles:[{role:'root'", js.replace(json.dumps(evil), ""))
+
+
+try:
+    import jose  # noqa: F401
+    _HAS_JOSE = True
+except ImportError:
+    _HAS_JOSE = False
+
+
+@unittest.skipUnless(_HAS_JOSE, "requires python-jose (optional web stack)")
+class TestClientIpAndJwt(unittest.TestCase):
+    """V5/V8 - run only when the web stack is installed (e.g. CI)."""
+
+    @staticmethod
+    def _req(client_host, headers):
+        class _Client:
+            host = client_host
+
+        class _Req:
+            client = _Client()
+
+            def __init__(self, hdrs):
+                self.headers = hdrs
+
+        return _Req(headers)
+
+    def test_forwarded_header_ignored_without_trusted_proxy(self):
+        from wasm.web.auth import get_client_ip
+
+        req = self._req("10.0.0.1", {"X-Forwarded-For": "6.6.6.6"})
+        self.assertEqual(get_client_ip(req), "10.0.0.1")
+
+    def test_forwarded_header_honoured_for_trusted_proxy(self):
+        from wasm.web.auth import get_client_ip
+
+        req = self._req("10.0.0.1", {"X-Forwarded-For": "6.6.6.6"})
+        self.assertEqual(get_client_ip(req, trusted_proxies=["10.0.0.1"]), "6.6.6.6")
+
+    def test_jwt_rejects_wrong_issuer(self):
+        from datetime import datetime, timedelta, timezone
+
+        from jose import jwt as jose_jwt
+
+        from wasm.web.auth import TokenManager, SecurityConfig
+
+        tm = TokenManager(SecurityConfig())
+        exp = (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp()
+        forged = jose_jwt.encode(
+            {"sub": "wasm_session", "sid": "s1", "exp": exp, "iss": "evil"},
+            tm._secret_key,
+            algorithm="HS256",
+        )
+        self.assertIsNone(tm.verify_session_token(forged, "1.2.3.4"))
+
+
 if __name__ == "__main__":
     unittest.main()

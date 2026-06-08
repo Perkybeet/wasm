@@ -194,14 +194,14 @@ class MongoDBManager(BaseDatabaseManager):
             raise DatabaseExistsError(f"Database '{name}' already exists")
         
         # Create a collection to instantiate the database
-        cmd = f"db.getSiblingDB('{name}').createCollection('_wasm_init')"
+        cmd = f"db.getSiblingDB({json.dumps(name)}).createCollection('_wasm_init')"
         success, output = self._execute_mongo(cmd)
-        
+
         if not success:
             raise DatabaseError(f"Failed to create database '{name}'", output)
-        
+
         # Drop the temp collection
-        self._execute_mongo(f"db.getSiblingDB('{name}')._wasm_init.drop()")
+        self._execute_mongo(f"db.getSiblingDB({json.dumps(name)})._wasm_init.drop()")
         
         self.logger.info(f"Created database: {name}")
         return self.get_database_info(name)
@@ -211,7 +211,7 @@ class MongoDBManager(BaseDatabaseManager):
         if not self.database_exists(name) and not force:
             raise DatabaseNotFoundError(f"Database '{name}' does not exist")
         
-        cmd = f"db.getSiblingDB('{name}').dropDatabase()"
+        cmd = f"db.getSiblingDB({json.dumps(name)}).dropDatabase()"
         success, output = self._execute_mongo(cmd)
         
         if not success:
@@ -261,7 +261,7 @@ class MongoDBManager(BaseDatabaseManager):
             raise DatabaseNotFoundError(f"Database '{name}' does not exist")
         
         # Get database stats
-        cmd = f"db.getSiblingDB('{name}').stats()"
+        cmd = f"db.getSiblingDB({json.dumps(name)}).stats()"
         success, data = self._execute_mongo_json(cmd)
         
         size = None
@@ -305,12 +305,14 @@ class MongoDBManager(BaseDatabaseManager):
         database = kwargs.get("database", "admin")
         roles = kwargs.get("roles", [{"role": "readWrite", "db": database}])
         
-        # Build create user command
+        # Build create user command. json.dumps emits properly escaped JS string
+        # literals, so a quote in username/password cannot break out of the JS
+        # context and inject arbitrary shell-side commands (V9).
         roles_json = json.dumps(roles)
         cmd = f"""
-            db.getSiblingDB('{database}').createUser({{
-                user: '{username}',
-                pwd: '{password}',
+            db.getSiblingDB({json.dumps(database)}).createUser({{
+                user: {json.dumps(username)},
+                pwd: {json.dumps(password)},
                 roles: {roles_json}
             }})
         """
@@ -337,7 +339,7 @@ class MongoDBManager(BaseDatabaseManager):
         if not self.user_exists(username):
             raise DatabaseUserError(f"User '{username}' does not exist")
         
-        cmd = f"db.dropUser('{username}')"
+        cmd = f"db.dropUser({json.dumps(username)})"
         success, output = self._execute_mongo(cmd, database="admin")
         
         if not success:
@@ -348,7 +350,7 @@ class MongoDBManager(BaseDatabaseManager):
     
     def user_exists(self, username: str, host: str = "localhost") -> bool:
         """Check if a user exists."""
-        cmd = f"db.getUser('{username}')"
+        cmd = f"db.getUser({json.dumps(username)})"
         success, output = self._execute_mongo(cmd, database="admin")
         return success and output.strip() and output.strip() != "null"
     
@@ -397,7 +399,7 @@ class MongoDBManager(BaseDatabaseManager):
         roles = privileges or ["readWrite"]
         
         roles_json = json.dumps([{"role": r, "db": database} for r in roles])
-        cmd = f"db.grantRolesToUser('{username}', {roles_json})"
+        cmd = f"db.grantRolesToUser({json.dumps(username)}, {roles_json})"
         
         success, output = self._execute_mongo(cmd, database="admin")
         
@@ -418,7 +420,7 @@ class MongoDBManager(BaseDatabaseManager):
         roles = privileges or ["readWrite"]
         
         roles_json = json.dumps([{"role": r, "db": database} for r in roles])
-        cmd = f"db.revokeRolesFromUser('{username}', {roles_json})"
+        cmd = f"db.revokeRolesFromUser({json.dumps(username)}, {roles_json})"
         
         success, output = self._execute_mongo(cmd, database="admin")
         
