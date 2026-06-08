@@ -1,6 +1,17 @@
 # .gitattributes
 # Control what gets included in git archive (used for source tarballs)
 
+# Line ending normalization: store everything as LF in the repo to avoid
+# CRLF corruption when editing on Windows/WSL.
+* text=auto eol=lf
+
+# Scripts and config that must keep Unix line endings to run correctly
+*.sh text eol=lf
+*.py text eol=lf
+obs/debian.rules text eol=lf
+obs/debian.postinst text eol=lf
+obs/debian.postrm text eol=lf
+
 # Exclude development and CI files
 .github/ export-ignore
 .gitignore export-ignore
