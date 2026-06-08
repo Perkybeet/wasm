@@ -254,7 +254,7 @@ async def websocket_system(
             
             metrics = {
                 "type": "metrics",
-                "timestamp": asyncio.get_event_loop().time(),
+                "timestamp": asyncio.get_running_loop().time(),
                 "cpu": {
                     "percent": cpu_percent,
                     "cores": psutil.cpu_count()

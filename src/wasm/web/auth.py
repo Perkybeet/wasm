@@ -15,7 +15,7 @@ import os
 import secrets
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
@@ -324,7 +324,7 @@ class TokenManager:
         Returns:
             JWT token string.
         """
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         expires = now + timedelta(hours=self.config.token_expiration_hours)
         
         # Generate unique session ID
