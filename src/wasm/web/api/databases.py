@@ -14,6 +14,7 @@ from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
 from pydantic import BaseModel, Field
 
 from wasm.web.api.auth import get_current_session
+from wasm.validators.webinput import is_within_directory, query_has_os_escalation
 from wasm.managers.database import (
     DatabaseRegistry,
     get_db_manager,
@@ -756,10 +757,18 @@ async def restore_backup(
     
     from pathlib import Path
     backup_path = Path(request.backup_path)
-    
+
+    # Restrict restores to the managed backup directory so the web surface
+    # cannot read/process arbitrary files on disk (V4: path-controlled restore).
+    if not is_within_directory(manager.BACKUP_DIR, backup_path):
+        raise HTTPException(
+            status_code=400,
+            detail="backup_path must be inside the managed backup directory",
+        )
+
     if not backup_path.exists():
         raise HTTPException(status_code=404, detail=f"Backup file not found: {request.backup_path}")
-    
+
     try:
         manager.restore(
             database=request.database,
@@ -784,7 +793,16 @@ async def execute_query(
     """Execute a database query."""
     manager = get_manager(request.engine)
     check_running(manager)
-    
+
+    # Block SQL that escalates to OS command/file access on the DB host
+    # (e.g. Postgres COPY ... TO PROGRAM, MySQL INTO OUTFILE). This keeps the
+    # console usable for ordinary SQL while removing the RCE primitive (V3).
+    if query_has_os_escalation(request.query):
+        raise HTTPException(
+            status_code=400,
+            detail="Query rejected: filesystem or program execution is not allowed via the web console",
+        )
+
     try:
         success, output = manager.execute_query(
             database=request.database,

@@ -7,6 +7,7 @@ PostgreSQL database manager for WASM.
 """
 
 import re
+import shlex
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -520,16 +521,20 @@ class PostgresManager(BaseDatabaseManager):
             # Return info for the last schema (caller should use backup_all_schemas for full results)
             return results[-1] if results else self.backup_schema(database, schemas[0], compress=compress)
 
+        # shlex.quote prevents shell injection via database/path inside bash -c
+        q_db = shlex.quote(database)
+        q_path = shlex.quote(str(backup_path))
         if compress and format_opt == "plain":
             # Pipe through gzip
-            full_cmd = f"sudo -u postgres pg_dump {database} | gzip > {backup_path}"
+            full_cmd = f"sudo -u postgres pg_dump {q_db} | gzip > {q_path}"
             result = self._run(["bash", "-c", full_cmd])
         else:
-            cmd = ["sudo", "-u", "postgres", "pg_dump", "-Fc" if format_opt == "custom" else "", database]
-            cmd = [c for c in cmd if c]  # Remove empty strings
-            result = self._run(cmd)
-            if result.success:
-                self._run_sudo(["bash", "-c", f"echo '{result.stdout}' > {backup_path}"])
+            # Redirect pg_dump straight to the file instead of routing the whole
+            # dump through `echo '...'`, which broke on quotes/binary output and
+            # allowed shell injection from the dump contents.
+            fmt = "-Fc " if format_opt == "custom" else ""
+            full_cmd = f"sudo -u postgres pg_dump {fmt}{q_db} > {q_path}"
+            result = self._run(["bash", "-c", full_cmd])
         
         if not result.success:
             raise DatabaseBackupError(f"Failed to backup database '{database}'", result.stderr)
@@ -618,7 +623,10 @@ class PostgresManager(BaseDatabaseManager):
         self._run_sudo(["mkdir", "-p", str(backup_path.parent)])
 
         if compress:
-            full_cmd = f"sudo -u postgres pg_dump --schema={schema} {database} | gzip > {backup_path}"
+            full_cmd = (
+                f"sudo -u postgres pg_dump --schema={shlex.quote(schema)} "
+                f"{shlex.quote(database)} | gzip > {shlex.quote(str(backup_path))}"
+            )
             result = self._run(["bash", "-c", full_cmd])
         else:
             result = self._run([
@@ -711,7 +719,10 @@ class PostgresManager(BaseDatabaseManager):
         
         # Restore based on compression
         if backup_path.suffix == ".gz":
-            full_cmd = f"gunzip < {backup_path} | sudo -u postgres psql {database}"
+            full_cmd = (
+                f"gunzip < {shlex.quote(str(backup_path))} "
+                f"| sudo -u postgres psql {shlex.quote(database)}"
+            )
             result = self._run(["bash", "-c", full_cmd])
         else:
             result = self._run(["sudo", "-u", "postgres", "psql", database, "-f", str(backup_path)])

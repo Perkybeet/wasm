@@ -8,6 +8,7 @@ MySQL/MariaDB database manager for WASM.
 
 import os
 import re
+import shlex
 import tempfile
 from contextlib import contextmanager
 from datetime import datetime
@@ -582,8 +583,9 @@ class MySQLManager(BaseDatabaseManager):
         cmd = ["mysqldump", "--single-transaction", "--routines", "--triggers", database]
         
         if compress:
-            # Pipe through gzip
-            full_cmd = " ".join(cmd) + f" | gzip > {backup_path}"
+            # Pipe through gzip. Quote every arg (incl. database) to block
+            # shell injection inside bash -c.
+            full_cmd = " ".join(shlex.quote(c) for c in cmd) + f" | gzip > {shlex.quote(str(backup_path))}"
             result = self._run_sudo(["bash", "-c", full_cmd])
         else:
             result = self._run_sudo(cmd)
@@ -627,11 +629,13 @@ class MySQLManager(BaseDatabaseManager):
             self.create_database(database)
         
         # Restore based on compression
+        q_db = shlex.quote(database)
+        q_path = shlex.quote(str(backup_path))
         if backup_path.suffix == ".gz":
-            full_cmd = f"gunzip < {backup_path} | mysql {database}"
+            full_cmd = f"gunzip < {q_path} | mysql {q_db}"
             result = self._run_sudo(["bash", "-c", full_cmd])
         else:
-            result = self._run_sudo(["bash", "-c", f"mysql {database} < {backup_path}"])
+            result = self._run_sudo(["bash", "-c", f"mysql {q_db} < {q_path}"])
         
         if not result.success:
             raise DatabaseBackupError(f"Failed to restore database '{database}'", result.stderr)

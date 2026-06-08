@@ -12,6 +12,7 @@ and authentication is global.
 
 import os
 import re
+import shlex
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -481,7 +482,7 @@ class RedisManager(BaseDatabaseManager):
         rdb_file = self.DATA_DIR / "dump.rdb"
         
         if compress:
-            result = self._run_sudo(["bash", "-c", f"gzip -c {rdb_file} > {backup_path}"])
+            result = self._run_sudo(["bash", "-c", f"gzip -c {shlex.quote(str(rdb_file))} > {shlex.quote(str(backup_path))}"])
         else:
             result = self._run_sudo(["cp", str(rdb_file), str(backup_path)])
         
@@ -564,7 +565,7 @@ class RedisManager(BaseDatabaseManager):
             aof_file = self.DATA_DIR / "appendonly.aof"
 
         if compress:
-            result = self._run_sudo(["bash", "-c", f"gzip -c {aof_file} > {backup_path}"])
+            result = self._run_sudo(["bash", "-c", f"gzip -c {shlex.quote(str(aof_file))} > {shlex.quote(str(backup_path))}"])
         else:
             result = self._run_sudo(["cp", str(aof_file), str(backup_path)])
 
@@ -605,7 +606,7 @@ class RedisManager(BaseDatabaseManager):
         rdb_file = self.DATA_DIR / "dump.rdb"
         
         if backup_path.suffix == ".gz":
-            result = self._run_sudo(["bash", "-c", f"gunzip -c {backup_path} > {rdb_file}"])
+            result = self._run_sudo(["bash", "-c", f"gunzip -c {shlex.quote(str(backup_path))} > {shlex.quote(str(rdb_file))}"])
         else:
             result = self._run_sudo(["cp", str(backup_path), str(rdb_file)])
         

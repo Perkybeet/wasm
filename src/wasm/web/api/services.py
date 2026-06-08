@@ -4,16 +4,35 @@ Services API endpoints.
 Provides endpoints for managing systemd services.
 """
 
+import re
 import subprocess
+from pathlib import Path
 from typing import List, Optional
 
 from fastapi import APIRouter, Request, HTTPException, Depends, Query
 from pydantic import BaseModel
 
 from wasm.web.api.auth import get_current_session
+from wasm.validators.webinput import is_safe_resource_name, is_within_directory
 from wasm.core.store import get_store
 
 router = APIRouter()
+
+SYSTEMD_DIR = Path("/etc/systemd/system")
+
+
+def _require_safe_name(name: str) -> str:
+    """Reject service names that could traverse paths or inject systemd directives."""
+    if not is_safe_resource_name(name):
+        raise HTTPException(status_code=400, detail=f"Invalid service name: {name!r}")
+    return name
+
+
+def _reject_newlines(value: str, field: str) -> str:
+    """Reject CR/LF so a field cannot inject extra systemd unit directives."""
+    if value is not None and ("\n" in value or "\r" in value):
+        raise HTTPException(status_code=400, detail=f"Invalid {field}: line breaks are not allowed")
+    return value
 
 
 class ServiceInfo(BaseModel):
@@ -281,6 +300,7 @@ async def get_service_logs(
     Get service logs from journalctl.
     """
     from wasm.managers.service_manager import ServiceManager
+    _require_safe_name(name)
     service_manager = ServiceManager(verbose=False)
     service_name = service_manager._resolve_service_name(name)
 
@@ -313,16 +333,16 @@ async def get_service_config(
     """
     Get the systemd unit file content for a service.
     """
-    from pathlib import Path
     from wasm.managers.service_manager import ServiceManager
 
+    _require_safe_name(name)
     service_manager = ServiceManager(verbose=False)
     service_name = service_manager._resolve_service_name(name)
-    service_path = Path(f"/etc/systemd/system/{service_name}.service")
-    
+    service_path = SYSTEMD_DIR / f"{service_name}.service"
+
     if not service_path.exists():
         raise HTTPException(status_code=404, detail=f"Service not found: {service_name}")
-    
+
     try:
         content = service_path.read_text()
         return {
@@ -349,16 +369,16 @@ async def update_service_config(
     """
     Update the systemd unit file content for a service.
     """
-    from pathlib import Path
     from wasm.managers.service_manager import ServiceManager
 
+    _require_safe_name(name)
     service_manager = ServiceManager(verbose=False)
     service_name = service_manager._resolve_service_name(name)
-    service_path = Path(f"/etc/systemd/system/{service_name}.service")
-    
+    service_path = SYSTEMD_DIR / f"{service_name}.service"
+
     if not service_path.exists():
         raise HTTPException(status_code=404, detail=f"Service not found: {service_name}")
-    
+
     try:
         # Write the new config
         service_path.write_text(data.config)
@@ -384,15 +404,17 @@ async def create_service(
     """
     Create a new systemd service.
     """
-    from pathlib import Path
+    # New services don't use wasm- prefix.
+    # Validate the name so it cannot traverse out of SYSTEMD_DIR or be treated
+    # as an option/relative path (V2: arbitrary file write as root).
+    service_name = _require_safe_name(data.name)
+    service_path = SYSTEMD_DIR / f"{service_name}.service"
+    if not is_within_directory(SYSTEMD_DIR, service_path):
+        raise HTTPException(status_code=400, detail=f"Invalid service name: {service_name!r}")
 
-    # New services don't use wasm- prefix
-    service_name = data.name
-    service_path = Path(f"/etc/systemd/system/{service_name}.service")
-    
     if service_path.exists():
         raise HTTPException(status_code=400, detail=f"Service already exists: {service_name}")
-    
+
     # Use raw content if provided (advanced mode)
     if data.raw_content:
         service_content = data.raw_content
@@ -400,13 +422,28 @@ async def create_service(
         # Validate command is provided in simple mode
         if not data.command:
             raise HTTPException(status_code=400, detail="Command is required in simple mode")
-        
+
+        # Reject line breaks in structured fields so a value cannot inject extra
+        # systemd directives (e.g. User=root\nExecStartPre=...).
+        _reject_newlines(data.command, "command")
+        _reject_newlines(data.user, "user")
+        _reject_newlines(data.working_directory, "working_directory")
+        _reject_newlines(data.restart, "restart")
+
         # Build environment section
         env_section = ""
         if data.environment:
-            env_lines = [f"Environment=\"{k}={v}\"" for k, v in data.environment.items()]
+            env_lines = []
+            for k, v in data.environment.items():
+                key = str(k)
+                val = str(v)
+                if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
+                    raise HTTPException(status_code=400, detail=f"Invalid environment key: {key!r}")
+                if "\n" in val or "\r" in val or '"' in val:
+                    raise HTTPException(status_code=400, detail=f"Invalid value for environment key {key!r}")
+                env_lines.append(f'Environment="{key}={val}"')
             env_section = "\n".join(env_lines) + "\n"
-        
+
         # Create service file
         service_content = f"""[Unit]
 Description=WASM Service: {data.name}
@@ -458,16 +495,16 @@ async def delete_service(
     """
     Delete a systemd service.
     """
-    from pathlib import Path
     from wasm.managers.service_manager import ServiceManager
 
+    _require_safe_name(name)
     service_manager = ServiceManager(verbose=False)
     service_name = service_manager._resolve_service_name(name)
-    service_path = Path(f"/etc/systemd/system/{service_name}.service")
-    
+    service_path = SYSTEMD_DIR / f"{service_name}.service"
+
     if not service_path.exists():
         raise HTTPException(status_code=404, detail=f"Service not found: {service_name}")
-    
+
     try:
         # Stop the service
         subprocess.run(

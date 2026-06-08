@@ -12,6 +12,9 @@ from fastapi import APIRouter, Request, HTTPException, Depends
 from pydantic import BaseModel
 
 from wasm.web.api.auth import get_current_session
+from wasm.validators.webinput import is_safe_resource_name, is_within_directory
+from wasm.validators.domain import validate_domain
+from wasm.core.exceptions import DomainError
 from wasm.core.config import (
     NGINX_SITES_AVAILABLE,
     NGINX_SITES_ENABLED,
@@ -21,6 +24,21 @@ from wasm.core.config import (
 from wasm.core.store import get_store
 
 router = APIRouter()
+
+
+def _safe_config_path(available_dir: Path, name: str) -> Path:
+    """
+    Resolve a site config path, rejecting traversal out of ``available_dir``.
+
+    Prevents reading/writing arbitrary files as root via the ``name`` path
+    parameter (V2: arbitrary file write/read).
+    """
+    if not is_safe_resource_name(name):
+        raise HTTPException(status_code=400, detail=f"Invalid site name: {name!r}")
+    config_path = available_dir / name
+    if not is_within_directory(available_dir, config_path):
+        raise HTTPException(status_code=400, detail=f"Invalid site name: {name!r}")
+    return config_path
 
 
 class SiteInfo(BaseModel):
@@ -212,12 +230,12 @@ async def get_site_config(
         available_dir = NGINX_SITES_AVAILABLE
     else:
         available_dir = APACHE_SITES_AVAILABLE
-    
-    config_path = available_dir / name
-    
+
+    config_path = _safe_config_path(available_dir, name)
+
     if not config_path.exists():
         raise HTTPException(status_code=404, detail=f"Site not found: {name}")
-    
+
     try:
         content = config_path.read_text()
         return {
@@ -250,12 +268,12 @@ async def update_site_config(
         available_dir = NGINX_SITES_AVAILABLE
     else:
         available_dir = APACHE_SITES_AVAILABLE
-    
-    config_path = available_dir / name
-    
+
+    config_path = _safe_config_path(available_dir, name)
+
     if not config_path.exists():
         raise HTTPException(status_code=404, detail=f"Site not found: {name}")
-    
+
     try:
         # Write the new config
         config_path.write_text(data.config)
@@ -287,11 +305,23 @@ async def create_site(
         available_dir = APACHE_SITES_AVAILABLE
         enabled_dir = APACHE_SITES_ENABLED
     
-    site_name = data.domain.replace(".", "_")
+    # Validate the domain so it cannot traverse paths or inject config content
+    # via the file name (V2: arbitrary file write as root).
+    try:
+        domain = validate_domain(data.domain)
+    except DomainError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    data.domain = domain
+
+    site_name = domain.replace(".", "_")
+    if not is_safe_resource_name(site_name):
+        raise HTTPException(status_code=400, detail=f"Invalid domain: {data.domain!r}")
     config_path = available_dir / site_name
-    
+    if not is_within_directory(available_dir, config_path):
+        raise HTTPException(status_code=400, detail=f"Invalid domain: {data.domain!r}")
+
     if config_path.exists():
-        raise HTTPException(status_code=400, detail=f"Site already exists: {data.domain}")
+        raise HTTPException(status_code=400, detail=f"Site already exists: {domain}")
     
     # Generate config based on template
     if webserver == "nginx":
