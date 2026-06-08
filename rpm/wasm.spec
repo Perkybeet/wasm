@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.15.8
+Version:        0.15.9
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -137,6 +137,19 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
 fi
 
 %changelog
+* Mon Jun 08 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.15.9-1
+- Security: Validate service/site names and contain config paths (web API)
+- Security: Reject SQL that escalates to OS command/file access on the query console
+- Security: shlex-quote database names and paths in backup/restore (shell injection)
+- Security: Restrict database restore to the managed backup directory
+- Security: Ignore spoofable X-Forwarded-For for rate limiting unless trusted proxy
+- Security: Validate GRANT/REVOKE privileges and CREATE DATABASE encoding/template
+- Security: Write secrets with restrictive permissions and no world-readable window
+- Security: Validate JWT issuer and stop leaking the token in login URLs
+- Security: JSON-escape values interpolated into MongoDB shell commands
+- Compatibility: Support Python 3.13 and 3.14 (Ubuntu 26.04 LTS)
+- Chore: Normalize repository line endings to LF
+
 * Fri Mar 20 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.15.8-1
 - Feature: Auto-verify and expand SSL certificates for www subdomain coverage
 - Enhancement: cert_manager.obtain() checks domain coverage before skipping existing certs

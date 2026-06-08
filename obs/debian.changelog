@@ -1,3 +1,24 @@
+wasm (0.15.9-1) unstable; urgency=high
+
+  * Security: Validate service/site names and contain config paths to prevent
+    arbitrary file writes as root via the web API
+  * Security: Reject SQL that escalates to OS command/file access on the web
+    query console (COPY ... TO PROGRAM, INTO OUTFILE, LOAD_FILE, etc.)
+  * Security: shlex-quote database names and paths in database backup/restore
+    to prevent shell injection
+  * Security: Restrict database restore to the managed backup directory
+  * Security: Ignore spoofable X-Forwarded-For for rate limiting unless the peer
+    is a configured trusted proxy
+  * Security: Validate GRANT/REVOKE privileges and CREATE DATABASE encoding/template
+  * Security: Write secrets (JWT key, config.yaml, .env, store, systemd units)
+    with restrictive permissions and no world-readable window
+  * Security: Validate JWT issuer and stop emitting login URLs that leak the token
+  * Security: JSON-escape values interpolated into MongoDB shell commands
+  * Compatibility: Support Python 3.13 and 3.14 (Ubuntu 26.04 LTS)
+  * Chore: Normalize repository line endings to LF via .gitattributes
+
+ -- Yago Lopez Prado <yago.lopez.adeje@gmail.com>  Mon, 08 Jun 2026 12:00:00 +0000
+
 wasm (0.15.8-1) unstable; urgency=medium
 
   * Feature: Auto-verify and expand SSL certificates for www subdomain coverage
