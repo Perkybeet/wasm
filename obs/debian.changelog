@@ -1,3 +1,9 @@
+wasm (1.0.3-1) unstable; urgency=medium
+
+  * Fix: the Debian build dependencies in wasm.dsc and debian.control agree, and are the minimum that builds a wheel
+
+ -- Yago Lopez Prado <yago.lopez.adeje@gmail.com>  Wed, 12 Aug 2026 16:38:49 +0000
+
 wasm (1.0.2-1) unstable; urgency=medium
 
   * Fix: interactive mode works again; it still imported inquirer after that stopped being a dependency

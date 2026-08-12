@@ -6,17 +6,16 @@ Maintainer: Yago López Prado <yago.lopez.adeje@gmail.com>
 # at import time is needed at build time too, not only at run time. Leaving
 # these out is what made every OBS target fail with ModuleNotFoundError while
 # the GitHub runner, which happens to ship python3-yaml, built fine.
+# Only what builds a wheel. Nothing here runs the package: the shell
+# completions are committed rather than generated, which is what removed
+# the whole class of failure where every runtime import became a build
+# dependency on every distribution and every architecture.
 Build-Depends: debhelper-compat (= 13),
                dh-python,
                pybuild-plugin-pyproject,
                python3-all,
                python3-setuptools,
-               python3-wheel,
-               python3-click,
-               python3-jinja2,
-               python3-yaml,
-               python3-questionary,
-               python3-rich
+               python3-wheel
 Standards-Version: 4.6.0
 Homepage: https://github.com/Perkybeet/wasm
 Rules-Requires-Root: no

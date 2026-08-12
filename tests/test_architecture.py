@@ -421,6 +421,60 @@ class TestPackaging:
             + "\n".join(f"  {pattern}" for pattern in missing)
         )
 
+    def test_the_debian_build_dependencies_agree(self):
+        """
+        wasm.dsc and debian.control must declare the same build dependencies.
+
+        OBS builds the buildroot from the .dsc and debhelper checks against
+        debian/control, so a difference between them means the build either
+        fails for a dependency that is declared in the wrong file, or succeeds
+        on one machine and not another.
+        """
+
+        def build_deps(text: str) -> set[str]:
+            lines = text.splitlines()
+            start = next(i for i, line in enumerate(lines) if line.startswith("Build-Depends:"))
+            collected = lines[start].split(":", 1)[1]
+            index = start
+            while collected.rstrip().endswith(","):
+                index += 1
+                collected += lines[index]
+            return {part.strip() for part in collected.split(",") if part.strip()}
+
+        dsc = build_deps((REPO / "obs/wasm.dsc").read_text(encoding="utf-8"))
+        control = build_deps((REPO / "obs/debian.control").read_text(encoding="utf-8"))
+
+        assert dsc == control, (
+            "obs/wasm.dsc and obs/debian.control disagree:\n"
+            f"  only in wasm.dsc:      {sorted(dsc - control)}\n"
+            f"  only in debian.control: {sorted(control - dsc)}"
+        )
+
+    def test_nothing_runs_the_package_during_a_distribution_build(self):
+        """
+        A packaging recipe must not execute the package it is building.
+
+        Doing it to generate the shell completions made every runtime import a
+        build dependency, and one missing entry failed all twenty-two OBS
+        targets at once. The completions are committed instead.
+        """
+        recipes = {
+            "obs/debian.rules": (REPO / "obs/debian.rules").read_text(encoding="utf-8"),
+            "rpm/wasm.spec": (REPO / "rpm/wasm.spec").read_text(encoding="utf-8"),
+        }
+
+        offenders = [
+            f"{name}: {line.strip()}"
+            for name, text in recipes.items()
+            for line in text.splitlines()
+            if "_WASM_COMPLETE" in line or "-m wasm" in line
+        ]
+
+        assert not offenders, (
+            "These lines run the package during a distribution build:\n"
+            + "\n".join(f"  {line}" for line in offenders)
+        )
+
     def test_version_is_consistent_across_packaging_files(self):
         """The version lives in six files; drift caused corrective releases."""
         import subprocess

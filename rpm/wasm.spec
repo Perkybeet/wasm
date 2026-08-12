@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        1.0.2
+Version:        1.0.3
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -163,6 +163,8 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
 fi
 
 %changelog
+* Wed Aug 12 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.0.3-1
+- Fix: the Debian build dependencies in wasm.dsc and debian.control agree, and are the minimum that builds a wheel
 * Wed Aug 12 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.0.2-1
 - Fix: interactive mode works again; it still imported inquirer after that stopped being a dependency
 - Fix: distribution packages build; the completion scripts are committed instead of generated, so the build no longer needs to run the package
