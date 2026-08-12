@@ -27,7 +27,7 @@ from urllib.parse import parse_qs
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import MutableHeaders
 from starlette.requests import HTTPConnection
@@ -35,7 +35,9 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from wasm.core.exceptions import SecurityError
 from wasm.web.auth import (
+    CSRF_COOKIE_NAME,
     SAFE_METHODS,
+    SESSION_COOKIE_NAME,
     WS_CLOSE_FORBIDDEN,
     WS_CLOSE_RATE_LIMITED,
     WS_CLOSE_UNAUTHORIZED,
@@ -81,7 +83,9 @@ HSTS_VALUE = "max-age=31536000; includeSubDomains"
 
 #: Endpoints that exist to be given a credential by an anonymous client, and
 #: are therefore the ones a lockout has to guard even before authentication.
-AUTH_PATHS = frozenset({"/api/auth/login", "/api/auth/token"})
+#: ``/login`` is the browser's form; ``/api/auth/login`` is the same exchange
+#: for a script. Both count towards the same lockout.
+AUTH_PATHS = frozenset({"/login", "/api/auth/login", "/api/auth/token"})
 
 _token_manager: TokenManager | None = None
 _rate_limiter: RateLimiter | None = None
@@ -263,6 +267,35 @@ def create_app(config: SecurityConfig | None = None) -> FastAPI:
 
     app.include_router(views_router)
 
+    def render_login(request: Request, *, error: str | None = None, status: int = 200) -> Response:
+        """
+        Render the sign-in page.
+
+        Args:
+            request: The incoming request.
+            error: Message to show above the form.
+            status: HTTP status to answer with.
+
+        Returns:
+            The sign-in page. Tokens are never accepted in the URL: query
+            strings are recorded by proxies, browsers and access logs.
+        """
+        from wasm.web.views.rendering import templates
+
+        client_ip = get_client_ip(request)
+        locked_for = get_brute_force().get_lockout_remaining(client_ip) or None
+
+        return HTMLResponse(
+            templates.get_template("login.html").render(
+                hostname=socket.gethostname(),
+                csrf_token="",
+                error=error,
+                locked_for=locked_for,
+                theme=None,
+            ),
+            status_code=status,
+        )
+
     @app.get("/login", response_class=HTMLResponse)
     def login_page(request: Request) -> Response:
         """
@@ -272,20 +305,105 @@ def create_app(config: SecurityConfig | None = None) -> FastAPI:
             request: The incoming request.
 
         Returns:
-            The sign-in page. Tokens are never accepted in the URL: query
-            strings are recorded by proxies, browsers and access logs.
+            The sign-in page.
         """
-        from wasm.web.views.rendering import templates
+        return render_login(request)
 
-        return HTMLResponse(
-            templates.get_template("login.html").render(
-                hostname=socket.gethostname(),
-                csrf_token=getattr(getattr(request.state, "session", None), "csrf_token", ""),
-                error=None,
-                locked_for=None,
-                theme=None,
+    # The browser posts here. It used to post to a route that did not exist:
+    # the page offered a form and the only login endpoint was the JSON one
+    # under /api/auth/login, so nobody could sign in with a browser at all.
+    # Async, unlike the rest: reading a request body requires awaiting it, and
+    # this handler does no blocking work of its own. The body is parsed here
+    # rather than with fastapi.Form, which would pull in python-multipart for
+    # a plain urlencoded field and add a dependency to package on four
+    # distributions for no gain.
+    @app.post("/login")
+    async def login_submit(request: Request) -> Response:
+        """
+        Exchange a token typed into the form for a session cookie.
+
+        Args:
+            request: The incoming request.
+
+        Returns:
+            A redirect to the panel, or the form again with the reason.
+        """
+        body = await request.body()
+        token = parse_qs(body.decode("utf-8", errors="replace")).get("token", [""])[0]
+        manager = get_token_manager()
+        brute_force = get_brute_force()
+        audit = get_audit()
+        client_ip = get_client_ip(request)
+
+        if brute_force.is_locked(client_ip):
+            return render_login(
+                request,
+                error=f"Too many attempts. Try again in "
+                f"{brute_force.get_lockout_remaining(client_ip)} seconds.",
+                status=429,
             )
-        )
+
+        if not manager.verify_master_token(token):
+            brute_force.record_failure(client_ip)
+            if audit:
+                audit.record(
+                    action="auth.login",
+                    result="failure",
+                    client_ip=client_ip,
+                    resource="/login",
+                    detail=f"{brute_force.get_attempts_remaining(client_ip)} attempts remaining",
+                )
+            return render_login(
+                request,
+                error=(
+                    "That token was not accepted. "
+                    f"{brute_force.get_attempts_remaining(client_ip)} attempts remaining."
+                ),
+                status=401,
+            )
+
+        brute_force.record_success(client_ip)
+        session = manager.create_session(client_ip)
+
+        # 303 so the browser follows with GET; a 302 after a POST is allowed to
+        # repeat the POST, which would replay the credential.
+        response = RedirectResponse("/", status_code=303)
+        from wasm.web.api.auth import set_session_cookies
+
+        set_session_cookies(response, session, secure=is_secure_request(request))
+
+        if audit:
+            audit.record(
+                action="auth.login",
+                result="success",
+                client_ip=client_ip,
+                actor=session.session_id,
+                resource="/login",
+            )
+        return response
+
+    @app.post("/logout")
+    def logout_submit(request: Request) -> Response:
+        """
+        End the session and send the browser back to the form.
+
+        Args:
+            request: The incoming request.
+
+        Returns:
+            A response that clears the session and redirects.
+        """
+        manager = get_token_manager()
+        session_id = getattr(getattr(request.state, "session", None), "session_id", None)
+        if session_id:
+            manager.revoke_session(session_id)
+
+        # htmx issued the request, so the redirect has to be a header it
+        # understands; a 303 body would simply be swapped into the page.
+        response = Response(status_code=204, headers={"HX-Redirect": "/login"})
+        response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+        response.delete_cookie(CSRF_COOKIE_NAME, path="/")
+        return response
 
     @app.get("/health")
     async def health_check() -> dict[str, str]:

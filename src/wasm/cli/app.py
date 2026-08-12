@@ -40,6 +40,7 @@ import click
 
 from wasm import __version__
 from wasm.core.exceptions import WASMError
+from wasm.core.fs import DryRunFileSystem, set_fs
 from wasm.core.logger import Logger, set_colors_disabled
 from wasm.core.runner import DryRunRunner, SubprocessRunner, set_runner
 
@@ -109,6 +110,9 @@ class Context:
     dry_run: bool = False
     json_output: bool = False
     no_color: bool = False
+    #: Set once the seams have been swapped, so a subcommand that also
+    #: accepts --dry-run does not announce the rehearsal twice.
+    dry_run_active: bool = False
     _logger: Logger | None = field(default=None, repr=False)
 
     @property
@@ -120,6 +124,37 @@ class Context:
 
 
 pass_context = click.make_pass_decorator(Context, ensure=True)
+
+
+def enable_dry_run(state: Context) -> None:
+    """
+    Turn the invocation into a rehearsal.
+
+    Both seams are swapped, and both are needed. Swapping only the command
+    runner is what let ``wasm --dry-run backup delete <id> --force`` announce
+    that nothing would change and then delete the archive, because a deletion
+    is a ``Path.unlink`` and never reaches a subprocess.
+
+    Exported so that a subcommand which accepts ``--dry-run`` after its own
+    name turns it on the same way, rather than each one repeating the wiring
+    and drifting.
+
+    Args:
+        state: The shared context, already marked as a dry run.
+    """
+    logger = state.logger
+    if state.dry_run_active:
+        return
+    state.dry_run_active = True
+
+    logger.warning("Dry run: nothing on this machine will be changed")
+    set_runner(
+        DryRunRunner(
+            SubprocessRunner(),
+            on_skip=lambda cmd: logger.info(f"would run: {' '.join(cmd)}"),
+        )
+    )
+    set_fs(DryRunFileSystem(on_skip=logger.info))
 
 
 class LazyGroup(click.Group):
@@ -227,14 +262,7 @@ def cli(
     # Wiring it per command is what left it honoured in three code paths and
     # silently ignored in every destructive one.
     if state.dry_run:
-        logger = state.logger
-        logger.warning("Dry run: no changes will be made to this machine")
-        set_runner(
-            DryRunRunner(
-                SubprocessRunner(),
-                on_skip=lambda cmd: logger.info(f"would run: {' '.join(cmd)}"),
-            )
-        )
+        enable_dry_run(state)
 
     if changelog:
         from wasm.cli.commands.version import show_changelog
