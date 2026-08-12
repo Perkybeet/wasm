@@ -1,0 +1,167 @@
+{#
+  Component library for the panel.
+
+  Every component here is driven by an explicit context, so a template never
+  reaches into a manager or a model. The state vocabulary is fixed and shared:
+  "active", "idle", "failed" and "busy". Those four words are what the state
+  rail, the badge and the notice all agree on, so an operator learns the
+  language once and it holds on every screen.
+#}
+
+{% set _STATE_ALIASES = {
+  "active": "active", "running": "active", "valid": "active", "enabled": "active",
+  "failed": "failed", "error": "failed", "expired": "failed", "corrupt": "failed",
+  "busy": "busy", "deploying": "busy", "renewing": "busy", "expiring": "busy",
+  "building": "busy", "restoring": "busy"
+} %}
+
+
+{% macro state_class(state) -%}
+{{- _STATE_ALIASES.get(state | lower, "idle") -}}
+{%- endmacro %}
+
+
+{% macro badge(state, text=none) -%}
+<span class="badge badge--{{ state_class(state) }}">{{ text or state }}</span>
+{%- endmacro %}
+
+
+{#
+  A resource row. The coloured rail on the leading edge is the whole point:
+  running your eye down the left border of a list tells you the health of
+  everything on it without reading a word.
+
+  meta is a list of (label, value) pairs rendered in mono. Keep it to the three
+  or four facts an operator scans for, not everything the record holds.
+
+  Used with {% call %} so the caller supplies the action buttons:
+
+      {% call m.row("example.com", "active", meta) %}
+        {{ m.action_button("Restart", "/api/apps/example.com/restart") }}
+      {% endcall %}
+#}
+{% macro row(name, state, meta=[], href=none, row_id=none) %}
+<div class="row row--{{ state_class(state) }}"{% if row_id %} id="{{ row_id }}"{% endif %}>
+  <div class="row__main">
+    <span class="row__name">
+      {%- if href %}<a href="{{ href }}">{{ name }}</a>{% else %}{{ name }}{% endif -%}
+    </span>
+    {% if meta %}
+      <span class="row__meta">
+        {% for label, value in meta %}<span>{{ label }} {{ value }}</span>{% endfor %}
+      </span>
+    {% endif %}
+  </div>
+  <div class="row__actions">{{ caller() if caller else "" }}</div>
+</div>
+{% endmacro %}
+
+
+{#
+  Page header. Used with {% call %} so the caller supplies the toolbar:
+
+      {% call m.page_head("Applications", "3 deployed") %}
+        <a class="btn btn--primary" href="/apps/new">Deploy</a>
+      {% endcall %}
+#}
+{% macro page_head(title, subtitle=none) %}
+<div class="page__head">
+  <div class="page__title">
+    <h1>{{ title }}</h1>
+    {% if subtitle %}<p class="muted">{{ subtitle }}</p>{% endif %}
+  </div>
+  <div class="toolbar">{{ caller() if caller else "" }}</div>
+</div>
+{% endmacro %}
+
+
+{#
+  An empty screen is an invitation to act, not a shrug. It always names the one
+  thing to do next, and gives the equivalent command, because this audience
+  often prefers the terminal and should not have to guess the incantation.
+#}
+{% macro empty(title, body, action_label=none, action_href=none, command=none) %}
+<div class="empty">
+  <h2>{{ title }}</h2>
+  <p>{{ body }}</p>
+  {% if action_label and action_href %}
+    <a class="btn btn--primary" href="{{ action_href }}">{{ action_label }}</a>
+  {% endif %}
+  {% if command %}<p class="faint">Or run <code>{{ command }}</code></p>{% endif %}
+</div>
+{% endmacro %}
+
+
+{#
+  A message from nginx, systemd or certbot is never paraphrased. The fix goes
+  above it in plain words; the tool's own output goes below it verbatim, in
+  mono, because that is what the operator will search for.
+#}
+{% macro problem(fix, output=none) %}
+<div class="problem" role="alert">
+  <p class="problem__fix">{{ fix }}</p>
+  {% if output %}<pre class="problem__output">{{ output }}</pre>{% endif %}
+</div>
+{% endmacro %}
+
+
+{#
+  A capacity bar reads faster than a percentage, and both together read
+  fastest. Thresholds live here so every meter in the panel agrees on what
+  "nearly full" means.
+#}
+{% macro capacity(label, used, total, human_used="", human_total="") %}
+{%- set pct = (used / total * 100) if total else 0 -%}
+{%- set level = "critical" if pct >= 90 else ("warn" if pct >= 75 else "ok") -%}
+<span class="machine__metric" title="{{ label }}: {{ human_used }} of {{ human_total }}">
+  <span class="label">{{ label }}</span>
+  <span class="capacity capacity--{{ level }}">
+    <span class="capacity__fill" style="width: {{ pct | round | int }}%"></span>
+  </span>
+  <span class="num">{{ pct | round | int }}%</span>
+</span>
+{% endmacro %}
+
+
+{% macro stat(label, value, unit=none) %}
+<span class="machine__metric">
+  <span class="label">{{ label }}</span>
+  <span class="num">{{ value }}{% if unit %}<span class="faint">{{ unit }}</span>{% endif %}</span>
+</span>
+{% endmacro %}
+
+
+{#
+  Destructive actions ask first, and the question names the exact resource and
+  the exact consequence. "Are you sure?" tells an operator nothing.
+#}
+{% macro danger_button(label, endpoint, resource, consequence) %}
+<button class="btn btn--sm btn--danger"
+        hx-delete="{{ endpoint }}"
+        hx-confirm="{{ label }} {{ resource }}? {{ consequence }}"
+        hx-target="closest .row"
+        hx-swap="outerHTML">{{ label }}</button>
+{% endmacro %}
+
+
+{% macro action_button(label, endpoint, target="closest .row") %}
+<button class="btn btn--sm"
+        hx-post="{{ endpoint }}"
+        hx-target="{{ target }}"
+        hx-swap="outerHTML">{{ label }}</button>
+{% endmacro %}
+
+
+{#
+  Attaches the docked drawer to a log stream. The drawer itself is in base.html
+  and persists across navigation, so this only tells it what to follow.
+
+  The source and URL travel as data attributes, picked up by a delegated
+  listener. An inline onclick carrying interpolated server data is how the
+  previous panel ended up with a hundred and three places where a domain name
+  could break out of an attribute.
+#}
+{% macro follow_button(label, source, url) %}
+<button class="btn btn--sm btn--quiet" data-follow-log data-source="{{ source }}"
+        data-url="{{ url }}">{{ label }}</button>
+{% endmacro %}

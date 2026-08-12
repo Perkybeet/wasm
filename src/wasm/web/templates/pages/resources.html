@@ -1,0 +1,40 @@
+{#
+  One template for every resource list.
+
+  Applications, services, sites, certificates, databases and backups are all
+  the same shape: a dense list of rows carrying a state rail. Rendering them
+  from one template is what keeps them looking and behaving alike, so an
+  operator learns the screen once.
+#}
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+
+{% block title %}{{ title }}{% endblock %}
+
+{% block content %}
+
+{% call m.page_head(title, subtitle) %}
+  {% if kind == "apps" %}
+    <a class="btn btn--primary" href="/apps/new">Deploy an application</a>
+  {% endif %}
+{% endcall %}
+
+{% if rows %}
+  <div class="rows">
+    {% for item in rows %}
+      {% call m.row(item.domain, item.state, item.meta,
+                    "/" ~ kind ~ "/" ~ item.domain, "row-" ~ item.id) %}
+        {% if kind in ("apps", "services") %}
+          {{ m.follow_button("Logs", item.domain, "/ws/logs/" ~ item.domain) }}
+          {{ m.action_button("Restart", "/api/" ~ kind ~ "/" ~ item.domain ~ "/restart") }}
+        {% endif %}
+        {{ m.danger_button("Delete", "/api/" ~ kind ~ "/" ~ item.domain, item.domain,
+                           "This cannot be undone.") }}
+      {% endcall %}
+    {% endfor %}
+  </div>
+{% else %}
+  {{ m.empty(empty_title, empty_body, command=command) }}
+{% endif %}
+
+{% endblock %}

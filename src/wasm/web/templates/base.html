@@ -1,0 +1,104 @@
+{#
+  The panel shell.
+
+  Three things are present on every page: the machine strip, so you always know
+  which box you are about to change; the navigation, with live counts; and the
+  log drawer, docked at the bottom rather than hidden behind a click per
+  resource.
+#}
+{% macro nav_item(href, label, key, count) -%}
+<a class="nav__item" href="{{ href }}" hx-boost="true"
+   {%- if page == key %} aria-current="page"{% endif %}>
+  <span>{{ label }}</span>
+  {%- if count is not none %}<span class="nav__count">{{ count }}</span>{% endif %}
+</a>
+{%- endmacro %}
+
+<!doctype html>
+<html lang="en"{% if theme %} data-theme="{{ theme }}"{% endif %}>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{{ machine.hostname }}{% endblock %} - WASM</title>
+
+  {# Everything is served from this host. The panel works on a machine with no
+     route to the internet, which is rather the point of self-hosting. #}
+  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/vendor/xterm.css">
+  <link rel="stylesheet" href="/static/vendor/uplot.min.css">
+  <link rel="icon" href="/static/logo.webp" type="image/webp">
+
+  <script src="/static/vendor/htmx.min.js" defer></script>
+  <script src="/static/vendor/alpine.min.js" defer></script>
+  <script src="/static/panel.js" type="module"></script>
+</head>
+
+<body hx-headers='{"X-CSRF-Token": "{{ csrf_token }}"}'>
+
+<a class="visually-hidden" href="#main">Skip to content</a>
+
+{# The signature element: one dense instrument line for this machine. The
+   fragment carries its own element so htmx can swap it whole. #}
+{% include "fragments/machine.html" %}
+
+<div class="shell" x-data="{ nav: false }">
+  <nav class="sidebar" :data-open="nav" aria-label="Sections">
+    <div class="brand">
+      <img src="/static/logo.webp" alt="" width="20" height="20">
+      WASM
+    </div>
+
+    <div class="nav">
+      <div class="nav__group label">Deployments</div>
+      {{ nav_item("/", "Overview", "dashboard", none) }}
+      {{ nav_item("/apps", "Applications", "apps", counts.apps) }}
+      {{ nav_item("/services", "Services", "services", counts.services) }}
+      {{ nav_item("/sites", "Sites", "sites", counts.sites) }}
+
+      <div class="nav__group label">Infrastructure</div>
+      {{ nav_item("/certificates", "Certificates", "certificates", counts.certificates) }}
+      {{ nav_item("/databases", "Databases", "databases", counts.databases) }}
+      {{ nav_item("/backups", "Backups", "backups", counts.backups) }}
+
+      <div class="nav__group label">Operations</div>
+      {{ nav_item("/activity", "Activity", "activity", counts.running_jobs) }}
+      {{ nav_item("/settings", "Settings", "settings", none) }}
+    </div>
+
+    <form method="post" action="/logout" style="margin-top: auto; padding: 0 1rem">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="btn btn--quiet" type="submit">Sign out</button>
+    </form>
+  </nav>
+
+  <main class="main" id="main">
+    <div class="page">
+      {% block content %}{% endblock %}
+    </div>
+
+    {#
+      The docked log drawer. It costs vertical space, and that is the bet: the
+      moment logs matter most is mid-deploy, and hiding them behind a click per
+      resource is what makes a web panel feel worse than an SSH session.
+    #}
+    <section class="drawer" id="log-drawer" x-data="logDrawer()" :data-open="open"
+             aria-label="Live log">
+      <div class="drawer__bar" role="button" tabindex="0" :aria-expanded="open"
+           @click="toggle()" @keydown.enter="toggle()" @keydown.space.prevent="toggle()">
+        <span class="label">Log</span>
+        <span class="drawer__source" x-text="source || 'nothing attached'"></span>
+        <span class="drawer__tools" @click.stop>
+          <button class="btn btn--sm btn--quiet" @click="clear()">Clear</button>
+          <button class="btn btn--sm btn--quiet" @click="toggle()"
+                  x-text="open ? 'Hide' : 'Show'"></button>
+        </span>
+      </div>
+      <div class="drawer__body" x-ref="terminal"></div>
+    </section>
+  </main>
+</div>
+
+<div class="notice" id="notices" aria-live="polite"></div>
+
+</body>
+</html>
