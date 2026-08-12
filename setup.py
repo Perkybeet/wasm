@@ -26,11 +26,11 @@ setup(
         "interactive": ["inquirer>=3.1.0"],
         "web": [
             "fastapi>=0.109.0",
+            "starlette>=0.36.0",
+            "pydantic>=2.0",
             "uvicorn[standard]>=0.27.0",
             "python-jose[cryptography]>=3.3.0",
-            "passlib[bcrypt]>=1.7.4",
             "psutil>=5.9.0",
-            "aiofiles>=23.0.0",
         ],
         "monitor": [
             "psutil>=5.9.0",
@@ -42,10 +42,10 @@ setup(
             "psutil>=5.9.0",
             "httpx>=0.25.0",
             "fastapi>=0.109.0",
+            "starlette>=0.36.0",
+            "pydantic>=2.0",
             "uvicorn[standard]>=0.27.0",
             "python-jose[cryptography]>=3.3.0",
-            "passlib[bcrypt]>=1.7.4",
-            "aiofiles>=23.0.0",
         ],
     },
     entry_points={

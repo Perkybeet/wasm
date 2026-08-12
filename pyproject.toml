@@ -66,11 +66,15 @@ monitor = [
 ]
 web = [
     "fastapi>=0.109.0",
+    # Imported directly for HTTPConnection, which covers both HTTP requests and
+    # WebSocket handshakes in the security middleware. FastAPI happens to pull
+    # it in, but relying on a transitive dependency is how a working install
+    # breaks on an unrelated upgrade.
+    "starlette>=0.36.0",
+    "pydantic>=2.0",
     "uvicorn[standard]>=0.27.0",
     "python-jose[cryptography]>=3.3.0",
-    "passlib[bcrypt]>=1.7.4",
     "psutil>=5.9.0",
-    "aiofiles>=23.0.0",
 ]
 all = [
     "inquirer>=3.1.0",
@@ -78,10 +82,10 @@ all = [
     "psutil>=5.9.0",
     "httpx>=0.25.0",
     "fastapi>=0.109.0",
+    "starlette>=0.36.0",
+    "pydantic>=2.0",
     "uvicorn[standard]>=0.27.0",
     "python-jose[cryptography]>=3.3.0",
-    "passlib[bcrypt]>=1.7.4",
-    "aiofiles>=23.0.0",
 ]
 
 [project.scripts]

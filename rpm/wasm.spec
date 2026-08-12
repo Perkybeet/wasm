@@ -25,8 +25,16 @@ BuildRequires:  python3-pip
 BuildRequires:  python3-wheel
 Requires:       python3-jinja2 >= 3.1.0
 Requires:       python3-pyyaml >= 6.0
-# inquirer is optional (for interactive mode)
-Suggests:       python3-inquirer >= 3.1.0
+# The panel is optional. Everything it needs is packaged in Fedora.
+Suggests:       python3-fastapi
+Suggests:       python3-starlette
+Suggests:       python3-pydantic
+Suggests:       python3-uvicorn
+Suggests:       python3-jose
+Suggests:       python3-psutil
+# Interactive prompts.
+Suggests:       python3-questionary
+Suggests:       python3-rich
 %endif
 
 # openSUSE specific
@@ -34,7 +42,14 @@ Suggests:       python3-inquirer >= 3.1.0
 BuildRequires:  python3-wheel
 Requires:       python3-Jinja2 >= 3.1.0
 Requires:       python3-PyYAML >= 6.0
-# inquirer may need to be installed via pip on SUSE
+Suggests:       python3-fastapi
+Suggests:       python3-starlette
+Suggests:       python3-pydantic
+Suggests:       python3-uvicorn
+Suggests:       python3-python-jose
+Suggests:       python3-psutil
+Suggests:       python3-questionary
+Suggests:       python3-rich
 %endif
 
 # Runtime requirements (common)
