@@ -8,12 +8,14 @@ Base deployer class for WASM.
 Defines the interface and common functionality for all deployers.
 """
 
+import shutil
+import sqlite3
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Literal
 
 from wasm.core.config import Config
-from wasm.core.exceptions import BuildError, DeploymentError, OutOfMemoryError
+from wasm.core.exceptions import BuildError, DeploymentError, OutOfMemoryError, WASMError
 from wasm.core.logger import Logger
 from wasm.core.store import (
     App,
@@ -35,6 +37,7 @@ from wasm.managers.cert_manager import CertManager
 from wasm.managers.nginx_manager import NginxManager
 from wasm.managers.service_manager import ServiceManager
 from wasm.managers.source_manager import SourceManager
+from wasm.validators.environment import validate_environment, validate_unit_value
 
 # Type for package managers
 PackageManager = Literal["npm", "pnpm", "bun", "yarn", "auto"]
@@ -635,15 +638,15 @@ class BaseDeployer(ABC):
         # 1. Stop and remove service if it exists
         try:
             if self.app_name:
-                status = self.service_manager.status(self.app_name)
+                status = self.service_manager.get_status(self.app_name)
                 if status.get("exists"):
                     self.logger.debug(f"Removing service: {self.app_name}")
                     try:
                         self.service_manager.stop(self.app_name)
-                    except Exception:
-                        pass  # Service might not be running
+                    except WASMError as e:
+                        self.logger.debug(f"Service was not running: {e}")
                     self.service_manager.delete_service(self.app_name)
-        except Exception as e:
+        except (WASMError, OSError) as e:
             errors.append(f"Service cleanup failed: {e}")
             self.logger.debug(f"Service cleanup error: {e}")
 
@@ -660,40 +663,37 @@ class BaseDeployer(ABC):
                     manager.disable_site(self.domain)
                     manager.delete_site(self.domain)
                     manager.reload()
-        except Exception as e:
+        except (WASMError, OSError) as e:
             errors.append(f"Site cleanup failed: {e}")
             self.logger.debug(f"Site cleanup error: {e}")
 
         # 3. Remove application files
         if not keep_files and self.app_path and self.app_path.exists():
             try:
-                import shutil
-
                 self.logger.debug(f"Removing app files: {self.app_path}")
                 shutil.rmtree(self.app_path)
-            except Exception as e:
+            except OSError as e:
                 errors.append(f"File cleanup failed: {e}")
                 self.logger.debug(f"File cleanup error: {e}")
 
-        # 4. Clean up store records
+        # 4. Clean up store records.
+        # The store deletes by natural key, so these take the service name and
+        # the domain. Passing row ids silently matched nothing.
         try:
             if self.domain:
-                # Remove service record
                 if self.app_name:
                     service = self.store.get_service(self.app_name)
                     if service:
-                        self.store.delete_service(service.id)
+                        self.store.delete_service(service.name)
 
-                # Remove site record
                 site = self.store.get_site(self.domain)
                 if site:
-                    self.store.delete_site(site.id)
+                    self.store.delete_site(site.domain)
 
-                # Remove or update app record
                 app = self.store.get_app(self.domain)
                 if app:
-                    self.store.delete_app(app.id)
-        except Exception as e:
+                    self.store.delete_app(app.domain)
+        except (WASMError, sqlite3.Error) as e:
             errors.append(f"Store cleanup failed: {e}")
             self.logger.debug(f"Store cleanup error: {e}")
 
@@ -971,6 +971,10 @@ class BaseDeployer(ABC):
 
         Returns:
             True if successful.
+
+        Raises:
+            EnvironmentValidationError: If an environment variable or a unit
+                directive value cannot be written safely into the unit file.
         """
         start_command = self.get_start_command()
 
@@ -985,12 +989,22 @@ class BaseDeployer(ABC):
         env["PORT"] = str(self.port)
         env["NODE_ENV"] = "production"
 
+        # Everything below is interpolated into a systemd unit, where a newline
+        # starts a new directive. env_vars arrives unfiltered from the CLI and
+        # from POST /api/apps, so it is validated before it can reach the unit.
+        env = validate_environment(env)
+        start_command = validate_unit_value(start_command, field="ExecStart")
+        working_directory = validate_unit_value(str(self.app_path), field="WorkingDirectory")
+        description = validate_unit_value(
+            f"WASM: {self.domain} ({self.APP_TYPE})", field="Description"
+        )
+
         self.service_manager.create_service(
             name=self.app_name,
             command=start_command,
-            working_directory=str(self.app_path),
+            working_directory=working_directory,
             environment=env,
-            description=f"WASM: {self.domain} ({self.APP_TYPE})",
+            description=description,
         )
 
         # Enable service

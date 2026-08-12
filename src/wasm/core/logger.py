@@ -6,14 +6,62 @@ Provides a rich, user-friendly logging experience with support for:
 - Verbose mode for detailed output
 - Color-coded output
 - Structured log messages
+
+Color handling is process-wide on purpose: command handlers build their own
+:class:`Logger` instances deep in the call stack, so the only way for a
+top-level ``--no-color`` to reach them is a module-level override installed by
+:func:`set_colors_disabled`.
 """
 
+import json
 import logging
+import os
 import sys
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import TextIO
+from typing import Any, TextIO
+
+_colors_disabled: bool = False
+
+
+def set_colors_disabled(disabled: bool) -> None:
+    """
+    Turn colored output off (or back on) for every logger created afterwards.
+
+    This is what ``wasm --no-color`` calls. It is process-wide because handlers
+    instantiate their own loggers and never see the parsed CLI arguments.
+
+    Args:
+        disabled: True to strip colors from all output.
+    """
+    global _colors_disabled
+    _colors_disabled = disabled
+
+
+def colors_enabled(stream: TextIO) -> bool:
+    """
+    Decide whether colored output is appropriate for a stream.
+
+    Colors are suppressed when ``--no-color`` was used, when the NO_COLOR
+    environment variable is set to a non-empty value (see https://no-color.org)
+    or when the stream is not a terminal (piped or redirected output).
+
+    Args:
+        stream: The stream the logger writes to.
+
+    Returns:
+        True when ANSI escape codes should be emitted.
+    """
+    if _colors_disabled:
+        return False
+    if os.environ.get("NO_COLOR", ""):
+        return False
+    isatty = getattr(stream, "isatty", None)
+    if isatty is None:
+        return False
+    return bool(isatty())
 
 
 class Colors:
@@ -109,19 +157,11 @@ class Logger:
             stream: Output stream (defaults to stdout).
         """
         self.verbose = verbose
-        self.stream = stream  # Must be set before _supports_color() is called
-        self.no_color = no_color or not self._supports_color()
+        self.stream = stream  # Must be set before colors_enabled() is called
+        self.no_color = no_color or not colors_enabled(self.stream)
         self.log_file = log_file
         self._current_step = 0
         self._total_steps = 0
-
-    def _supports_color(self) -> bool:
-        """Check if the terminal supports color output."""
-        if not hasattr(self.stream, "isatty"):
-            return False
-        if not self.stream.isatty():
-            return False
-        return True
 
     def _colorize(self, text: str, color: str) -> str:
         """Apply color to text if colors are enabled."""
@@ -397,3 +437,120 @@ class Logger:
             self._write(self._colorize(f"│  {line.ljust(max_len - 2)}│", Colors.CYAN))
 
         self._write(self._colorize(bottom, Colors.CYAN))
+
+
+class OutputFormat(Enum):
+    """How a command result should be rendered."""
+
+    TEXT = "text"
+    JSON = "json"
+
+
+class Presenter:
+    """
+    Render a command result either as human text or as machine-readable JSON.
+
+    This is the seam a machine-readable ``--json`` needs: a handler builds the
+    data once and hands it over, instead of calling print() directly. No CLI
+    flag selects JSON yet, so every caller currently gets TEXT; see the module
+    docs of the CLI parser for the migration status.
+
+    Example:
+        presenter = Presenter(logger)
+        presenter.emit({"domain": "example.com", "status": "running"})
+    """
+
+    def __init__(
+        self,
+        logger: Logger | None = None,
+        output_format: OutputFormat = OutputFormat.TEXT,
+        stream: TextIO = sys.stdout,
+    ):
+        """
+        Initialize the presenter.
+
+        Args:
+            logger: Logger used for text rendering (created if omitted).
+            output_format: Rendering mode.
+            stream: Stream JSON payloads are written to.
+        """
+        self.logger = logger if logger is not None else Logger(stream=stream)
+        self.output_format = output_format
+        self.stream = stream
+
+    @property
+    def is_json(self) -> bool:
+        """
+        Report whether this presenter emits JSON.
+
+        Returns:
+            True when the output format is JSON.
+        """
+        return self.output_format is OutputFormat.JSON
+
+    def emit(
+        self,
+        payload: Mapping[str, Any],
+        text: Callable[[Logger], None] | None = None,
+    ) -> None:
+        """
+        Emit a single structured result.
+
+        Args:
+            payload: The data describing the result. Must be JSON serialisable.
+            text: Optional custom text renderer. Defaults to one key-value line
+                per top-level entry.
+        """
+        if self.is_json:
+            self._dump(payload)
+            return
+
+        if text is not None:
+            text(self.logger)
+            return
+
+        for key, value in payload.items():
+            self.logger.key_value(key, str(value))
+
+    def emit_table(
+        self,
+        headers: Sequence[str],
+        rows: Sequence[Sequence[Any]],
+        key: str = "items",
+    ) -> None:
+        """
+        Emit a tabular result.
+
+        Args:
+            headers: Column headers, also used as JSON object keys.
+            rows: Row values, aligned with the headers.
+            key: Top-level key wrapping the rows in JSON mode.
+        """
+        if self.is_json:
+            self._dump({key: [dict(zip(headers, row, strict=False)) for row in rows]})
+            return
+
+        self.logger.table(list(headers), [list(row) for row in rows])
+
+    def emit_error(self, message: str, details: str = "") -> None:
+        """
+        Emit an error in the active format.
+
+        Args:
+            message: What went wrong.
+            details: How to fix it.
+        """
+        if self.is_json:
+            self._dump({"error": message, "details": details})
+            return
+
+        self.logger.error(message, details)
+
+    def _dump(self, payload: Mapping[str, Any]) -> None:
+        """
+        Write a JSON payload to the stream.
+
+        Args:
+            payload: The data to serialise.
+        """
+        print(json.dumps(payload, default=str), file=self.stream, flush=True)

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+from wasm.core.runner import CommandRunner, get_runner
 from wasm.core.utils import (
     TRUSTED_INSTALLER_URLS,
     command_exists,
@@ -232,14 +233,22 @@ class DependencyChecker:
         },
     }
 
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, runner: CommandRunner | None = None):
         """
         Initialize the dependency checker.
 
         Args:
             verbose: Enable verbose output.
+            runner: Command runner used to probe the system. Defaults to the
+                process-wide runner.
         """
         self.verbose = verbose
+        self._runner = runner
+
+    @property
+    def runner(self) -> CommandRunner:
+        """The command runner this checker probes the system with."""
+        return self._runner if self._runner is not None else get_runner()
 
     def check_command(self, command: str) -> bool:
         """
@@ -251,7 +260,7 @@ class DependencyChecker:
         Returns:
             True if command exists.
         """
-        return command_exists(command)
+        return self.runner.exists(command)
 
     def get_version(self, command: str, version_flag: str = "--version") -> str | None:
         """
@@ -262,11 +271,12 @@ class DependencyChecker:
             version_flag: Flag to get version.
 
         Returns:
-            Version string or None.
+            Version string, or None when the command is absent or silent.
         """
-        result = run_command([command, version_flag])
+        # Version probes are quick; a program that does not answer promptly is
+        # more likely to be waiting on something than to be slow.
+        result = self.runner.run([command, version_flag], timeout=15)
         if result.success:
-            # Try to extract version from output
             output = result.stdout.strip() or result.stderr.strip()
             return output.split("\n")[0] if output else None
         return None

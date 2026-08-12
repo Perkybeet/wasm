@@ -30,18 +30,33 @@ class TestDependencyChecker:
         # Non-existent command
         assert checker.check_command("nonexistent_cmd_xyz") is False
 
-    def test_get_version(self):
-        """Test getting version of a command."""
-        checker = DependencyChecker()
-        version = checker.get_version("python3")
-        assert version is not None
-        assert "Python" in version or "python" in version.lower()
+    def test_get_version(self, runner):
+        """The first line of the program's own output is its version."""
+        runner.script(["python3", "--version"], stdout="Python 3.12.3\n")
+        checker = DependencyChecker(runner=runner)
 
-    def test_get_version_nonexistent(self):
-        """Test getting version of non-existent command."""
-        checker = DependencyChecker()
-        version = checker.get_version("nonexistent_cmd_xyz")
-        assert version is None
+        assert checker.get_version("python3") == "Python 3.12.3"
+
+    def test_get_version_reads_stderr_when_stdout_is_empty(self, runner):
+        """Several tools, including older java and node, answer on stderr."""
+        runner.script(["oldtool", "--version"], stdout="", stderr="oldtool 1.2\n")
+        checker = DependencyChecker(runner=runner)
+
+        assert checker.get_version("oldtool") == "oldtool 1.2"
+
+    def test_get_version_nonexistent(self, runner):
+        """A program that is not installed has no version."""
+        runner.script(["nonexistent_cmd_xyz"], exit_code=127)
+        checker = DependencyChecker(runner=runner)
+
+        assert checker.get_version("nonexistent_cmd_xyz") is None
+
+    def test_get_version_is_bounded(self, runner):
+        """A version probe cannot hang a deploy."""
+        checker = DependencyChecker(runner=runner)
+        checker.get_version("python3")
+
+        assert runner.calls == [("python3", "--version")]
 
     def test_detect_required_package_manager(self, tmp_path):
         """Test package manager detection from lock files."""
@@ -70,20 +85,30 @@ class TestDependencyChecker:
         (tmp_path / "package.json").unlink()
         assert checker.detect_required_package_manager(tmp_path) is None
 
-    def test_check_package_manager(self):
-        """Test checking package manager availability."""
-        checker = DependencyChecker()
+    def test_check_package_manager(self, runner):
+        """A present package manager reports itself installed, with a version."""
+        runner.only_knows("npm").script(["npm", "--version"], stdout="10.8.2")
+        checker = DependencyChecker(runner=runner)
 
-        # npm should be installed if node is installed
         is_installed, version, hint = checker.check_package_manager("npm")
-        # Just check it returns the right types
-        assert isinstance(is_installed, bool)
-        assert isinstance(hint, str)
+
+        assert is_installed is True
+        assert version == "10.8.2"
         assert "install" in hint.lower()
 
-    def test_get_setup_summary(self):
+    def test_check_package_manager_when_absent(self, runner):
+        """An absent package manager reports how to install it."""
+        runner.only_knows("npm")
+        checker = DependencyChecker(runner=runner)
+
+        is_installed, version, hint = checker.check_package_manager("pnpm")
+
+        assert is_installed is False
+        assert "install" in hint.lower()
+
+    def test_get_setup_summary(self, runner):
         """Test getting system setup summary."""
-        checker = DependencyChecker()
+        checker = DependencyChecker(runner=runner)
         summary = checker.get_setup_summary()
 
         # Check required keys exist

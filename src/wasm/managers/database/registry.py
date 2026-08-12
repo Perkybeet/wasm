@@ -8,6 +8,7 @@ Database manager registry for WASM.
 Provides registration and lookup of database engine managers.
 """
 
+from typing import ClassVar
 
 from wasm.managers.database.base import BaseDatabaseManager
 
@@ -19,11 +20,15 @@ class DatabaseRegistry:
     Manages registration and retrieval of database managers.
     """
 
-    _managers: dict[str, type[BaseDatabaseManager]] = {}
-    _aliases: dict[str, str] = {}
+    _managers: ClassVar[dict[str, type[BaseDatabaseManager]]] = {}
+    _aliases: ClassVar[dict[str, str]] = {}
 
     @classmethod
-    def register(cls, manager_class: type[BaseDatabaseManager], aliases: list[str] = None) -> None:
+    def register(
+        cls,
+        manager_class: type[BaseDatabaseManager],
+        aliases: list[str] | None = None,
+    ) -> None:
         """
         Register a database manager.
 

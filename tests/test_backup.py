@@ -343,42 +343,47 @@ class TestBackupManager:
 
 
 class TestBackupManagerWithMocks:
-    """Tests for BackupManager with mocked system calls."""
+    """
+    Tests for BackupManager against a fake command runner.
+
+    These used to patch ``wasm.managers.backup_manager.run_command`` by name,
+    which coupled them to an implementation detail rather than to behaviour and
+    broke the moment the module started going through the injected runner.
+    """
 
     @pytest.fixture
-    def manager(self):
-        """Create a backup manager instance."""
-        return BackupManager(verbose=False)
+    def manager(self, runner):
+        """
+        Create a backup manager wired to the fake runner.
 
-    @mock.patch("wasm.managers.backup_manager.run_command_sudo")
-    @mock.patch("wasm.managers.backup_manager.run_command")
-    def test_create_backup_app_not_found(self, mock_run, mock_sudo, manager):
-        """Test creating backup for non-existent app."""
+        Args:
+            runner: The FakeRunner fixture.
+
+        Returns:
+            A backup manager that cannot touch the machine.
+        """
+        return BackupManager(verbose=False, runner=runner)
+
+    def test_create_backup_app_not_found(self, manager):
+        """Backing up a domain that was never deployed is an error, not a no-op."""
         with pytest.raises(BackupError) as exc_info:
             manager.create("nonexistent.domain.com")
 
         assert "Application not found" in str(exc_info.value)
 
-    @mock.patch("wasm.managers.backup_manager.run_command_sudo")
-    def test_verify_backup_not_found(self, mock_sudo, manager):
-        """Test verifying non-existent backup."""
-        mock_sudo.return_value = mock.Mock(success=False, stdout="", stderr="")
+    def test_verify_backup_not_found(self, manager, tmp_path):
+        """Verifying an absent backup reports invalid rather than raising."""
+        manager.backup_dir = tmp_path
 
-        # Use a temp directory that exists but is empty
-        with tempfile.TemporaryDirectory() as tmp:
-            manager.backup_dir = Path(tmp)
-            result = manager.verify("nonexistent-backup")
+        result = manager.verify("nonexistent-backup")
 
         assert result["valid"] is False
         assert any("not found" in err.lower() for err in result["errors"])
 
-    @mock.patch("wasm.managers.backup_manager.run_command_sudo")
-    def test_get_storage_usage_empty(self, mock_sudo, manager):
-        """Test storage usage with no backups."""
-        mock_sudo.return_value = mock.Mock(success=True, stdout="0")
+    def test_get_storage_usage_empty(self, manager, tmp_path):
+        """An empty backup directory reports zero rather than failing."""
+        manager.backup_dir = tmp_path / "missing"
 
-        # Set backup_dir to a non-existent path
-        manager.backup_dir = Path("/nonexistent/backup/dir")
         result = manager.get_storage_usage()
 
         assert result["total_size_bytes"] == 0

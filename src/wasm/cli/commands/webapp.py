@@ -1,27 +1,64 @@
 """
 Web application command handlers for WASM.
+
+Everything this module needs is imported here rather than inside the handlers.
+An import that only exists inside one function is a NameError waiting for the
+next caller, which is exactly how ``site delete`` lost its certificate cleanup.
 """
 
 import re
 import sys
+import time
 from argparse import Namespace
 from pathlib import Path
+
+from wasm.core.config import Config
+from wasm.core.dependencies import check_deployment_ready
+from wasm.core.exceptions import DeploymentError, ServiceError, WASMError
+from wasm.core.logger import Logger
+from wasm.core.runner import CommandResult, get_runner
+from wasm.core.store import AppStatus, get_store
+from wasm.core.utils import domain_to_app_name, remove_directory
+from wasm.deployers import detect_app_type, get_deployer
+from wasm.deployers.docker_compose import DockerComposeDeployer
+from wasm.deployers.monorepo import MonorepoDeployer
+from wasm.managers.apache_manager import ApacheManager
+from wasm.managers.backup_manager import RollbackManager
+from wasm.managers.cert_manager import CertManager
+from wasm.managers.nginx_manager import NginxManager
+from wasm.managers.service_manager import ServiceManager
+from wasm.managers.source_manager import SourceManager
+from wasm.validators.domain import should_include_www, validate_domain
+from wasm.validators.port import find_available_port, validate_port
 
 # Constants for .env file parsing
 MAX_ENV_FILE_SIZE = 1024 * 1024  # 1MB max
 MAX_ENV_LINE_LENGTH = 10000
 VALID_ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-from wasm.core.config import Config
-from wasm.core.exceptions import DeploymentError, WASMError
-from wasm.core.logger import Logger
-from wasm.core.utils import domain_to_app_name
-from wasm.deployers import detect_app_type, get_deployer
-from wasm.managers.apache_manager import ApacheManager
-from wasm.managers.nginx_manager import NginxManager
-from wasm.managers.service_manager import ServiceManager
-from wasm.validators.domain import validate_domain
-from wasm.validators.port import find_available_port, validate_port
+#: Following logs is interactive and ends with Ctrl+C, but the runner insists
+#: on a deadline. A day is long enough to be indistinguishable from forever.
+_FOLLOW_TIMEOUT = 86400
+
+#: Docker Compose pulls images and rebuilds; it needs room.
+_COMPOSE_TIMEOUT = 1800
+
+
+def _follow(argv: list[str], cwd: Path | None = None) -> CommandResult | None:
+    """
+    Stream a long-running command until the user interrupts it.
+
+    Args:
+        argv: Program and arguments.
+        cwd: Working directory.
+
+    Returns:
+        The command outcome, or None when the user pressed Ctrl+C.
+    """
+    try:
+        return get_runner().stream(argv, on_line=print, cwd=cwd, timeout=_FOLLOW_TIMEOUT)
+    except KeyboardInterrupt:
+        return None
 
 
 def handle_webapp(args: Namespace) -> int:
@@ -79,9 +116,10 @@ def handle_webapp(args: Namespace) -> int:
                 )
             logger.blank()
         return 1
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - the CLI error boundary: nothing above catches
         logger = Logger(verbose=args.verbose)
         logger.error(f"Unexpected error: {e}")
+        logger.debug(f"Unhandled {type(e).__name__} in webapp {action}")
         if args.verbose:
             import traceback
 
@@ -90,9 +128,16 @@ def handle_webapp(args: Namespace) -> int:
 
 
 def _handle_create(args: Namespace) -> int:
-    """Handle webapp create command."""
+    """
+    Handle webapp create command.
+
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        Exit code.
+    """
     logger = Logger(verbose=args.verbose)
-    config = Config()
 
     # Validate domain
     domain = validate_domain(args.domain)
@@ -118,8 +163,6 @@ def _handle_create(args: Namespace) -> int:
     # =========================================================================
     # Pre-deployment verification
     # =========================================================================
-    from wasm.core.dependencies import check_deployment_ready
-
     can_deploy, missing, warnings = check_deployment_ready(
         app_type=app_type,
         package_manager=package_manager,
@@ -190,11 +233,8 @@ def _handle_create(args: Namespace) -> int:
                             value = value[1:-1]
 
                         env_vars[key] = value
-            except OSError as e:
+            except (OSError, UnicodeDecodeError) as e:
                 logger.error(f"Failed to read environment file {env_path}: {e}")
-                return 1
-            except Exception as e:
-                logger.error(f"Failed to parse environment file {env_path}: {e}")
                 return 1
 
     # Print deployment header
@@ -207,8 +247,6 @@ def _handle_create(args: Namespace) -> int:
     logger.key_value("SSL", "Yes" if not args.no_ssl else "No")
     include_www = getattr(args, "www", False)
     if not args.no_ssl and include_www:
-        from wasm.validators.domain import should_include_www
-
         if should_include_www(domain):
             logger.key_value("WWW", f"www.{domain} included")
     logger.blank()
@@ -244,9 +282,18 @@ def _handle_create(args: Namespace) -> int:
 
 
 def _handle_monorepo_create(args: Namespace, domain: str, env_vars: dict, logger: Logger) -> int:
-    """Handle monorepo deployment specially."""
-    from wasm.deployers.monorepo import MonorepoDeployer
+    """
+    Handle monorepo deployment specially.
 
+    Args:
+        args: Parsed arguments.
+        domain: Validated domain.
+        env_vars: Environment variables for the deployment.
+        logger: Logger of the current command.
+
+    Returns:
+        Exit code.
+    """
     # Parse subdomain overrides
     subdomain_overrides = {}
     if getattr(args, "subdomains", None):
@@ -287,9 +334,18 @@ def _handle_monorepo_create(args: Namespace, domain: str, env_vars: dict, logger
 def _handle_docker_compose_create(
     args: Namespace, domain: str, env_vars: dict, logger: Logger
 ) -> int:
-    """Handle Docker Compose deployment."""
-    from wasm.deployers.docker_compose import DockerComposeDeployer
+    """
+    Handle Docker Compose deployment.
 
+    Args:
+        args: Parsed arguments.
+        domain: Validated domain.
+        env_vars: Environment variables for the deployment.
+        logger: Logger of the current command.
+
+    Returns:
+        Exit code.
+    """
     deployer = DockerComposeDeployer(verbose=args.verbose)
 
     deployer.configure(
@@ -310,10 +366,16 @@ def _handle_docker_compose_create(
 
 
 def _handle_list(args: Namespace) -> int:
-    """Handle webapp list command."""
-    logger = Logger(verbose=args.verbose)
+    """
+    Handle webapp list command.
 
-    from wasm.core.store import AppStatus, get_store
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        Exit code.
+    """
+    logger = Logger(verbose=args.verbose)
 
     store = get_store()
 
@@ -362,11 +424,17 @@ def _handle_list(args: Namespace) -> int:
 
 
 def _handle_status(args: Namespace) -> int:
-    """Handle webapp status command."""
+    """
+    Handle webapp status command.
+
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        Exit code.
+    """
     logger = Logger(verbose=args.verbose)
     service_manager = ServiceManager(verbose=args.verbose)
-
-    from wasm.core.store import get_store
 
     store = get_store()
 
@@ -449,10 +517,16 @@ def _handle_status(args: Namespace) -> int:
 
 
 def _handle_restart(args: Namespace) -> int:
-    """Handle webapp restart command."""
-    logger = Logger(verbose=args.verbose)
+    """
+    Handle webapp restart command.
 
-    from wasm.core.store import get_store
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        Exit code.
+    """
+    logger = Logger(verbose=args.verbose)
 
     store = get_store()
 
@@ -481,10 +555,16 @@ def _handle_restart(args: Namespace) -> int:
 
 
 def _handle_stop(args: Namespace) -> int:
-    """Handle webapp stop command."""
-    logger = Logger(verbose=args.verbose)
+    """
+    Handle webapp stop command.
 
-    from wasm.core.store import get_store
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        Exit code.
+    """
+    logger = Logger(verbose=args.verbose)
 
     store = get_store()
 
@@ -513,10 +593,16 @@ def _handle_stop(args: Namespace) -> int:
 
 
 def _handle_start(args: Namespace) -> int:
-    """Handle webapp start command."""
-    logger = Logger(verbose=args.verbose)
+    """
+    Handle webapp start command.
 
-    from wasm.core.store import get_store
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        Exit code.
+    """
+    logger = Logger(verbose=args.verbose)
 
     store = get_store()
 
@@ -559,8 +645,6 @@ def _handle_update(args: Namespace) -> int:
     logger = Logger(verbose=args.verbose)
     config = Config()
 
-    from wasm.core.store import get_store
-
     store = get_store()
 
     domain = validate_domain(args.domain)
@@ -591,8 +675,6 @@ def _handle_update(args: Namespace) -> int:
     # Step 1: Create pre-update backup for potential rollback
     logger.step(1, total_steps, "Creating pre-update backup")
     try:
-        from wasm.managers.backup_manager import RollbackManager
-
         rollback_manager = RollbackManager(verbose=args.verbose)
         backup = rollback_manager.create_pre_deploy_backup(
             domain=domain, description="Pre-update automatic backup"
@@ -601,12 +683,10 @@ def _handle_update(args: Namespace) -> int:
             logger.substep(f"Backup created: {backup.id}")
         else:
             logger.substep("No existing app to backup")
-    except Exception as e:
+    except (WASMError, OSError) as e:
         logger.substep(f"Backup skipped: {e}")
 
     # Step 2: Pull latest changes or fetch from new source
-    from wasm.managers.source_manager import SourceManager
-
     source_manager = SourceManager(verbose=args.verbose)
 
     new_source = getattr(args, "source", None)
@@ -727,10 +807,28 @@ def _handle_update(args: Namespace) -> int:
     return 0
 
 
-def _handle_monorepo_update(args, app_path, app_name, domain, logger, total_steps):
-    """Handle update for monorepo applications."""
-    from wasm.deployers.monorepo import MonorepoDeployer
+def _handle_monorepo_update(
+    args: Namespace,
+    app_path: Path,
+    app_name: str,
+    domain: str,
+    logger: Logger,
+    total_steps: int,
+) -> int:
+    """
+    Handle update for monorepo applications.
 
+    Args:
+        args: Parsed arguments.
+        app_path: Directory holding the application.
+        app_name: Directory name of the application.
+        domain: Validated domain.
+        logger: Logger of the current command.
+        total_steps: Number of steps reported to the user.
+
+    Returns:
+        Exit code.
+    """
     deployer = MonorepoDeployer(verbose=args.verbose)
     deployer.app_path = app_path
     deployer.app_name = app_name
@@ -755,8 +853,6 @@ def _handle_monorepo_update(args, app_path, app_name, domain, logger, total_step
     service_manager = ServiceManager(verbose=args.verbose)
 
     # Find all services for this monorepo
-    from wasm.core.store import get_store
-
     store = get_store()
     app = store.get_app(domain)
 
@@ -769,7 +865,7 @@ def _handle_monorepo_update(args, app_path, app_name, domain, logger, total_step
             try:
                 service_manager.restart(service.name)
                 restarted.append(service.name)
-            except Exception as e:
+            except ServiceError as e:
                 logger.warning(f"Failed to restart {service.name}: {e}")
     else:
         # Fallback: restart by app_name pattern
@@ -779,8 +875,6 @@ def _handle_monorepo_update(args, app_path, app_name, domain, logger, total_step
             restarted.append(app_name)
 
     if restarted:
-        import time
-
         time.sleep(3)
         logger.success(f"Monorepo updated successfully: {domain}")
         logger.blank()
@@ -793,10 +887,26 @@ def _handle_monorepo_update(args, app_path, app_name, domain, logger, total_step
     return 0
 
 
-def _handle_docker_compose_update(args, app_path, app_name, domain, logger):
-    """Handle update for Docker Compose applications."""
-    from wasm.deployers.docker_compose import DockerComposeDeployer
+def _handle_docker_compose_update(
+    args: Namespace,
+    app_path: Path,
+    app_name: str,
+    domain: str,
+    logger: Logger,
+) -> int:
+    """
+    Handle update for Docker Compose applications.
 
+    Args:
+        args: Parsed arguments.
+        app_path: Directory holding the application.
+        app_name: Directory name of the application.
+        domain: Validated domain.
+        logger: Logger of the current command.
+
+    Returns:
+        Exit code.
+    """
     deployer = DockerComposeDeployer(verbose=args.verbose)
     deployer.app_path = app_path
     deployer.app_name = app_name
@@ -809,13 +919,11 @@ def _handle_docker_compose_update(args, app_path, app_name, domain, logger):
     deployer._build_images()
 
     logger.step(5, 5, "Restarting containers")
-    from wasm.core.utils import run_command
-
     cmd = ["docker", "compose"]
     if deployer.compose_path:
         cmd.extend(["-f", str(deployer.compose_path)])
     cmd.extend(["up", "-d", "--remove-orphans"])
-    result = run_command(cmd, cwd=app_path, timeout=300000)
+    result = get_runner().run(cmd, cwd=app_path, timeout=_COMPOSE_TIMEOUT)
 
     if result.success:
         logger.success(f"Docker Compose app updated: {domain}")
@@ -827,11 +935,17 @@ def _handle_docker_compose_update(args, app_path, app_name, domain, logger):
 
 
 def _handle_delete(args: Namespace) -> int:
-    """Handle webapp delete command."""
+    """
+    Handle webapp delete command.
+
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        Exit code.
+    """
     logger = Logger(verbose=args.verbose)
     config = Config()
-
-    from wasm.core.store import get_store
 
     store = get_store()
 
@@ -858,11 +972,11 @@ def _handle_delete(args: Namespace) -> int:
         # Check service
         service_manager = ServiceManager(verbose=args.verbose)
         try:
-            status = service_manager.status(app_name)
+            status = service_manager.get_status(app_name)
             if status.get("exists"):
                 logger.key_value("Stop and remove service", app_name)
-        except Exception:
-            pass
+        except ServiceError as e:
+            logger.debug(f"Could not query service {app_name}: {e}")
 
         # Check nginx
         nginx = NginxManager(verbose=args.verbose)
@@ -903,14 +1017,13 @@ def _handle_delete(args: Namespace) -> int:
     # Stop Docker Compose containers if applicable
     if app and app.app_type == "docker-compose":
         logger.step(1, total_steps, "Stopping Docker Compose containers")
-        from wasm.core.utils import run_command as _run_cmd
-
         for compose_name in ["docker-compose.prod.yml", "docker-compose.yml", "compose.yml"]:
             compose_file = app_path / compose_name
             if compose_file.exists():
-                _run_cmd(
+                get_runner().run(
                     ["docker", "compose", "-f", str(compose_file), "down", "--remove-orphans"],
                     cwd=app_path,
+                    timeout=_COMPOSE_TIMEOUT,
                 )
                 break
     else:
@@ -920,7 +1033,7 @@ def _handle_delete(args: Namespace) -> int:
     service_manager = ServiceManager(verbose=args.verbose)
     try:
         service_manager.delete_service(app_name)
-    except Exception as e:
+    except ServiceError as e:
         logger.warning(f"Failed to delete service: {e}")
 
     # Delete site configuration
@@ -930,7 +1043,7 @@ def _handle_delete(args: Namespace) -> int:
         if nginx.site_exists(domain):
             nginx.delete_site(domain)
             nginx.reload()
-    except Exception as e:
+    except WASMError as e:
         logger.warning(f"Failed to remove nginx site configuration: {e}")
 
     try:
@@ -938,28 +1051,24 @@ def _handle_delete(args: Namespace) -> int:
         if apache.site_exists(domain):
             apache.delete_site(domain)
             apache.reload()
-    except Exception as e:
+    except WASMError as e:
         logger.warning(f"Failed to remove apache site configuration: {e}")
 
     # Delete SSL certificate
     logger.step(3, total_steps, "Removing SSL certificate")
-    try:
-        from wasm.managers.cert_manager import CertManager
-
-        cert_manager = CertManager(verbose=args.verbose)
-        if cert_manager.is_installed() and cert_manager.cert_exists(domain):
+    cert_manager = CertManager(verbose=args.verbose)
+    if cert_manager.is_installed() and cert_manager.cert_exists(domain):
+        try:
             cert_manager.delete(domain)
             logger.substep(f"Certificate deleted: {domain}")
-        else:
-            logger.substep("No certificate found")
-    except Exception as e:
-        logger.warning(f"Failed to delete certificate: {e}")
+        except WASMError as e:
+            logger.warning(f"Failed to delete certificate: {e}")
+    else:
+        logger.substep("No certificate found")
 
     # Delete files
     if not args.keep_files:
         logger.step(4, total_steps, "Removing application files")
-        from wasm.core.utils import remove_directory
-
         remove_directory(app_path, sudo=True)
     else:
         logger.step(4, total_steps, "Keeping application files")
@@ -978,7 +1087,15 @@ def _handle_delete(args: Namespace) -> int:
 
 
 def _handle_logs(args: Namespace) -> int:
-    """Handle webapp logs command."""
+    """
+    Handle webapp logs command.
+
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        Exit code.
+    """
     logger = Logger(verbose=args.verbose)
     service_manager = ServiceManager(verbose=args.verbose)
 
@@ -986,17 +1103,12 @@ def _handle_logs(args: Namespace) -> int:
     app_name = domain_to_app_name(domain)
 
     # Check if this is a docker-compose app
-    from wasm.core.store import get_store
-
     store = get_store()
     app = store.get_app(domain)
 
     if app and app.app_type == "docker-compose":
         config = Config()
         app_path = Path(app.app_path) if app.app_path else config.apps_directory / app_name
-        import subprocess
-
-        from wasm.core.utils import run_command as _run_cmd
 
         # Find compose file
         compose_file = None
@@ -1013,12 +1125,9 @@ def _handle_logs(args: Namespace) -> int:
 
         if args.follow:
             cmd.append("-f")
-            try:
-                subprocess.run(cmd, cwd=app_path)
-            except KeyboardInterrupt:
-                pass
+            _follow(cmd, cwd=app_path)
         else:
-            result = _run_cmd(cmd, cwd=app_path)
+            result = get_runner().run(cmd, cwd=app_path, timeout=_COMPOSE_TIMEOUT)
             print(result.stdout if result.success else result.stderr)
         return 0
 
@@ -1026,27 +1135,18 @@ def _handle_logs(args: Namespace) -> int:
     service_name = service_manager._resolve_service_name(app_name)
 
     if args.follow:
-        # Use journalctl directly for follow mode
-        import subprocess
-
-        try:
-            subprocess.run(
-                [
-                    "journalctl",
-                    "-u",
-                    f"{service_name}.service",
-                    "-f",
-                    "-n",
-                    str(args.lines),
-                ]
-            )
-        except KeyboardInterrupt:
-            pass
-        except FileNotFoundError:
-            logger.error("journalctl command not found. Please ensure systemd is installed.")
-            return 1
-        except subprocess.SubprocessError as e:
-            logger.error(f"Failed to run journalctl: {e}")
+        result = _follow(
+            [
+                "journalctl",
+                "-u",
+                f"{service_name}.service",
+                "-f",
+                "-n",
+                str(args.lines),
+            ]
+        )
+        if result is not None and not result.success and not result.timed_out:
+            logger.error(f"Failed to follow the journal: {result.stderr}")
             return 1
     else:
         logs = service_manager.logs(app_name, lines=args.lines)

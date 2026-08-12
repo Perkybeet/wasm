@@ -1,5 +1,10 @@
 """
 Site command handlers for WASM.
+
+Every manager this module needs is imported here, at module level. Importing
+CertManager inside ``_handle_create`` meant ``wasm site delete`` raised
+NameError on every run, and the broad handler around it turned that into a
+warning about a certificate that had in fact never been touched.
 """
 
 import sys
@@ -8,8 +13,9 @@ from argparse import Namespace
 from wasm.core.exceptions import WASMError
 from wasm.core.logger import Logger
 from wasm.managers.apache_manager import ApacheManager
+from wasm.managers.cert_manager import CertManager
 from wasm.managers.nginx_manager import NginxManager
-from wasm.validators.domain import validate_domain
+from wasm.validators.domain import should_include_www, validate_domain
 
 
 def handle_site(args: Namespace) -> int:
@@ -48,9 +54,10 @@ def handle_site(args: Namespace) -> int:
         logger = Logger(verbose=args.verbose)
         logger.error(str(e))
         return 1
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - the CLI error boundary: nothing above catches
         logger = Logger(verbose=args.verbose)
         logger.error(f"Unexpected error: {e}")
+        logger.debug(f"Unhandled {type(e).__name__} in site {action}")
         if args.verbose:
             import traceback
 
@@ -58,8 +65,17 @@ def handle_site(args: Namespace) -> int:
         return 1
 
 
-def _get_manager(webserver: str, verbose: bool = False):
-    """Get the appropriate site manager."""
+def _get_manager(webserver: str, verbose: bool = False) -> ApacheManager | NginxManager:
+    """
+    Get the appropriate site manager.
+
+    Args:
+        webserver: Either "apache" or "nginx".
+        verbose: Enable verbose logging.
+
+    Returns:
+        The manager for the requested web server.
+    """
     if webserver == "apache":
         return ApacheManager(verbose=verbose)
     return NginxManager(verbose=verbose)
@@ -68,9 +84,6 @@ def _get_manager(webserver: str, verbose: bool = False):
 def _handle_create(args: Namespace) -> int:
     """Handle site create command."""
     logger = Logger(verbose=args.verbose)
-
-    from wasm.managers.cert_manager import CertManager
-    from wasm.validators.domain import should_include_www
 
     domain = validate_domain(args.domain)
     manager = _get_manager(args.webserver, verbose=args.verbose)
@@ -272,14 +285,14 @@ def _handle_delete(args: Namespace) -> int:
         logger.success(f"Site deleted (apache): {domain}")
 
     # Delete SSL certificate if exists
-    try:
-        cert_manager = CertManager(verbose=args.verbose)
-        if cert_manager.is_installed() and cert_manager.cert_exists(domain):
-            logger.info(f"Deleting SSL certificate for {domain}...")
+    cert_manager = CertManager(verbose=args.verbose)
+    if cert_manager.is_installed() and cert_manager.cert_exists(domain):
+        logger.info(f"Deleting SSL certificate for {domain}...")
+        try:
             cert_manager.delete(domain)
             logger.success(f"Certificate deleted: {domain}")
-    except Exception as e:
-        logger.warning(f"Failed to delete certificate: {e}")
+        except WASMError as e:
+            logger.warning(f"Failed to delete certificate: {e}")
 
     if not deleted:
         raise WASMError(f"Site not found: {domain}")
@@ -288,9 +301,15 @@ def _handle_delete(args: Namespace) -> int:
 
 
 def _handle_show(args: Namespace) -> int:
-    """Handle site show command."""
-    logger = Logger(verbose=args.verbose)
+    """
+    Handle site show command.
 
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        Exit code.
+    """
     domain = validate_domain(args.domain)
 
     nginx = NginxManager(verbose=args.verbose)

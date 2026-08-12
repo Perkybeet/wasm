@@ -3,23 +3,223 @@
 # https://github.com/Perkybeet/wasm/blob/main/LICENSE
 
 """
-Base database manager for WASM.
+Shared machinery for every database engine manager.
 
-Provides abstract base class for all database engine managers.
+Service control, package install and removal, dump and restore plumbing,
+privilege whitelisting and identifier quoting live here. A concrete backend only
+declares its packages, its client binaries and the statements its engine speaks.
+
+Three rules are enforced in this module and must not be relaxed by subclasses:
+
+- **No shell.** Dumps reach disk through
+  :meth:`~wasm.core.runner.CommandRunner.capture_to_file`. The contents of a
+  database can never be reinterpreted as shell syntax, and a binary dump is
+  never round-tripped through a string.
+- **No secrets in argv.** Passwords travel through stdin, an environment
+  variable or a 0600 option file. Anything on a command line is visible in
+  ``ps`` to every account on the machine.
+- **No unvalidated SQL fragments.** Privileges come from a per-engine whitelist
+  and identifiers are quoted with the engine's own mechanism.
 """
 
+from __future__ import annotations
+
+import re
 import secrets
 import string
 from abc import abstractmethod
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from wasm.core.exceptions import (
+    DatabaseBackupError,
     DatabaseEngineError,
+    DatabaseError,
+    DatabaseUserError,
 )
+from wasm.core.runner import CommandResult, CommandRunner, get_runner
 from wasm.managers.base_manager import BaseManager
+
+#: Deadline for a query or any other short-lived client invocation.
+QUERY_TIMEOUT = 120
+
+#: Deadline for a systemctl verb. Stopping a busy engine can take a while.
+SERVICE_TIMEOUT = 120
+
+#: Deadline for apt. Package downloads are slow and must not be cut short.
+PACKAGE_TIMEOUT = 1800
+
+#: Deadline for a dump, a restore or a decompression.
+TRANSFER_TIMEOUT = 3600
+
+#: apt must never stop to ask a question on a server.
+APT_ENV: Mapping[str, str] = {"DEBIAN_FRONTEND": "noninteractive"}
+
+#: Backups are readable only by root, and so is the directory holding them.
+BACKUP_DIR_MODE = 0o750
+
+#: Staging directory for restores: traversable so the engine account can open
+#: the file it owns, unlistable so it cannot enumerate other backups.
+STAGING_DIR_MODE = 0o711
+
+#: Database and user names accepted by WASM. Deliberately narrower than what the
+#: engines accept: names come from HTTP requests and CLI arguments, and a name
+#: that needs quoting to be safe is a name nobody wants to type.
+NAME_PATTERN = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_$-]*$")
+
+#: Filesystem paths that may be handed to a client's own file-reading command.
+SAFE_PATH_PATTERN = re.compile(r"^[A-Za-z0-9_./-]+$")
+
+#: Privileges are keywords, optionally multi-word ("ALL PRIVILEGES"). Anything
+#: with punctuation is an injection attempt, not a privilege.
+PRIVILEGE_PATTERN = re.compile(r"^[A-Z]+(?: [A-Z]+)*$")
+
+
+def quote_identifier(value: str, quote: str) -> str:
+    """
+    Quote a SQL identifier with the engine's quoting character.
+
+    Args:
+        value: Raw identifier, such as a database or user name.
+        quote: The engine's identifier quote character (a backtick for MySQL, a
+            double quote for PostgreSQL).
+
+    Returns:
+        The identifier wrapped in the quote character, with every embedded
+        occurrence of that character doubled.
+    """
+    return f"{quote}{value.replace(quote, quote * 2)}{quote}"
+
+
+def validate_name(value: str, *, kind: str, engine: str, max_length: int) -> str:
+    """
+    Check that a database or user name is one WASM is willing to handle.
+
+    Quoting alone would be enough for the SQL layer, but names also end up in
+    file names, service names and connection strings, so they are constrained
+    once, here.
+
+    Args:
+        value: Candidate name.
+        kind: What the name designates, used in the error message.
+        engine: Engine name, used in the error message.
+        max_length: Longest name the engine accepts.
+
+    Returns:
+        The name, unchanged.
+
+    Raises:
+        DatabaseError: When the name is empty, too long or contains a character
+            outside ``[A-Za-z0-9_$-]``.
+    """
+    if not isinstance(value, str) or not value:
+        raise DatabaseError(
+            f"Empty {engine} {kind} name",
+            details=f"Provide a {kind} name of 1 to {max_length} characters.",
+        )
+    if len(value) > max_length:
+        raise DatabaseError(
+            f"{engine} {kind} name is too long: {len(value)} characters",
+            details=f"{engine} accepts at most {max_length} characters for a {kind} name.",
+        )
+    if not NAME_PATTERN.match(value):
+        raise DatabaseError(
+            f"Invalid {engine} {kind} name: {value!r}",
+            details=(
+                f"A {kind} name must start with a letter, a digit or an underscore and may "
+                "only contain letters, digits and the characters _ $ -."
+            ),
+        )
+    return value
+
+
+def validate_privileges(
+    privileges: Sequence[str] | None,
+    *,
+    allowed: frozenset[str],
+    engine: str,
+    default: Sequence[str],
+) -> tuple[str, ...]:
+    """
+    Reduce a caller-supplied privilege list to a whitelisted, normalised tuple.
+
+    Privileges are the one part of a GRANT that cannot be quoted: they are SQL
+    keywords. The only safe treatment is an exact-match whitelist, which is what
+    this function is.
+
+    Args:
+        privileges: Privileges requested by the caller, or None for the default.
+        allowed: The engine's whitelist, upper case.
+        engine: Engine name, used in the error message.
+        default: Privileges to use when the caller supplied none.
+
+    Returns:
+        Normalised privileges, upper case, in the order given, without repeats.
+
+    Raises:
+        DatabaseUserError: When any entry is not a plain whitelisted keyword.
+    """
+    requested = list(privileges) if privileges else list(default)
+
+    seen: list[str] = []
+    for raw in requested:
+        if not isinstance(raw, str):
+            raise DatabaseUserError(
+                f"Invalid {engine} privilege: {raw!r}",
+                details=f"Privileges must be strings. Allowed: {', '.join(sorted(allowed))}.",
+            )
+        candidate = " ".join(raw.split()).upper()
+        if not PRIVILEGE_PATTERN.match(candidate) or candidate not in allowed:
+            raise DatabaseUserError(
+                f"Invalid {engine} privilege: {raw!r}",
+                details=(
+                    f"Allowed {engine} privileges: {', '.join(sorted(allowed))}. "
+                    "Pass one privilege per list entry, without punctuation."
+                ),
+            )
+        if candidate not in seen:
+            seen.append(candidate)
+
+    if not seen:
+        raise DatabaseUserError(
+            f"No {engine} privileges given",
+            details=f"Allowed {engine} privileges: {', '.join(sorted(allowed))}.",
+        )
+    return tuple(seen)
+
+
+def validate_path(path: Path, *, purpose: str) -> Path:
+    """
+    Check that a path may be embedded in a client's own file-reading command.
+
+    Some clients (the MySQL shell, for one) have no argv option for "read this
+    file", only an in-band ``source`` command. Such a path must not contain
+    anything that the client's parser could read as syntax.
+
+    Args:
+        path: Candidate path.
+        purpose: What the path is for, used in the error message.
+
+    Returns:
+        The path, unchanged.
+
+    Raises:
+        DatabaseBackupError: When the path contains anything but letters,
+            digits, dot, slash, dash or underscore.
+    """
+    if not SAFE_PATH_PATTERN.match(str(path)):
+        raise DatabaseBackupError(
+            f"Unsafe path for {purpose}: {path}",
+            details=(
+                "Move the file to a path made only of letters, digits and the characters "
+                "._-/ before retrying."
+            ),
+        )
+    return path
 
 
 @dataclass
@@ -37,7 +237,12 @@ class DatabaseInfo:
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary."""
+        """
+        Render the database information as plain data.
+
+        Returns:
+            A JSON-serialisable dictionary.
+        """
         return {
             "name": self.name,
             "engine": self.engine,
@@ -64,7 +269,12 @@ class UserInfo:
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary."""
+        """
+        Render the user information as plain data.
+
+        Returns:
+            A JSON-serialisable dictionary.
+        """
         return {
             "username": self.username,
             "engine": self.engine,
@@ -88,58 +298,113 @@ class BackupInfo:
     compressed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary."""
+        """
+        Render the backup information as plain data.
+
+        Returns:
+            A JSON-serialisable dictionary.
+        """
         return {
             "path": str(self.path),
             "database": self.database,
             "engine": self.engine,
             "size": self.size,
-            "size_human": self._format_size(self.size),
+            "size_human": format_size(self.size),
             "created": self.created.isoformat(),
             "compressed": self.compressed,
         }
 
-    @staticmethod
-    def _format_size(size: int) -> str:
-        """Format size in human readable format."""
-        for unit in ["B", "KB", "MB", "GB", "TB"]:
-            if size < 1024:
-                return f"{size:.1f} {unit}"
-            size /= 1024
-        return f"{size:.1f} PB"
+
+def format_size(size: float) -> str:
+    """
+    Render a byte count in the largest unit that keeps it under 1024.
+
+    Args:
+        size: Number of bytes.
+
+    Returns:
+        A human readable size, such as ``"1.5 MB"``.
+    """
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} PB"
 
 
 class BaseDatabaseManager(BaseManager):
     """
-    Abstract base class for database managers.
+    Base class for database engine managers.
 
-    Each database engine (MySQL, PostgreSQL, Redis, MongoDB) should
-    implement this interface.
+    Subclasses declare the engine's packages, binaries and dialect; the workflow
+    around them is implemented once, here.
     """
 
-    # Class attributes to be overridden by subclasses
-    ENGINE_NAME: str = ""  # e.g., "mysql", "postgresql", "redis", "mongodb"
-    DISPLAY_NAME: str = ""  # e.g., "MySQL", "PostgreSQL", "Redis", "MongoDB"
+    #: Engine identifier used in the registry, in file names and in the API.
+    ENGINE_NAME: str = ""
+    #: Human readable engine name, used in messages.
+    DISPLAY_NAME: str = ""
+    #: Port the engine listens on by default.
     DEFAULT_PORT: int = 0
-    SERVICE_NAME: str = ""  # e.g., "mysql", "postgresql", "redis", "mongod"
-    PACKAGE_NAMES: list[str] = []  # Packages to install
+    #: systemd unit that runs the engine.
+    SERVICE_NAME: str = ""
+    #: Packages installed by :meth:`install`.
+    PACKAGE_NAMES: tuple[str, ...] = ()
+    #: Binary whose presence means the engine's client is installed.
+    CLIENT_BINARY: str = ""
+    #: Command that prints the engine version.
+    VERSION_ARGV: tuple[str, ...] = ()
+    #: Pattern whose first group is the version inside that command's output.
+    VERSION_PATTERN: str = r"(\d+\.\d+\.\d+)"
+    #: Paths removed by ``uninstall(purge=True)``.
+    PURGE_PATHS: tuple[str, ...] = ()
+    #: Extension given to a backup file before any ``.gz``.
+    BACKUP_SUFFIX: str = ".sql"
+    #: Longest database name the engine accepts.
+    MAX_DATABASE_NAME_LENGTH: int = 63
+    #: Longest user name the engine accepts.
+    MAX_USER_NAME_LENGTH: int = 63
+    #: Privileges :meth:`grant_privileges` and :meth:`revoke_privileges` accept.
+    VALID_PRIVILEGES: frozenset[str] = frozenset()
+    #: Privileges used when the caller names none.
+    DEFAULT_PRIVILEGES: tuple[str, ...] = ()
 
-    # Common directories
+    #: Where backups are written when the caller gives no path.
     BACKUP_DIR = Path("/var/backups/wasm/databases")
 
-    def __init__(self, verbose: bool = False):
-        """Initialize the database manager."""
-        super().__init__(verbose=verbose)
-        self._ensure_backup_dir()
+    # ==================== Process execution ====================
 
-    def _ensure_backup_dir(self) -> None:
-        """Ensure backup directory exists."""
-        if not self.BACKUP_DIR.exists():
-            try:
-                self._run_sudo(["mkdir", "-p", str(self.BACKUP_DIR)])
-                self._run_sudo(["chmod", "750", str(self.BACKUP_DIR)])
-            except Exception as e:
-                self.logger.debug(f"Failed to create backup directory {self.BACKUP_DIR}: {e}")
+    @property
+    def runner(self) -> CommandRunner:
+        """The process runner. Resolved per call so tests can swap it in."""
+        return get_runner()
+
+    def _exec(
+        self,
+        argv: Sequence[str],
+        *,
+        input: str | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout: int = QUERY_TIMEOUT,
+        secrets: Sequence[str] = (),
+    ) -> CommandResult:
+        """
+        Run a command through the audited runner.
+
+        Args:
+            argv: Program and arguments. Never a shell string.
+            input: Data written to the process stdin. Statements carrying a
+                password go here instead of into argv.
+            env: Extra environment variables.
+            timeout: Deadline in seconds.
+            secrets: Values to keep out of the logs.
+
+        Returns:
+            The command outcome.
+        """
+        return self.runner.run(argv, input=input, env=env, timeout=timeout, secrets=secrets)
+
+    # ==================== Passwords ====================
 
     @staticmethod
     def generate_password(length: int = 24) -> str:
@@ -150,10 +415,10 @@ class BaseDatabaseManager(BaseManager):
             length: Password length.
 
         Returns:
-            Secure random password.
+            A password containing at least one lower case letter, one upper case
+            letter, one digit and one symbol.
         """
         alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
-        # Ensure at least one of each type
         password = [
             secrets.choice(string.ascii_lowercase),
             secrets.choice(string.ascii_uppercase),
@@ -164,136 +429,297 @@ class BaseDatabaseManager(BaseManager):
         secrets.SystemRandom().shuffle(password)
         return "".join(password)
 
-    # ==================== Engine Management ====================
+    # ==================== Validation ====================
 
-    @abstractmethod
-    def is_installed(self) -> bool:
+    @classmethod
+    def validate_database_name(cls, name: str) -> str:
         """
-        Check if the database engine is installed.
-
-        Returns:
-            True if installed.
-        """
-        pass
-
-    @abstractmethod
-    def get_version(self) -> str | None:
-        """
-        Get the database engine version.
-
-        Returns:
-            Version string or None if not installed.
-        """
-        pass
-
-    @abstractmethod
-    def install(self) -> bool:
-        """
-        Install the database engine.
-
-        Returns:
-            True if installation successful.
-
-        Raises:
-            DatabaseEngineError: If installation fails.
-        """
-        pass
-
-    @abstractmethod
-    def uninstall(self, purge: bool = False) -> bool:
-        """
-        Uninstall the database engine.
+        Check a database name against the engine's rules.
 
         Args:
-            purge: Remove all data and configuration.
+            name: Candidate database name.
 
         Returns:
-            True if uninstallation successful.
+            The name, unchanged.
 
         Raises:
-            DatabaseEngineError: If uninstallation fails.
+            DatabaseError: When the name is not acceptable.
         """
-        pass
+        return validate_name(
+            name,
+            kind="database",
+            engine=cls.DISPLAY_NAME,
+            max_length=cls.MAX_DATABASE_NAME_LENGTH,
+        )
 
-    def start(self) -> bool:
+    @classmethod
+    def validate_user_name(cls, username: str) -> str:
         """
-        Start the database service.
+        Check a user name against the engine's rules.
 
-        Returns:
-            True if started successfully.
-        """
-        result = self._run_sudo(["systemctl", "start", self.SERVICE_NAME])
-        if not result.success:
-            raise DatabaseEngineError(f"Failed to start {self.DISPLAY_NAME}", result.stderr)
-        return True
-
-    def stop(self) -> bool:
-        """
-        Stop the database service.
+        Args:
+            username: Candidate user name.
 
         Returns:
-            True if stopped successfully.
-        """
-        result = self._run_sudo(["systemctl", "stop", self.SERVICE_NAME])
-        if not result.success:
-            raise DatabaseEngineError(f"Failed to stop {self.DISPLAY_NAME}", result.stderr)
-        return True
+            The name, unchanged.
 
-    def restart(self) -> bool:
+        Raises:
+            DatabaseError: When the name is not acceptable.
         """
-        Restart the database service.
+        return validate_name(
+            username,
+            kind="user",
+            engine=cls.DISPLAY_NAME,
+            max_length=cls.MAX_USER_NAME_LENGTH,
+        )
+
+    @classmethod
+    def validate_privileges(cls, privileges: Sequence[str] | None) -> tuple[str, ...]:
+        """
+        Reduce requested privileges to the engine's whitelist.
+
+        Args:
+            privileges: Privileges requested by the caller, or None.
 
         Returns:
-            True if restarted successfully.
+            Normalised, whitelisted privileges.
+
+        Raises:
+            DatabaseUserError: When a privilege is not whitelisted.
         """
-        result = self._run_sudo(["systemctl", "restart", self.SERVICE_NAME])
+        return validate_privileges(
+            privileges,
+            allowed=cls.VALID_PRIVILEGES,
+            engine=cls.DISPLAY_NAME,
+            default=cls.DEFAULT_PRIVILEGES,
+        )
+
+    # ==================== Engine Management ====================
+
+    def is_installed(self) -> bool:
+        """
+        Report whether the engine's client is installed.
+
+        Returns:
+            True when the client binary is on PATH.
+        """
+        return bool(self.CLIENT_BINARY) and self.runner.exists(self.CLIENT_BINARY)
+
+    def get_version(self) -> str | None:
+        """
+        Read the engine version from its own ``--version`` output.
+
+        Returns:
+            The version string, or None when the engine is absent or silent.
+        """
+        if not self.VERSION_ARGV:
+            return None
+        result = self._exec(list(self.VERSION_ARGV))
         if not result.success:
-            raise DatabaseEngineError(f"Failed to restart {self.DISPLAY_NAME}", result.stderr)
-        return True
+            return None
+        match = re.search(self.VERSION_PATTERN, result.stdout)
+        return match.group(1) if match else None
+
+    def _package_sets(self) -> tuple[list[str], ...]:
+        """
+        Return the package sets to try, in order of preference.
+
+        Returns:
+            One list of package names per candidate flavour of the engine.
+        """
+        return (list(self.PACKAGE_NAMES),)
+
+    def _pre_install(self) -> None:
+        """Prepare apt sources. Engines outside the distro repos override this."""
+
+    def _post_install(self) -> None:
+        """Harden the fresh installation. Engines that need it override this."""
+
+    def _on_packages_installed(self, packages: Sequence[str]) -> None:
+        """
+        React to the package set that actually installed.
+
+        Args:
+            packages: The package names that installed successfully.
+        """
+
+    def install(self) -> None:
+        """
+        Install the engine, enable its unit and start it.
+
+        Raises:
+            DatabaseEngineError: When apt or the unit fails.
+        """
+        self.logger.info(f"Installing {self.DISPLAY_NAME}...")
+
+        self._pre_install()
+
+        result = self._exec(["apt-get", "update"], env=APT_ENV, timeout=PACKAGE_TIMEOUT)
+        if not result.success:
+            raise DatabaseEngineError(
+                "Failed to update the package list",
+                details=result.stderr.strip() or "Check the apt sources in /etc/apt.",
+            )
+
+        failures: list[str] = []
+        for packages in self._package_sets():
+            result = self._exec(
+                ["apt-get", "install", "-y", *packages],
+                env=APT_ENV,
+                timeout=PACKAGE_TIMEOUT,
+            )
+            if result.success:
+                self._on_packages_installed(packages)
+                break
+            failures.append(f"{' '.join(packages)}: {result.stderr.strip()}")
+        else:
+            raise DatabaseEngineError(
+                f"Failed to install {self.DISPLAY_NAME}",
+                details="\n".join(failures) or "apt-get install returned no output.",
+            )
+
+        self.enable()
+        self.start()
+        self._post_install()
+
+    def uninstall(self, purge: bool = False) -> None:
+        """
+        Remove the engine's packages, and its data when purging.
+
+        Args:
+            purge: Also delete the data and configuration directories.
+
+        Raises:
+            DatabaseEngineError: When every package set fails to be removed.
+        """
+        self.logger.info(f"Uninstalling {self.DISPLAY_NAME}...")
+
+        try:
+            self.stop()
+        except DatabaseEngineError as exc:
+            self.logger.warning(f"Could not stop {self.DISPLAY_NAME} before removal: {exc}")
+
+        action = "purge" if purge else "remove"
+        failures: list[str] = []
+        for packages in self._package_sets():
+            result = self._exec(
+                ["apt-get", action, "-y", *packages],
+                env=APT_ENV,
+                timeout=PACKAGE_TIMEOUT,
+            )
+            if not result.success:
+                failures.append(f"{' '.join(packages)}: {result.stderr.strip()}")
+
+        if len(failures) == len(self._package_sets()):
+            raise DatabaseEngineError(
+                f"Failed to remove {self.DISPLAY_NAME}",
+                details="\n".join(failures) or f"Run: apt-get {action} -y manually.",
+            )
+
+        if purge:
+            for path in self.PURGE_PATHS:
+                self._exec(["rm", "-rf", path], timeout=SERVICE_TIMEOUT)
+
+    def _systemctl(self, action: str) -> CommandResult:
+        """
+        Apply a systemd verb to the engine's unit.
+
+        Args:
+            action: The systemctl verb.
+
+        Returns:
+            The command outcome.
+        """
+        return self._exec(["systemctl", action, self.SERVICE_NAME], timeout=SERVICE_TIMEOUT)
+
+    def _service_action(self, action: str) -> None:
+        """
+        Apply a systemd verb and turn a failure into an actionable error.
+
+        Args:
+            action: The systemctl verb.
+
+        Raises:
+            DatabaseEngineError: When systemctl reports failure.
+        """
+        result = self._systemctl(action)
+        if not result.success:
+            raise DatabaseEngineError(
+                f"Failed to {action} {self.DISPLAY_NAME}",
+                details=(
+                    f"{result.stderr.strip()}\n"
+                    f"Inspect the unit with: journalctl -u {self.SERVICE_NAME} -n 50"
+                ).strip(),
+            )
+
+    def start(self) -> None:
+        """
+        Start the engine's service.
+
+        Raises:
+            DatabaseEngineError: When the unit fails to start.
+        """
+        self._service_action("start")
+
+    def stop(self) -> None:
+        """
+        Stop the engine's service.
+
+        Raises:
+            DatabaseEngineError: When the unit fails to stop.
+        """
+        self._service_action("stop")
+
+    def restart(self) -> None:
+        """
+        Restart the engine's service.
+
+        Raises:
+            DatabaseEngineError: When the unit fails to restart.
+        """
+        self._service_action("restart")
+
+    def enable(self) -> None:
+        """
+        Enable the engine's service at boot.
+
+        Raises:
+            DatabaseEngineError: When the unit cannot be enabled.
+        """
+        self._service_action("enable")
+
+    def disable(self) -> None:
+        """
+        Disable the engine's service at boot.
+
+        Raises:
+            DatabaseEngineError: When the unit cannot be disabled.
+        """
+        self._service_action("disable")
 
     def is_running(self) -> bool:
         """
-        Check if the database service is running.
+        Report whether the engine's service is active.
 
         Returns:
-            True if running.
+            True when systemd reports the unit as active.
         """
-        result = self._run(["systemctl", "is-active", self.SERVICE_NAME])
-        return result.stdout.strip() == "active"
-
-    def enable(self) -> bool:
-        """
-        Enable the database service to start on boot.
-
-        Returns:
-            True if enabled successfully.
-        """
-        result = self._run_sudo(["systemctl", "enable", self.SERVICE_NAME])
-        return result.success
-
-    def disable(self) -> bool:
-        """
-        Disable the database service from starting on boot.
-
-        Returns:
-            True if disabled successfully.
-        """
-        result = self._run_sudo(["systemctl", "disable", self.SERVICE_NAME])
-        return result.success
+        return self._systemctl("is-active").output == "active"
 
     def get_status(self) -> dict[str, Any]:
         """
-        Get the database engine status.
+        Summarise the engine's state.
 
         Returns:
-            Dictionary with status information.
+            A dictionary describing installation, version and service state.
         """
+        installed = self.is_installed()
         return {
             "engine": self.ENGINE_NAME,
             "display_name": self.DISPLAY_NAME,
-            "installed": self.is_installed(),
-            "version": self.get_version() if self.is_installed() else None,
-            "running": self.is_running() if self.is_installed() else False,
+            "installed": installed,
+            "version": self.get_version() if installed else None,
+            "running": self.is_running() if installed else False,
             "port": self.DEFAULT_PORT,
             "service": self.SERVICE_NAME,
         }
@@ -313,75 +739,68 @@ class BaseDatabaseManager(BaseManager):
 
         Args:
             name: Database name.
-            owner: Owner user (if applicable).
+            owner: Owner user, when the engine has the concept.
             encoding: Character encoding.
-            **kwargs: Additional engine-specific options.
+            **kwargs: Engine-specific options.
 
         Returns:
-            DatabaseInfo object.
+            Information about the new database.
 
         Raises:
-            DatabaseExistsError: If database already exists.
-            DatabaseError: If creation fails.
+            DatabaseExistsError: When the database already exists.
+            DatabaseError: When creation fails.
         """
-        pass
 
     @abstractmethod
-    def drop_database(self, name: str, force: bool = False) -> bool:
+    def drop_database(self, name: str, force: bool = False) -> None:
         """
         Drop a database.
 
         Args:
             name: Database name.
-            force: Force drop even if in use.
-
-        Returns:
-            True if dropped successfully.
+            force: Drop even if the database is in use, and stay silent when it
+                does not exist.
 
         Raises:
-            DatabaseNotFoundError: If database doesn't exist.
-            DatabaseError: If drop fails.
+            DatabaseNotFoundError: When the database does not exist.
+            DatabaseError: When the drop fails.
         """
-        pass
 
     @abstractmethod
     def database_exists(self, name: str) -> bool:
         """
-        Check if a database exists.
+        Report whether a database exists.
 
         Args:
             name: Database name.
 
         Returns:
-            True if exists.
+            True when the database exists.
         """
-        pass
 
     @abstractmethod
     def list_databases(self) -> list[DatabaseInfo]:
         """
-        List all databases.
+        List the databases the engine holds.
 
         Returns:
-            List of DatabaseInfo objects.
+            One entry per non-system database.
         """
-        pass
 
     @abstractmethod
     def get_database_info(self, name: str) -> DatabaseInfo:
         """
-        Get detailed information about a database.
+        Describe one database.
 
         Args:
             name: Database name.
 
         Returns:
-            DatabaseInfo object.
+            Information about the database.
 
         Raises:
-            DatabaseNotFoundError: If database doesn't exist.
+            DatabaseNotFoundError: When the database does not exist.
         """
-        pass
 
     # ==================== User Management ====================
 
@@ -394,108 +813,276 @@ class BaseDatabaseManager(BaseManager):
         **kwargs,
     ) -> tuple[UserInfo, str]:
         """
-        Create a new database user.
+        Create a database user.
 
         Args:
-            username: Username.
-            password: Password (generated if not provided).
-            host: Host restriction.
-            **kwargs: Additional engine-specific options.
+            username: User name.
+            password: Password. Generated when omitted.
+            host: Host restriction, for engines that have one.
+            **kwargs: Engine-specific options.
 
         Returns:
-            Tuple of (UserInfo, password).
+            The user and its password.
 
         Raises:
-            DatabaseUserError: If creation fails.
+            DatabaseUserError: When creation fails.
         """
-        pass
 
     @abstractmethod
-    def drop_user(self, username: str, host: str = "localhost") -> bool:
+    def drop_user(self, username: str, host: str = "localhost") -> None:
         """
         Drop a database user.
 
         Args:
-            username: Username.
-            host: Host restriction.
-
-        Returns:
-            True if dropped successfully.
+            username: User name.
+            host: Host restriction, for engines that have one.
 
         Raises:
-            DatabaseUserError: If drop fails.
+            DatabaseUserError: When the drop fails.
         """
-        pass
 
     @abstractmethod
     def user_exists(self, username: str, host: str = "localhost") -> bool:
         """
-        Check if a user exists.
+        Report whether a user exists.
 
         Args:
-            username: Username.
-            host: Host restriction.
+            username: User name.
+            host: Host restriction, for engines that have one.
 
         Returns:
-            True if exists.
+            True when the user exists.
         """
-        pass
 
     @abstractmethod
     def list_users(self) -> list[UserInfo]:
         """
-        List all database users.
+        List the engine's users.
 
         Returns:
-            List of UserInfo objects.
+            One entry per user.
         """
-        pass
 
     @abstractmethod
     def grant_privileges(
         self,
         username: str,
         database: str,
-        privileges: list[str] = None,
+        privileges: Sequence[str] | None = None,
         host: str = "localhost",
-    ) -> bool:
+    ) -> None:
         """
-        Grant privileges to a user on a database.
+        Grant privileges on a database to a user.
 
         Args:
-            username: Username.
+            username: User name.
             database: Database name.
-            privileges: List of privileges (default: ALL).
-            host: Host restriction.
+            privileges: Privileges to grant. Engine default when omitted.
+            host: Host restriction, for engines that have one.
 
-        Returns:
-            True if granted successfully.
+        Raises:
+            DatabaseUserError: When a privilege is not whitelisted or the grant
+                fails.
         """
-        pass
 
     @abstractmethod
     def revoke_privileges(
         self,
         username: str,
         database: str,
-        privileges: list[str] = None,
+        privileges: Sequence[str] | None = None,
         host: str = "localhost",
-    ) -> bool:
+    ) -> None:
         """
-        Revoke privileges from a user on a database.
+        Revoke privileges on a database from a user.
 
         Args:
-            username: Username.
+            username: User name.
             database: Database name.
-            privileges: List of privileges (default: ALL).
-            host: Host restriction.
+            privileges: Privileges to revoke. Engine default when omitted.
+            host: Host restriction, for engines that have one.
 
-        Returns:
-            True if revoked successfully.
+        Raises:
+            DatabaseUserError: When a privilege is not whitelisted or the revoke
+                fails.
         """
-        pass
 
     # ==================== Backup & Restore ====================
+
+    def _ensure_directory(self, path: Path, mode: int = BACKUP_DIR_MODE) -> Path:
+        """
+        Create a directory, applying restrictive permissions to what we create.
+
+        An existing directory keeps its permissions: a caller may legitimately
+        point a backup at a directory whose mode is none of our business.
+
+        Args:
+            path: Directory to create.
+            mode: Permissions for directories this call creates.
+
+        Returns:
+            The directory path.
+
+        Raises:
+            DatabaseBackupError: When the directory cannot be created.
+        """
+        existed = path.exists()
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            if not existed:
+                path.chmod(mode)
+        except OSError as exc:
+            raise DatabaseBackupError(
+                f"Cannot create the backup directory {path}",
+                details=f"{exc}. Check ownership and free space, then retry.",
+            ) from exc
+        return path
+
+    def _backup_path(
+        self,
+        database: str,
+        output_path: Path | None,
+        compress: bool,
+        *,
+        label: str | None = None,
+        suffix: str | None = None,
+    ) -> Path:
+        """
+        Decide where a backup is written.
+
+        Args:
+            database: Database the backup belongs to.
+            output_path: Caller-supplied destination, used verbatim when given.
+            compress: Whether the file will be gzipped.
+            label: Overrides the database name in the generated file name.
+            suffix: Overrides :attr:`BACKUP_SUFFIX`.
+
+        Returns:
+            The destination path.
+        """
+        if output_path is not None:
+            return Path(output_path)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = (
+            f"{self.ENGINE_NAME}-{label or database}-{timestamp}{suffix or self.BACKUP_SUFFIX}"
+        )
+        if compress:
+            filename += ".gz"
+        return self.BACKUP_DIR / filename
+
+    def _dump_to_file(
+        self,
+        argv: Sequence[str],
+        destination: Path,
+        *,
+        database: str,
+        compress: bool,
+        env: Mapping[str, str] | None = None,
+        secrets: Sequence[str] = (),
+        timeout: int = TRANSFER_TIMEOUT,
+    ) -> BackupInfo:
+        """
+        Run a dump command and stream its stdout straight into a file.
+
+        The dump never passes through a shell and never through a Python string,
+        which is what makes a binary dump or a dump containing quotes survive.
+
+        Args:
+            argv: The dump command.
+            destination: File to write.
+            database: Database being dumped, for messages and metadata.
+            compress: Pipe the dump through gzip.
+            env: Extra environment variables, for credentials.
+            secrets: Values to keep out of the logs.
+            timeout: Deadline in seconds.
+
+        Returns:
+            Information about the backup that was written.
+
+        Raises:
+            DatabaseBackupError: When the dump command fails or writes nothing.
+        """
+        self._ensure_directory(destination.parent)
+        result = self.runner.capture_to_file(
+            argv,
+            destination,
+            compress=compress,
+            env=env,
+            timeout=timeout,
+            secrets=secrets,
+        )
+        if not result.success:
+            raise DatabaseBackupError(
+                f"Failed to back up '{database}'",
+                details=(
+                    result.stderr.strip()
+                    or f"{argv[0]} exited with code {result.exit_code} and said nothing."
+                ),
+            )
+        if not destination.exists():
+            raise DatabaseBackupError(
+                f"Backup of '{database}' produced no file",
+                details=f"{argv[0]} reported success but {destination} does not exist.",
+            )
+
+        self.logger.info(f"Created backup: {destination}")
+        return BackupInfo(
+            path=destination,
+            database=database,
+            engine=self.ENGINE_NAME,
+            size=destination.stat().st_size,
+            created=datetime.now(),
+            compressed=compress,
+        )
+
+    @contextmanager
+    def _staged_backup(
+        self,
+        source: Path,
+        staged_name: str,
+        *,
+        owner: str | None = None,
+    ) -> Iterator[Path]:
+        """
+        Make a backup readable by the account that will restore it.
+
+        Backups are written 0600 and owned by root, and a client such as psql
+        opens the file itself, as the engine's own account. The file is therefore
+        copied (or decompressed) into a traversable staging directory and handed
+        to that account for the duration of the restore.
+
+        Args:
+            source: The backup file, plain or gzipped.
+            staged_name: File name to use inside the staging directory.
+            owner: Account that must be able to read the staged file.
+
+        Yields:
+            The path of the staged, plain-text copy.
+
+        Raises:
+            DatabaseBackupError: When staging fails.
+        """
+        staging_dir = self._ensure_directory(self.BACKUP_DIR / ".staging", STAGING_DIR_MODE)
+        staged = staging_dir / staged_name
+        try:
+            if source.suffix == ".gz":
+                result = self.runner.capture_to_file(
+                    ["gzip", "-dc", str(source)],
+                    staged,
+                    timeout=TRANSFER_TIMEOUT,
+                )
+            else:
+                result = self._exec(["cp", str(source), str(staged)], timeout=TRANSFER_TIMEOUT)
+            if not result.success:
+                raise DatabaseBackupError(
+                    f"Failed to stage the backup {source}",
+                    details=result.stderr.strip() or "Check free space in the backup directory.",
+                )
+            if owner:
+                self._exec(["chown", owner, str(staged)], timeout=SERVICE_TIMEOUT)
+            yield staged
+        finally:
+            staged.unlink(missing_ok=True)
 
     @abstractmethod
     def backup(
@@ -506,21 +1093,20 @@ class BaseDatabaseManager(BaseManager):
         **kwargs,
     ) -> BackupInfo:
         """
-        Create a backup of a database.
+        Back up a database.
 
         Args:
             database: Database name.
             output_path: Custom output path.
-            compress: Compress the backup.
-            **kwargs: Additional engine-specific options.
+            compress: Compress the backup with gzip.
+            **kwargs: Engine-specific options.
 
         Returns:
-            BackupInfo object.
+            Information about the backup.
 
         Raises:
-            DatabaseBackupError: If backup fails.
+            DatabaseBackupError: When the backup fails.
         """
-        pass
 
     @abstractmethod
     def restore(
@@ -529,69 +1115,64 @@ class BaseDatabaseManager(BaseManager):
         backup_path: Path,
         drop_existing: bool = False,
         **kwargs,
-    ) -> bool:
+    ) -> None:
         """
-        Restore a database from backup.
+        Restore a database from a backup.
 
         Args:
             database: Target database name.
-            backup_path: Path to backup file.
-            drop_existing: Drop existing database first.
-            **kwargs: Additional engine-specific options.
-
-        Returns:
-            True if restored successfully.
+            backup_path: Path to the backup file.
+            drop_existing: Drop the target database first.
+            **kwargs: Engine-specific options.
 
         Raises:
-            DatabaseBackupError: If restore fails.
+            DatabaseBackupError: When the restore fails.
         """
-        pass
 
     def list_backups(self, database: str | None = None) -> list[BackupInfo]:
         """
-        List available backups.
+        List the backups this engine has written.
 
         Args:
-            database: Filter by database name.
+            database: Only list backups of this database.
 
         Returns:
-            List of BackupInfo objects.
+            Backups, newest first.
         """
-        backups = []
-
         if not self.BACKUP_DIR.exists():
-            return backups
+            return []
 
-        pattern = (
-            f"{self.ENGINE_NAME}-*.sql*"
-            if not database
-            else f"{self.ENGINE_NAME}-{database}-*.sql*"
+        # engine-database-YYYYmmdd_HHMMSS.ext, where the database name itself may
+        # contain dashes, so the timestamp is what anchors the split.
+        pattern = re.compile(
+            rf"^{re.escape(self.ENGINE_NAME)}-(?P<database>.+)-\d{{8}}_\d{{6}}(?P<ext>\..+)?$"
         )
 
-        for path in self.BACKUP_DIR.glob(pattern):
+        backups: list[BackupInfo] = []
+        for path in sorted(self.BACKUP_DIR.glob(f"{self.ENGINE_NAME}-*")):
+            match = pattern.match(path.name)
+            if not match:
+                continue
+            db_name = match.group("database")
+            if database and db_name != database:
+                continue
             try:
                 stat = path.stat()
-                # Parse filename: engine-database-timestamp.sql[.gz]
-                parts = path.stem.replace(".sql", "").split("-")
-                if len(parts) >= 3:
-                    db_name = parts[1]
-                    if database and db_name != database:
-                        continue
-
-                    backups.append(
-                        BackupInfo(
-                            path=path,
-                            database=db_name,
-                            engine=self.ENGINE_NAME,
-                            size=stat.st_size,
-                            created=datetime.fromtimestamp(stat.st_mtime),
-                            compressed=path.suffix == ".gz",
-                        )
-                    )
-            except Exception:
+            except OSError as exc:
+                self.logger.debug(f"Skipping unreadable backup {path}: {exc}")
                 continue
+            backups.append(
+                BackupInfo(
+                    path=path,
+                    database=db_name,
+                    engine=self.ENGINE_NAME,
+                    size=stat.st_size,
+                    created=datetime.fromtimestamp(stat.st_mtime),
+                    compressed=path.suffix == ".gz",
+                )
+            )
 
-        return sorted(backups, key=lambda x: x.created, reverse=True)
+        return sorted(backups, key=lambda backup: backup.created, reverse=True)
 
     # ==================== Query Execution ====================
 
@@ -603,20 +1184,19 @@ class BaseDatabaseManager(BaseManager):
         **kwargs,
     ) -> tuple[bool, str]:
         """
-        Execute a SQL query.
+        Execute a statement against a database.
 
         Args:
             database: Database name.
-            query: SQL query to execute.
-            **kwargs: Additional options.
+            query: Statement to execute.
+            **kwargs: Engine-specific options.
 
         Returns:
-            Tuple of (success, output).
+            Whether the statement succeeded, and its output.
 
         Raises:
-            DatabaseQueryError: If query fails.
+            DatabaseQueryError: When the statement fails.
         """
-        pass
 
     @abstractmethod
     def get_connection_string(
@@ -627,18 +1207,17 @@ class BaseDatabaseManager(BaseManager):
         host: str = "localhost",
     ) -> str:
         """
-        Get a connection string for the database.
+        Build a connection string for an application.
 
         Args:
             database: Database name.
-            username: Username.
+            username: User name.
             password: Password.
-            host: Host.
+            host: Host to connect to.
 
         Returns:
-            Connection string.
+            The connection string.
         """
-        pass
 
     def get_interactive_command(
         self,
@@ -646,13 +1225,16 @@ class BaseDatabaseManager(BaseManager):
         username: str | None = None,
     ) -> list[str]:
         """
-        Get the command to connect interactively.
+        Build the command that opens an interactive client.
 
         Args:
-            database: Database name.
-            username: Username.
+            database: Database to connect to.
+            username: User to connect as.
 
         Returns:
-            Command list for subprocess.
+            The argument vector to execute.
+
+        Raises:
+            NotImplementedError: When the engine does not define one.
         """
         raise NotImplementedError("Subclass must implement get_interactive_command")

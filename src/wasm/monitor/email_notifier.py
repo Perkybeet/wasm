@@ -1,634 +1,454 @@
 """
-Email notification system for WASM process monitoring.
+Email delivery for monitor observations.
 
-Sends alerts and reports via SMTP when suspicious or malicious
-processes are detected.
+Three properties matter here, and each maps to a defect this module used to
+have:
+
+- **Every socket has a deadline.** The monitor loop is single threaded. An SMTP
+  connection without a timeout does not fail, it hangs, and the daemon stops
+  monitoring forever while systemd still reports it as active.
+- **Credentials never cross a plaintext session.** Authenticating over an
+  unencrypted connection puts the password on the wire; the notifier refuses.
+- **The password never reaches a log.** Server replies are echoed into error
+  details, and some servers echo back what was sent, so details are redacted.
 """
 
+from __future__ import annotations
+
 import smtplib
+import socket
 import ssl
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from html import escape
+from typing import Any
 
 from wasm.core.config import Config
 from wasm.core.exceptions import EmailError
 from wasm.core.logger import Logger
+from wasm.monitor.models import SEVERITY_WARNING, ProcessObservation
+
+#: Deadline for every SMTP socket operation, in seconds. Long enough for a slow
+#: relay, short enough that a scan loop recovers within one interval.
+DEFAULT_SMTP_TIMEOUT = 30
+
+#: Beyond this a "timeout" stops protecting the scan loop it exists to protect.
+MAX_SMTP_TIMEOUT = 120
+
+_REDACTED = "***"
 
 
 @dataclass
 class SMTPConfig:
-    """SMTP server configuration."""
+    """
+    Connection settings for the outgoing mail server.
+
+    Attributes:
+        host: SMTP server hostname.
+        port: SMTP server port.
+        username: Account used to authenticate, empty for anonymous relays.
+        password: Password for that account.
+        use_ssl: Connect with implicit TLS (SMTPS, usually port 465).
+        use_tls: Connect in the clear and upgrade with STARTTLS (usually 587).
+        from_address: Envelope sender. Defaults to the username.
+        timeout: Socket deadline in seconds.
+    """
 
     host: str
     port: int
-    username: str
-    password: str
+    username: str = ""
+    password: str = ""
     use_ssl: bool = True
     use_tls: bool = False
     from_address: str | None = None
+    timeout: int = DEFAULT_SMTP_TIMEOUT
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
+        """
+        Normalise the sender and reject a deadline that is not one.
+
+        Raises:
+            EmailError: When the timeout is missing, zero or negative.
+        """
         if not self.from_address:
             self.from_address = self.username
+        if not self.timeout or self.timeout <= 0:
+            raise EmailError(
+                "SMTP timeout must be a positive number of seconds",
+                details=(
+                    "A missing or zero timeout hangs the monitor loop forever. "
+                    f"Set monitor.smtp.timeout to a value between 1 and {MAX_SMTP_TIMEOUT}."
+                ),
+            )
+        self.timeout = min(int(self.timeout), MAX_SMTP_TIMEOUT)
+
+    @property
+    def secrets(self) -> tuple[str, ...]:
+        """Values that must never appear in a log or an error message."""
+        return tuple(value for value in (self.password,) if value)
 
 
 @dataclass
-class ThreatReport:
-    """Report of detected threat."""
+class EmailContent:
+    """
+    A rendered message, ready to be handed to the server.
 
-    process_name: str
-    pid: int
-    user: str
-    cpu_percent: float
-    memory_percent: float
-    command: str
-    threat_level: str  # "suspicious", "malicious"
-    confidence: float
-    reason: str
-    parent_pid: int | None = None
-    parent_name: str | None = None
-    action_taken: str | None = None
-    timestamp: datetime | None = None
+    Attributes:
+        subject: Message subject.
+        text: Plain text body.
+        html: HTML body.
+        headers: Extra headers to set.
+    """
 
-    def __post_init__(self):
-        if not self.timestamp:
-            self.timestamp = datetime.now()
+    subject: str
+    text: str
+    html: str
+    headers: dict[str, str] = field(default_factory=dict)
 
 
 class EmailNotifier:
-    """
-    Email notification system for process monitoring alerts.
-
-    Sends formatted HTML emails when threats are detected and
-    after mitigation actions are completed.
-    """
+    """Sends monitor observations by email."""
 
     def __init__(
         self,
         smtp_config: SMTPConfig | None = None,
         recipients: list[str] | None = None,
         verbose: bool = False,
-    ):
+    ) -> None:
         """
-        Initialize email notifier.
-
         Args:
-            smtp_config: SMTP server configuration. If None, loads from config.
-            recipients: List of email recipients. If None, loads from config.
+            smtp_config: Server settings. Loaded from the global config if None.
+            recipients: Destination addresses. Loaded from the config if None.
             verbose: Enable verbose logging.
         """
         self.logger = Logger(verbose=verbose)
         self.config = Config()
-        # Always reload config to get latest values
         self.config.reload()
 
-        if smtp_config:
-            self.smtp_config = smtp_config
-        else:
-            self.smtp_config = self._load_smtp_config()
-
-        if recipients:
-            self.recipients = recipients
-        else:
-            self.recipients = self._load_recipients()
+        self.smtp_config = smtp_config or self._load_smtp_config()
+        self.recipients = recipients if recipients is not None else self._load_recipients()
 
     def _load_smtp_config(self) -> SMTPConfig:
-        """Load SMTP configuration from global config."""
+        """
+        Build the server settings from the global configuration.
+
+        Returns:
+            The SMTP settings.
+
+        Raises:
+            EmailError: When the configured timeout is not positive.
+        """
         return SMTPConfig(
             host=self.config.get("monitor.smtp.host", ""),
-            port=self.config.get("monitor.smtp.port", 465),
+            port=int(self.config.get("monitor.smtp.port", 465)),
             username=self.config.get("monitor.smtp.username", ""),
             password=self.config.get("monitor.smtp.password", ""),
-            use_ssl=self.config.get("monitor.smtp.use_ssl", True),
-            use_tls=self.config.get("monitor.smtp.use_tls", False),
+            use_ssl=bool(self.config.get("monitor.smtp.use_ssl", True)),
+            use_tls=bool(self.config.get("monitor.smtp.use_tls", False)),
             from_address=self.config.get("monitor.smtp.from_address", ""),
+            timeout=int(self.config.get("monitor.smtp.timeout", DEFAULT_SMTP_TIMEOUT)),
         )
 
     def _load_recipients(self) -> list[str]:
-        """Load email recipients from global config."""
+        """
+        Read the destination addresses from the global configuration.
+
+        Returns:
+            The configured recipients, possibly empty.
+        """
         recipients = self.config.get("monitor.email_recipients", [])
         if isinstance(recipients, str):
             return [recipients]
-        return recipients or []
+        return list(recipients or [])
+
+    def _redact(self, text: str) -> str:
+        """
+        Strip credentials out of a message before it is logged or raised.
+
+        Args:
+            text: Text that may quote a server reply.
+
+        Returns:
+            The text with every known secret replaced.
+        """
+        for secret in self.smtp_config.secrets:
+            text = text.replace(secret, _REDACTED)
+        return text
+
+    @property
+    def is_configured(self) -> bool:
+        """True when there is a server to talk to and someone to talk about."""
+        return bool(self.smtp_config.host and self.recipients)
 
     def _create_connection(self) -> smtplib.SMTP:
         """
-        Create SMTP connection.
+        Open an authenticated connection to the mail server.
 
         Returns:
-            Connected SMTP object.
+            The connected client.
 
         Raises:
-            EmailError: If connection fails.
+            EmailError: When the transport is insecure or the server refuses.
         """
+        config = self.smtp_config
+        needs_login = bool(config.username or config.password)
+
+        if needs_login and not (config.use_ssl or config.use_tls):
+            raise EmailError(
+                "Refusing to send SMTP credentials over an unencrypted connection",
+                details=(
+                    "Set monitor.smtp.use_ssl (port 465) or monitor.smtp.use_tls (port 587). "
+                    "Only an anonymous local relay may run without encryption."
+                ),
+            )
+
+        context = ssl.create_default_context()
+
         try:
-            if self.smtp_config.use_ssl:
-                context = ssl.create_default_context()
-                server = smtplib.SMTP_SSL(
-                    self.smtp_config.host,
-                    self.smtp_config.port,
+            if config.use_ssl:
+                server: smtplib.SMTP = smtplib.SMTP_SSL(
+                    config.host,
+                    config.port,
                     context=context,
+                    timeout=config.timeout,
                 )
             else:
-                server = smtplib.SMTP(
-                    self.smtp_config.host,
-                    self.smtp_config.port,
-                )
-                if self.smtp_config.use_tls:
-                    server.starttls()
+                server = smtplib.SMTP(config.host, config.port, timeout=config.timeout)
+                if config.use_tls:
+                    server.starttls(context=context)
 
-            server.login(self.smtp_config.username, self.smtp_config.password)
+            if needs_login:
+                server.login(config.username, config.password)
             return server
 
-        except smtplib.SMTPAuthenticationError as e:
+        except smtplib.SMTPAuthenticationError as exc:
             raise EmailError(
                 "SMTP authentication failed",
-                details=f"Check username and password: {e}",
-            )
-        except smtplib.SMTPConnectError as e:
+                details=self._redact(f"Check monitor.smtp.username and password: {exc}"),
+            ) from exc
+        except smtplib.SMTPConnectError as exc:
             raise EmailError(
-                "Failed to connect to SMTP server",
-                details=f"Host: {self.smtp_config.host}:{self.smtp_config.port} - {e}",
-            )
-        except Exception as e:
+                "Failed to connect to the SMTP server",
+                details=self._redact(f"{config.host}:{config.port} - {exc}"),
+            ) from exc
+        except (smtplib.SMTPException, ssl.SSLError, TimeoutError, OSError) as exc:
             raise EmailError(
-                "Failed to establish SMTP connection",
-                details=str(e),
-            )
+                "Failed to establish an SMTP connection",
+                details=self._redact(
+                    f"{config.host}:{config.port} (timeout {config.timeout}s) - {exc}"
+                ),
+            ) from exc
 
-    def _generate_threat_html(self, reports: list[ThreatReport], is_final: bool = False) -> str:
+    def _send(self, content: EmailContent) -> bool:
         """
-        Generate HTML content for threat report email.
+        Deliver a rendered message.
 
         Args:
-            reports: List of threat reports.
-            is_final: Whether this is the final mitigation report.
+            content: The message to send.
 
         Returns:
-            HTML formatted email content.
+            True when the server accepted the message.
+
+        Raises:
+            EmailError: When the message could not be delivered.
         """
-        hostname = self._get_hostname()
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        message = MIMEMultipart("alternative")
+        message["Subject"] = content.subject
+        message["From"] = self.smtp_config.from_address or self.smtp_config.username
+        message["To"] = ", ".join(self.recipients)
+        for header, value in content.headers.items():
+            message[header] = value
+        message.attach(MIMEText(content.text, "plain"))
+        message.attach(MIMEText(content.html, "html"))
 
-        if is_final:
-            title = "🛡️ WASM Security Monitor - Mitigation Report"
-            subtitle = "Actions taken to neutralize detected threats"
-            color = "#28a745"
-        else:
-            # Check if any malicious
-            has_malicious = any(r.threat_level == "malicious" for r in reports)
-            if has_malicious:
-                title = "🚨 WASM Security Alert - MALICIOUS PROCESS DETECTED"
-                color = "#dc3545"
-            else:
-                title = "⚠️ WASM Security Alert - Suspicious Activity Detected"
-                color = "#ffc107"
-            subtitle = "Immediate attention may be required"
+        server = self._create_connection()
+        try:
+            server.sendmail(
+                self.smtp_config.from_address or self.smtp_config.username,
+                self.recipients,
+                message.as_string(),
+            )
+        except (smtplib.SMTPException, TimeoutError, OSError) as exc:
+            raise EmailError(
+                "Failed to send the notification email",
+                details=self._redact(str(exc)),
+            ) from exc
+        finally:
+            try:
+                server.quit()
+            except (smtplib.SMTPException, OSError) as exc:
+                self.logger.debug(
+                    f"SMTP connection did not close cleanly: {self._redact(str(exc))}"
+                )
 
-        html = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-            line-height: 1.6;
-            color: #333;
-            margin: 0;
-            padding: 0;
-            background-color: #f4f4f4;
-        }}
-        .wrapper {{
-            width: 100%;
-            background-color: #f4f4f4;
-            padding: 20px 0;
-        }}
-        .container {{
-            width: 600px;
-            max-width: 600px;
-            margin: 0 auto;
-            background-color: #ffffff;
-        }}
-        .header {{
-            background: {color};
-            color: white;
-            padding: 20px;
-            text-align: center;
-            width: 560px;
-        }}
-        .header h1 {{
-            margin: 0;
-            font-size: 22px;
-        }}
-        .header p {{
-            margin: 10px 0 0;
-            opacity: 0.9;
-            font-size: 14px;
-        }}
-        .content {{
-            background: #f8f9fa;
-            padding: 20px;
-            width: 560px;
-        }}
-        .info-box {{
-            background: white;
-            padding: 15px;
-            margin-bottom: 20px;
-            border-left: 4px solid {color};
-        }}
-        .threat-card {{
-            background: white;
-            border: 1px solid #ddd;
-            margin-bottom: 15px;
-            overflow: hidden;
-        }}
-        .threat-header {{
-            padding: 12px 15px;
-            font-weight: bold;
-            border-bottom: 1px solid #ddd;
-        }}
-        .threat-malicious {{
-            background: #f8d7da;
-            color: #721c24;
-        }}
-        .threat-suspicious {{
-            background: #fff3cd;
-            color: #856404;
-        }}
-        .threat-neutralized {{
-            background: #d4edda;
-            color: #155724;
-        }}
-        .threat-body {{
-            padding: 15px;
-        }}
-        .threat-body table {{
-            width: 100%;
-            border-collapse: collapse;
-        }}
-        .threat-body td {{
-            padding: 5px 0;
-            vertical-align: top;
-        }}
-        .threat-body td:first-child {{
-            font-weight: bold;
-            width: 140px;
-            color: #666;
-        }}
-        .command-box {{
-            background: #2d2d2d;
-            color: #f8f8f2;
-            padding: 10px;
-            border-radius: 4px;
-            font-family: 'Courier New', monospace;
-            font-size: 12px;
-            word-break: break-all;
-            margin-top: 10px;
-        }}
-        .badge {{
-            display: inline-block;
-            padding: 3px 8px;
-            border-radius: 12px;
-            font-size: 12px;
-            font-weight: bold;
-        }}
-        .badge-danger {{
-            background: #dc3545;
-            color: white;
-        }}
-        .badge-warning {{
-            background: #ffc107;
-            color: #333;
-        }}
-        .badge-success {{
-            background: #28a745;
-            color: white;
-        }}
-        .footer {{
-            text-align: center;
-            padding: 20px;
-            color: #666;
-            font-size: 12px;
-            width: 560px;
-            background: #ffffff;
-        }}
-    </style>
-</head>
-<body>
-    <div class="wrapper">
-        <table cellpadding="0" cellspacing="0" border="0" width="600" align="center" style="margin: 0 auto;">
-            <tr>
-                <td>
-                    <div class="container">
-                        <div class="header">
-                            <h1>{title}</h1>
-                            <p>{subtitle}</p>
-                        </div>
-                        <div class="content">
-                            <div class="info-box">
-                                <strong>🖥️ Server:</strong> {hostname}<br>
-                                <strong>🕐 Time:</strong> {timestamp}<br>
-                                <strong>📊 Threats detected:</strong> {len(reports)}
-                            </div>
-"""
+        self.logger.debug(f"Sent '{content.subject}' to {len(self.recipients)} recipient(s)")
+        return True
 
-        for report in reports:
-            if is_final and report.action_taken:
-                threat_class = "threat-neutralized"
-                level_badge = '<span class="badge badge-success">NEUTRALIZED</span>'
-            elif report.threat_level == "malicious":
-                threat_class = "threat-malicious"
-                level_badge = '<span class="badge badge-danger">MALICIOUS</span>'
-            else:
-                threat_class = "threat-suspicious"
-                level_badge = '<span class="badge badge-warning">SUSPICIOUS</span>'
-
-            html += f"""
-                            <div class="threat-card">
-                                <div class="threat-header {threat_class}">
-                                    {level_badge} {report.process_name} (PID: {report.pid})
-                                </div>
-                                <div class="threat-body">
-                                    <table>
-                                        <tr>
-                                            <td>User:</td>
-                                            <td>{report.user}</td>
-                                        </tr>
-                                        <tr>
-                                            <td>CPU Usage:</td>
-                                            <td>{report.cpu_percent:.1f}%</td>
-                                        </tr>
-                                        <tr>
-                                            <td>Memory Usage:</td>
-                                            <td>{report.memory_percent:.1f}%</td>
-                                        </tr>
-                                        <tr>
-                                            <td>Confidence:</td>
-                                            <td>{report.confidence * 100:.0f}%</td>
-                                        </tr>
-                                        <tr>
-                                            <td>Reason:</td>
-                                            <td>{report.reason}</td>
-                                        </tr>
-"""
-
-            if report.parent_pid and report.parent_name:
-                html += f"""
-                                        <tr>
-                                            <td>Parent Process:</td>
-                                            <td>{report.parent_name} (PID: {report.parent_pid})</td>
-                                        </tr>
-"""
-
-            if is_final and report.action_taken:
-                html += f"""
-                                        <tr>
-                                            <td>Action Taken:</td>
-                                            <td><strong>{report.action_taken}</strong></td>
-                                        </tr>
-"""
-
-            html += f"""
-                                    </table>
-                                    <div class="command-box">{report.command}</div>
-                                </div>
-                            </div>
-"""
-
-        html += """
-                        </div>
-                        <div class="footer">
-                            <p>This is an automated message from WASM Security Monitor.<br>
-                            Please do not reply to this email.</p>
-                        </div>
-                    </div>
-                </td>
-            </tr>
-        </table>
-    </div>
-</body>
-</html>
-"""
-        return html
-
-    def _generate_threat_text(self, reports: list[ThreatReport], is_final: bool = False) -> str:
+    def _hostname(self) -> str:
         """
-        Generate plain text content for threat report email.
+        Return the machine name used in subjects and bodies.
+
+        Returns:
+            The hostname, or "unknown" when it cannot be resolved.
+        """
+        try:
+            return socket.gethostname()
+        except OSError:
+            return "unknown"
+
+    def render_observations(self, observations: list[ProcessObservation]) -> EmailContent:
+        """
+        Render an observation report.
 
         Args:
-            reports: List of threat reports.
-            is_final: Whether this is the final mitigation report.
+            observations: What the scan noticed.
 
         Returns:
-            Plain text formatted email content.
+            The message to send.
         """
-        hostname = self._get_hostname()
+        hostname = self._hostname()
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        warnings = sum(1 for o in observations if o.severity == SEVERITY_WARNING)
 
-        if is_final:
-            title = "WASM Security Monitor - Mitigation Report"
-        else:
-            has_malicious = any(r.threat_level == "malicious" for r in reports)
-            if has_malicious:
-                title = "WASM Security Alert - MALICIOUS PROCESS DETECTED"
-            else:
-                title = "WASM Security Alert - Suspicious Activity Detected"
+        subject = f"[WASM] {len(observations)} process observation(s) on {hostname}"
 
         lines = [
-            "=" * 60,
-            title,
+            "WASM monitor - process observations",
             "=" * 60,
             "",
             f"Server: {hostname}",
-            f"Time: {timestamp}",
-            f"Threats detected: {len(reports)}",
+            f"Time:   {timestamp}",
+            f"Noted:  {len(observations)} process(es), {warnings} of them as warnings",
+            "",
+            "The monitor reports only. No process was signalled and no file was",
+            "touched. Review each entry before taking any action.",
             "",
             "-" * 60,
         ]
-
-        for report in reports:
+        for observation in observations:
+            process = observation.process
             lines.extend(
                 [
                     "",
-                    f"[{report.threat_level.upper()}] {report.process_name} (PID: {report.pid})",
-                    f"  User: {report.user}",
-                    f"  CPU: {report.cpu_percent:.1f}% | Memory: {report.memory_percent:.1f}%",
-                    f"  Confidence: {report.confidence * 100:.0f}%",
-                    f"  Reason: {report.reason}",
+                    f"[{observation.severity.upper()}] {process.name} (PID {process.pid})",
+                    f"  Signal:  {observation.signal}",
+                    f"  User:    {process.user}",
+                    f"  CPU:     {process.cpu_percent:.1f}%",
+                    f"  Memory:  {process.memory_percent:.1f}%",
+                    f"  Detail:  {observation.detail}",
+                    f"  Command: {process.command}",
                 ]
             )
+            if process.parent_pid:
+                lines.append(f"  Parent:  {process.parent_name or '?'} (PID {process.parent_pid})")
 
-            if report.parent_pid and report.parent_name:
-                lines.append(f"  Parent: {report.parent_name} (PID: {report.parent_pid})")
-
-            if is_final and report.action_taken:
-                lines.append(f"  Action: {report.action_taken}")
-
-            lines.extend(
-                [
-                    f"  Command: {report.command}",
-                    "",
-                ]
-            )
-
-        lines.extend(
-            [
-                "-" * 60,
-                "",
-                "This is an automated message from WASM Security Monitor.",
-            ]
+        rows = "".join(
+            f"""
+        <tr>
+            <td>{o.severity.upper()}</td>
+            <td>{_escape(o.process.name)} (PID {o.process.pid})</td>
+            <td>{o.process.user}</td>
+            <td>{o.process.cpu_percent:.1f}%</td>
+            <td>{o.process.memory_percent:.1f}%</td>
+            <td>{_escape(o.signal)}: {_escape(o.detail)}<br>
+                <code>{_escape(o.process.command)}</code></td>
+        </tr>"""
+            for o in observations
         )
 
-        return "\n".join(lines)
+        html = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>{subject}</title></head>
+<body style="font-family: system-ui, sans-serif; color: #222;">
+    <h2>WASM monitor - process observations</h2>
+    <p><strong>Server:</strong> {hostname}<br>
+       <strong>Time:</strong> {timestamp}<br>
+       <strong>Noted:</strong> {len(observations)} process(es), {warnings} as warnings</p>
+    <p>The monitor reports only. No process was signalled and no file was touched.
+       Review each entry before taking any action.</p>
+    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse: collapse;">
+        <tr><th>Severity</th><th>Process</th><th>User</th><th>CPU</th><th>Memory</th><th>Why</th></tr>{rows}
+    </table>
+</body>
+</html>"""
 
-    def _get_hostname(self) -> str:
-        """Get system hostname."""
-        import socket
+        return EmailContent(subject=subject, text="\n".join(lines), html=html)
 
-        try:
-            return socket.gethostname()
-        except Exception:
-            return "unknown"
-
-    def send_threat_alert(
-        self,
-        reports: list[ThreatReport],
-        is_final: bool = False,
-    ) -> bool:
+    def send_observation_alert(self, observations: list[ProcessObservation]) -> bool:
         """
-        Send threat alert email.
+        Email a set of observations.
 
         Args:
-            reports: List of threat reports.
-            is_final: Whether this is the final mitigation report.
+            observations: What the scan noticed.
 
         Returns:
-            True if email sent successfully.
+            True when the report was sent, False when there was nothing to send
+            or no working configuration.
 
         Raises:
-            EmailError: If sending fails.
+            EmailError: When delivery fails.
         """
-        if not self.recipients:
-            self.logger.warning("No email recipients configured")
+        if not observations:
+            return False
+        if not self.is_configured:
+            self.logger.debug("SMTP or recipients not configured, skipping notification")
             return False
 
-        if not self.smtp_config.host or not self.smtp_config.username:
-            self.logger.warning("SMTP not configured")
-            return False
-
-        # Determine subject
-        hostname = self._get_hostname()
-        if is_final:
-            subject = f"[WASM] Mitigation Complete - {hostname}"
-        else:
-            has_malicious = any(r.threat_level == "malicious" for r in reports)
-            if has_malicious:
-                subject = f"[WASM] 🚨 CRITICAL: Malicious Process Detected - {hostname}"
-            else:
-                subject = f"[WASM] ⚠️ Warning: Suspicious Activity - {hostname}"
-
-        # Create message
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"] = self.smtp_config.from_address
-        msg["To"] = ", ".join(self.recipients)
-
-        # Attach both plain text and HTML versions
-        text_content = self._generate_threat_text(reports, is_final)
-        html_content = self._generate_threat_html(reports, is_final)
-
-        msg.attach(MIMEText(text_content, "plain"))
-        msg.attach(MIMEText(html_content, "html"))
-
-        try:
-            self.logger.debug(f"Connecting to SMTP server: {self.smtp_config.host}")
-            server = self._create_connection()
-
-            self.logger.debug(f"Sending email to: {', '.join(self.recipients)}")
-            server.sendmail(
-                self.smtp_config.from_address,
-                self.recipients,
-                msg.as_string(),
-            )
-            server.quit()
-
-            self.logger.success("Alert email sent successfully")
-            return True
-
-        except EmailError:
-            raise
-        except Exception as e:
-            raise EmailError(
-                "Failed to send email",
-                details=str(e),
-            )
+        return self._send(self.render_observations(observations))
 
     def send_test_email(self) -> bool:
         """
-        Send a test email to verify configuration.
+        Send a message that proves the configuration works.
 
         Returns:
-            True if test email sent successfully.
+            True when the message was accepted.
+
+        Raises:
+            EmailError: When delivery fails.
         """
-        hostname = self._get_hostname()
+        hostname = self._hostname()
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"[WASM] Test Email - {hostname}"
-        msg["From"] = self.smtp_config.from_address
-        msg["To"] = ", ".join(self.recipients)
-
-        text = f"""
-WASM Security Monitor - Test Email
-===================================
-
-This is a test email from WASM Security Monitor.
-
-Server: {hostname}
-Time: {timestamp}
-
-If you received this email, your notification system is configured correctly.
-"""
-
-        html = f"""
-<!DOCTYPE html>
+        text = (
+            "WASM monitor - test email\n"
+            "=========================\n\n"
+            f"Server: {hostname}\n"
+            f"Time:   {timestamp}\n\n"
+            "Receiving this means monitor notifications are configured correctly."
+        )
+        html = f"""<!DOCTYPE html>
 <html>
-<head>
-    <style>
-        body {{ font-family: Arial, sans-serif; padding: 20px; }}
-        .box {{ background: #d4edda; border: 1px solid #c3e6cb; padding: 20px; border-radius: 8px; }}
-    </style>
-</head>
-<body>
-    <div class="box">
-        <h2>✅ WASM Security Monitor - Test Email</h2>
-        <p>This is a test email from WASM Security Monitor.</p>
-        <p><strong>Server:</strong> {hostname}<br>
-        <strong>Time:</strong> {timestamp}</p>
-        <p>If you received this email, your notification system is configured correctly.</p>
-    </div>
+<head><meta charset="utf-8"><title>WASM monitor test email</title></head>
+<body style="font-family: system-ui, sans-serif; color: #222;">
+    <h2>WASM monitor - test email</h2>
+    <p><strong>Server:</strong> {hostname}<br>
+       <strong>Time:</strong> {timestamp}</p>
+    <p>Receiving this means monitor notifications are configured correctly.</p>
 </body>
-</html>
-"""
+</html>"""
 
-        msg.attach(MIMEText(text, "plain"))
-        msg.attach(MIMEText(html, "html"))
+        return self._send(
+            EmailContent(
+                subject=f"[WASM] Test email - {hostname}",
+                text=text,
+                html=html,
+            )
+        )
 
-        try:
-            server = self._create_connection()
-            server.sendmail(
-                self.smtp_config.from_address,
-                self.recipients,
-                msg.as_string(),
-            )
-            server.quit()
-            return True
-        except Exception as e:
-            raise EmailError(
-                "Failed to send test email",
-                details=str(e),
-            )
+
+def _escape(value: Any) -> str:
+    """
+    Escape a value for inclusion in the HTML body.
+
+    Command lines come from other users on the machine and must not be able to
+    inject markup into a report an administrator opens.
+
+    Args:
+        value: The value to render.
+
+    Returns:
+        The escaped string.
+    """
+    return escape(str(value), quote=True)

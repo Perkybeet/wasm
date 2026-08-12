@@ -1,59 +1,173 @@
 """
 WebSocket router for real-time features.
+
+Handshakes authenticate with the session cookie, with the
+``Sec-WebSocket-Protocol`` header, or with a single-use ticket obtained from
+``POST /api/auth/ws-ticket``. A long-lived token is never accepted in the query
+string, because query strings are recorded by browsers, proxies and access logs.
 """
+
+from __future__ import annotations
 
 import asyncio
 import json
+import logging
+from typing import Any
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
 from wasm.core.utils import domain_to_app_name
+from wasm.web.auth import (
+    SESSION_COOKIE_NAME,
+    get_audit_logger,
+    get_client_ip,
+)
 from wasm.web.server import get_token_manager
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
+
+#: Subprotocol prefix carrying a session token, for clients that cannot send a
+#: cookie: ``Sec-WebSocket-Protocol: wasm.auth, wasm.token.<token>``.
+WS_SUBPROTOCOL = "wasm.auth"
+WS_TOKEN_PREFIX = "wasm.token."  # noqa: S105 - subprotocol prefix, not a credential
+
+#: Close code used for a rejected handshake.
+WS_CLOSE_UNAUTHORIZED = 4401
 
 # Active WebSocket connections
 _log_connections: dict[str, set[WebSocket]] = {}
 _system_connections: set[WebSocket] = set()
 
 
-async def _verify_websocket_token(websocket: WebSocket, token: str) -> bool:
-    """Verify the WebSocket connection token."""
+def _subprotocol_token(websocket: WebSocket) -> str | None:
+    """
+    Extract a session token from the requested subprotocols.
+
+    Args:
+        websocket: The pending WebSocket connection.
+
+    Returns:
+        The token, or None when no subprotocol carries one.
+    """
+    header = websocket.headers.get("sec-websocket-protocol", "")
+    for entry in (part.strip() for part in header.split(",")):
+        if entry.startswith(WS_TOKEN_PREFIX):
+            return entry[len(WS_TOKEN_PREFIX) :]
+    return None
+
+
+async def authenticate_websocket(
+    websocket: WebSocket, ticket: str | None = None
+) -> dict[str, Any] | None:
+    """
+    Authenticate a WebSocket handshake.
+
+    Args:
+        websocket: The pending connection.
+        ticket: Single-use ticket from ``POST /api/auth/ws-ticket``, if any.
+
+    Returns:
+        The session payload when the handshake is authenticated, None otherwise.
+    """
     token_manager = get_token_manager()
+    client_ip = get_client_ip(websocket)
 
-    # Get client IP (WebSocket doesn't have the same request object)
-    client_ip = websocket.client.host if websocket.client else "unknown"
+    cookie = websocket.cookies.get(SESSION_COOKIE_NAME)
+    if cookie:
+        payload = token_manager.verify_session_token(cookie, client_ip)
+        if payload:
+            return payload
 
-    # Try session token first
-    payload = token_manager.verify_session_token(token, client_ip)
-    if payload:
-        return True
+    token = _subprotocol_token(websocket)
+    if token:
+        payload = token_manager.verify_session_token(token, client_ip)
+        if payload:
+            return payload
+        if token_manager.verify_master_token(token):
+            return {"type": "master", "sid": "master", "ip": client_ip}
 
-    # Try master token
-    if token_manager.verify_master_token(token):
-        return True
+    if ticket:
+        payload = token_manager.consume_ws_ticket(ticket, client_ip)
+        if payload:
+            return payload
 
-    return False
+    return None
+
+
+async def _reject(websocket: WebSocket, path: str) -> None:
+    """
+    Close an unauthenticated handshake and record it.
+
+    Args:
+        websocket: The pending connection.
+        path: Resource the client tried to reach, for the audit trail.
+    """
+    audit = get_audit_logger()
+    if audit:
+        audit.record(
+            action="ws.connect",
+            result="denied",
+            client_ip=get_client_ip(websocket),
+            resource=path,
+            detail="no valid cookie, subprotocol token or ticket",
+        )
+    await websocket.close(code=WS_CLOSE_UNAUTHORIZED, reason="Authentication required")
+
+
+async def _accept(websocket: WebSocket, session: dict[str, Any], path: str) -> None:
+    """
+    Accept an authenticated handshake and record it.
+
+    Args:
+        websocket: The pending connection.
+        session: The authenticated session payload.
+        path: Resource being streamed, for the audit trail.
+    """
+    subprotocol = (
+        WS_SUBPROTOCOL
+        if WS_SUBPROTOCOL in websocket.headers.get("sec-websocket-protocol", "")
+        else None
+    )
+    await websocket.accept(subprotocol=subprotocol)
+
+    audit = get_audit_logger()
+    if audit:
+        audit.record(
+            action="ws.connect",
+            result="success",
+            client_ip=get_client_ip(websocket),
+            actor=str(session.get("sid")),
+            resource=path,
+        )
 
 
 @router.websocket("/logs/{domain}")
 async def websocket_logs(
     websocket: WebSocket,
     domain: str,
-    token: str = Query(...),
+    ticket: str | None = Query(default=None),
     lines: int = Query(default=50, ge=1, le=500),
 ):
     """
     Stream application logs in real-time.
 
-    Connect with: ws://host:port/ws/logs/{domain}?token=xxx
+    Connect with the session cookie, with ``Sec-WebSocket-Protocol:
+    wasm.auth, wasm.token.<token>``, or with ``?ticket=<single-use ticket>``.
+
+    Args:
+        websocket: The client connection.
+        domain: Domain whose service logs are streamed.
+        ticket: Optional single-use handshake ticket.
+        lines: Backlog of log lines to send first.
     """
-    # Verify token
-    if not await _verify_websocket_token(websocket, token):
-        await websocket.close(code=4001, reason="Invalid token")
+    session = await authenticate_websocket(websocket, ticket)
+    if session is None:
+        await _reject(websocket, f"/ws/logs/{domain}")
         return
 
-    await websocket.accept()
+    await _accept(websocket, session, f"/ws/logs/{domain}")
 
     from wasm.managers.service_manager import ServiceManager
 
@@ -191,20 +305,23 @@ async def websocket_logs(
 @router.websocket("/system")
 async def websocket_system(
     websocket: WebSocket,
-    token: str = Query(...),
+    ticket: str | None = Query(default=None),
     interval: float = Query(default=2.0, ge=0.5, le=30.0),
 ):
     """
     Stream system metrics in real-time.
 
-    Connect with: ws://host:port/ws/system?token=xxx&interval=2
+    Args:
+        websocket: The client connection.
+        ticket: Optional single-use handshake ticket.
+        interval: Seconds between metric samples.
     """
-    # Verify token
-    if not await _verify_websocket_token(websocket, token):
-        await websocket.close(code=4001, reason="Invalid token")
+    session = await authenticate_websocket(websocket, ticket)
+    if session is None:
+        await _reject(websocket, "/ws/system")
         return
 
-    await websocket.accept()
+    await _accept(websocket, session, "/ws/system")
     _system_connections.add(websocket)
 
     try:
@@ -281,18 +398,20 @@ async def websocket_system(
 
 
 @router.websocket("/events")
-async def websocket_events(websocket: WebSocket, token: str = Query(...)):
+async def websocket_events(websocket: WebSocket, ticket: str | None = Query(default=None)):
     """
     Stream system events (service changes, deployments, etc).
 
-    Connect with: ws://host:port/ws/events?token=xxx
+    Args:
+        websocket: The client connection.
+        ticket: Optional single-use handshake ticket.
     """
-    # Verify token
-    if not await _verify_websocket_token(websocket, token):
-        await websocket.close(code=4001, reason="Invalid token")
+    session = await authenticate_websocket(websocket, ticket)
+    if session is None:
+        await _reject(websocket, "/ws/events")
         return
 
-    await websocket.accept()
+    await _accept(websocket, session, "/ws/events")
 
     try:
         await websocket.send_json({"type": "connected", "message": "Listening for system events"})
@@ -383,21 +502,24 @@ _all_jobs_connections: set[WebSocket] = set()
 async def websocket_job(
     websocket: WebSocket,
     job_id: str,
-    token: str = Query(...),
+    ticket: str | None = Query(default=None),
 ):
     """
     Stream updates for a specific job in real-time.
 
-    Connect with: ws://host:port/ws/jobs/{job_id}?token=xxx
+    Args:
+        websocket: The client connection.
+        job_id: Identifier of the job to follow.
+        ticket: Optional single-use handshake ticket.
     """
     from wasm.web.jobs import get_job_manager
 
-    # Verify token
-    if not await _verify_websocket_token(websocket, token):
-        await websocket.close(code=4001, reason="Invalid token")
+    session = await authenticate_websocket(websocket, ticket)
+    if session is None:
+        await _reject(websocket, f"/ws/jobs/{job_id}")
         return
 
-    await websocket.accept()
+    await _accept(websocket, session, f"/ws/jobs/{job_id}")
 
     manager = get_job_manager()
     job = manager.get_job(job_id)
@@ -496,21 +618,23 @@ async def websocket_job(
 @router.websocket("/jobs")
 async def websocket_all_jobs(
     websocket: WebSocket,
-    token: str = Query(...),
+    ticket: str | None = Query(default=None),
 ):
     """
     Stream updates for all jobs in real-time.
 
-    Connect with: ws://host:port/ws/jobs?token=xxx
+    Args:
+        websocket: The client connection.
+        ticket: Optional single-use handshake ticket.
     """
     from wasm.web.jobs import get_job_manager
 
-    # Verify token
-    if not await _verify_websocket_token(websocket, token):
-        await websocket.close(code=4001, reason="Invalid token")
+    session = await authenticate_websocket(websocket, ticket)
+    if session is None:
+        await _reject(websocket, "/ws/jobs")
         return
 
-    await websocket.accept()
+    await _accept(websocket, session, "/ws/jobs")
     _all_jobs_connections.add(websocket)
 
     manager = get_job_manager()

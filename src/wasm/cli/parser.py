@@ -4,11 +4,48 @@
 
 """
 Argument parser for WASM CLI.
+
+Every parser in the tree carries the same global flags (``--verbose``,
+``--no-color``, ``--dry-run``) so they can be written before or after the
+subcommand. Subparsers declare them with ``argparse.SUPPRESS`` as default
+because argparse copies subparser defaults over whatever the root parser
+already parsed; a plain ``False`` default silently disarms ``wasm --dry-run
+monitor scan``. :func:`_propagate_global_flags` is what enforces that.
+
+Each command parser also carries a ``func`` default pointing at its handler, so
+:mod:`wasm.main` dispatches without an if/elif chain and argparse reports a
+missing action on its own.
+
+``--json`` is deliberately *not* global: only the subcommands that really build
+a structured payload offer it (``backup list``, ``db status``, ``store stats``,
+...). A root-level ``--json`` would promise machine-readable output for the
+other ~80 commands, which still print human text; see
+:class:`wasm.core.logger.Presenter` for the seam they need to migrate through.
 """
 
 import argparse
 
 from wasm import __version__
+from wasm.cli.commands.backup import handle_backup, handle_rollback
+from wasm.cli.commands.cert import handle_cert
+from wasm.cli.commands.config import handle_config
+from wasm.cli.commands.db import handle_db
+from wasm.cli.commands.env import handle_env
+from wasm.cli.commands.health import handle_health
+from wasm.cli.commands.monitor import handle_monitor
+from wasm.cli.commands.service import handle_service
+from wasm.cli.commands.setup import handle_setup
+from wasm.cli.commands.site import handle_site
+from wasm.cli.commands.store import handle_store
+from wasm.cli.commands.web import handle_web
+from wasm.cli.commands.webapp import handle_webapp
+
+# Flags accepted at every level of the command tree: (option strings, help).
+_GLOBAL_FLAGS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("--verbose", "-v"), "Enable verbose output"),
+    (("--no-color",), "Disable colored output"),
+    (("--dry-run",), "Show what would be done without making changes"),
+)
 
 # Webapp actions that are now top-level commands
 WEBAPP_ACTIONS = [
@@ -29,6 +66,46 @@ WEBAPP_ACTIONS = [
     "rm",
     "logs",
 ]
+
+
+def _add_global_flags(parser: argparse.ArgumentParser, *, shadow_safe: bool) -> None:
+    """
+    Declare the global flags on a parser.
+
+    Args:
+        parser: Parser receiving the flags.
+        shadow_safe: True for subparsers, so the flags default to
+            ``argparse.SUPPRESS`` and cannot overwrite the value already parsed
+            by an ancestor parser. False for the root parser, which owns the
+            real defaults.
+    """
+    default = argparse.SUPPRESS if shadow_safe else False
+    for option_strings, help_text in _GLOBAL_FLAGS:
+        parser.add_argument(
+            *option_strings,
+            action="store_true",
+            default=default,
+            help=help_text,
+        )
+
+
+def _propagate_global_flags(parser: argparse.ArgumentParser) -> None:
+    """
+    Add the global flags to every parser below the given one.
+
+    argparse exposes no public API to walk a parser tree, hence the private
+    attributes. Aliases share a single parser object, so each one is visited
+    only once.
+
+    Args:
+        parser: Parser whose descendants receive the flags.
+    """
+    for action in parser._actions:
+        if not isinstance(action, argparse._SubParsersAction):
+            continue
+        for subparser in dict.fromkeys(action.choices.values()):
+            _add_global_flags(subparser, shadow_safe=True)
+            _propagate_global_flags(subparser)
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -53,7 +130,6 @@ QUICK START:
     epilog = """EXAMPLES:
   wasm create -d example.com -s git@github.com:user/app.git -t nextjs
   wasm --dry-run delete example.com
-  wasm --json list
   wasm db install mysql
   wasm backup create example.com
 
@@ -83,32 +159,12 @@ DOCUMENTATION:
         help="Show changelog for current version",
     )
     parser.add_argument(
-        "--verbose",
-        "-v",
-        action="store_true",
-        help="Enable verbose output",
-    )
-    parser.add_argument(
         "--interactive",
         "-i",
         action="store_true",
         help="Run in interactive mode",
     )
-    parser.add_argument(
-        "--no-color",
-        action="store_true",
-        help="Disable colored output",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what would be done without making changes",
-    )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Output results in JSON format",
-    )
+    _add_global_flags(parser, shadow_safe=False)
 
     # Subparsers for commands
     subparsers = parser.add_subparsers(
@@ -160,15 +216,18 @@ DOCUMENTATION:
     # Env management command
     _add_env_parser(subparsers)
 
+    _propagate_global_flags(parser)
+
     return parser
 
 
 def _add_health_parser(subparsers) -> None:
     """Add health check command."""
-    health_parser = subparsers.add_parser(
+    health = subparsers.add_parser(
         "health",
         help="Check system health and diagnose issues",
     )
+    health.set_defaults(func=handle_health)
 
 
 def _add_webapp_commands(subparsers) -> None:
@@ -180,6 +239,9 @@ def _add_webapp_commands(subparsers) -> None:
         aliases=["new", "deploy"],
         help="Deploy a new web application",
     )
+    # Aliases share one parser object, so the action is the canonical name;
+    # handle_webapp accepts both spellings.
+    create.set_defaults(func=handle_webapp, action="create")
     create.add_argument(
         "--domain",
         "-d",
@@ -280,11 +342,12 @@ def _add_webapp_commands(subparsers) -> None:
     )
 
     # list (alias: ls)
-    subparsers.add_parser(
+    list_apps = subparsers.add_parser(
         "list",
         aliases=["ls"],
         help="List deployed applications",
     )
+    list_apps.set_defaults(func=handle_webapp, action="list")
 
     # status (alias: info)
     status = subparsers.add_parser(
@@ -292,6 +355,7 @@ def _add_webapp_commands(subparsers) -> None:
         aliases=["info"],
         help="Show application status",
     )
+    status.set_defaults(func=handle_webapp, action="status")
     status.add_argument(
         "domain",
         help="Application domain",
@@ -302,6 +366,7 @@ def _add_webapp_commands(subparsers) -> None:
         "restart",
         help="Restart an application",
     )
+    restart.set_defaults(func=handle_webapp, action="restart")
     restart.add_argument(
         "domain",
         help="Application domain",
@@ -312,6 +377,7 @@ def _add_webapp_commands(subparsers) -> None:
         "stop",
         help="Stop an application",
     )
+    stop.set_defaults(func=handle_webapp, action="stop")
     stop.add_argument(
         "domain",
         help="Application domain",
@@ -322,6 +388,7 @@ def _add_webapp_commands(subparsers) -> None:
         "start",
         help="Start an application",
     )
+    start.set_defaults(func=handle_webapp, action="start")
     start.add_argument(
         "domain",
         help="Application domain",
@@ -333,6 +400,7 @@ def _add_webapp_commands(subparsers) -> None:
         aliases=["upgrade"],
         help="Update an application (pull and rebuild)",
     )
+    update.set_defaults(func=handle_webapp, action="update")
     update.add_argument(
         "domain",
         help="Application domain",
@@ -361,6 +429,7 @@ def _add_webapp_commands(subparsers) -> None:
         aliases=["remove", "rm"],
         help="Delete an application",
     )
+    delete.set_defaults(func=handle_webapp, action="delete")
     delete.add_argument(
         "domain",
         help="Application domain",
@@ -383,6 +452,7 @@ def _add_webapp_commands(subparsers) -> None:
         "logs",
         help="View application logs",
     )
+    logs.set_defaults(func=handle_webapp, action="logs")
     logs.add_argument(
         "domain",
         help="Application domain",
@@ -409,11 +479,13 @@ def _add_site_parser(subparsers) -> None:
         help="Manage web server sites",
         description="Manage Nginx/Apache virtual hosts",
     )
+    site.set_defaults(func=handle_site)
 
     site_sub = site.add_subparsers(
         dest="action",
         title="actions",
         metavar="<action>",
+        required=True,
     )
 
     # site create
@@ -530,11 +602,13 @@ def _add_service_parser(subparsers) -> None:
         help="Manage systemd services",
         description="Manage systemd services",
     )
+    service.set_defaults(func=handle_service)
 
     service_sub = service.add_subparsers(
         dest="action",
         title="actions",
         metavar="<action>",
+        required=True,
     )
 
     # service create
@@ -676,11 +750,13 @@ def _add_cert_parser(subparsers) -> None:
         help="Manage SSL certificates",
         description="Manage Let's Encrypt SSL certificates",
     )
+    cert.set_defaults(func=handle_cert)
 
     cert_sub = cert.add_subparsers(
         dest="action",
         title="actions",
         metavar="<action>",
+        required=True,
     )
 
     # cert create
@@ -722,11 +798,6 @@ def _add_cert_parser(subparsers) -> None:
         help="Use Apache plugin",
     )
     create.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Test without obtaining",
-    )
-    create.add_argument(
         "--expand",
         action="store_true",
         help="Expand existing certificate to include additional domains",
@@ -764,11 +835,6 @@ def _add_cert_parser(subparsers) -> None:
         "--force",
         action="store_true",
         help="Force renewal",
-    )
-    renew.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Test without renewing",
     )
 
     # cert revoke
@@ -813,11 +879,13 @@ def _add_monitor_parser(subparsers) -> None:
         help="AI-powered process security monitoring",
         description="Monitor system processes for suspicious activity using AI analysis",
     )
+    monitor.set_defaults(func=handle_monitor)
 
     monitor_sub = monitor.add_subparsers(
         dest="action",
         title="actions",
         metavar="<action>",
+        required=True,
     )
 
     # monitor status
@@ -831,11 +899,6 @@ def _add_monitor_parser(subparsers) -> None:
     scan = monitor_sub.add_parser(
         "scan",
         help="Run a single security scan",
-    )
-    scan.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Don't terminate processes, just report",
     )
     scan.add_argument(
         "--force-ai",
@@ -898,11 +961,13 @@ def _add_setup_parser(subparsers) -> None:
         help="Initial setup and configuration",
         description="Setup WASM directories, permissions, and shell completions",
     )
+    setup.set_defaults(func=handle_setup)
 
     setup_sub = setup.add_subparsers(
         dest="action",
         title="actions",
         metavar="<action>",
+        required=True,
     )
 
     # setup init
@@ -985,12 +1050,17 @@ def _add_backup_parser(subparsers) -> None:
         help="Manage application backups",
         description="Create, list, restore, and manage application backups",
     )
+    backup.set_defaults(func=handle_backup)
 
     backup_sub = backup.add_subparsers(
         dest="action",
         title="actions",
         metavar="<action>",
     )
+    # `wasm backup` with no action lists the backups, so the action is optional.
+    # add_subparsers() rejects a default= keyword, and a parser-level default
+    # would lose against the subparsers action default, so it is set here.
+    backup_sub.default = "list"
 
     # backup create
     create = backup_sub.add_parser(
@@ -1241,6 +1311,7 @@ def _add_rollback_parser(subparsers) -> None:
         help="Rollback an application to a previous state",
         description="Quick rollback to the most recent backup or a specific backup",
     )
+    rollback.set_defaults(func=handle_rollback)
     rollback.add_argument(
         "domain",
         help="Domain name of the application to rollback",
@@ -1266,11 +1337,14 @@ def _add_db_parser(subparsers) -> None:
         description="Install, manage, and configure database engines (MySQL, PostgreSQL, Redis, MongoDB)",
     )
 
+    db.set_defaults(func=handle_db)
+
     db_sub = db.add_subparsers(
         dest="action",
         title="actions",
         description="Database actions",
         metavar="<action>",
+        required=True,
     )
 
     # Common arguments for engine
@@ -1777,11 +1851,14 @@ def _add_web_parser(subparsers) -> None:
         description="Start, stop, and manage the WASM web dashboard",
     )
 
+    web.set_defaults(func=handle_web)
+
     web_sub = web.add_subparsers(
         dest="action",
         title="actions",
         description="Web interface actions",
         metavar="<action>",
+        required=True,
     )
 
     # web start
@@ -1883,11 +1960,14 @@ def _add_store_parser(subparsers) -> None:
         description="Initialize, manage, and query the SQLite persistence store",
     )
 
+    store.set_defaults(func=handle_store)
+
     store_sub = store.add_subparsers(
         dest="action",
         title="actions",
         description="Store actions",
         metavar="<action>",
+        required=True,
     )
 
     # store init
@@ -1945,6 +2025,9 @@ def _add_config_parser(subparsers) -> None:
         description="Commands for managing WASM configuration files.",
     )
 
+    # No required action: `wasm config` prints its own command summary.
+    config.set_defaults(func=handle_config)
+
     config_sub = config.add_subparsers(
         dest="action",
         title="config commands",
@@ -1984,10 +2067,13 @@ def _add_env_parser(subparsers) -> None:
         description="Configure, show, and export environment variables",
     )
 
+    env.set_defaults(func=handle_env)
+
     env_sub = env.add_subparsers(
         dest="action",
         title="actions",
         metavar="<action>",
+        required=True,
     )
 
     # env configure

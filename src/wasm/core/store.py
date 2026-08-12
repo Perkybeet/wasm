@@ -13,6 +13,7 @@ Provides a centralized store for all WASM-managed resources:
 """
 
 import json
+import os
 import sqlite3
 import threading
 from collections.abc import Iterator
@@ -22,6 +23,8 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
+
+from wasm.core.config import SECRET_FILE_MODE, restrict_file, secure_directory
 
 # Database location
 DEFAULT_DB_PATH = Path("/var/lib/wasm/wasm.db")
@@ -399,6 +402,12 @@ class WASMStore:
         1. Explicit path provided
         2. System path if writable (/var/lib/wasm/)
         3. User path (~/.local/share/wasm/)
+
+        Args:
+            db_path: Explicit database path, if the caller has one.
+
+        Returns:
+            The path the store will use.
         """
         if db_path:
             return Path(db_path)
@@ -407,13 +416,13 @@ class WASMStore:
         if DEFAULT_DB_PATH.parent.exists():
             try:
                 # Check if we can write to system path
-                DEFAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+                secure_directory(DEFAULT_DB_PATH.parent)
                 return DEFAULT_DB_PATH
             except PermissionError:
                 pass
 
         # Fall back to user path
-        USER_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        secure_directory(USER_DB_PATH.parent)
         return USER_DB_PATH
 
     @property
@@ -445,9 +454,29 @@ class WASMStore:
             conn.rollback()
             raise
 
+    def _secure_db_file(self) -> None:
+        """
+        Create the database file with owner-only permissions.
+
+        The rows hold application secrets (``env_vars`` carries DATABASE_URL and
+        similar), so the file is created through ``os.open`` before SQLite ever
+        opens it, which would otherwise create it world readable. A database
+        left lax by an older version is tightened here as well.
+
+        Raises:
+            OSError: If the file or its directory cannot be secured.
+        """
+        secure_directory(self._db_path.parent)
+
+        if self._db_path.exists():
+            restrict_file(self._db_path)
+            return
+
+        os.close(os.open(self._db_path, os.O_WRONLY | os.O_CREAT, SECRET_FILE_MODE))
+
     def _ensure_schema(self) -> None:
         """Ensure database schema exists and is up to date."""
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._secure_db_file()
 
         with self._transaction() as cursor:
             # Check if schema_version table exists

@@ -6,6 +6,13 @@
 Health check command for WASM.
 
 Provides system-wide health diagnostics.
+
+This is the command an operator runs when something looks wrong, so it is the
+last place that should quietly report nothing. Two defects made it do exactly
+that: it asked ServiceManager for a ``status`` method that does not exist, so
+every application was counted as failed, and it looked for an ``expires`` key
+in certificate data that carries ``expiry``, so no certificate ever appeared to
+be close to renewal.
 """
 
 import shutil
@@ -13,11 +20,32 @@ from argparse import Namespace
 from datetime import datetime
 
 from wasm.core.config import Config
+from wasm.core.exceptions import ServiceError, WASMError
 from wasm.core.logger import Logger
+from wasm.core.store import get_store
+from wasm.core.utils import domain_to_app_name
+from wasm.managers.apache_manager import ApacheManager
+from wasm.managers.cert_manager import CertificateInfo, CertManager
+from wasm.managers.nginx_manager import NginxManager
+from wasm.managers.service_manager import ServiceManager
+
+#: A certificate this close to expiry is an incident, not a reminder.
+_CERT_CRITICAL_DAYS = 7
+
+#: A certificate this close to expiry deserves a warning.
+_CERT_WARNING_DAYS = 30
 
 
 def _print_status(logger: Logger, key: str, value: str, status: str) -> None:
-    """Print a key-value pair with status indicator."""
+    """
+    Print a key-value pair with status indicator.
+
+    Args:
+        logger: Logger of the current command, kept for signature stability.
+        key: Name of the checked item.
+        value: Human readable result.
+        status: One of "ok", "warning", "error" or "info".
+    """
     if status == "ok":
         indicator = "\033[32m[OK]\033[0m"
     elif status == "warning":
@@ -30,11 +58,51 @@ def _print_status(logger: Logger, key: str, value: str, status: str) -> None:
     print(f"  {indicator} {key}: {value}")
 
 
+def _days_until(expiry: str) -> int | None:
+    """
+    Days left before a certificate expiry date.
+
+    Args:
+        expiry: Expiry date as certbot reports it, ``YYYY-MM-DD``.
+
+    Returns:
+        Whole days remaining, or None when the date cannot be parsed.
+    """
+    try:
+        expires = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (expires - datetime.now(expires.tzinfo)).days
+
+
+def _certificate_label(cert: CertificateInfo) -> str:
+    """
+    Name a certificate for an operator-facing message.
+
+    Args:
+        cert: Certificate entry from the certificate manager.
+
+    Returns:
+        The lineage name, falling back to the first covered domain.
+    """
+    name = cert.get("name")
+    if name:
+        return name
+    domains = cert.get("domains") or []
+    return domains[0] if domains else "unknown"
+
+
 def handle_health(args: Namespace) -> int:
     """
     Handle the health check command.
 
     Performs system diagnostics and shows overall health status.
+
+    Args:
+        args: Parsed arguments; only ``verbose`` is read.
+
+    Returns:
+        1 when the check found issues, 0 otherwise.
     """
     logger = Logger(verbose=args.verbose)
     config = Config()
@@ -80,15 +148,12 @@ def handle_health(args: Namespace) -> int:
                 )
         else:
             _print_status(logger, "Disk Space", "Apps directory not found", "warning")
-    except Exception as e:
+    except OSError as e:
         warnings.append(f"Could not check disk space: {e}")
 
     # 2. Check web servers
     logger.blank()
     logger.info("Checking web servers...")
-
-    from wasm.managers.apache_manager import ApacheManager
-    from wasm.managers.nginx_manager import NginxManager
 
     nginx = NginxManager(verbose=args.verbose)
     apache = ApacheManager(verbose=args.verbose)
@@ -123,9 +188,6 @@ def handle_health(args: Namespace) -> int:
     logger.blank()
     logger.info("Checking deployed applications...")
 
-    from wasm.core.store import get_store
-    from wasm.managers.service_manager import ServiceManager
-
     store = get_store()
     service_manager = ServiceManager(verbose=args.verbose)
 
@@ -136,14 +198,19 @@ def handle_health(args: Namespace) -> int:
 
     for app in apps:
         try:
-            status = service_manager.status(app.domain.replace(".", "-"))
-            if status.get("active"):
-                apps_running += 1
-            else:
-                apps_stopped += 1
-                warnings.append(f"App '{app.domain}' is not running")
-        except Exception:
+            # The unit was created from domain_to_app_name(); a hand-rolled
+            # replace() disagrees with it for any domain that is not lowercase.
+            status = service_manager.get_status(domain_to_app_name(app.domain))
+        except ServiceError as e:
             apps_failed += 1
+            warnings.append(f"App '{app.domain}' could not be queried: {e}")
+            continue
+
+        if status.get("active"):
+            apps_running += 1
+        else:
+            apps_stopped += 1
+            warnings.append(f"App '{app.domain}' is not running")
 
     total_apps = len(apps)
     if total_apps > 0:
@@ -163,8 +230,6 @@ def handle_health(args: Namespace) -> int:
     logger.blank()
     logger.info("Checking SSL certificates...")
 
-    from wasm.managers.cert_manager import CertManager
-
     cert_manager = CertManager(verbose=args.verbose)
 
     try:
@@ -172,22 +237,24 @@ def handle_health(args: Namespace) -> int:
         expiring_soon = []
 
         for cert in certs:
-            if cert.get("expires"):
-                try:
-                    expires = datetime.fromisoformat(cert["expires"].replace("Z", "+00:00"))
-                    days_left = (expires - datetime.now(expires.tzinfo)).days
-                    if days_left < 7:
-                        issues.append(
-                            f"Certificate for {cert['domain']} expires in {days_left} days"
-                        )
-                        expiring_soon.append(cert["domain"])
-                    elif days_left < 30:
-                        warnings.append(
-                            f"Certificate for {cert['domain']} expires in {days_left} days"
-                        )
-                        expiring_soon.append(cert["domain"])
-                except Exception:
-                    pass
+            expiry = cert.get("expiry")
+            if not expiry:
+                continue
+
+            days_left = _days_until(expiry)
+            if days_left is None:
+                warnings.append(
+                    f"Certificate for {_certificate_label(cert)} has an unreadable expiry date"
+                )
+                continue
+
+            label = _certificate_label(cert)
+            if days_left < _CERT_CRITICAL_DAYS:
+                issues.append(f"Certificate for {label} expires in {days_left} days")
+                expiring_soon.append(label)
+            elif days_left < _CERT_WARNING_DAYS:
+                warnings.append(f"Certificate for {label} expires in {days_left} days")
+                expiring_soon.append(label)
 
         if expiring_soon:
             _print_status(
@@ -200,7 +267,7 @@ def handle_health(args: Namespace) -> int:
             _print_status(logger, "SSL Certificates", f"{len(certs)} total, all valid", "ok")
         else:
             _print_status(logger, "SSL Certificates", "None configured", "info")
-    except Exception as e:
+    except WASMError as e:
         _print_status(logger, "SSL Certificates", f"Could not check: {e}", "warning")
 
     # 5. Check system resources
@@ -245,7 +312,7 @@ def handle_health(args: Namespace) -> int:
                 f"{free_mem:.1f}GB free / {total_mem:.1f}GB total ({used_percent:.0f}% used)",
                 "ok",
             )
-    except Exception as e:
+    except (OSError, ValueError, ZeroDivisionError) as e:
         _print_status(logger, "Memory", f"Could not check: {e}", "warning")
 
     # Summary
