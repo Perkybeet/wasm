@@ -29,7 +29,7 @@
                        ("progress", job.progress ~ "/" ~ job.total_steps),
                        ("on", job.resource),
                        ("started", job.started)],
-                      none, "row-" ~ job.id, job.description) %}
+                      none, "row-" ~ job.id, job.description, job.status) %}
           {{ m.follow_button("Logs", job.name, job.log_url) }}
           {{ m.action_button("Cancel", job.cancel_endpoint,
                              "Cancel " ~ job.name ~ "? The step already running is left to finish, and the machine is left half changed.") }}

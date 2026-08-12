@@ -2,14 +2,35 @@
 # Licensed under WASM-NCSAL 1.0 (Commercial use prohibited)
 # https://github.com/Perkybeet/wasm/blob/main/LICENSE
 
-"""Tests for the EnvManager helper."""
+"""
+Tests for the EnvManager helper.
+
+Two properties beyond the parsing surface. Everything this manager writes is a
+credential store, so it goes out through the :mod:`wasm.core.fs` seam with
+:data:`~wasm.core.fs.SECRET_MODE`, which is what makes ``--dry-run`` honest and
+the file 0600. And a password hidden inside a connection string is redacted
+whether or not the URL names a user: ``redis://:password@host`` is the canonical
+Redis form and used to come out in clear.
+"""
+
+import ast
+from pathlib import Path
 
 import pytest
 
+from wasm.core.exceptions import SecurityError
+from wasm.core.fs import (
+    SECRET_DIR_MODE,
+    SECRET_MODE,
+    DryRunFileSystem,
+    RecordingFileSystem,
+)
+from wasm.deployers.helpers import env_manager as env_manager_module
 from wasm.deployers.helpers.env_manager import (
     EnvConfig,
     EnvManager,
     EnvVariable,
+    redact_url_credentials,
 )
 
 
@@ -325,3 +346,344 @@ class TestCurrentValues:
     def test_missing_env(self, env_manager, tmp_path):
         values = env_manager.get_current_values(tmp_path)
         assert values == {}
+
+
+class TestEnvFilePermissions:
+    """A deployed .env carries DATABASE_URL, API keys and generated secrets."""
+
+    def test_env_file_is_owner_only(self, tmp_path):
+        """The mode comes from the creating open(), not from a later chmod."""
+        manager = EnvManager(fs=RecordingFileSystem())
+
+        written = manager.write_env_files(tmp_path, {"DATABASE_URL": "postgres://s3cret"})
+
+        assert written[0].stat().st_mode & 0o777 == SECRET_MODE
+
+    def test_an_env_left_lax_by_an_older_version_is_repaired(self, tmp_path):
+        """Rewriting must not preserve a world-readable mode."""
+        env_file = tmp_path / ".env"
+        env_file.write_text("OLD=1\n")
+        env_file.chmod(0o644)
+
+        EnvManager(fs=RecordingFileSystem()).write_env_files(tmp_path, {"API_KEY": "sk-live"})
+
+        assert env_file.stat().st_mode & 0o777 == SECRET_MODE
+
+    def test_the_application_directory_is_not_tightened(self, tmp_path):
+        """The tree is served by the web server; only the file is private."""
+        app_path = tmp_path / "app"
+        app_path.mkdir(mode=0o755)
+        app_path.chmod(0o755)
+
+        EnvManager(fs=RecordingFileSystem()).write_env_files(app_path, {"API_KEY": "sk-live"})
+
+        assert app_path.stat().st_mode & 0o777 == 0o755
+
+    def test_env_config_json_is_private_and_so_is_its_directory(self, tmp_path):
+        """.wasm records the inventory; nothing but WASM reads it."""
+        manager = EnvManager(fs=RecordingFileSystem())
+
+        manager.save_config(tmp_path, EnvConfig(variables=[EnvVariable(name="API_KEY")]))
+
+        saved = tmp_path / ".wasm" / "env-config.json"
+        assert saved.stat().st_mode & 0o777 == SECRET_MODE
+        assert saved.parent.stat().st_mode & 0o777 == SECRET_DIR_MODE
+
+    def test_a_wasm_directory_left_lax_is_tightened(self, tmp_path):
+        """An older version created it 0755 next to a 0600 file."""
+        wasm_dir = tmp_path / ".wasm"
+        wasm_dir.mkdir(mode=0o755)
+        wasm_dir.chmod(0o755)
+
+        EnvManager(fs=RecordingFileSystem()).save_config(tmp_path, EnvConfig())
+
+        assert wasm_dir.stat().st_mode & 0o777 == SECRET_DIR_MODE
+
+    def test_writing_through_a_planted_symlink_is_refused(self, tmp_path):
+        """A link where an app's .env belongs is someone harvesting secrets."""
+        victim = tmp_path / "victim.txt"
+        victim.write_text("original\n")
+        (tmp_path / ".env").symlink_to(victim)
+
+        with pytest.raises(SecurityError):
+            EnvManager(fs=RecordingFileSystem()).write_env_files(tmp_path, {"API_KEY": "sk-live"})
+
+        assert victim.read_text() == "original\n"
+
+    def test_saving_the_config_through_a_planted_symlink_is_refused(self, tmp_path):
+        """The inventory file is a credential store too."""
+        victim = tmp_path / "victim.txt"
+        victim.write_text("original\n")
+        (tmp_path / ".wasm").mkdir()
+        (tmp_path / ".wasm" / "env-config.json").symlink_to(victim)
+
+        with pytest.raises(SecurityError):
+            EnvManager(fs=RecordingFileSystem()).save_config(tmp_path, EnvConfig())
+
+        assert victim.read_text() == "original\n"
+
+    def test_every_written_file_goes_through_the_seam(self, tmp_path):
+        """The monorepo path writes several files; all of them are secrets."""
+        recorder = RecordingFileSystem()
+
+        written = EnvManager(fs=recorder).write_env_files(
+            tmp_path,
+            {"API_KEY": "sk-live", "PORT": "3000"},
+            file_mapping={"apps/web/.env": ["API_KEY"], ".env": ["PORT"]},
+        )
+
+        assert [path for kind, path in recorder.changes if kind == "write"] == written
+        for path in written:
+            assert path.stat().st_mode & 0o077 == 0, f"{path} is not private"
+
+
+class TestEnvWritesUnderADryRun:
+    """A rehearsal that writes half the deployment is worse than no rehearsal."""
+
+    def test_no_env_file_is_created(self, tmp_path):
+        """The .env is what carries the credentials into the filesystem."""
+        dry = DryRunFileSystem()
+
+        EnvManager(fs=dry).write_env_files(tmp_path, {"API_KEY": "sk-live"})
+
+        assert not (tmp_path / ".env").exists()
+        assert list(tmp_path.iterdir()) == []
+        assert any(".env" in line for line in dry.skipped)
+
+    def test_an_existing_env_file_survives_untouched(self, tmp_path):
+        """Overwriting is destructive: the previous secrets are gone."""
+        env_file = tmp_path / ".env"
+        env_file.write_text("API_KEY=the-old-one\n")
+
+        EnvManager(fs=DryRunFileSystem()).write_env_files(tmp_path, {"API_KEY": "the-new-one"})
+
+        assert env_file.exists()
+        assert env_file.read_text() == "API_KEY=the-old-one\n"
+
+    def test_the_mapped_subdirectories_are_not_created(self, tmp_path):
+        """A monorepo rehearsal must not leave apps/web behind."""
+        EnvManager(fs=DryRunFileSystem()).write_env_files(
+            tmp_path, {"API_KEY": "sk-live"}, file_mapping={"apps/web/.env": ["API_KEY"]}
+        )
+
+        assert not (tmp_path / "apps").exists()
+
+    def test_saving_the_config_creates_neither_file_nor_directory(self, tmp_path):
+        """save_config used to create .wasm on the way to writing the file."""
+        EnvManager(fs=DryRunFileSystem()).save_config(tmp_path, EnvConfig())
+
+        assert not (tmp_path / ".wasm").exists()
+
+    def test_an_existing_config_survives_untouched(self, tmp_path):
+        """The stored inventory must come out of a rehearsal unchanged."""
+        wasm_dir = tmp_path / ".wasm"
+        wasm_dir.mkdir()
+        config_file = wasm_dir / "env-config.json"
+        config_file.write_text('{"variables": [], "files": {}}')
+
+        EnvManager(fs=DryRunFileSystem()).save_config(
+            tmp_path, EnvConfig(variables=[EnvVariable(name="NEW")])
+        )
+
+        assert config_file.read_text() == '{"variables": [], "files": {}}'
+
+    def test_a_lax_wasm_directory_is_not_chmodded(self, tmp_path):
+        """A chmod changes this machine, so a rehearsal must skip it too."""
+        wasm_dir = tmp_path / ".wasm"
+        wasm_dir.mkdir(mode=0o755)
+        wasm_dir.chmod(0o755)
+
+        EnvManager(fs=DryRunFileSystem()).save_config(tmp_path, EnvConfig())
+
+        assert wasm_dir.stat().st_mode & 0o777 == 0o755
+
+
+class TestConnectionStringRedaction:
+    """A password inside a value that no name marks as a secret."""
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            # The finding: the canonical Redis URL has no user name, and a
+            # pattern that requires one printed the password in clear.
+            ("redis://:password@host:6379", "redis://:***@host:6379"),
+            ("rediss://:p4ss@host:6380/0", "rediss://:***@host:6380/0"),
+            ("mongodb://:password@host:27017", "mongodb://:***@host:27017"),
+            ("postgres://user:pass@host:5432/db", "postgres://user:***@host:5432/db"),
+            (
+                "postgresql://wasm:s3cr3t@127.0.0.1:5432/app?sslmode=require",
+                "postgresql://wasm:***@127.0.0.1:5432/app?sslmode=require",
+            ),
+            ("amqp://guest:guest@rabbit:5672/%2f", "amqp://guest:***@rabbit:5672/%2f"),
+            ("amqps://:only-a-pass@broker", "amqps://:***@broker"),
+            ("mysql+pymysql://root:toor@db/app", "mysql+pymysql://root:***@db/app"),
+            ("smtp://:pw@mail.example.com:465", "smtp://:***@mail.example.com:465"),
+            # An empty password still says "there is a credential here".
+            ("redis://:@host:6379", "redis://:***@host:6379"),
+        ],
+    )
+    def test_credentials_inside_urls_are_replaced(self, value, expected):
+        assert redact_url_credentials(value) == expected
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "redis://host:6379",
+            "redis://localhost:6379/0",
+            "postgres://localhost:5432/mydb",
+            "https://api.example.com/v1/things",
+            "http://127.0.0.1:8080/health",
+            "amqp://rabbit:5672",
+            "mongodb://replica-a:27017,replica-b:27017/app",
+            "3000",
+            "",
+            "production",
+            # A bare address is not a URL, and a mail address is not a password.
+            "alerts@example.com",
+            # The '@' is in the query string, past the end of the authority.
+            "http://host:8080/redirect?to=user@example.com",
+            # The '@' is in the path, likewise past the authority.
+            "https://cdn.example.com:443/pkg/@scope/name",
+        ],
+    )
+    def test_values_without_credentials_are_left_alone(self, value):
+        assert redact_url_credentials(value) == value
+
+    def test_several_urls_in_one_value_are_all_redacted(self):
+        value = "redis://:a@one,postgres://u:b@two"
+
+        assert redact_url_credentials(value) == "redis://:***@one,postgres://u:***@two"
+
+    def test_the_placeholder_is_configurable(self):
+        assert redact_url_credentials("redis://:pw@host", placeholder="X") == "redis://:X@host"
+
+    def test_the_cli_prints_a_userless_redis_url_redacted(self):
+        """The finding was reported against ``wasm env show``: prove it there."""
+        from wasm.cli.commands.env import _redact
+
+        redacted = _redact({"REDIS_URL": "redis://:hunter2@cache:6379"})
+
+        assert "hunter2" not in redacted["REDIS_URL"]
+        assert redacted["REDIS_URL"] == "redis://:***@cache:6379"
+
+    def test_the_cli_keeps_no_second_copy_of_the_pattern(self):
+        """Two copies of a security pattern is how one of them stays wrong."""
+        from wasm.cli.commands import env as env_cli
+
+        assert not hasattr(env_cli, "_URL_CREDENTIALS")
+
+    def test_the_replacement_never_leaks_the_password_length(self):
+        short = redact_url_credentials("redis://:a@host")
+        long = redact_url_credentials("redis://:" + "z" * 64 + "@host")
+
+        assert short == long
+
+
+class TestNoMutationEscapesTheSeam:
+    """
+    The guard that stops the defect from coming back.
+
+    ``--dry-run`` announced that nothing would change and then wrote the .env,
+    because a write is a ``Path.write_text`` and never goes near a subprocess.
+    Reads are deliberately not covered: they change nothing.
+    """
+
+    #: Calls that change the filesystem. Names only, because that is what
+    #: survives an alias, a re-import or a helper variable.
+    MUTATING = frozenset(
+        {
+            "chmod",
+            "chown",
+            "copy",
+            "copy2",
+            "copyfile",
+            "copymode",
+            "copystat",
+            "copytree",
+            "hardlink_to",
+            "lchmod",
+            "lchown",
+            "link",
+            "link_to",
+            "makedirs",
+            "mkdir",
+            "mkdtemp",
+            "mkstemp",
+            "mknod",
+            "move",
+            "open",
+            "remove",
+            "removedirs",
+            "rename",
+            "renames",
+            "replace",
+            "rmdir",
+            "rmtree",
+            "symlink",
+            "symlink_to",
+            "touch",
+            "truncate",
+            "unlink",
+            "utime",
+            "write_bytes",
+            "write_text",
+            "writelines",
+            "NamedTemporaryFile",
+            "TemporaryDirectory",
+            "TemporaryFile",
+        }
+    )
+
+    #: Expressions that are the seam itself, written as source text so a new
+    #: spelling has to be added here on purpose rather than by accident.
+    SEAM = frozenset({"fs", "self.fs", "self._fs", "filesystem", "self.filesystem"})
+
+    def _offenders(self, path: Path) -> list[str]:
+        """
+        Collect every mutating call in a module that bypasses the seam.
+
+        Args:
+            path: Module to inspect.
+
+        Returns:
+            One ``name (line N)`` entry per offending call.
+        """
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        found: list[str] = []
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+
+            func = node.func
+            if isinstance(func, ast.Attribute):
+                name, receiver = func.attr, ast.unparse(func.value)
+            elif isinstance(func, ast.Name):
+                name, receiver = func.id, ""
+            else:
+                continue
+
+            if name in self.MUTATING and receiver not in self.SEAM:
+                found.append(f"{name} on {receiver or '<bare call>'} (line {node.lineno})")
+
+        return found
+
+    def test_the_env_manager_never_writes_outside_the_seam(self):
+        """Every .env and every directory goes through wasm.core.fs."""
+        module = Path(env_manager_module.__file__)
+
+        assert self._offenders(module) == []
+
+    def test_the_guard_notices_a_direct_mutation(self, tmp_path):
+        """A guard that cannot fail protects nothing."""
+        sample = tmp_path / "sample.py"
+        sample.write_text("from pathlib import Path\nPath('/x/.env').write_text('K=v')\n")
+
+        assert self._offenders(sample) != []
+
+    def test_the_guard_accepts_the_seam(self, tmp_path):
+        """The same call through the seam is exactly what we want to see."""
+        sample = tmp_path / "sample.py"
+        sample.write_text("def f(self):\n    self.fs.write_text(self.path, 'K=v')\n")
+
+        assert self._offenders(sample) == []

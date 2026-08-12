@@ -53,10 +53,8 @@ optional, since this manager is the single step every caller must pass through.
 
 from __future__ import annotations
 
-import os
 import re
 import sqlite3
-import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -67,7 +65,8 @@ from jinja2 import TemplateError as JinjaTemplateError
 
 from wasm.core.config import SYSTEMD_DIR
 from wasm.core.exceptions import ServiceError, TemplateError, WASMError
-from wasm.core.runner import DEFAULT_TIMEOUT, CommandResult, CommandRunner, get_runner
+from wasm.core.fs import FileSystem
+from wasm.core.runner import DEFAULT_TIMEOUT, CommandResult, CommandRunner
 from wasm.core.store import Service, get_store
 from wasm.managers.base_manager import BaseManager
 from wasm.validators.environment import validate_environment, validate_unit_value
@@ -150,7 +149,12 @@ class ServiceManager(BaseManager):
     SERVICE_PREFIX = "wasm-"
     LEGACY_PREFIX = SERVICE_PREFIX
 
-    def __init__(self, verbose: bool = False, runner: CommandRunner | None = None):
+    def __init__(
+        self,
+        verbose: bool = False,
+        runner: CommandRunner | None = None,
+        fs: FileSystem | None = None,
+    ):
         """
         Initialize service manager.
 
@@ -158,10 +162,12 @@ class ServiceManager(BaseManager):
             verbose: Enable verbose logging.
             runner: Command runner to execute systemd with. Defaults to the
                 process-wide runner.
+            fs: Filesystem to write unit files through. Defaults to the
+                process-wide one, which is what makes ``--dry-run`` refuse to
+                install or delete a unit.
         """
-        super().__init__(verbose=verbose)
+        super().__init__(verbose=verbose, runner=runner, fs=fs)
         self.store = get_store()
-        self._runner = runner
 
         try:
             # Unit files are not markup: autoescaping would corrupt ExecStart.
@@ -176,16 +182,6 @@ class ServiceManager(BaseManager):
             # create_service keeps working.
             self.logger.debug(f"Systemd template environment unavailable: {exc}")
             self.jinja_env = None
-
-    @property
-    def runner(self) -> CommandRunner:
-        """
-        The command runner used for every systemd invocation.
-
-        Returns:
-            The injected runner, or the process-wide one.
-        """
-        return self._runner or get_runner()
 
     def _exec(self, argv: list[str], *, timeout: int = DEFAULT_TIMEOUT) -> CommandResult:
         """
@@ -669,10 +665,12 @@ class ServiceManager(BaseManager):
         """
         Write a unit file so that no reader ever sees a partial one.
 
-        The temporary file is created in the destination directory, because
-        :func:`os.replace` is only atomic within a filesystem, and it is renamed
-        into place once its contents are on disk. A crash therefore leaves
-        either the old unit or the new one, never half of either.
+        This used to open its own ``mkstemp``, fsync it and ``os.replace`` it
+        into position. :meth:`~wasm.core.fs.FileSystem.write_text` already does
+        exactly that - sibling temporary, fsync, atomic rename, mode applied at
+        creation - so the copy is gone: two implementations of an atomic write
+        means one of them eventually stops being atomic, and only one of them
+        can be turned off by ``--dry-run``.
 
         Args:
             path: Final unit file path.
@@ -681,32 +679,15 @@ class ServiceManager(BaseManager):
         Raises:
             ServiceError: When the file cannot be written or renamed.
         """
-        directory = path.parent
         try:
-            directory.mkdir(parents=True, exist_ok=True)
-            handle_fd, temp_name = tempfile.mkstemp(
-                dir=directory, prefix=f".{path.name}.", suffix=".tmp"
-            )
+            self.fs.write_text(path, content, mode=UNIT_FILE_MODE)
         except OSError as exc:
             raise ServiceError(
                 f"Failed to write unit file: {path}",
-                details=f"{exc}. Check that {directory} exists and is writable by root.",
-            ) from exc
-
-        temp_path = Path(temp_name)
-        try:
-            with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
-                handle.write(content)
-                handle.flush()
-                os.fsync(handle.fileno())
-            # mkstemp creates 0600; a unit file has to stay readable.
-            os.chmod(temp_path, UNIT_FILE_MODE)
-            os.replace(temp_path, path)
-        except OSError as exc:
-            temp_path.unlink(missing_ok=True)
-            raise ServiceError(
-                f"Failed to write unit file: {path}",
-                details=f"{exc}. The previous unit file, if any, is untouched.",
+                details=(
+                    f"{exc}. The previous unit file, if any, is untouched. "
+                    f"Check that {path.parent} exists and is writable by root."
+                ),
             ) from exc
 
     def _render_unit(self, template: str, context: Mapping[str, Any]) -> str:
@@ -956,7 +937,7 @@ class ServiceManager(BaseManager):
             self._exec(["systemctl", "disable", info.unit_file])
 
             try:
-                info.path.unlink(missing_ok=True)
+                self.fs.remove(info.path, missing_ok=True)
             except OSError as exc:
                 raise ServiceError(
                     f"Failed to delete service: {info.unit}",

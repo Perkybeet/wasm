@@ -14,6 +14,11 @@ containing a newline turned the second one into arbitrary directives in a
 root-owned unit file, which is the exact injection the templates were fixed for.
 Only the Jinja renderer survives, and the values it receives are validated
 before they reach it.
+
+Unit files are written and removed through :mod:`wasm.core.fs`, for the same
+reason systemctl goes through the runner: ``wasm --dry-run backup schedule
+delete`` used to unlink two root-owned unit files while announcing that it would
+change nothing.
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ from jinja2 import Environment, PackageLoader, TemplateError
 
 from wasm.core.config import SYSTEMD_DIR as _SYSTEMD_DIR
 from wasm.core.exceptions import BackupError, WASMError
+from wasm.core.fs import FileSystem, get_fs
 from wasm.core.logger import Logger
 from wasm.core.runner import CommandRunner, get_runner
 from wasm.core.utils import domain_to_app_name
@@ -121,7 +127,12 @@ class BackupScheduler:
 
     SYSTEMD_DIR = _SYSTEMD_DIR
 
-    def __init__(self, verbose: bool = False, runner: CommandRunner | None = None) -> None:
+    def __init__(
+        self,
+        verbose: bool = False,
+        runner: CommandRunner | None = None,
+        fs: FileSystem | None = None,
+    ) -> None:
         """
         Initialize the scheduler.
 
@@ -129,10 +140,13 @@ class BackupScheduler:
             verbose: Enable verbose logging.
             runner: Command runner used for systemctl. Defaults to the
                 process-wide runner.
+            fs: Filesystem used to write and remove unit files. Defaults to the
+                process-wide one, so ``--dry-run`` reaches the unit files too.
         """
         self.verbose = verbose
         self.logger = Logger(verbose=verbose)
         self._runner = runner
+        self._fs = fs
         self.jinja_env = Environment(
             loader=PackageLoader("wasm", "templates/systemd"),
             trim_blocks=True,
@@ -151,6 +165,16 @@ class BackupScheduler:
             The injected runner, or the process-wide one.
         """
         return self._runner or get_runner()
+
+    @property
+    def fs(self) -> FileSystem:
+        """
+        Return the filesystem used for every unit file this scheduler owns.
+
+        Returns:
+            The injected filesystem, or the process-wide one.
+        """
+        return self._fs or get_fs()
 
     def _systemctl(self, *args: str) -> Any:
         """
@@ -234,9 +258,7 @@ class BackupScheduler:
             BackupError: If the file cannot be written.
         """
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content)
-            path.chmod(_UNIT_MODE)
+            self.fs.write_text(path, content, mode=_UNIT_MODE)
         except OSError as exc:
             raise BackupError(
                 f"Failed to write unit file: {path}",
@@ -312,7 +334,7 @@ class BackupScheduler:
         for suffix in (".timer", ".service"):
             path = self._unit_path(f"{timer_name}{suffix}")
             try:
-                path.unlink(missing_ok=True)
+                self.fs.remove(path)
             except OSError as exc:
                 self.logger.warning(f"Could not remove {path}: {exc}")
 

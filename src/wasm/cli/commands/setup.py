@@ -23,12 +23,16 @@ version told:
 - **Report success it did not achieve.** ``setup init`` printed "Setup
   Complete!" and exited 0 even when every single install had failed. The exit
   status and the final message now describe what actually happened.
+- **Change the machine during a rehearsal.** ``setup init --dry-run`` created
+  /etc/wasm, wrote config.yaml and installed the man page, because the flag only
+  swapped the command runner and every one of those is a plain filesystem call.
+  Every write here now goes through :mod:`wasm.core.fs`, and each step reports
+  what is on disk afterwards rather than what it asked for.
 """
 
 from __future__ import annotations
 
 import os
-import shutil
 import sys
 from argparse import Namespace
 from collections.abc import Callable
@@ -38,7 +42,7 @@ from typing import TYPE_CHECKING, Any, NoReturn
 
 import click
 
-from wasm.cli.app import Context, pass_context
+from wasm.cli.app import Context, enable_dry_run, pass_context
 from wasm.core.config import (
     DEFAULT_APPS_DIR,
     DEFAULT_CONFIG_PATH,
@@ -47,8 +51,8 @@ from wasm.core.config import (
     secure_directory,
 )
 from wasm.core.exceptions import WASMError
+from wasm.core.fs import FileSystem, get_fs
 from wasm.core.logger import Logger, set_colors_disabled
-from wasm.core.runner import DryRunRunner, SubprocessRunner, set_runner
 from wasm.core.utils import command_exists, run_command, run_trusted_installer
 
 if TYPE_CHECKING:
@@ -74,30 +78,15 @@ class SetupError(WASMError):
 # ---------------------------------------------------------------------------
 
 
-def _enable_dry_run(state: Context) -> None:
-    """
-    Route every external command through the rehearsal runner.
-
-    The root group does this when ``--dry-run`` comes before the subcommand.
-    A subcommand has to do it itself when the flag comes after, because by then
-    the root callback has already run.
-
-    Args:
-        state: The shared context to mark as rehearsing.
-    """
-    logger = state.logger
-    logger.warning("Dry run: no changes will be made to this machine")
-    set_runner(
-        DryRunRunner(
-            SubprocessRunner(),
-            on_skip=lambda cmd: logger.info(f"would run: {' '.join(cmd)}"),
-        )
-    )
-
-
 def _fold_into_context(attribute: str) -> Callable[[click.Context, click.Parameter, bool], bool]:
     """
     Build the callback that records a global flag on the shared context.
+
+    The root group turns ``--dry-run`` on when it comes before the subcommand.
+    When it comes after, the root callback has already run, so the flag is
+    turned on here through the same :func:`~wasm.cli.app.enable_dry_run`: a
+    second implementation is how ``wasm setup init --dry-run`` ended up swapping
+    the command runner and not the filesystem, and creating /etc/wasm anyway.
 
     Args:
         attribute: Name of the :class:`~wasm.cli.app.Context` attribute to set.
@@ -114,7 +103,7 @@ def _fold_into_context(attribute: str) -> Callable[[click.Context, click.Paramet
         if attribute == "no_color":
             set_colors_disabled(True)
         elif attribute == "dry_run":
-            _enable_dry_run(state)
+            enable_dry_run(state)
         return value
 
     return fold
@@ -357,23 +346,31 @@ def _install_packages(
 # ---------------------------------------------------------------------------
 
 
-def _create_config_directory(logger: Logger) -> bool:
+def _create_config_directory(logger: Logger, fs: FileSystem | None = None) -> bool:
     """
     Create the directory that holds config.yaml, owner-only.
 
     Args:
         logger: Logger used to report progress.
+        fs: Filesystem to change. Defaults to the process-wide one.
 
     Returns:
-        True if the directory exists and is private afterwards.
+        True if the directory exists and is private afterwards, or if this is a
+        rehearsal and nothing was created.
     """
     config_dir = DEFAULT_CONFIG_PATH.parent
     logger.substep(f"Creating config directory: {config_dir}")
     try:
-        secure_directory(config_dir)
+        secure_directory(config_dir, fs=fs or get_fs())
     except OSError as e:
         logger.warning(f"Failed to create config directory: {e}")
         return False
+
+    if not config_dir.is_dir():
+        # A rehearsal refused the creation. Nothing to inspect, and nothing to
+        # report as a failure either: the run was never going to change anything.
+        logger.debug(f"{config_dir} was not created")
+        return True
 
     if config_dir.stat().st_mode & 0o077:
         logger.warning(
@@ -541,14 +538,18 @@ def _run_completions(logger: Logger, shell: str | None, user_only: bool, to_stdo
         return 1
 
     try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(script, encoding="utf-8")
+        get_fs().write_text(target, script)
     except OSError as e:
         logger.error(
             f"Could not write {target}: {e}",
             details="Run this with sudo, or use --user-only to install it for yourself.",
         )
         return 1
+
+    if not target.exists():
+        # A rehearsal. Saying it was installed and then telling the user to
+        # source a file that is not there is the lie this seam exists to stop.
+        return 0
 
     logger.success(f"Installed {shell} completions to {target}")
     for line in _completion_instructions(shell, target, user_only):
@@ -864,6 +865,7 @@ def _create_directories(logger: Logger) -> list[str]:
         One sentence per failure. Empty when all directories exist.
     """
     failures: list[str] = []
+    fs = get_fs()
 
     # Served content and logs are deliberately world-readable: the web server's
     # account has to traverse the first, and an operator should be able to tail
@@ -872,15 +874,24 @@ def _create_directories(logger: Logger) -> list[str]:
     for label, path in (("apps", DEFAULT_APPS_DIR), ("log", DEFAULT_LOG_DIR)):
         logger.substep(f"Creating {label} directory: {path}")
         try:
-            path.mkdir(parents=True, exist_ok=True)
-            os.chmod(path, 0o755)  # noqa: S103
+            fs.make_dir(path, mode=0o755, parents=True)
+            if path.is_dir():
+                # mkdir's mode is masked by the umask, and a directory left by
+                # an earlier run may be anything at all; the web server's
+                # account has to be able to traverse this one.
+                fs.chmod(path, 0o755)
         except OSError as e:
             logger.warning(f"Failed to create {label} directory: {e}")
             failures.append(f"{path}: {e}")
         else:
-            logger.success(f"Created {path}")
+            # Report the directory that is there, not the one that was asked
+            # for: during a rehearsal the seam creates nothing.
+            if path.is_dir():
+                logger.success(f"Created {path}")
+            else:
+                logger.debug(f"{path} was not created")
 
-    if not _create_config_directory(logger):
+    if not _create_config_directory(logger, fs=fs):
         failures.append(f"{DEFAULT_CONFIG_PATH.parent}: could not be created privately")
 
     return failures
@@ -915,6 +926,12 @@ def _write_config(logger: Logger, choices: dict[str, Any]) -> list[str]:
         logger.warning(f"Could not save {DEFAULT_CONFIG_PATH}")
         return [f"{DEFAULT_CONFIG_PATH}: could not be written, see the error above"]
 
+    if not DEFAULT_CONFIG_PATH.exists():
+        # A rehearsal: the seam refused the write and reported it, so claiming
+        # the file was created would contradict what the operator just read.
+        logger.debug(f"{DEFAULT_CONFIG_PATH} was not written")
+        return []
+
     logger.success(f"{'Updated' if existed else 'Created'} {DEFAULT_CONFIG_PATH}")
     return []
 
@@ -946,11 +963,14 @@ def _install_man_page(logger: Logger) -> None:
 
     logger.substep("Installing man page...")
     try:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy(source, destination)
-        os.chmod(destination, 0o644)
-    except OSError as e:
+        # Copied as text rather than with shutil: the seam is what makes a
+        # rehearsal leave nothing behind, and a man page is roff source.
+        get_fs().write_text(destination, source.read_text(encoding="utf-8"), mode=0o644)
+    except (OSError, UnicodeDecodeError) as e:
         logger.debug(f"Could not install the man page: {e}")
+        return
+
+    if not destination.exists():
         return
 
     run_command(["mandb", "-q"])

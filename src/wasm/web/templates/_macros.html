@@ -38,18 +38,29 @@
   certbot's own validity line, or a backup's description. It is not a place for
   commentary.
 
+  state_text is the state in words. The rail is a colour, and a colour on its
+  own is unreadable to anyone who cannot see this particular pair of hues and
+  invisible to a screen reader. Pass it wherever the record actually has a
+  state worth naming; where it does not, the state is still announced, just not
+  taken up screen space with.
+
   Used with {% call %} so the caller supplies the action buttons:
 
       {% call m.row("example.com", "active", meta) %}
         {{ m.action_button("Restart", "/api/apps/example.com/restart") }}
       {% endcall %}
 #}
-{% macro row(name, state, meta=[], href=none, row_id=none, note=none) %}
+{% macro row(name, state, meta=[], href=none, row_id=none, note=none, state_text=none) %}
 <div class="row row--{{ state_class(state) }}"{% if row_id %} id="{{ row_id }}"{% endif %}>
   <div class="row__main">
     <span class="row__name">
       {%- if href %}<a href="{{ href }}">{{ name }}</a>{% else %}{{ name }}{% endif -%}
     </span>
+    {% if state_text %}
+      {{ badge(state, state_text) }}
+    {% else %}
+      <span class="visually-hidden">Status: {{ state }}</span>
+    {% endif %}
     {% if meta %}
       <span class="row__meta">
         {% for label, value in meta %}<span>{{ label }} {{ value }}</span>{% endfor %}
@@ -147,7 +158,7 @@
   a row only disappears when the deletion actually happened.
 #}
 {% macro danger_button(label, endpoint, resource, consequence, question=none) %}
-<button class="btn btn--sm btn--danger"
+<button type="button" class="btn btn--sm btn--danger"
         hx-delete="{{ endpoint }}"
         hx-confirm="{{ question or (label ~ ' ' ~ resource ~ '? ' ~ consequence) }}"
         hx-target="closest .row"
@@ -162,7 +173,7 @@
   the template cannot read.
 #}
 {% macro action_button(label, endpoint, confirm=none) %}
-<button class="btn btn--sm"
+<button type="button" class="btn btn--sm"
         hx-post="{{ endpoint }}"
         {% if confirm %}hx-confirm="{{ confirm }}"
         {% endif %}hx-swap="none">{{ label }}</button>
@@ -210,6 +221,6 @@
   could break out of an attribute.
 #}
 {% macro follow_button(label, source, url) %}
-<button class="btn btn--sm btn--quiet" data-follow-log data-source="{{ source }}"
+<button type="button" class="btn btn--sm btn--quiet" data-follow-log data-source="{{ source }}"
         data-url="{{ url }}">{{ label }}</button>
 {% endmacro %}

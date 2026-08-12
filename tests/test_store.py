@@ -4,14 +4,27 @@
 
 """
 Tests for WASM SQLite persistence store.
+
+Beyond the CRUD surface, this file pins two properties that were not properties
+before: the database and its directory are created through the
+:mod:`wasm.core.fs` seam, so ``--dry-run`` cannot leave one behind, and they end
+up 0600 inside 0700, because ``apps.env_vars`` holds DATABASE_URL and API keys.
 """
 
+import ast
 import sqlite3
 import tempfile
 from pathlib import Path
 
 import pytest
 
+from wasm.core import store as store_module
+from wasm.core.fs import (
+    SECRET_DIR_MODE,
+    SECRET_MODE,
+    DryRunFileSystem,
+    RecordingFileSystem,
+)
 from wasm.core.store import (
     SCHEMA_VERSION,
     App,
@@ -22,10 +35,25 @@ from wasm.core.store import (
     DatabaseUser,
     Service,
     Site,
+    StoreError,
     WASMStore,
     WebServer,
     get_store,
 )
+
+
+@pytest.fixture
+def fresh():
+    """
+    Guarantee a store singleton that this test owns.
+
+    Yields:
+        Nothing; the singleton is reset before and after the test so an
+        injected filesystem is actually the one used.
+    """
+    WASMStore.reset_instance()
+    yield
+    WASMStore.reset_instance()
 
 
 @pytest.fixture
@@ -571,3 +599,249 @@ class TestEdgeCases:
         app = temp_db.get_app("null.com")
         assert app.branch is None
         assert app.port is None
+
+
+class TestStoreFilePermissions:
+    """The rows carry DATABASE_URL and API keys: 0600 inside 0700 or nothing."""
+
+    def test_database_is_owner_only_inside_an_owner_only_directory(self, fresh, tmp_path):
+        """The whole point: a store full of passwords readable by everyone."""
+        db_path = tmp_path / "lib" / "wasm" / "wasm.db"
+
+        store = WASMStore(db_path, fs=RecordingFileSystem())
+
+        assert store.db_path.stat().st_mode & 0o777 == SECRET_MODE
+        assert db_path.parent.stat().st_mode & 0o777 == SECRET_DIR_MODE
+
+    def test_every_created_level_is_private_not_only_the_last(self, fresh, tmp_path):
+        """mkdir(parents=True) applies the mode to the leaf and leaks the rest."""
+        db_path = tmp_path / "lib" / "wasm" / "wasm.db"
+
+        WASMStore(db_path, fs=RecordingFileSystem())
+
+        assert (tmp_path / "lib").stat().st_mode & 0o077 == 0
+
+    def test_the_mode_survives_sqlite_creating_the_schema(self, fresh, tmp_path):
+        """SQLite opens the file itself; it must not widen what we created."""
+        db_path = tmp_path / "wasm.db"
+        store = WASMStore(db_path, fs=RecordingFileSystem())
+
+        store.create_app(App(domain="perm.com", app_type="nodejs", app_path="/perm"))
+
+        assert db_path.stat().st_mode & 0o077 == 0
+
+    def test_a_database_left_lax_by_an_older_version_is_tightened(self, fresh, tmp_path):
+        """Upgrading must repair what the previous release created 0644."""
+        db_path = tmp_path / "wasm.db"
+        WASMStore(db_path, fs=RecordingFileSystem())
+        WASMStore.reset_instance()
+        db_path.chmod(0o644)
+
+        WASMStore(db_path, fs=RecordingFileSystem())
+
+        assert db_path.stat().st_mode & 0o777 == SECRET_MODE
+
+    def test_the_directory_and_the_file_are_created_through_the_seam(self, fresh, tmp_path):
+        """Anything not routed through the seam is invisible to --dry-run."""
+        recorder = RecordingFileSystem()
+        db_path = tmp_path / "lib" / "wasm.db"
+
+        WASMStore(db_path, fs=recorder)
+
+        assert ("mkdir", db_path.parent) in recorder.changes
+        assert ("write", db_path) in recorder.changes
+
+
+class TestStoreUnderADryRun:
+    """A rehearsal that creates the database is not a rehearsal."""
+
+    def test_nothing_is_created_when_the_filesystem_refuses(self, fresh, tmp_path):
+        """The previous version created directory and file regardless."""
+        db_path = tmp_path / "lib" / "wasm" / "wasm.db"
+
+        WASMStore(db_path, fs=DryRunFileSystem())
+
+        assert not db_path.exists()
+        assert not db_path.parent.exists()
+        assert list(tmp_path.iterdir()) == []
+
+    def test_sqlite_does_not_create_the_database_behind_the_seam(self, fresh, tmp_path):
+        """Connecting with the default rwc is how a dry run leaves a file."""
+        db_path = tmp_path / "wasm.db"
+        store = WASMStore(db_path, fs=DryRunFileSystem())
+
+        with pytest.raises(StoreError):
+            store.list_apps()
+
+        assert not db_path.exists()
+
+    def test_an_existing_database_is_neither_deleted_nor_rewritten(self, fresh, tmp_path):
+        """The file on a real server must come out of a rehearsal untouched."""
+        db_path = tmp_path / "wasm.db"
+        real = WASMStore(db_path, fs=RecordingFileSystem())
+        real.create_app(App(domain="keep.com", app_type="nodejs", app_path="/keep"))
+        before = db_path.read_bytes()
+        WASMStore.reset_instance()
+
+        store = WASMStore(db_path, fs=DryRunFileSystem())
+
+        assert db_path.exists()
+        assert db_path.read_bytes() == before
+        assert store.get_app("keep.com") is not None
+
+    def test_a_lax_database_is_not_chmodded_during_a_rehearsal(self, fresh, tmp_path):
+        """chmod is a change to this machine, so --dry-run must skip it too."""
+        db_path = tmp_path / "wasm.db"
+        WASMStore(db_path, fs=RecordingFileSystem())
+        WASMStore.reset_instance()
+        db_path.chmod(0o644)
+
+        WASMStore(db_path, fs=DryRunFileSystem())
+
+        assert db_path.stat().st_mode & 0o777 == 0o644
+
+    def test_the_skipped_changes_are_reported(self, fresh, tmp_path):
+        """An operator only trusts the rehearsal if it says what it skipped."""
+        dry = DryRunFileSystem()
+
+        WASMStore(tmp_path / "lib" / "wasm.db", fs=dry)
+
+        assert any("wasm.db" in line for line in dry.skipped)
+
+
+class TestResolvingThePathChangesNothing:
+    """Deciding where the database lives is a question, not a change."""
+
+    def test_the_user_directory_is_not_created_while_resolving(self, fresh, tmp_path, monkeypatch):
+        """The previous version created ~/.local/share/wasm just by asking."""
+        user_db = tmp_path / "home" / ".local" / "share" / "wasm" / "wasm.db"
+        system_db = tmp_path / "var" / "lib" / "wasm" / "wasm.db"
+        monkeypatch.setattr(store_module, "USER_DB_PATH", user_db)
+        monkeypatch.setattr(store_module, "DEFAULT_DB_PATH", system_db)
+        store = WASMStore(tmp_path / "explicit.db", fs=RecordingFileSystem())
+
+        resolved = store._resolve_db_path()
+
+        assert resolved == user_db
+        assert not user_db.parent.exists()
+
+    def test_the_system_path_wins_when_its_directory_is_writable(
+        self, fresh, tmp_path, monkeypatch
+    ):
+        """Behaviour preserved: /var/lib/wasm is preferred when usable."""
+        system_db = tmp_path / "var" / "lib" / "wasm" / "wasm.db"
+        system_db.parent.mkdir(parents=True)
+        monkeypatch.setattr(store_module, "DEFAULT_DB_PATH", system_db)
+        store = WASMStore(tmp_path / "explicit.db", fs=RecordingFileSystem())
+
+        assert store._resolve_db_path() == system_db
+
+
+class TestNoMutationEscapesTheSeam:
+    """
+    The guard that stops the defect from coming back.
+
+    ``--dry-run`` printed "no changes will be made to this machine" and then
+    deleted files, because a deletion is a ``Path.unlink`` and never goes near a
+    subprocess. Reads are deliberately not covered: they change nothing.
+    """
+
+    #: Calls that change the filesystem. Names only, because that is what
+    #: survives an alias, a re-import or a helper variable.
+    MUTATING = frozenset(
+        {
+            "chmod",
+            "chown",
+            "copy",
+            "copy2",
+            "copyfile",
+            "copymode",
+            "copystat",
+            "copytree",
+            "hardlink_to",
+            "lchmod",
+            "lchown",
+            "link",
+            "link_to",
+            "makedirs",
+            "mkdir",
+            "mkdtemp",
+            "mkstemp",
+            "mknod",
+            "move",
+            "open",
+            "remove",
+            "removedirs",
+            "rename",
+            "renames",
+            "replace",
+            "rmdir",
+            "rmtree",
+            "symlink",
+            "symlink_to",
+            "touch",
+            "truncate",
+            "unlink",
+            "utime",
+            "write_bytes",
+            "write_text",
+            "writelines",
+            "NamedTemporaryFile",
+            "TemporaryDirectory",
+            "TemporaryFile",
+        }
+    )
+
+    #: Expressions that are the seam itself, written as source text so a new
+    #: spelling has to be added here on purpose rather than by accident.
+    SEAM = frozenset({"fs", "self.fs", "self._fs", "filesystem", "self.filesystem"})
+
+    def _offenders(self, path: Path) -> list[str]:
+        """
+        Collect every mutating call in a module that bypasses the seam.
+
+        Args:
+            path: Module to inspect.
+
+        Returns:
+            One ``name (line N)`` entry per offending call.
+        """
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        found: list[str] = []
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+
+            func = node.func
+            if isinstance(func, ast.Attribute):
+                name, receiver = func.attr, ast.unparse(func.value)
+            elif isinstance(func, ast.Name):
+                name, receiver = func.id, ""
+            else:
+                continue
+
+            if name in self.MUTATING and receiver not in self.SEAM:
+                found.append(f"{name} on {receiver or '<bare call>'} (line {node.lineno})")
+
+        return found
+
+    def test_the_store_never_writes_outside_the_seam(self):
+        """Every mkdir, chmod and file creation goes through wasm.core.fs."""
+        module = Path(store_module.__file__)
+
+        assert self._offenders(module) == []
+
+    def test_the_guard_notices_a_direct_mutation(self, tmp_path):
+        """A guard that cannot fail protects nothing."""
+        sample = tmp_path / "sample.py"
+        sample.write_text("from pathlib import Path\nPath('/x').unlink()\n")
+
+        assert self._offenders(sample) != []
+
+    def test_the_guard_accepts_the_seam(self, tmp_path):
+        """The same call through the seam is exactly what we want to see."""
+        sample = tmp_path / "sample.py"
+        sample.write_text("def f(self):\n    self.fs.remove(self.path)\n")
+
+        assert self._offenders(sample) == []

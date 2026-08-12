@@ -30,9 +30,19 @@
     </div>
   {% endif %}
 
-  <form method="post" action="/login" autocomplete="off">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  {#
+    Posted as a plain urlencoded form to /login, which is what the server
+    parses: a single "token" field, and nothing in the URL, because a query
+    string is written to browser history, proxy logs and access logs.
 
+    There is no CSRF field, and there deliberately is not one. This exchange
+    happens before any session exists, so there is no token to carry; the
+    field that used to sit here always sent an empty string, which is a claim
+    of protection that was not there. Nothing is at stake either way: the only
+    thing this form can do with a forged submission is present a token the
+    forger already knows.
+  #}
+  <form method="post" action="/login" autocomplete="off">
     <div class="field">
       <label class="label" for="token">Access token</label>
       <input class="mono" type="password" id="token" name="token"
@@ -46,7 +56,9 @@
     <button class="btn btn--primary" type="submit" style="width: 100%">Sign in</button>
   </form>
 
-  {% if locked_for %}
+  {# Only when the lockout has not already been said above: a refusal repeated
+     twice on one screen reads as two different problems. #}
+  {% if locked_for and not error %}
     <p class="faint" style="margin-top: 1rem; font-size: var(--text-xs)">
       Too many attempts. Try again in {{ locked_for }} seconds.
     </p>

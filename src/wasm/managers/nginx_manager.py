@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from wasm.core.fs import FileSystem
 from wasm.core.runner import CommandRunner
 from wasm.managers.webserver import (
     NGINX_BACKEND,
@@ -49,6 +50,7 @@ class NginxManager(WebServerManager):
         verbose: bool = False,
         runner: CommandRunner | None = None,
         backend: WebServerBackend | None = None,
+        fs: FileSystem | None = None,
     ) -> None:
         """
         Initialize the Nginx manager.
@@ -59,8 +61,9 @@ class NginxManager(WebServerManager):
                 one.
             backend: Backend override, used by tests to point the manager at a
                 temporary configuration tree.
+            fs: Filesystem to write through. Defaults to the process-wide one.
         """
-        super().__init__(backend or NGINX_BACKEND, verbose=verbose, runner=runner)
+        super().__init__(backend or NGINX_BACKEND, verbose=verbose, runner=runner, fs=fs)
 
     def create_advanced_site(
         self,

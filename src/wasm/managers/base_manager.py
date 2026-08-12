@@ -8,13 +8,21 @@ Infrastructure shared by every manager.
 Two things live here, and both exist to remove a defect class rather than to
 save typing.
 
-:class:`BaseManager` gives every adapter one way to reach the system: the
-injectable :class:`~wasm.core.runner.CommandRunner`. The previous version wrapped
-``core.utils.run_command``, which split strings into argv, accepted ``shell=``
-and defaulted to no timeout at all; three separate ways for a domain name to
-become a command. It also carried ``_run_sudo``. That is gone: WASM requires root
-(decision D6 of the v1 design), so a manager that re-elevates is either
-redundant or hiding the fact that it is running unprivileged.
+:class:`BaseManager` gives every adapter two ways to reach the system, and only
+those two: the injectable :class:`~wasm.core.runner.CommandRunner` for anything
+it executes, and the injectable :class:`~wasm.core.fs.FileSystem` for anything it
+writes. The previous version wrapped ``core.utils.run_command``, which split
+strings into argv, accepted ``shell=`` and defaulted to no timeout at all; three
+separate ways for a domain name to become a command. It also carried
+``_run_sudo``. That is gone: WASM requires root (decision D6 of the v1 design),
+so a manager that re-elevates is either redundant or hiding the fact that it is
+running unprivileged.
+
+The filesystem seam is here for the same reason the runner is. These managers
+write systemd units and web server configurations into ``/etc`` and delete them
+again; before the seam existed a ``--dry-run`` deploy printed "no changes will
+be made to this machine" and then unlinked the unit file, because a deletion is
+a ``Path.unlink`` and never goes near a subprocess.
 
 :class:`MappingRecord` is the bridge that lets a manager return a typed record
 where it used to return a bare dict. The contract that matters is the field
@@ -32,6 +40,7 @@ from pathlib import Path
 from typing import Any
 
 from wasm.core.config import Config
+from wasm.core.fs import FileSystem, get_fs
 from wasm.core.logger import Logger
 from wasm.core.runner import DEFAULT_TIMEOUT, CommandResult, CommandRunner, get_runner
 
@@ -176,11 +185,17 @@ class BaseManager(ABC):
     """
     Abstract base class for all managers.
 
-    Provides configuration access, logging, and the single seam through which a
-    manager may touch the system.
+    Provides configuration access, logging, and the two seams through which a
+    manager may touch the system: one for what it executes, one for what it
+    writes.
     """
 
-    def __init__(self, verbose: bool = False, runner: CommandRunner | None = None) -> None:
+    def __init__(
+        self,
+        verbose: bool = False,
+        runner: CommandRunner | None = None,
+        fs: FileSystem | None = None,
+    ) -> None:
         """
         Initialize the manager.
 
@@ -189,11 +204,14 @@ class BaseManager(ABC):
             runner: Command runner to execute with. Defaults to the process-wide
                 runner, which is what makes ``--dry-run`` and the test fake work
                 without every call site knowing about them.
+            fs: Filesystem to write through. Defaults to the process-wide one,
+                for the same reason.
         """
         self.config = Config()
         self.logger = Logger(verbose=verbose)
         self.verbose = verbose
         self._runner = runner
+        self._fs = fs
 
     @property
     def runner(self) -> CommandRunner:
@@ -204,6 +222,16 @@ class BaseManager(ABC):
             The injected runner, or the process-wide one.
         """
         return self._runner or get_runner()
+
+    @property
+    def fs(self) -> FileSystem:
+        """
+        The filesystem used for every change this manager makes to disk.
+
+        Returns:
+            The injected filesystem, or the process-wide one.
+        """
+        return self._fs or get_fs()
 
     def _run(
         self,

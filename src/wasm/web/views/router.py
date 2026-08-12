@@ -43,6 +43,12 @@ async def require_page_session(request: Request) -> dict[str, Any]:
     one the API uses, so there is one place where a credential is verified and
     one counter recording failures.
 
+    Only a 401 becomes a redirect. A 403 from here means the session is valid
+    and its CSRF token was not presented, and answering that with "sign in
+    again" is both a lie and a loop: signing in produces the same session and
+    the next click fails the same way. It is passed through so the operator
+    reads what actually went wrong.
+
     Args:
         request: The incoming request.
 
@@ -50,12 +56,14 @@ async def require_page_session(request: Request) -> dict[str, Any]:
         The authenticated session payload.
 
     Raises:
-        HTTPException: A 303 redirect to the sign-in page when unauthenticated.
+        HTTPException: A 303 redirect to the sign-in page when unauthenticated,
+            or the original refusal when the session is real but the request
+            was not accepted.
     """
     try:
         session = await require_auth(request)
     except HTTPException as exc:
-        if exc.status_code in (401, 403):
+        if exc.status_code == 401:
             raise HTTPException(
                 status_code=303,
                 headers={"Location": "/login"},
@@ -203,10 +211,14 @@ def certificates(request: Request) -> HTMLResponse:
         request: The incoming request.
 
     Returns:
-        The certificates page.
+        The certificates page. When certbot cannot be asked, the uncovered
+        list is None rather than empty: "no domain is missing a certificate"
+        and "this machine cannot tell" are different facts, and showing the
+        second as the first told the operator every domain was covered at
+        exactly the moment nothing could be issued at all.
     """
     rows, problem = resources.certificate_rows()
-    uncovered = resources.domains_without_certificate(rows) if problem is None else []
+    uncovered = resources.domains_without_certificate(rows) if problem is None else None
     expiring = [row for row in rows if row["state"] in ("busy", "failed")]
     return page(
         request,

@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import ClassVar
 
+from wasm.core.fs import FileSystem
 from wasm.core.runner import CommandRunner
 from wasm.deployers.base import BaseDeployer
 from wasm.deployers.registry import DeployerRegistry
@@ -35,7 +36,12 @@ class NextJSDeployer(BaseDeployer):
 
     SYSTEM_DEPS: ClassVar[list[str]] = ["node", "npm"]
 
-    def __init__(self, verbose: bool = False, runner: CommandRunner | None = None):
+    def __init__(
+        self,
+        verbose: bool = False,
+        runner: CommandRunner | None = None,
+        fs: FileSystem | None = None,
+    ):
         """
         Initialize the Next.js deployer.
 
@@ -43,8 +49,10 @@ class NextJSDeployer(BaseDeployer):
             verbose: Enable verbose logging.
             runner: Command runner used for installs and builds. Defaults to the
                 process-wide runner.
+            fs: Filesystem every change goes through. Defaults to the
+                process-wide one.
         """
-        super().__init__(verbose=verbose, runner=runner)
+        super().__init__(verbose=verbose, runner=runner, fs=fs)
         self.is_standalone = False
 
     def detect(self, path: Path) -> bool:
@@ -128,24 +136,17 @@ class NextJSDeployer(BaseDeployer):
         if self.is_standalone:
             self.logger.debug("Standalone output mode detected")
 
-            # Copy static and public files for standalone
+            # A standalone build ships only the server; the assets it serves
+            # have to be copied in next to it or every page 404s its own CSS.
             standalone_dir = self.app_path / ".next" / "standalone"
             if standalone_dir.exists():
-                # Copy static files
                 static_src = self.app_path / ".next" / "static"
-                static_dest = standalone_dir / ".next" / "static"
                 if static_src.exists():
-                    import shutil
+                    self.fs.copy_tree(static_src, standalone_dir / ".next" / "static")
 
-                    shutil.copytree(static_src, static_dest, dirs_exist_ok=True)
-
-                # Copy public files
                 public_src = self.app_path / "public"
-                public_dest = standalone_dir / "public"
                 if public_src.exists():
-                    import shutil
-
-                    shutil.copytree(public_src, public_dest, dirs_exist_ok=True)
+                    self.fs.copy_tree(public_src, standalone_dir / "public")
 
         return True
 

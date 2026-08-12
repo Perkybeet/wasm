@@ -10,7 +10,7 @@ console. Every command is a thin shell around
 :mod:`wasm.managers.database`: this module parses, confirms and prints, and
 never speaks to an engine itself.
 
-Two things are deliberate here:
+Three things are deliberate here:
 
 - **The work lives in module-level functions, not in the Click callbacks.**
   ``handle_db`` still routes the argparse tree that is being retired, and both
@@ -19,6 +19,11 @@ Two things are deliberate here:
 - **Nothing spawns a process.** The one exception is :func:`_open_client`,
   which hands the terminal to ``psql`` or ``mysql`` and is documented where it
   is defined.
+- **Read-only means one statement.** ``wasm db query`` defaults to the engine's
+  read-only transaction, and :func:`_single_statement` is what stops a request
+  from carrying a second statement that closes it. Without that rule the
+  default is decoration: ``SELECT 1; COMMIT; DROP TABLE users`` commits the
+  read-only transaction and drops the table.
 """
 
 from __future__ import annotations
@@ -34,7 +39,7 @@ import click
 
 from wasm.cli.app import Context, pass_context
 from wasm.core.config import Config
-from wasm.core.exceptions import DatabaseError
+from wasm.core.exceptions import DatabaseError, DatabaseQueryError
 from wasm.core.logger import Logger
 from wasm.managers.database import (
     BaseDatabaseManager,
@@ -46,6 +51,10 @@ from wasm.managers.database import (
 #: read-only request cannot be honoured, so it is refused rather than granted
 #: on paper: the manager would accept the flag and run the statement anyway.
 READ_ONLY_ENGINES = frozenset({"mariadb", "mysql", "postgres", "postgresql"})
+
+#: Longest statement the console accepts. Matched to the panel's limit so the
+#: two front doors agree on what one statement is.
+MAX_QUERY_LENGTH = 20_000
 
 #: Placeholder printed in a connection string when the operator gave no
 #: password. It is a blank to fill in, not a credential.
@@ -1097,6 +1106,57 @@ def _backups(*, engine: str | None, database: str | None, json_output: bool, log
 # ==================== Query and connection ====================
 
 
+def _single_statement(query: str) -> str:
+    """
+    Reduce a request to exactly one statement.
+
+    This is what makes read-only mode mean anything. A manager wraps the text
+    it is given in the engine's own read-only transaction, so a request holding
+    two statements is handed to the engine as
+    ``START TRANSACTION READ ONLY; SELECT 1; COMMIT; DROP TABLE users``: the
+    embedded ``COMMIT`` ends the read-only transaction and everything after it
+    runs with write access. One statement in, one transaction, no escape.
+
+    Args:
+        query: The statement as it was typed.
+
+    Returns:
+        The statement, stripped, without its optional trailing semicolon.
+
+    Raises:
+        DatabaseQueryError: When the text is empty, too long, or holds more
+            than one statement.
+    """
+    statement = query.strip()
+    if not statement:
+        raise DatabaseQueryError(
+            "Empty statement",
+            details="Pass the statement to run as the second argument.",
+        )
+    if len(statement) > MAX_QUERY_LENGTH:
+        raise DatabaseQueryError(
+            f"Statement is too long: {len(statement)} characters",
+            details=(
+                f"The console accepts at most {MAX_QUERY_LENGTH} characters. "
+                "Put a longer script in a file and feed it to the engine's own client "
+                "with 'wasm db connect'."
+            ),
+        )
+
+    stripped = statement.removesuffix(";").rstrip()
+    if ";" in stripped:
+        raise DatabaseQueryError(
+            "Only one statement may be sent at a time in read-only mode",
+            details=(
+                "An embedded ';' can close the read-only transaction the engine was "
+                "asked to hold, so everything after it would run with write access. "
+                "Send the statements one by one, or pass --write if you accept that "
+                "they may change data."
+            ),
+        )
+    return stripped
+
+
 def _query(database: str, query: str, *, engine: str, read_only: bool, logger: Logger) -> int:
     """
     Run one statement against a database.
@@ -1124,14 +1184,21 @@ def _query(database: str, query: str, *, engine: str, read_only: bool, logger: L
         return 1
 
     try:
+        # Checked before the engine is looked at, so a rejected statement never
+        # reaches it. Only read-only mode needs the guard: --write is the
+        # operator saying the statement may change data, and a batch is then a
+        # legitimate thing to send.
+        statement = _single_statement(query) if read_only else query
+
         if not manager.is_running():
             logger.error(f"{manager.DISPLAY_NAME} is not running")
             return 1
 
-        # The guarantee is the engine's transaction, not a keyword check here:
-        # a leading keyword does not tell you what a statement does, and
+        # Beyond the one-statement rule the guarantee is the engine's
+        # transaction, not a keyword check here: a leading keyword does not
+        # tell you what a statement does, and
         # WITH x AS (DELETE ... RETURNING *) SELECT * FROM x begins with WITH.
-        success, output = manager.execute_query(database, query, read_only=read_only)
+        success, output = manager.execute_query(database, statement, read_only=read_only)
 
         if output:
             click.echo(output)
@@ -1718,11 +1785,17 @@ def backups(ctx: Context, engine: str | None, database: str | None) -> None:
 @click.option(
     "--write",
     is_flag=True,
-    help="Allow the statement to change data. Without it the engine runs it in a read-only transaction.",
+    help="Allow the statement to change data. Without it the engine runs one statement "
+    "in a read-only transaction.",
 )
 @pass_context
 def query(ctx: Context, database: str, query: str, engine: str, write: bool) -> None:
-    """Run one statement against a database, read-only unless told otherwise."""
+    """
+    Run one statement against a database, read-only unless told otherwise.
+
+    Read-only mode takes a single statement: an embedded ';' can close the
+    transaction the engine was asked to hold it in.
+    """
     _exit(_query(database, query, engine=engine, read_only=not write, logger=ctx.logger))
 
 

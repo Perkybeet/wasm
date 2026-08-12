@@ -18,7 +18,6 @@ functions, so the two paths cannot drift apart while the migration finishes.
 
 from __future__ import annotations
 
-import re
 from argparse import Namespace
 from collections.abc import Mapping
 from pathlib import Path
@@ -31,7 +30,7 @@ from wasm.core.config import REDACTED, Config, redact_secrets
 from wasm.core.exceptions import EnvConfigError, WASMError
 from wasm.core.logger import Logger
 from wasm.core.utils import domain_to_app_name
-from wasm.deployers.helpers.env_manager import EnvConfig, EnvManager
+from wasm.deployers.helpers.env_manager import EnvConfig, EnvManager, redact_url_credentials
 
 #: Historical spellings of the subcommand names. They are in scripts and in the
 #: published documentation, so dropping one is a breaking change.
@@ -41,11 +40,6 @@ ENV_ALIASES: dict[str, str] = {
     "list": "show",
     "ls": "show",
 }
-
-# A credential embedded in a connection string. DATABASE_URL is the canonical
-# example: neither redact_secrets nor EnvManager.SECRET_PATTERNS flags the name,
-# yet the value carries the database password in clear.
-_URL_CREDENTIALS = re.compile(r"(?P<prefix>[A-Za-z][A-Za-z0-9+.\-]*://[^:/?#@\s]+:)[^@\s]*@")
 
 
 class AliasedGroup(click.Group):
@@ -117,8 +111,10 @@ def _redact(values: Mapping[str, str]) -> dict[str, str]:
     Three classifiers are combined because each one misses what the others
     catch: :func:`~wasm.core.config.redact_secrets` splits the name into words,
     :data:`~wasm.deployers.helpers.env_manager.EnvManager.SECRET_PATTERNS`
-    matches substrings such as ``_PASS``, and the connection-string pattern
-    catches a password that only appears inside the value.
+    matches substrings such as ``_PASS``, and
+    :func:`~wasm.deployers.helpers.env_manager.redact_url_credentials` catches a
+    password that only appears inside the value, including the user-less
+    ``redis://:password@host`` form.
 
     The placeholder is fixed width, so the output never reveals the length of a
     secret nor whether one is set at all.
@@ -135,7 +131,7 @@ def _redact(values: Mapping[str, str]) -> dict[str, str]:
         if by_word.get(key) == REDACTED or _looks_secret(key):
             safe[key] = REDACTED
         else:
-            safe[key] = _URL_CREDENTIALS.sub(rf"\g<prefix>{REDACTED}@", value)
+            safe[key] = redact_url_credentials(value)
     return safe
 
 

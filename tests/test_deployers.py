@@ -13,17 +13,19 @@ leave a service, a site and three store rows behind.
 from __future__ import annotations
 
 import json
+import stat
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from wasm.core.exceptions import BuildError, DeploymentError
+from wasm.core.fs import SECRET_MODE, DryRunFileSystem, RecordingFileSystem
 from wasm.core.runner import FakeRunner
-from wasm.core.store import App, AppStatus, WASMStore
+from wasm.core.store import App, AppStatus, MonorepoWorkspace, WASMStore
 from wasm.deployers.auto import AutoDeployer
 from wasm.deployers.docker_compose import DockerComposeDeployer
-from wasm.deployers.interface import AppDeployer
+from wasm.deployers.interface import AppDeployer, UpdateResult
 from wasm.deployers.monorepo import MonorepoDeployer
 from wasm.deployers.nextjs import NextJSDeployer
 from wasm.deployers.nodejs import NodeJSDeployer
@@ -930,3 +932,443 @@ def test_failure_output_combines_both_streams() -> None:
 
     assert combined == "npm ERR!\nERESOLVE"
     assert failure_output(CommandResult(argv=("x",), exit_code=1)) == ""
+
+
+# ---------------------------------------------------------------------------
+# The filesystem seam
+#
+# --dry-run was only ever true for what a deployment *ran*. A rollback deletes
+# the application tree with shutil.rmtree and a monorepo writes an nginx config
+# and a .env full of database passwords, none of which goes near a subprocess,
+# so all of it happened during a rehearsal. These fix that.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def dry() -> DryRunFileSystem:
+    """
+    Provide a filesystem that records changes and makes none.
+
+    Returns:
+        The rehearsal filesystem.
+    """
+    return DryRunFileSystem()
+
+
+def test_remove_source_keeps_the_application_in_a_rehearsal(
+    tmp_path: Path, store: WASMStore, dry: DryRunFileSystem
+) -> None:
+    """The undo of a failed fetch is an rm -rf of a deployed application."""
+    deployer = NodeJSDeployer(fs=dry)
+    deployer.configure("app.example.com", "src", app_path=tmp_path / "app")
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "server.js").write_text("listen(3000)")
+
+    deployer.remove_source()
+
+    assert (tmp_path / "app" / "server.js").read_text() == "listen(3000)"
+    assert any("would delete directory" in change for change in dry.skipped)
+
+
+def test_a_rehearsed_failed_deployment_deletes_nothing(
+    tmp_path: Path, store: WASMStore, dry: DryRunFileSystem
+) -> None:
+    """The rollback of a redeployment must not take the running tree with it."""
+    deployer = build_deployer(NodeJSDeployer, tmp_path)
+    deployer._fs = dry
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    (app_dir / "package.json").write_text(PACKAGE_JSON)
+
+    deployer.fetch_source = lambda: True  # type: ignore[method-assign]
+    deployer.install_dependencies = lambda: True  # type: ignore[method-assign]
+    deployer.build = _raise(BuildError("build blew up"))  # type: ignore[method-assign]
+
+    with pytest.raises(BuildError):
+        deployer.deploy()
+
+    assert (app_dir / "package.json").read_text() == PACKAGE_JSON
+
+
+def test_nextjs_standalone_copies_no_assets_in_a_rehearsal(
+    tmp_path: Path, store: WASMStore, dry: DryRunFileSystem
+) -> None:
+    """post_build copies the static and public trees into .next/standalone."""
+    deployer = NextJSDeployer(fs=dry)
+    deployer.configure("app.example.com", "src", app_path=tmp_path)
+    (tmp_path / "next.config.js").write_text("module.exports = { output: 'standalone' }")
+    (tmp_path / ".next" / "standalone").mkdir(parents=True)
+    (tmp_path / ".next" / "static").mkdir(parents=True)
+    (tmp_path / "public").mkdir()
+
+    assert deployer.post_build() is True
+
+    assert deployer.is_standalone is True
+    assert not (tmp_path / ".next" / "standalone" / ".next").exists()
+    assert not (tmp_path / ".next" / "standalone" / "public").exists()
+    assert len(dry.skipped) == 2
+
+
+def test_nextjs_standalone_copies_assets_through_the_seam(tmp_path: Path, store: WASMStore) -> None:
+    """The rehearsal must not have disarmed the real copy."""
+    filesystem = RecordingFileSystem()
+    deployer = NextJSDeployer(fs=filesystem)
+    deployer.configure("app.example.com", "src", app_path=tmp_path)
+    (tmp_path / "next.config.js").write_text("module.exports = { output: 'standalone' }")
+    (tmp_path / ".next" / "standalone").mkdir(parents=True)
+    (tmp_path / ".next" / "static").mkdir(parents=True)
+    (tmp_path / ".next" / "static" / "app.css").write_text("body{}")
+
+    deployer.post_build()
+
+    assert (tmp_path / ".next" / "standalone" / ".next" / "static" / "app.css").exists()
+    assert ("copy_tree", tmp_path / ".next" / "static") in filesystem.changes
+
+
+def test_monorepo_env_file_is_not_written_in_a_rehearsal(
+    tmp_path: Path, store: WASMStore, dry: DryRunFileSystem
+) -> None:
+    """A .env holding a generated database password is a change like any other."""
+    deployer = MonorepoDeployer(fs=dry)
+    target = tmp_path / ".env.production"
+
+    deployer._write_env_file(target, {"DATABASE_URL": "postgresql://u:secret@localhost/db"})
+
+    assert not target.exists()
+    assert any("would write" in change for change in dry.skipped)
+
+
+def test_monorepo_env_file_is_written_owner_only(tmp_path: Path, store: WASMStore) -> None:
+    """It holds a database password, so nothing else on the box may read it."""
+    deployer = MonorepoDeployer(fs=RecordingFileSystem())
+    target = tmp_path / ".env.production"
+
+    deployer._write_env_file(target, {"DATABASE_URL": "postgresql://u:secret@localhost/db"})
+
+    assert target.read_text() == "DATABASE_URL=postgresql://u:secret@localhost/db\n"
+    assert stat.S_IMODE(target.stat().st_mode) == SECRET_MODE
+
+
+def test_monorepo_writes_no_nginx_configuration_in_a_rehearsal(
+    tmp_path: Path, store: WASMStore, dry: DryRunFileSystem
+) -> None:
+    """This one wrote straight into /etc/nginx and linked it into sites-enabled."""
+    deployer = MonorepoDeployer(fs=dry)
+    deployer.configure("example.com", "src", app_path=tmp_path / "app")
+    deployer.workspaces = [
+        MonorepoWorkspace(
+            name="web", path="apps/web", app_type="nextjs", subdomain="www", port=3000
+        )
+    ]
+
+    deployer._create_nginx_sites_inline(FakeWebServer(), with_ssl=False)
+
+    assert not Path("/etc/nginx/sites-available/example.com").exists()
+    assert not Path("/etc/nginx/sites-enabled/example.com").exists()
+    assert [change for change in dry.skipped if "would write" in change]
+    assert [change for change in dry.skipped if "would link" in change]
+
+
+def test_monorepo_rollback_keeps_the_files_in_a_rehearsal(
+    tmp_path: Path, store: WASMStore, dry: DryRunFileSystem
+) -> None:
+    """A rehearsed monorepo deployment that fails must delete nothing."""
+    deployer = MonorepoDeployer(fs=dry)
+    deployer.configure("example.com", "src", app_path=tmp_path / "app")
+    deployer.service_manager = FakeServiceManager()
+    deployer._webserver_manager = lambda: FakeWebServer()  # type: ignore[method-assign]
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "turbo.json").write_text("{}")
+
+    deployer._rollback()
+
+    assert (tmp_path / "app" / "turbo.json").read_text() == "{}"
+
+
+def test_docker_compose_rollback_keeps_the_files_in_a_rehearsal(
+    tmp_path: Path,
+    store: WASMStore,
+    dry: DryRunFileSystem,
+    runner: FakeRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The compose rollback removed the application directory outright."""
+    from wasm.deployers import docker_compose as compose_module
+
+    monkeypatch.setattr(compose_module, "ServiceManager", lambda **kw: FakeServiceManager())
+    monkeypatch.setattr(compose_module, "NginxManager", lambda **kw: FakeWebServer())
+
+    deployer = DockerComposeDeployer(runner=runner, fs=dry)
+    deployer.configure("app.example.com", "src", app_path=tmp_path / "app")
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "docker-compose.yml").write_text("services: {}\n")
+
+    deployer._rollback()
+
+    assert (tmp_path / "app" / "docker-compose.yml").exists()
+
+
+# ---------------------------------------------------------------------------
+# update(): one signature for every deployer
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "deployer_class",
+    [
+        NodeJSDeployer,
+        NextJSDeployer,
+        ViteDeployer,
+        PythonDeployer,
+        MonorepoDeployer,
+        DockerComposeDeployer,
+    ],
+)
+def test_update_has_the_signature_the_interface_declares(deployer_class: type) -> None:
+    """The CLI drives every deployer through one call; docker-compose did not."""
+    import inspect
+
+    signature = inspect.signature(deployer_class.update)
+
+    assert list(signature.parameters) == ["self", "on_step"]
+    assert signature.return_annotation in (UpdateResult, "UpdateResult")
+
+
+def test_monorepo_update_runs_the_same_steps_the_cli_used_to_drive(
+    tmp_path: Path, store: WASMStore, runner: FakeRunner
+) -> None:
+    """The CLI poked four private methods in order; that sequence lives here now."""
+    app_path = tmp_path / "app"
+    write_tree(app_path, TREES["monorepo"])
+
+    deployer = MonorepoDeployer(runner=runner)
+    deployer.configure("example.com", str(app_path), app_path=app_path)
+    steps: list[str] = []
+
+    result = deployer.update(on_step=steps.append)
+
+    assert result.package_manager == "pnpm"
+    assert result.is_static is False
+    assert "Installing dependencies" in steps
+    assert "Building applications" in steps
+    assert runner.ran("pnpm", "install", "--frozen-lockfile")
+    assert runner.ran("pnpm", "build")
+
+
+def test_monorepo_update_without_configure_is_a_clear_error(store: WASMStore) -> None:
+    """An unconfigured deployer says so instead of building in the cwd."""
+    with pytest.raises(DeploymentError, match="not configured"):
+        MonorepoDeployer().update()
+
+
+def test_docker_compose_update_rebuilds_and_recreates(
+    tmp_path: Path, store: WASMStore, runner: FakeRunner
+) -> None:
+    """It no longer pulls the source itself: whoever owns that step already did."""
+    app_path = tmp_path / "app"
+    app_path.mkdir()
+    (app_path / "docker-compose.yml").write_text("services:\n  web:\n    image: nginx\n")
+
+    deployer = DockerComposeDeployer(runner=runner)
+    deployer.configure("app.example.com", str(app_path), app_path=app_path)
+    steps: list[str] = []
+
+    result = deployer.update(on_step=steps.append)
+
+    assert result.is_static is True
+    assert steps == ["Rebuilding Docker images", "Recreating containers"]
+    assert runner.calls_to("git") == []
+    assert runner.ran(
+        "docker",
+        "compose",
+        "-f",
+        str(app_path / "docker-compose.yml"),
+        "up",
+        "-d",
+        "--remove-orphans",
+    )
+
+
+# ---------------------------------------------------------------------------
+# The guard that keeps them there
+# ---------------------------------------------------------------------------
+
+#: Calls that change the filesystem without going through wasm.core.fs.
+DIRECT_MUTATORS = frozenset(
+    {
+        "shutil.rmtree",
+        "shutil.move",
+        "shutil.copy",
+        "shutil.copy2",
+        "shutil.copyfile",
+        "shutil.copytree",
+        "shutil.copystat",
+        "shutil.chown",
+        "shutil.unpack_archive",
+        "os.remove",
+        "os.unlink",
+        "os.rmdir",
+        "os.removedirs",
+        "os.makedirs",
+        "os.mkdir",
+        "os.rename",
+        "os.renames",
+        "os.replace",
+        "os.symlink",
+        "os.link",
+        "os.chmod",
+        "os.chown",
+        "os.truncate",
+        "os.mknod",
+        "os.open",
+        "tempfile.mkdtemp",
+        "tempfile.mkstemp",
+        "tempfile.NamedTemporaryFile",
+        "tempfile.TemporaryDirectory",
+        # The wrappers in core.utils are the old bypass: they mutate too.
+        "write_file",
+        "copy_file",
+        "remove_directory",
+        "create_symlink",
+        "ensure_directory",
+        "set_permissions",
+    }
+)
+
+#: Path methods that change the filesystem. Also the names the seam itself
+#: uses, hence the receiver check.
+PATH_MUTATORS = frozenset(
+    {
+        "write_text",
+        "write_bytes",
+        "mkdir",
+        "unlink",
+        "rmdir",
+        "chmod",
+        "lchmod",
+        "symlink_to",
+        "hardlink_to",
+        "touch",
+        "rename",
+    }
+)
+
+#: Expressions that *are* the seam, so a mutating name on them is the point.
+SEAM_RECEIVERS = frozenset({"self.fs", "fs", "filesystem", "self._fs"})
+
+#: Modules owned by another part of this refactor, checked by its own tests.
+NOT_SCANNED = frozenset({"env_manager.py"})
+
+
+def _mutating_calls(path: Path) -> list[tuple[str, str, int]]:
+    """
+    Find every filesystem mutation in a module that skips the seam.
+
+    Args:
+        path: Python file to scan.
+
+    Returns:
+        Triples of (enclosing function, call as written, line number).
+    """
+    import ast
+
+    tree = ast.parse(path.read_text(), filename=str(path))
+    found: list[tuple[str, str, int]] = []
+    scope: list[str] = ["<module>"]
+
+    class Visitor(ast.NodeVisitor):
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            scope.append(node.name)
+            self.generic_visit(node)
+            scope.pop()
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            scope.append(node.name)
+            self.generic_visit(node)
+            scope.pop()
+
+        def visit_Call(self, node: ast.Call) -> None:
+            written = ast.unparse(node.func)
+            if written in DIRECT_MUTATORS:
+                found.append((scope[-1], written, node.lineno))
+            elif isinstance(node.func, ast.Attribute) and node.func.attr in PATH_MUTATORS:
+                if ast.unparse(node.func.value) not in SEAM_RECEIVERS:
+                    found.append((scope[-1], written, node.lineno))
+            elif (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "replace"
+                and len(node.args) == 1
+                and not node.keywords
+            ):
+                # Path.replace(target) takes one argument; the far more common
+                # str.replace(old, new) takes two, so arity tells them apart.
+                found.append((scope[-1], written, node.lineno))
+            elif isinstance(node.func, ast.Name) and node.func.id == "open":
+                modes = [
+                    a.value
+                    for a in [*node.args[1:], *(k.value for k in node.keywords)]
+                    if isinstance(a, ast.Constant) and isinstance(a.value, str)
+                ]
+                if any(set(mode) & set("wax+") for mode in modes):
+                    found.append((scope[-1], written, node.lineno))
+            self.generic_visit(node)
+
+    Visitor().visit(tree)
+    return found
+
+
+def test_no_deployer_mutates_the_filesystem_outside_the_seam() -> None:
+    """
+    The regression guard: every write, delete, chmod and link goes through core.fs.
+
+    This is what stops the next `shutil.rmtree` from quietly making --dry-run a
+    lie again. There are no exemptions here on purpose: unlike archive
+    extraction, everything a deployer writes is a whole file at a time.
+    """
+    import wasm.deployers
+
+    root = Path(wasm.deployers.__file__).parent
+    offenders = []
+
+    for module in sorted(root.rglob("*.py")):
+        if module.name in NOT_SCANNED:
+            continue
+        for function, call, line in _mutating_calls(module):
+            offenders.append(f"{module.relative_to(root)}:{line} {function}() calls {call}")
+
+    assert offenders == [], "Filesystem mutations outside wasm.core.fs:\n" + "\n".join(offenders)
+
+
+def test_monorepo_permissions_pass_keeps_the_env_files_owner_only(
+    tmp_path: Path, store: WASMStore, runner: FakeRunner
+) -> None:
+    """`chmod -R o+rX` over the tree also opened up the file with the password."""
+    deployer = MonorepoDeployer(runner=runner, fs=RecordingFileSystem())
+    deployer.configure("example.com", "src", app_path=tmp_path)
+    deployer.workspaces = [
+        MonorepoWorkspace(name="web", path="apps/web", subdomain="www", port=3000)
+    ]
+    workspace_env = tmp_path / "apps" / "web" / ".env.production"
+    workspace_env.parent.mkdir(parents=True)
+    workspace_env.write_text("DATABASE_URL=postgresql://u:secret@localhost/db\n")
+    workspace_env.chmod(0o644)
+
+    deployer._set_permissions()
+
+    assert stat.S_IMODE(workspace_env.stat().st_mode) == SECRET_MODE
+
+
+def test_monorepo_permissions_pass_changes_nothing_in_a_rehearsal(
+    tmp_path: Path, store: WASMStore, runner: FakeRunner, dry: DryRunFileSystem
+) -> None:
+    """Including the chmod, which is a change to this machine like any other."""
+    deployer = MonorepoDeployer(runner=runner, fs=dry)
+    deployer.configure("example.com", "src", app_path=tmp_path)
+    env_file = tmp_path / ".env"
+    env_file.write_text("DATABASE_URL=postgresql://u:secret@localhost/db\n")
+    env_file.chmod(0o644)
+
+    deployer._set_permissions()
+
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o644
+    assert any("would set" in change for change in dry.skipped)

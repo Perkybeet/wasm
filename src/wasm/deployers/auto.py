@@ -23,6 +23,7 @@ from typing import Any
 
 from wasm.core.config import Config
 from wasm.core.exceptions import DeploymentError
+from wasm.core.fs import FileSystem
 from wasm.core.logger import Logger
 from wasm.core.utils import domain_to_app_name
 from wasm.deployers.interface import AppDeployer
@@ -53,12 +54,16 @@ class AutoDeployer(AppDeployer):
     #: trees that at least look like source.
     FALLBACK_TYPE = "nodejs"
 
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, fs: FileSystem | None = None):
         """
         Args:
             verbose: Enable verbose logging.
+            fs: Filesystem every change goes through. Passed on to the source
+                manager and to the deployer this one delegates to, so a
+                rehearsal stays a rehearsal across the hand-off.
         """
         self.verbose = verbose
+        self._fs = fs
         self.logger = Logger(verbose=verbose)
         self.config = Config()
         self._source_manager: SourceManager | None = None
@@ -77,7 +82,7 @@ class AutoDeployer(AppDeployer):
     def source_manager(self) -> SourceManager:
         """The manager that fetches source code, built on first use."""
         if self._source_manager is None:
-            self._source_manager = SourceManager(verbose=self.verbose)
+            self._source_manager = SourceManager(verbose=self.verbose, fs=self._fs)
         return self._source_manager
 
     @source_manager.setter
@@ -190,7 +195,7 @@ class AutoDeployer(AppDeployer):
         if deployer_class is None:  # pragma: no cover - registry is populated above
             raise DeploymentError(f"Detected unknown application type: {app_type}")
 
-        delegate = deployer_class(verbose=self.verbose)
+        delegate = deployer_class(verbose=self.verbose, fs=self._fs)
         delegate.configure(self.domain, self.source, **self._options)
         # The code is already on disk; re-fetching would clean the directory and
         # clone it a second time.

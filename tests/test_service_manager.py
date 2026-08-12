@@ -11,16 +11,27 @@ root-owned file write.
 The rule the whole file asserts: a unit is WASM's only when systemd loads it
 from the directory WASM manages, it carries a WASM signal (prefix, store record
 or marker) and it does not shadow a unit shipped by the distribution.
+
+The second rule, added with the filesystem seam: a rehearsal writes nothing and
+deletes nothing. ``--dry-run`` used to be honest only about what WASM executes,
+so a rehearsed ``service delete`` announced that no changes would be made and
+then unlinked the unit file, because a deletion is a ``Path.unlink`` and never
+goes near a subprocess. The ``DryRunFileSystem`` tests below assert the file is
+still there afterwards, and :func:`test_managers_have_no_direct_filesystem_calls`
+walks the AST of every manager in this area so the bypass cannot come back one
+convenient ``write_text`` at a time.
 """
 
 from __future__ import annotations
 
+import ast
 import os
 from pathlib import Path
 
 import pytest
 
 from wasm.core.exceptions import SecurityError, ServiceError, ValidationError
+from wasm.core.fs import DryRunFileSystem, set_fs
 from wasm.core.runner import FakeRunner
 from wasm.core.store import Service
 from wasm.managers.service_manager import WASM_UNIT_MARKER, ServiceManager
@@ -129,6 +140,39 @@ def manager(runner: FakeRunner, store: FakeStore, unit_dirs: dict[str, Path]) ->
         The manager under test.
     """
     return ServiceManager()
+
+
+@pytest.fixture
+def dry_fs() -> DryRunFileSystem:
+    """
+    A filesystem that refuses every change and records what it refused.
+
+    Returns:
+        The rehearsal filesystem.
+    """
+    return DryRunFileSystem()
+
+
+@pytest.fixture
+def rehearsal(
+    runner: FakeRunner,
+    store: FakeStore,
+    unit_dirs: dict[str, Path],
+    dry_fs: DryRunFileSystem,
+) -> ServiceManager:
+    """
+    A manager wired to a filesystem that refuses to change anything.
+
+    Args:
+        runner: The fake command runner installed process-wide.
+        store: The in-memory store.
+        unit_dirs: The temporary unit directories.
+        dry_fs: The rehearsal filesystem.
+
+    Returns:
+        The manager under test, as ``wasm --dry-run`` builds it.
+    """
+    return ServiceManager(fs=dry_fs)
 
 
 @pytest.fixture
@@ -640,3 +684,246 @@ def test_list_services_query_is_scoped(manager: ServiceManager, runner: FakeRunn
     argv = next(call for call in runner.calls if call[:2] == ("systemctl", "list-units"))
     assert "*" not in argv
     assert "wasm-*" in argv
+
+
+# ---------------------------------------------------------------------------
+# A rehearsal writes nothing and deletes nothing
+# ---------------------------------------------------------------------------
+
+
+def test_create_under_dry_run_installs_no_unit_file(
+    rehearsal: ServiceManager, dry_fs: DryRunFileSystem, unit_dirs: dict[str, Path]
+) -> None:
+    """A rehearsed create must leave the unit directory exactly as it found it."""
+    rehearsal.create_service(name="example", command="/usr/bin/true", working_directory="/srv")
+
+    assert list(unit_dirs["managed"].iterdir()) == []
+    assert any("example.service" in skipped for skipped in dry_fs.skipped)
+
+
+def test_create_from_unit_under_dry_run_installs_no_unit_file(
+    rehearsal: ServiceManager, unit_dirs: dict[str, Path]
+) -> None:
+    """The hand-written-unit path writes through the same seam as the rest."""
+    rehearsal.create_from_unit("example", f"# {WASM_UNIT_MARKER}\n[Service]\nExecStart=/bin/true\n")
+
+    assert list(unit_dirs["managed"].iterdir()) == []
+
+
+def test_delete_under_dry_run_keeps_the_unit_file(
+    rehearsal: ServiceManager, dry_fs: DryRunFileSystem, unit_dirs: dict[str, Path]
+) -> None:
+    """This is the defect the seam exists for: the rehearsal used to delete it."""
+    unit = owned_unit(unit_dirs)
+    before = unit.read_text()
+
+    rehearsal.delete_service("wasm-example")
+
+    assert unit.exists()
+    assert unit.read_text() == before
+    assert any(str(unit) in skipped for skipped in dry_fs.skipped)
+
+
+def test_update_config_under_dry_run_keeps_the_previous_body(
+    rehearsal: ServiceManager, unit_dirs: dict[str, Path]
+) -> None:
+    """A rehearsed rewrite still reports what it would have replaced."""
+    unit = owned_unit(unit_dirs)
+    before = unit.read_text()
+
+    previous = rehearsal.update_config(
+        "wasm-example", f"# {WASM_UNIT_MARKER}\n[Service]\nExecStart=/bin/false\n"
+    )
+
+    assert previous == before
+    assert unit.read_text() == before
+
+
+def test_dry_run_leaves_no_temporary_file_behind(
+    rehearsal: ServiceManager, unit_dirs: dict[str, Path]
+) -> None:
+    """An atomic write that stages a sibling must not stage it either."""
+    rehearsal.create_service(name="example", command="/usr/bin/true", working_directory="/srv")
+    rehearsal.delete_service("wasm-never-created")
+
+    assert list(unit_dirs["managed"].rglob("*")) == []
+
+
+def test_the_process_wide_filesystem_is_honoured_without_injection(
+    runner: FakeRunner, store: FakeStore, unit_dirs: dict[str, Path]
+) -> None:
+    """
+    ``wasm --dry-run`` installs the rehearsal filesystem globally, not per call.
+
+    A manager built the ordinary way - which is how every CLI command builds it -
+    has to pick that up, or the flag is only honest for the call sites that
+    remembered to pass it.
+    """
+    unit = owned_unit(unit_dirs)
+    dry = DryRunFileSystem()
+    set_fs(dry)
+    try:
+        ServiceManager().delete_service("wasm-example")
+    finally:
+        set_fs(None)
+
+    assert unit.exists()
+    assert dry.skipped
+
+
+# ---------------------------------------------------------------------------
+# The seam cannot be bypassed by a future edit
+# ---------------------------------------------------------------------------
+
+#: Every manager in this area. These write systemd units and web server
+#: configuration into /etc, so they are the ones a lying rehearsal hurts most.
+MANAGER_SOURCES = (
+    "src/wasm/managers/base_manager.py",
+    "src/wasm/managers/service_manager.py",
+    "src/wasm/managers/webserver.py",
+    "src/wasm/managers/nginx_manager.py",
+    "src/wasm/managers/apache_manager.py",
+    "src/wasm/managers/cert_manager.py",
+)
+
+#: Names that change the filesystem whatever they are called on. ``Path`` and
+#: ``os`` are the only things in the language that answer to these, so matching
+#: on the name alone produces no false positives and survives an alias such as
+#: ``from shutil import rmtree``.
+ANY_RECEIVER_MUTATORS = frozenset(
+    {
+        "write_text",
+        "write_bytes",
+        "mkdir",
+        "makedirs",
+        "rmdir",
+        "removedirs",
+        "rmtree",
+        "unlink",
+        "symlink",
+        "symlink_to",
+        "hardlink_to",
+        "link_to",
+        "touch",
+        "chmod",
+        "chown",
+        "rename",
+        "truncate",
+        "fdopen",
+        "mkstemp",
+        "mkdtemp",
+        "mkfifo",
+        "mknod",
+        "NamedTemporaryFile",
+        "TemporaryFile",
+        "TemporaryDirectory",
+        "SpooledTemporaryFile",
+    }
+)
+
+#: Names that are only a mutation when they are called on one of these modules.
+#: ``list.remove`` and ``dict.copy`` are not filesystem changes.
+MODULE_MUTATORS = {
+    "os": frozenset({"remove", "replace", "link", "utime", "lchown", "renames"}),
+    "shutil": frozenset(
+        {
+            "move",
+            "copy",
+            "copy2",
+            "copyfile",
+            "copytree",
+            "copystat",
+            "copymode",
+            "chown",
+            "unpack_archive",
+            "make_archive",
+        }
+    ),
+}
+
+#: The seam itself. A call on one of these is the sanctioned way to mutate.
+SEAM_RECEIVERS = frozenset({"self.fs", "self._fs", "fs", "filesystem", "self.filesystem"})
+
+
+def _opens_for_writing(node: ast.Call, *, position: int) -> bool:
+    """
+    Report whether an ``open()`` call asks for a writable handle.
+
+    Args:
+        node: The call node.
+        position: Index of the mode argument, which differs between the builtin
+            ``open(path, mode)`` and ``Path.open(mode)``.
+
+    Returns:
+        True when a mode argument carries a writing flag. An unreadable mode -
+        a variable rather than a literal - counts as writing, because a guard
+        that gives up on the hard case is not a guard.
+    """
+    mode: ast.expr | None = node.args[position] if len(node.args) > position else None
+    for keyword in node.keywords:
+        if keyword.arg == "mode":
+            mode = keyword.value
+    if mode is None:
+        return False
+    if isinstance(mode, ast.Constant) and isinstance(mode.value, str):
+        return any(flag in mode.value for flag in "wax+")
+    return True
+
+
+def _direct_mutations(source: str) -> list[str]:
+    """
+    Find every filesystem mutation in a module that bypasses the seam.
+
+    Args:
+        source: Module source code.
+
+    Returns:
+        One ``line: expression`` entry per offending call.
+    """
+    offenders: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+
+        if isinstance(node.func, ast.Attribute):
+            name, receiver, bound = node.func.attr, ast.unparse(node.func.value), True
+        elif isinstance(node.func, ast.Name):
+            name, receiver, bound = node.func.id, "", False
+        else:
+            continue
+
+        if receiver in SEAM_RECEIVERS:
+            continue
+
+        module = receiver.rsplit(".", 1)[-1]
+        mutates = name in ANY_RECEIVER_MUTATORS or name in MODULE_MUTATORS.get(module, frozenset())
+        if name == "open":
+            # Path.open takes the mode first; the builtin takes the path first.
+            mutates = _opens_for_writing(node, position=0 if bound else 1)
+        elif name == "replace":
+            # str.replace always takes two arguments, Path.replace exactly one,
+            # so arity separates a text substitution from an atomic rename.
+            mutates = module == "os" or (len(node.args) == 1 and not node.keywords)
+
+        if mutates:
+            offenders.append(f"line {node.lineno}: {ast.unparse(node.func)}(...)")
+    return offenders
+
+
+@pytest.mark.parametrize("relative", MANAGER_SOURCES)
+def test_managers_have_no_direct_filesystem_calls(relative: str) -> None:
+    """
+    Nothing in these modules may change a file except through ``self.fs``.
+
+    This is the test that stops the defect returning. Routing the writes once is
+    easy; keeping them routed while six people edit six managers is what needs
+    an assertion, because a single ``path.unlink()`` added in a hurry makes
+    ``--dry-run`` lie again and nothing else in the suite would notice.
+    """
+    path = Path(__file__).resolve().parents[1] / relative
+    offenders = _direct_mutations(path.read_text(encoding="utf-8"))
+
+    assert offenders == [], (
+        f"{relative} changes the filesystem without going through wasm.core.fs: "
+        + "; ".join(offenders)
+    )

@@ -8,10 +8,10 @@ Global configuration management for WASM.
 The configuration file holds credentials (MySQL root password, SMTP account,
 OpenAI API key), so this module owns four security guarantees:
 
-* every file it writes is created with :data:`SECRET_FILE_MODE` via ``os.open``,
-  never with a ``chmod`` afterwards, which would leave a window where the
-  secrets are world readable, and with ``O_NOFOLLOW``, so a symlink planted in
-  the destination directory cannot redirect the write,
+* every file it writes is created with :data:`SECRET_FILE_MODE` at ``open``
+  time, never with a ``chmod`` afterwards, which would leave a window where the
+  secrets are world readable, and a symlink planted in the destination
+  directory cannot redirect the write,
 * every directory it creates on the way there gets :data:`SECRET_DIR_MODE`, not
   just the last one,
 * the in-memory configuration is isolated from :data:`DEFAULT_CONFIG`; defaults
@@ -24,26 +24,34 @@ OpenAI API key), so this module owns four security guarantees:
 This is the only writer of ``config.yaml``. The web API and the CLI both go
 through :class:`Config`; a second writer is how the hardening was lost once
 already.
+
+Every change to the filesystem goes through :mod:`wasm.core.fs`. Nothing here
+calls ``mkdir``, ``chmod`` or ``open`` for writing directly, because a
+``--dry-run`` that writes half of ``/etc/wasm/config.yaml`` is worse than no
+rehearsal at all: the operator has already been told nothing would change.
 """
 
+from __future__ import annotations
+
 import copy
-import errno
 import logging
 import os
 import re
 import stat
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import yaml  # type: ignore[import-untyped]
 
 from wasm.core.exceptions import SecurityError
+from wasm.core.fs import SECRET_DIR_MODE, SECRET_MODE, FileSystem, get_fs
 
 logger = logging.getLogger(__name__)
 
-# Files holding secrets are owner-only; the directories that contain them too.
-SECRET_FILE_MODE = 0o600
-SECRET_DIR_MODE = 0o700
+#: Files holding secrets are owner-only. The value lives in :mod:`wasm.core.fs`
+#: so the seam and the callers that ask it for a mode cannot drift apart; the
+#: name is kept because the rest of the codebase imports it from here.
+SECRET_FILE_MODE = SECRET_MODE
 
 # Default paths
 DEFAULT_CONFIG_PATH = Path("/etc/wasm/config.yaml")
@@ -348,51 +356,52 @@ def _strip_removed_under(prefix: str, value: Any) -> Any:
     return value
 
 
-def secure_directory(path: Path) -> None:
+def secure_directory(path: Path, fs: FileSystem | None = None) -> None:
     """
     Create a directory that may hold secrets and enforce owner-only access.
 
     Every level that is missing is created with :data:`SECRET_DIR_MODE`;
     ``mkdir(parents=True)`` applies the mode to the last level only and leaves
-    the intermediate ones at ``0777 & ~umask``. Directories that already exist
-    are left alone, except the leaf, which is tightened when it belongs to the
-    current user and is not a shared directory (sticky bit): tightening ``/tmp``
-    or another shared location would break the system for everyone else, and the
-    0600 mode of the files inside already protects their content. A chmod that is
-    refused is logged, not raised, because the payload write must still go
-    through.
+    the intermediate ones at ``0777 & ~umask``, which is exactly what
+    :meth:`~wasm.core.fs.FileSystem.make_dir` exists to avoid. Directories that
+    already exist are left alone, except the leaf, which is tightened when it
+    belongs to the current user and is not a shared directory (sticky bit):
+    tightening ``/tmp`` or another shared location would break the system for
+    everyone else, and the 0600 mode of the files inside already protects their
+    content. A chmod that is refused is logged, not raised, because the payload
+    write must still go through.
 
     Args:
         path: Directory to create or tighten.
+        fs: Filesystem to change. Defaults to the process-wide one, which is
+            what makes ``--dry-run`` leave the machine untouched.
 
     Raises:
         OSError: If the directory cannot be created.
     """
-    missing: list[Path] = []
-    node = path
-    while not node.exists():
-        missing.append(node)
-        if node.parent == node:
-            break
-        node = node.parent
+    filesystem = fs or get_fs()
+    try:
+        filesystem.make_dir(path, mode=SECRET_DIR_MODE, parents=True)
+    except FileExistsError:
+        # Another process won the race between the existence check and the
+        # mkdir; its mode is not ours to change.
+        pass
 
-    for directory in reversed(missing):
-        try:
-            directory.mkdir(mode=SECRET_DIR_MODE)
-        except FileExistsError:
-            # Another process won the race; its mode is not ours to change.
-            continue
+    if not path.exists():
+        # A rehearsal refused to create it. There is nothing to inspect and
+        # nothing to tighten, and stat() here would raise.
+        return
 
     info = path.stat()
     is_shared = bool(info.st_mode & stat.S_ISVTX)
     if info.st_mode & 0o077 and not is_shared and info.st_uid == os.geteuid():
         try:
-            path.chmod(SECRET_DIR_MODE)
+            filesystem.chmod(path, SECRET_DIR_MODE)
         except OSError as exc:
             logger.warning("Could not restrict permissions on %s: %s", path, exc)
 
 
-def restrict_file(path: Path) -> None:
+def restrict_file(path: Path, fs: FileSystem | None = None) -> None:
     """
     Tighten an existing file that holds secrets to owner-only access.
 
@@ -405,6 +414,7 @@ def restrict_file(path: Path) -> None:
 
     Args:
         path: File to tighten.
+        fs: Filesystem to change. Defaults to the process-wide one.
     """
     try:
         info = os.lstat(path)
@@ -418,20 +428,57 @@ def restrict_file(path: Path) -> None:
     if not info.st_mode & 0o077:
         return
 
+    filesystem = fs or get_fs()
     try:
-        os.chmod(path, SECRET_FILE_MODE)
+        filesystem.chmod(path, SECRET_FILE_MODE)
     except OSError as exc:
         logger.warning("Could not restrict permissions on %s: %s", path, exc)
 
 
-def secure_write(path: Path, content: str, secure_parent: bool = True) -> None:
+def _refuse_symlink(path: Path) -> None:
+    """
+    Stop before writing secrets to a path someone replaced with a link.
+
+    The write itself lands on a fresh file that is renamed over ``path``, so a
+    link could not redirect the content anyway; refusing loudly is still the
+    right answer, because a symlink where WASM expects its own file means
+    somebody is trying something and silently unlinking their link would hide
+    it.
+
+    Args:
+        path: Destination about to be written.
+
+    Raises:
+        SecurityError: If ``path`` is a symlink, dangling ones included.
+    """
+    if path.is_symlink():
+        raise SecurityError(
+            f"Refusing to write secrets through the symlink {path}",
+            details=(
+                "Something replaced the file with a symbolic link, which would "
+                "redirect the write. Inspect the directory, remove the link and "
+                "retry."
+            ),
+        )
+
+
+def secure_write(
+    path: Path,
+    content: str,
+    secure_parent: bool = True,
+    fs: FileSystem | None = None,
+) -> None:
     """
     Write a file that holds secrets, owner-readable only.
 
-    The file is created through ``os.open`` with the restrictive mode already
-    applied, so it is never briefly world readable, and with ``O_NOFOLLOW``, so
-    a symlink at ``path`` is refused instead of followed. An existing regular
-    file with a lax mode is tightened before its new content is written.
+    The write goes through :meth:`~wasm.core.fs.FileSystem.write_text`, which
+    creates a temporary file with :data:`SECRET_FILE_MODE` already applied and
+    renames it over the destination. That buys three things at once: the file is
+    never briefly world readable, a reader never sees a half-written config, and
+    the rename cannot follow a symlink planted at ``path``. Such a link is
+    refused before anything is written, and an existing regular file with a lax
+    mode is tightened as well, so a failure in between cannot leave the old
+    secrets exposed.
 
     Args:
         path: Destination file.
@@ -439,33 +486,22 @@ def secure_write(path: Path, content: str, secure_parent: bool = True) -> None:
         secure_parent: Whether the parent directory must be private too. Pass
             False for files that live inside a tree served to other accounts,
             such as an application's ``.env``.
+        fs: Filesystem to change. Defaults to the process-wide one, which is
+            what makes ``--dry-run`` leave the machine untouched.
 
     Raises:
         SecurityError: If ``path`` is a symlink.
         OSError: If the file cannot be created or written.
     """
+    filesystem = fs or get_fs()
     if secure_parent:
-        secure_directory(path.parent)
+        secure_directory(path.parent, fs=filesystem)
     else:
-        path.parent.mkdir(parents=True, exist_ok=True)
-    restrict_file(path)
+        filesystem.make_dir(path.parent, parents=True)
 
-    try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, SECRET_FILE_MODE)
-    except OSError as exc:
-        if exc.errno == errno.ELOOP:
-            raise SecurityError(
-                f"Refusing to write secrets through the symlink {path}",
-                details=(
-                    "Something replaced the file with a symbolic link, which would "
-                    "redirect the write. Inspect the directory, remove the link and "
-                    "retry."
-                ),
-            ) from exc
-        raise
-
-    with os.fdopen(fd, "w") as handle:
-        handle.write(content)
+    _refuse_symlink(path)
+    restrict_file(path, fs=filesystem)
+    filesystem.write_text(path, content, mode=SECRET_FILE_MODE)
 
 
 def _strip_removed_keys(config: dict[str, Any]) -> dict[str, Any]:
@@ -500,15 +536,40 @@ class Config:
     the global config file and environment variables.
     """
 
-    _instance: Optional["Config"] = None
+    _instance: Config | None = None
     _config: dict[str, Any] = {}
+    _fs: FileSystem | None = None
 
-    def __new__(cls) -> "Config":
-        """Singleton pattern to ensure single config instance."""
+    def __new__(cls, fs: FileSystem | None = None) -> Config:
+        """
+        Return the single configuration instance, building it on first use.
+
+        Args:
+            fs: Filesystem this instance writes through. Defaults to the
+                process-wide one, which is what makes ``--dry-run`` honest.
+                Passing one on a later call re-points the existing instance,
+                because the singleton is what every caller shares.
+
+        Returns:
+            The configuration instance.
+        """
         if cls._instance is None:
             cls._instance = super().__new__(cls)
+            cls._instance._fs = fs
             cls._instance._load_config()
+        elif fs is not None:
+            cls._instance._fs = fs
         return cls._instance
+
+    @property
+    def fs(self) -> FileSystem:
+        """
+        The filesystem every write of this configuration goes through.
+
+        Returns:
+            The injected filesystem, or the process-wide one.
+        """
+        return self._fs or get_fs()
 
     def _load_config(self) -> None:
         """
@@ -694,6 +755,7 @@ class Config:
         """
         cls._instance = None
         cls._config = {}
+        cls._fs = None
 
     @property
     def service_user(self) -> str:
@@ -731,7 +793,7 @@ class Config:
             yaml.YAMLError: If the configuration cannot be serialised.
         """
         save_path = path or DEFAULT_CONFIG_PATH
-        secure_write(save_path, yaml.dump(self._config, default_flow_style=False))
+        secure_write(save_path, yaml.dump(self._config, default_flow_style=False), fs=self.fs)
         return save_path
 
     def save(self, path: Path | None = None) -> bool:
@@ -806,6 +868,7 @@ class Config:
                 secure_write(
                     config_path,
                     yaml.dump(merged_config, default_flow_style=False, sort_keys=False),
+                    fs=self.fs,
                 )
 
                 # Reload to use new config

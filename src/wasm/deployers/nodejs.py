@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import ClassVar
 
+from wasm.core.fs import FileSystem
 from wasm.core.runner import CommandRunner
 from wasm.deployers.base import BaseDeployer
 from wasm.deployers.registry import DeployerRegistry
@@ -31,7 +32,12 @@ class NodeJSDeployer(BaseDeployer):
 
     SYSTEM_DEPS: ClassVar[list[str]] = ["node", "npm"]
 
-    def __init__(self, verbose: bool = False, runner: CommandRunner | None = None):
+    def __init__(
+        self,
+        verbose: bool = False,
+        runner: CommandRunner | None = None,
+        fs: FileSystem | None = None,
+    ):
         """
         Initialize the Node.js deployer.
 
@@ -39,8 +45,10 @@ class NodeJSDeployer(BaseDeployer):
             verbose: Enable verbose logging.
             runner: Command runner used for installs and builds. Defaults to the
                 process-wide runner.
+            fs: Filesystem every change goes through. Defaults to the
+                process-wide one.
         """
-        super().__init__(verbose=verbose, runner=runner)
+        super().__init__(verbose=verbose, runner=runner, fs=fs)
         self.package_manager = "npm"
         self.start_script = "start"
         self.has_build = False

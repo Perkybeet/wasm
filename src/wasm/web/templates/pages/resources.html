@@ -22,7 +22,8 @@
 {% if rows %}
   <div class="rows">
     {% for item in rows %}
-      {% call m.row(item.domain, item.state, item.meta, item.href, "row-" ~ item.id) %}
+      {% call m.row(item.domain, item.state, item.meta, item.href, "row-" ~ item.id,
+                    none, item.state_text) %}
         {% if item.log_url %}
           {{ m.follow_button("Logs", item.domain, item.log_url) }}
         {% endif %}

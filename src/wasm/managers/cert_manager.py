@@ -32,7 +32,6 @@ cheap and safe:
 
 from __future__ import annotations
 
-import os
 import re
 import sqlite3
 from collections.abc import Sequence
@@ -41,6 +40,7 @@ from pathlib import Path
 from typing import Any, Literal, overload
 
 from wasm.core.exceptions import CertificateError, WASMError
+from wasm.core.fs import FileSystem
 from wasm.core.runner import DEFAULT_TIMEOUT, CommandResult, CommandRunner
 from wasm.core.store import WASMStore, get_store
 from wasm.managers.base_manager import BaseManager, MappingRecord
@@ -56,6 +56,10 @@ DEFAULT_WEBROOT = Path("/var/www/html")
 #: Cron fallback for systems whose certbot package ships no systemd timer.
 _CRON_FILE = Path("/etc/cron.d/certbot-renew")
 _CRON_LINE = "0 0,12 * * * root certbot renew -q\n"
+
+#: cron refuses to run a file in ``/etc/cron.d`` that is group or world
+#: writable, and the line holds no secret, so it is the usual 0644.
+_CRON_MODE = 0o644
 
 #: Fields of :class:`CertificateInfo` that hold text, used to type the mapping
 #: accessor the CLI and the health check still read certificates through.
@@ -165,7 +169,12 @@ class CertManager(BaseManager):
     LETSENCRYPT_DIR = Path("/etc/letsencrypt")
     LIVE_DIR = LETSENCRYPT_DIR / "live"
 
-    def __init__(self, verbose: bool = False, runner: CommandRunner | None = None) -> None:
+    def __init__(
+        self,
+        verbose: bool = False,
+        runner: CommandRunner | None = None,
+        fs: FileSystem | None = None,
+    ) -> None:
         """
         Initialize the certificate manager.
 
@@ -173,8 +182,10 @@ class CertManager(BaseManager):
             verbose: Enable verbose logging.
             runner: Command runner to execute certbot with. Defaults to the
                 process-wide runner.
+            fs: Filesystem to write the renewal cron entry through. Defaults to
+                the process-wide one.
         """
-        super().__init__(verbose=verbose, runner=runner)
+        super().__init__(verbose=verbose, runner=runner, fs=fs)
         self._plugin_available: dict[str, bool] = {}
 
     @property
@@ -903,9 +914,8 @@ class CertManager(BaseManager):
             return True
 
         try:
-            _CRON_FILE.parent.mkdir(parents=True, exist_ok=True)
-            _CRON_FILE.write_text(_CRON_LINE)
-            os.chmod(_CRON_FILE, 0o644)
+            self.fs.make_dir(_CRON_FILE.parent)
+            self.fs.write_text(_CRON_FILE, _CRON_LINE, mode=_CRON_MODE)
         except OSError as exc:
             self.logger.error(f"Could not install the renewal cron entry: {exc}")
             return False

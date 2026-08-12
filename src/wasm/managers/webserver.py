@@ -20,9 +20,12 @@ That set is :class:`WebServerBackend`. Everything else is
 :class:`WebServerManager`, and both concrete managers are thin subclasses of it,
 so the contract is the same by construction rather than by convention.
 
-Three rules the old code broke and this one keeps:
+Four rules the old code broke and this one keeps:
 
 - **Every operation goes through the runner.** Argv, timeout, no shell.
+- **Every change to disk goes through the filesystem seam.** Writing a vhost,
+  linking it into ``sites-enabled`` and deleting it again are the three things
+  ``--dry-run`` most needs to be honest about, and none of them is a subprocess.
 - **Nothing crosses a boundary as a dict with magic keys.** ``get_status`` and
   ``list_sites`` return records whose field names are part of a type.
 - **A domain is validated before it becomes a path.** WASM runs as root, so a
@@ -31,7 +34,6 @@ Three rules the old code broke and this one keeps:
 
 from __future__ import annotations
 
-import os
 import re
 import sqlite3
 from collections.abc import Mapping
@@ -57,6 +59,7 @@ from wasm.core.exceptions import (
     TemplateError,
     WASMError,
 )
+from wasm.core.fs import FileSystem
 from wasm.core.runner import CommandRunner
 from wasm.core.store import Site, WASMStore, WebServer, get_store
 from wasm.managers.base_manager import BaseManager, MappingRecord
@@ -234,6 +237,7 @@ class WebServerManager(BaseManager):
         backend: WebServerBackend,
         verbose: bool = False,
         runner: CommandRunner | None = None,
+        fs: FileSystem | None = None,
     ) -> None:
         """
         Initialize the manager.
@@ -243,8 +247,10 @@ class WebServerManager(BaseManager):
             verbose: Enable verbose logging.
             runner: Command runner to execute with. Defaults to the process-wide
                 one.
+            fs: Filesystem to write configurations and symlinks through.
+                Defaults to the process-wide one.
         """
-        super().__init__(verbose=verbose, runner=runner)
+        super().__init__(verbose=verbose, runner=runner, fs=fs)
         self.backend = backend
 
     # -- Wiring ------------------------------------------------------------
@@ -754,13 +760,10 @@ class WebServerManager(BaseManager):
         content = self.render_config(domain, template, ctx)
 
         try:
-            config_path.parent.mkdir(parents=True, exist_ok=True)
-            # Written to a sibling and renamed so a reload racing this call sees
-            # either the old file or the new one, never half of one.
-            staging = config_path.with_name(f".{config_path.name}.wasm-new")
-            staging.write_text(content)
-            staging.chmod(_CONFIG_MODE)
-            os.replace(staging, config_path)
+            # The seam writes through a sibling and renames, so a reload racing
+            # this call sees either the old file or the new one, never half of
+            # one - and a rehearsal writes neither, including the sibling.
+            self.fs.write_text(config_path, content, mode=_CONFIG_MODE)
         except OSError as exc:
             raise self.backend.error(
                 f"Failed to write configuration: {config_path}",
@@ -851,8 +854,8 @@ class WebServerManager(BaseManager):
         program = self.backend.enable_site_program
         if program is None:
             try:
-                link.parent.mkdir(parents=True, exist_ok=True)
-                link.symlink_to(self.config_path(domain))
+                self.fs.make_dir(link.parent)
+                self.fs.symlink(self.config_path(domain), link)
             except OSError as exc:
                 raise self.backend.error(
                     f"Failed to enable site: {domain}",
@@ -892,7 +895,7 @@ class WebServerManager(BaseManager):
         program = self.backend.disable_site_program
         if program is None:
             try:
-                link.unlink(missing_ok=True)
+                self.fs.remove(link, missing_ok=True)
             except OSError as exc:
                 raise self.backend.error(
                     f"Failed to disable site: {domain}",
@@ -945,7 +948,7 @@ class WebServerManager(BaseManager):
 
         config_path = self.config_path(domain)
         try:
-            config_path.unlink(missing_ok=True)
+            self.fs.remove(config_path, missing_ok=True)
         except OSError as exc:
             raise self.backend.error(
                 f"Failed to delete site: {domain}",

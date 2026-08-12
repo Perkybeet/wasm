@@ -10,11 +10,21 @@ Provides a centralized store for all WASM-managed resources:
 - Sites (Nginx/Apache configurations)
 - Services (systemd services)
 - Databases (MySQL, PostgreSQL, Redis, MongoDB)
+
+The rows hold credentials: ``apps.env_vars`` and ``services.environment`` carry
+DATABASE_URL, API keys and generated secrets. So the database file is 0600
+inside a 0700 directory, and both are created through
+:mod:`wasm.core.fs` rather than by SQLite: SQLite creates the file with the
+process umask, which is how a store full of passwords ends up world readable,
+and a creation that does not go through the seam is a creation ``--dry-run``
+cannot stop.
 """
 
 import json
+import logging
 import os
 import sqlite3
+import stat
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -23,12 +33,20 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import quote
 
-from wasm.core.config import SECRET_FILE_MODE, restrict_file, secure_directory
+from wasm.core.exceptions import WASMError
+from wasm.core.fs import SECRET_DIR_MODE, SECRET_MODE, FileSystem, get_fs
+
+logger = logging.getLogger(__name__)
 
 # Database location
 DEFAULT_DB_PATH = Path("/var/lib/wasm/wasm.db")
 USER_DB_PATH = Path.home() / ".local/share/wasm/wasm.db"
+
+
+class StoreError(WASMError):
+    """Raised when the store cannot be opened or created."""
 
 
 class AppType(str, Enum):
@@ -371,7 +389,7 @@ class WASMStore:
     _instance: Optional["WASMStore"] = None
     _lock = threading.Lock()
 
-    def __new__(cls, db_path: Path | None = None) -> "WASMStore":
+    def __new__(cls, db_path: Path | None = None, fs: FileSystem | None = None) -> "WASMStore":
         """Singleton pattern with thread safety."""
         with cls._lock:
             if cls._instance is None:
@@ -379,20 +397,35 @@ class WASMStore:
                 cls._instance._initialized = False
             return cls._instance
 
-    def __init__(self, db_path: Path | None = None):
+    def __init__(self, db_path: Path | None = None, fs: FileSystem | None = None):
         """
         Initialize the store.
 
         Args:
             db_path: Custom database path. Defaults to system or user path.
+            fs: Filesystem the database file and its directory are created
+                through. Defaults to the process-wide one, which is what makes
+                ``--dry-run`` and the test doubles work without every call site
+                knowing about them.
         """
         if self._initialized:
             return
 
+        self._fs = fs
         self._db_path = self._resolve_db_path(db_path)
         self._local = threading.local()
         self._ensure_schema()
         self._initialized = True
+
+    @property
+    def fs(self) -> FileSystem:
+        """
+        The filesystem every change this store makes on disk goes through.
+
+        Returns:
+            The injected filesystem, or the process-wide one.
+        """
+        return self._fs or get_fs()
 
     def _resolve_db_path(self, db_path: Path | None = None) -> Path:
         """
@@ -403,6 +436,11 @@ class WASMStore:
         2. System path if writable (/var/lib/wasm/)
         3. User path (~/.local/share/wasm/)
 
+        Nothing is created here. Deciding *where* the database lives is a
+        question, not a change, and the previous version answered it by trying
+        to create the directory, so merely resolving a path left a directory
+        behind on a run that was supposed to change nothing.
+
         Args:
             db_path: Explicit database path, if the caller has one.
 
@@ -412,17 +450,9 @@ class WASMStore:
         if db_path:
             return Path(db_path)
 
-        # Try system path first
-        if DEFAULT_DB_PATH.parent.exists():
-            try:
-                # Check if we can write to system path
-                secure_directory(DEFAULT_DB_PATH.parent)
-                return DEFAULT_DB_PATH
-            except PermissionError:
-                pass
+        if DEFAULT_DB_PATH.parent.is_dir() and os.access(DEFAULT_DB_PATH.parent, os.W_OK):
+            return DEFAULT_DB_PATH
 
-        # Fall back to user path
-        secure_directory(USER_DB_PATH.parent)
         return USER_DB_PATH
 
     @property
@@ -431,16 +461,53 @@ class WASMStore:
         return self._db_path
 
     def _get_connection(self) -> sqlite3.Connection:
-        """Get a thread-local database connection."""
-        if not hasattr(self._local, "connection") or self._local.connection is None:
-            self._local.connection = sqlite3.connect(
-                str(self._db_path),
-                check_same_thread=False,
-            )
-            self._local.connection.row_factory = sqlite3.Row
-            # Enable foreign keys
-            self._local.connection.execute("PRAGMA foreign_keys = ON")
+        """
+        Get a thread-local database connection.
+
+        Returns:
+            The connection belonging to the calling thread.
+
+        Raises:
+            StoreError: If the database file cannot be opened.
+        """
+        if getattr(self._local, "connection", None) is None:
+            self._local.connection = self._connect()
         return self._local.connection
+
+    def _connect(self) -> sqlite3.Connection:
+        """
+        Open the database, refusing to create it.
+
+        ``mode=rw`` instead of the default ``rwc``: the file is created by
+        :meth:`_secure_db_file` through the filesystem seam, with 0600 applied
+        at creation. If it is missing by the time we connect, the seam declined
+        to create it, and letting SQLite create one behind the seam's back is
+        exactly the defect the seam exists to remove: a rehearsal that leaves a
+        file, and a world-readable one at that.
+
+        Returns:
+            A new connection with foreign keys enabled.
+
+        Raises:
+            StoreError: If the database file cannot be opened.
+        """
+        uri = f"file:{quote(str(self._db_path.resolve()))}?mode=rw"
+        try:
+            connection = sqlite3.connect(uri, uri=True, check_same_thread=False)
+        except sqlite3.OperationalError as exc:
+            raise StoreError(
+                f"Cannot open the WASM database at {self._db_path}",
+                details=(
+                    "The file is missing or cannot be opened. It is created on the "
+                    "first real run; --dry-run deliberately does not create it, so "
+                    "run the command once without --dry-run. Otherwise check that "
+                    f"{self._db_path.parent} exists and is writable by this user."
+                ),
+            ) from exc
+
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        return connection
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Cursor]:
@@ -454,29 +521,83 @@ class WASMStore:
             conn.rollback()
             raise
 
-    def _secure_db_file(self) -> None:
+    def _secure_directory(self, path: Path) -> None:
+        """
+        Create the directory the database lives in, owner-only.
+
+        Every missing level is created 0700, not just the last one: that is how
+        a private directory ends up under a world-readable parent. A directory
+        left lax by an older version is tightened, but only when it is ours and
+        not shared (sticky bit); tightening ``/tmp`` or another shared location
+        would break the machine for every other account, and the 0600 file mode
+        already protects the content.
+
+        Args:
+            path: Directory to create or tighten.
+
+        Raises:
+            OSError: If the directory cannot be created.
+        """
+        self.fs.make_dir(path, mode=SECRET_DIR_MODE, parents=True)
+
+        if not path.is_dir():
+            # The seam declined to create it, so there is nothing to tighten.
+            return
+
+        info = path.stat()
+        is_shared = bool(info.st_mode & stat.S_ISVTX)
+        if info.st_mode & 0o077 and not is_shared and info.st_uid == os.geteuid():
+            self.fs.chmod(path, SECRET_DIR_MODE)
+
+    def _secure_db_file(self) -> bool:
         """
         Create the database file with owner-only permissions.
 
         The rows hold application secrets (``env_vars`` carries DATABASE_URL and
-        similar), so the file is created through ``os.open`` before SQLite ever
-        opens it, which would otherwise create it world readable. A database
-        left lax by an older version is tightened here as well.
+        similar), so the file is created through the filesystem seam with 0600
+        applied at creation, before SQLite ever opens it; SQLite would create it
+        with the process umask instead. A database left lax by an older version
+        is tightened here as well.
+
+        Returns:
+            True if the database file is present once this returns. False means
+            the filesystem declined to create it, which is what a dry run does.
 
         Raises:
             OSError: If the file or its directory cannot be secured.
         """
-        secure_directory(self._db_path.parent)
+        self._secure_directory(self._db_path.parent)
 
-        if self._db_path.exists():
-            restrict_file(self._db_path)
-            return
+        try:
+            info = os.lstat(self._db_path)
+        except OSError:
+            # Missing, or a dangling symlink, for which exists() answers False.
+            self.fs.write_text(self._db_path, "", mode=SECRET_MODE)
+            return self._db_path.exists()
 
-        os.close(os.open(self._db_path, os.O_WRONLY | os.O_CREAT, SECRET_FILE_MODE))
+        if stat.S_ISLNK(info.st_mode):
+            # chmod follows the link, which would hand the mode change to a file
+            # of the attacker's choosing.
+            logger.warning("Refusing to change permissions through the symlink %s", self._db_path)
+            return True
+
+        if info.st_mode & 0o077:
+            self.fs.chmod(self._db_path, SECRET_MODE)
+
+        return True
 
     def _ensure_schema(self) -> None:
-        """Ensure database schema exists and is up to date."""
-        self._secure_db_file()
+        """
+        Ensure database schema exists and is up to date.
+
+        Nothing happens when the filesystem declined to create the database
+        file. Creating the schema means connecting, and connecting to a missing
+        file is how SQLite would create it outside the seam: a dry run would
+        leave a database behind after announcing it would change nothing.
+        """
+        if not self._secure_db_file():
+            logger.debug("Filesystem declined to create %s; skipping schema", self._db_path)
+            return
 
         with self._transaction() as cursor:
             # Check if schema_version table exists
@@ -1154,14 +1275,16 @@ class WASMStore:
 
 
 # Convenience function to get store instance
-def get_store(db_path: Path | None = None) -> WASMStore:
+def get_store(db_path: Path | None = None, fs: FileSystem | None = None) -> WASMStore:
     """
     Get the WASM store instance.
 
     Args:
         db_path: Optional custom database path.
+        fs: Optional filesystem to create the database through. Only honoured
+            when the singleton is built; an existing instance keeps its own.
 
     Returns:
         WASMStore singleton instance.
     """
-    return WASMStore(db_path)
+    return WASMStore(db_path, fs)

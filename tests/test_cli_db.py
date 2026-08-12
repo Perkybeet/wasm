@@ -30,6 +30,7 @@ from click.testing import CliRunner
 
 from wasm.cli import app as cli_app
 from wasm.cli.commands import db as db_cli
+from wasm.core.exceptions import WASMError
 from wasm.core.logger import Logger
 
 #: Every subcommand the frozen surface promises, with the arguments that make
@@ -208,6 +209,23 @@ class FakeManager:
     ) -> FakeBackupInfo:
         self._record("backup", database, output_path=output_path, compress=compress)
         return FakeBackupInfo(output_path or Path("/var/backups/wasm/databases/shop.sql"))
+
+
+def _guard_outcome(guard: Any, statement: str) -> str:
+    """
+    Run a single-statement guard and describe what it did.
+
+    Args:
+        guard: The function under test.
+        statement: The text to hand it.
+
+    Returns:
+        The accepted statement, or "refused" when it raised.
+    """
+    try:
+        return guard(statement)
+    except WASMError:
+        return "refused"
 
 
 @pytest.fixture
@@ -590,6 +608,111 @@ class TestQuery:
 
         assert result.exit_code == 0, result.output
         assert manager.called("execute_query") == {"read_only": False}
+
+    def test_a_second_statement_cannot_ride_along_in_read_only_mode(
+        self, cli_runner: CliRunner, manager: FakeManager, logged: io.StringIO
+    ):
+        """
+        The reported bypass: MySQL commits the read-only transaction on a ';'.
+
+        The manager wraps what it is given in START TRANSACTION READ ONLY, so
+        'SELECT 1; COMMIT; DROP TABLE users' arrives at the engine with the
+        COMMIT in the middle, and everything after it runs with write access.
+        """
+        result = cli_runner.invoke(
+            cli_app.cli,
+            ["db", "query", "shop", "SELECT 1; COMMIT; DROP TABLE users", "-e", "postgresql"],
+        )
+
+        assert result.exit_code == 1
+        assert manager.names_called() == []
+        assert "one statement" in logged.getvalue()
+        assert "--write" in logged.getvalue()
+
+    def test_a_trailing_semicolon_is_not_a_second_statement(
+        self, cli_runner: CliRunner, manager: FakeManager
+    ):
+        """Typing SQL the way SQL is written must keep working."""
+        result = cli_runner.invoke(
+            cli_app.cli, ["db", "query", "shop", "  SELECT 1;  ", "-e", "postgresql"]
+        )
+
+        assert result.exit_code == 0, result.output
+        sent = next(args for name, args, _ in manager.calls if name == "execute_query")
+        assert sent == ("shop", "SELECT 1")
+
+    def test_a_semicolon_inside_a_literal_is_refused_too(
+        self, cli_runner: CliRunner, manager: FakeManager
+    ):
+        """
+        Deliberately conservative.
+
+        Telling a ';' that ends a statement from one inside a literal needs a
+        parser for each engine's grammar. Refusing the rare legitimate query is
+        recoverable with --write; getting it wrong the other way is not.
+        """
+        result = cli_runner.invoke(
+            cli_app.cli, ["db", "query", "shop", "SELECT ';'", "-e", "postgresql"]
+        )
+
+        assert result.exit_code == 1
+        assert manager.names_called() == []
+
+    def test_write_mode_may_still_send_a_batch(self, cli_runner: CliRunner, manager: FakeManager):
+        """--write is the operator accepting that the statements change data."""
+        result = cli_runner.invoke(
+            cli_app.cli,
+            [
+                "db",
+                "query",
+                "shop",
+                "INSERT INTO t VALUES (1); DELETE FROM u",
+                "-e",
+                "postgresql",
+                "--write",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert manager.called("execute_query") == {"read_only": False}
+
+    def test_an_empty_statement_is_refused_before_the_engine_is_touched(
+        self, cli_runner: CliRunner, manager: FakeManager, logged: io.StringIO
+    ):
+        """A blank argument is a mistake, not a query."""
+        result = cli_runner.invoke(cli_app.cli, ["db", "query", "shop", "   ", "-e", "postgresql"])
+
+        assert result.exit_code == 1
+        assert manager.names_called() == []
+        assert "Empty statement" in logged.getvalue()
+
+    def test_an_oversized_statement_is_refused(
+        self, cli_runner: CliRunner, manager: FakeManager, logged: io.StringIO
+    ):
+        """The console is not a file upload, and says where to put one instead."""
+        oversized = "SELECT " + "a" * db_cli.MAX_QUERY_LENGTH
+
+        result = cli_runner.invoke(
+            cli_app.cli, ["db", "query", "shop", oversized, "-e", "postgresql"]
+        )
+
+        assert result.exit_code == 1
+        assert manager.names_called() == []
+        assert "wasm db connect" in logged.getvalue()
+
+    def test_the_guard_matches_the_one_the_panel_applies(self):
+        """
+        The CLI and the web console have to agree on what one statement is.
+
+        They are two front doors to the same root-level console; a rule that
+        holds at one of them only is the rule not holding.
+        """
+        from wasm.web.api import databases as databases_api
+
+        for statement in ("SELECT 1;", "  SELECT 1  ", "SELECT ';'", "SELECT 1; DROP TABLE t"):
+            cli_result = _guard_outcome(db_cli._single_statement, statement)
+            api_result = _guard_outcome(databases_api._reject_multiple_statements, statement)
+            assert cli_result == api_result, statement
 
     def test_an_engine_that_cannot_be_held_read_only_refuses_to_pretend(
         self, cli_runner: CliRunner, monkeypatch: pytest.MonkeyPatch, logged: io.StringIO

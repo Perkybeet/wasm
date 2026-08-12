@@ -24,7 +24,8 @@
     <h2 class="label" style="margin-bottom: var(--space-2)">Needs attention</h2>
     <div class="rows">
       {% for item in attention %}
-        {% call m.row(item.domain, item.state, item.meta, item.href, "row-" ~ item.id) %}
+        {% call m.row(item.domain, item.state, item.meta, item.href, "row-" ~ item.id,
+                      none, item.state_text) %}
           <a class="btn btn--sm" href="{{ item.href }}">Open</a>
         {% endcall %}
       {% endfor %}
@@ -41,7 +42,8 @@
       {% for job in running %}
         {% call m.row(job.name, job.state,
                       [("step", job.current_step), ("progress", job.progress ~ "/" ~ job.total_steps),
-                       ("started", job.started)], "/activity", "row-" ~ job.id) %}
+                       ("started", job.started)], "/activity", "row-" ~ job.id,
+                      none, job.status) %}
           {{ m.follow_button("Logs", job.name, job.log_url) }}
         {% endcall %}
       {% endfor %}
@@ -55,7 +57,8 @@
   {% if apps %}
     <div class="rows">
       {% for app in apps %}
-        {% call m.row(app.domain, app.state, app.meta, app.href, "row-" ~ app.id) %}
+        {% call m.row(app.domain, app.state, app.meta, app.href, "row-" ~ app.id,
+                      none, app.state_text) %}
           {{ m.follow_button("Logs", app.domain, app.log_url) }}
           {{ m.action_button("Restart", app.restart_endpoint) }}
         {% endcall %}
@@ -76,10 +79,10 @@
     <table class="table">
       <thead>
         <tr>
-          <th>Finished</th>
-          <th>Action</th>
-          <th>Resource</th>
-          <th>Result</th>
+          <th scope="col">Finished</th>
+          <th scope="col">Action</th>
+          <th scope="col">Resource</th>
+          <th scope="col">Result</th>
         </tr>
       </thead>
       <tbody>

@@ -496,7 +496,7 @@ Run one statement against a database, read\-only unless told otherwise.
 Engine the database is on. Default: Sentinel.UNSET.
 .TP
 .B \-\-write
-Allow the statement to change data. Without it the engine runs it in a read\-only transaction.
+Allow the statement to change data. Without it the engine runs one statement in a read\-only transaction.
 
 .SS wasm db restart
 Restart an engine's service.
@@ -1231,10 +1231,13 @@ Rehearse without changing anything. Read\-only checks still run.
 Never emit colour.
 
 .SS wasm web token
-Issue a new access token and print it.
+Show the state of the access token, or issue a new one with \-\-new.
+.TP
+.B \-\-new, \-\-rotate
+Issue a new access token. The token currently in use stops working.
 .TP
 .B \-r, \-\-regenerate
-Also rotate the signing key, which logs out every open session.
+Issue a new token and rotate the signing key, logging out every open session.
 .TP
 .B \-y, \-\-yes
 Do not ask for confirmation.

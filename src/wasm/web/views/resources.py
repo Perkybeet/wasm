@@ -115,6 +115,10 @@ def _shape(kind: str, record: Any) -> dict[str, Any]:
             "id": record.domain,
             "domain": record.domain,
             "state": record.status,
+            # The rail is a colour, and a colour alone is unreadable to anyone
+            # who cannot tell these hues apart and invisible to a screen
+            # reader. Records that have a real state carry it in words too.
+            "state_text": record.status,
             "meta": [
                 ("type", record.app_type),
                 ("port", record.port or "—"),
@@ -134,6 +138,7 @@ def _shape(kind: str, record: Any) -> dict[str, Any]:
             "id": record.domain,
             "domain": record.domain,
             "state": "active" if record.enabled else "idle",
+            "state_text": "enabled" if record.enabled else "disabled",
             "meta": [
                 ("server", record.webserver),
                 ("ssl", "yes" if record.ssl_enabled else "no"),
@@ -153,6 +158,7 @@ def _shape(kind: str, record: Any) -> dict[str, Any]:
             "id": record.name,
             "domain": record.name,
             "state": record.status,
+            "state_text": record.status,
             "meta": [("port", record.port or "—"), ("user", record.user)],
             "href": None,
             "log_url": f"/ws/logs/{record.name}",
@@ -167,10 +173,17 @@ def _shape(kind: str, record: Any) -> dict[str, Any]:
         "id": f"{engine}-{name}",
         "domain": name,
         "state": "idle",
+        # A database record carries no health, so naming a state would invent
+        # one. The rail stays grey and the row says nothing it cannot know.
+        "state_text": None,
         "meta": [("engine", engine), ("user", getattr(record, "username", None) or "—")],
         "href": None,
         "log_url": None,
         "restart_endpoint": None,
+        # Two segments, and both are meant. The API router mounts the databases
+        # module under /api/databases and the module declares its own
+        # /databases collection beside /engines, /users and /backups. The row
+        # used to point at /api/databases/{name}, which matches nothing at all.
         "delete_endpoint": f"/api/databases/databases/{engine}/{name}",
         "delete_consequence": "Every table in it goes with it. This cannot be undone.",
     }

@@ -11,6 +11,14 @@ than as happy paths:
 - **Every page demands a session.** A screen that lists domains, ports and
   configuration is not a public page, and the one that forgets is the one an
   attacker finds.
+- **Every screen is exercised with data in it.** An empty machine renders
+  almost nothing, so a suite that only ever looks at empty screens is a suite
+  that has not looked at the product. Reverting the databases delete URL to a
+  route that does not exist used to leave every test green, because no test
+  ever put a database in the store.
+- **Every address a screen emits resolves, with the method it is emitted
+  with.** A button that deletes through an address the router does not answer
+  for is worse than no button.
 - **No page ships an unresolved variable.** The Jinja environment renders a
   missing name as ``[missing: x]`` instead of an empty string, so a typo in a
   context key is caught here rather than by a user asking where their data
@@ -40,8 +48,8 @@ from fastapi.testclient import TestClient
 from starlette.routing import Match
 
 from wasm.core.config import Config
-from wasm.core.store import App, Service, Site, WASMStore
-from wasm.web.auth import CSRF_HEADER_NAME, SecurityConfig
+from wasm.core.store import App, Database, Service, Site, WASMStore
+from wasm.web.auth import CSRF_HEADER_NAME, SESSION_COOKIE_NAME, SecurityConfig
 from wasm.web.jobs import Job, JobLogEntry, JobStatus, JobType
 from wasm.web.server import create_app, get_token_manager
 from wasm.web.views import rendering, resources
@@ -60,6 +68,23 @@ PAGES = (
     "/settings",
     "/fragments/machine",
 )
+
+#: Every screen, including the ones that need a resource named in the URL. The
+#: parametrised page is where a list's links actually land, so it belongs in
+#: every sweep the flat pages get.
+SCREENS = (*PAGES, "/apps/example.com")
+
+#: How an address reaches the browser, and the method the browser will use with
+#: it. Checking the method matters: a delete button aimed at a path that only
+#: answers GET is still a dead button.
+URL_ATTRIBUTES = {
+    "href": "GET",
+    "hx-get": "GET",
+    "action": "POST",
+    "hx-post": "POST",
+    "hx-delete": "DELETE",
+    "data-url": "WEBSOCKET",
+}
 
 #: What the loud Undefined renders. Finding it in a page means a context key is
 #: missing or misspelled.
@@ -320,6 +345,55 @@ def deploy(store: WASMStore, domain: str = "example.com", **overrides: Any) -> A
     return app
 
 
+@pytest.fixture
+def populated(
+    store: WASMStore, config_file: Path, sandbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> dict[str, Any]:
+    """
+    Put something on every screen the panel has.
+
+    An empty machine renders almost nothing, so a suite that only ever looks at
+    empty screens has not looked at the product. This is what caught the
+    databases list offering a delete button aimed at a route that does not
+    exist: nothing here ever created a database, so the row was never drawn.
+
+    Args:
+        store: The store the pages read.
+        config_file: The configuration fixture, so settings has something.
+        sandbox: Isolated filesystem root, where the backup archive lands.
+        monkeypatch: Patching helper, scoped to the test.
+
+    Returns:
+        What was created, for a test that wants to name it.
+    """
+    deploy(store, domain="example.com")
+    deploy(store, domain="broken.example.com", status="failed", ssl_enabled=False)
+
+    store.create_database(
+        Database(name="app_production", engine="postgresql", port=5432, username="app")
+    )
+    store.create_database(Database(name="cache", engine="mysql", port=3306))
+
+    write_backup(sandbox, "example.com")
+
+    jobs = [
+        make_job("job-running", JobStatus.RUNNING),
+        make_job("job-done", JobStatus.COMPLETED),
+        make_job("job-broken", JobStatus.FAILED, error="nginx: [emerg] duplicate listen"),
+    ]
+    monkeypatch.setattr("wasm.web.jobs.get_job_manager", lambda: FakeJobs(jobs))
+
+    config = Config()
+    config.set("databases.credentials.mysql.password", CONFIG_SECRET)
+    config.set("apps.directory", "/var/www/apps")
+
+    return {
+        "domains": ["example.com", "broken.example.com"],
+        "databases": [("postgresql", "app_production"), ("mysql", "cache")],
+        "jobs": jobs,
+    }
+
+
 def body_of(client: TestClient, path: str) -> str:
     """
     Fetch a page and return its markup.
@@ -385,69 +459,115 @@ def test_a_domain_that_is_not_deployed_answers_404(client: TestClient) -> None:
 
 
 def test_no_page_leaves_a_template_variable_unresolved(
-    client: TestClient, store: WASMStore, monkeypatch: pytest.MonkeyPatch
+    client: TestClient, populated: dict[str, Any]
 ) -> None:
     """A missing context key renders a marker; none may reach a browser."""
-    deploy(store)
-    monkeypatch.setattr(
-        "wasm.web.jobs.get_job_manager",
-        lambda: FakeJobs([make_job(), make_job("job-2", JobStatus.RUNNING)]),
-    )
-
-    for path in (*PAGES, "/apps/example.com"):
+    for path in SCREENS:
         page = body_of(client, path)
         assert MISSING_MARKER not in page, f"{path} rendered an undefined variable"
 
 
-def test_navigation_never_points_at_a_route_that_does_not_exist(
-    app: FastAPI, client: TestClient, store: WASMStore
+def test_the_sign_in_page_leaves_no_template_variable_unresolved(anonymous: TestClient) -> None:
+    """It renders outside the shell, so the sweep above never reaches it."""
+    for response in (anonymous.get("/login"), anonymous.post("/login", data={"token": "wrong"})):
+        assert MISSING_MARKER not in response.text
+
+
+def addresses_on(client: TestClient, path: str) -> set[tuple[str, str]]:
+    """
+    Collect every address a screen hands the browser, with its method.
+
+    Args:
+        client: A signed-in client.
+        path: The screen to read.
+
+    Returns:
+        Method and path pairs.
+    """
+    page = body_of(client, path)
+    found: set[tuple[str, str]] = set()
+    for attribute, method in URL_ATTRIBUTES.items():
+        for target in re.findall(rf'(?:^|\s){attribute}="(/[^"#]*)"', page):
+            found.add((method, target))
+    return found
+
+
+def test_every_address_on_every_populated_screen_resolves(
+    app: FastAPI, client: TestClient, populated: dict[str, Any]
 ) -> None:
     """
-    Every link and every htmx endpoint on every page resolves.
+    Every link, form and htmx endpoint resolves, with the method it is sent with.
 
-    A dead link in a panel that holds root over the machine costs more trust
-    than a screen that is missing, because the operator stops believing the
-    rest of it.
+    This is the test that stops a button pointing at nothing. It is run with
+    the machine full rather than empty, because a row is where the action
+    endpoints live and an empty screen has no rows: the databases list spent
+    its whole life offering a delete aimed at ``/api/databases/{name}``, which
+    matches no route at all, and every test passed because no test had ever
+    created a database.
     """
-    deploy(store)
-    targets: set[str] = set()
-    for path in (*PAGES, "/apps/example.com"):
-        page = body_of(client, path)
-        for attribute in ("href", "action", "hx-get", "hx-post", "hx-delete", "data-url"):
-            targets.update(re.findall(rf'{attribute}="(/[^"#]*)"', page))
+    targets: set[tuple[str, str]] = set()
+    per_screen: dict[str, int] = {}
+    for path in (*SCREENS, "/apps/broken.example.com"):
+        found = addresses_on(client, path)
+        per_screen[path] = len(found)
+        targets |= found
 
-    unresolved = sorted(target for target in targets if not _resolves(app, target))
-    assert not unresolved, f"pages link to routes that do not exist: {unresolved}"
+    empty = sorted(path for path, count in per_screen.items() if count == 0)
+    assert not empty, f"these screens emitted no addresses, so they were not exercised: {empty}"
+
+    # A net that catches nothing passes silently. These are the addresses that
+    # only exist once the machine has something on it.
+    assert ("DELETE", "/api/databases/databases/postgresql/app_production") in targets
+    assert ("DELETE", "/api/apps/example.com") in targets
+    assert ("POST", "/api/backups/example-com_20260101_120000/restore") in targets
+    assert ("WEBSOCKET", "/ws/logs/example.com") in targets
+    assert len(targets) >= 25, f"only {len(targets)} addresses were checked"
+
+    unresolved = sorted(target for target in targets if not _resolves(app, *target))
+    assert not unresolved, f"screens point at routes that do not exist: {unresolved}"
 
 
-def _resolves(app: FastAPI, path: str) -> bool:
+def test_the_sign_in_page_posts_to_a_route_that_exists(app: FastAPI, anonymous: TestClient) -> None:
+    """The form is outside the shell, so it is swept separately or not at all."""
+    response = anonymous.get("/login")
+    assert response.status_code == 200
+
+    targets: set[tuple[str, str]] = set()
+    for attribute, method in URL_ATTRIBUTES.items():
+        for target in re.findall(rf'(?:^|\s){attribute}="(/[^"#]*)"', response.text):
+            targets.add((method, target))
+
+    assert ("POST", "/login") in targets, "the form no longer posts to the login route"
+    unresolved = sorted(target for target in targets if not _resolves(app, *target))
+    assert not unresolved, f"the sign-in page points at routes that do not exist: {unresolved}"
+
+
+def _resolves(app: FastAPI, method: str, path: str) -> bool:
     """
-    Check whether the application would route a path.
+    Check whether the application would route a path with a given method.
 
     The application's own matching is used rather than a regex of our own, so
-    this keeps working whatever shape the router assembles routes into.
+    this keeps working whatever shape the router assembles routes into. Only a
+    full match counts: Starlette reports a path that exists under a different
+    method as a partial one, and accepting that would pass a delete button
+    aimed at a read-only route.
 
     Args:
         app: The application.
+        method: HTTP method, or ``WEBSOCKET`` for a handshake.
         path: An absolute path taken from a rendered page.
 
     Returns:
-        True when some route, mount or WebSocket answers for it.
+        True when some route, mount or WebSocket fully answers for it.
     """
-    for scope_type, method in (("http", "GET"), ("http", "POST"), ("websocket", None)):
-        scope: dict[str, Any] = {
-            "type": scope_type,
-            "path": path,
-            "root_path": "",
-            "headers": [],
-        }
-        if method is not None:
-            scope["method"] = method
-        for route in app.routes:
-            match, _ = route.matches(scope)
-            if match is not Match.NONE:
-                return True
-    return False
+    scope: dict[str, Any] = {"path": path, "root_path": "", "headers": []}
+    if method == "WEBSOCKET":
+        scope["type"] = "websocket"
+    else:
+        scope["type"] = "http"
+        scope["method"] = method
+
+    return any(route.matches(scope)[0] is Match.FULL for route in app.routes)
 
 
 def test_no_page_handler_is_a_coroutine() -> None:
@@ -538,6 +658,21 @@ def test_an_application_environment_hides_its_credentials(
 # ------------------------------------------------------------------ behaviour
 
 
+def shell_headers(page: str) -> dict[str, str]:
+    """
+    Read the headers the shell tells htmx to send with every request.
+
+    Args:
+        page: A rendered page.
+
+    Returns:
+        The parsed ``hx-headers`` object.
+    """
+    match = re.search(r"hx-headers='([^']*)'", page)
+    assert match is not None, "the shell no longer sets hx-headers"
+    return dict(json.loads(match.group(1)))
+
+
 def test_the_shell_carries_the_session_csrf_token(client: TestClient) -> None:
     """
     Without it every mutation the panel offers is refused.
@@ -546,10 +681,39 @@ def test_the_shell_carries_the_session_csrf_token(client: TestClient) -> None:
     the payload is a mapping, so it was always empty and every restart, delete
     and sign-out came back 403.
     """
-    page = body_of(client, "/apps")
-    match = re.search(r"hx-headers='\{\"X-CSRF-Token\": \"([^\"]*)\"\}'", page)
-    assert match is not None, "the shell no longer sends a CSRF header"
-    assert match.group(1), "the CSRF token reaching the browser is empty"
+    headers = shell_headers(body_of(client, "/apps"))
+    assert headers, "the shell no longer sends a CSRF header"
+    assert all(headers.values()), "the CSRF token reaching the browser is empty"
+
+
+def test_the_header_the_shell_sends_is_the_one_the_server_reads(
+    app: FastAPI, store: WASMStore
+) -> None:
+    """
+    Spelling the header twice, in two files, is not a thing care can maintain.
+
+    The shell sent ``X-CSRF-Token`` and :mod:`wasm.web.auth` reads
+    ``X-WASM-CSRF``, so every mutation a browser made came back 403: restart,
+    delete and the sign-out button included. Only the exact headers the page
+    hands the browser are used here, so this cannot pass by a test setting the
+    right header itself.
+    """
+    deploy(store)
+    browser = TestClient(app, client=("testclient", 50000), follow_redirects=False)
+    token = get_token_manager().generate_master_token()
+    assert browser.post("/login", data={"token": token}).status_code == 303
+
+    headers = shell_headers(browser.get("/apps").text)
+
+    # Established first, or the test below proves nothing: the mutation has to
+    # be one that is genuinely refused without the header.
+    assert browser.post("/logout").status_code == 403
+
+    response = browser.post("/logout", headers=headers)
+    assert response.status_code == 200, (
+        f"the shell sends {sorted(headers)}, which the server does not accept: {response.text}"
+    )
+    assert response.headers["HX-Redirect"] == "/login"
 
 
 def test_signing_out_ends_the_session(client: TestClient) -> None:
@@ -559,6 +723,11 @@ def test_signing_out_ends_the_session(client: TestClient) -> None:
     response = client.post("/logout")
     assert response.status_code == 200
     assert response.headers["HX-Redirect"] == "/login"
+
+    # The cookies go too, so a browser that ignores the redirect is not left
+    # holding something that looks like a session.
+    cleared = response.headers.get_list("set-cookie")
+    assert any(SESSION_COOKIE_NAME in header for header in cleared)
 
     assert client.get("/apps").status_code == 303
 
@@ -669,3 +838,358 @@ def test_days_remaining_decide_the_rail_colour() -> None:
     assert resources.certificate_state(0) == "failed"
     assert resources.certificate_state(-3) == "failed"
     assert resources.certificate_state(None) == "idle"
+
+
+# ------------------------------------------------------------------- session
+
+
+def test_the_sign_in_page_is_reachable_without_a_session(anonymous: TestClient) -> None:
+    """It is the one page that must answer an anonymous browser."""
+    response = anonymous.get("/login")
+    assert response.status_code == 200
+    assert "Access token" in response.text
+
+
+def test_the_form_posts_the_field_the_server_reads(anonymous: TestClient) -> None:
+    """
+    The page and the handler have to agree on the body.
+
+    The form used to post to a route that did not exist at all; a field name
+    that drifts is the same failure one letter smaller, and it is invisible
+    until someone tries to sign in.
+    """
+    page = anonymous.get("/login").text
+    assert 'method="post"' in page
+    assert 'action="/login"' in page
+    assert 'name="token"' in page
+    # Nothing is accepted in a URL: a query string is written to browser
+    # history, proxy logs and access logs.
+    assert 'method="get"' not in page.lower()
+
+
+def test_a_token_typed_into_the_form_opens_a_session(anonymous: TestClient) -> None:
+    """The whole point of the page: type the token, land on the panel."""
+    token = get_token_manager().generate_master_token()
+
+    response = anonymous.post("/login", data={"token": token})
+
+    # 303 so the browser follows with GET; a 302 after a POST may repeat the
+    # POST, which would replay the credential.
+    assert response.status_code == 303, response.text
+    assert response.headers["location"] == "/"
+    assert SESSION_COOKIE_NAME in anonymous.cookies
+
+    landing = anonymous.get("/")
+    assert landing.status_code == 200
+    assert MISSING_MARKER not in landing.text
+
+
+def test_a_token_the_server_does_not_accept_comes_back_to_the_form(
+    anonymous: TestClient,
+) -> None:
+    """A refusal says what happened and how many tries are left, and sets nothing."""
+    get_token_manager().generate_master_token()
+
+    response = anonymous.post("/login", data={"token": "not-the-token"})
+
+    assert response.status_code == 401
+    assert "attempts remaining" in response.text
+    assert 'name="token"' in response.text
+    assert SESSION_COOKIE_NAME not in anonymous.cookies
+    assert anonymous.get("/").status_code == 303
+
+
+def test_a_body_with_no_token_at_all_is_refused_rather_than_crashing(
+    anonymous: TestClient,
+) -> None:
+    """The handler parses the body itself, so an empty one has to be survivable."""
+    get_token_manager().generate_master_token()
+    response = anonymous.post("/login", content=b"", headers={"content-type": "text/plain"})
+    assert response.status_code == 401
+    assert SESSION_COOKIE_NAME not in anonymous.cookies
+
+
+def test_the_session_cookie_is_not_readable_by_script(anonymous: TestClient) -> None:
+    """The panel is root over the machine; an XSS must not be able to lift it."""
+    token = get_token_manager().generate_master_token()
+    response = anonymous.post("/login", data={"token": token})
+
+    cookies = " ".join(response.headers.get_list("set-cookie"))
+    assert SESSION_COOKIE_NAME in cookies
+    assert "HttpOnly" in cookies
+    assert "SameSite" in cookies
+
+
+# ------------------------------------------------------ screens with data in
+
+
+def test_every_screen_renders_with_the_machine_full(
+    client: TestClient, populated: dict[str, Any]
+) -> None:
+    """
+    The counterpart to the empty sweep, and the one that has teeth.
+
+    An empty screen draws a heading and an invitation. Everything that can be
+    wrong about a row, an endpoint or a shaped value only exists once there is
+    something to draw.
+    """
+    for path in (*SCREENS, "/apps/broken.example.com"):
+        response = client.get(path)
+        assert response.status_code == 200, f"{path} answered {response.status_code}"
+        assert MISSING_MARKER not in response.text
+
+
+def test_the_databases_screen_shows_what_the_store_holds(
+    client: TestClient, populated: dict[str, Any]
+) -> None:
+    """
+    The screen the suite had never rendered with a row in it.
+
+    Its delete button is the reason: the endpoint lives under the databases
+    module's own collection, two segments deep, and the row used to point one
+    segment short of it at an address the router answers for with nothing.
+    """
+    page = body_of(client, "/databases")
+
+    assert "app_production" in page
+    assert "cache" in page
+    assert "engine postgresql" in page
+    assert "/api/databases/databases/postgresql/app_production" in page
+    assert "/api/databases/databases/mysql/cache" in page
+    # The one-segment address is not merely absent from the routes; it must be
+    # absent from the page.
+    assert 'hx-delete="/api/databases/app_production"' not in page
+
+
+def test_the_databases_screen_invites_when_there_is_nothing_on_it(client: TestClient) -> None:
+    """An empty screen names the next thing to do and gives the command for it."""
+    page = body_of(client, "/databases")
+    assert "No databases yet" in page
+    assert "wasm db create" in page
+
+
+def test_the_certificates_screen_admits_when_certbot_cannot_be_asked(
+    sandbox: Path, store: WASMStore, config_file: Path, runner
+) -> None:
+    """
+    "Every domain is covered" is the worst possible thing to say here.
+
+    With certbot missing, nothing on this machine can be issued or renewed and
+    the panel knows nothing about what is covered. Reporting that as "all
+    covered" is a confident answer given at exactly the moment there is none.
+    """
+    runner.only_knows()
+    app = create_app(SecurityConfig(state_dir=sandbox / "state", rate_limit_requests=5000))
+    signed_in = TestClient(app, client=("testclient", 50000), follow_redirects=False)
+    token = get_token_manager().generate_master_token()
+    signed_in.post("/login", data={"token": token})
+    deploy(store, domain="bare.example.com", ssl_enabled=False)
+
+    page = signed_in.get("/certificates").text
+
+    assert "certbot is not installed" in page
+    assert "Every domain this machine serves is covered" not in page
+    assert "cannot say which" in page
+    assert MISSING_MARKER not in page
+
+
+# -------------------------------------------------------------- hostile input
+
+
+def test_no_screen_lets_markup_out_of_an_attribute_or_a_text_node(
+    client: TestClient,
+    store: WASMStore,
+    sandbox: Path,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Every value on these screens comes off the machine, and the machine lies.
+
+    A domain, a database name, a configuration value and an error message from
+    a tool all reach the browser, and any of them can carry markup. An injected
+    script in a panel that runs systemd as root is a root shell.
+    """
+    deploy(store, domain=XSS_DOMAIN)
+    store.create_database(Database(name=XSS_DOMAIN, engine="postgresql"))
+    Config().set("apps.directory", XSS_ERROR)
+    monkeypatch.setattr(
+        "wasm.web.jobs.get_job_manager",
+        lambda: FakeJobs([make_job("job-x", JobStatus.FAILED, error=XSS_ERROR)]),
+    )
+
+    for path in PAGES:
+        page = body_of(client, path)
+        assert "<script>alert" not in page, f"{path} let a script tag through"
+        assert '"><script' not in page, f"{path} let a value close an attribute"
+        assert "</script>alert" not in page
+
+
+def test_the_hostile_values_actually_reached_the_pages(
+    client: TestClient, store: WASMStore, config_file: Path
+) -> None:
+    """
+    The escaping test above is worthless if nothing under test was rendered.
+
+    A page that dropped the value entirely would pass it silently.
+    """
+    deploy(store, domain=XSS_DOMAIN)
+    store.create_database(Database(name=XSS_DOMAIN, engine="postgresql"))
+    Config().set("apps.directory", XSS_ERROR)
+
+    assert "boom-7" in body_of(client, "/apps")
+    assert "boom-7" in body_of(client, "/databases")
+    assert "boom-9" in body_of(client, "/settings")
+
+
+# ------------------------------------------------------------ secrets, again
+
+
+def test_no_screen_echoes_the_master_token(client: TestClient, populated: dict[str, Any]) -> None:
+    """
+    The token is root on this machine and belongs only on the terminal that
+    printed it.
+    """
+    token = get_token_manager().generate_master_token()
+    for path in SCREENS:
+        assert token not in body_of(client, path), f"{path} printed the master token"
+
+
+def test_no_screen_echoes_the_session_cookie(
+    app: FastAPI, store: WASMStore, populated: dict[str, Any]
+) -> None:
+    """A page that renders its own session cookie hands it to anything that can read the DOM."""
+    browser = TestClient(app, client=("testclient", 50000), follow_redirects=False)
+    token = get_token_manager().generate_master_token()
+    browser.post("/login", data={"token": token})
+    cookie = browser.cookies[SESSION_COOKIE_NAME]
+
+    for path in SCREENS:
+        assert cookie not in browser.get(path).text, f"{path} printed the session cookie"
+
+
+def test_the_stored_secret_stays_hidden_on_every_screen(
+    client: TestClient, populated: dict[str, Any]
+) -> None:
+    """Not only on the settings screen: nothing may print it anywhere."""
+    for path in SCREENS:
+        assert CONFIG_SECRET not in body_of(client, path), f"{path} printed a stored secret"
+
+
+# ---------------------------------------------------------------- the floor
+
+
+def test_every_page_can_be_reached_by_keyboard_alone(
+    client: TestClient, populated: dict[str, Any]
+) -> None:
+    """
+    Navigation is anchors, so it works with no pointer and with no JavaScript.
+
+    The skip link and the landmark it targets are what make the sidebar
+    skippable rather than something to tab through on every screen.
+    """
+    for path in PAGES:
+        if path.startswith("/fragments/"):
+            continue
+        page = body_of(client, path)
+        assert 'href="#main"' in page, f"{path} has no skip link"
+        assert 'id="main"' in page, f"{path} has nothing for the skip link to reach"
+        assert '<html lang="en"' in page
+
+
+def test_the_log_drawer_is_operated_by_a_real_button(client: TestClient) -> None:
+    """
+    It used to be a div with role="button" wrapping two more buttons.
+
+    That is invalid nesting, its keyboard handling was hand-rolled, and its
+    label was empty until Alpine had run. A native button is focusable,
+    answers to Enter and Space, and is announced without any of it.
+    """
+    page = body_of(client, "/apps")
+
+    assert 'role="button"' not in page, "a control is imitating a button again"
+    assert 'aria-controls="log-drawer-body"' in page
+    assert 'id="log-drawer-body"' in page
+    assert 'aria-expanded="false"' in page, "the collapsed state is not announced before Alpine"
+    assert ">Show</button>" in page, "the toggle has no label until JavaScript runs"
+
+
+def test_no_row_encodes_its_state_in_colour_alone(
+    client: TestClient, populated: dict[str, Any]
+) -> None:
+    """
+    The rail is the panel's signature, and a colour is not a message.
+
+    Every row carries its state in words as well: visibly, as a badge, where
+    the record has a state worth naming, and for a screen reader in every case.
+    """
+    for path in SCREENS:
+        page = body_of(client, path)
+        fragments = page.split('<div class="row row--')[1:]
+        assert fragments or path in ("/settings", "/fragments/machine"), f"{path} drew no rows"
+        for fragment in fragments:
+            row = fragment.split('<div class="row row--')[0]
+            assert "visually-hidden" in row or "badge badge--" in row, (
+                f"a row on {path} says its state only in colour"
+            )
+
+
+def test_no_screen_ships_a_control_that_submits_by_accident(
+    client: TestClient, populated: dict[str, Any], anonymous: TestClient
+) -> None:
+    """
+    A button with no type is a submit button.
+
+    Every action in the panel is an htmx request, and one of them ending up
+    inside a form would fire twice: once through htmx and once as a
+    submission. The machine has to be full for this to see anything: the
+    action buttons live in rows, and an empty screen has no rows.
+    """
+    pages = [body_of(client, path) for path in SCREENS]
+    pages.append(anonymous.get("/login").text)
+
+    assert sum(page.count("<button") for page in pages) >= 10, "no buttons were examined"
+
+    bare = [found for page in pages for found in re.findall(r"<button(?![^>]*\btype=)[^>]*>", page)]
+    assert not bare, f"buttons without an explicit type: {bare}"
+
+
+# ------------------------------------------------------------------ the seam
+
+
+def test_the_presentation_layer_never_changes_the_filesystem() -> None:
+    """
+    A view renders. It does not write, and it does not delete.
+
+    ``--dry-run`` is only honest while every mutation goes through
+    :mod:`wasm.core.fs`. A page handler that reaches for ``Path.unlink``
+    because it is convenient is how the flag stops being true, and the panel
+    is the layer where that temptation looks most harmless.
+    """
+    import ast
+
+    views = Path(__file__).resolve().parent.parent / "src" / "wasm" / "web" / "views"
+    forbidden = {
+        "write_text",
+        "write_bytes",
+        "mkdir",
+        "makedirs",
+        "unlink",
+        "rmtree",
+        "copytree",
+        "rename",
+        "touch",
+        "symlink_to",
+        "chmod",
+    }
+
+    offenders: list[str] = []
+    for module in sorted(views.glob("*.py")):
+        tree = ast.parse(module.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+                if name in forbidden or name == "open":
+                    offenders.append(f"{module.name}:{node.lineno} {name}")
+
+    assert not offenders, f"the presentation layer is changing the filesystem: {offenders}"

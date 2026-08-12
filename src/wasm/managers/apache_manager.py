@@ -14,6 +14,7 @@ real - the ``.conf`` suffix, ``a2ensite``, the module list - are now data on
 
 from __future__ import annotations
 
+from wasm.core.fs import FileSystem
 from wasm.core.runner import CommandRunner
 from wasm.managers.webserver import (
     APACHE_BACKEND,
@@ -43,6 +44,7 @@ class ApacheManager(WebServerManager):
         verbose: bool = False,
         runner: CommandRunner | None = None,
         backend: WebServerBackend | None = None,
+        fs: FileSystem | None = None,
     ) -> None:
         """
         Initialize the Apache manager.
@@ -53,5 +55,6 @@ class ApacheManager(WebServerManager):
                 one.
             backend: Backend override, used by tests to point the manager at a
                 temporary configuration tree.
+            fs: Filesystem to write through. Defaults to the process-wide one.
         """
-        super().__init__(backend or APACHE_BACKEND, verbose=verbose, runner=runner)
+        super().__init__(backend or APACHE_BACKEND, verbose=verbose, runner=runner, fs=fs)

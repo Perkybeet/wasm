@@ -28,6 +28,7 @@ from wasm.cli import app as app_module
 from wasm.cli.commands import env as env_module
 from wasm.core.config import REDACTED
 from wasm.core.exceptions import EnvConfigError
+from wasm.core.fs import DryRunFileSystem, set_fs
 from wasm.core.logger import Logger
 from wasm.deployers.helpers.env_manager import EnvManager, EnvVariable
 
@@ -37,6 +38,22 @@ GLOBAL_FLAGS = frozenset({"-v", "--verbose", "--dry-run", "--json", "--no-color"
 
 #: Every command name and alias the frozen surface promises under ``env``.
 CONTRACT_NAMES = ["configure", "config", "setup", "show", "list", "ls", "export"]
+
+
+@pytest.fixture(autouse=True)
+def _real_filesystem() -> None:
+    """
+    Put the real filesystem back after every test.
+
+    The seam is process-wide, like the command runner. A test that installs
+    :class:`~wasm.core.fs.DryRunFileSystem` and forgets to undo it turns every
+    later assertion about a written file into an assertion about nothing.
+    """
+    set_fs(None)
+    try:
+        yield
+    finally:
+        set_fs(None)
 
 
 @pytest.fixture
@@ -386,3 +403,149 @@ def test_handle_env_without_an_action_explains_itself(
     """An action is required, and the message says where to look."""
     assert env_module.handle_env(Namespace(verbose=False)) == 1
     assert "wasm env --help" in logged.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Nothing this group writes escapes the filesystem seam
+# ---------------------------------------------------------------------------
+
+
+def test_export_writes_nothing_during_a_rehearsal(deployed: Path, tmp_path: Path) -> None:
+    """
+    ``wasm --dry-run env export`` must not drop a file full of secrets.
+
+    The export is a plain file write and never reaches a subprocess, so before
+    the seam existed the rehearsal announced that nothing would change and then
+    wrote every credential the application runs with to disk.
+    """
+    (deployed / ".env").write_text("API_KEY=ak_live_9f3c\n", encoding="utf-8")
+    target = tmp_path / "exported.env"
+    set_fs(DryRunFileSystem())
+
+    assert env_module._env_export("example.com", str(target), verbose=False) == 0
+
+    assert not target.exists()
+
+
+def test_export_does_not_destroy_an_existing_file_during_a_rehearsal(
+    deployed: Path, tmp_path: Path
+) -> None:
+    """An export over an existing file must not truncate it while rehearsing."""
+    (deployed / ".env").write_text("API_KEY=ak_live_9f3c\n", encoding="utf-8")
+    target = tmp_path / "exported.env"
+    target.write_text("KEEP=me\n", encoding="utf-8")
+    set_fs(DryRunFileSystem())
+
+    env_module._env_export("example.com", str(target), verbose=False)
+
+    assert target.read_text(encoding="utf-8") == "KEEP=me\n"
+
+
+def test_configure_writes_nothing_during_a_rehearsal(
+    deployed: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The .env and the .wasm inventory are both files; neither may appear."""
+    monkeypatch.setattr(EnvManager, "discover", lambda self, path: [EnvVariable(name="API_KEY")])
+    monkeypatch.setattr(
+        EnvManager,
+        "prompt_variables",
+        lambda self, variables, existing: {"API_KEY": "ak_live_9f3c"},
+    )
+    set_fs(DryRunFileSystem())
+
+    assert env_module._env_configure("example.com", verbose=False) == 0
+
+    assert not (deployed / ".env").exists()
+    assert not (deployed / ".wasm").exists()
+
+
+def test_configure_does_not_overwrite_the_running_env_during_a_rehearsal(
+    deployed: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The values the application is running with must survive the rehearsal."""
+    (deployed / ".env").write_text("API_KEY=in-production\n", encoding="utf-8")
+    monkeypatch.setattr(EnvManager, "discover", lambda self, path: [EnvVariable(name="API_KEY")])
+    monkeypatch.setattr(
+        EnvManager,
+        "prompt_variables",
+        lambda self, variables, existing: {"API_KEY": "replacement"},
+    )
+    set_fs(DryRunFileSystem())
+
+    env_module._env_configure("example.com", verbose=False)
+
+    assert (deployed / ".env").read_text(encoding="utf-8") == "API_KEY=in-production\n"
+
+
+def test_a_rehearsed_export_says_what_it_would_have_written(deployed: Path, tmp_path: Path) -> None:
+    """Reporting the skipped write is what separates a rehearsal from a no-op."""
+    (deployed / ".env").write_text("API_KEY=ak_live_9f3c\n", encoding="utf-8")
+    target = tmp_path / "exported.env"
+    rehearsal = DryRunFileSystem()
+    set_fs(rehearsal)
+
+    env_module._env_export("example.com", str(target), verbose=False)
+
+    assert any(str(target) in line for line in rehearsal.skipped)
+
+
+def test_a_rehearsal_never_names_the_secret_it_would_have_written(
+    deployed: Path, tmp_path: Path
+) -> None:
+    """The skip log is printed; a value in it is the same leak by another road."""
+    (deployed / ".env").write_text("API_KEY=ak_live_9f3c\n", encoding="utf-8")
+    rehearsal = DryRunFileSystem()
+    set_fs(rehearsal)
+
+    env_module._env_export("example.com", str(tmp_path / "exported.env"), verbose=False)
+
+    assert not any("ak_live_9f3c" in line for line in rehearsal.skipped)
+
+
+# ---------------------------------------------------------------------------
+# show hides secrets by default, and the default is what scripts get
+# ---------------------------------------------------------------------------
+
+
+def test_show_redacts_without_being_asked_to(
+    cli_runner: CliRunner, deployed: Path, logged: io.StringIO
+) -> None:
+    """
+    Through the real command, not the private function.
+
+    The redaction is only worth anything if it is what ``wasm env show`` does
+    with no options at all, which is how it appears in every runbook.
+    """
+    (deployed / ".env").write_text(
+        "DATABASE_URL=postgres://app:s3cr3t@db/app\nAPI_KEY=ak_live_9f3c\nPORT=3000\n",
+        encoding="utf-8",
+    )
+
+    result = cli_runner.invoke(app_module.cli, ["env", "show", "example.com"])
+
+    output = result.output + logged.getvalue()
+    assert result.exit_code == 0, output
+    assert "s3cr3t" not in output
+    assert "ak_live_9f3c" not in output
+    assert "3000" in output
+
+
+def test_show_is_the_only_command_that_prints_values_and_it_needs_a_flag() -> None:
+    """--unmask is opt-in, so nothing prints a credential by accident."""
+    ctx = click.Context(env_module.cli)
+    unmasking = {
+        name
+        for name in env_module.cli.list_commands(ctx)
+        if any(
+            "--unmask" in param.opts
+            for param in (env_module.cli.get_command(ctx, name) or env_module.cli).params
+        )
+    }
+
+    assert unmasking == {"show"}
+    unmask = next(
+        param
+        for param in (env_module.cli.get_command(ctx, "show") or env_module.cli).params
+        if "--unmask" in param.opts
+    )
+    assert unmask.default is False

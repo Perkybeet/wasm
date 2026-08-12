@@ -15,7 +15,13 @@ shell with a login form:
 - **Binding beyond loopback without protection is an error, not a warning.** A
   warning scrolls past; the operator wanted the panel up, and it comes up. So
   ``--host 0.0.0.0`` is refused unless the panel terminates TLS itself or only
-  answers a declared list of addresses.
+  answers a declared list of addresses. The decision is made about the address
+  that would be bound, not about the string typed: "", ``*``, ``0``, ``::`` and
+  a name that resolves to 0.0.0.0 are all the same socket, and a set of
+  known-good host strings recognised one of them.
+- **``wasm web token`` reports; it does not rotate.** The command people run to
+  look the root credential up cannot be the command that revokes it. Issuing
+  takes ``--new`` and a confirmation that names what stops working.
 
 Two structural notes about the Click migration:
 
@@ -34,22 +40,26 @@ Two structural notes about the Click migration:
 from __future__ import annotations
 
 import importlib.util
+import ipaddress
 import os
 import signal
+import socket
 import sys
 import time
 from argparse import ArgumentParser, Namespace
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn, TypeVar
 
 import click
 
-from wasm.cli.app import Context, pass_context
+from wasm.cli.app import Context, enable_dry_run, pass_context
 from wasm.core.exceptions import SecurityError, WASMError
+from wasm.core.fs import get_fs
 from wasm.core.logger import Logger, set_colors_disabled
-from wasm.core.runner import DryRunRunner, SubprocessRunner, get_runner, set_runner
+from wasm.core.runner import get_runner
 
 if TYPE_CHECKING:
     from wasm.web.auth import SecurityConfig
@@ -58,9 +68,16 @@ if TYPE_CHECKING:
 PID_FILE = Path("/var/run/wasm-web.pid")
 PID_FILE_USER = Path.home() / ".wasm" / "web.pid"
 
-#: Addresses that only the machine itself can reach. Anything else is exposed
-#: to a network and has to justify itself.
-LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", ""})
+#: The address a socket is given when it should answer on every interface. It
+#: is named here to be recognised and refused, never bound by default.
+ALL_INTERFACES = "0.0.0.0"  # noqa: S104
+
+#: Spellings of "every interface" that no resolver accepts, so they cannot be
+#: classified by looking them up. The empty string is the one that mattered: a
+#: version of this module kept a set of loopback *strings* with "" in it, and
+#: ``wasm web start --host ""`` walked past the refusal below and bound the
+#: root panel to every interface in cleartext.
+WILDCARD_SPELLINGS = frozenset({"", "*"})
 
 #: Package installation is slow on a cold cache but must not hang a session.
 INSTALL_TIMEOUT = 900
@@ -115,14 +132,10 @@ def _adopt_global_flag(attribute: str) -> Callable[[click.Context, click.Paramet
         elif attribute == "no_color":
             set_colors_disabled(True)
         elif attribute == "dry_run":
-            logger = state.logger
-            logger.warning("Dry run: no changes will be made to this machine")
-            set_runner(
-                DryRunRunner(
-                    SubprocessRunner(),
-                    on_skip=lambda cmd: logger.info(f"would run: {' '.join(cmd)}"),
-                )
-            )
+            # Both seams are swapped by the one helper. Wiring the runner here
+            # by hand is what left the filesystem seam untouched, so a
+            # rehearsal still wrote PID files and rotated tokens for real.
+            enable_dry_run(state)
 
     return callback
 
@@ -194,6 +207,110 @@ def _exit(code: int) -> NoReturn:
 # ---------------------------------------------------------------------------
 # How the panel is exposed
 # ---------------------------------------------------------------------------
+
+#: Address family alias, for the helpers below.
+IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
+
+
+def _strip_brackets(host: str) -> str:
+    """
+    Remove the brackets an IPv6 literal is often written with.
+
+    Args:
+        host: The spelling the operator typed.
+
+    Returns:
+        The spelling without a surrounding ``[]`` pair.
+    """
+    candidate = host.strip()
+    if len(candidate) > 1 and candidate.startswith("[") and candidate.endswith("]"):
+        return candidate[1:-1]
+    return candidate
+
+
+def _host_addresses(host: str) -> tuple[IPAddress, ...]:
+    """
+    Return every address a host spelling would end up bound to.
+
+    Comparing host strings is what made this decision wrong: "" , "*", "0",
+    "0.0.0.0", "::" and a name in ``/etc/hosts`` pointing at 0.0.0.0 are six
+    spellings of the same socket, and a set of known-good strings misses five
+    of them. The resolver is asked instead, and its answer is classified with
+    :mod:`ipaddress`.
+
+    Args:
+        host: The spelling the operator typed.
+
+    Returns:
+        The addresses, empty when the spelling cannot be resolved. Empty means
+        "unknown", and every caller treats unknown as exposed.
+    """
+    candidate = _strip_brackets(host)
+    if candidate in WILDCARD_SPELLINGS:
+        return (ipaddress.ip_address(ALL_INTERFACES),)
+
+    try:
+        return (ipaddress.ip_address(candidate),)
+    except ValueError:
+        pass
+
+    try:
+        # A resolution covers names and also the inet_aton spellings ipaddress
+        # refuses but a socket accepts, such as "0" (INADDR_ANY) and "127.1".
+        infos = socket.getaddrinfo(candidate, None, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError, ValueError):
+        return ()
+
+    addresses = []
+    for info in infos:
+        # A link-local sockaddr carries a %scope suffix that ipaddress refuses.
+        text = str(info[4][0]).split("%", 1)[0]
+        try:
+            addresses.append(ipaddress.ip_address(text))
+        except ValueError:
+            return ()
+    return tuple(addresses)
+
+
+def _is_loopback_host(host: str) -> bool:
+    """
+    Report whether only this machine could reach a panel bound to a host.
+
+    Args:
+        host: The spelling the operator typed.
+
+    Returns:
+        True only when the spelling is known to resolve to loopback addresses
+        and nothing else. A spelling that cannot be resolved is not loopback,
+        because guessing in the other direction publishes a root shell.
+    """
+    addresses = _host_addresses(host)
+    return bool(addresses) and all(address.is_loopback for address in addresses)
+
+
+def _normalize_host(host: str) -> str:
+    """
+    Canonicalise a host spelling so what is checked is what is reported.
+
+    Args:
+        host: The spelling the operator typed.
+
+    Returns:
+        The canonical spelling. Every way of writing "every interface" becomes
+        the address it binds, so the refusal below names a real address instead
+        of quoting an empty string back at the operator.
+    """
+    candidate = _strip_brackets(host)
+    addresses = _host_addresses(candidate)
+    if not addresses:
+        return candidate
+    if candidate in WILDCARD_SPELLINGS or all(address.is_unspecified for address in addresses):
+        return str(addresses[0])
+    try:
+        return str(ipaddress.ip_address(candidate))
+    except ValueError:
+        # A name: binding it is the resolver's business, not this module's.
+        return candidate
 
 
 @dataclass(frozen=True)
@@ -303,10 +420,13 @@ def _build_security_config(options: StartOptions) -> SecurityConfig:
     """
     from wasm.web.auth import SecurityConfig
 
-    host = options.host
+    # Normalised first, so the exposure decision, the message and the address
+    # that is finally bound all talk about the same thing.
+    host = _normalize_host(options.host)
     port = options.port
     whitelist = list(options.allow_ip)
     proxies = list(options.trusted_proxy)
+    local_only = _is_loopback_host(host)
 
     if options.require_https and not (options.tls_cert and options.tls_key):
         raise SecurityError(
@@ -319,12 +439,20 @@ def _build_security_config(options: StartOptions) -> SecurityConfig:
             ),
         )
 
-    if host not in LOOPBACK_HOSTS and not options.require_https and not whitelist:
+    if not local_only and not options.require_https and not whitelist:
+        unresolved = (
+            f"WASM could not resolve {host!r}, so it cannot show that only this machine "
+            "would reach the panel, and treats it as exposed.\n"
+            if not _host_addresses(host)
+            else ""
+        )
         raise SecurityError(
             f"Refusing to expose the WASM panel on {host} without TLS or an IP whitelist",
             details=(
                 "The panel drives systemd, nginx and certbot as root, so this would put a "
-                "root shell on the network in cleartext. Pick one:\n"
+                "root shell on the network in cleartext.\n"
+                f"{unresolved}"
+                "Pick one:\n"
                 "  - keep it local and reach it over SSH: "
                 f"wasm web start --host 127.0.0.1 --port {port} "
                 f"(then 'ssh -L {port}:127.0.0.1:{port} user@server')\n"
@@ -346,7 +474,7 @@ def _build_security_config(options: StartOptions) -> SecurityConfig:
         trusted_proxies=proxies,
     )
 
-    if host not in LOOPBACK_HOSTS:
+    if not local_only:
         # The Host header of a panel reachable by address or by name is not
         # something we can enumerate for the operator.
         config.allowed_hosts = []
@@ -581,13 +709,14 @@ def _prompt_install(missing_apt: list[str], missing_pip: list[str], verbose: boo
 # ---------------------------------------------------------------------------
 
 
-def _start(options: StartOptions, verbose: bool) -> int:
+def _start(options: StartOptions, verbose: bool, *, dry_run: bool = False) -> int:
     """
     Start the panel, refusing an unsafe exposure first.
 
     Args:
         options: How the operator asked for the panel to be exposed.
         verbose: Whether to log verbosely.
+        dry_run: Report what would be served instead of serving it.
 
     Returns:
         Exit code.
@@ -597,14 +726,17 @@ def _start(options: StartOptions, verbose: bool) -> int:
     """
     logger = Logger(verbose=verbose)
 
-    # Check dependencies
+    # Dependencies first: SecurityConfig lives in wasm.web.auth, which imports
+    # fastapi, so building the configuration on a host without the panel's
+    # packages would answer a missing dependency with an ImportError traceback.
     all_installed, missing_apt, missing_pip = _check_dependencies()
     if not all_installed:
         logger.error("Web dependencies not installed")
         logger.info(f"Missing packages: {', '.join(missing_apt)}")
 
-        # Offer to install automatically
-        if _prompt_install(missing_apt, missing_pip, verbose):
+        # Offer to install automatically. A rehearsal never offers: accepting
+        # would install packages, which is exactly what it promised not to do.
+        if not dry_run and _prompt_install(missing_apt, missing_pip, verbose):
             # Re-check after installation
             all_installed, _, _ = _check_dependencies()
             if all_installed:
@@ -622,6 +754,12 @@ def _start(options: StartOptions, verbose: bool) -> int:
             logger.info("Or run: wasm web install")
             return 1
 
+    # Refuses an unsafe exposure before a stale PID file is removed or a socket
+    # is bound. Everything this call does is a read, so a rehearsal reaches it
+    # too and reports the same refusal a real run would.
+    config = _build_security_config(options)
+    host = config.host
+
     # Check if already running
     pid_file = get_pid_file()
     if pid_file.exists():
@@ -634,21 +772,27 @@ def _start(options: StartOptions, verbose: bool) -> int:
             return 1
         except (ProcessLookupError, ValueError):
             # Process not running, remove stale PID file
-            pid_file.unlink(missing_ok=True)
-
-    # Refuses an unsafe exposure before anything is bound or written.
-    config = _build_security_config(options)
-    host = config.host
+            get_fs().remove(pid_file, missing_ok=True)
 
     if config.ip_whitelist:
         logger.info(f"Only these clients may connect: {', '.join(config.ip_whitelist)}")
     if config.trusted_proxies:
         logger.info(f"Forwarding headers believed from: {', '.join(config.trusted_proxies)}")
-    elif host in LOOPBACK_HOSTS and not config.require_https:
+    elif _is_loopback_host(host) and not config.require_https:
         logger.warning(
             "Serving plain HTTP on loopback. Behind a TLS proxy, pass --trusted-proxy "
             "so the session cookie is issued with the Secure flag."
         )
+
+    if dry_run:
+        # Serving is neither a subprocess nor a file write, so neither seam
+        # would have stopped it: a rehearsal that binds a root panel to a port
+        # is the defect this flag exists to prevent.
+        scheme = "https" if config.require_https else "http"
+        placement = "in the background" if options.daemon else "in the foreground"
+        logger.info(f"would serve the panel {placement} at {scheme}://{host}:{config.port}")
+        logger.info(f"would record the process in {pid_file}")
+        return 0
 
     if options.daemon:
         return _start_daemon(config, verbose)
@@ -668,15 +812,16 @@ def _start_foreground(config: SecurityConfig) -> int:
     from wasm.web.server import run_server
 
     # Create PID file
+    fs = get_fs()
     pid_file = get_pid_file()
-    pid_file.parent.mkdir(parents=True, exist_ok=True)
-    pid_file.write_text(str(os.getpid()))
+    fs.make_dir(pid_file.parent)
+    fs.write_text(pid_file, str(os.getpid()))
 
     try:
         run_server(host=config.host, port=config.port, config=config, show_token=True)
         return 0
     finally:
-        pid_file.unlink(missing_ok=True)
+        fs.remove(pid_file, missing_ok=True)
 
 
 def _start_daemon(config: SecurityConfig, verbose: bool) -> int:
@@ -719,10 +864,12 @@ def _start_daemon(config: SecurityConfig, verbose: bool) -> int:
     with open("/dev/null") as devnull:
         os.dup2(devnull.fileno(), sys.stdin.fileno())
 
+    fs = get_fs()
+
     log_file = Path("/var/log/wasm/web.log")
     if not log_file.parent.exists():
         log_file = Path.home() / ".wasm" / "web.log"
-    log_file.parent.mkdir(parents=True, exist_ok=True)
+    fs.make_dir(log_file.parent)
 
     with open(log_file, "a") as log:
         os.dup2(log.fileno(), sys.stdout.fileno())
@@ -730,8 +877,8 @@ def _start_daemon(config: SecurityConfig, verbose: bool) -> int:
 
     # Write PID file
     pid_file = get_pid_file()
-    pid_file.parent.mkdir(parents=True, exist_ok=True)
-    pid_file.write_text(str(os.getpid()))
+    fs.make_dir(pid_file.parent)
+    fs.write_text(pid_file, str(os.getpid()))
 
     # Start server
     try:
@@ -739,22 +886,24 @@ def _start_daemon(config: SecurityConfig, verbose: bool) -> int:
 
         run_server(host=config.host, port=config.port, config=config, show_token=False)
     finally:
-        pid_file.unlink(missing_ok=True)
+        fs.remove(pid_file, missing_ok=True)
 
     os._exit(0)
 
 
-def _stop(verbose: bool) -> int:
+def _stop(verbose: bool, *, dry_run: bool = False) -> int:
     """
     Stop the running panel.
 
     Args:
         verbose: Whether to log verbosely.
+        dry_run: Report the signal instead of sending it.
 
     Returns:
         Exit code.
     """
     logger = Logger(verbose=verbose)
+    fs = get_fs()
 
     pid_file = get_pid_file()
 
@@ -765,22 +914,28 @@ def _stop(verbose: bool) -> int:
     try:
         pid = int(pid_file.read_text().strip())
 
+        if dry_run:
+            # A signal is neither a subprocess nor a file write, so nothing
+            # below the CLI would have held it back.
+            logger.info(f"would send SIGTERM to PID {pid} and remove {pid_file}")
+            return 0
+
         # Send SIGTERM
         os.kill(pid, signal.SIGTERM)
         logger.success(f"Web server stopped (PID: {pid})")
 
         # Remove PID file
-        pid_file.unlink(missing_ok=True)
+        fs.remove(pid_file, missing_ok=True)
 
         return 0
 
     except ProcessLookupError:
         logger.info("Web server is not running (stale PID file removed)")
-        pid_file.unlink(missing_ok=True)
+        fs.remove(pid_file, missing_ok=True)
         return 0
     except ValueError:
         logger.error("Invalid PID file")
-        pid_file.unlink(missing_ok=True)
+        fs.remove(pid_file, missing_ok=True)
         return 1
     except PermissionError:
         logger.error("Permission denied. Try running with sudo.")
@@ -831,20 +986,21 @@ def _status(verbose: bool) -> int:
 
     except ProcessLookupError:
         logger.key_value("Status", "not running (stale PID)")
-        pid_file.unlink(missing_ok=True)
+        get_fs().remove(pid_file, missing_ok=True)
         return 0
     except ValueError:
         logger.error("Invalid PID file")
         return 1
 
 
-def _restart(options: StartOptions, verbose: bool) -> int:
+def _restart(options: StartOptions, verbose: bool, *, dry_run: bool = False) -> int:
     """
     Stop the panel and start it again with new options.
 
     Args:
         options: How the operator asked for the panel to be exposed.
         verbose: Whether to log verbosely.
+        dry_run: Report both halves instead of performing them.
 
     Returns:
         Exit code.
@@ -856,20 +1012,22 @@ def _restart(options: StartOptions, verbose: bool) -> int:
 
     logger.info("Restarting web server...")
 
-    _stop(verbose)
+    _stop(verbose, dry_run=dry_run)
 
-    # The old process needs a moment to release the listening socket.
-    time.sleep(RESTART_PAUSE)
+    # The old process needs a moment to release the listening socket. There is
+    # no socket to wait for when nothing was stopped.
+    if not dry_run:
+        time.sleep(RESTART_PAUSE)
 
-    return _start(options, verbose)
+    return _start(options, verbose, dry_run=dry_run)
 
 
 def _confirm_token_change(config: SecurityConfig, regenerate: bool) -> None:
     """
     Ask before invalidating credentials that are already in use.
 
-    Nothing is asked when there is no token yet: the first one costs nobody
-    anything.
+    Nothing is asked when there is nothing to invalidate: the first token and
+    the first signing key cost nobody anything.
 
     Args:
         config: Configuration naming the files that would be rewritten.
@@ -878,7 +1036,8 @@ def _confirm_token_change(config: SecurityConfig, regenerate: bool) -> None:
     Raises:
         click.Abort: When the operator declines.
     """
-    if not config.token_file.exists():
+    in_use = config.token_file.exists() or (regenerate and config.secret_file.exists())
+    if not in_use:
         return
 
     if regenerate:
@@ -895,18 +1054,62 @@ def _confirm_token_change(config: SecurityConfig, regenerate: bool) -> None:
     click.confirm(message, abort=True)
 
 
-def _token(regenerate: bool, confirm: bool, verbose: bool) -> int:
+def _token_status(config: SecurityConfig, logger: Logger) -> int:
     """
-    Issue an access token and print it.
+    Report what is known about the access token, changing nothing.
 
-    The stored token is a salted hash, so an existing token cannot be read back:
-    the only way to answer "what is my token" is to issue a new one, which is
-    what this does.
+    Args:
+        config: Configuration naming the files that hold the credentials.
+        logger: Logger for the report.
+
+    Returns:
+        Exit code.
+    """
+    logger.header("WASM Web Access Token")
+
+    if not config.token_file.exists():
+        logger.key_value("Status", "no token has been issued yet")
+        logger.blank()
+        logger.info("Issue the first one with: wasm web token --new")
+        return 0
+
+    issued = datetime.fromtimestamp(config.token_file.stat().st_mtime)
+    logger.key_value("Status", "issued")
+    logger.key_value("Token file", str(config.token_file))
+    logger.key_value("Issued", issued.isoformat(sep=" ", timespec="seconds"))
+    logger.blank()
+    logger.info(
+        "The token is stored as a salted hash, so it cannot be read back here. "
+        "If you have lost it, issue a new one with 'wasm web token --new'; "
+        "the token currently in use stops working."
+    )
+    return 0
+
+
+def _token(
+    regenerate: bool,
+    confirm: bool,
+    verbose: bool,
+    *,
+    issue: bool = False,
+    dry_run: bool = False,
+) -> int:
+    """
+    Report the state of the access token, or issue a new one on request.
+
+    Showing is the default because that is what operators run this for. The
+    stored token is a salted hash and cannot be read back, so issuing a new one
+    is the only way to hold a token again - and it invalidates the one in use,
+    which is far too much to do to somebody who only typed ``wasm web token``.
+    So it takes ``--new`` (or ``--regenerate``) and a confirmation.
 
     Args:
         regenerate: Also rotate the signing key, revoking every session.
-        confirm: Ask before invalidating a token that is already in use.
+            Implies issuing a new token.
+        confirm: Ask before invalidating credentials that are already in use.
         verbose: Whether to log verbosely.
+        issue: Issue a new access token, replacing the one in use.
+        dry_run: Report what would be replaced instead of replacing it.
 
     Returns:
         Exit code.
@@ -932,8 +1135,20 @@ def _token(regenerate: bool, confirm: bool, verbose: bool) -> int:
 
     config = SecurityConfig()
 
+    if not (issue or regenerate):
+        return _token_status(config, logger)
+
     if confirm:
         _confirm_token_change(config, regenerate)
+
+    if dry_run:
+        # TokenManager writes the signing key the moment it is constructed, so
+        # the rehearsal has to stop before that and not after.
+        logger.info(f"would issue a new access token and rewrite {config.token_file}")
+        if regenerate:
+            logger.info(f"would rotate the signing key in {config.secret_file}")
+            logger.info(f"would revoke every session in {config.session_db}")
+        return 0
 
     token_manager = TokenManager(config)
 
@@ -1155,7 +1370,7 @@ def start_command(
         allow_ip=tuple(allow_ip),
         trusted_proxy=tuple(trusted_proxy),
     )
-    _exit(_start(options, ctx.verbose))
+    _exit(_start(options, ctx.verbose, dry_run=ctx.dry_run))
 
 
 @cli.command("stop")
@@ -1163,7 +1378,7 @@ def start_command(
 @pass_context
 def stop_command(ctx: Context) -> NoReturn:
     """Stop the running panel."""
-    _exit(_stop(ctx.verbose))
+    _exit(_stop(ctx.verbose, dry_run=ctx.dry_run))
 
 
 @cli.command("status")
@@ -1200,22 +1415,42 @@ def restart_command(
         allow_ip=tuple(allow_ip),
         trusted_proxy=tuple(trusted_proxy),
     )
-    _exit(_restart(options, ctx.verbose))
+    _exit(_restart(options, ctx.verbose, dry_run=ctx.dry_run))
 
 
 @cli.command("token")
 @click.option(
+    "--new",
+    "--rotate",
+    "issue",
+    is_flag=True,
+    help="Issue a new access token. The token currently in use stops working.",
+)
+@click.option(
     "-r",
     "--regenerate",
     is_flag=True,
-    help="Also rotate the signing key, which logs out every open session.",
+    help="Issue a new token and rotate the signing key, logging out every open session.",
 )
 @click.option("-y", "--yes", "assume_yes", is_flag=True, help="Do not ask for confirmation.")
 @global_flags
 @pass_context
-def token_command(ctx: Context, regenerate: bool, assume_yes: bool) -> NoReturn:
-    """Issue a new access token and print it."""
-    _exit(_token(regenerate=regenerate, confirm=not assume_yes, verbose=ctx.verbose))
+def token_command(ctx: Context, issue: bool, regenerate: bool, assume_yes: bool) -> NoReturn:
+    """
+    Show the state of the access token, or issue a new one with --new.
+
+    Showing is the default: issuing a token invalidates the one the panel is
+    being used with right now, and nobody types 'wasm web token' meaning that.
+    """
+    _exit(
+        _token(
+            regenerate=regenerate,
+            confirm=not assume_yes,
+            verbose=ctx.verbose,
+            issue=issue,
+            dry_run=ctx.dry_run,
+        )
+    )
 
 
 @cli.command("install")
@@ -1245,7 +1480,7 @@ def _handle_start(args: Namespace) -> int:
     Returns:
         Exit code.
     """
-    return _start(_start_options(args), args.verbose)
+    return _start(_start_options(args), args.verbose, dry_run=bool(getattr(args, "dry_run", False)))
 
 
 def _handle_stop(args: Namespace) -> int:
@@ -1258,7 +1493,7 @@ def _handle_stop(args: Namespace) -> int:
     Returns:
         Exit code.
     """
-    return _stop(args.verbose)
+    return _stop(args.verbose, dry_run=bool(getattr(args, "dry_run", False)))
 
 
 def _handle_status(args: Namespace) -> int:
@@ -1284,12 +1519,18 @@ def _handle_restart(args: Namespace) -> int:
     Returns:
         Exit code.
     """
-    return _restart(_start_options(args), args.verbose)
+    return _restart(
+        _start_options(args), args.verbose, dry_run=bool(getattr(args, "dry_run", False))
+    )
 
 
 def _handle_token(args: Namespace) -> int:
     """
     Handle ``web token`` from the argparse tree.
+
+    The default is a report here too. Two front doors that disagree on whether
+    a bare ``token`` invalidates the credential in use is worse than either
+    behaviour on its own.
 
     Args:
         args: Parsed arguments.
@@ -1301,6 +1542,8 @@ def _handle_token(args: Namespace) -> int:
         regenerate=bool(getattr(args, "regenerate", False)),
         confirm=False,
         verbose=args.verbose,
+        issue=bool(getattr(args, "new", False)),
+        dry_run=bool(getattr(args, "dry_run", False)),
     )
 
 

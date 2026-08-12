@@ -21,6 +21,7 @@ import inspect
 import json
 import os
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -277,6 +278,159 @@ def test_binding_to_every_interface_without_protection_is_refused(
     assert "config" not in started
 
 
+#: Every way of asking a socket for every interface. The first one is the
+#: reported regression: an earlier version kept a set of loopback strings with
+#: "" in it, so an empty host read as loopback and bound INADDR_ANY.
+ALL_INTERFACES_SPELLINGS = ["", "0.0.0.0", "::", "*", "0", "[::]", " 0.0.0.0 "]  # noqa: S104
+
+
+@pytest.mark.parametrize("spelling", ALL_INTERFACES_SPELLINGS)
+def test_no_spelling_of_every_interface_escapes_the_refusal(
+    cli_runner: CliRunner,
+    deps_present: None,
+    pid_file: Path,
+    started: dict[str, Any],
+    spelling: str,
+) -> None:
+    """
+    The refusal is about the address bound, not about the string typed.
+
+    Args:
+        spelling: One way of writing "every interface".
+    """
+    result = cli_runner.invoke(web.cli, ["start", "--host", spelling])
+
+    assert isinstance(result.exception, SecurityError), result.output
+    assert "--allow-ip" in result.exception.details
+    assert "config" not in started
+
+
+def test_a_name_that_resolves_to_every_interface_is_refused(
+    cli_runner: CliRunner,
+    deps_present: None,
+    pid_file: Path,
+    started: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A line in /etc/hosts is not a way past the refusal."""
+    monkeypatch.setattr(
+        web.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(2, 1, 6, "", (ALL_INTERFACES, 0))],
+    )
+
+    result = cli_runner.invoke(web.cli, ["start", "--host", "panel.internal"])
+
+    assert isinstance(result.exception, SecurityError), result.output
+    assert "config" not in started
+
+
+def test_a_host_that_cannot_be_resolved_is_treated_as_exposed(
+    cli_runner: CliRunner,
+    deps_present: None,
+    pid_file: Path,
+    started: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unknown is not loopback: guessing the other way publishes a root shell."""
+
+    def unresolvable(*args: Any, **kwargs: Any) -> list[Any]:
+        raise OSError("Name or service not known")
+
+    monkeypatch.setattr(web.socket, "getaddrinfo", unresolvable)
+
+    result = cli_runner.invoke(web.cli, ["start", "--host", "panel.invalid"])
+
+    assert isinstance(result.exception, SecurityError), result.output
+    assert "could not resolve" in result.exception.details
+    assert "config" not in started
+
+
+@pytest.mark.parametrize("spelling", ["127.0.0.1", "::1", "localhost", "127.1", "[::1]"])
+def test_every_spelling_of_loopback_still_starts_unprotected(
+    cli_runner: CliRunner,
+    deps_present: None,
+    pid_file: Path,
+    started: dict[str, Any],
+    spelling: str,
+) -> None:
+    """
+    Nothing beyond this machine can reach these, so no flags are demanded.
+
+    Args:
+        spelling: One way of writing an address only this machine answers on.
+    """
+    result = cli_runner.invoke(web.cli, ["start", "--host", spelling])
+
+    assert result.exit_code == 0, result.output
+    assert started["config"].allowed_hosts != []
+
+
+def test_an_empty_host_is_reported_as_the_address_it_would_bind(
+    cli_runner: CliRunner, deps_present: None, pid_file: Path, started: dict[str, Any]
+) -> None:
+    """The message names an address, so the operator can act on it."""
+    result = cli_runner.invoke(web.cli, ["start", "--host", ""])
+
+    assert isinstance(result.exception, SecurityError)
+    assert ALL_INTERFACES in str(result.exception)
+
+
+def test_a_wildcard_host_is_normalised_before_it_is_bound(
+    cli_runner: CliRunner, deps_present: None, pid_file: Path, started: dict[str, Any]
+) -> None:
+    """What was checked and what is served have to be the same address."""
+    result = cli_runner.invoke(web.cli, ["start", "--host", "", "--allow-ip", "10.0.0.0/24"])
+
+    assert result.exit_code == 0, result.output
+    assert started["config"].host == ALL_INTERFACES
+
+
+def test_a_refused_exposure_changes_nothing_first(
+    cli_runner: CliRunner,
+    deps_present: None,
+    pid_file: Path,
+    started: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The refusal comes before the stale PID file is cleared, not after."""
+    pid_file.write_text("4321")
+
+    def gone(pid: int, sig: int) -> None:
+        raise ProcessLookupError
+
+    monkeypatch.setattr(os, "kill", gone)
+
+    result = cli_runner.invoke(web.cli, ["start", "--host", ALL_INTERFACES])
+
+    assert isinstance(result.exception, SecurityError)
+    assert pid_file.read_text() == "4321"
+
+
+def test_missing_dependencies_are_reported_before_the_panel_is_configured(
+    cli_runner: CliRunner,
+    pid_file: Path,
+    started: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    SecurityConfig lives behind fastapi.
+
+    Building it before the dependency check would answer a missing package with
+    an ImportError traceback instead of the line that says how to install it.
+    """
+    monkeypatch.setattr(
+        web, "_check_dependencies", lambda: (False, ["python3-fastapi"], ["fastapi>=0.109.0"])
+    )
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+
+    result = cli_runner.invoke(web.cli, ["start"])
+
+    assert result.exit_code == 1
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "python3-fastapi" in result.output
+
+
 def test_require_https_without_material_is_refused(
     cli_runner: CliRunner, deps_present: None, pid_file: Path, started: dict[str, Any]
 ) -> None:
@@ -406,6 +560,144 @@ def test_install_refuses_both_package_managers(cli_runner: CliRunner) -> None:
 
 
 # ---------------------------------------------------------------------------
+# A rehearsal that changes nothing
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def seams() -> Iterator[None]:
+    """
+    Put the process-wide runner and filesystem back after the test.
+
+    ``--dry-run`` swaps both, and they are module globals: a test that turns it
+    on and does not put them back leaks a filesystem that refuses to write into
+    every test that follows.
+
+    Yields:
+        None.
+    """
+    from wasm.core.fs import set_fs
+    from wasm.core.runner import set_runner
+
+    try:
+        yield
+    finally:
+        set_fs(None)
+        set_runner(None)
+
+
+@pytest.mark.parametrize("argv", [["start", "--dry-run"], ["--dry-run", "start"]])
+def test_a_rehearsed_start_binds_nothing(
+    cli_runner: CliRunner,
+    deps_present: None,
+    pid_file: Path,
+    started: dict[str, Any],
+    seams: None,
+    argv: list[str],
+) -> None:
+    """
+    Serving is neither a subprocess nor a write, so only the command may stop it.
+
+    Args:
+        argv: The invocation, with the flag typed before and after the command.
+    """
+    result = cli_runner.invoke(web.cli, argv)
+
+    assert result.exit_code == 0, result.output
+    assert "config" not in started
+    assert not pid_file.exists()
+    assert "would serve the panel" in result.output
+
+
+def test_a_rehearsed_start_installs_the_filesystem_seam(
+    cli_runner: CliRunner,
+    deps_present: None,
+    pid_file: Path,
+    started: dict[str, Any],
+    seams: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A stale PID file is a ``Path.unlink``: only the fs seam holds it back.
+
+    Wiring just the command runner is what let ``--dry-run`` announce that
+    nothing would change and then delete a file.
+    """
+    pid_file.write_text("4321")
+
+    def gone(pid: int, sig: int) -> None:
+        raise ProcessLookupError
+
+    monkeypatch.setattr(os, "kill", gone)
+
+    result = cli_runner.invoke(web.cli, ["start", "--dry-run"])
+
+    assert result.exit_code == 0, result.output
+    assert pid_file.read_text() == "4321"
+
+
+def test_a_rehearsed_stop_signals_nothing(
+    cli_runner: CliRunner, pid_file: Path, seams: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The panel is still running afterwards, and its PID file is still there."""
+    pid_file.write_text("4321")
+    signalled: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: signalled.append((pid, sig)))
+
+    result = cli_runner.invoke(web.cli, ["stop", "--dry-run"])
+
+    assert result.exit_code == 0, result.output
+    assert signalled == []
+    assert pid_file.read_text() == "4321"
+    assert "would send SIGTERM to PID 4321" in result.output
+
+
+def test_a_rehearsed_rotation_keeps_the_token_in_use(
+    cli_runner: CliRunner, deps_present: None, state_dir: Path, seams: None
+) -> None:
+    """The signing key and the token hash are written outside both seams."""
+    cli_runner.invoke(web.cli, ["token", "--new", "--yes"])
+    token_before = (state_dir / "web-token").read_text()
+    key_before = (state_dir / "web-secret").read_text()
+
+    result = cli_runner.invoke(web.cli, ["token", "--regenerate", "--yes", "--dry-run"])
+
+    assert result.exit_code == 0, result.output
+    assert (state_dir / "web-token").read_text() == token_before
+    assert (state_dir / "web-secret").read_text() == key_before
+    assert "would rotate the signing key" in result.output
+
+
+def test_a_rehearsal_announces_itself_once(
+    cli_runner: CliRunner,
+    deps_present: None,
+    pid_file: Path,
+    started: dict[str, Any],
+    seams: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The flag before and after the command name is one rehearsal, not two.
+
+    The announcement comes from the shared context's logger, which binds its
+    stream when it is built, so that logger is redirected too.
+    """
+    from wasm.cli import app as cli_app
+
+    real_logger = cli_app.Logger
+    monkeypatch.setattr(
+        cli_app, "Logger", lambda **kwargs: real_logger(stream=sys.stdout, **kwargs)
+    )
+
+    state = cli_app.Context()
+    result = cli_runner.invoke(web.cli, ["--dry-run", "start", "--dry-run"], obj=state)
+
+    assert result.exit_code == 0, result.output
+    assert state.dry_run_active is True
+    assert result.output.count("Dry run:") == 1
+
+
+# ---------------------------------------------------------------------------
 # Stop and status
 # ---------------------------------------------------------------------------
 
@@ -451,7 +743,7 @@ def test_restart_stops_then_starts(
     """Restart is a stop and a start, with the new options applied."""
     order: list[str] = []
 
-    def record_stop(verbose: bool) -> int:
+    def record_stop(verbose: bool, *, dry_run: bool = False) -> int:
         order.append("stop")
         return 0
 
@@ -490,11 +782,61 @@ def state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return directory
 
 
-def test_token_prints_an_access_token(
+def test_a_bare_token_command_does_not_touch_the_token_in_use(
     cli_runner: CliRunner, deps_present: None, state_dir: Path
 ) -> None:
-    """``wasm web token`` answers the question operators actually ask."""
+    """
+    The reported defect: ``wasm web token`` silently revoked the root credential.
+
+    Operators run it to look the token up, so a bare invocation reports and
+    changes nothing. Rotating is what needs to be typed out.
+    """
+    cli_runner.invoke(web.cli, ["token", "--new", "--yes"])
+    before = (state_dir / "web-token").read_text()
+
     result = cli_runner.invoke(web.cli, ["token"])
+
+    assert result.exit_code == 0, result.output
+    assert (state_dir / "web-token").read_text() == before
+    assert "Access Token: wasm_" not in result.output
+    assert "wasm web token --new" in result.output
+
+
+def test_the_status_report_says_when_the_token_was_issued(
+    cli_runner: CliRunner, deps_present: None, state_dir: Path
+) -> None:
+    """Showing is the default, so it has to be worth reading."""
+    cli_runner.invoke(web.cli, ["token", "--new", "--yes"])
+
+    result = cli_runner.invoke(web.cli, ["token"])
+
+    assert result.exit_code == 0, result.output
+    assert "web-token" in result.output
+    assert "salted hash" in result.output
+
+
+def test_the_status_report_says_when_no_token_exists_yet(
+    cli_runner: CliRunner, deps_present: None, state_dir: Path
+) -> None:
+    """A fresh install is a state the report has to name, not a crash."""
+    result = cli_runner.invoke(web.cli, ["token"])
+
+    assert result.exit_code == 0, result.output
+    assert "no token" in result.output
+    assert not (state_dir / "web-token").exists()
+
+
+@pytest.mark.parametrize("flag", ["--new", "--rotate"])
+def test_issuing_a_token_prints_it(
+    cli_runner: CliRunner, deps_present: None, state_dir: Path, flag: str
+) -> None:
+    """
+    Both spellings of the explicit request issue a token.
+
+    Args:
+        flag: The spelling under test.
+    """
+    result = cli_runner.invoke(web.cli, ["token", flag])
 
     assert result.exit_code == 0, result.output
     assert "Access Token: wasm_" in result.output
@@ -507,7 +849,7 @@ def test_token_is_verified_by_the_manager_that_issued_it(
     """The printed token is the one the panel will accept at the login form."""
     from wasm.web.auth import SecurityConfig, TokenManager
 
-    result = cli_runner.invoke(web.cli, ["token"])
+    result = cli_runner.invoke(web.cli, ["token", "--new"])
     printed = next(
         line.split("Access Token:", 1)[1].strip()
         for line in result.output.splitlines()
@@ -521,7 +863,7 @@ def test_regenerate_rotates_the_signing_key(
     cli_runner: CliRunner, deps_present: None, state_dir: Path
 ) -> None:
     """--regenerate replaces the key, which is what revokes every session."""
-    cli_runner.invoke(web.cli, ["token", "--yes"])
+    cli_runner.invoke(web.cli, ["token", "--new", "--yes"])
     first_key = (state_dir / "web-secret").read_text()
 
     result = cli_runner.invoke(web.cli, ["token", "--regenerate", "--yes"])
@@ -535,10 +877,10 @@ def test_replacing_a_token_in_use_asks_first(
     cli_runner: CliRunner, deps_present: None, state_dir: Path
 ) -> None:
     """The prompt names the file and the consequence, and declining changes nothing."""
-    cli_runner.invoke(web.cli, ["token", "--yes"])
+    cli_runner.invoke(web.cli, ["token", "--new", "--yes"])
     before = (state_dir / "web-token").read_text()
 
-    result = cli_runner.invoke(web.cli, ["token"], input="n\n")
+    result = cli_runner.invoke(web.cli, ["token", "--new"], input="n\n")
 
     assert result.exit_code != 0
     assert "web-token" in result.output
@@ -546,11 +888,25 @@ def test_replacing_a_token_in_use_asks_first(
     assert (state_dir / "web-token").read_text() == before
 
 
+def test_regenerating_names_the_sessions_it_would_close(
+    cli_runner: CliRunner, deps_present: None, state_dir: Path
+) -> None:
+    """The consequence an operator cannot undo has to be in the question."""
+    cli_runner.invoke(web.cli, ["token", "--new", "--yes"])
+    before = (state_dir / "web-secret").read_text()
+
+    result = cli_runner.invoke(web.cli, ["token", "--regenerate"], input="n\n")
+
+    assert result.exit_code != 0
+    assert "logged out" in result.output
+    assert (state_dir / "web-secret").read_text() == before
+
+
 def test_the_first_token_is_not_worth_a_prompt(
     cli_runner: CliRunner, deps_present: None, state_dir: Path
 ) -> None:
     """There is nothing to invalidate before a token exists."""
-    result = cli_runner.invoke(web.cli, ["token"], input="")
+    result = cli_runner.invoke(web.cli, ["token", "--new"], input="")
 
     assert result.exit_code == 0, result.output
     assert "Access Token: wasm_" in result.output

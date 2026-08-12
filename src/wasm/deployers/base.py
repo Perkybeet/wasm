@@ -15,7 +15,6 @@ here.
 
 from __future__ import annotations
 
-import shutil
 from abc import abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -23,6 +22,7 @@ from typing import Any, ClassVar, Literal
 
 from wasm.core.config import Config
 from wasm.core.exceptions import BuildError, DeploymentError, OutOfMemoryError, WASMError
+from wasm.core.fs import FileSystem
 from wasm.core.logger import Icons, Logger
 from wasm.core.runner import CommandResult, CommandRunner, get_runner
 from wasm.core.store import (
@@ -87,7 +87,12 @@ class BaseDeployer(AppDeployer):
     # System dependencies
     SYSTEM_DEPS: ClassVar[list[str]] = []
 
-    def __init__(self, verbose: bool = False, runner: CommandRunner | None = None):
+    def __init__(
+        self,
+        verbose: bool = False,
+        runner: CommandRunner | None = None,
+        fs: FileSystem | None = None,
+    ):
         """
         Initialize the deployer.
 
@@ -95,12 +100,15 @@ class BaseDeployer(AppDeployer):
             verbose: Enable verbose logging.
             runner: Command runner used for install and build commands. Defaults
                 to the process-wide runner, which is what enforces --dry-run.
+            fs: Filesystem every change goes through. Defaults to the
+                process-wide one, for the same reason.
         """
         self.verbose = verbose
         self.config = Config()
         self.logger = Logger(verbose=verbose)
         self.store = get_store()
         self._runner = runner
+        self._fs = fs
 
         # Managers are built on first use. Detection instantiates every
         # registered deployer just to ask "is this yours?", and constructing
@@ -158,7 +166,7 @@ class BaseDeployer(AppDeployer):
     def source_manager(self) -> SourceManager:
         """The manager that fetches source code."""
         if self._source_manager is None:
-            self._source_manager = SourceManager(verbose=self.verbose)
+            self._source_manager = SourceManager(verbose=self.verbose, fs=self._fs)
         return self._source_manager
 
     @source_manager.setter
@@ -688,7 +696,12 @@ class BaseDeployer(AppDeployer):
         """Delete the fetched application directory."""
         if self.app_path and self.app_path.exists():
             self.logger.debug(f"Removing app files: {self.app_path}")
-            shutil.rmtree(self.app_path, ignore_errors=True)
+            try:
+                self.fs.remove_tree(self.app_path)
+            except OSError as e:
+                # An undo runs while something has already gone wrong; one
+                # directory that will not go away must not hide that failure.
+                self.logger.debug(f"Could not remove {self.app_path}: {e}")
 
     def remove_site(self) -> None:
         """Remove the web server site configuration for this domain."""

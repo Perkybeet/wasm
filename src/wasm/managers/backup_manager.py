@@ -23,8 +23,24 @@ that promise, and this module exists in its current shape because of them:
   reused here rather than re-implemented.
 - **``verify()`` verified nothing** it could not see: it shelled out to
   ``sha256sum`` and ``tar -tzf``. Both checks now run in process, and the
-  archive is opened and walked, so a corrupted backup is found before a restore
-  needs it.
+  archive is unpacked with the *same* extractor a restore uses, so an archive
+  that ``restore()`` would always refuse is reported before a restore needs it.
+  ``tar -tzf`` said "valid" for an archive full of absolute symlinks.
+- **A Python application's backup could not be restored at all.**
+  ``PythonDeployer`` creates ``<app>/venv``, a virtualenv is full of absolute
+  symlinks into ``/usr``, and the hardened extractor refuses those - correctly,
+  because that is how an archive reaches a file outside the deployment. So the
+  virtualenv is excluded from the archive (see :attr:`BackupManager.DEFAULT_EXCLUDES`)
+  and rebuilt from ``requirements.txt`` on the next install, which is also the
+  only way it could ever have worked: a venv carries the absolute paths of the
+  machine that built it.
+
+**Rehearsals.** Everything that changes the persistent filesystem goes through
+:mod:`wasm.core.fs`, because ``wasm --dry-run backup delete <id> --force`` used
+to announce a rehearsal and then unlink the archive. The one thing that does not
+is the archive built inside a :class:`tempfile.TemporaryDirectory`: it is
+staging, it is removed by its own context manager, and a rehearsal never reaches
+it (see :meth:`BackupManager.create`).
 
 **Size limits.** The whole application tree, every dump and every volume go into
 one archive, so a backup is as large as the data it protects. Extraction is
@@ -60,6 +76,13 @@ from wasm.core.exceptions import (
     ServiceError,
     ValidationError,
     WASMError,
+)
+from wasm.core.fs import (
+    SECRET_DIR_MODE,
+    SECRET_MODE,
+    DryRunFileSystem,
+    FileSystem,
+    get_fs,
 )
 from wasm.core.logger import Logger
 from wasm.core.runner import DEFAULT_TIMEOUT, CommandResult, CommandRunner, get_runner
@@ -256,9 +279,17 @@ class BackupManager:
     # Default backup directory
     DEFAULT_BACKUP_DIR = Path("/var/backups/wasm")
 
-    # Files/directories to always exclude from backups
+    # Files/directories to always exclude from backups.
+    #
+    # The virtualenv entries are not a size optimisation. A venv is a tree of
+    # absolute symlinks into the interpreter of the machine that built it, and
+    # the extractor a restore uses refuses absolute link targets, so an archive
+    # containing one could never be restored - the backup only looked like a
+    # backup. ``install_dependencies()`` recreates it from requirements.txt.
     DEFAULT_EXCLUDES: ClassVar[list[str]] = [
         "node_modules",
+        "venv",
+        ".venv",
         ".git",
         "__pycache__",
         "*.pyc",
@@ -288,7 +319,12 @@ class BackupManager:
     # level and pointed at dumps living outside the archive.
     BACKUP_VERSION = "2.0.0"
 
-    def __init__(self, verbose: bool = False, runner: CommandRunner | None = None) -> None:
+    def __init__(
+        self,
+        verbose: bool = False,
+        runner: CommandRunner | None = None,
+        fs: FileSystem | None = None,
+    ) -> None:
         """
         Initialize the backup manager.
 
@@ -296,11 +332,15 @@ class BackupManager:
             verbose: Enable verbose logging.
             runner: Command runner used for docker, chown and hooks. Defaults
                 to the process-wide runner.
+            fs: Filesystem used for every change to the persistent tree.
+                Defaults to the process-wide one, which is what makes
+                ``--dry-run`` true for a deletion as well as for a command.
         """
         self.verbose = verbose
         self.logger = Logger(verbose=verbose)
         self.config = Config()
         self._runner = runner
+        self._fs = fs
         self.service_manager = ServiceManager(verbose=verbose, runner=runner)
 
         self.backup_dir = Path(self.config.get("backup.directory", str(self.DEFAULT_BACKUP_DIR)))
@@ -319,6 +359,32 @@ class BackupManager:
             The injected runner, or the process-wide one.
         """
         return self._runner or get_runner()
+
+    @property
+    def fs(self) -> FileSystem:
+        """
+        Return the filesystem used for every change to the persistent tree.
+
+        Returns:
+            The injected filesystem, or the process-wide one.
+        """
+        return self._fs or get_fs()
+
+    @property
+    def _rehearsing(self) -> bool:
+        """
+        Report whether changes are being rehearsed rather than applied.
+
+        Only :meth:`create` asks. Every other operation stays oblivious and
+        lets the seam refuse, which is the whole point of having a seam; but
+        building a multi-gigabyte archive and dumping production databases in
+        order to throw the result away is not a rehearsal, it is the operation.
+
+        Returns:
+            True when the active filesystem records changes instead of making
+            them.
+        """
+        return isinstance(self.fs, DryRunFileSystem)
 
     def _exec(
         self,
@@ -344,14 +410,19 @@ class BackupManager:
 
     def _ensure_backup_dir(self) -> None:
         """
-        Ensure the backup directory exists and is not world readable.
+        Ensure the backup directory exists and is readable only by root.
+
+        An archive carries the application's ``.env`` and its database dumps, so
+        the directory holding it is a secrets directory, not a shared one.
 
         Raises:
             BackupError: If the directory cannot be created.
         """
         try:
-            self.backup_dir.mkdir(parents=True, exist_ok=True)
-            self.backup_dir.chmod(0o750)
+            self.fs.make_dir(self.backup_dir, mode=SECRET_DIR_MODE)
+            # An installation that predates this tightening already has the
+            # directory, and make_dir only sets the mode on what it creates.
+            self.fs.chmod(self.backup_dir, SECRET_DIR_MODE)
         except OSError as exc:
             raise BackupError(
                 f"Failed to create backup directory: {self.backup_dir}",
@@ -527,8 +598,13 @@ class BackupManager:
         (sockets, devices, FIFOs) have to be dropped rather than guessed at, and
         a backup nobody can reason about is a backup nobody can trust.
 
+        This is the one write that does not go through :mod:`wasm.core.fs`: a
+        tar stream cannot, and ``destination`` is always a file inside the
+        caller's :class:`tempfile.TemporaryDirectory`, which removes itself and
+        which a rehearsal never reaches.
+
         Args:
-            destination: Archive file to create.
+            destination: Archive file to create, inside the staging directory.
             app_path: Application directory to archive.
             app_name: Name the application tree takes inside the archive.
             payload_dir: Directory holding dumps, volumes and the manifest.
@@ -552,7 +628,7 @@ class BackupManager:
                 archive.add(app_path, arcname=app_name, recursive=True, filter=_filter)
                 archive.add(payload_dir, arcname=PAYLOAD_DIR, recursive=True)
         except (tarfile.TarError, OSError) as exc:
-            destination.unlink(missing_ok=True)
+            self.fs.remove(destination)
             raise BackupError(
                 f"Failed to create backup archive for {app_name}",
                 details=str(exc),
@@ -593,7 +669,9 @@ class BackupManager:
             pre_backup_hook: Optional command to run before the backup.
 
         Returns:
-            Metadata describing the archive that was written.
+            Metadata describing the archive that was written. In a rehearsal,
+            metadata describing the archive that *would* have been written, with
+            no size and no checksum, because nothing was read or compressed.
 
         Raises:
             BackupError: If the application is missing, a dump fails, or the
@@ -625,8 +703,8 @@ class BackupManager:
         self._ensure_backup_dir()
         app_backup_dir = self._get_app_backup_dir(app_name)
         try:
-            app_backup_dir.mkdir(parents=True, exist_ok=True)
-            app_backup_dir.chmod(0o750)
+            self.fs.make_dir(app_backup_dir, mode=SECRET_DIR_MODE)
+            self.fs.chmod(app_backup_dir, SECRET_DIR_MODE)
         except OSError as exc:
             raise BackupError(
                 f"Failed to create backup directory: {app_backup_dir}",
@@ -638,6 +716,21 @@ class BackupManager:
         metadata_file = app_backup_dir / f"{backup_id}.json"
 
         self.logger.debug(f"Creating backup: {backup_id}")
+
+        if self._rehearsing:
+            return self._rehearse_create(
+                domain=domain,
+                app_name=app_name,
+                app_path=app_path,
+                backup_id=backup_id,
+                backup_file=backup_file,
+                metadata_file=metadata_file,
+                description=description,
+                include_env=include_env,
+                include_node_modules=include_node_modules,
+                include_build=include_build,
+                tags=tags,
+            )
 
         if pre_backup_hook:
             self.logger.debug(f"Running pre-backup hook: {pre_backup_hook}")
@@ -659,7 +752,7 @@ class BackupManager:
         with tempfile.TemporaryDirectory(prefix="wasm-backup-") as staging:
             staging_path = Path(staging)
             payload_dir = staging_path / PAYLOAD_DIR
-            payload_dir.mkdir(mode=0o700)
+            self.fs.make_dir(payload_dir, mode=SECRET_DIR_MODE)
 
             database_backups: list[dict[str, Any]] = []
             if include_databases:
@@ -689,7 +782,11 @@ class BackupManager:
                 "databases": database_backups,
                 "volumes": volume_backups,
             }
-            (payload_dir / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2))
+            self.fs.write_text(
+                payload_dir / MANIFEST_NAME,
+                json.dumps(manifest, indent=2),
+                mode=SECRET_MODE,
+            )
 
             staged_archive = staging_path / "archive.tar.gz"
             self._write_archive(staged_archive, app_path, app_name, payload_dir, excludes)
@@ -698,10 +795,12 @@ class BackupManager:
             checksum = self._calculate_checksum(staged_archive)
 
             try:
-                shutil.move(str(staged_archive), str(backup_file))
-                backup_file.chmod(0o640)
+                self.fs.move(staged_archive, backup_file)
+                # The archive carries the application's .env and its database
+                # dumps: it is a secret, not a file for the adm group.
+                self.fs.chmod(backup_file, SECRET_MODE)
             except OSError as exc:
-                backup_file.unlink(missing_ok=True)
+                self.fs.remove(backup_file)
                 raise BackupError(
                     f"Failed to store backup archive: {backup_file}",
                     details=str(exc),
@@ -733,10 +832,11 @@ class BackupManager:
         )
 
         try:
-            metadata_file.write_text(json.dumps(metadata.to_dict(), indent=2))
-            metadata_file.chmod(0o640)
+            self.fs.write_text(
+                metadata_file, json.dumps(metadata.to_dict(), indent=2), mode=SECRET_MODE
+            )
         except OSError as exc:
-            backup_file.unlink(missing_ok=True)
+            self.fs.remove(backup_file)
             raise BackupError(
                 f"Failed to write backup metadata: {metadata_file}",
                 details=str(exc),
@@ -754,6 +854,69 @@ class BackupManager:
         self.logger.debug(f"Backup created: {backup_file} ({metadata.size_human})")
 
         return metadata
+
+    def _rehearse_create(
+        self,
+        *,
+        domain: str,
+        app_name: str,
+        app_path: Path,
+        backup_id: str,
+        backup_file: Path,
+        metadata_file: Path,
+        description: str,
+        include_env: bool,
+        include_node_modules: bool,
+        include_build: bool,
+        tags: list[str] | None,
+    ) -> BackupMetadata:
+        """
+        Report the backup a real run would have taken, without taking it.
+
+        Compressing the tree and dumping the databases only to delete the result
+        is not a rehearsal: it costs the same disk, CPU and database load as the
+        operation, on a machine the operator asked not to touch. So the two
+        writes that would have persisted are announced through the seam and
+        nothing is read or compressed.
+
+        Only :meth:`create` calls this, and only once it has established that
+        the filesystem in effect records changes instead of making them.
+
+        Args:
+            domain: Domain being backed up.
+            app_name: Application name.
+            app_path: Directory that would have been archived.
+            backup_id: Identifier the backup would have been given.
+            backup_file: Archive that would have been written.
+            metadata_file: Sidecar that would have been written.
+            description: Description the caller passed.
+            include_env: Whether ``.env`` files would have been included.
+            include_node_modules: Whether ``node_modules`` would be included.
+            include_build: Whether build output would be included.
+            tags: Tags the caller passed.
+
+        Returns:
+            Metadata for the archive that was not written: no size, no checksum.
+        """
+        self.fs.write_text(backup_file, "", mode=SECRET_MODE)
+        self.fs.write_text(metadata_file, "", mode=SECRET_MODE)
+        self.logger.info(f"Would back up {app_path} to {backup_file}")
+
+        return BackupMetadata(
+            id=backup_id,
+            domain=domain,
+            app_name=app_name,
+            created_at=datetime.now().isoformat(),
+            size_bytes=0,
+            app_type=self._detect_app_type(app_path),
+            version=self.BACKUP_VERSION,
+            description=description,
+            includes_env=include_env,
+            includes_node_modules=include_node_modules,
+            includes_build=include_build,
+            checksum=None,
+            tags=tags or [],
+        )
 
     # -- listing ----------------------------------------------------------
 
@@ -986,6 +1149,9 @@ class BackupManager:
                     "created. Restoring it would restore corrupted data.",
                 )
 
+        if self._rehearsing:
+            return self._rehearse_restore(archive, target_domain, fallback)
+
         with tempfile.TemporaryDirectory(prefix="wasm-restore-") as tmp_dir:
             tmp_path = Path(tmp_dir)
             extracted = tmp_path / "extracted"
@@ -1038,8 +1204,7 @@ class BackupManager:
 
             if env_backup is not None:
                 self.logger.debug("Restoring the previously deployed .env file")
-                env_file.write_text(env_backup)
-                env_file.chmod(0o600)
+                self.fs.write_text(env_file, env_backup, mode=SECRET_MODE)
 
             service_user = self.config.service_user
             self._exec(
@@ -1051,6 +1216,8 @@ class BackupManager:
             # application whose state lives in a database or a volume.
             self._restore_databases(manifest, extracted, fallback)
             self._restore_docker_volumes(manifest, extracted, fallback)
+
+            self._warn_about_missing_environment(app_path)
 
         if post_restore_hook:
             self.logger.debug(f"Running post-restore hook: {post_restore_hook}")
@@ -1065,6 +1232,114 @@ class BackupManager:
             self.service_manager.start(app_name)
 
         return True
+
+    def _rehearse_restore(
+        self,
+        archive: Path,
+        target_domain: str | None,
+        fallback: BackupMetadata | None,
+    ) -> bool:
+        """
+        Report what a restore would replace, without unpacking anything.
+
+        A restore deletes the deployed tree and puts the archive's copy in its
+        place, so the rehearsal announces that deletion through the seam and
+        stops. It deliberately does not unpack the archive: the extraction is
+        the size of the backup, and a rehearsal that fills ``/tmp`` has damaged
+        the machine it promised not to touch. ``wasm backup verify`` is the
+        command that unpacks an archive to prove it is restorable.
+
+        Args:
+            archive: Archive that would have been restored.
+            target_domain: Domain the caller asked to restore into.
+            fallback: Metadata sidecar, for archives with no manifest.
+
+        Returns:
+            True, as a real restore would.
+
+        Raises:
+            BackupError: If nothing says which application the archive belongs
+                to, which is the same refusal a real restore makes.
+        """
+        manifest = self._read_manifest_in_place(archive)
+        domain = target_domain or self._manifest_domain(manifest, fallback)
+        app_name = validate_app_name(domain_to_app_name(domain))
+        app_path = self.config.apps_directory / app_name
+
+        if app_path.exists():
+            self.fs.remove_tree(app_path)
+        self.logger.info(f"Would restore {archive} into {app_path}")
+
+        databases = self._payload_entries(manifest, fallback, "databases", "database_backups")
+        for entry in databases:
+            self.logger.info(f"Would restore {entry.get('engine')} database {entry.get('name')}")
+        volumes = self._payload_entries(manifest, fallback, "volumes", "docker_volume_backups")
+        for entry in volumes:
+            self.logger.info(f"Would restore Docker volume {entry.get('volume')}")
+
+        return True
+
+    def _read_manifest_in_place(self, archive: Path) -> dict[str, Any] | None:
+        """
+        Read an archive's manifest without extracting the archive.
+
+        Args:
+            archive: Archive to read.
+
+        Returns:
+            The manifest, or None for a 1.x archive that carries none.
+
+        Raises:
+            BackupError: If the archive cannot be read, or its manifest is not
+                a JSON object.
+        """
+        try:
+            with tarfile.open(archive, "r:gz") as tar:
+                try:
+                    member = tar.getmember(f"{PAYLOAD_DIR}/{MANIFEST_NAME}")
+                except KeyError:
+                    return None
+                source = tar.extractfile(member)
+                if source is None:
+                    return None
+                with source:
+                    data = json.loads(source.read().decode("utf-8"))
+        except (tarfile.TarError, OSError, EOFError, ValueError, UnicodeDecodeError) as exc:
+            raise BackupError(
+                f"Cannot read {archive.name}",
+                details=f"{exc}. The archive is corrupted or was not written by WASM.",
+            ) from exc
+        if not isinstance(data, dict):
+            raise BackupError(
+                "Backup manifest is not an object",
+                details="The archive was not written by WASM.",
+            )
+        return data
+
+    def _warn_about_missing_environment(self, app_path: Path) -> None:
+        """
+        Tell the operator that dependencies still have to be installed.
+
+        A backup deliberately excludes ``node_modules`` and the virtualenv: both
+        are machine-specific, and a virtualenv full of absolute symlinks is one
+        the extractor would refuse outright. The restored tree is therefore
+        complete but not runnable, and saying so beats a service that fails to
+        start with a stack trace about a missing module.
+
+        Args:
+            app_path: Directory the application was restored into.
+        """
+        app_type = self._detect_app_type(app_path)
+        if app_type == "python" and not (app_path / "venv").is_dir():
+            self.logger.warning(
+                "The restored application has no virtualenv: a venv holds absolute paths "
+                "and is never archived. Run 'wasm update <domain>' to rebuild it."
+            )
+        elif app_type in {"nextjs", "nodejs", "vite"} and not (app_path / "node_modules").is_dir():
+            self.logger.warning(
+                "The restored application has no node_modules: dependencies are not archived. "
+                "Run 'wasm update <domain>' to install them."
+            )
 
     def _stop_service_for_restore(self, app_name: str, stop_service: bool) -> bool:
         """
@@ -1109,23 +1384,23 @@ class BackupManager:
         if had_existing:
             self.logger.debug("Copying the current state aside in case the restore fails")
             try:
-                shutil.copytree(app_path, safety_copy, symlinks=True)
+                self.fs.copy_tree(app_path, safety_copy)
             except OSError as exc:
                 self.logger.warning(f"Could not create safety copy: {exc}")
                 had_existing = False
 
         try:
             if app_path.exists():
-                shutil.rmtree(app_path)
-            app_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(app_root), str(app_path))
+                self.fs.remove_tree(app_path)
+            self.fs.make_dir(app_path.parent)
+            self.fs.move(app_root, app_path)
         except OSError as exc:
             if had_existing and safety_copy.exists():
                 self.logger.warning("Restore failed, rolling back to the previous state")
                 try:
                     if app_path.exists():
-                        shutil.rmtree(app_path)
-                    shutil.move(str(safety_copy), str(app_path))
+                        self.fs.remove_tree(app_path)
+                    self.fs.move(safety_copy, app_path)
                     self.logger.info("Rollback successful - original state restored")
                 except OSError as rollback_error:
                     self.logger.error(f"Rollback failed: {rollback_error}")
@@ -1302,7 +1577,7 @@ class BackupManager:
             if (app_backup_dir / f"{metadata_file.stem}.tar.gz").is_file():
                 continue
             try:
-                metadata_file.unlink()
+                self.fs.remove(metadata_file)
                 removed += 1
                 self.logger.debug(f"Removed orphan backup metadata: {metadata_file.name}")
             except OSError as exc:
@@ -1312,6 +1587,11 @@ class BackupManager:
     def delete(self, backup_id: str) -> bool:
         """
         Delete a backup and everything that belongs to it.
+
+        Every unlink goes through :mod:`wasm.core.fs`. This method is the reason
+        that seam exists: ``wasm --dry-run backup delete <id> --force`` printed
+        "no changes will be made to this machine" and then removed the archive,
+        because a deletion never goes near a subprocess.
 
         Args:
             backup_id: Backup identifier.
@@ -1339,7 +1619,7 @@ class BackupManager:
 
         for path in targets:
             try:
-                path.unlink(missing_ok=True)
+                self.fs.remove(path)
             except OSError as exc:
                 self.logger.warning(f"Failed to delete {path}: {exc}")
 
@@ -1463,8 +1743,7 @@ class BackupManager:
             self.logger.debug(f"No databases associated with {domain}")
             return []
 
-        destination.mkdir(parents=True, exist_ok=True)
-        destination.chmod(0o700)
+        self.fs.make_dir(destination, mode=SECRET_DIR_MODE)
 
         self.logger.info(f"Backing up {len(databases)} database(s) for {domain}")
 
@@ -1503,7 +1782,7 @@ class BackupManager:
             if written != target:
                 # An engine that ignores output_path would leave the dump
                 # outside the archive, which is exactly what must not happen.
-                shutil.move(str(written), str(target))
+                self.fs.move(written, target)
 
             if not target.is_file():
                 raise BackupError(
@@ -1671,7 +1950,9 @@ class BackupManager:
         Returns:
             One entry per volume actually archived.
         """
-        destination.mkdir(parents=True, exist_ok=True)
+        # A volume holds application state, which is as likely to hold a
+        # credential as a database dump does.
+        self.fs.make_dir(destination, mode=SECRET_DIR_MODE)
 
         volume_backups: list[dict[str, Any]] = []
         for vol_name in volume_names:
@@ -1811,22 +2092,38 @@ class BackupManager:
 
     # -- verification -----------------------------------------------------
 
-    def verify(self, backup_id: str) -> dict[str, Any]:
+    def verify(self, backup_id: str, *, deep: bool = True) -> dict[str, Any]:
         """
-        Verify a backup's integrity, by reading it.
+        Verify a backup's integrity, by reading it and by unpacking it.
 
         The archive is hashed and walked in process: a backup that cannot be
         opened, or whose bytes changed since it was written, is reported as
         invalid before a restore needs it. When the metadata claims databases,
         the payload is checked for the dumps it names.
 
+        Listing the members is not enough. ``restore()`` extracts through a
+        hardened extractor that refuses absolute symlinks, ``..``, hardlinks to
+        files outside the archive and device nodes, so an archive that lists
+        cleanly can still be one ``restore()`` will *always* refuse - which is
+        how every backup of a Python application containing a ``venv`` passed
+        verification and failed the restore. The check therefore runs the real
+        extractor, into a temporary directory that is thrown away, rather than a
+        second copy of its rules that could drift from it.
+
         Args:
             backup_id: Backup identifier.
+            deep: Unpack the archive to prove it is extractable. This costs one
+                full pass over the archive and as much temporary space as the
+                backup expands to, and it is skipped rather than allowed to fill
+                the disk. Turning it off makes the verification cheap and much
+                weaker: it then only proves the archive is readable, not
+                restorable, which is the state that let every Python
+                application's backup pass.
 
         Returns:
             A dictionary with ``valid``, ``errors``, ``warnings`` and, when the
-            archive could be read, ``checksum_ok``, ``files_ok`` and
-            ``file_count``.
+            archive could be read, ``checksum_ok``, ``files_ok``, ``file_count``
+            and ``extractable``.
         """
         errors: list[str] = []
         warnings: list[str] = []
@@ -1862,7 +2159,9 @@ class BackupManager:
 
         try:
             with tarfile.open(backup_file, "r:gz") as archive:
-                names = archive.getnames()
+                members = archive.getmembers()
+            names = [member.name for member in members]
+            declared_bytes = sum(member.size for member in members if member.isfile())
         except (tarfile.TarError, OSError, EOFError) as exc:
             results["valid"] = False
             errors.append(f"Archive is corrupted: {exc}")
@@ -1871,7 +2170,10 @@ class BackupManager:
         results["files_ok"] = True
         results["file_count"] = len(names)
 
-        members = set(names)
+        if deep:
+            self._verify_extractable(backup_file, declared_bytes, results, errors, warnings)
+
+        member_names = set(names)
         if metadata.includes_databases:
             expected = [
                 entry.get("archive_path")
@@ -1884,7 +2186,7 @@ class BackupManager:
                     "outside the archive and will not travel with it"
                 )
             for path in expected:
-                if path not in members:
+                if path not in member_names:
                     results["valid"] = False
                     errors.append(f"Archive claims a database dump it does not carry: {path}")
 
@@ -1893,6 +2195,73 @@ class BackupManager:
 
         results["message"] = "Backup is valid" if results["valid"] else "; ".join(errors)
         return results
+
+    def _verify_extractable(
+        self,
+        backup_file: Path,
+        declared_bytes: int,
+        results: dict[str, Any],
+        errors: list[str],
+        warnings: list[str],
+    ) -> None:
+        """
+        Prove the archive can be extracted, with the rules a restore uses.
+
+        The archive is unpacked into a temporary directory that is removed
+        immediately. That costs the space the backup expands to, so the check is
+        skipped, loudly, when the temporary filesystem cannot hold it: a
+        verification that quietly fills the disk it is protecting is not an
+        improvement over one that lied.
+
+        Args:
+            backup_file: Archive to unpack.
+            declared_bytes: Total size the archive headers claim.
+            results: Verification result being assembled, updated in place.
+            errors: Errors collected so far, appended to.
+            warnings: Warnings collected so far, appended to.
+        """
+        if self._rehearsing:
+            # The extractor refuses to write anything alongside a rehearsing
+            # filesystem, so running it here would prove nothing and report
+            # success, which is the exact defect this check was added for.
+            warnings.append("Could not check that the archive is extractable: this is a dry run")
+            return
+
+        workspace = Path(tempfile.gettempdir())
+        try:
+            free = shutil.disk_usage(workspace).free
+        except OSError as exc:
+            free = 0
+            self.logger.debug(f"Could not measure free space on {workspace}: {exc}")
+
+        # A margin, because the headers are the archive's own claim about its
+        # size and the last thing a restore needs is a full /tmp.
+        if declared_bytes and free < declared_bytes * 1.1:
+            warnings.append(
+                f"Could not check that the archive is extractable: unpacking it needs about "
+                f"{declared_bytes} bytes under {workspace} and only {free} are free"
+            )
+            return
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="wasm-verify-") as tmp_dir:
+                extract_archive(
+                    backup_file,
+                    Path(tmp_dir) / "extracted",
+                    archive_format="tar.gz",
+                    max_entries=self.max_entries,
+                    max_total_bytes=self.max_bytes,
+                )
+        except SourceError as exc:
+            results["valid"] = False
+            results["extractable"] = False
+            errors.append(f"Archive cannot be restored: {exc}")
+            return
+        except OSError as exc:
+            warnings.append(f"Could not check that the archive is extractable: {exc}")
+            return
+
+        results["extractable"] = True
 
     def get_storage_usage(self) -> dict[str, Any]:
         """
@@ -1965,17 +2334,23 @@ class RollbackManager:
     state.
     """
 
-    def __init__(self, verbose: bool = False, runner: CommandRunner | None = None) -> None:
+    def __init__(
+        self,
+        verbose: bool = False,
+        runner: CommandRunner | None = None,
+        fs: FileSystem | None = None,
+    ) -> None:
         """
         Initialize the rollback manager.
 
         Args:
             verbose: Enable verbose logging.
             runner: Command runner passed to the managers it drives.
+            fs: Filesystem passed to the backup manager it drives.
         """
         self.verbose = verbose
         self.logger = Logger(verbose=verbose)
-        self.backup_manager = BackupManager(verbose=verbose, runner=runner)
+        self.backup_manager = BackupManager(verbose=verbose, runner=runner, fs=fs)
         self.service_manager = ServiceManager(verbose=verbose, runner=runner)
         self.config = Config()
 

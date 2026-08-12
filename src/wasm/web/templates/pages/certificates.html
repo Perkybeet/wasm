@@ -58,6 +58,14 @@
         {% endcall %}
       {% endfor %}
     </div>
+  {% elif uncovered is none %}
+    {# certbot could not be asked, so nothing here is known. Saying "every
+       domain is covered" at the moment no certificate can be issued would be
+       the most expensive kind of wrong. #}
+    <p class="muted">
+      Nothing could be read from certbot, so this machine cannot say which
+      domains are without a certificate.
+    </p>
   {% else %}
     <p class="muted">Every domain this machine serves is covered.</p>
   {% endif %}

@@ -82,11 +82,18 @@ def shared_context(request: Request) -> dict[str, Any]:
     Returns:
         Values every template can rely on being present.
     """
+    from wasm.web.auth import CSRF_HEADER_NAME
+
     session = getattr(request.state, "session", None)
     return {
         "machine": machine_state(),
         "counts": resource_counts(),
         "csrf_token": csrf_token(session),
+        # The name travels with the value. The shell used to hard-code
+        # "X-CSRF-Token" while the server reads CSRF_HEADER_NAME, so every
+        # mutation a browser sent was refused; a constant cannot drift from
+        # itself.
+        "csrf_header": CSRF_HEADER_NAME,
         "page": request.url.path.strip("/").split("/")[0] or "dashboard",
         "theme": None,
     }

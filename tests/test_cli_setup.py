@@ -30,6 +30,7 @@ from click.testing import CliRunner
 from wasm.cli import app as app_module
 from wasm.cli.app import cli as root_cli
 from wasm.cli.commands import setup as setup_cmd
+from wasm.core.fs import DryRunFileSystem, get_fs, set_fs
 from wasm.core.logger import Logger
 from wasm.core.runner import DryRunRunner, FakeRunner, get_runner
 
@@ -106,6 +107,23 @@ def _readable_output(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setattr(app_module, "Logger", _TestLogger)
     monkeypatch.setattr(setup_cmd, "Logger", _TestLogger)
+
+
+@pytest.fixture(autouse=True)
+def _real_filesystem() -> None:
+    """
+    Put the real filesystem back after every test.
+
+    ``--dry-run`` installs a rehearsing filesystem process-wide, exactly like
+    the command runner. Half the tests in this file pass that flag, so without
+    this the first of them would silently disable every write in the rest of
+    the session.
+    """
+    set_fs(None)
+    try:
+        yield
+    finally:
+        set_fs(None)
 
 
 @pytest.fixture
@@ -239,6 +257,10 @@ def prepared(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Any]:
     )
 
     saved: dict[str, Any] = {}
+    # What Config.save() answers. A fixture that always says True cannot tell a
+    # wizard that checks the result from one that ignores it, which is how the
+    # unchecked save survived a review with green tests.
+    outcome = {"save": True}
 
     class _FakeConfig:
         """Records what setup asked to persist, without touching /etc."""
@@ -255,16 +277,36 @@ def prepared(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Any]:
 
         def save(self) -> bool:
             """
-            Pretend the file was written.
+            Report what the test asked this save to do.
 
             Returns:
-                Always True.
+                True unless the test set ``prepared["save_succeeds"] = False``.
             """
-            return True
+            return outcome["save"]
 
     monkeypatch.setattr(core_config, "Config", _FakeConfig)
 
-    return {"installed": installed, "saved": saved, "root": tmp_path}
+    class _Prepared(dict):
+        """A dict whose ``save_succeeds`` key drives the fake Config."""
+
+        def __setitem__(self, key: str, value: Any) -> None:
+            """
+            Store a value, forwarding the save outcome to the fake Config.
+
+            Args:
+                key: Setting name.
+                value: New value.
+            """
+            if key == "save_succeeds":
+                outcome["save"] = bool(value)
+            super().__setitem__(key, value)
+
+    return _Prepared(
+        installed=installed,
+        saved=saved,
+        root=tmp_path,
+        save_succeeds=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -765,3 +807,202 @@ def test_handle_setup_still_dispatches(runner: FakeRunner, prepared: dict[str, A
 def test_handle_setup_rejects_an_unknown_action(runner: FakeRunner) -> None:
     """An action that does not exist is an error, not a silent success."""
     assert setup_cmd.handle_setup(Namespace(action="teleport", verbose=False)) == 1
+
+
+# ---------------------------------------------------------------------------
+# setup init tells the truth about the configuration file
+# ---------------------------------------------------------------------------
+
+
+def test_init_fails_when_the_configuration_cannot_be_saved(
+    wasm: Wasm, runner: FakeRunner, prepared: dict[str, Any]
+) -> None:
+    """
+    A configuration that was not written is a setup that did not finish.
+
+    ``Config.save()`` reports failure by returning False, having logged the
+    reason. Ignoring that result is how the wizard came to announce a config
+    file it never managed to write, and exit 0 while doing it.
+    """
+    prepared["installed"].add("apt-get")
+    prepared["save_succeeds"] = False
+
+    result = wasm("setup", "init", "--yes")
+
+    assert result.exit_code == 1
+    assert "Setup complete" not in result.output
+    assert "Setup finished with problems" in result.output
+    assert str(prepared["root"] / "etc/wasm/config.yaml") in result.output
+
+
+def test_init_does_not_claim_to_have_written_a_configuration_it_did_not(
+    wasm: Wasm, runner: FakeRunner, prepared: dict[str, Any]
+) -> None:
+    """The failure path must not print Created or Updated for that same file."""
+    prepared["installed"].add("apt-get")
+    prepared["save_succeeds"] = False
+    config_path = str(prepared["root"] / "etc/wasm/config.yaml")
+
+    output = wasm("setup", "init", "--yes").output
+
+    claims = [line for line in output.splitlines() if config_path in line]
+    assert claims, output
+    assert not any("Created" in line or "Updated" in line for line in claims), claims
+
+
+def test_init_succeeds_when_the_configuration_is_saved(
+    wasm: Wasm, runner: FakeRunner, prepared: dict[str, Any]
+) -> None:
+    """
+    The other half of the pair, so the test above cannot pass for free.
+
+    Without this, "always fails" would satisfy the assertion just as well as
+    "reports what happened".
+    """
+    prepared["installed"].add("apt-get")
+    prepared["save_succeeds"] = True
+
+    result = wasm("setup", "init", "--yes")
+
+    assert result.exit_code == 0, result.output
+    assert "Setup complete" in result.output
+
+
+def test_init_reports_every_failed_install_by_name(
+    wasm: Wasm, runner: FakeRunner, prepared: dict[str, Any]
+) -> None:
+    """
+    All installs failing must not be reported as a complete setup.
+
+    This is the original defect in its strongest form: nothing was installed,
+    and the wizard said "Setup Complete!" and exited 0.
+    """
+    prepared["installed"].add("apt-get")
+    runner.script(["apt-get", "install"], stderr="E: Unable to locate package", exit_code=100)
+
+    result = wasm("setup", "init", "--yes")
+
+    assert result.exit_code == 1
+    assert "Git" in result.output
+    assert "nginx" in result.output
+    assert "Certbot" in result.output
+    assert "step(s) did not complete" in result.output
+
+
+# ---------------------------------------------------------------------------
+# --dry-run changes nothing, including what setup writes
+# ---------------------------------------------------------------------------
+
+
+def _tree(root: Path) -> set[Path]:
+    """
+    List everything under a directory.
+
+    Args:
+        root: Directory to walk.
+
+    Returns:
+        Every path below ``root``, relative paths included.
+    """
+    return set(root.rglob("*"))
+
+
+@pytest.mark.parametrize("where", ["before", "after"])
+def test_init_dry_run_creates_nothing(
+    wasm: Wasm, runner: FakeRunner, prepared: dict[str, Any], where: str
+) -> None:
+    """
+    ``setup init --dry-run`` must leave the machine exactly as it found it.
+
+    It used to create /etc/wasm, write config.yaml and install the man page,
+    because the flag only swapped the command runner and every one of those is
+    a plain filesystem call. The flag is checked on both sides of the
+    subcommand name: when it came after, setup turned the rehearsal on through
+    its own copy of the wiring, which swapped one seam and not the other.
+    """
+    prepared["installed"].add("apt-get")
+    root = prepared["root"]
+    before = _tree(root)
+
+    argv = ("--dry-run", "setup", "init", "--yes")
+    if where == "after":
+        argv = ("setup", "init", "--yes", "--dry-run")
+    result = wasm(*argv)
+
+    assert isinstance(get_fs(), DryRunFileSystem)
+    assert _tree(root) == before, "a rehearsal changed the filesystem"
+    assert not (root / "etc").exists()
+    assert not (root / "var").exists()
+    assert not (root / "usr").exists()
+    assert result.exit_code == 0, result.output
+
+
+def test_init_dry_run_does_not_overwrite_an_existing_configuration(
+    wasm: Wasm, runner: FakeRunner, prepared: dict[str, Any]
+) -> None:
+    """The credentials already on disk must survive the rehearsal untouched."""
+    config_path = prepared["root"] / "etc/wasm/config.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("webserver: apache\n", encoding="utf-8")
+    prepared["installed"].add("apt-get")
+
+    wasm("--dry-run", "setup", "init", "--yes")
+
+    assert config_path.read_text(encoding="utf-8") == "webserver: apache\n"
+
+
+def test_init_dry_run_says_what_it_would_have_written(
+    wasm: Wasm, runner: FakeRunner, prepared: dict[str, Any]
+) -> None:
+    """A rehearsal that reports nothing is indistinguishable from a no-op."""
+    prepared["installed"].add("apt-get")
+
+    output = wasm("--dry-run", "setup", "init", "--yes").output
+
+    assert "would create directory" in output
+    assert str(prepared["root"] / "var/www/apps") in output
+
+
+def test_completions_dry_run_installs_nothing(wasm: Wasm, sandbox: Path) -> None:
+    """The completion script is a file too, and a rehearsal must not write it."""
+    result = wasm("--dry-run", "setup", "completions", "--shell", "zsh", "--user-only")
+
+    target = sandbox / ".zsh/completions/_wasm"
+    assert result.exit_code == 0, result.output
+    assert not target.exists()
+    assert not target.parent.exists()
+
+
+def test_dry_run_after_the_subcommand_swaps_the_filesystem_too(
+    wasm: Wasm, runner: FakeRunner
+) -> None:
+    """
+    Both seams, or the flag is a promise the program cannot keep.
+
+    ``setup`` re-offers the global flags so they keep parsing after the
+    subcommand name. Its own copy of the wiring swapped the command runner
+    only, which is precisely the defect the seam exists to remove.
+    """
+    wasm("setup", "permissions", "--dry-run")
+
+    assert isinstance(get_runner(), DryRunRunner)
+    assert isinstance(get_fs(), DryRunFileSystem)
+
+
+def test_man_page_is_installed_through_the_seam(
+    wasm: Wasm, runner: FakeRunner, prepared: dict[str, Any]
+) -> None:
+    """
+    A real run still installs the man page; only the rehearsal does not.
+
+    Without this, routing the copy through the seam could have quietly stopped
+    installing anything at all and the dry-run test above would still pass.
+    """
+    source = Path(setup_cmd.__file__).resolve().parents[4] / "man" / "wasm.1"
+    prepared["installed"].add("apt-get")
+
+    wasm("setup", "init", "--yes")
+
+    installed = prepared["root"] / "usr/share/man/man1/wasm.1"
+    assert installed.read_text(encoding="utf-8") == source.read_text(encoding="utf-8")
+    assert ("mandb", "-q") in runner.calls

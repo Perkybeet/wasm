@@ -5,6 +5,7 @@ Static site deployer for WASM.
 from pathlib import Path
 from typing import ClassVar
 
+from wasm.core.fs import FileSystem
 from wasm.core.logger import Icons
 from wasm.core.runner import CommandRunner
 from wasm.deployers.base import BaseDeployer
@@ -32,7 +33,12 @@ class StaticDeployer(BaseDeployer):
 
     SYSTEM_DEPS: ClassVar[list[str]] = []
 
-    def __init__(self, verbose: bool = False, runner: CommandRunner | None = None):
+    def __init__(
+        self,
+        verbose: bool = False,
+        runner: CommandRunner | None = None,
+        fs: FileSystem | None = None,
+    ):
         """
         Initialize the static deployer.
 
@@ -40,8 +46,10 @@ class StaticDeployer(BaseDeployer):
             verbose: Enable verbose logging.
             runner: Command runner used for installs and builds. Defaults to the
                 process-wide runner.
+            fs: Filesystem every change goes through. Defaults to the
+                process-wide one.
         """
-        super().__init__(verbose=verbose, runner=runner)
+        super().__init__(verbose=verbose, runner=runner, fs=fs)
         self.static_dir: Path | None = None
 
     def detect(self, path: Path) -> bool:

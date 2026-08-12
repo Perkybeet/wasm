@@ -20,6 +20,7 @@ Covers five classes of problem that were found in production code:
 
 from __future__ import annotations
 
+import ast
 import copy
 import json
 import os
@@ -41,8 +42,32 @@ from wasm.core.config import (
     secure_write,
 )
 from wasm.core.exceptions import SecurityError
+from wasm.core.fs import (
+    SECRET_DIR_MODE,
+    SECRET_MODE,
+    DryRunFileSystem,
+    RecordingFileSystem,
+    set_fs,
+)
 from wasm.core.store import WASMStore
 from wasm.deployers.helpers.env_manager import EnvConfig, EnvManager, EnvVariable
+
+
+@pytest.fixture(autouse=True)
+def _real_filesystem() -> None:
+    """
+    Give every test the real filesystem back, whatever the last one installed.
+
+    The seam is process-wide, exactly like the command runner. A test that
+    installs :class:`~wasm.core.fs.DryRunFileSystem` and forgets to undo it
+    makes every later test in the session silently assert on files nobody
+    wrote.
+    """
+    set_fs(None)
+    try:
+        yield
+    finally:
+        set_fs(None)
 
 
 @pytest.fixture
@@ -706,8 +731,17 @@ class TestEnvFilePermissions:
         for path in written:
             assert path.stat().st_mode & 0o077 == 0, f"{path} is not private"
 
-    def test_env_file_is_never_briefly_world_readable(self, sandbox: Path) -> None:
-        """The mode must come from the open(), not from a chmod afterwards."""
+    def test_env_file_is_never_briefly_world_readable(
+        self, sandbox: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The mode must come from the open(), not from a chmod afterwards.
+
+        The write is atomic, so the descriptor that carries the secrets belongs
+        to a temporary file next to the destination. Every file created under
+        the application directory is inspected rather than only ``.env``, or
+        the assertion would pass by looking at nothing.
+        """
         app_path = sandbox / "app"
         app_path.mkdir()
         modes: list[int] = []
@@ -715,17 +749,15 @@ class TestEnvFilePermissions:
 
         def recording_open(path, flags, mode=0o777, **kwargs):
             fd = real_open(path, flags, mode, **kwargs)
-            if str(path).endswith(".env"):
+            if flags & os.O_CREAT and Path(path).parent == app_path:
                 modes.append(stat.S_IMODE(os.fstat(fd).st_mode))
             return fd
 
-        os.open = recording_open
-        try:
-            EnvManager().write_env_files(app_path, {"API_KEY": "sk-live"})
-        finally:
-            os.open = real_open
+        monkeypatch.setattr(os, "open", recording_open)
+        EnvManager().write_env_files(app_path, {"API_KEY": "sk-live"})
 
         assert modes == [0o600]
+        assert stat.S_IMODE((app_path / ".env").stat().st_mode) == 0o600
 
     def test_app_directory_is_not_tightened(self, sandbox: Path) -> None:
         """The app tree is served by the web server; only the file is private."""
@@ -782,3 +814,321 @@ class TestSetupCreatesAPrivateConfigDirectory:
             os.umask(previous)
 
         assert config_path.parent.stat().st_mode & 0o077 == 0
+
+
+class TestConfigWritesGoThroughTheSeam:
+    """
+    ``--dry-run`` has to be true for what WASM writes, not only what it runs.
+
+    Deleting or overwriting ``/etc/wasm/config.yaml`` is a ``Path`` call and
+    never reaches a subprocess, so swapping the command runner alone left the
+    rehearsal free to destroy the file it had just promised not to touch.
+    """
+
+    def test_save_writes_nothing_during_a_rehearsal(self, config_path: Path) -> None:
+        """A rehearsed save must not create the configuration file."""
+        set_fs(DryRunFileSystem())
+
+        assert Config().save() is True
+
+        assert not config_path.exists()
+        assert not config_path.parent.exists()
+
+    def test_save_does_not_destroy_the_existing_file_during_a_rehearsal(
+        self, config_path: Path
+    ) -> None:
+        """The old credentials must survive a rehearsal untouched."""
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text("webserver: apache\n", encoding="utf-8")
+        config = Config()
+        config.set("webserver", "nginx")
+        set_fs(DryRunFileSystem())
+
+        assert config.save() is True
+
+        assert config_path.read_text(encoding="utf-8") == "webserver: apache\n"
+
+    def test_upgrade_writes_nothing_during_a_rehearsal(self, config_path: Path) -> None:
+        """upgrade() rewrites the whole file; a rehearsal must not."""
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text("webserver: nginx\n", encoding="utf-8")
+        set_fs(DryRunFileSystem())
+
+        Config().upgrade()
+
+        assert config_path.read_text(encoding="utf-8") == "webserver: nginx\n"
+
+    def test_secure_directory_creates_nothing_during_a_rehearsal(self, sandbox: Path) -> None:
+        """No level of the path may appear, and the missing leaf must not raise."""
+        set_fs(DryRunFileSystem())
+
+        secure_directory(sandbox / "outer" / "inner")
+
+        assert not (sandbox / "outer").exists()
+
+    def test_secure_write_leaves_no_temporary_file_behind(self, sandbox: Path) -> None:
+        """A rehearsal that leaves a staging file behind is still a change."""
+        target = sandbox / "etc" / "wasm" / "config.yaml"
+        set_fs(DryRunFileSystem())
+
+        secure_write(target, "webserver: nginx\n")
+
+        assert list(sandbox.iterdir()) == []
+
+    def test_a_rehearsal_says_what_it_would_have_written(self, config_path: Path) -> None:
+        """Announcing the skipped change is the half that makes it a rehearsal."""
+        rehearsal = DryRunFileSystem()
+        set_fs(rehearsal)
+
+        Config().save()
+
+        assert any(str(config_path) in line for line in rehearsal.skipped)
+
+    def test_the_saved_file_and_its_directory_carry_the_secret_modes(
+        self, config_path: Path
+    ) -> None:
+        """config.yaml is 0600 inside a 0700 directory, asked for explicitly."""
+        recorder = RecordingFileSystem()
+        set_fs(recorder)
+
+        assert Config().save() is True
+
+        assert ("write", config_path) in recorder.changes
+        assert ("mkdir", config_path.parent) in recorder.changes
+        assert stat.S_IMODE(config_path.stat().st_mode) == SECRET_MODE
+        assert stat.S_IMODE(config_path.parent.stat().st_mode) == SECRET_DIR_MODE
+
+    def test_an_injected_filesystem_wins_over_the_process_wide_one(self, config_path: Path) -> None:
+        """Constructor injection is what lets a caller rehearse one instance."""
+        rehearsal = DryRunFileSystem()
+        Config.reset_instance()
+
+        assert Config(fs=rehearsal).save() is True
+
+        assert not config_path.exists()
+        assert rehearsal.skipped != []
+
+
+class TestNoMutationEscapesTheSeam:
+    """
+    The AST guard. Migrating once is easy; staying migrated is what this is for.
+
+    Every write, delete, chmod and mkdir in these modules has to go through
+    :mod:`wasm.core.fs`, or ``--dry-run`` starts lying again the next time
+    somebody reaches for ``Path.write_text`` because it is one line shorter.
+    """
+
+    #: Methods that change the filesystem, whatever they are called on.
+    MUTATING_METHODS = frozenset(
+        {
+            "chmod",
+            "copy2",
+            "copyfile",
+            "copytree",
+            "hardlink_to",
+            "lchmod",
+            "makedirs",
+            "mkdir",
+            "mkdtemp",
+            "mkstemp",
+            "rmdir",
+            "rmtree",
+            "symlink_to",
+            "touch",
+            "unlink",
+            "write_bytes",
+            "write_text",
+        }
+    )
+
+    #: Module-qualified calls that change the filesystem. Spelled out per
+    #: module because ``replace``, ``rename``, ``move`` and ``copy`` are also
+    #: perfectly innocent method names on strings, dicts and paths' neighbours.
+    MUTATING_FUNCTIONS = frozenset(
+        {
+            ("os", "chmod"),
+            ("os", "chown"),
+            ("os", "link"),
+            ("os", "makedirs"),
+            ("os", "mkdir"),
+            ("os", "remove"),
+            ("os", "removedirs"),
+            ("os", "rename"),
+            ("os", "renames"),
+            ("os", "replace"),
+            ("os", "rmdir"),
+            ("os", "symlink"),
+            ("os", "truncate"),
+            ("os", "unlink"),
+            ("shutil", "copy"),
+            ("shutil", "copy2"),
+            ("shutil", "copyfile"),
+            ("shutil", "copytree"),
+            ("shutil", "move"),
+            ("shutil", "rmtree"),
+            ("tempfile", "NamedTemporaryFile"),
+            ("tempfile", "TemporaryDirectory"),
+            ("tempfile", "mkdtemp"),
+            ("tempfile", "mkstemp"),
+        }
+    )
+
+    #: The modules this guard covers.
+    MODULES = (
+        "src/wasm/core/config.py",
+        "src/wasm/cli/commands/setup.py",
+        "src/wasm/cli/commands/env.py",
+    )
+
+    @staticmethod
+    def _is_seam(node: ast.expr) -> bool:
+        """
+        Decide whether an expression evaluates to the filesystem seam.
+
+        Args:
+            node: The receiver of an attribute call.
+
+        Returns:
+            True for ``fs``, ``self.fs``, ``filesystem``, ``get_fs()`` and the
+            like, which are the only receivers allowed to mutate.
+        """
+        if isinstance(node, ast.Call):
+            return isinstance(node.func, ast.Name) and node.func.id == "get_fs"
+        name = node.id if isinstance(node, ast.Name) else getattr(node, "attr", "")
+        return name in {"fs", "filesystem"} or name.endswith(("_fs", "_filesystem"))
+
+    @classmethod
+    def _violations(cls, source: str, label: str) -> list[str]:
+        """
+        Find every direct filesystem mutation in a module.
+
+        Args:
+            source: Python source text.
+            label: Name to report offences under.
+
+        Returns:
+            One ``label:line: call`` string per offence.
+        """
+        found: list[str] = []
+        for node in ast.walk(ast.parse(source)):
+            if not isinstance(node, ast.Call):
+                continue
+
+            func = node.func
+            if isinstance(func, ast.Name):
+                if func.id in {"open", "mkdtemp", "mkstemp"} and _opens_for_writing(node):
+                    found.append(f"{label}:{func.lineno}: {func.id}()")
+                continue
+
+            if not isinstance(func, ast.Attribute):
+                continue
+
+            owner = func.value.id if isinstance(func.value, ast.Name) else None
+            if (owner, func.attr) in cls.MUTATING_FUNCTIONS:
+                found.append(f"{label}:{func.lineno}: {owner}.{func.attr}()")
+                continue
+            if func.attr == "open" and _opens_for_writing(node):
+                found.append(f"{label}:{func.lineno}: .open() for writing")
+                continue
+            if func.attr in cls.MUTATING_METHODS and not cls._is_seam(func.value):
+                found.append(f"{label}:{func.lineno}: .{func.attr}()")
+
+        return found
+
+    @pytest.mark.parametrize("module", MODULES)
+    def test_the_module_mutates_nothing_directly(self, module: str) -> None:
+        """No write, delete, chmod or mkdir outside wasm.core.fs."""
+        path = Path(__file__).resolve().parents[1] / module
+
+        offences = self._violations(path.read_text(encoding="utf-8"), module)
+
+        assert offences == [], "These change the filesystem without the seam:\n" + "\n".join(
+            offences
+        )
+
+    def test_the_guard_catches_what_it_is_there_to_catch(self) -> None:
+        """
+        A guard nobody has seen fail is a guard nobody knows works.
+
+        Each line below is a real way the migration was undone in review.
+        """
+        mutations = [
+            "path.write_text('secret')",
+            "path.unlink()",
+            "path.chmod(0o600)",
+            "path.parent.mkdir(parents=True)",
+            "path.symlink_to(other)",
+            "path.touch()",
+            "shutil.rmtree(path)",
+            "shutil.move(path, path)",
+            "shutil.copytree(path, path)",
+            "os.replace(path, path)",
+            "os.remove(path)",
+            "os.makedirs(path)",
+            "tempfile.mkdtemp()",
+            "open(path, 'w').close()",
+            "open(path, mode=chosen).close()",
+            "path.open('a').close()",
+        ]
+        allowed = [
+            "fs.write_text(path, 'fine')",
+            "self.fs.chmod(path, 0o600)",
+            "get_fs().remove(path)",
+            "filesystem.mkdir(path)",
+            "self._fs.write_text(path, 'fine')",
+        ]
+        header = ["import os, shutil, tempfile", "def leak(path, other, chosen, fs, self):"]
+        source = "\n".join(header + [f"    {line}" for line in mutations + allowed])
+
+        offences = self._violations(source, "sample")
+
+        # One offence per mutation, none for the seam calls, and each is
+        # reported at the line the reviewer has to look at.
+        expected = {len(header) + index + 1 for index in range(len(mutations))}
+        assert {int(offence.split(":")[1]) for offence in offences} == expected
+
+    def test_reading_is_not_flagged(self) -> None:
+        """Reads change nothing; routing them through the seam is only noise."""
+        reading = "\n".join(
+            [
+                "from pathlib import Path",
+                "def look(path):",
+                "    if path.exists():",
+                "        return path.read_text(), list(path.iterdir()), path.stat()",
+                "    with path.open() as handle:",
+                "        return handle.read()",
+            ]
+        )
+
+        assert self._violations(reading, "sample") == []
+
+
+def _opens_for_writing(node: ast.Call) -> bool:
+    """
+    Decide whether an ``open`` call creates or truncates a file.
+
+    ``open(path)`` and ``open(path, "r")`` are reads. Anything with ``w``,
+    ``a``, ``x`` or ``+`` in its mode changes the filesystem, and a mode that is
+    not a literal is treated as a change: a guard that assumes the best is not
+    a guard.
+
+    Args:
+        node: The ``open`` call.
+
+    Returns:
+        True when the call may change the filesystem.
+    """
+    mode: ast.expr | None = None
+    for index, argument in enumerate(node.args):
+        # open(file, mode) on the builtin, path.open(mode) on a Path.
+        if index in (0, 1):
+            mode = argument if isinstance(argument, ast.Constant) else mode
+    for keyword in node.keywords:
+        if keyword.arg == "mode":
+            mode = keyword.value
+
+    if mode is None:
+        return False
+    if not isinstance(mode, ast.Constant) or not isinstance(mode.value, str):
+        return True
+    return any(flag in mode.value for flag in "wax+")

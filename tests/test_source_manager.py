@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from wasm.core.exceptions import SourceError
+from wasm.core.fs import DryRunFileSystem, RecordingFileSystem
 from wasm.core.runner import FakeRunner
 from wasm.managers import source_manager as sm
 from wasm.managers.source_manager import SourceManager
@@ -655,3 +656,312 @@ def test_extracted_files_are_not_group_or_world_writable(tmp_path: Path) -> None
         mode = os.stat(path).st_mode
         assert not mode & stat.S_IWGRP
         assert not mode & stat.S_IWOTH
+
+
+# The filesystem seam ------------------------------------------------------
+#
+# --dry-run was true for what this module executes and false for what it
+# writes: `fetch` deleted the destination with shutil.rmtree and copied over it
+# without a single subprocess in the way. These fix the other half.
+
+
+@pytest.fixture
+def dry() -> DryRunFileSystem:
+    """
+    Provide a filesystem that records changes and makes none.
+
+    Returns:
+        The rehearsal filesystem.
+    """
+    return DryRunFileSystem()
+
+
+def test_fetch_does_not_delete_the_existing_deployment_in_a_rehearsal(
+    tmp_path: Path, dry: DryRunFileSystem
+) -> None:
+    """`clean=True` wipes the destination; a rehearsal must leave it alone."""
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "app.py").write_text("print('new')")
+
+    destination = tmp_path / "app"
+    destination.mkdir()
+    (destination / "keep.txt").write_text("the running deployment")
+
+    manager = SourceManager(fs=dry)
+
+    assert manager.fetch(str(source), destination) is True
+
+    assert (destination / "keep.txt").read_text() == "the running deployment"
+    assert not (destination / "app.py").exists()
+    assert any("would delete directory" in change for change in dry.skipped)
+
+
+def test_fetch_of_a_local_source_creates_nothing_in_a_rehearsal(
+    tmp_path: Path, dry: DryRunFileSystem
+) -> None:
+    """A rehearsed local deployment leaves no directory behind."""
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "index.html").write_text("<html></html>")
+    destination = tmp_path / "apps" / "example-com"
+
+    assert SourceManager(fs=dry).fetch(str(source), destination) is True
+
+    assert not destination.exists()
+    assert not destination.parent.exists()
+
+
+def test_download_archive_touches_neither_network_nor_disk_in_a_rehearsal(
+    tmp_path: Path, dry: DryRunFileSystem, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rehearsing a deployment must not pull a gigabyte off the network."""
+
+    def _refuse(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a rehearsal must not open a connection")
+
+    monkeypatch.setattr(sm, "_open_url", _refuse)
+    destination = tmp_path / "app"
+
+    assert SourceManager(fs=dry).download_archive(ARCHIVE_URL, destination) is True
+
+    assert not destination.exists()
+    assert any("would create directory" in change for change in dry.skipped)
+
+
+def test_extract_archive_writes_nothing_in_a_rehearsal(
+    tmp_path: Path, dry: DryRunFileSystem
+) -> None:
+    """Not one member, and not the destination directory either."""
+    destination = tmp_path / "app"
+    archive = _write_tar(
+        tmp_path / "app.tar.gz",
+        [
+            (_tar_special("pkg", tarfile.DIRTYPE), None),
+            (_tar_file("pkg/main.py", b"x"), b"x"),
+        ],
+    )
+
+    sm.extract_archive(archive, destination, fs=dry)
+
+    assert not destination.exists()
+
+
+def test_extract_archive_still_extracts_through_the_real_seam(tmp_path: Path) -> None:
+    """The gate must not disarm extraction on a machine that does change."""
+    filesystem = RecordingFileSystem()
+    destination = tmp_path / "app"
+    archive = _write_tar(tmp_path / "app.tar.gz", [(_tar_file("main.py", b"body"), b"body")])
+
+    sm.extract_archive(archive, destination, fs=filesystem)
+
+    assert (destination / "main.py").read_bytes() == b"body"
+    assert ("mkdir", destination) in filesystem.changes
+
+
+def test_copy_local_copies_nothing_in_a_rehearsal(tmp_path: Path, dry: DryRunFileSystem) -> None:
+    """The one call that copies a tree outside the extraction path."""
+    source = tmp_path / "src"
+    (source / "app").mkdir(parents=True)
+    (source / "app" / "index.js").write_text("module.exports = {}")
+    destination = tmp_path / "app"
+
+    assert SourceManager(fs=dry).copy_local(source, destination) is True
+
+    assert not destination.exists()
+
+
+def test_flatten_moves_the_wrapper_contents_through_the_seam(tmp_path: Path) -> None:
+    """A release tarball wraps everything in one directory; unwrapping mutates."""
+    filesystem = RecordingFileSystem()
+    destination = tmp_path / "app"
+    wrapper = destination / "app-1.2.3"
+    wrapper.mkdir(parents=True)
+    (wrapper / "package.json").write_text("{}")
+
+    SourceManager(fs=filesystem)._flatten_single_directory(destination)
+
+    assert (destination / "package.json").read_text() == "{}"
+    assert not wrapper.exists()
+    assert ("move", wrapper / "package.json") in filesystem.changes
+    assert ("remove_tree", wrapper) in filesystem.changes
+
+
+def test_flatten_moves_nothing_in_a_rehearsal(tmp_path: Path, dry: DryRunFileSystem) -> None:
+    """Nothing is moved and, above all, the wrapper is not deleted."""
+    destination = tmp_path / "app"
+    wrapper = destination / "app-1.2.3"
+    wrapper.mkdir(parents=True)
+    (wrapper / "package.json").write_text("{}")
+
+    SourceManager(fs=dry)._flatten_single_directory(destination)
+
+    assert (wrapper / "package.json").read_text() == "{}"
+    assert not (destination / "package.json").exists()
+
+
+# The guard that keeps them there ------------------------------------------
+
+#: Calls that change the filesystem without going through wasm.core.fs.
+DIRECT_MUTATORS = frozenset(
+    {
+        "shutil.rmtree",
+        "shutil.move",
+        "shutil.copy",
+        "shutil.copy2",
+        "shutil.copyfile",
+        "shutil.copytree",
+        "shutil.copystat",
+        "shutil.chown",
+        "shutil.unpack_archive",
+        "os.remove",
+        "os.unlink",
+        "os.rmdir",
+        "os.removedirs",
+        "os.makedirs",
+        "os.mkdir",
+        "os.rename",
+        "os.renames",
+        "os.replace",
+        "os.symlink",
+        "os.link",
+        "os.chmod",
+        "os.chown",
+        "os.truncate",
+        "os.mknod",
+        "os.open",
+        "tempfile.mkdtemp",
+        "tempfile.mkstemp",
+        "tempfile.NamedTemporaryFile",
+        "tempfile.TemporaryDirectory",
+        # The wrappers in core.utils are the old bypass: they mutate too.
+        "write_file",
+        "copy_file",
+        "remove_directory",
+        "create_symlink",
+        "ensure_directory",
+        "set_permissions",
+    }
+)
+
+#: Path methods that change the filesystem. Also the names the seam itself
+#: uses, hence the receiver check.
+PATH_MUTATORS = frozenset(
+    {
+        "write_text",
+        "write_bytes",
+        "mkdir",
+        "unlink",
+        "rmdir",
+        "chmod",
+        "lchmod",
+        "symlink_to",
+        "hardlink_to",
+        "touch",
+        "rename",
+    }
+)
+
+#: Expressions that *are* the seam, so a mutating name on them is the point.
+SEAM_RECEIVERS = frozenset({"self.fs", "fs", "filesystem", "self._fs"})
+
+#: Functions allowed to mutate directly, and why. Every entry is load-bearing:
+#: the test fails if one of them stops being needed, so the list cannot rot.
+SEAM_EXEMPTIONS: dict[tuple[str, str], str] = {
+    ("source_manager.py", "_download_to_file"): (
+        "O_EXCL|O_CREAT at 0600 on a binary stream; gated by download_archive"
+    ),
+    ("source_manager.py", "_make_directory"): "archive member; gated by extract_archive",
+    ("source_manager.py", "_write_regular_file"): (
+        "O_EXCL|O_NOFOLLOW on a binary stream against a byte budget; gated by extract_archive"
+    ),
+    ("source_manager.py", "_create_symlink"): "archive member; gated by extract_archive",
+    ("source_manager.py", "_create_hardlink"): "archive member; gated by extract_archive",
+    ("source_manager.py", "download_archive"): "staging directory under /tmp, self-cleaning",
+    ("source_manager.py", "copy_local"): (
+        "shutil.copytree keeps the .git/node_modules ignore list the seam has no "
+        "parameter for; gated by _writes_directly"
+    ),
+}
+
+
+def _mutating_calls(path: Path) -> list[tuple[str, str, int]]:
+    """
+    Find every filesystem mutation in a module that skips the seam.
+
+    Args:
+        path: Python file to scan.
+
+    Returns:
+        Triples of (enclosing function, call as written, line number).
+    """
+    import ast
+
+    tree = ast.parse(path.read_text(), filename=str(path))
+    found: list[tuple[str, str, int]] = []
+    scope: list[str] = ["<module>"]
+
+    class Visitor(ast.NodeVisitor):
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            scope.append(node.name)
+            self.generic_visit(node)
+            scope.pop()
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            scope.append(node.name)
+            self.generic_visit(node)
+            scope.pop()
+
+        def visit_Call(self, node: ast.Call) -> None:
+            written = ast.unparse(node.func)
+            if written in DIRECT_MUTATORS:
+                found.append((scope[-1], written, node.lineno))
+            elif isinstance(node.func, ast.Attribute) and node.func.attr in PATH_MUTATORS:
+                receiver = ast.unparse(node.func.value)
+                if receiver not in SEAM_RECEIVERS:
+                    found.append((scope[-1], written, node.lineno))
+            elif (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "replace"
+                and len(node.args) == 1
+                and not node.keywords
+            ):
+                # Path.replace(target) takes one argument; the far more common
+                # str.replace(old, new) takes two, so arity tells them apart.
+                found.append((scope[-1], written, node.lineno))
+            elif isinstance(node.func, ast.Name) and node.func.id == "open":
+                modes = [
+                    a.value
+                    for a in [*node.args[1:], *(k.value for k in node.keywords)]
+                    if isinstance(a, ast.Constant) and isinstance(a.value, str)
+                ]
+                if any(set(mode) & set("wax+") for mode in modes):
+                    found.append((scope[-1], written, node.lineno))
+            self.generic_visit(node)
+
+    Visitor().visit(tree)
+    return found
+
+
+def test_no_filesystem_mutation_bypasses_the_seam() -> None:
+    """
+    The regression guard: every write, delete and chmod goes through core.fs.
+
+    This is what stops the next `Path.unlink` from quietly making --dry-run a
+    lie again. New exemptions have to be argued for here, in writing.
+    """
+    module = Path(sm.__file__)
+    offenders = []
+    used: set[tuple[str, str]] = set()
+
+    for function, call, line in _mutating_calls(module):
+        key = (module.name, function)
+        if key in SEAM_EXEMPTIONS:
+            used.add(key)
+            continue
+        offenders.append(f"{module.name}:{line} {function}() calls {call}")
+
+    assert offenders == [], "Filesystem mutations outside wasm.core.fs:\n" + "\n".join(offenders)
+
+    stale = {key for key in SEAM_EXEMPTIONS if key[0] == module.name} - used
+    assert stale == set(), f"Exemptions that are no longer needed: {sorted(stale)}"

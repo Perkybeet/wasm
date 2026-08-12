@@ -28,6 +28,7 @@ from wasm.core.exceptions import (
     ServiceError,
     WASMError,
 )
+from wasm.core.fs import SECRET_MODE, FileSystem
 from wasm.core.logger import Icons, Logger
 from wasm.core.runner import CommandResult, CommandRunner, get_runner
 from wasm.core.store import (
@@ -48,7 +49,7 @@ from wasm.deployers.helpers import (
     TurboHelper,
     WorkspaceHelper,
 )
-from wasm.deployers.interface import AppDeployer
+from wasm.deployers.interface import AppDeployer, StepReporter, UpdateResult
 from wasm.deployers.registry import DeployerRegistry
 from wasm.managers.apache_manager import ApacheManager
 from wasm.managers.cert_manager import CertManager
@@ -107,7 +108,12 @@ class MonorepoDeployer(AppDeployer):
     DEFAULT_BASE_PORT = 3000
     DEFAULT_PORT = 3000
 
-    def __init__(self, verbose: bool = False, runner: CommandRunner | None = None):
+    def __init__(
+        self,
+        verbose: bool = False,
+        runner: CommandRunner | None = None,
+        fs: FileSystem | None = None,
+    ):
         """
         Initialize the monorepo deployer.
 
@@ -115,9 +121,12 @@ class MonorepoDeployer(AppDeployer):
             verbose: Enable verbose logging.
             runner: Command runner used for installs and builds. Defaults to the
                 process-wide runner, which is what enforces --dry-run.
+            fs: Filesystem every change goes through. Defaults to the
+                process-wide one, for the same reason.
         """
         self.verbose = verbose
         self._runner = runner
+        self._fs = fs
         self.config = Config()
         self.logger = Logger(verbose=verbose)
         self.store = get_store()
@@ -172,7 +181,7 @@ class MonorepoDeployer(AppDeployer):
     def source_manager(self) -> SourceManager:
         """The manager that fetches source code."""
         if self._source_manager is None:
-            self._source_manager = SourceManager(verbose=self.verbose)
+            self._source_manager = SourceManager(verbose=self.verbose, fs=self._fs)
         return self._source_manager
 
     @source_manager.setter
@@ -476,6 +485,66 @@ class MonorepoDeployer(AppDeployer):
 
             raise
 
+    def update(self, on_step: StepReporter | None = None) -> UpdateResult:
+        """
+        Rebuild every workspace of a monorepo that is already deployed.
+
+        The CLI used to do this itself: it built a deployer, assigned
+        ``app_path``, ``app_name``, ``domain`` and ``package_manager`` by hand
+        and then called four private methods in order. That made the update a
+        second pipeline that no test could reach and that drifted from
+        :meth:`deploy` every time either side changed.
+
+        Restarting the services is deliberately not part of this: which units
+        exist is a store question, and the caller already owns it.
+
+        Args:
+            on_step: Called as each step begins.
+
+        Returns:
+            What was done, for the caller to present.
+
+        Raises:
+            DeploymentError: When the deployer was not configured, or when
+                dependency installation fails.
+            BuildError: When the build fails.
+        """
+        if not self.app_path or self.app_path == Path():
+            raise DeploymentError(
+                "Deployer was not configured",
+                details="Call configure(domain=..., source=...) before update().",
+            )
+
+        report = on_step or (lambda _message: None)
+
+        if not self.workspaces:
+            report("Discovering workspaces")
+            try:
+                self._discover_workspaces()
+            except DeploymentError as e:
+                # Only the build timeout estimate depends on the count, so a
+                # layout this cannot read must not block a rebuild.
+                self.logger.debug(f"Could not enumerate workspaces: {e}")
+
+        report("Installing dependencies")
+        self._install_dependencies()
+
+        report("Running database migrations")
+        prisma_updated = self._run_prisma_migrations()
+
+        report("Building applications")
+        self._set_permissions()
+        self._build_all()
+
+        return UpdateResult(
+            package_manager=self.package_manager,
+            prisma_updated=prisma_updated,
+            # Every workspace of a monorepo runs as its own unit; there is
+            # nothing static about it.
+            is_static=False,
+            start_command="",
+        )
+
     def _pre_flight_check(self) -> None:
         """Perform pre-deployment validation."""
         issues = []
@@ -500,8 +569,6 @@ class MonorepoDeployer(AppDeployer):
                     issues.append(f"Repository not accessible: {self.source}")
 
         # Check disk space
-        import shutil
-
         apps_dir = self.config.apps_directory
         if apps_dir.exists():
             usage = shutil.disk_usage(apps_dir)
@@ -763,12 +830,20 @@ class MonorepoDeployer(AppDeployer):
             self._write_env_file(root_env_file, {"DATABASE_URL": self.env_vars["DATABASE_URL"]})
 
     def _write_env_file(self, path: Path, env_vars: dict[str, str]) -> None:
-        """Write environment variables to a file."""
+        """
+        Write environment variables to a file.
+
+        Args:
+            path: File to write.
+            env_vars: Variables to record, one per line.
+        """
         lines = []
         for key, value in sorted(env_vars.items()):
             # Don't quote values for systemd compatibility
             lines.append(f"{key}={value}")
-        path.write_text("\n".join(lines) + "\n")
+        # SECRET_MODE: this file holds DATABASE_URL with the password this
+        # deployer just generated, plus whatever else .env.example asked for.
+        self.fs.write_text(path, "\n".join(lines) + "\n", mode=SECRET_MODE)
 
     def _install_dependencies(self) -> None:
         """Install dependencies using pnpm."""
@@ -785,8 +860,14 @@ class MonorepoDeployer(AppDeployer):
                 "Failed to install dependencies", details=result.stderr or result.stdout
             )
 
-    def _run_prisma_migrations(self) -> None:
-        """Run Prisma migrations if detected."""
+    def _run_prisma_migrations(self) -> bool:
+        """
+        Run Prisma migrations if detected.
+
+        Returns:
+            True when a Prisma client was generated or a migration ran, so an
+            update can report whether the database was touched.
+        """
         # Check for project scripts first (preferred method)
         package_json = self.app_path / "package.json"
         has_db_scripts = False
@@ -815,7 +896,7 @@ class MonorepoDeployer(AppDeployer):
                 if not result.success:
                     self.logger.warning(f"Prisma migrate failed: {result.stderr}")
 
-            return
+            return True
 
         # Fallback: Check for Prisma schema directly
         prisma_dirs = [
@@ -858,9 +939,10 @@ class MonorepoDeployer(AppDeployer):
                 else:
                     self.logger.substep("No migrations to run")
 
-                return
+                return True
 
         self.logger.substep("No Prisma schema found")
+        return False
 
     def _set_permissions(self) -> None:
         """Set correct ownership and permissions for the app directory."""
@@ -883,6 +965,25 @@ class MonorepoDeployer(AppDeployer):
             )
         except OSError as e:
             self.logger.debug(f"Failed to set permissions: {e}")
+
+        # That -R also put o+r on the .env files written a step earlier, which
+        # hold the database password this deployer generated. The chown above
+        # has just made the service account their owner, so 0600 is readable by
+        # the application and by nobody else.
+        for env_file in self._env_files():
+            if env_file.exists():
+                self.fs.chmod(env_file, SECRET_MODE)
+
+    def _env_files(self) -> list[Path]:
+        """
+        List the environment files this deployment writes.
+
+        Returns:
+            The per-workspace files, and the root one Prisma reads.
+        """
+        files = [self.app_path / ws.path / ".env.production" for ws in self.workspaces]
+        files.append(self.app_path / ".env")
+        return files
 
     def _build_all(self) -> None:
         """Build all applications using Turborepo."""
@@ -961,16 +1062,7 @@ class MonorepoDeployer(AppDeployer):
 
         config_content = template.render(**context)
 
-        # Write configuration
-        config_file = Path(f"/etc/nginx/sites-available/{self.domain}")
-        config_file.write_text(config_content)
-
-        # Enable site
-        enabled_link = Path(f"/etc/nginx/sites-enabled/{self.domain}")
-        if not enabled_link.exists():
-            enabled_link.symlink_to(config_file)
-
-        self._created_sites.append(self.domain)
+        self._install_nginx_site(config_content)
 
         # Register sites in store
         for ws in self.workspaces:
@@ -1081,21 +1173,27 @@ class MonorepoDeployer(AppDeployer):
 
             lines.append("}")
 
-        config_content = "\n".join(lines)
-
-        # Write configuration
-        config_file = Path(f"/etc/nginx/sites-available/{self.domain}")
-        config_file.write_text(config_content)
-
-        # Enable site
-        enabled_link = Path(f"/etc/nginx/sites-enabled/{self.domain}")
-        if not enabled_link.exists():
-            enabled_link.symlink_to(config_file)
-
-        self._created_sites.append(self.domain)
+        self._install_nginx_site("\n".join(lines))
 
         for ws in self.workspaces:
             self._register_site_in_store(ws, with_ssl)
+
+    def _install_nginx_site(self, config_content: str) -> None:
+        """
+        Write the site configuration and enable it.
+
+        Args:
+            config_content: The rendered nginx configuration.
+        """
+        from wasm.core.config import NGINX_SITES_AVAILABLE, NGINX_SITES_ENABLED
+
+        config_file = NGINX_SITES_AVAILABLE / self.domain
+        self.fs.write_text(config_file, config_content)
+        # Linking unconditionally: the previous "if not exists" skipped a
+        # dangling link, which left the site disabled with no way to notice.
+        self.fs.symlink(config_file, NGINX_SITES_ENABLED / self.domain)
+
+        self._created_sites.append(self.domain)
 
     def _create_apache_sites(self, manager: ApacheManager, with_ssl: bool) -> None:
         """Create Apache configurations (simplified version)."""
@@ -1362,7 +1460,7 @@ class MonorepoDeployer(AppDeployer):
         # Remove files
         if self.app_path and self.app_path.exists():
             try:
-                shutil.rmtree(self.app_path)
+                self.fs.remove_tree(self.app_path)
             except OSError as e:
                 errors.append(f"File cleanup error: {e}")
 

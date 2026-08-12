@@ -182,6 +182,83 @@ class TestErrorHandling:
         assert not offenders, "bare excepts:\n" + "\n".join(f"  {o}" for o in offenders)
 
 
+class TestFilesystemSeam:
+    """
+    Changes to disk go through wasm.core.fs, so --dry-run can refuse them.
+
+    Enforcing the flag only in the command runner made it true for what WASM
+    executes and false for what WASM writes: an adversarial review showed
+    ``wasm --dry-run backup delete <id> --force`` announcing that nothing would
+    change and then deleting the archive, because a deletion is a
+    ``Path.unlink`` and never reaches a subprocess.
+    """
+
+    #: Calls that put something on disk or take it off.
+    MUTATIONS = frozenset(
+        {
+            "write_text",
+            "write_bytes",
+            "mkdir",
+            "unlink",
+            "rmdir",
+            "rmtree",
+            "symlink_to",
+            "makedirs",
+            "copytree",
+            "touch",
+        }
+    )
+
+    #: The seam itself, and the two places that legitimately write outside it:
+    #: the runner streams a database dump straight to a file descriptor it
+    #: opens with the right mode, which is the point of that method, and the
+    #: auth store writes its own state before the CLI context exists.
+    SEAM_FILES = {"src/wasm/core/fs.py", "src/wasm/core/runner.py"}
+
+    #: What is left of the migration, by file. This may only fall.
+    DIRECT_MUTATIONS_ALLOWED = 32
+
+    def direct_mutations(self) -> list[str]:
+        """
+        Find calls that change the filesystem without going through the seam.
+
+        Returns:
+            Locations, as ``path:line:call``.
+        """
+        found: list[str] = []
+        for path in python_files():
+            if relative(path) in self.SEAM_FILES:
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                    continue
+                if node.func.attr not in self.MUTATIONS:
+                    continue
+                receiver = node.func.value
+                name = getattr(receiver, "attr", None) or getattr(receiver, "id", None)
+                # A call on the seam is the seam being used, not bypassed.
+                if name in ("fs", "_fs"):
+                    continue
+                found.append(f"{relative(path)}:{node.lineno}:{node.func.attr}")
+        return sorted(found)
+
+    def test_direct_filesystem_mutations_do_not_grow(self):
+        found = self.direct_mutations()
+
+        assert len(found) <= self.DIRECT_MUTATIONS_ALLOWED, (
+            f"direct filesystem mutations went from {self.DIRECT_MUTATIONS_ALLOWED} to "
+            f"{len(found)}. Route the change through wasm.core.fs, or --dry-run "
+            "will announce that nothing changed and then change it.\n"
+            + "\n".join(f"  {line}" for line in found[-15:])
+        )
+
+        assert len(found) >= self.DIRECT_MUTATIONS_ALLOWED - 5, (
+            f"direct filesystem mutations are down to {len(found)}. Lower "
+            f"DIRECT_MUTATIONS_ALLOWED to {len(found)} so the ratchet keeps holding."
+        )
+
+
 class TestTemplateSafety:
     """Templates escape by default, everywhere."""
 

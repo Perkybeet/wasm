@@ -20,6 +20,18 @@ WASM runs as root, so it is written defensively:
   a URL into a command, and a URL starting with ``-`` becomes an option, so
   both are rejected and every clone passes ``--`` before the URL.
 - **Processes go through the CommandRunner**, never through ``subprocess``.
+- **Filesystem changes go through :mod:`wasm.core.fs`**, so ``--dry-run`` is
+  true for what this module writes and deletes, not only for what it executes.
+
+The one deliberate exception is the body of an extraction. Every member is
+written with ``os.open(O_EXCL | O_NOFOLLOW)`` and streamed in chunks against a
+byte budget; routing that through :meth:`~wasm.core.fs.FileSystem.write_text`
+would mean decoding binary members into ``str``, buffering a whole file in
+memory, and losing the two flags that stop a crafted archive from writing
+through a symlink or overwriting a member it already wrote. So the *decision*
+is routed instead: :func:`extract_archive`, :meth:`SourceManager.download_archive`
+and :meth:`SourceManager.copy_local` ask the filesystem whether raw writes are
+allowed at all, and a rehearsal extracts nothing and creates no destination.
 """
 
 from __future__ import annotations
@@ -49,8 +61,8 @@ from urllib.request import (
 )
 
 from wasm.core.exceptions import SourceError
+from wasm.core.fs import FileSystem, RealFileSystem, get_fs
 from wasm.core.runner import CommandResult, CommandRunner
-from wasm.core.utils import remove_directory
 from wasm.managers.base_manager import BaseManager
 from wasm.validators.source import (
     parse_git_url,
@@ -524,12 +536,36 @@ def detect_archive_format(name: str) -> str:
     )
 
 
-def _prepare_destination(destination: Path) -> Path:
+def _writes_directly(filesystem: FileSystem) -> bool:
+    """
+    Report whether raw writes may be made alongside this filesystem.
+
+    An extraction cannot go through the seam member by member without giving up
+    ``O_EXCL``/``O_NOFOLLOW``, binary content and streaming; see the module
+    docstring. What it can do is refuse to write anything at all when the seam
+    would not have written either, which is what this answers.
+
+    The check fails closed on purpose: a filesystem this module does not
+    recognise as the real one is treated as a rehearsal, so an unknown
+    implementation ends up with nothing written behind its back rather than
+    with an archive unpacked past it.
+
+    Args:
+        filesystem: The filesystem in effect.
+
+    Returns:
+        True when the filesystem actually changes this machine.
+    """
+    return isinstance(filesystem, RealFileSystem)
+
+
+def _prepare_destination(destination: Path, filesystem: FileSystem) -> Path:
     """
     Create the destination directory and return its canonical path.
 
     Args:
         destination: Directory to extract into.
+        filesystem: The seam the directory is created through.
 
     Returns:
         The destination with every symlink resolved, which is the root every
@@ -539,7 +575,7 @@ def _prepare_destination(destination: Path) -> Path:
         SourceError: If the directory cannot be created.
     """
     try:
-        destination.mkdir(parents=True, exist_ok=True)
+        filesystem.make_dir(destination, parents=True)
     except OSError as exc:
         raise SourceError(
             f"Cannot create destination directory: {destination}",
@@ -942,6 +978,7 @@ def extract_archive(
     archive_format: str | None = None,
     max_entries: int = MAX_ARCHIVE_ENTRIES,
     max_total_bytes: int = MAX_ARCHIVE_BYTES,
+    fs: FileSystem | None = None,
 ) -> None:
     """
     Extract an archive into a directory without letting it escape.
@@ -956,13 +993,21 @@ def extract_archive(
         archive_format: Format override. Detected from the file name when None.
         max_entries: Maximum number of members.
         max_total_bytes: Maximum number of bytes to write.
+        fs: Filesystem the destination is created through. Defaults to the
+            process-wide one. A filesystem that does not change this machine
+            makes the whole extraction a no-op: nothing is created, nothing is
+            written.
 
     Raises:
         SourceError: If the archive is malformed, of an unsupported format, or
             contains any member that is unsafe to extract.
     """
+    filesystem = fs if fs is not None else get_fs()
+    if not _writes_directly(filesystem):
+        return
+
     resolved_format = archive_format or detect_archive_format(archive.name)
-    root = _prepare_destination(destination)
+    root = _prepare_destination(destination, filesystem)
     budget = _ExtractionBudget(max_entries=max_entries, max_total_bytes=max_total_bytes)
 
     if resolved_format == "zip":
@@ -994,7 +1039,12 @@ class SourceManager(BaseManager):
     and copying local directories.
     """
 
-    def __init__(self, verbose: bool = False, runner: CommandRunner | None = None):
+    def __init__(
+        self,
+        verbose: bool = False,
+        runner: CommandRunner | None = None,
+        fs: FileSystem | None = None,
+    ):
         """
         Initialize source manager.
 
@@ -1002,8 +1052,22 @@ class SourceManager(BaseManager):
             verbose: Enable verbose logging.
             runner: Command runner to execute git with. Defaults to the
                 process-wide runner.
+            fs: Filesystem every change goes through. Defaults to the
+                process-wide one, which is what makes ``--dry-run`` and the test
+                doubles work without every call site knowing about them.
         """
         super().__init__(verbose=verbose, runner=runner)
+        self._fs = fs
+
+    @property
+    def fs(self) -> FileSystem:
+        """
+        The filesystem this manager changes the machine through.
+
+        Returns:
+            The injected filesystem, or the process-wide one.
+        """
+        return self._fs if self._fs is not None else get_fs()
 
     def _git(
         self,
@@ -1080,10 +1144,19 @@ class SourceManager(BaseManager):
         # Clean destination if requested
         if clean and destination.exists():
             self.logger.debug(f"Removing existing directory: {destination}")
-            remove_directory(destination, sudo=True)
+            try:
+                self.fs.remove_tree(destination)
+            except OSError as exc:
+                # This used to be remove_directory(ignore_errors=True), so a
+                # directory that could not be removed was cloned into on top of
+                # its own leftovers instead of saying so.
+                raise SourceError(
+                    f"Cannot replace the existing directory: {destination}",
+                    details=f"{exc}. Remove it by hand or stop whatever holds it open.",
+                ) from exc
 
         # Ensure parent directory exists
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        self.fs.make_dir(destination.parent, parents=True)
 
         # Fetch based on source type
         if source_type == "git":
@@ -1444,12 +1517,19 @@ class SourceManager(BaseManager):
         safe_url = validate_archive_url(url)
         archive_format = detect_archive_format(urlparse(safe_url).path)
 
+        self.fs.make_dir(destination, parents=True)
+        if not _writes_directly(self.fs):
+            # A rehearsal does not pull a gigabyte off the network to unpack it
+            # into a directory it was not allowed to create.
+            self.logger.debug(f"Would download and extract: {safe_url} -> {destination}")
+            return True
+
         self.logger.debug(f"Downloading: {safe_url}")
 
         with tempfile.TemporaryDirectory(prefix="wasm-source-") as workdir:
             archive = Path(workdir) / "archive"
             _download_to_file(safe_url, archive)
-            extract_archive(archive, destination, archive_format=archive_format)
+            extract_archive(archive, destination, archive_format=archive_format, fs=self.fs)
 
         self._flatten_single_directory(destination)
         return True
@@ -1477,8 +1557,8 @@ class SourceManager(BaseManager):
 
         try:
             for item in subdir.iterdir():
-                shutil.move(str(item), str(destination))
-            subdir.rmdir()
+                self.fs.move(item, destination / item.name)
+            self.fs.remove_tree(subdir)
         except (OSError, shutil.Error) as exc:
             raise SourceError(
                 f"Cannot flatten extracted directory: {subdir.name}",
@@ -1505,10 +1585,18 @@ class SourceManager(BaseManager):
         if not source.is_dir():
             raise SourceError(f"Source is not a directory: {source}")
 
+        self.fs.make_dir(destination, parents=True)
+        if not _writes_directly(self.fs):
+            self.logger.debug(f"Would copy: {source} -> {destination}")
+            return True
+
         self.logger.debug(f"Copying: {source} -> {destination}")
 
         try:
-            # Use shutil.copytree
+            # Not fs.copy_tree: the seam copies everything, and a deployment
+            # that drags .git, node_modules and .venv along is both enormous and
+            # wrong. The ignore list is the point of this call, so the copy
+            # stays here behind the check above rather than losing it.
             shutil.copytree(
                 source,
                 destination,

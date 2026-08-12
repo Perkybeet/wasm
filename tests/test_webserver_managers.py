@@ -19,9 +19,14 @@ Three things are pinned here, and each one maps to a defect that shipped:
   ``cert["expires"]`` for several releases while this manager wrote ``expiry``,
   and a plain dict answered that with None forever.
 
-Plus the one that matters most for a program running as root: a domain that
+Plus the two that matter most for a program running as root: a domain that
 carries a path separator must never become a file outside the configuration
-directory.
+directory, and a rehearsal must not write or delete anything at all. The second
+one is new: ``--dry-run`` was enforced at the command runner, so it covered the
+``systemctl reload`` and missed the vhost being written and the symlink being
+unlinked, neither of which is a subprocess. The ``DryRunFileSystem`` cases below
+pin that, and the AST guard lives in ``test_service_manager.py``, which walks
+every manager in this area including these ones.
 """
 
 from __future__ import annotations
@@ -43,6 +48,7 @@ from wasm.core.exceptions import (
     ValidationError,
     WASMError,
 )
+from wasm.core.fs import DryRunFileSystem, set_fs
 from wasm.core.runner import FakeRunner
 from wasm.managers.apache_manager import ApacheManager
 from wasm.managers.cert_manager import CertificateInfo, CertManager
@@ -235,6 +241,42 @@ def managers(nginx: NginxManager, apache: ApacheManager) -> dict[str, WebServerM
         A mapping from backend name to manager.
     """
     return {"nginx": nginx, "apache": apache}
+
+
+@pytest.fixture
+def dry_fs() -> DryRunFileSystem:
+    """
+    A filesystem that refuses every change and records what it refused.
+
+    Returns:
+        The rehearsal filesystem.
+    """
+    return DryRunFileSystem()
+
+
+@pytest.fixture
+def rehearsals(
+    nginx: NginxManager, apache: ApacheManager, dry_fs: DryRunFileSystem
+) -> dict[str, WebServerManager]:
+    """
+    Both backends again, rehearsing against the same temporary tree.
+
+    Sharing the backends with the ``nginx`` and ``apache`` fixtures is the point:
+    a test can create a site for real and then check that the rehearsal refuses
+    to touch that exact file.
+
+    Args:
+        nginx: The real nginx manager, for its backend paths.
+        apache: The real apache manager, for its backend paths.
+        dry_fs: The rehearsal filesystem.
+
+    Returns:
+        A mapping from backend name to a manager that writes nothing.
+    """
+    return {
+        "nginx": NginxManager(backend=nginx.backend, fs=dry_fs),
+        "apache": ApacheManager(backend=apache.backend, fs=dry_fs),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -955,3 +997,155 @@ def test_a_hostile_domain_never_reaches_certbot(certs: CertManager, domain: str)
     """A lineage name becomes a directory under /etc/letsencrypt."""
     with pytest.raises((CertificateError, WASMError)):
         certs.obtain(domain, email="ops@example.com")
+
+
+# ---------------------------------------------------------------------------
+# A rehearsal writes nothing and deletes nothing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("backend", ["nginx", "apache"])
+def test_create_site_under_dry_run_writes_no_configuration(
+    rehearsals: dict[str, WebServerManager],
+    dry_fs: DryRunFileSystem,
+    tmp_path: Path,
+    backend: str,
+) -> None:
+    """A rehearsed create must leave no vhost and no staging file behind."""
+    manager = rehearsals[backend]
+
+    assert manager.create_site("example.com", context={"port": 3000}) is True
+
+    assert [p for p in tmp_path.rglob("*") if p.is_file()] == []
+    assert not manager.site_exists("example.com")
+    assert any("example.com" in skipped for skipped in dry_fs.skipped)
+
+
+@pytest.mark.parametrize("backend", ["nginx", "apache"])
+def test_update_site_under_dry_run_keeps_the_previous_configuration(
+    managers: dict[str, WebServerManager],
+    rehearsals: dict[str, WebServerManager],
+    backend: str,
+) -> None:
+    """Rehearsing a port change must not change the port the server serves."""
+    managers[backend].create_site("example.com", context={"port": 3000})
+    before = managers[backend].get_site_config("example.com")
+
+    rehearsals[backend].update_site("example.com", context={"port": 4100})
+
+    assert managers[backend].get_site_config("example.com") == before
+    assert "4100" not in before
+
+
+@pytest.mark.parametrize("backend", ["nginx", "apache"])
+def test_delete_site_under_dry_run_keeps_the_file(
+    managers: dict[str, WebServerManager],
+    rehearsals: dict[str, WebServerManager],
+    dry_fs: DryRunFileSystem,
+    backend: str,
+) -> None:
+    """
+    The defect the seam exists for, in its web server form.
+
+    ``--dry-run site delete`` announced that nothing would change and then
+    unlinked the virtual host, because the deletion is a ``Path.unlink``.
+    """
+    manager = managers[backend]
+    manager.create_site("example.com")
+    config = manager.config_path("example.com")
+    before = config.read_text()
+
+    assert rehearsals[backend].delete_site("example.com") is True
+
+    assert config.exists()
+    assert config.read_text() == before
+    assert any(str(config) in skipped for skipped in dry_fs.skipped)
+
+
+def test_enable_site_under_dry_run_writes_no_symlink(
+    nginx: NginxManager, rehearsals: dict[str, WebServerManager]
+) -> None:
+    """nginx enables a site by writing a link, which is a change like any other."""
+    nginx.create_site("example.com")
+
+    rehearsals["nginx"].enable_site("example.com")
+
+    link = nginx.sites_enabled / "example.com"
+    assert not link.is_symlink()
+    assert not link.exists()
+
+
+def test_disable_site_under_dry_run_keeps_the_symlink(
+    nginx: NginxManager, rehearsals: dict[str, WebServerManager]
+) -> None:
+    """A rehearsed disable must not take a live site out of service."""
+    nginx.create_site("example.com")
+    nginx.enable_site("example.com")
+    link = nginx.sites_enabled / "example.com"
+
+    rehearsals["nginx"].disable_site("example.com")
+
+    assert link.is_symlink()
+    assert nginx.site_enabled("example.com") is True
+
+
+@pytest.mark.parametrize("backend", ["nginx", "apache"])
+def test_the_process_wide_filesystem_is_honoured_without_injection(
+    managers: dict[str, WebServerManager], tmp_path: Path, backend: str
+) -> None:
+    """
+    ``wasm --dry-run`` installs the rehearsal filesystem globally, not per call.
+
+    Every CLI command builds its managers the ordinary way, so the flag is only
+    honest if a manager nobody handed a filesystem to still picks up the one the
+    entry point installed.
+    """
+    manager = managers[backend]
+    manager.create_site("example.com")
+    config = manager.config_path("example.com")
+
+    dry = DryRunFileSystem()
+    set_fs(dry)
+    try:
+        factory = NginxManager if backend == "nginx" else ApacheManager
+        factory(backend=manager.backend).delete_site("example.com")
+    finally:
+        set_fs(None)
+
+    assert config.exists()
+    assert dry.skipped
+
+
+def test_auto_renewal_under_dry_run_installs_no_cron_entry(
+    runner: FakeRunner,
+    store: FakeStore,
+    dry_fs: DryRunFileSystem,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cron fallback writes into /etc/cron.d; a rehearsal must not."""
+    cron_file = tmp_path / "cron.d/certbot-renew"
+    monkeypatch.setattr("wasm.managers.cert_manager._CRON_FILE", cron_file)
+    # Without a certbot.timer the manager falls through to the cron entry, which
+    # is the only path in this manager that writes a file.
+    runner.script(["sudo", "systemctl", "enable", "certbot.timer"], exit_code=1)
+
+    assert CertManager(fs=dry_fs).setup_auto_renewal() is True
+
+    assert not cron_file.exists()
+    assert not cron_file.parent.exists()
+    assert any(str(cron_file) in skipped for skipped in dry_fs.skipped)
+
+
+def test_auto_renewal_writes_the_cron_entry_through_the_seam(
+    runner: FakeRunner, store: FakeStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real path still has to work, and cron ignores a writable file."""
+    cron_file = tmp_path / "cron.d/certbot-renew"
+    monkeypatch.setattr("wasm.managers.cert_manager._CRON_FILE", cron_file)
+    runner.script(["sudo", "systemctl", "enable", "certbot.timer"], exit_code=1)
+
+    assert CertManager().setup_auto_renewal() is True
+
+    assert "certbot renew -q" in cron_file.read_text()
+    assert cron_file.stat().st_mode & 0o022 == 0

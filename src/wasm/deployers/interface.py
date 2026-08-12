@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, TypeAlias
 
+from wasm.core.fs import FileSystem, get_fs
+
 #: Called with a short description as each update step begins.
 StepReporter: TypeAlias = Callable[[str], None]
 
@@ -68,16 +70,34 @@ class AppDeployer(ABC):
 
     source_already_fetched: bool = False
 
-    def __init__(self, verbose: bool = False):
+    #: Class-level default so :attr:`fs` answers even for a subclass that builds
+    #: its own state without calling ``__init__`` here.
+    _fs: FileSystem | None = None
+
+    def __init__(self, verbose: bool = False, fs: FileSystem | None = None):
         """
         Args:
             verbose: Enable verbose logging.
+            fs: Filesystem every change goes through. Defaults to the
+                process-wide one, which is what makes ``--dry-run`` real for
+                what a deployment *writes*, not only for what it runs.
 
         Note:
             Declared here so the registry can build any deployer the same way.
             Subclasses do their own setup and are not required to call this.
         """
         self.verbose = verbose
+        self._fs = fs
+
+    @property
+    def fs(self) -> FileSystem:
+        """
+        The filesystem this deployer changes the machine through.
+
+        Returns:
+            The injected filesystem, or the process-wide one.
+        """
+        return self._fs if self._fs is not None else get_fs()
 
     @abstractmethod
     def detect(self, path: Path) -> bool:

@@ -26,14 +26,12 @@ from wasm.core.exceptions import (
     DockerError,
     WASMError,
 )
+from wasm.core.fs import FileSystem
 from wasm.core.logger import Logger
 from wasm.core.runner import CommandResult, CommandRunner, get_runner
 from wasm.core.store import App, AppStatus, AppType, get_store
-from wasm.core.utils import (
-    domain_to_app_name,
-    remove_directory,
-)
-from wasm.deployers.interface import AppDeployer
+from wasm.core.utils import domain_to_app_name
+from wasm.deployers.interface import AppDeployer, StepReporter, UpdateResult
 from wasm.deployers.registry import DeployerRegistry
 from wasm.managers.cert_manager import CertManager
 from wasm.managers.nginx_manager import NginxManager
@@ -98,15 +96,23 @@ class DockerComposeDeployer(AppDeployer):
         "compose.yaml",
     ]
 
-    def __init__(self, verbose: bool = False, runner: CommandRunner | None = None):
+    def __init__(
+        self,
+        verbose: bool = False,
+        runner: CommandRunner | None = None,
+        fs: FileSystem | None = None,
+    ):
         """
         Args:
             verbose: Enable verbose logging.
             runner: Command runner used for every docker invocation. Defaults to
                 the process-wide runner, which is what enforces --dry-run.
+            fs: Filesystem every change goes through. Defaults to the
+                process-wide one, for the same reason.
         """
         self.verbose = verbose
         self._runner = runner
+        self._fs = fs
         self.logger = Logger(verbose=verbose)
         self.config = Config()
         self.store = get_store()
@@ -410,7 +416,7 @@ class DockerComposeDeployer(AppDeployer):
             # clean the directory and clone a second time.
             self.logger.substep(f"Source already present at {self.app_path}")
             return
-        source_manager = SourceManager(verbose=self.verbose)
+        source_manager = SourceManager(verbose=self.verbose, fs=self._fs)
         source_manager.fetch(
             source=self.source,
             destination=self.app_path,
@@ -809,7 +815,10 @@ class DockerComposeDeployer(AppDeployer):
 
         # Remove app directory
         if self.app_path.exists():
-            remove_directory(self.app_path, sudo=True)
+            try:
+                self.fs.remove_tree(self.app_path)
+            except OSError as e:
+                self.logger.debug(f"File cleanup failed: {e}")
 
         # Clean store
         try:
@@ -890,20 +899,49 @@ class DockerComposeDeployer(AppDeployer):
             "running": sum(1 for s in services if s.get("State") == "running"),
         }
 
-    def update(self) -> None:
-        """Update the Docker Compose application (git pull + rebuild)."""
-        # Pull latest code
-        source_manager = SourceManager(verbose=self.verbose)
-        source_manager.pull(self.app_path, branch=self.branch)
+    def update(self, on_step: StepReporter | None = None) -> UpdateResult:
+        """
+        Rebuild the images of this stack and recreate its containers.
 
-        # Rebuild and restart
+        This used to take no arguments, return None and pull the source itself,
+        which is why the CLI could not drive it through the same call as every
+        other deployer and grew a third copy of the update flow instead. The
+        source is now fetched by whoever owns that step, exactly as
+        :meth:`~wasm.deployers.base.BaseDeployer.update` expects.
+
+        Args:
+            on_step: Called as each step begins.
+
+        Returns:
+            What was done, for the caller to present.
+
+        Raises:
+            DeploymentError: When no compose file can be found.
+            DockerError: When the build or the recreate fails.
+        """
+        report = on_step or (lambda _message: None)
+
+        if self.compose_path is None:
+            self._discover_compose_file()
+
+        report("Rebuilding Docker images")
         self._build_images()
 
+        report("Recreating containers")
         result = self._run(self._compose("up", "-d", "--remove-orphans"))
         if not result.success:
             raise DockerError("Failed to update containers", result.stderr)
 
         self.store.update_app_status(self.domain, AppStatus.RUNNING.value)
+
+        return UpdateResult(
+            package_manager="docker compose",
+            prisma_updated=False,
+            # The containers were recreated by the command above, so there is
+            # no unit for the caller to restart afterwards.
+            is_static=True,
+            start_command=" ".join(self._compose("up", "-d")),
+        )
 
     def delete(self, remove_volumes: bool = False) -> None:
         """

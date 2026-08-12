@@ -12,22 +12,54 @@ secret auto-generation, and interactive configuration.
 Everything this module writes holds credentials: a deployed ``.env`` carries
 ``DATABASE_URL``, API keys and the secrets generated here, and
 ``.wasm/env-config.json`` records the same inventory. Both go out through
-:func:`~wasm.core.config.secure_write`, which creates them 0600 in a single
-``os.open`` and refuses to follow a symlink. The application directory itself is
-left alone: it is served by the web server and read by the service account, so
-tightening it would break the deployment while doing nothing for the secrets,
-which are protected by the file mode.
+:mod:`wasm.core.fs` with :data:`~wasm.core.fs.SECRET_MODE`, so the mode is
+applied by the ``os.open`` that creates the file rather than by a ``chmod``
+afterwards, and the write lands on a temporary file that is renamed into place,
+so a half-written ``.env`` never exists and a symlink planted at the destination
+is replaced instead of followed. The application directory itself is left alone:
+it is served by the web server and read by the service account, so tightening it
+would break the deployment while doing nothing for the secrets, which are
+protected by the file mode.
 """
 
 import json
+import re
 import secrets
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
 
-from wasm.core.config import secure_write
-from wasm.core.exceptions import WASMError
+from wasm.core.config import REDACTED
+from wasm.core.exceptions import SecurityError, WASMError
+from wasm.core.fs import SECRET_DIR_MODE, SECRET_MODE, FileSystem, get_fs
 from wasm.core.logger import Logger
+
+#: A credential embedded in a connection string. ``DATABASE_URL`` is the
+#: canonical example: nothing in the *name* marks it as a secret, yet the value
+#: carries the database password in clear.
+#:
+#: The user name is optional on purpose. ``redis://:password@host:6379`` is the
+#: form redis-py, Heroku Redis and docker-compose all produce, and a pattern
+#: that demands a user before the colon lets exactly that one through in clear.
+#: The password may not contain ``/``, ``?`` or ``#``: those end the authority
+#: in RFC 3986, so refusing them keeps ``http://host:8080/a@b`` from being read
+#: as a credential and redacted.
+URL_CREDENTIALS = re.compile(r"(?P<prefix>[A-Za-z][A-Za-z0-9+.\-]*://[^:/?#@\s]*:)[^@\s/?#]*@")
+
+
+def redact_url_credentials(value: str, placeholder: str = REDACTED) -> str:
+    """
+    Replace the password inside every connection string in a value.
+
+    Args:
+        value: Text that may contain one or more URLs.
+        placeholder: What to put where the password was.
+
+    Returns:
+        The value with every embedded password replaced. Text carrying no
+        credential is returned unchanged.
+    """
+    return URL_CREDENTIALS.sub(lambda match: f"{match.group('prefix')}{placeholder}@", value)
 
 
 class EnvConfigError(WASMError):
@@ -140,9 +172,27 @@ class EnvManager:
         "WEBHOOK_SECRET",
     ]
 
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, fs: FileSystem | None = None):
+        """
+        Args:
+            verbose: Enable verbose logging.
+            fs: Filesystem every write goes through. Defaults to the
+                process-wide one, which is what makes ``--dry-run`` and the test
+                doubles work without every call site knowing about them.
+        """
         self.verbose = verbose
         self.logger = Logger(verbose=verbose)
+        self._fs = fs
+
+    @property
+    def fs(self) -> FileSystem:
+        """
+        The filesystem every file this manager writes goes through.
+
+        Returns:
+            The injected filesystem, or the process-wide one.
+        """
+        return self._fs or get_fs()
 
     def discover(self, app_path: Path) -> list[EnvVariable]:
         """
@@ -444,6 +494,12 @@ class EnvManager:
 
         Values are not quoted for systemd compatibility.
 
+        A symlink at the destination is refused rather than written through.
+        The seam would not follow it anyway, because it renames a temporary file
+        into place, but a link that appears where an application's ``.env``
+        belongs is someone trying to harvest credentials, and continuing past it
+        as if it were an ordinary file hides that.
+
         Args:
             path: Path to write the .env file.
             values: Variable name -> value mapping.
@@ -452,11 +508,21 @@ class EnvManager:
             SecurityError: If the destination is a symlink.
             OSError: If the file cannot be created or written.
         """
+        if path.is_symlink():
+            raise SecurityError(
+                f"Refusing to write secrets through the symlink {path}",
+                details=(
+                    "Something replaced the file with a symbolic link, which would "
+                    "redirect the write. Inspect the directory, remove the link and "
+                    "retry."
+                ),
+            )
+
         lines = []
         for key, value in sorted(values.items()):
             # Don't quote values for systemd compatibility
             lines.append(f"{key}={value}")
-        secure_write(path, "\n".join(lines) + "\n", secure_parent=False)
+        self.fs.write_text(path, "\n".join(lines) + "\n", mode=SECRET_MODE)
         self.logger.debug(f"Wrote env file: {path}")
 
     def save_config(self, app_path: Path, config: EnvConfig) -> None:
@@ -475,10 +541,25 @@ class EnvManager:
             SecurityError: If the destination is a symlink.
             OSError: If the file cannot be created or written.
         """
-        secure_write(
-            app_path / ".wasm" / "env-config.json",
-            json.dumps(config.to_dict(), indent=2),
-        )
+        directory = app_path / ".wasm"
+        self.fs.make_dir(directory, mode=SECRET_DIR_MODE, parents=True)
+        # A .wasm left world readable by an older version is tightened; the
+        # directory is ours alone, so there is nothing else to break.
+        if directory.is_dir() and directory.stat().st_mode & 0o077:
+            self.fs.chmod(directory, SECRET_DIR_MODE)
+
+        target = directory / "env-config.json"
+        if target.is_symlink():
+            raise SecurityError(
+                f"Refusing to write secrets through the symlink {target}",
+                details=(
+                    "Something replaced the file with a symbolic link, which would "
+                    "redirect the write. Inspect the directory, remove the link and "
+                    "retry."
+                ),
+            )
+
+        self.fs.write_text(target, json.dumps(config.to_dict(), indent=2), mode=SECRET_MODE)
 
     def load_config(self, app_path: Path) -> EnvConfig | None:
         """
