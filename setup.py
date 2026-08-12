@@ -31,8 +31,7 @@ setup(
             "starlette>=0.36.0",
             "pydantic>=2.0",
             "uvicorn[standard]>=0.27.0",
-            "python-jose[cryptography]>=3.3.0",
-            "psutil>=5.9.0",
+                    "psutil>=5.9.0",
         ],
         "monitor": [
             "psutil>=5.9.0",
@@ -45,8 +44,7 @@ setup(
             "starlette>=0.36.0",
             "pydantic>=2.0",
             "uvicorn[standard]>=0.27.0",
-            "python-jose[cryptography]>=3.3.0",
-        ],
+                ],
     },
     entry_points={
         "console_scripts": [
@@ -67,5 +65,7 @@ setup(
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
+        "Programming Language :: Python :: 3.14",
     ],
 )

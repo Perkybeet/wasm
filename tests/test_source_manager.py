@@ -9,6 +9,7 @@ that smuggle git options or non-network schemes.
 
 from __future__ import annotations
 
+import gzip
 import io
 import os
 import stat
@@ -24,6 +25,10 @@ from wasm.core.fs import DryRunFileSystem, RecordingFileSystem
 from wasm.core.runner import FakeRunner
 from wasm.managers import source_manager as sm
 from wasm.managers.source_manager import SourceManager
+
+#: Largest value a plain ustar size field can hold: eleven octal digits.
+#: Bigger sizes need the GNU or pax extensions, which is a different test.
+MAX_USTAR_SIZE = 0o77777777777
 
 ARCHIVE_URL = "https://archives.example.test/app.tar.gz"
 ZIP_URL = "https://archives.example.test/app.zip"
@@ -51,6 +56,43 @@ def _write_tar(path: Path, entries: Iterable[tuple[tarfile.TarInfo, bytes | None
             else:
                 info.size = len(data)
                 tf.addfile(info, io.BytesIO(data))
+    return path
+
+
+def _write_tar_with_lying_size(path: Path, name: str, declared: int) -> Path:
+    """
+    Build an archive whose header claims a size the payload does not have.
+
+    ``tarfile`` will not produce this: from Python 3.14 ``addfile`` refuses a
+    non-zero size without a payload, and before that it wrote padding to match.
+    A hostile archive has no such scruples, so the size field is patched in the
+    raw bytes, which is what actually arrives over the wire and what the
+    extractor has to refuse before reading anything.
+
+    Args:
+        path: Archive to write.
+        name: Member name.
+        declared: Size to claim, in bytes.
+
+    Returns:
+        The archive path.
+    """
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as tf:
+        tf.addfile(_tar_file(name, data=b""))
+
+    if declared > MAX_USTAR_SIZE:
+        raise ValueError(f"a ustar size field holds at most {MAX_USTAR_SIZE} bytes")
+
+    header = bytearray(raw.getvalue())
+    # ustar: the size field is twelve bytes at offset 124, octal, NUL padded.
+    header[124:136] = f"{declared:011o}\0".encode()
+    # The checksum covers the header with its own field blanked out.
+    header[148:156] = b" " * 8
+    header[148:156] = f"{sum(header[:512]):06o}\0 ".encode()
+
+    with gzip.open(path, "wb") as out:
+        out.write(bytes(header))
     return path
 
 
@@ -415,11 +457,9 @@ def test_tar_entry_count_limit_enforced(tmp_path: Path) -> None:
 
 
 def test_tar_declared_size_bomb_rejected(tmp_path: Path) -> None:
-    """A member declaring a terabyte is refused before a single byte is read."""
+    """A member declaring eight gigabytes is refused before a byte is read."""
     destination = tmp_path / "app"
-    info = _tar_file("huge.bin")
-    info.size = 10**12
-    archive = _write_tar(tmp_path / "bomb.tar.gz", [(info, None)])
+    archive = _write_tar_with_lying_size(tmp_path / "bomb.tar.gz", "huge.bin", MAX_USTAR_SIZE)
 
     with pytest.raises(SourceError):
         sm.extract_archive(archive, destination)

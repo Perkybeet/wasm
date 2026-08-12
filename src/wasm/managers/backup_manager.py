@@ -1375,8 +1375,8 @@ class BackupManager:
             workspace: Temporary directory used to hold the previous tree.
 
         Raises:
-            BackupError: If the swap fails. The previous tree is restored first
-                when one existed.
+            BackupError: If the safety copy cannot be made, or if the swap
+                fails. The previous tree is restored first when one existed.
         """
         safety_copy = workspace / "previous"
         had_existing = app_path.exists()
@@ -1386,8 +1386,19 @@ class BackupManager:
             try:
                 self.fs.copy_tree(app_path, safety_copy)
             except OSError as exc:
-                self.logger.warning(f"Could not create safety copy: {exc}")
-                had_existing = False
+                # Carrying on here used to degrade this to a warning and then
+                # delete the deployed tree anyway, with nothing to roll back
+                # to. A restore that cannot protect what is already running
+                # must not destroy it: refusing costs the operator a retry,
+                # continuing costs them the application.
+                raise BackupError(
+                    f"Refusing to restore over {app_path}: the current state could not be "
+                    "copied aside first",
+                    details=(
+                        f"{exc}. Free space or fix permissions under {workspace.parent}, or "
+                        f"move {app_path} out of the way yourself and restore again."
+                    ),
+                ) from exc
 
         try:
             if app_path.exists():

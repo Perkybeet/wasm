@@ -36,6 +36,7 @@ equivalent to a root shell. The design decisions that follow from that:
 from __future__ import annotations
 
 import hashlib
+import hmac
 import ipaddress
 import json
 import logging
@@ -50,7 +51,6 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException, Request, status
-from jose import JWTError, jwt
 from starlette.requests import HTTPConnection
 
 from wasm.core.exceptions import SecurityError
@@ -108,9 +108,10 @@ WS_CLOSE_RATE_LIMITED = 4429
 WS_SUBPROTOCOL = "wasm.auth"
 WS_TOKEN_PREFIX = "wasm.token."  # noqa: S105 - subprotocol prefix, not a credential
 
-JWT_ALGORITHM = "HS256"
-JWT_ISSUER = "wasm-web"
-JWT_SUBJECT = "wasm_session"
+#: Recorded in the payload the auth dependency hands to endpoints. Kept as
+#: names rather than a JWT: see SessionStore._encode for why the JWT went.
+SESSION_ISSUER = "wasm-web"
+SESSION_SUBJECT = "wasm_session"
 JWT_EXPIRATION_HOURS = 12
 
 #: A session is re-issued once it is past this fraction of its lifetime, so an
@@ -1199,26 +1200,54 @@ class TokenManager:
 
     def _encode(self, session_id: str, client_ip: str, issued: datetime, expires: datetime) -> str:
         """
-        Sign a session payload.
+        Sign a session identifier.
+
+        The token is the opaque identifier plus an HMAC of it, not a JWT. Every
+        field the server trusts - expiry, address, CSRF token - is read from the
+        session record, never from the token, so a JWT's payload was carried
+        across the wire and then ignored. What is left is "did we issue this",
+        which one HMAC answers.
+
+        Dropping it also drops ``python-jose``, which is not packaged in Ubuntu
+        26.04 and would have left the panel uninstallable there.
 
         Args:
             session_id: Server-side session identifier.
-            client_ip: IP the session belongs to.
-            issued: Issue time.
-            expires: Expiry time.
+            client_ip: IP the session belongs to. Unused in the token itself;
+                it is checked against the stored record.
+            issued: Issue time. Recorded in the store.
+            expires: Expiry time. Recorded in the store.
 
         Returns:
             The signed token.
         """
-        payload = {
-            "sub": JWT_SUBJECT,
-            "sid": session_id,
-            "ip": client_ip,
-            "iat": int(issued.timestamp()),
-            "exp": int(expires.timestamp()),
-            "iss": JWT_ISSUER,
-        }
-        return str(jwt.encode(payload, self._secret_key, algorithm=JWT_ALGORITHM))
+        signature = hmac.new(
+            self._secret_key.encode(), session_id.encode(), hashlib.sha256
+        ).hexdigest()
+        return f"{session_id}.{signature}"
+
+    def _decode(self, token: str) -> str | None:
+        """
+        Return the session identifier a token carries, if we signed it.
+
+        Args:
+            token: The token presented by the client.
+
+        Returns:
+            The session identifier, or None when the token is malformed or the
+            signature does not match.
+        """
+        session_id, _, signature = token.partition(".")
+        if not session_id or not signature:
+            return None
+        expected = hmac.new(
+            self._secret_key.encode(), session_id.encode(), hashlib.sha256
+        ).hexdigest()
+        # Constant time: a timing oracle here would let an attacker forge a
+        # signature one byte at a time.
+        if not hmac.compare_digest(expected, signature):
+            return None
+        return session_id
 
     def verify_session_token(
         self, token: str, client_ip: str | None = None
@@ -1240,23 +1269,24 @@ class TokenManager:
         if not token:
             return None
 
-        try:
-            payload: dict[str, Any] = jwt.decode(
-                token, self._secret_key, algorithms=[JWT_ALGORITHM], issuer=JWT_ISSUER
-            )
-        except JWTError:
-            return None
-
-        session_id = payload.get("sid")
+        session_id = self._decode(token)
         if not session_id:
             return None
 
-        record = self.sessions.get(str(session_id))
+        record = self.sessions.get(session_id)
         if record is None:
             return None
 
+        payload: dict[str, Any] = {
+            "sub": SESSION_SUBJECT,
+            "sid": session_id,
+            "ip": record["client_ip"],
+            "exp": record["expires_at"],
+            "iss": SESSION_ISSUER,
+        }
+
         if self._past_absolute_deadline(record):
-            self.sessions.revoke(str(session_id))
+            self.sessions.revoke(session_id)
             return None
 
         if self.config.bind_session_to_ip and client_ip and record["client_ip"] != client_ip:
@@ -1309,12 +1339,12 @@ class TokenManager:
             login has reached its absolute deadline.
         """
         session_id = payload.get("sid")
-        record = self.sessions.get(str(session_id)) if session_id else None
+        record = self.sessions.get(session_id) if session_id else None
         if record is None:
             return None
 
         if self._past_absolute_deadline(record):
-            self.sessions.revoke(str(session_id))
+            self.sessions.revoke(session_id)
             return None
 
         max_age = int(self.config.token_expiration_hours * 3600)
@@ -1329,7 +1359,7 @@ class TokenManager:
 
         new_sid = secrets.token_hex(16)
         new_csrf = secrets.token_urlsafe(32)
-        if self.sessions.rotate(str(session_id), new_sid, new_csrf, expires.timestamp()) is None:
+        if self.sessions.rotate(session_id, new_sid, new_csrf, expires.timestamp()) is None:
             return None
 
         token = self._encode(new_sid, record["client_ip"], now, expires)

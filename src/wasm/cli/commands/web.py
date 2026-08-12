@@ -510,7 +510,6 @@ def build_security_config(args: Namespace) -> SecurityConfig:
 WEB_DEPENDENCIES = {
     "fastapi": ("python3-fastapi", "fastapi>=0.109.0"),
     "uvicorn": ("python3-uvicorn", "uvicorn[standard]>=0.27.0"),
-    "jose": ("python3-jose", "python-jose[cryptography]>=3.3.0"),
     "psutil": ("python3-psutil", "psutil>=5.9.0"),
 }
 

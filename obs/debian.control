@@ -33,7 +33,6 @@ Recommends: python3-fastapi,
             python3-starlette,
             python3-pydantic,
             python3-uvicorn,
-            python3-jose,
             python3-psutil
 Suggests: git,
           nodejs,

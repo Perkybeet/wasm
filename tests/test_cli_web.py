@@ -937,15 +937,13 @@ def test_install_with_pip_builds_the_exact_argv(
 ) -> None:
     """The command that ends up running is the one under test."""
     monkeypatch.setattr(
-        web, "_check_dependencies", lambda: (False, ["python3-jose"], ["python-jose>=3.3.0"])
+        web, "_check_dependencies", lambda: (False, ["python3-fastapi"], ["fastapi>=0.109.0"])
     )
     monkeypatch.setattr(web, "_is_externally_managed", lambda: False)
 
     result = cli_runner.invoke(web.cli, ["install", "--pip"])
 
-    assert runner.calls == [
-        (sys.executable, "-m", "pip", "install", "--user", "python-jose>=3.3.0")
-    ]
+    assert runner.calls == [(sys.executable, "-m", "pip", "install", "--user", "fastapi>=0.109.0")]
     assert result.exit_code == 1  # the module is still missing afterwards
 
 
@@ -954,12 +952,12 @@ def test_install_with_apt_builds_the_exact_argv(
 ) -> None:
     """apt is driven through the runner, never through a shell."""
     monkeypatch.setattr(
-        web, "_check_dependencies", lambda: (False, ["python3-jose"], ["python-jose>=3.3.0"])
+        web, "_check_dependencies", lambda: (False, ["python3-fastapi"], ["fastapi>=0.109.0"])
     )
 
     cli_runner.invoke(web.cli, ["install", "--apt"])
 
-    assert runner.calls[0] == ("apt-get", "install", "-y", "python3-jose")
+    assert runner.calls[0] == ("apt-get", "install", "-y", "python3-fastapi")
 
 
 def test_install_is_a_no_op_when_everything_is_present(

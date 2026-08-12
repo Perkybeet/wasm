@@ -1226,3 +1226,54 @@ class TestTheReproducedCommand:
         assert result.exit_code == 0, result.exception
         assert _tree_snapshot(manager.backup_dir) == before
         assert (manager.backup_dir / "shop-example-com" / f"{metadata.id}.tar.gz").is_file()
+
+
+class TestARestoreNeverDestroysWhatItCannotReplace:
+    """
+    The deployed tree is deleted to make room for the archive's copy. If the
+    safety copy of it could not be made, deleting it is unrecoverable: there is
+    nothing to roll back to and the application is gone.
+    """
+
+    def test_a_failed_safety_copy_aborts_before_anything_is_deleted(
+        self, manager, tmp_path, monkeypatch
+    ):
+        deployed = tmp_path / "apps" / "example-com"
+        deployed.mkdir(parents=True)
+        (deployed / "server.js").write_text("the running application")
+        extracted = tmp_path / "extracted"
+        extracted.mkdir()
+        (extracted / "server.js").write_text("the archived application")
+        workspace = tmp_path / "work"
+        workspace.mkdir()
+
+        def no_space(*_args, **_kwargs):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(manager.fs, "copy_tree", no_space)
+
+        with pytest.raises(BackupError) as exc:
+            manager._swap_in_tree(extracted, deployed, workspace)
+
+        assert "could not be copied aside" in str(exc.value)
+        assert (deployed / "server.js").read_text() == "the running application", (
+            "the deployed application was destroyed by a restore that could not protect it"
+        )
+
+    def test_the_refusal_says_how_to_proceed(self, manager, tmp_path, monkeypatch):
+        deployed = tmp_path / "apps" / "example-com"
+        deployed.mkdir(parents=True)
+        (deployed / "x").write_text("x")
+        workspace = tmp_path / "work"
+        workspace.mkdir()
+        monkeypatch.setattr(
+            manager.fs,
+            "copy_tree",
+            lambda *a, **k: (_ for _ in ()).throw(OSError(13, "Permission denied")),
+        )
+
+        with pytest.raises(BackupError) as exc:
+            manager._swap_in_tree(tmp_path / "extracted", deployed, workspace)
+
+        assert exc.value.details
+        assert "restore again" in exc.value.details

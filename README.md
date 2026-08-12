@@ -50,11 +50,11 @@ WASM is a command-line tool for deploying and managing web applications on Linux
 
 ```bash
 # Add GPG key
-curl -fsSL https://download.opensuse.org/repositories/home:/Perkybeet/xUbuntu_24.04/Release.key | \
+curl -fsSL https://download.opensuse.org/repositories/home:/Perkybeet/xUbuntu_26.04/Release.key | \
   gpg --dearmor | sudo tee /usr/share/keyrings/wasm.gpg > /dev/null
 
 # Add repository
-echo 'deb [signed-by=/usr/share/keyrings/wasm.gpg] https://download.opensuse.org/repositories/home:/Perkybeet/xUbuntu_24.04/ /' | \
+echo 'deb [signed-by=/usr/share/keyrings/wasm.gpg] https://download.opensuse.org/repositories/home:/Perkybeet/xUbuntu_26.04/ /' | \
   sudo tee /etc/apt/sources.list.d/wasm.list
 
 # Install
@@ -63,15 +63,16 @@ sudo apt install wasm
 ```
 
 **Supported versions:**
-- Ubuntu 22.04 LTS (Jammy Jellyfish)
+- Ubuntu 26.04 LTS (Resolute Raccoon, Python 3.14)
 - Ubuntu 24.04 LTS (Noble Numbat)
-- Debian 12 (Bookworm)
+- Ubuntu 22.04 LTS (Jammy Jellyfish)
+- Debian 12 (Bookworm) and 13 (Trixie)
 
 ### Fedora
 
 ```bash
 sudo dnf config-manager --add-repo \
-  https://download.opensuse.org/repositories/home:/Perkybeet/Fedora_40/home:Perkybeet.repo
+  https://download.opensuse.org/repositories/home:/Perkybeet/Fedora_42/home:Perkybeet.repo
 sudo dnf install wasm-cli
 ```
 
@@ -463,9 +464,10 @@ endpoints but no screen. Use the CLI for those.
 
 ## System Requirements
 
-- **Operating System**: Ubuntu 20.04+, Debian 11+, Fedora 38+, openSUSE Leap 15.5+
-- **Python**: 3.10 or higher
-- **Privileges**: sudo access for service management
+- **Operating System**: Ubuntu 22.04+, Debian 12+, Fedora 40+, openSUSE Leap 15.6+
+- **Python**: 3.10 to 3.14
+- **Privileges**: root. WASM writes to /etc, /var and systemd, so it checks for
+  root on the commands that touch the system rather than escalating per call.
 
 ### Optional Dependencies
 

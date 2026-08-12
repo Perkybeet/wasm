@@ -32,7 +32,6 @@ Suggests:       python3-fastapi
 Suggests:       python3-starlette
 Suggests:       python3-pydantic
 Suggests:       python3-uvicorn
-Suggests:       python3-jose
 Suggests:       python3-psutil
 %endif
 
@@ -48,7 +47,6 @@ Suggests:       python3-fastapi
 Suggests:       python3-starlette
 Suggests:       python3-pydantic
 Suggests:       python3-uvicorn
-Suggests:       python3-python-jose
 Suggests:       python3-psutil
 %endif
 

@@ -66,8 +66,8 @@ jobs:
             
             ### Ubuntu/Debian
             ```bash
-            curl -fsSL https://download.opensuse.org/repositories/home:Perkybeet/xUbuntu_24.04/Release.key | sudo gpg --dearmor -o /usr/share/keyrings/wasm.gpg
-            echo "deb [signed-by=/usr/share/keyrings/wasm.gpg] https://download.opensuse.org/repositories/home:Perkybeet/xUbuntu_24.04/ /" | sudo tee /etc/apt/sources.list.d/wasm.list
+            curl -fsSL https://download.opensuse.org/repositories/home:Perkybeet/xUbuntu_26.04/Release.key | sudo gpg --dearmor -o /usr/share/keyrings/wasm.gpg
+            echo "deb [signed-by=/usr/share/keyrings/wasm.gpg] https://download.opensuse.org/repositories/home:Perkybeet/xUbuntu_26.04/ /" | sudo tee /etc/apt/sources.list.d/wasm.list
             sudo apt update && sudo apt install wasm
             ```
             
