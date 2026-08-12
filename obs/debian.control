@@ -2,13 +2,21 @@ Source: wasm
 Section: admin
 Priority: optional
 Maintainer: Yago López Prado <yago.lopez.adeje@gmail.com>
+# Generating the shell completions runs the package, so everything it imports
+# at import time is needed at build time too, not only at run time. Leaving
+# these out is what made every OBS target fail with ModuleNotFoundError while
+# the GitHub runner, which happens to ship python3-yaml, built fine.
 Build-Depends: debhelper-compat (= 13),
                dh-python,
                pybuild-plugin-pyproject,
                python3-all,
                python3-setuptools,
-               python3-pip,
-               python3-wheel
+               python3-wheel,
+               python3-click,
+               python3-jinja2,
+               python3-yaml,
+               python3-questionary,
+               python3-rich
 Standards-Version: 4.6.0
 Homepage: https://github.com/Perkybeet/wasm
 Rules-Requires-Root: no

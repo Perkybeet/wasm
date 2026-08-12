@@ -1,15 +1,13 @@
 """
-Interactive mode for WASM using inquirer.
+Interactive mode.
+
+Prompts come from :mod:`wasm.cli.prompts`, which is built on questionary. The
+previous implementation used inquirer, which is not packaged in Debian or
+Ubuntu, so interactive mode never worked on the distributions most WASM users
+run.
 """
 
-try:
-    import inquirer
-    from inquirer.themes import GreenPassion
-
-    HAS_INQUIRER = True
-except ImportError:
-    HAS_INQUIRER = False
-
+from wasm.cli import prompts
 from wasm.core.exceptions import WASMError
 from wasm.core.logger import Logger
 from wasm.validators.domain import check_domain
@@ -19,7 +17,7 @@ from wasm.validators.source import is_valid_source
 
 class InteractiveMode:
     """
-    Interactive mode handler using inquirer prompts.
+    Interactive mode handler.
     """
 
     def __init__(self, verbose: bool = False):
@@ -32,10 +30,14 @@ class InteractiveMode:
         self.verbose = verbose
         self.logger = Logger(verbose=verbose)
 
-        if not HAS_INQUIRER:
+        if not prompts.AVAILABLE:
             raise WASMError(
-                "Interactive mode requires 'inquirer' package.",
-                "Install with: pip install wasm-cli[interactive]\nOr: pip install inquirer",
+                "Interactive mode needs questionary, which is missing",
+                details=(
+                    "It is a hard dependency, so this means a broken install.\n"
+                    "  pip install --force-reinstall wasm-cli\n"
+                    "  or, on a distribution package: apt install python3-questionary"
+                ),
             )
 
     def run(self) -> int:
@@ -73,7 +75,7 @@ class InteractiveMode:
     def _prompt_action_type(self) -> str:
         """Prompt for action type."""
         questions = [
-            inquirer.List(
+            prompts.List(
                 "action_type",
                 message="What would you like to do?",
                 choices=[
@@ -85,13 +87,13 @@ class InteractiveMode:
             ),
         ]
 
-        answers = inquirer.prompt(questions, theme=GreenPassion())
+        answers = prompts.prompt(questions)
         return answers["action_type"] if answers else None
 
     def _webapp_flow(self) -> int:
         """Handle webapp interactive flow."""
         questions = [
-            inquirer.List(
+            prompts.List(
                 "action",
                 message="What action would you like to perform?",
                 choices=[
@@ -108,7 +110,7 @@ class InteractiveMode:
             ),
         ]
 
-        answers = inquirer.prompt(questions, theme=GreenPassion())
+        answers = prompts.prompt(questions)
         if not answers:
             return 0
 
@@ -155,7 +157,7 @@ class InteractiveMode:
     def _webapp_create(self) -> int:
         """Handle webapp create flow."""
         questions = [
-            inquirer.List(
+            prompts.List(
                 "type",
                 message="Select application type",
                 choices=[
@@ -167,23 +169,23 @@ class InteractiveMode:
                     ("🔍 Auto-detect", "auto"),
                 ],
             ),
-            inquirer.Text(
+            prompts.Text(
                 "domain",
                 message="Enter target domain",
                 validate=lambda _, x: check_domain(x) or "Invalid domain name",
             ),
-            inquirer.Text(
+            prompts.Text(
                 "source",
                 message="Enter source (Git URL or path)",
                 validate=lambda _, x: is_valid_source(x) or "Invalid source",
             ),
-            inquirer.Text(
+            prompts.Text(
                 "port",
                 message="Application port (leave empty for auto)",
                 default="",
                 validate=lambda _, x: x == "" or check_port(x) or "Invalid port",
             ),
-            inquirer.List(
+            prompts.List(
                 "webserver",
                 message="Select web server",
                 choices=[
@@ -192,24 +194,24 @@ class InteractiveMode:
                 ],
                 default="nginx",
             ),
-            inquirer.Text(
+            prompts.Text(
                 "branch",
                 message="Git branch (leave empty for default)",
                 default="",
             ),
-            inquirer.Confirm(
+            prompts.Confirm(
                 "ssl",
                 message="Configure SSL certificate?",
                 default=True,
             ),
-            inquirer.Text(
+            prompts.Text(
                 "env_file",
                 message="Path to environment file (leave empty to skip)",
                 default="",
             ),
         ]
 
-        answers = inquirer.prompt(questions, theme=GreenPassion())
+        answers = prompts.prompt(questions)
         if not answers:
             return 0
 
@@ -219,13 +221,13 @@ class InteractiveMode:
         include_www = False
         if answers["ssl"] and should_include_www(answers["domain"]):
             www_questions = [
-                inquirer.Confirm(
+                prompts.Confirm(
                     "include_www",
                     message=f"Include www.{answers['domain']} in certificate and web server config?",
                     default=True,
                 ),
             ]
-            www_answers = inquirer.prompt(www_questions, theme=GreenPassion())
+            www_answers = prompts.prompt(www_questions)
             include_www = www_answers.get("include_www", True) if www_answers else False
 
         # Build arguments
@@ -252,20 +254,20 @@ class InteractiveMode:
     def _webapp_logs(self, domain: str) -> int:
         """Handle webapp logs flow with interactive prompts."""
         questions = [
-            inquirer.Text(
+            prompts.Text(
                 "lines",
                 message="Number of log lines to show",
                 default="50",
                 validate=lambda _, x: (x.isdigit() and int(x) > 0) or "Must be a positive number",
             ),
-            inquirer.Confirm(
+            prompts.Confirm(
                 "follow",
                 message="Follow log output in real time?",
                 default=False,
             ),
         ]
 
-        answers = inquirer.prompt(questions, theme=GreenPassion())
+        answers = prompts.prompt(questions)
         if not answers:
             return 0
 
@@ -279,14 +281,14 @@ class InteractiveMode:
     def _webapp_update(self, domain: str) -> int:
         """Handle webapp update flow with interactive prompts."""
         questions = [
-            inquirer.Text(
+            prompts.Text(
                 "branch",
                 message="Git branch to update from (leave empty for default)",
                 default="",
             ),
         ]
 
-        answers = inquirer.prompt(questions, theme=GreenPassion())
+        answers = prompts.prompt(questions)
         if not answers:
             return 0
 
@@ -299,7 +301,7 @@ class InteractiveMode:
     def _site_flow(self) -> int:
         """Handle site interactive flow."""
         questions = [
-            inquirer.List(
+            prompts.List(
                 "action",
                 message="What action would you like to perform?",
                 choices=[
@@ -313,7 +315,7 @@ class InteractiveMode:
             ),
         ]
 
-        answers = inquirer.prompt(questions, theme=GreenPassion())
+        answers = prompts.prompt(questions)
         if not answers:
             return 0
 
@@ -334,12 +336,12 @@ class InteractiveMode:
     def _site_create(self) -> int:
         """Handle site create flow."""
         questions = [
-            inquirer.Text(
+            prompts.Text(
                 "domain",
                 message="Enter domain name",
                 validate=lambda _, x: check_domain(x) or "Invalid domain name",
             ),
-            inquirer.List(
+            prompts.List(
                 "webserver",
                 message="Select web server",
                 choices=[
@@ -347,7 +349,7 @@ class InteractiveMode:
                     ("Apache", "apache"),
                 ],
             ),
-            inquirer.List(
+            prompts.List(
                 "template",
                 message="Select configuration template",
                 choices=[
@@ -355,20 +357,20 @@ class InteractiveMode:
                     ("Static Site", "static"),
                 ],
             ),
-            inquirer.Text(
+            prompts.Text(
                 "port",
                 message="Backend port (for proxy)",
                 default="3000",
                 validate=lambda _, x: check_port(x) or "Invalid port",
             ),
-            inquirer.Confirm(
+            prompts.Confirm(
                 "ssl",
                 message="Configure SSL certificate?",
                 default=True,
             ),
         ]
 
-        answers = inquirer.prompt(questions, theme=GreenPassion())
+        answers = prompts.prompt(questions)
         if not answers:
             return 0
 
@@ -378,13 +380,13 @@ class InteractiveMode:
         include_www = False
         if answers["ssl"] and should_include_www(answers["domain"]):
             www_questions = [
-                inquirer.Confirm(
+                prompts.Confirm(
                     "include_www",
                     message=f"Include www.{answers['domain']} in certificate and web server config?",
                     default=True,
                 ),
             ]
-            www_answers = inquirer.prompt(www_questions, theme=GreenPassion())
+            www_answers = prompts.prompt(www_questions)
             include_www = www_answers.get("include_www", True) if www_answers else False
 
         from argparse import Namespace
@@ -407,7 +409,7 @@ class InteractiveMode:
     def _service_flow(self) -> int:
         """Handle service interactive flow."""
         questions = [
-            inquirer.List(
+            prompts.List(
                 "action",
                 message="What action would you like to perform?",
                 choices=[
@@ -423,7 +425,7 @@ class InteractiveMode:
             ),
         ]
 
-        answers = inquirer.prompt(questions, theme=GreenPassion())
+        answers = prompts.prompt(questions)
         if not answers:
             return 0
 
@@ -447,34 +449,34 @@ class InteractiveMode:
     def _service_create(self) -> int:
         """Handle service create flow."""
         questions = [
-            inquirer.Text(
+            prompts.Text(
                 "name",
                 message="Enter service name",
                 validate=lambda _, x: len(x) > 0 or "Name required",
             ),
-            inquirer.Text(
+            prompts.Text(
                 "command",
                 message="Enter command to run",
                 validate=lambda _, x: len(x) > 0 or "Command required",
             ),
-            inquirer.Text(
+            prompts.Text(
                 "directory",
                 message="Enter working directory",
                 validate=lambda _, x: len(x) > 0 or "Directory required",
             ),
-            inquirer.Text(
+            prompts.Text(
                 "user",
                 message="User to run as",
                 default="www-data",
             ),
-            inquirer.Text(
+            prompts.Text(
                 "description",
                 message="Service description",
                 default="",
             ),
         ]
 
-        answers = inquirer.prompt(questions, theme=GreenPassion())
+        answers = prompts.prompt(questions)
         if not answers:
             return 0
 
@@ -497,20 +499,20 @@ class InteractiveMode:
     def _service_logs(self, name: str) -> int:
         """Handle service logs flow with interactive prompts."""
         questions = [
-            inquirer.Text(
+            prompts.Text(
                 "lines",
                 message="Number of log lines to show",
                 default="50",
                 validate=lambda _, x: (x.isdigit() and int(x) > 0) or "Must be a positive number",
             ),
-            inquirer.Confirm(
+            prompts.Confirm(
                 "follow",
                 message="Follow log output in real time?",
                 default=False,
             ),
         ]
 
-        answers = inquirer.prompt(questions, theme=GreenPassion())
+        answers = prompts.prompt(questions)
         if not answers:
             return 0
 
@@ -525,7 +527,7 @@ class InteractiveMode:
     def _cert_flow(self) -> int:
         """Handle cert interactive flow."""
         questions = [
-            inquirer.List(
+            prompts.List(
                 "action",
                 message="What action would you like to perform?",
                 choices=[
@@ -539,7 +541,7 @@ class InteractiveMode:
             ),
         ]
 
-        answers = inquirer.prompt(questions, theme=GreenPassion())
+        answers = prompts.prompt(questions)
         if not answers:
             return 0
 
@@ -564,22 +566,22 @@ class InteractiveMode:
     def _cert_create(self) -> int:
         """Handle cert create flow."""
         questions = [
-            inquirer.Text(
+            prompts.Text(
                 "domain",
                 message="Enter primary domain",
                 validate=lambda _, x: check_domain(x) or "Invalid domain",
             ),
-            inquirer.Text(
+            prompts.Text(
                 "additional",
                 message="Additional domains (comma separated, or leave empty)",
                 default="",
             ),
-            inquirer.Text(
+            prompts.Text(
                 "email",
                 message="Email for registration (leave empty for default)",
                 default="",
             ),
-            inquirer.List(
+            prompts.List(
                 "method",
                 message="Certificate obtention method",
                 choices=[
@@ -589,14 +591,14 @@ class InteractiveMode:
                     ("Webroot", "webroot"),
                 ],
             ),
-            inquirer.Confirm(
+            prompts.Confirm(
                 "dry_run",
                 message="Dry run (test without obtaining)?",
                 default=False,
             ),
         ]
 
-        answers = inquirer.prompt(questions, theme=GreenPassion())
+        answers = prompts.prompt(questions)
         if not answers:
             return 0
 
@@ -631,7 +633,7 @@ class InteractiveMode:
     def _cert_renew(self) -> int:
         """Handle cert renew flow."""
         questions = [
-            inquirer.List(
+            prompts.List(
                 "scope",
                 message="What to renew?",
                 choices=[
@@ -639,19 +641,19 @@ class InteractiveMode:
                     ("Specific certificate", "specific"),
                 ],
             ),
-            inquirer.Confirm(
+            prompts.Confirm(
                 "force",
                 message="Force renewal?",
                 default=False,
             ),
-            inquirer.Confirm(
+            prompts.Confirm(
                 "dry_run",
                 message="Dry run?",
                 default=False,
             ),
         ]
 
-        answers = inquirer.prompt(questions, theme=GreenPassion())
+        answers = prompts.prompt(questions)
         if not answers:
             return 0
 
@@ -676,25 +678,25 @@ class InteractiveMode:
     def _prompt_domain(self, message: str) -> str:
         """Prompt for a domain name."""
         questions = [
-            inquirer.Text(
+            prompts.Text(
                 "domain",
                 message=message,
                 validate=lambda _, x: check_domain(x) or "Invalid domain",
             ),
         ]
-        answers = inquirer.prompt(questions, theme=GreenPassion())
+        answers = prompts.prompt(questions)
         return answers["domain"] if answers else None
 
     def _prompt_text(self, message: str, default: str = "") -> str:
         """Prompt for text input."""
         questions = [
-            inquirer.Text(
+            prompts.Text(
                 "value",
                 message=message,
                 default=default,
             ),
         ]
-        answers = inquirer.prompt(questions, theme=GreenPassion())
+        answers = prompts.prompt(questions)
         return answers["value"] if answers else default
 
     def _run_command(self, resource: str, action: str, target: str | None = None, **kwargs) -> int:

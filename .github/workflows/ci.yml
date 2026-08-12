@@ -172,6 +172,11 @@ jobs:
       - name: Check the man page is current
         run: python scripts/generate_man.py --check
 
+      # Committed rather than generated at package build time, so a Click
+      # upgrade that changes the shim has to be noticed here.
+      - name: Check the completion scripts are current
+        run: python scripts/generate_completions.py --check
+
       - name: Build distributions
         run: |
           pip install build twine

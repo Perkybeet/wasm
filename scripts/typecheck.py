@@ -39,7 +39,25 @@ BASELINE_FILE = ROOT / "scripts/typecheck.baseline.json"
 
 #: Error codes that mean "this name does not exist". They are the reason this
 #: gate exists, so they are never allowed, baseline or not.
-FATAL_CODES = frozenset({"attr-defined", "name-defined", "call-arg", "used-before-def"})
+#:
+#: ``import-not-found`` is here because it caught a real one: inquirer stayed
+#: imported after it stopped being a dependency, so ``wasm --interactive``
+#: crashed on any clean install while the developer's machine, which still had
+#: the package, said nothing.
+FATAL_CODES = frozenset(
+    {
+        "attr-defined",
+        "name-defined",
+        "call-arg",
+        "used-before-def",
+        "import-not-found",
+    }
+)
+
+#: Codes whose count depends on which optional packages happen to be installed.
+#: Baselining them makes the gate fail for reasons that have nothing to do with
+#: the change being checked.
+ENVIRONMENT_DEPENDENT = frozenset({"import-untyped"})
 
 ERROR_LINE = re.compile(
     r"^(?P<file>[^:]+):(?P<line>\d+): error: (?P<message>.*?)\s*\[(?P<code>[a-z-]+)\]$"
@@ -94,7 +112,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--update", action="store_true", help="record the current counts")
     args = parser.parse_args(argv)
 
-    findings = run_mypy()
+    findings = [f for f in run_mypy() if f["code"] not in ENVIRONMENT_DEPENDENT]
     counts = Counter(f["code"] for f in findings)
 
     if args.update:

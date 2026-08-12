@@ -3,7 +3,6 @@
   "assignment": 3,
   "call-overload": 1,
   "has-type": 2,
-  "import-untyped": 8,
   "no-any-return": 6,
   "return-value": 2,
   "unused-ignore": 1,

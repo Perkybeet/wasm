@@ -16,8 +16,188 @@ permissions:
   packages: write
 
 jobs:
+  # Nothing is published until this passes.
+  #
+  # This job exists because it did not. Release triggers on the tag and every
+  # other job hung off `release`, so pushing a tag shipped to PyPI and OBS
+  # while CI was still running; v1.0.0 went out with a failing test suite and
+  # every OBS target then failed to build. A tag is a request to publish, not
+  # evidence that publishing is safe.
+  verify:
+    name: Verify before publishing
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        python-version: ["3.10", "3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install project
+        run: pip install -e ".[all,dev]"
+
+      - name: Run tests
+        run: pytest
+
+      # A tag whose version does not match the files is a release nobody can
+      # reproduce, and the distribution packages would carry the wrong number.
+      - name: Check version consistency
+        run: python scripts/release.py --check
+
+      - name: Check the command surface
+        run: python scripts/cli_parity.py
+
+      - name: Check vendored assets
+        run: python scripts/vendor_assets.py --check
+
+      - name: Check the completion scripts are current
+        run: python scripts/generate_completions.py --check
+
+  quality:
+    name: Lint and types before publishing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install project and tools
+        run: |
+          pip install -e ".[all,dev]"
+          pip install "ruff==0.14.4" "mypy==1.19.0"
+
+      - name: Lint
+        run: ruff check src/wasm tests scripts
+
+      - name: Format
+        run: ruff format --check src/wasm tests scripts
+
+      - name: Types
+        run: python scripts/typecheck.py
+
+  # A clean machine, with only what the package declares. This is what an OBS
+  # build environment looks like, and it is what catches an import of something
+  # that is no longer a dependency: the developer's machine still has it
+  # installed and says nothing.
+  clean-install:
+    name: Install as a user would
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Build and install the wheel, nothing else
+        run: |
+          pip install build
+          python -m build
+          pip install "$(ls dist/*.whl)[all]"
+
+      - name: Exercise it outside the source tree
+        working-directory: /tmp
+        run: |
+          wasm --version
+          wasm --help
+          for group in backup cert db env monitor service setup site store web; do
+            wasm "$group" --help > /dev/null
+          done
+          python - <<'PY'
+          import importlib, pkgutil, sys
+          import wasm
+
+          failed = []
+          for mod in pkgutil.walk_packages(wasm.__path__, "wasm."):
+              try:
+                  importlib.import_module(mod.name)
+              except Exception as exc:
+                  failed.append(f"{mod.name}: {exc.__class__.__name__}: {exc}")
+          if failed:
+              print("Modules that fail to import from an installed package:")
+              for line in failed:
+                  print(f"  {line}")
+              sys.exit(1)
+          print("Every module imports from the installed package")
+          PY
+
+  # Builds the .deb the way OBS does: in a container with only the declared
+  # Build-Depends, and no network during the build.
+  #
+  # The GitHub runner has python3-yaml and half a dozen other things installed
+  # already, so building there proves nothing about a build host. That is how
+  # v1.0.0 shipped with incomplete Build-Depends and failed on every OBS
+  # target, on every architecture, with ModuleNotFoundError.
+  deb-in-a-clean-container:
+    name: Build the .deb as OBS would
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    steps:
+      - name: Install only what a build host has
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends devscripts equivs git ca-certificates
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Lay out the debian directory
+        run: |
+          mkdir -p debian/source
+          cp obs/debian.changelog debian/changelog
+          cp obs/debian.control debian/control
+          cp obs/debian.copyright debian/copyright
+          cp obs/debian.rules debian/rules
+          cp obs/debian.postinst debian/postinst
+          cp obs/debian.postrm debian/postrm
+          cp obs/wasm.default.yaml debian/wasm.default.yaml
+          cp obs/wasm.dirs debian/dirs
+          cp obs/wasm.manpages debian/manpages
+          cp obs/wasm.1 debian/wasm.1
+          cp obs/source/format debian/source/format
+          cp obs/source/options debian/source/options
+          chmod +x debian/rules
+
+      # Installs exactly what debian/control declares, and nothing else. A
+      # missing Build-Depends fails here rather than on somebody's server.
+      - name: Install the declared build dependencies
+        run: mk-build-deps --install --remove --tool "apt-get -y --no-install-recommends" debian/control
+
+      - name: Build
+        run: dpkg-buildpackage -us -uc -b
+
+      - name: Check the package holds what it should
+        run: |
+          deb=$(ls ../wasm_*.deb)
+          echo "Built $deb"
+          dpkg-deb -c "$deb" > contents.txt
+          for path in \
+            usr/share/bash-completion/completions/wasm \
+            usr/share/man/man1/wasm.1 \
+            web/templates/base.html \
+            web/static/app.css \
+            web/static/vendor/htmx.min.js
+          do
+            grep -q "$path" contents.txt || { echo "MISSING from the package: $path"; exit 1; }
+          done
+          echo "Every expected file is in the package"
+
   release:
     name: Create Release
+    needs: [verify, quality, clean-install, deb-in-a-clean-container]
     runs-on: ubuntu-latest
     outputs:
       upload_url: ${{ steps.create_release.outputs.upload_url }}

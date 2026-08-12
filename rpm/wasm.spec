@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        1.0.1
+Version:        1.0.2
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -15,13 +15,15 @@ Source1:        wasm.default.yaml
 Source2:        wasm.1
 BuildArch:      noarch
 
-# Build requirements - use python3 macros
+# Build requirements. Deliberately only what builds a wheel: nothing here runs
+# the package, so no runtime import is needed at build time.
 BuildRequires:  python3-devel
-%{?pyproject_buildrequires}
+BuildRequires:  python3-setuptools
+BuildRequires:  python3-pip
+BuildRequires:  python3-wheel
 
 # Fedora/RHEL specific
 %if 0%{?fedora} || 0%{?rhel}
-BuildRequires:  python3-wheel
 Requires:       python3-click >= 8.0
 Requires:       python3-jinja2 >= 3.1.0
 Requires:       python3-pyyaml >= 6.0
@@ -37,7 +39,6 @@ Suggests:       python3-psutil
 
 # openSUSE specific
 %if 0%{?suse_version}
-BuildRequires:  python3-wheel
 Requires:       python3-click >= 8.0
 Requires:       python3-Jinja2 >= 3.1.0
 Requires:       python3-PyYAML >= 6.0
@@ -82,25 +83,30 @@ Features:
 %autosetup -n wasm-%{version}
 
 %build
+# The pyproject macros where they exist (Fedora deprecated %py3_build in 43 and
+# the openSUSE guidelines forbid the legacy equivalents), and the old ones on
+# the distributions that do not have them yet.
+%if %{defined pyproject_wheel}
 %pyproject_wheel
+%else
+%py3_build
+%endif
 
 %install
+%if %{defined pyproject_install}
 %pyproject_install
+%else
+%py3_install
+%endif
 
-# Shell completion, generated from the command tree rather than written by hand.
-# The hand-written scripts were 2,295 lines kept in step with 108 subcommands
-# from memory. Generating them needs no network, which this build does not have.
-PYTHONPATH=%{buildroot}%{python3_sitelib} _WASM_COMPLETE=bash_source python3 -m wasm \
-    > wasm.bash-completion
-install -Dm644 wasm.bash-completion %{buildroot}%{_datadir}/bash-completion/completions/wasm
+# Shell completion. Committed, not generated here: Click's scripts contain no
+# command names, so they cannot drift, and running Python during the build made
+# every runtime import a build dependency.
+install -Dm644 src/wasm/completions/wasm.bash %{buildroot}%{_datadir}/bash-completion/completions/wasm
 
 %if ! 0%{?suse_version}
-PYTHONPATH=%{buildroot}%{python3_sitelib} _WASM_COMPLETE=fish_source python3 -m wasm \
-    > wasm.fish-completion
-PYTHONPATH=%{buildroot}%{python3_sitelib} _WASM_COMPLETE=zsh_source python3 -m wasm \
-    > wasm.zsh-completion
-install -Dm644 wasm.fish-completion %{buildroot}%{_datadir}/fish/vendor_completions.d/wasm.fish
-install -Dm644 wasm.zsh-completion %{buildroot}%{_datadir}/zsh/site-functions/_wasm
+install -Dm644 src/wasm/completions/wasm.fish %{buildroot}%{_datadir}/fish/vendor_completions.d/wasm.fish
+install -Dm644 src/wasm/completions/_wasm %{buildroot}%{_datadir}/zsh/site-functions/_wasm
 %endif
 
 # Install default configuration
@@ -117,7 +123,7 @@ install -d %{buildroot}/var/log/wasm
 %doc README.md
 %doc docs/
 %{python3_sitelib}/wasm/
-%{python3_sitelib}/wasm_cli-*.dist-info/
+%{python3_sitelib}/wasm_cli-*
 %{_bindir}/wasm
 %{_mandir}/man1/wasm.1*
 %{_datadir}/bash-completion/completions/wasm
@@ -157,6 +163,11 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
 fi
 
 %changelog
+* Wed Aug 12 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.0.2-1
+- Fix: interactive mode works again; it still imported inquirer after that stopped being a dependency
+- Fix: distribution packages build; the completion scripts are committed instead of generated, so the build no longer needs to run the package
+- Fix: the RPM spec no longer uses a macro as a tag, which failed every Fedora and openSUSE target
+- Change: publishing waits for tests, lint, types, a clean install and a container-built .deb
 * Wed Aug 12 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.0.1-1
 - Fix: package manager availability is asked of the command runner, not of the process PATH
 - Fix: a project whose lock file names a package manager refuses to install with a different one

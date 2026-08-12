@@ -16,19 +16,16 @@ override_dh_auto_install:
 	install -d debian/wasm/var/www/apps
 	# Create log directory
 	install -d debian/wasm/var/log/wasm
-	# Shell completion, generated from the command tree rather than written by
-	# hand. The hand-written scripts were 2,295 lines kept in step with 108
-	# subcommands from memory, so they were wrong. Generating them needs no
-	# network, which the build environment does not have.
-	install -d debian/wasm/usr/share/bash-completion/completions
-	install -d debian/wasm/usr/share/zsh/vendor-completions
-	install -d debian/wasm/usr/share/fish/vendor_completions.d
-	PYTHONPATH=src _WASM_COMPLETE=bash_source python3 -m wasm \
-		> debian/wasm/usr/share/bash-completion/completions/wasm
-	PYTHONPATH=src _WASM_COMPLETE=zsh_source python3 -m wasm \
-		> debian/wasm/usr/share/zsh/vendor-completions/_wasm
-	PYTHONPATH=src _WASM_COMPLETE=fish_source python3 -m wasm \
-		> debian/wasm/usr/share/fish/vendor_completions.d/wasm.fish
+	# Shell completion. Committed, not generated here: Click's scripts contain
+	# no command names, so they cannot drift, and running Python during the
+	# build would make every runtime import a build dependency. That is what
+	# failed all twenty-two OBS targets.
+	install -Dm644 src/wasm/completions/wasm.bash \
+		debian/wasm/usr/share/bash-completion/completions/wasm
+	install -Dm644 src/wasm/completions/_wasm \
+		debian/wasm/usr/share/zsh/vendor-completions/_wasm
+	install -Dm644 src/wasm/completions/wasm.fish \
+		debian/wasm/usr/share/fish/vendor_completions.d/wasm.fish
 
 override_dh_installsystemd:
 	dh_installsystemd --no-enable --no-start

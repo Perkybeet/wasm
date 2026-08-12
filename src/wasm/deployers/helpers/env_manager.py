@@ -406,8 +406,8 @@ class EnvManager:
         """
         Interactively prompt for variable values grouped by category.
 
-        Uses inquirer for interactive input. Falls back to input()
-        if inquirer is not available.
+        Prompts come from :mod:`wasm.cli.prompts`, falling back to input()
+        when questionary is missing.
 
         Args:
             variables: List of variables to prompt for.
@@ -427,12 +427,7 @@ class EnvManager:
                 categories[cat] = []
             categories[cat].append(var)
 
-        try:
-            import inquirer
-
-            has_inquirer = True
-        except ImportError:
-            has_inquirer = False
+        from wasm.cli import prompts
 
         for category, cat_vars in sorted(categories.items()):
             self.logger.info(f"\n  [{category}]")
@@ -453,25 +448,13 @@ class EnvManager:
                 if current:
                     prompt_msg += f" [{current}]"
 
-                if has_inquirer and var.secret:
-                    questions = [
-                        inquirer.Password(
-                            "value",
-                            message=f"{var.name}",
-                            default=current or "",
-                        )
-                    ]
-                    answers = inquirer.prompt(questions)
-                    value = answers["value"] if answers else current
-                elif has_inquirer:
-                    questions = [
-                        inquirer.Text(
-                            "value",
-                            message=f"{var.name}",
-                            default=current or "",
-                        )
-                    ]
-                    answers = inquirer.prompt(questions)
+                if prompts.AVAILABLE:
+                    # A secret is not echoed. It ends up in a systemd unit and
+                    # in a .env, and a shoulder is the cheapest way to lose one.
+                    question = prompts.Password if var.secret else prompts.Text
+                    answers = prompts.prompt(
+                        [question("value", message=var.name, default=current or "")]
+                    )
                     value = answers["value"] if answers else current
                 else:
                     value = input(f"{prompt_msg}: ").strip()

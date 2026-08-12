@@ -1,3 +1,12 @@
+wasm (1.0.2-1) unstable; urgency=medium
+
+  * Fix: interactive mode works again; it still imported inquirer after that stopped being a dependency
+  * Fix: distribution packages build; the completion scripts are committed instead of generated, so the build no longer needs to run the package
+  * Fix: the RPM spec no longer uses a macro as a tag, which failed every Fedora and openSUSE target
+  * Change: publishing waits for tests, lint, types, a clean install and a container-built .deb
+
+ -- Yago Lopez Prado <yago.lopez.adeje@gmail.com>  Wed, 12 Aug 2026 16:30:49 +0000
+
 wasm (1.0.1-1) unstable; urgency=medium
 
   * Fix: package manager availability is asked of the command runner, not of the process PATH

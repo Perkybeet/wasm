@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wasm-cli"
-version = "1.0.1"
+version = "1.0.2"
 description = "Web App System Management - Deploy and manage web applications on Linux servers"
 readme = "README.md"
 license = { text = "WASM-NCSAL" }
@@ -108,6 +108,8 @@ include = ["wasm*"]
 wasm = [
     # nginx, apache and systemd unit templates.
     "templates/**/*.j2",
+    # Committed, not generated: see src/wasm/completions/README.md.
+    "completions/*",
     # The panel: its pages, its stylesheet and every third-party asset it
     # serves. All of it has to ship, because the panel renders server-side and
     # fetches nothing from the network.
