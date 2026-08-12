@@ -19,11 +19,13 @@ setup(
     packages=find_packages(where="src"),
     include_package_data=True,
     install_requires=[
+        "click>=8.0",
         "Jinja2>=3.1.0",
         "PyYAML>=6.0",
+        "questionary>=2.0",
+        "rich>=13.0",
     ],
     extras_require={
-        "interactive": ["inquirer>=3.1.0"],
         "web": [
             "fastapi>=0.109.0",
             "starlette>=0.36.0",
@@ -37,8 +39,6 @@ setup(
             "httpx>=0.25.0",
         ],
         "all": [
-            "inquirer>=3.1.0",
-            "rich>=13.0",
             "psutil>=5.9.0",
             "httpx>=0.25.0",
             "fastapi>=0.109.0",

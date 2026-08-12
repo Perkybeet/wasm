@@ -17,14 +17,16 @@ BuildArch:      noarch
 
 # Build requirements - use python3 macros
 BuildRequires:  python3-devel
-BuildRequires:  python3-setuptools
-BuildRequires:  python3-pip
+%{?pyproject_buildrequires}
 
 # Fedora/RHEL specific
 %if 0%{?fedora} || 0%{?rhel}
 BuildRequires:  python3-wheel
+Requires:       python3-click >= 8.0
 Requires:       python3-jinja2 >= 3.1.0
 Requires:       python3-pyyaml >= 6.0
+Requires:       python3-questionary
+Requires:       python3-rich
 # The panel is optional. Everything it needs is packaged in Fedora.
 Suggests:       python3-fastapi
 Suggests:       python3-starlette
@@ -32,24 +34,22 @@ Suggests:       python3-pydantic
 Suggests:       python3-uvicorn
 Suggests:       python3-jose
 Suggests:       python3-psutil
-# Interactive prompts.
-Suggests:       python3-questionary
-Suggests:       python3-rich
 %endif
 
 # openSUSE specific
 %if 0%{?suse_version}
 BuildRequires:  python3-wheel
+Requires:       python3-click >= 8.0
 Requires:       python3-Jinja2 >= 3.1.0
 Requires:       python3-PyYAML >= 6.0
+Requires:       python3-questionary
+Requires:       python3-rich
 Suggests:       python3-fastapi
 Suggests:       python3-starlette
 Suggests:       python3-pydantic
 Suggests:       python3-uvicorn
 Suggests:       python3-python-jose
 Suggests:       python3-psutil
-Suggests:       python3-questionary
-Suggests:       python3-rich
 %endif
 
 # Runtime requirements (common)
@@ -75,30 +75,34 @@ Features:
  * Systemd service management
  * Interactive mode with guided prompts
  * One-command deployments
- * AI-powered security monitoring
+ * Resource and service observability
  * Backup and rollback system
- * Web dashboard for remote management (optional)
+ * Control panel for remote management (optional)
  * REST API with token-based authentication
 
 %prep
 %autosetup -n wasm-%{version}
 
 %build
-%py3_build
+%pyproject_wheel
 
 %install
-%py3_install
+%pyproject_install
 
-# Install completion scripts
-install -Dm644 src/wasm/completions/wasm.bash %{buildroot}%{_datadir}/bash-completion/completions/wasm
+# Shell completion, generated from the command tree rather than written by hand.
+# The hand-written scripts were 2,295 lines kept in step with 108 subcommands
+# from memory. Generating them needs no network, which this build does not have.
+PYTHONPATH=%{buildroot}%{python3_sitelib} _WASM_COMPLETE=bash_source python3 -m wasm \
+    > wasm.bash-completion
+install -Dm644 wasm.bash-completion %{buildroot}%{_datadir}/bash-completion/completions/wasm
 
-# For openSUSE: fish and zsh completions directories may not exist
-%if 0%{?suse_version}
-# SUSE: Only install if directories are provided by system packages
-# Skip fish/zsh completions on SUSE to avoid directory ownership issues
-%else
-install -Dm644 src/wasm/completions/wasm.fish %{buildroot}%{_datadir}/fish/vendor_completions.d/wasm.fish
-install -Dm644 src/wasm/completions/_wasm %{buildroot}%{_datadir}/zsh/site-functions/_wasm
+%if ! 0%{?suse_version}
+PYTHONPATH=%{buildroot}%{python3_sitelib} _WASM_COMPLETE=fish_source python3 -m wasm \
+    > wasm.fish-completion
+PYTHONPATH=%{buildroot}%{python3_sitelib} _WASM_COMPLETE=zsh_source python3 -m wasm \
+    > wasm.zsh-completion
+install -Dm644 wasm.fish-completion %{buildroot}%{_datadir}/fish/vendor_completions.d/wasm.fish
+install -Dm644 wasm.zsh-completion %{buildroot}%{_datadir}/zsh/site-functions/_wasm
 %endif
 
 # Install default configuration
@@ -115,7 +119,7 @@ install -d %{buildroot}/var/log/wasm
 %doc README.md
 %doc docs/
 %{python3_sitelib}/wasm/
-%{python3_sitelib}/wasm_cli*.egg-info/
+%{python3_sitelib}/wasm_cli-*.dist-info/
 %{_bindir}/wasm
 %{_mandir}/man1/wasm.1*
 %{_datadir}/bash-completion/completions/wasm
@@ -130,9 +134,6 @@ install -d %{buildroot}/var/log/wasm
 %post
 echo "WASM installed successfully!"
 echo "Run 'wasm setup' to configure the tool."
-echo ""
-echo "Note: You may need to install python3-inquirer via pip:"
-echo "  pip3 install inquirer"
 
 # Upgrade config file with new defaults (preserves user values)
 if [ -f /etc/wasm/config.yaml ]; then
