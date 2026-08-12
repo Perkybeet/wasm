@@ -172,6 +172,35 @@ class EnvManager:
         "WEBHOOK_SECRET",
     ]
 
+    #: Substrings that mark a default as a template placeholder rather than a
+    #: real value, matched case-insensitively against the .env.example default.
+    #: A secret whose default is a placeholder is regenerated: baking
+    #: "your-secret-key-here" into a systemd unit as Environment= overrides the
+    #: real .env the application reads at runtime, and the failure surfaces
+    #: much later as an authentication error nobody connects to a deploy.
+    PLACEHOLDER_PATTERNS = [
+        "your-",
+        "your_",
+        "yourapp",
+        "youremail",
+        "your.email",
+        "user:password",
+        "user:pass@",
+        "username:password",
+        "change-me",
+        "changeme",
+        "change_me",
+        "replace-me",
+        "replaceme",
+        "replace_me",
+        "<",
+        "secret-key-here",
+        "secret_key_here",
+        "todo",
+        "fixme",
+        "placeholder",
+    ]
+
     def __init__(self, verbose: bool = False, fs: FileSystem | None = None):
         """
         Args:
@@ -337,6 +366,25 @@ class EnvManager:
         upper_name = name.upper()
         return any(pattern in upper_name for pattern in self.SECRET_PATTERNS)
 
+    def _is_placeholder(self, value: str) -> bool:
+        """
+        Determine if a default value looks like a template placeholder.
+
+        Used to decide whether a secret default copied from .env.example is
+        safe to keep or should be regenerated. Matching is case-insensitive
+        against PLACEHOLDER_PATTERNS.
+
+        Args:
+            value: Default value to inspect.
+
+        Returns:
+            True if the value matches a known placeholder pattern.
+        """
+        if not value:
+            return False
+        lower = value.lower()
+        return any(pattern in lower for pattern in self.PLACEHOLDER_PATTERNS)
+
     @staticmethod
     def generate_secret(length: int = 32) -> str:
         """
@@ -439,7 +487,12 @@ class EnvManager:
         """
         Fill variable values non-interactively.
 
-        Uses defaults for regular variables and auto-generates secrets.
+        For secrets, regenerates whenever the default is empty or matches a
+        known placeholder pattern (e.g. "your-secret-key-here"); otherwise the
+        existing default is kept. For non-secret variables with a placeholder
+        default a warning is logged so users notice that the unit will be
+        deployed with template values, but the default is preserved to keep
+        backward compatibility with existing .env.example layouts.
 
         Args:
             variables: List of variables.
@@ -449,10 +502,25 @@ class EnvManager:
         """
         result = {}
         for var in variables:
-            if var.secret and not var.default:
+            default_is_placeholder = self._is_placeholder(var.default)
+
+            if var.secret and (not var.default or default_is_placeholder):
                 result[var.name] = self.generate_secret()
-            else:
-                result[var.name] = var.default
+                if default_is_placeholder:
+                    self.logger.debug(
+                        f"Regenerated secret for {var.name} (placeholder default detected)"
+                    )
+                continue
+
+            if default_is_placeholder:
+                self.logger.warning(
+                    f"{var.name} has a placeholder default "
+                    f"({var.default!r}); pass --env-file or run "
+                    f"'wasm env set' to provide a real value before the "
+                    f"application starts."
+                )
+
+            result[var.name] = var.default
         return result
 
     def write_env_files(

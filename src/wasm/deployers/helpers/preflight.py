@@ -57,11 +57,29 @@ def repository_unreachable(runner: CommandRunner, source: str) -> list[str]:
     if not source.startswith(_GIT_SCHEMES):
         return []
 
-    probe = runner.run(["git", "ls-remote", "--exit-code", source], timeout=GIT_PROBE_TIMEOUT)
+    # Run from a directory that is certain to exist. After `wasm delete` the
+    # operator's shell is often still sitting in the directory that was just
+    # removed; the child would inherit that cwd and git would abort with
+    # "Unable to read current working directory", which surfaced as an opaque
+    # "Repository not accessible" even when the credentials were fine.
+    safe_cwd = Path.home() if Path.home().exists() else Path("/")
+
+    probe = runner.run(
+        ["git", "ls-remote", "--exit-code", source],
+        cwd=safe_cwd,
+        timeout=GIT_PROBE_TIMEOUT,
+    )
     if probe.success:
         return []
 
-    issues = [f"Repository not accessible: {source}"]
+    # git's own first line says what went wrong. Repeating it beats replacing
+    # it with a summary that is true of half a dozen different causes.
+    detail = next(iter((probe.stderr or "").strip().splitlines()), "")
+    issues = [
+        f"Repository not accessible: {source} ({detail})"
+        if detail
+        else f"Repository not accessible: {source}"
+    ]
     if "Permission denied" in str(probe.stderr):
         issues.append("Check SSH key configuration: wasm setup ssh --test")
     return issues
