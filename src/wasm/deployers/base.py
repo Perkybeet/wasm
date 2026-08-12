@@ -43,7 +43,7 @@ from wasm.deployers.helpers.health import failure_output, wait_until_healthy
 from wasm.deployers.helpers.nginx_config import NginxAdvancedConfig
 from wasm.deployers.helpers.registration import StoreRegistrar
 from wasm.deployers.helpers.summary import print_deployment_summary
-from wasm.deployers.interface import AppDeployer
+from wasm.deployers.interface import AppDeployer, StepReporter, UpdateResult
 from wasm.deployers.pipeline import DeployStep, run_pipeline
 from wasm.managers.apache_manager import ApacheManager
 from wasm.managers.cert_manager import CertManager
@@ -747,7 +747,7 @@ class BaseDeployer(AppDeployer):
             try:
                 action()
             # Cleanup is an error boundary: one failure must not abort the rest.
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 errors += 1
                 self.logger.debug(f"Rollback of {what} failed: {e}")
 
@@ -1212,6 +1212,50 @@ class BaseDeployer(AppDeployer):
 
         if self.app_name:
             self.store.update_service_status(self.app_name, active=True, enabled=True)
+
+    def update(self, on_step: StepReporter | None = None) -> UpdateResult:
+        """
+        Rebuild this application in place, without a full redeploy.
+
+        The sequence used to live in ``wasm.cli.commands.webapp``, which drove
+        the deployer step by step and reached into ``_package_manager`` to do
+        it. Keeping it here means the update path is the deployer's own, gets
+        the same detection and error handling as a deploy, and can be tested.
+
+        Args:
+            on_step: Called as each step begins.
+
+        Returns:
+            What was done, for the caller to present.
+
+        Raises:
+            WASMError: When a step fails.
+        """
+        report = on_step or (lambda _message: None)
+
+        report("Inspecting the project")
+        self.pre_install()
+
+        report("Installing dependencies")
+        self.install_dependencies()
+
+        prisma_updated = False
+        if self.has_prisma:
+            report("Updating Prisma")
+            self.generate_prisma()
+            self.run_prisma_migrate(deploy=True)
+            prisma_updated = True
+
+        report("Building")
+        self.build()
+
+        start_command = self.get_start_command()
+        return UpdateResult(
+            package_manager=self.package_manager,
+            prisma_updated=prisma_updated,
+            is_static=not bool(start_command),
+            start_command=start_command,
+        )
 
     def deploy(self, total_steps: int = 7) -> bool:
         """

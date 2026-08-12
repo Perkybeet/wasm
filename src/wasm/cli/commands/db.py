@@ -172,7 +172,6 @@ def _db_uninstall(args: Namespace, verbose: bool) -> int:
 
 def _db_status(args: Namespace, verbose: bool) -> int:
     """Show database engine status."""
-    logger = Logger(verbose=verbose)
     engine = getattr(args, "engine", None)
     json_output = getattr(args, "json", False)
 
@@ -282,7 +281,6 @@ def _db_engine_restart(args: Namespace, verbose: bool) -> int:
 
 def _db_engines(args: Namespace, verbose: bool) -> int:
     """List available database engines."""
-    logger = Logger(verbose=verbose)
     json_output = getattr(args, "json", False)
 
     engines = []
@@ -966,7 +964,8 @@ def _db_connection_string(args: Namespace, verbose: bool) -> int:
         return 1
 
     if not password:
-        password = "<PASSWORD>"
+        # A placeholder for the operator to fill in, not a credential.
+        password = "<PASSWORD>"  # noqa: S105
 
     conn_string = manager.get_connection_string(
         database=database,

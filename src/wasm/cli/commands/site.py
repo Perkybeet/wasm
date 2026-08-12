@@ -54,7 +54,7 @@ def handle_site(args: Namespace) -> int:
         logger = Logger(verbose=args.verbose)
         logger.error(str(e))
         return 1
-    except Exception as e:  # noqa: BLE001 - the CLI error boundary: nothing above catches
+    except Exception as e:
         logger = Logger(verbose=args.verbose)
         logger.error(f"Unexpected error: {e}")
         logger.debug(f"Unhandled {type(e).__name__} in site {action}")

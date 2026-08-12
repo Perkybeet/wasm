@@ -23,6 +23,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from wasm.core.exceptions import SecurityError, ValidationError
+from wasm.managers.service_manager import WASM_UNIT_MARKER, ServiceManager
 from wasm.validators.names import (
     MAX_SERVICE_NAME_LENGTH,
     resolve_within,
@@ -32,7 +33,6 @@ from wasm.validators.names import (
     validate_filename,
     validate_service_name,
 )
-from wasm.managers.service_manager import WASM_UNIT_MARKER, ServiceManager
 from wasm.web.api import services as services_api
 from wasm.web.api.auth import get_current_session
 

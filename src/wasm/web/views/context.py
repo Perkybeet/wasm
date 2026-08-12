@@ -52,7 +52,7 @@ def resource_counts() -> dict[str, int | None]:
         counts["sites"] = len(store.list_sites())
         counts["services"] = len(store.list_services())
         counts["databases"] = len(store.list_databases())
-    except Exception as exc:  # noqa: BLE001 - navigation must render regardless
+    except Exception as exc:
         # The store being unreadable is worth knowing about, but it must not
         # stop the panel from rendering: the operator may be here precisely
         # because something is broken.
@@ -94,6 +94,6 @@ def machine_state() -> MachineState:
 
     try:
         apps_root = str(Config().get("apps.directory", "/var/www/apps"))
-    except Exception:  # noqa: BLE001 - the header must render without config
+    except Exception:
         apps_root = "/var/www/apps"
     return read_machine(apps_root)

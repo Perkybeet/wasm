@@ -130,7 +130,7 @@ def _download(url: str) -> bytes:
         raise SystemExit(f"Refusing to fetch a non-https URL: {url}")
     request = urllib.request.Request(url, headers={"User-Agent": "wasm-vendor"})
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:  # noqa: S310 - https enforced above
+        with urllib.request.urlopen(request, timeout=60) as response:
             return response.read()
     except urllib.error.URLError as exc:
         raise SystemExit(f"Failed to download {url}: {exc}") from exc

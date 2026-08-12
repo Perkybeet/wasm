@@ -399,7 +399,7 @@ def ensure_ssh_setup(
         logger.info("No SSH key found. Generating new key...")
 
         hostname = os.uname().nodename
-        success, key_path, msg = generate_ssh_key(
+        success, key_path, _msg = generate_ssh_key(
             key_type="ed25519",
             comment=f"wasm@{hostname}",
         )

@@ -21,7 +21,7 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse
 
 from wasm.web.auth import require_auth
 from wasm.web.views.rendering import page
@@ -85,7 +85,7 @@ def _rows_from_store(kind: str) -> list[dict[str, Any]]:
     }
     try:
         records = readers[kind]()
-    except Exception as exc:  # noqa: BLE001 - a page must render to report this
+    except Exception as exc:
         log.warning("Could not read %s from the store: %s", kind, exc)
         return []
 

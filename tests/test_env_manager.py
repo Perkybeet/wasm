@@ -256,7 +256,7 @@ class TestEnvFileWriting:
         env_manager.write_env_files(tmp_path, values)
 
         content = (tmp_path / ".env").read_text()
-        lines = [l for l in content.strip().split("\n") if l]
+        lines = [line for line in content.strip().split("\n") if line]
         assert lines[0] == "AAA=first"
         assert lines[-1] == "ZZZ=last"
 

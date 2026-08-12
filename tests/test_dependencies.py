@@ -101,7 +101,7 @@ class TestDependencyChecker:
         runner.only_knows("npm")
         checker = DependencyChecker(runner=runner)
 
-        is_installed, version, hint = checker.check_package_manager("pnpm")
+        is_installed, _version, hint = checker.check_package_manager("pnpm")
 
         assert is_installed is False
         assert "install" in hint.lower()
@@ -140,7 +140,7 @@ class TestCheckDeploymentReady:
 
         mock_check.side_effect = side_effect
 
-        can_deploy, missing, warnings = check_deployment_ready("nodejs", "npm", runner=runner)
+        can_deploy, missing, _warnings = check_deployment_ready("nodejs", "npm", runner=runner)
         assert can_deploy is False
         assert any("node" in m.lower() for m in missing)
 
@@ -155,7 +155,7 @@ class TestCheckDeploymentReady:
 
         mock_check.side_effect = side_effect
 
-        can_deploy, missing, warnings = check_deployment_ready("python", "auto", runner=runner)
+        can_deploy, missing, _warnings = check_deployment_ready("python", "auto", runner=runner)
         assert can_deploy is False
         assert any("python" in m.lower() for m in missing)
 
@@ -170,7 +170,7 @@ class TestCheckDeploymentReady:
 
         mock_check.side_effect = side_effect
 
-        can_deploy, missing, warnings = check_deployment_ready("static", "auto", runner=runner)
+        can_deploy, missing, _warnings = check_deployment_ready("static", "auto", runner=runner)
         assert can_deploy is False
         assert any("nginx" in m.lower() or "apache" in m.lower() for m in missing)
 
@@ -204,7 +204,7 @@ class TestCheckDeploymentReady:
         mock_check.side_effect = check_side_effect
         mock_available.return_value = []  # No PMs available
 
-        can_deploy, missing, warnings = check_deployment_ready("nextjs", "npm", runner=runner)
+        can_deploy, missing, _warnings = check_deployment_ready("nextjs", "npm", runner=runner)
         assert can_deploy is False
         assert any("package manager" in m.lower() for m in missing)
 

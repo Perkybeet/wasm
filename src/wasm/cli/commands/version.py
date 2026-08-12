@@ -59,7 +59,7 @@ def get_current_version_changelog() -> str | None:
         changelog_lines = []
         in_version = False
 
-        for i, line in enumerate(lines):
+        for _i, line in enumerate(lines):
             if re.match(version_pattern, line):
                 in_version = True
                 changelog_lines.append(line)

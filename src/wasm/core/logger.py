@@ -96,7 +96,7 @@ class Icons:
     SUCCESS = "✓"
     ERROR = "✗"
     WARNING = "⚠"
-    INFO = "ℹ"
+    INFO = "i"
     ARROW = "→"
     BULLET = "•"
     ROCKET = "🚀"
@@ -393,7 +393,7 @@ class Logger:
             return
 
         # Calculate column widths
-        all_rows = [headers] + rows
+        all_rows = [headers, *rows]
         col_widths = []
         for col_idx in range(len(headers)):
             max_width = max(len(str(row[col_idx])) for row in all_rows)

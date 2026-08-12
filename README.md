@@ -39,8 +39,8 @@ WASM is a command-line tool for deploying and managing web applications on Linux
 - Create and control systemd services
 - Database management (MySQL, PostgreSQL, Redis, MongoDB)
 - Backup and rollback system
-- Web-based dashboard (optional)
-- Process monitoring and security scanning
+- Control panel (optional)
+- Resource and service observability
 
 ---
 
@@ -414,9 +414,11 @@ wasm rollback <domain> [id]     Quick rollback
 
 ---
 
-## Web Dashboard
+## Control Panel
 
-WASM includes an optional web-based dashboard for remote management.
+An optional panel for the machine WASM runs on. It is server-rendered HTML updated by
+htmx, with no build step, no Node and no third-party CDN, so it works on a server with no
+route to the internet.
 
 ### Installation
 
@@ -424,23 +426,38 @@ WASM includes an optional web-based dashboard for remote management.
 pip install wasm-cli[web]
 ```
 
-### Start Dashboard
+### Start it
 
 ```bash
-wasm web start --host 0.0.0.0 --port 8080
+# Localhost only. This is the default and the safe one.
+wasm web start
+
+# Reachable from the network. TLS is required, because the panel's token is
+# root on this machine.
+wasm web start --host 0.0.0.0 --require-https --tls-cert cert.pem --tls-key key.pem
+
+# Behind a TLS-terminating reverse proxy: declare it, so the panel trusts its
+# forwarded headers and marks the session cookie Secure.
+wasm web start --trusted-proxy 127.0.0.1
 ```
 
-### Features
+Print the access token with `wasm web token`.
 
-- Application deployment and management
-- Real-time logs and monitoring
-- SSL certificate management
-- Service control
-- Backup creation and restoration
-- Database management
-- REST API with token authentication
+### What it does
 
-Access the dashboard at `http://your-server:8080`
+- Overview of the machine: load, memory, disk and the state of every managed service
+- Applications, services, sites and databases, with their live state
+- Live logs streamed from journald into a docked terminal
+- A JSON API under `/api` for automation, authenticated with the same token
+
+Sessions use an HttpOnly cookie with CSRF protection; the API also accepts
+`Authorization: Bearer` for scripts. Every privileged action is written to an append-only
+audit log.
+
+### Not yet in the panel
+
+Certificate issuance, backup and restore, scheduled jobs and settings currently have API
+endpoints but no screen. Use the CLI for those.
 
 ---
 
@@ -467,17 +484,18 @@ WASM will check for missing dependencies and prompt installation when needed.
 
 ```
 /var/www/apps/
-├── wasm-example-com/
-│   ├── current/              # Active deployment
-│   ├── releases/             # Previous releases (for rollback)
-│   │   ├── 20260114120000/
-│   │   └── 20260113150000/
-│   ├── shared/               # Persistent files (uploads, logs)
-│   └── .env                  # Environment variables
-│
-└── wasm-another-app/
+├── example-com/              # The application, deployed in place
+│   └── .env                  # Environment variables, mode 0600
+└── another-app/
     └── ...
+
+/var/lib/wasm/wasm.db         # What WASM knows about this machine, mode 0600
+/etc/wasm/config.yaml         # Configuration, mode 0600 in a 0700 directory
+/var/backups/wasm/            # Backup archives, each self-contained
 ```
+
+Rolling back restores from a backup rather than switching a symlink between releases; see
+`wasm backup list` and `wasm rollback`.
 
 ---
 

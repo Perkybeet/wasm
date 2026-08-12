@@ -470,7 +470,7 @@ class MonorepoDeployer(AppDeployer):
                     self.logger.info("Rollback completed successfully")
                 # Rollback is the last line of defence; whatever it hits, the
                 # original failure is what the caller must see.
-                except Exception as rollback_error:  # noqa: BLE001
+                except Exception as rollback_error:
                     self.logger.debug(f"Rollback error: {rollback_error}")
                     self.logger.warning("Rollback had some errors. Manual cleanup may be needed.")
 

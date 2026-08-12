@@ -137,6 +137,7 @@ class UpdateChecker:
                 cls.GITHUB_API, headers={"Accept": "application/vnd.github.v3+json"}
             )
 
+            # GITHUB_API is a module constant, not caller input.
             with urllib.request.urlopen(req, timeout=cls.TIMEOUT) as response:
                 if response.status == 200:
                     data = json.loads(response.read().decode())

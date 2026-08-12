@@ -418,7 +418,7 @@ class SubprocessRunner(CommandRunner):
         # Reading the pipe directly would block past the deadline whenever the
         # child goes quiet, which is exactly what a hung build does. A reader
         # thread keeps the deadline enforceable no matter what the child emits.
-        assert process.stdout is not None
+        assert process.stdout is not None  # noqa: S101 - narrows the type for mypy
         lines: queue.Queue[str | None] = queue.Queue()
 
         def _pump(stream) -> None:
@@ -496,7 +496,7 @@ class SubprocessRunner(CommandRunner):
                 )
                 gzip_proc = None
                 if compress:
-                    assert producer.stdout is not None
+                    assert producer.stdout is not None  # noqa: S101 - narrows the type
                     gzip_proc = subprocess.Popen(
                         ["gzip", "-c"],
                         stdin=producer.stdout,

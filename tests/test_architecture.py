@@ -136,6 +136,58 @@ class TestExecutionSeam:
         )
 
 
+class TestErrorHandling:
+    """
+    Blind excepts can only become fewer.
+
+    There were 302 of them, 149 of which logged nothing. That is the mechanism
+    by which five calls to methods that do not exist shipped for entire
+    releases: every AttributeError became a cosmetic warning. The lint rule is
+    disabled per package while the debt is paid down, so this test is what
+    stops it growing back in the meantime.
+    """
+
+    #: Current count. Lower it when you fix some; never raise it.
+    MAX_BLIND_EXCEPTS = 94
+
+    def test_blind_excepts_do_not_grow(self):
+        found: list[str] = []
+        for path in python_files():
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ExceptHandler):
+                    continue
+                caught = node.type
+                bare = caught is None
+                broad = isinstance(caught, ast.Name) and caught.id in {"Exception", "BaseException"}
+                if bare or broad:
+                    found.append(f"{relative(path)}:{node.lineno}")
+
+        assert len(found) <= self.MAX_BLIND_EXCEPTS, (
+            f"blind excepts went from {self.MAX_BLIND_EXCEPTS} to {len(found)}.\n"
+            "Catch the specific exception. A broad catch belongs only in an error "
+            "boundary, and it logs.\n" + "\n".join(f"  {line}" for line in found[-20:])
+        )
+
+        assert len(found) >= self.MAX_BLIND_EXCEPTS - 10, (
+            f"blind excepts are down to {len(found)}. Lower MAX_BLIND_EXCEPTS to "
+            f"{len(found)} so the ratchet keeps holding."
+        )
+
+    def test_no_bare_except_anywhere(self):
+        """A bare ``except:`` also swallows KeyboardInterrupt and SystemExit."""
+        offenders = []
+        for path in python_files():
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            offenders += [
+                f"{relative(path)}:{node.lineno}"
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ExceptHandler) and node.type is None
+            ]
+
+        assert not offenders, "bare excepts:\n" + "\n".join(f"  {o}" for o in offenders)
+
+
 class TestTemplateSafety:
     """Templates escape by default, everywhere."""
 
@@ -275,7 +327,7 @@ class TestPackaging:
         import subprocess
         import sys
 
-        result = subprocess.run(  # noqa: S603 - fixed argv, developer tool
+        result = subprocess.run(
             [sys.executable, str(REPO / "scripts/release.py"), "--check"],
             capture_output=True,
             text=True,
@@ -301,7 +353,7 @@ class TestImportable:
         for module in pkgutil.walk_packages(wasm.__path__, "wasm."):
             try:
                 importlib.import_module(module.name)
-            except Exception as exc:  # noqa: BLE001 - reporting is the point
+            except Exception as exc:
                 failures.append(f"{module.name}: {exc.__class__.__name__}: {exc}")
 
         assert not failures, "Modules that fail to import:\n" + "\n".join(

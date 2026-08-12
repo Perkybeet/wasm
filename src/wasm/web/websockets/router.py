@@ -260,7 +260,7 @@ async def websocket_logs(
         log_task = asyncio.create_task(read_logs())
         msg_task = asyncio.create_task(handle_messages())
 
-        done, pending = await asyncio.wait(
+        _done, pending = await asyncio.wait(
             [log_task, msg_task],
             timeout=LOG_STREAM_MAX_SECONDS,
             return_when=asyncio.FIRST_COMPLETED,
@@ -473,7 +473,7 @@ async def websocket_events(websocket: WebSocket, ticket: str | None = Query(defa
         event_task = asyncio.create_task(read_events())
         msg_task = asyncio.create_task(handle_messages())
 
-        done, pending = await asyncio.wait(
+        _done, pending = await asyncio.wait(
             [event_task, msg_task], return_when=asyncio.FIRST_COMPLETED
         )
 
@@ -548,8 +548,8 @@ async def websocket_job(
         if updated_job.id == job_id:
             try:
                 loop.call_soon_threadsafe(update_queue.put_nowait, updated_job.to_dict())
-            except Exception as e:
-                print(f"[WS] Error queueing job update: {e}")
+            except Exception:
+                pass
 
     # Subscribe to job updates
     manager.subscribe(job_id, on_job_update)
@@ -593,7 +593,7 @@ async def websocket_job(
         update_task = asyncio.create_task(send_updates())
         msg_task = asyncio.create_task(handle_messages())
 
-        done, pending = await asyncio.wait(
+        _done, pending = await asyncio.wait(
             [update_task, msg_task], return_when=asyncio.FIRST_COMPLETED
         )
 
@@ -652,8 +652,8 @@ async def websocket_all_jobs(
         """Callback when any job is updated (called from worker thread)."""
         try:
             loop.call_soon_threadsafe(update_queue.put_nowait, job.to_dict())
-        except Exception as e:
-            print(f"[WS] Error queueing all-jobs update: {e}")
+        except Exception:
+            pass
 
     # Subscribe to all job updates
     manager.subscribe_all(on_any_job_update)
@@ -703,7 +703,7 @@ async def websocket_all_jobs(
         update_task = asyncio.create_task(send_updates())
         msg_task = asyncio.create_task(handle_messages())
 
-        done, pending = await asyncio.wait(
+        _done, pending = await asyncio.wait(
             [update_task, msg_task], return_when=asyncio.FIRST_COMPLETED
         )
 

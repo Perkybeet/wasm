@@ -118,8 +118,11 @@ def validate_port(
     if isinstance(port, str):
         try:
             port = int(port)
-        except ValueError:
-            raise PortError(f"Invalid port number: '{port}'")
+        except ValueError as exc:
+            raise PortError(
+                f"Invalid port number: '{port}'",
+                details="A port is a number between 1 and 65535.",
+            ) from exc
 
     # Validate range
     is_valid, error = is_valid_port(port)
@@ -220,5 +223,8 @@ def parse_port_string(port_str: str) -> int:
 
     try:
         return int(port_str)
-    except ValueError:
-        raise PortError(f"Cannot parse port from: '{port_str}'")
+    except ValueError as exc:
+        raise PortError(
+            f"Cannot parse port from: '{port_str}'",
+            details="Expected a number, optionally after a colon, such as ':3000'.",
+        ) from exc

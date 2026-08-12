@@ -6,6 +6,7 @@
 Tests for WASM SQLite persistence store.
 """
 
+import sqlite3
 import tempfile
 from pathlib import Path
 
@@ -188,7 +189,7 @@ class TestAppCRUD:
 
         app.status = AppStatus.RUNNING.value
         app.port = 4000
-        updated = temp_db.update_app(app)
+        temp_db.update_app(app)
 
         retrieved = temp_db.get_app("update.com")
         assert retrieved.status == AppStatus.RUNNING.value
@@ -434,8 +435,8 @@ class TestRelations:
 
         # Related records should be deleted due to cascade
         # Note: In SQLite, ON DELETE CASCADE removes child records
-        site = populated_store.get_site("example.com")
-        service = populated_store.get_service("example-com")
+        populated_store.get_site("example.com")
+        populated_store.get_service("example-com")
 
         # Site and service remain but app_id is null (due to SET NULL) or deleted (CASCADE)
         # Depending on schema, check the appropriate behavior
@@ -546,7 +547,7 @@ class TestEdgeCases:
         """Test that duplicate domains raise an error."""
         temp_db.create_app(App(domain="dup.com", app_type="nodejs", app_path="/dup"))
 
-        with pytest.raises(Exception):  # sqlite3.IntegrityError
+        with pytest.raises(sqlite3.IntegrityError):
             temp_db.create_app(App(domain="dup.com", app_type="vite", app_path="/dup2"))
 
     def test_empty_env_vars(self, temp_db):

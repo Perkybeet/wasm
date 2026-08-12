@@ -481,7 +481,7 @@ class WASMStore:
         with self._transaction() as cursor:
             # Check if schema_version table exists
             cursor.execute("""
-                SELECT name FROM sqlite_master 
+                SELECT name FROM sqlite_master
                 WHERE type='table' AND name='schema_version'
             """)
 
@@ -628,7 +628,7 @@ class WASMStore:
             set_clause = ", ".join([f"{k} = ?" for k in data.keys()])
 
             cursor.execute(
-                f"UPDATE apps SET {set_clause} WHERE id = ?", list(data.values()) + [app_id]
+                f"UPDATE apps SET {set_clause} WHERE id = ?", [*list(data.values()), app_id]
             )
 
         return app
@@ -743,7 +743,7 @@ class WASMStore:
             set_clause = ", ".join([f"{k} = ?" for k in data.keys()])
 
             cursor.execute(
-                f"UPDATE sites SET {set_clause} WHERE id = ?", list(data.values()) + [site_id]
+                f"UPDATE sites SET {set_clause} WHERE id = ?", [*list(data.values()), site_id]
             )
 
         return site
@@ -764,7 +764,7 @@ class WASMStore:
         """Update SSL status for a site."""
         with self._transaction() as cursor:
             cursor.execute(
-                """UPDATE sites SET 
+                """UPDATE sites SET
                    ssl_enabled = ?, ssl_certificate = ?, ssl_key = ?, updated_at = ?
                    WHERE domain = ?""",
                 (1 if ssl else 0, ssl_certificate, ssl_key, datetime.now().isoformat(), domain),
@@ -852,7 +852,7 @@ class WASMStore:
             )
 
             cursor.execute(
-                f"UPDATE services SET {set_clause} WHERE id = ?", list(data.values()) + [service_id]
+                f"UPDATE services SET {set_clause} WHERE id = ?", [*list(data.values()), service_id]
             )
 
         return service
@@ -979,7 +979,7 @@ class WASMStore:
             set_clause = ", ".join([f"{k} = ?" for k in data.keys()])
 
             cursor.execute(
-                f"UPDATE databases SET {set_clause} WHERE id = ?", list(data.values()) + [db_id]
+                f"UPDATE databases SET {set_clause} WHERE id = ?", [*list(data.values()), db_id]
             )
 
         return database

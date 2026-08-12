@@ -272,8 +272,8 @@ def _handle_init(args: Namespace) -> int:
 
     # Check if inquirer is available for interactive mode
     try:
-        import inquirer
-        from inquirer.themes import GreenPassion
+        import inquirer  # noqa: F401 - probing availability
+        from inquirer.themes import GreenPassion  # noqa: F401 - probing availability
 
         has_inquirer = True
     except ImportError:
@@ -472,7 +472,8 @@ def _handle_init(args: Namespace) -> int:
     logger.substep(f"Creating apps directory: {DEFAULT_APPS_DIR}")
     try:
         DEFAULT_APPS_DIR.mkdir(parents=True, exist_ok=True)
-        os.chmod(DEFAULT_APPS_DIR, 0o755)
+        # Served content: the web server's account has to traverse this.
+        os.chmod(DEFAULT_APPS_DIR, 0o755)  # noqa: S103
         logger.success(f"Created {DEFAULT_APPS_DIR}")
     except Exception as e:
         logger.warning(f"Failed to create apps directory: {e}")
@@ -481,7 +482,9 @@ def _handle_init(args: Namespace) -> int:
     logger.substep(f"Creating log directory: {DEFAULT_LOG_DIR}")
     try:
         DEFAULT_LOG_DIR.mkdir(parents=True, exist_ok=True)
-        os.chmod(DEFAULT_LOG_DIR, 0o755)
+        # Logs are readable on purpose, so an operator can tail them
+        # without sudo.
+        os.chmod(DEFAULT_LOG_DIR, 0o755)  # noqa: S103
         logger.success(f"Created {DEFAULT_LOG_DIR}")
     except Exception as e:
         logger.warning(f"Failed to create log directory: {e}")
@@ -939,7 +942,7 @@ def _handle_doctor(args: Namespace) -> int:
         ("curl", "Data transfer tool", "sudo apt install curl"),
     ]
 
-    for cmd, desc, fix in core_deps:
+    for cmd, _desc, fix in core_deps:
         if command_exists(cmd):
             version = checker.get_version(cmd)
             logger.success(f"{cmd}: {version or 'OK'}")

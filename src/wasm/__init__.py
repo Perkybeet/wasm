@@ -8,7 +8,8 @@ WASM - Web App System Management
 A robust CLI tool for deploying and managing web applications on Linux servers.
 """
 
-from importlib.metadata import PackageNotFoundError, version as _installed_version
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _installed_version
 
 #: Fallback used when running from a source tree that was never installed, such
 #: as an OBS build directory. The single source of truth is the ``version``

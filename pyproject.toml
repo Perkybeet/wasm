@@ -175,9 +175,12 @@ select = [
     "RUF",  # ruff-specific rules
 ]
 ignore = [
-    "E501",  # line length is handled by the formatter
-    "S603",  # subprocess call: the runner is the audited seam for this
-    "S607",  # partial executable path: PATH lookup is intended for system tools
+    "E501",   # line length is handled by the formatter
+    "S603",   # subprocess call: the runner is the audited seam for this
+    "S607",   # partial executable path: PATH lookup is intended for system tools
+    "S310",   # urlopen: every call site validates the scheme before opening
+    "RUF012", # ClassVar annotations on config tables add noise without safety
+    "RUF059", # an unused element of an unpacked tuple is usually clearer named
 ]
 
 [tool.ruff.lint.per-file-ignores]
@@ -185,3 +188,28 @@ ignore = [
 "tests/**" = ["S101", "S105", "S106", "S108", "T20", "BLE"]
 # The release script is a developer tool, not shipped code.
 "scripts/**" = ["T20"]
+# Depends(), Query() and Field() in a signature default are how FastAPI is
+# written; B008 exists for the mutable-default trap, which these are not.
+"src/wasm/web/api/**" = ["B008"]
+"src/wasm/web/views/**" = ["B008"]
+# The CLI is the presentation layer, so this is where output legitimately
+# happens. It should still go through the logger rather than bare print, and
+# tests/test_architecture.py ratchets the count down.
+"src/wasm/cli/**" = ["T20", "BLE001", "S110"]
+# Blind excepts left in the managers and deployers. Down from 302; the count is
+# ratcheted in tests/test_architecture.py so it can only fall.
+"src/wasm/managers/**" = ["BLE001", "S110"]
+"src/wasm/deployers/**" = ["BLE001", "S110"]
+"src/wasm/monitor/**" = ["BLE001", "S110"]
+"src/wasm/core/**" = ["BLE001", "S110"]
+"src/wasm/web/**" = ["BLE001", "S110"]
+"src/wasm/validators/**" = ["BLE001", "S110"]
+# The store builds statements from column names it owns; every value is bound
+# as a parameter. S608 cannot tell the difference.
+"src/wasm/core/store.py" = ["S608"]
+# The version is read before the re-exports so a broken optional import cannot
+# stop `wasm --version` from answering.
+"src/wasm/__init__.py" = ["E402"]
+# Startup banner and update notice: the one place output precedes the logger.
+"src/wasm/core/update_checker.py" = ["T201"]
+"src/wasm/web/server.py" = ["T201", "S104"]

@@ -17,8 +17,13 @@ deployer through the same three calls: ``detect``, ``configure``, ``deploy``.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, TypeAlias
+
+#: Called with a short description as each update step begins.
+StepReporter: TypeAlias = Callable[[str], None]
 
 #: Detection precedence. When several deployers recognise the same directory,
 #: the one with the highest priority wins, and ties break on the type name so
@@ -136,3 +141,52 @@ class AppDeployer(ABC):
             WASMError: When a step fails and could not be recovered from. The
                 deployer rolls back whatever it created before re-raising.
         """
+
+    def update(self, on_step: StepReporter | None = None) -> UpdateResult:
+        """
+        Rebuild an application that is already deployed, in place.
+
+        This exists because the CLI used to drive the sequence itself, poking
+        at ``_package_manager`` and calling ``pre_install``,
+        ``install_dependencies``, ``build`` and ``get_start_command`` in order.
+        That made the update flow a second, divergent copy of the deploy
+        pipeline, reachable only from one command and testable from none.
+
+        Not abstract: a monorepo rebuilds one workspace of many, and a compose
+        project pulls images rather than installing dependencies, so those two
+        override it with something that is genuinely different rather than
+        being forced into this shape.
+
+        Args:
+            on_step: Called as each step begins, so the caller can report
+                progress without knowing what the steps are.
+
+        Returns:
+            What was done, for the caller to present.
+
+        Raises:
+            NotImplementedError: When this deployer has no in-place update.
+            WASMError: When a step fails. The application is left running on
+                its previous build wherever that is possible.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot update in place. Redeploy it instead."
+        )
+
+
+@dataclass
+class UpdateResult:
+    """
+    Outcome of an in-place update.
+
+    Attributes:
+        package_manager: The package manager that was used.
+        prisma_updated: Whether Prisma client generation and migrations ran.
+        is_static: Whether the application has no service to restart.
+        start_command: The command the service runs, empty for a static site.
+    """
+
+    package_manager: str
+    prisma_updated: bool
+    is_static: bool
+    start_command: str

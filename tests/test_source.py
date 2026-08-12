@@ -106,7 +106,7 @@ class TestValidateSource:
 
     def test_valid_https_url(self):
         """Test validation of HTTPS Git URLs."""
-        source_type, normalized = validate_source("https://github.com/user/repo.git")
+        source_type, _normalized = validate_source("https://github.com/user/repo.git")
         assert source_type == "git"
 
     def test_github_shorthand(self):

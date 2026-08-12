@@ -60,8 +60,11 @@ jobs:
           pip install -e ".[all,dev]"
           pip install "mypy==${MYPY_VERSION}"
 
+      # Blocks against a committed baseline that can only shrink. Errors that
+      # mean "this name does not exist" fail at zero regardless, because they
+      # are the reason the gate exists.
       - name: Run mypy
-        run: mypy
+        run: python scripts/typecheck.py
 
   test:
     name: Test on Python ${{ matrix.python-version }}
@@ -148,6 +151,11 @@ jobs:
       # gate that makes drift impossible rather than merely discouraged.
       - name: Check version consistency
         run: python scripts/release.py --check
+
+      # The panel serves no third-party asset it does not carry, so an
+      # air-gapped server still gets a working page.
+      - name: Check vendored assets
+        run: python scripts/vendor_assets.py --check
 
       - name: Build distributions
         run: |

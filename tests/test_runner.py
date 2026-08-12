@@ -7,6 +7,7 @@ the module under test is precisely to spawn processes correctly.
 
 from __future__ import annotations
 
+import dataclasses
 import gzip
 import sys
 
@@ -442,5 +443,5 @@ class TestCommandResult:
     def test_is_immutable(self):
         result = CommandResult(argv=("x",), exit_code=0)
 
-        with pytest.raises(Exception):
+        with pytest.raises((AttributeError, TypeError, dataclasses.FrozenInstanceError)):
             result.exit_code = 1  # type: ignore[misc]

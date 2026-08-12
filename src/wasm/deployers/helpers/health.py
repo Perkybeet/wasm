@@ -42,7 +42,7 @@ def wait_until_healthy(
         try:
             # The URL is always http://127.0.0.1:<port><path>, built here; S310
             # guards against a caller-supplied scheme, which cannot occur.
-            with urllib.request.urlopen(url, timeout=PROBE_TIMEOUT) as response:  # noqa: S310
+            with urllib.request.urlopen(url, timeout=PROBE_TIMEOUT) as response:
                 if response.status == 200:
                     return True
         # A health check is a probe: any failure to reach the app means "not

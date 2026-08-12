@@ -116,7 +116,7 @@ def handle_webapp(args: Namespace) -> int:
                 )
             logger.blank()
         return 1
-    except Exception as e:  # noqa: BLE001 - the CLI error boundary: nothing above catches
+    except Exception as e:
         logger = Logger(verbose=args.verbose)
         logger.error(f"Unexpected error: {e}")
         logger.debug(f"Unhandled {type(e).__name__} in webapp {action}")
@@ -737,46 +737,35 @@ def _handle_update(args: Namespace) -> int:
         return _handle_docker_compose_update(args, app_path, app_name, domain, logger)
 
     deployer = get_deployer(app_type, verbose=args.verbose)
-    deployer.app_path = app_path
-    deployer.app_name = app_name
-    deployer.domain = domain
-    deployer._package_manager = package_manager
+    deployer.configure(
+        domain=domain,
+        source=str(app_path),
+        app_path=app_path,
+        package_manager=package_manager,
+    )
 
-    # Run pre_install to detect package manager and prisma
-    deployer.pre_install()
-    logger.substep(f"Package manager: {deployer.package_manager}")
-    if deployer.has_prisma:
-        logger.substep("Prisma detected")
+    # One call, not a second copy of the deploy pipeline. The deployer reports
+    # each step as it starts so the numbering here stays the CLI's business.
+    step = iter(range(4, total_steps + 1))
+    result = deployer.update(on_step=lambda message: logger.step(next(step), total_steps, message))
 
-    # Step 4: Install dependencies (without stopping the app)
-    logger.step(4, total_steps, "Installing dependencies")
-    deployer.install_dependencies()
-
-    # Step 5: Generate Prisma and run migrations if needed
-    if deployer.has_prisma:
-        logger.step(5, total_steps, "Updating Prisma")
-        deployer.generate_prisma()
-        deployer.run_prisma_migrate(deploy=True)
-    else:
-        logger.step(5, total_steps, "Prisma not detected, skipping")
-
-    # Step 6: Build application (without stopping the app)
-    logger.step(6, total_steps, "Building application")
-    deployer.build()
+    logger.substep(f"Package manager: {result.package_manager}")
+    if result.prisma_updated:
+        logger.substep("Prisma updated")
 
     # Step 7: Restart service (only if not static)
     logger.step(7, total_steps, "Restarting application")
     service_manager = ServiceManager(verbose=args.verbose)
 
     # Check if this is a static app (no service to restart)
-    is_static = not bool(deployer.get_start_command())
+    is_static = result.is_static
 
     if is_static:
         logger.substep("Static application - no service restart needed")
         logger.success(f"Application updated successfully: {domain}")
         logger.blank()
         logger.key_value("Type", "Static")
-        logger.key_value("Package Manager", deployer.package_manager)
+        logger.key_value("Package Manager", result.package_manager)
     else:
         # Check if service exists before trying to restart
         status = service_manager.get_status(app_name)
@@ -797,8 +786,8 @@ def _handle_update(args: Namespace) -> int:
                 logger.success(f"Application updated successfully: {domain}")
                 logger.blank()
                 logger.key_value("Status", "Running")
-                logger.key_value("Package Manager", deployer.package_manager)
-                if deployer.has_prisma:
+                logger.key_value("Package Manager", result.package_manager)
+                if result.prisma_updated:
                     logger.key_value("Prisma", "Updated")
             else:
                 logger.warning("Application restarted but may not be running correctly")

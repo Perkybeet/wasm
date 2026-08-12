@@ -114,7 +114,7 @@ def _undo(completed: list[DeployStep], logger: Logger) -> None:
         # Rollback is an error boundary: one undo that cannot complete must not
         # stop the remaining ones from running, or the rollback itself leaves
         # the machine in a worse state than the failure did.
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             failures += 1
             logger.debug(f"Rollback of '{step.title}' failed: {exc}")
 

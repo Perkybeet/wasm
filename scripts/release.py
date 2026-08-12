@@ -213,7 +213,7 @@ def _current_tag() -> str | None:
         The tag name, or None when HEAD is not tagged or git is unavailable.
     """
     try:
-        result = subprocess.run(  # noqa: S603 - fixed argv, developer tool
+        result = subprocess.run(
             ["git", "describe", "--exact-match", "--tags", "HEAD"],
             cwd=ROOT,
             capture_output=True,
