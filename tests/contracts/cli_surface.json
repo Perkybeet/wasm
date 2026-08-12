@@ -1,0 +1,1513 @@
+{
+  "": {
+    "aliases": [],
+    "options": [
+      "--changelog",
+      "--dry-run",
+      "--interactive",
+      "--no-color",
+      "--verbose",
+      "--version",
+      "-V",
+      "-i",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "backup": {
+    "aliases": [
+      "bak"
+    ],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "backup create": {
+    "aliases": [
+      "new"
+    ],
+    "options": [
+      "--description",
+      "--dry-run",
+      "--include-build",
+      "--include-databases",
+      "--include-db",
+      "--include-docker-volumes",
+      "--include-node-modules",
+      "--no-color",
+      "--no-env",
+      "--redis-method",
+      "--retention-count",
+      "--retention-days",
+      "--schemas",
+      "--tags",
+      "--verbose",
+      "-m",
+      "-t",
+      "-v"
+    ],
+    "positionals": [
+      "domain"
+    ]
+  },
+  "backup delete": {
+    "aliases": [
+      "remove",
+      "rm"
+    ],
+    "options": [
+      "--dry-run",
+      "--force",
+      "--no-color",
+      "--verbose",
+      "-f",
+      "-v",
+      "-y"
+    ],
+    "positionals": [
+      "backup_id"
+    ]
+  },
+  "backup info": {
+    "aliases": [
+      "show"
+    ],
+    "options": [
+      "--dry-run",
+      "--json",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": [
+      "backup_id"
+    ]
+  },
+  "backup list": {
+    "aliases": [
+      "ls"
+    ],
+    "options": [
+      "--dry-run",
+      "--json",
+      "--limit",
+      "--no-color",
+      "--tags",
+      "--verbose",
+      "-n",
+      "-t",
+      "-v"
+    ],
+    "positionals": [
+      "domain"
+    ]
+  },
+  "backup restore": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--force",
+      "--no-color",
+      "--no-env",
+      "--no-verify",
+      "--target-domain",
+      "--verbose",
+      "-f",
+      "-v"
+    ],
+    "positionals": [
+      "backup_id"
+    ]
+  },
+  "backup schedule": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "backup schedule create": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--retention-count",
+      "--retention-days",
+      "--schedule",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": [
+      "domain"
+    ]
+  },
+  "backup schedule delete": {
+    "aliases": [
+      "remove",
+      "rm"
+    ],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": [
+      "domain"
+    ]
+  },
+  "backup schedule list": {
+    "aliases": [
+      "ls"
+    ],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "backup storage": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--json",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "backup verify": {
+    "aliases": [
+      "check"
+    ],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": [
+      "backup_id"
+    ]
+  },
+  "cert": {
+    "aliases": [
+      "certificate",
+      "ssl"
+    ],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "cert create": {
+    "aliases": [
+      "new",
+      "obtain"
+    ],
+    "options": [
+      "--apache",
+      "--domain",
+      "--dry-run",
+      "--email",
+      "--expand",
+      "--nginx",
+      "--no-color",
+      "--standalone",
+      "--verbose",
+      "--webroot",
+      "-d",
+      "-e",
+      "-v",
+      "-w"
+    ],
+    "positionals": []
+  },
+  "cert delete": {
+    "aliases": [
+      "remove",
+      "rm"
+    ],
+    "options": [
+      "--dry-run",
+      "--force",
+      "--no-color",
+      "--verbose",
+      "-f",
+      "-v"
+    ],
+    "positionals": [
+      "domain"
+    ]
+  },
+  "cert info": {
+    "aliases": [
+      "show"
+    ],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": [
+      "domain"
+    ]
+  },
+  "cert list": {
+    "aliases": [
+      "ls"
+    ],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "cert renew": {
+    "aliases": [],
+    "options": [
+      "--domain",
+      "--dry-run",
+      "--force",
+      "--no-color",
+      "--verbose",
+      "-d",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "cert revoke": {
+    "aliases": [],
+    "options": [
+      "--delete",
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": [
+      "domain"
+    ]
+  },
+  "config": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "config path": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "config show": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "config upgrade": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--quiet",
+      "--verbose",
+      "-q",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "create": {
+    "aliases": [
+      "deploy",
+      "new"
+    ],
+    "options": [
+      "--branch",
+      "--compose-file",
+      "--compose-profiles",
+      "--domain",
+      "--dry-run",
+      "--env-file",
+      "--no-color",
+      "--no-database",
+      "--no-ssl",
+      "--package-manager",
+      "--pm",
+      "--port",
+      "--source",
+      "--subdomains",
+      "--type",
+      "--verbose",
+      "--webserver",
+      "--workspaces",
+      "--www",
+      "-b",
+      "-d",
+      "-p",
+      "-s",
+      "-t",
+      "-v",
+      "-w"
+    ],
+    "positionals": []
+  },
+  "db": {
+    "aliases": [
+      "database"
+    ],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "db backup": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--engine",
+      "--no-color",
+      "--no-compress",
+      "--output",
+      "--verbose",
+      "-e",
+      "-o",
+      "-v"
+    ],
+    "positionals": [
+      "database"
+    ]
+  },
+  "db backups": {
+    "aliases": [],
+    "options": [
+      "--database",
+      "--dry-run",
+      "--engine",
+      "--json",
+      "--no-color",
+      "--verbose",
+      "-d",
+      "-e",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "db config": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--engine",
+      "--no-color",
+      "--password",
+      "--user",
+      "--verbose",
+      "-e",
+      "-p",
+      "-u",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "db connect": {
+    "aliases": [],
+    "options": [
+      "--database",
+      "--dry-run",
+      "--engine",
+      "--no-color",
+      "--username",
+      "--verbose",
+      "-d",
+      "-e",
+      "-u",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "db connection-string": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--engine",
+      "--host",
+      "--no-color",
+      "--password",
+      "--verbose",
+      "-e",
+      "-p",
+      "-v"
+    ],
+    "positionals": [
+      "database",
+      "username"
+    ]
+  },
+  "db create": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--encoding",
+      "--engine",
+      "--no-color",
+      "--owner",
+      "--verbose",
+      "-e",
+      "-o",
+      "-v"
+    ],
+    "positionals": [
+      "name"
+    ]
+  },
+  "db drop": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--engine",
+      "--force",
+      "--no-color",
+      "--verbose",
+      "-e",
+      "-f",
+      "-v",
+      "-y"
+    ],
+    "positionals": [
+      "name"
+    ]
+  },
+  "db engines": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--json",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "db grant": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--engine",
+      "--host",
+      "--no-color",
+      "--privileges",
+      "--verbose",
+      "-e",
+      "-v"
+    ],
+    "positionals": [
+      "username",
+      "database"
+    ]
+  },
+  "db info": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--engine",
+      "--json",
+      "--no-color",
+      "--verbose",
+      "-e",
+      "-v"
+    ],
+    "positionals": [
+      "name"
+    ]
+  },
+  "db install": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": [
+      "engine"
+    ]
+  },
+  "db list": {
+    "aliases": [
+      "ls"
+    ],
+    "options": [
+      "--dry-run",
+      "--engine",
+      "--json",
+      "--no-color",
+      "--verbose",
+      "-e",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "db query": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--engine",
+      "--no-color",
+      "--verbose",
+      "-e",
+      "-v"
+    ],
+    "positionals": [
+      "database",
+      "query"
+    ]
+  },
+  "db restart": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": [
+      "engine"
+    ]
+  },
+  "db restore": {
+    "aliases": [],
+    "options": [
+      "--drop",
+      "--dry-run",
+      "--engine",
+      "--force",
+      "--no-color",
+      "--verbose",
+      "-e",
+      "-f",
+      "-v",
+      "-y"
+    ],
+    "positionals": [
+      "database",
+      "file"
+    ]
+  },
+  "db revoke": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--engine",
+      "--host",
+      "--no-color",
+      "--privileges",
+      "--verbose",
+      "-e",
+      "-v"
+    ],
+    "positionals": [
+      "username",
+      "database"
+    ]
+  },
+  "db start": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": [
+      "engine"
+    ]
+  },
+  "db status": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--json",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": [
+      "engine"
+    ]
+  },
+  "db stop": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": [
+      "engine"
+    ]
+  },
+  "db uninstall": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--force",
+      "--no-color",
+      "--purge",
+      "--verbose",
+      "-f",
+      "-v",
+      "-y"
+    ],
+    "positionals": [
+      "engine"
+    ]
+  },
+  "db user-create": {
+    "aliases": [],
+    "options": [
+      "--database",
+      "--dry-run",
+      "--engine",
+      "--host",
+      "--no-color",
+      "--password",
+      "--verbose",
+      "-d",
+      "-e",
+      "-p",
+      "-v"
+    ],
+    "positionals": [
+      "username"
+    ]
+  },
+  "db user-delete": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--engine",
+      "--force",
+      "--host",
+      "--no-color",
+      "--verbose",
+      "-e",
+      "-f",
+      "-v",
+      "-y"
+    ],
+    "positionals": [
+      "username"
+    ]
+  },
+  "db user-list": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--engine",
+      "--json",
+      "--no-color",
+      "--verbose",
+      "-e",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "delete": {
+    "aliases": [
+      "remove",
+      "rm"
+    ],
+    "options": [
+      "--dry-run",
+      "--force",
+      "--keep-files",
+      "--no-color",
+      "--verbose",
+      "-f",
+      "-v",
+      "-y"
+    ],
+    "positionals": [
+      "domain"
+    ]
+  },
+  "env": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "env configure": {
+    "aliases": [
+      "config",
+      "setup"
+    ],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": [
+      "domain"
+    ]
+  },
+  "env export": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--output",
+      "--verbose",
+      "-o",
+      "-v"
+    ],
+    "positionals": [
+      "domain"
+    ]
+  },
+  "env show": {
+    "aliases": [
+      "list",
+      "ls"
+    ],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--unmask",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": [
+      "domain"
+    ]
+  },
+  "health": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "list": {
+    "aliases": [
+      "ls"
+    ],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "logs": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--follow",
+      "--lines",
+      "--no-color",
+      "--verbose",
+      "-f",
+      "-n",
+      "-v"
+    ],
+    "positionals": [
+      "domain"
+    ]
+  },
+  "monitor": {
+    "aliases": [
+      "mon"
+    ],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "monitor config": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "monitor disable": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "monitor enable": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "monitor install": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "monitor run": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "monitor scan": {
+    "aliases": [],
+    "options": [
+      "--all",
+      "--dry-run",
+      "--force-ai",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "monitor status": {
+    "aliases": [
+      "info"
+    ],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "monitor test-email": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "monitor uninstall": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "restart": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": [
+      "domain"
+    ]
+  },
+  "rollback": {
+    "aliases": [
+      "rb"
+    ],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--no-rebuild",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": [
+      "domain",
+      "backup_id"
+    ]
+  },
+  "service": {
+    "aliases": [
+      "svc"
+    ],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "service create": {
+    "aliases": [],
+    "options": [
+      "--command",
+      "--description",
+      "--directory",
+      "--dry-run",
+      "--name",
+      "--no-color",
+      "--user",
+      "--verbose",
+      "-c",
+      "-d",
+      "-n",
+      "-u",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "service delete": {
+    "aliases": [
+      "remove",
+      "rm"
+    ],
+    "options": [
+      "--dry-run",
+      "--force",
+      "--no-color",
+      "--verbose",
+      "-f",
+      "-v",
+      "-y"
+    ],
+    "positionals": [
+      "name"
+    ]
+  },
+  "service list": {
+    "aliases": [
+      "ls"
+    ],
+    "options": [
+      "--all",
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-a",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "service logs": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--follow",
+      "--lines",
+      "--no-color",
+      "--verbose",
+      "-f",
+      "-n",
+      "-v"
+    ],
+    "positionals": [
+      "name"
+    ]
+  },
+  "service restart": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": [
+      "name"
+    ]
+  },
+  "service start": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": [
+      "name"
+    ]
+  },
+  "service status": {
+    "aliases": [
+      "info"
+    ],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": [
+      "name"
+    ]
+  },
+  "service stop": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": [
+      "name"
+    ]
+  },
+  "setup": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "setup completions": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--shell",
+      "--user-only",
+      "--verbose",
+      "-s",
+      "-u",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "setup doctor": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "setup init": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "setup permissions": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "setup ssh": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--generate",
+      "--no-color",
+      "--show",
+      "--test",
+      "--type",
+      "--verbose",
+      "-S",
+      "-T",
+      "-g",
+      "-t",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "site": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "site create": {
+    "aliases": [],
+    "options": [
+      "--domain",
+      "--dry-run",
+      "--no-color",
+      "--no-ssl",
+      "--port",
+      "--template",
+      "--verbose",
+      "--webserver",
+      "--www",
+      "-d",
+      "-p",
+      "-t",
+      "-v",
+      "-w"
+    ],
+    "positionals": []
+  },
+  "site delete": {
+    "aliases": [
+      "remove",
+      "rm"
+    ],
+    "options": [
+      "--dry-run",
+      "--force",
+      "--no-color",
+      "--verbose",
+      "-f",
+      "-v",
+      "-y"
+    ],
+    "positionals": [
+      "domain"
+    ]
+  },
+  "site disable": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": [
+      "domain"
+    ]
+  },
+  "site enable": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": [
+      "domain"
+    ]
+  },
+  "site list": {
+    "aliases": [
+      "ls"
+    ],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "--webserver",
+      "-v",
+      "-w"
+    ],
+    "positionals": []
+  },
+  "site show": {
+    "aliases": [
+      "cat"
+    ],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": [
+      "domain"
+    ]
+  },
+  "start": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": [
+      "domain"
+    ]
+  },
+  "status": {
+    "aliases": [
+      "info"
+    ],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": [
+      "domain"
+    ]
+  },
+  "stop": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": [
+      "domain"
+    ]
+  },
+  "store": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "store export": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--output",
+      "--verbose",
+      "-o",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "store import": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "store init": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "store path": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "store stats": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--json",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "store sync": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "update": {
+    "aliases": [
+      "upgrade"
+    ],
+    "options": [
+      "--branch",
+      "--dry-run",
+      "--no-color",
+      "--package-manager",
+      "--pm",
+      "--source",
+      "--verbose",
+      "-b",
+      "-s",
+      "-v"
+    ],
+    "positionals": [
+      "domain"
+    ]
+  },
+  "web": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "web install": {
+    "aliases": [],
+    "options": [
+      "--apt",
+      "--dry-run",
+      "--no-color",
+      "--pip",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "web restart": {
+    "aliases": [],
+    "options": [
+      "--daemon",
+      "--dry-run",
+      "--host",
+      "--no-color",
+      "--port",
+      "--verbose",
+      "-H",
+      "-d",
+      "-p",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "web start": {
+    "aliases": [],
+    "options": [
+      "--daemon",
+      "--dry-run",
+      "--host",
+      "--no-color",
+      "--port",
+      "--verbose",
+      "-H",
+      "-d",
+      "-p",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "web status": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "web stop": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--verbose",
+      "-v"
+    ],
+    "positionals": []
+  },
+  "web token": {
+    "aliases": [],
+    "options": [
+      "--dry-run",
+      "--no-color",
+      "--regenerate",
+      "--verbose",
+      "-r",
+      "-v"
+    ],
+    "positionals": []
+  }
+}

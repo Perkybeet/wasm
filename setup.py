@@ -9,7 +9,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="wasm-cli",
-    version="0.15.8",
+    version="1.0.0",
     description="Web App System Management - Deploy and manage web applications on Linux servers",
     author="Yago López Prado",
     author_email="yago.lopez.adeje@gmail.com",
@@ -19,38 +19,36 @@ setup(
     packages=find_packages(where="src"),
     include_package_data=True,
     install_requires=[
+        "click>=8.0",
         "Jinja2>=3.1.0",
         "PyYAML>=6.0",
+        "questionary>=2.0",
+        "rich>=13.0",
     ],
     extras_require={
-        "interactive": ["inquirer>=3.1.0"],
         "web": [
             "fastapi>=0.109.0",
+            "starlette>=0.36.0",
+            "pydantic>=2.0",
             "uvicorn[standard]>=0.27.0",
-            "python-jose[cryptography]>=3.3.0",
-            "passlib[bcrypt]>=1.7.4",
-            "psutil>=5.9.0",
-            "aiofiles>=23.0.0",
+                    "psutil>=5.9.0",
         ],
         "monitor": [
             "psutil>=5.9.0",
             "httpx>=0.25.0",
         ],
         "all": [
-            "inquirer>=3.1.0",
-            "rich>=13.0",
             "psutil>=5.9.0",
             "httpx>=0.25.0",
             "fastapi>=0.109.0",
+            "starlette>=0.36.0",
+            "pydantic>=2.0",
             "uvicorn[standard]>=0.27.0",
-            "python-jose[cryptography]>=3.3.0",
-            "passlib[bcrypt]>=1.7.4",
-            "aiofiles>=23.0.0",
-        ],
+                ],
     },
     entry_points={
         "console_scripts": [
-            "wasm=wasm.main:cli",
+            "wasm=wasm.cli.app:entrypoint",
         ],
     },
     data_files=[
@@ -67,5 +65,7 @@ setup(
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
+        "Programming Language :: Python :: 3.14",
     ],
 )

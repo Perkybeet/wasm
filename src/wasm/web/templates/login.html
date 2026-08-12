@@ -1,0 +1,69 @@
+{#
+  Sign-in.
+
+  Deliberately spare. The one thing worth saying here is which machine you are
+  about to get root on, because an operator with several servers open in
+  several tabs should not have to guess.
+#}
+<!doctype html>
+<html lang="en"{% if theme %} data-theme="{{ theme }}"{% endif %}>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in - {{ hostname }} - WASM</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <link rel="icon" href="/static/logo.webp" type="image/webp">
+</head>
+
+<body style="display: grid; place-items: center; min-height: 100dvh">
+
+<main style="width: min(22rem, 100%); padding: 1.5rem">
+  <div class="brand" style="padding: 0; margin-bottom: 0.25rem">
+    <img src="/static/logo.webp" alt="" width="20" height="20">
+    WASM
+  </div>
+  <p class="mono muted" style="font-size: var(--text-sm); margin-bottom: 1.5rem">{{ hostname }}</p>
+
+  {% if error %}
+    <div class="problem" role="alert">
+      <p class="problem__fix" style="margin: 0">{{ error }}</p>
+    </div>
+  {% endif %}
+
+  {#
+    Posted as a plain urlencoded form to /login, which is what the server
+    parses: a single "token" field, and nothing in the URL, because a query
+    string is written to browser history, proxy logs and access logs.
+
+    There is no CSRF field, and there deliberately is not one. This exchange
+    happens before any session exists, so there is no token to carry; the
+    field that used to sit here always sent an empty string, which is a claim
+    of protection that was not there. Nothing is at stake either way: the only
+    thing this form can do with a forged submission is present a token the
+    forger already knows.
+  #}
+  <form method="post" action="/login" autocomplete="off">
+    <div class="field">
+      <label class="label" for="token">Access token</label>
+      <input class="mono" type="password" id="token" name="token"
+             required autofocus autocomplete="current-password"
+             aria-describedby="token-hint">
+      <span class="field__hint" id="token-hint">
+        Run <code>wasm web token</code> on the server to print it.
+      </span>
+    </div>
+
+    <button class="btn btn--primary" type="submit" style="width: 100%">Sign in</button>
+  </form>
+
+  {# Only when the lockout has not already been said above: a refusal repeated
+     twice on one screen reads as two different problems. #}
+  {% if locked_for and not error %}
+    <p class="faint" style="margin-top: 1rem; font-size: var(--text-xs)">
+      Too many attempts. Try again in {{ locked_for }} seconds.
+    </p>
+  {% endif %}
+</main>
+
+</body>
+</html>

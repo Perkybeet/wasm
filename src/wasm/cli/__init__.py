@@ -1,6 +1,9 @@
-"""CLI module for WASM."""
+"""
+Command line interface.
 
-from wasm.cli.parser import create_parser, parse_args
-from wasm.cli.interactive import InteractiveMode
-
-__all__ = ["create_parser", "parse_args", "InteractiveMode"]
+Deliberately empty of imports. The package used to pull in the argparse tree,
+which imported every command module, so one broken optional dependency
+anywhere took down the whole CLI including ``wasm --version``. The command
+tree lives in :mod:`wasm.cli.app` and loads each command module only when that
+command is invoked.
+"""

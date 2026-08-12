@@ -14,8 +14,8 @@ from wasm.deployers.helpers.nginx_config import NginxConfigBuilder
 from wasm.deployers.helpers.package_manager import PackageManagerHelper
 from wasm.deployers.helpers.path_resolver import PathResolver
 from wasm.deployers.helpers.prisma import PrismaHelper
-from wasm.deployers.helpers.workspace import WorkspaceHelper
 from wasm.deployers.helpers.turbo import TurboHelper
+from wasm.deployers.helpers.workspace import WorkspaceHelper
 
 __all__ = [
     "EnvManager",
@@ -23,6 +23,6 @@ __all__ = [
     "PackageManagerHelper",
     "PathResolver",
     "PrismaHelper",
-    "WorkspaceHelper",
     "TurboHelper",
+    "WorkspaceHelper",
 ]

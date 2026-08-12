@@ -2,60 +2,57 @@
 Interactive mode for WASM using inquirer.
 """
 
-import sys
-from typing import Any, Dict, List, Optional
-
 try:
     import inquirer
     from inquirer.themes import GreenPassion
+
     HAS_INQUIRER = True
 except ImportError:
     HAS_INQUIRER = False
 
-from wasm.core.logger import Logger
 from wasm.core.exceptions import WASMError
-from wasm.validators.domain import validate_domain, check_domain
-from wasm.validators.port import validate_port, check_port
-from wasm.validators.source import validate_source, is_valid_source
+from wasm.core.logger import Logger
+from wasm.validators.domain import check_domain
+from wasm.validators.port import check_port
+from wasm.validators.source import is_valid_source
 
 
 class InteractiveMode:
     """
     Interactive mode handler using inquirer prompts.
     """
-    
+
     def __init__(self, verbose: bool = False):
         """
         Initialize interactive mode.
-        
+
         Args:
             verbose: Enable verbose output.
         """
         self.verbose = verbose
         self.logger = Logger(verbose=verbose)
-        
+
         if not HAS_INQUIRER:
             raise WASMError(
                 "Interactive mode requires 'inquirer' package.",
-                "Install with: pip install wasm-cli[interactive]\n"
-                "Or: pip install inquirer"
+                "Install with: pip install wasm-cli[interactive]\nOr: pip install inquirer",
             )
-    
+
     def run(self) -> int:
         """
         Run interactive mode.
-        
+
         Returns:
             Exit code.
         """
         self.logger.header("WASM Interactive Mode")
         self.logger.info("Answer the prompts to configure your operation")
         self.logger.blank()
-        
+
         try:
             # Select action type
             action_type = self._prompt_action_type()
-            
+
             if action_type == "webapp":
                 return self._webapp_flow()
             elif action_type == "site":
@@ -67,12 +64,12 @@ class InteractiveMode:
             else:
                 self.logger.warning("No action selected")
                 return 0
-                
+
         except KeyboardInterrupt:
             self.logger.blank()
             self.logger.info("Aborted")
             return 130
-    
+
     def _prompt_action_type(self) -> str:
         """Prompt for action type."""
         questions = [
@@ -87,10 +84,10 @@ class InteractiveMode:
                 ],
             ),
         ]
-        
+
         answers = inquirer.prompt(questions, theme=GreenPassion())
         return answers["action_type"] if answers else None
-    
+
     def _webapp_flow(self) -> int:
         """Handle webapp interactive flow."""
         questions = [
@@ -110,13 +107,13 @@ class InteractiveMode:
                 ],
             ),
         ]
-        
+
         answers = inquirer.prompt(questions, theme=GreenPassion())
         if not answers:
             return 0
-        
+
         action = answers["action"]
-        
+
         if action == "create":
             return self._webapp_create()
         elif action == "list":
@@ -133,32 +130,28 @@ class InteractiveMode:
         elif action == "delete":
             domain = self._prompt_domain("Enter application domain")
             return self._run_webapp_command("delete", domain, force=True, keep_files=False)
-        
+
         return 0
-    
-    def _run_webapp_command(
-        self,
-        action: str,
-        domain: Optional[str] = None,
-        **kwargs
-    ) -> int:
+
+    def _run_webapp_command(self, action: str, domain: str | None = None, **kwargs) -> int:
         """Run a webapp command with arguments."""
         from argparse import Namespace
-        
+
         args_dict = {
             "verbose": self.verbose,
             "action": action,
             **kwargs,
         }
-        
+
         if domain:
             args_dict["domain"] = domain
-        
+
         args = Namespace(**args_dict)
-        
+
         from wasm.cli.commands.webapp import handle_webapp
+
         return handle_webapp(args)
-    
+
     def _webapp_create(self) -> int:
         """Handle webapp create flow."""
         questions = [
@@ -215,13 +208,14 @@ class InteractiveMode:
                 default="",
             ),
         ]
-        
+
         answers = inquirer.prompt(questions, theme=GreenPassion())
         if not answers:
             return 0
 
         # Ask about www if SSL enabled and domain is a base domain
         from wasm.validators.domain import should_include_www
+
         include_www = False
         if answers["ssl"] and should_include_www(answers["domain"]):
             www_questions = [
@@ -236,6 +230,7 @@ class InteractiveMode:
 
         # Build arguments
         from argparse import Namespace
+
         args = Namespace(
             verbose=self.verbose,
             action="create",
@@ -251,8 +246,9 @@ class InteractiveMode:
         )
 
         from wasm.cli.commands.webapp import handle_webapp
+
         return handle_webapp(args)
-    
+
     def _webapp_logs(self, domain: str) -> int:
         """Handle webapp logs flow with interactive prompts."""
         questions = [
@@ -260,7 +256,7 @@ class InteractiveMode:
                 "lines",
                 message="Number of log lines to show",
                 default="50",
-                validate=lambda _, x: x.isdigit() and int(x) > 0 or "Must be a positive number",
+                validate=lambda _, x: (x.isdigit() and int(x) > 0) or "Must be a positive number",
             ),
             inquirer.Confirm(
                 "follow",
@@ -316,13 +312,13 @@ class InteractiveMode:
                 ],
             ),
         ]
-        
+
         answers = inquirer.prompt(questions, theme=GreenPassion())
         if not answers:
             return 0
-        
+
         action = answers["action"]
-        
+
         if action == "create":
             return self._site_create()
         elif action == "list":
@@ -332,9 +328,9 @@ class InteractiveMode:
             if action == "delete":
                 return self._run_command("site", action, domain, force=True)
             return self._run_command("site", action, domain)
-        
+
         return 0
-    
+
     def _site_create(self) -> int:
         """Handle site create flow."""
         questions = [
@@ -378,6 +374,7 @@ class InteractiveMode:
 
         # Ask about www if SSL enabled and domain is a base domain
         from wasm.validators.domain import should_include_www
+
         include_www = False
         if answers["ssl"] and should_include_www(answers["domain"]):
             www_questions = [
@@ -391,6 +388,7 @@ class InteractiveMode:
             include_www = www_answers.get("include_www", True) if www_answers else False
 
         from argparse import Namespace
+
         args = Namespace(
             verbose=self.verbose,
             action="create",
@@ -403,8 +401,9 @@ class InteractiveMode:
         )
 
         from wasm.cli.commands.site import handle_site
+
         return handle_site(args)
-    
+
     def _service_flow(self) -> int:
         """Handle service interactive flow."""
         questions = [
@@ -423,13 +422,13 @@ class InteractiveMode:
                 ],
             ),
         ]
-        
+
         answers = inquirer.prompt(questions, theme=GreenPassion())
         if not answers:
             return 0
-        
+
         action = answers["action"]
-        
+
         if action == "create":
             return self._service_create()
         elif action == "list":
@@ -442,9 +441,9 @@ class InteractiveMode:
             if action == "delete":
                 return self._run_command("service", action, name, force=True)
             return self._run_command("service", action, name)
-        
+
         return 0
-    
+
     def _service_create(self) -> int:
         """Handle service create flow."""
         questions = [
@@ -474,12 +473,13 @@ class InteractiveMode:
                 default="",
             ),
         ]
-        
+
         answers = inquirer.prompt(questions, theme=GreenPassion())
         if not answers:
             return 0
-        
+
         from argparse import Namespace
+
         args = Namespace(
             verbose=self.verbose,
             action="create",
@@ -489,10 +489,11 @@ class InteractiveMode:
             user=answers["user"],
             description=answers["description"] or None,
         )
-        
+
         from wasm.cli.commands.service import handle_service
+
         return handle_service(args)
-    
+
     def _service_logs(self, name: str) -> int:
         """Handle service logs flow with interactive prompts."""
         questions = [
@@ -500,7 +501,7 @@ class InteractiveMode:
                 "lines",
                 message="Number of log lines to show",
                 default="50",
-                validate=lambda _, x: x.isdigit() and int(x) > 0 or "Must be a positive number",
+                validate=lambda _, x: (x.isdigit() and int(x) > 0) or "Must be a positive number",
             ),
             inquirer.Confirm(
                 "follow",
@@ -537,13 +538,13 @@ class InteractiveMode:
                 ],
             ),
         ]
-        
+
         answers = inquirer.prompt(questions, theme=GreenPassion())
         if not answers:
             return 0
-        
+
         action = answers["action"]
-        
+
         if action == "create":
             return self._cert_create()
         elif action == "list":
@@ -557,9 +558,9 @@ class InteractiveMode:
             elif action == "revoke":
                 return self._run_command("cert", action, domain, delete=True)
             return self._run_command("cert", action, domain)
-        
+
         return 0
-    
+
     def _cert_create(self) -> int:
         """Handle cert create flow."""
         questions = [
@@ -594,18 +595,19 @@ class InteractiveMode:
                 default=False,
             ),
         ]
-        
+
         answers = inquirer.prompt(questions, theme=GreenPassion())
         if not answers:
             return 0
-        
+
         # Parse domains
         domains = [answers["domain"]]
         if answers["additional"]:
             additional = [d.strip() for d in answers["additional"].split(",")]
             domains.extend(additional)
-        
+
         from argparse import Namespace
+
         args = Namespace(
             verbose=self.verbose,
             action="create",
@@ -617,14 +619,15 @@ class InteractiveMode:
             apache=answers["method"] == "apache",
             dry_run=answers["dry_run"],
         )
-        
+
         if answers["method"] == "webroot":
             webroot = self._prompt_text("Enter webroot path")
             args.webroot = webroot
-        
+
         from wasm.cli.commands.cert import handle_cert
+
         return handle_cert(args)
-    
+
     def _cert_renew(self) -> int:
         """Handle cert renew flow."""
         questions = [
@@ -647,16 +650,17 @@ class InteractiveMode:
                 default=False,
             ),
         ]
-        
+
         answers = inquirer.prompt(questions, theme=GreenPassion())
         if not answers:
             return 0
-        
+
         domain = None
         if answers["scope"] == "specific":
             domain = self._prompt_domain("Enter domain name")
-        
+
         from argparse import Namespace
+
         args = Namespace(
             verbose=self.verbose,
             action="renew",
@@ -664,10 +668,11 @@ class InteractiveMode:
             force=answers["force"],
             dry_run=answers["dry_run"],
         )
-        
+
         from wasm.cli.commands.cert import handle_cert
+
         return handle_cert(args)
-    
+
     def _prompt_domain(self, message: str) -> str:
         """Prompt for a domain name."""
         questions = [
@@ -679,7 +684,7 @@ class InteractiveMode:
         ]
         answers = inquirer.prompt(questions, theme=GreenPassion())
         return answers["domain"] if answers else None
-    
+
     def _prompt_text(self, message: str, default: str = "") -> str:
         """Prompt for text input."""
         questions = [
@@ -691,43 +696,41 @@ class InteractiveMode:
         ]
         answers = inquirer.prompt(questions, theme=GreenPassion())
         return answers["value"] if answers else default
-    
-    def _run_command(
-        self,
-        resource: str,
-        action: str,
-        target: Optional[str] = None,
-        **kwargs
-    ) -> int:
+
+    def _run_command(self, resource: str, action: str, target: str | None = None, **kwargs) -> int:
         """Run a command with arguments."""
         from argparse import Namespace
-        
+
         args_dict = {
             "verbose": self.verbose,
             "action": action,
             **kwargs,
         }
-        
+
         # Add target based on resource type
         if target:
             if resource in ["webapp", "site", "cert"]:
                 args_dict["domain"] = target
             elif resource == "service":
                 args_dict["name"] = target
-        
+
         args = Namespace(**args_dict)
-        
+
         if resource == "webapp":
             from wasm.cli.commands.webapp import handle_webapp
+
             return handle_webapp(args)
         elif resource == "site":
             from wasm.cli.commands.site import handle_site
+
             return handle_site(args)
         elif resource == "service":
             from wasm.cli.commands.service import handle_service
+
             return handle_service(args)
         elif resource == "cert":
             from wasm.cli.commands.cert import handle_cert
+
             return handle_cert(args)
-        
+
         return 1

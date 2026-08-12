@@ -2,40 +2,89 @@
 Services API endpoints.
 
 Provides endpoints for managing systemd services.
+
+Two rules govern this module:
+
+- **Every name is validated before it becomes a path.** The panel runs as root,
+  and a unit name arriving in a JSON body is not constrained by the router's
+  path matching. Names go through :func:`wasm.validators.names.validate_service_name`
+  and paths through :func:`wasm.validators.names.resolve_within`, so a write can
+  only ever land inside :data:`SYSTEMD_UNIT_DIR`.
+- **Handlers are synchronous.** They call systemctl and journalctl, which block.
+  Declared ``async def`` they would run on the event loop and freeze the whole
+  panel for every other request; declared ``def``, FastAPI runs them in the
+  threadpool.
 """
 
-import subprocess
-from typing import List, Optional
+from __future__ import annotations
 
-from fastapi import APIRouter, Request, HTTPException, Depends, Query
+import re
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
-from wasm.web.api.auth import get_current_session
+from wasm.core.config import SYSTEMD_DIR
+from wasm.core.exceptions import SecurityError, ServiceError, ValidationError, WASMError
 from wasm.core.store import get_store
+from wasm.managers.service_manager import ServiceManager
+from wasm.validators.names import resolve_within, validate_service_name
+from wasm.web.api.auth import get_current_session
 
 router = APIRouter()
+
+#: Directory unit files are read from and written to. Module level on purpose:
+#: the path used to be interpolated inline at each call site, which made the
+#: write path impossible to exercise in a test and is how the traversal
+#: survived. Tests point this at a sandbox.
+SYSTEMD_UNIT_DIR: Path = SYSTEMD_DIR
+
+#: Units created by older WASM versions carry this prefix.
+LEGACY_PREFIX = "wasm-"
+
+#: Values systemd accepts for ``Restart=``.
+VALID_RESTART_POLICIES = frozenset(
+    {
+        "no",
+        "always",
+        "on-success",
+        "on-failure",
+        "on-abnormal",
+        "on-abort",
+        "on-watchdog",
+    }
+)
+
+#: Accounts a unit may run as.
+USER_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,31}\$?$")
+
+#: Environment variable names, as accepted by the shell and by systemd.
+ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class ServiceInfo(BaseModel):
     """Service information."""
+
     name: str
-    description: Optional[str] = None
+    description: str | None = None
     active: bool
     enabled: bool
     status: str
-    pid: Optional[int] = None
-    uptime: Optional[str] = None
-    memory: Optional[str] = None
+    pid: int | None = None
+    uptime: str | None = None
+    memory: str | None = None
 
 
 class ServiceListResponse(BaseModel):
     """Response for listing services."""
-    services: List[ServiceInfo]
+
+    services: list[ServiceInfo]
     total: int
 
 
 class ServiceActionResponse(BaseModel):
     """Response for service actions."""
+
     success: bool
     message: str
     service: str
@@ -43,76 +92,251 @@ class ServiceActionResponse(BaseModel):
 
 class CreateServiceRequest(BaseModel):
     """Request to create a new service."""
+
     name: str
-    command: Optional[str] = None
+    command: str | None = None
     user: str = "root"
     working_directory: str = "/var/www"
     restart: str = "always"
-    environment: Optional[dict] = None
-    raw_content: Optional[str] = None  # Raw systemd unit content for advanced mode
+    environment: dict | None = None
+    raw_content: str | None = None  # Raw systemd unit content for advanced mode
+
+
+class UpdateServiceConfigRequest(BaseModel):
+    """Request to update service configuration."""
+
+    config: str
+
+
+def _bad_request(exc: WASMError) -> HTTPException:
+    """
+    Turn a validation or containment failure into a client error.
+
+    Args:
+        exc: The raised WASM error.
+
+    Returns:
+        An HTTPException carrying the actionable message.
+    """
+    return HTTPException(status_code=400, detail=str(exc))
+
+
+def _unit_path(service_name: str) -> Path:
+    """
+    Build the unit file path for an already validated service name.
+
+    Args:
+        service_name: Validated unit name, without the ``.service`` suffix.
+
+    Returns:
+        The absolute unit file path, guaranteed to be inside SYSTEMD_UNIT_DIR.
+
+    Raises:
+        ValidationError: When the resulting name is not a usable path component.
+        SecurityError: When the path would leave the unit directory, including
+            through a symlink already present in it.
+    """
+    return resolve_within(SYSTEMD_UNIT_DIR, f"{service_name}.service")
+
+
+def _resolve_unit(name: str) -> tuple[str, Path]:
+    """
+    Validate a requested service name and locate its unit file.
+
+    Mirrors the legacy-prefix lookup of
+    :meth:`wasm.managers.service_manager.ServiceManager._resolve_service_name`,
+    but against :data:`SYSTEMD_UNIT_DIR` instead of a hardcoded directory, so the
+    API and its tests agree on where units live.
+
+    Args:
+        name: Service name as supplied by the client.
+
+    Returns:
+        Tuple of the resolved unit name and its path.
+
+    Raises:
+        ValidationError: When the name is not a safe unit name.
+        SecurityError: When the unit path would leave the unit directory.
+    """
+    service_name = validate_service_name(name).removesuffix(".service")
+    base = service_name.removeprefix(LEGACY_PREFIX) or service_name
+
+    legacy_name = f"{LEGACY_PREFIX}{base}"
+    legacy_path = _unit_path(legacy_name)
+    if legacy_path.exists():
+        return legacy_name, legacy_path
+
+    return base, _unit_path(base)
+
+
+def _reject_control_characters(value: str, field: str) -> str:
+    """
+    Refuse values that could smuggle extra directives into a unit file.
+
+    A newline in ``ExecStart=`` is a new systemd directive, so simple mode must
+    not accept one even though advanced mode lets an operator write a whole unit
+    by hand.
+
+    Args:
+        value: The field value.
+        field: Field name, used in the error message.
+
+    Returns:
+        The value, unchanged.
+
+    Raises:
+        ValidationError: When the value contains a control character.
+    """
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValidationError(
+            f"Invalid {field}: control characters are not allowed",
+            details=(
+                f"Remove line breaks and control characters from {field}, or use "
+                "advanced mode to supply the whole unit file."
+            ),
+        )
+    return value
+
+
+def _render_unit(data: CreateServiceRequest, service_name: str) -> str:
+    """
+    Render a unit file from the simple-mode fields of a create request.
+
+    Args:
+        data: The create request.
+        service_name: The already validated unit name.
+
+    Returns:
+        The unit file content.
+
+    Raises:
+        ValidationError: When any field would corrupt the unit file.
+    """
+    if not data.command:
+        raise ValidationError(
+            "Command is required in simple mode",
+            details="Provide 'command', or send 'raw_content' with a full unit file.",
+        )
+
+    command = _reject_control_characters(data.command, "command")
+    working_directory = _reject_control_characters(data.working_directory, "working_directory")
+
+    if not working_directory.startswith("/"):
+        raise ValidationError(
+            f"Working directory must be absolute: {working_directory!r}",
+            details="systemd rejects relative WorkingDirectory values.",
+        )
+
+    if not USER_NAME_PATTERN.match(data.user):
+        raise ValidationError(
+            f"Invalid user: {data.user!r}",
+            details="Use an existing account name made of letters, digits, '_' and '-'.",
+        )
+
+    if data.restart not in VALID_RESTART_POLICIES:
+        raise ValidationError(
+            f"Invalid restart policy: {data.restart!r}",
+            details=f"Use one of: {', '.join(sorted(VALID_RESTART_POLICIES))}.",
+        )
+
+    env_section = ""
+    if data.environment:
+        env_lines = []
+        for key, value in data.environment.items():
+            if not ENV_KEY_PATTERN.match(str(key)):
+                raise ValidationError(
+                    f"Invalid environment variable name: {key!r}",
+                    details=(
+                        "Names must start with a letter or '_' and contain only "
+                        "letters, digits and '_'."
+                    ),
+                )
+            text = _reject_control_characters(str(value), f"environment value for {key}")
+            if '"' in text or "\\" in text:
+                raise ValidationError(
+                    f"Invalid environment value for {key}",
+                    details="Double quotes and backslashes are not supported here.",
+                )
+            env_lines.append(f'Environment="{key}={text}"')
+        env_section = "\n".join(env_lines) + "\n"
+
+    return f"""[Unit]
+Description=WASM Service: {service_name}
+After=network.target
+
+[Service]
+Type=simple
+User={data.user}
+WorkingDirectory={working_directory}
+ExecStart={command}
+Restart={data.restart}
+RestartSec=5
+{env_section}
+[Install]
+WantedBy=multi-user.target
+"""
 
 
 @router.get("", response_model=ServiceListResponse)
-async def list_services(
+def list_services(
     request: Request,
     wasm_only: bool = Query(default=True, description="Only show WASM services"),
-    session: dict = Depends(get_current_session)
+    session: dict = Depends(get_current_session),
 ):
     """
     List all services (or only WASM services).
     """
-    from wasm.managers.service_manager import ServiceManager
-    
     store = get_store()
     service_manager = ServiceManager(verbose=False)
-    
+
     # Get services from store
     stored_services = store.list_services()
-    
+
     result = []
     for svc in stored_services:
         # Get live status from systemd (ServiceManager resolves name automatically)
         live_status = service_manager.get_status(svc.name)
-        
-        result.append(ServiceInfo(
-            name=svc.name,
-            description=svc.command,
-            active=live_status.get("active", False),
-            enabled=live_status.get("enabled", False),
-            status="running" if live_status.get("active") else "stopped",
-            pid=live_status.get("pid"),
-            uptime=live_status.get("uptime"),
-            memory=live_status.get("memory")
-        ))
-    
+
+        result.append(
+            ServiceInfo(
+                name=svc.name,
+                description=svc.command,
+                active=live_status.get("active", False),
+                enabled=live_status.get("enabled", False),
+                status="running" if live_status.get("active") else "stopped",
+                pid=live_status.get("pid"),
+                uptime=live_status.get("uptime"),
+                memory=live_status.get("memory"),
+            )
+        )
+
     return ServiceListResponse(services=result, total=len(result))
 
 
 @router.get("/{name}", response_model=ServiceInfo)
-async def get_service(
-    name: str,
-    request: Request,
-    session: dict = Depends(get_current_session)
-):
+def get_service(name: str, request: Request, session: dict = Depends(get_current_session)):
     """
     Get details for a specific service.
     """
-    from wasm.managers.service_manager import ServiceManager
-    
+    try:
+        service_name = validate_service_name(name)
+    except ValidationError as exc:
+        raise _bad_request(exc) from exc
+
     store = get_store()
     service_manager = ServiceManager(verbose=False)
-    
+
     # Handle both prefixed and non-prefixed names for backwards compatibility
-    svc = store.get_service(name)
+    svc = store.get_service(service_name)
     if not svc:
-        svc = store.get_service(f"wasm-{name}")
+        svc = store.get_service(f"{LEGACY_PREFIX}{service_name}")
 
     if not svc:
-        raise HTTPException(status_code=404, detail=f"Service not found: {name}")
+        raise HTTPException(status_code=404, detail=f"Service not found: {service_name}")
 
     # Get live status from systemd (ServiceManager resolves name automatically)
     live_status = service_manager.get_status(svc.name)
-    
+
     return ServiceInfo(
         name=svc.name,
         description=svc.command,
@@ -121,378 +345,234 @@ async def get_service(
         status="running" if live_status.get("active") else "stopped",
         pid=live_status.get("pid"),
         uptime=live_status.get("uptime"),
-        memory=live_status.get("memory")
+        memory=live_status.get("memory"),
+    )
+
+
+def _run_service_action(name: str, action: str, past_tense: str) -> ServiceActionResponse:
+    """
+    Validate a service name and run one systemctl verb through the manager.
+
+    Args:
+        name: Service name as supplied by the client.
+        action: ServiceManager method to call (start, stop, restart, ...).
+        past_tense: Word used in the response message.
+
+    Returns:
+        The action response.
+
+    Raises:
+        HTTPException: 400 for an unsafe name, 404 when the unit does not exist,
+            500 when systemd refuses the operation.
+    """
+    try:
+        service_name, service_path = _resolve_unit(name)
+    except (ValidationError, SecurityError) as exc:
+        raise _bad_request(exc) from exc
+
+    if not service_path.exists():
+        raise HTTPException(status_code=404, detail=f"Service not found: {service_name}")
+
+    service_manager = ServiceManager(verbose=False)
+    try:
+        getattr(service_manager, action)(service_name)
+    except WASMError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return ServiceActionResponse(
+        success=True,
+        message=f"Service {past_tense}: {service_name}",
+        service=service_name,
     )
 
 
 @router.post("/{name}/start", response_model=ServiceActionResponse)
-async def start_service(
-    name: str,
-    request: Request,
-    session: dict = Depends(get_current_session)
-):
+def start_service(name: str, request: Request, session: dict = Depends(get_current_session)):
     """
     Start a service.
     """
-    from wasm.managers.service_manager import ServiceManager
-    
-    service_manager = ServiceManager(verbose=False)
-    app_name = name
-    
-    status = service_manager.get_status(app_name)
-    if not status["exists"]:
-        raise HTTPException(status_code=404, detail=f"Service not found: {name}")
-    
-    try:
-        service_manager.start(app_name)
-        return ServiceActionResponse(
-            success=True,
-            message=f"Service started: {name}",
-            service=name
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return _run_service_action(name, "start", "started")
 
 
 @router.post("/{name}/stop", response_model=ServiceActionResponse)
-async def stop_service(
-    name: str,
-    request: Request,
-    session: dict = Depends(get_current_session)
-):
+def stop_service(name: str, request: Request, session: dict = Depends(get_current_session)):
     """
     Stop a service.
     """
-    from wasm.managers.service_manager import ServiceManager
-    
-    service_manager = ServiceManager(verbose=False)
-    app_name = name
-    
-    status = service_manager.get_status(app_name)
-    if not status["exists"]:
-        raise HTTPException(status_code=404, detail=f"Service not found: {name}")
-    
-    try:
-        service_manager.stop(app_name)
-        return ServiceActionResponse(
-            success=True,
-            message=f"Service stopped: {name}",
-            service=name
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return _run_service_action(name, "stop", "stopped")
 
 
 @router.post("/{name}/restart", response_model=ServiceActionResponse)
-async def restart_service(
-    name: str,
-    request: Request,
-    session: dict = Depends(get_current_session)
-):
+def restart_service(name: str, request: Request, session: dict = Depends(get_current_session)):
     """
     Restart a service.
     """
-    from wasm.managers.service_manager import ServiceManager
-    
-    service_manager = ServiceManager(verbose=False)
-    app_name = name
-    
-    status = service_manager.get_status(app_name)
-    if not status["exists"]:
-        raise HTTPException(status_code=404, detail=f"Service not found: {name}")
-    
-    try:
-        service_manager.restart(app_name)
-        return ServiceActionResponse(
-            success=True,
-            message=f"Service restarted: {name}",
-            service=name
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return _run_service_action(name, "restart", "restarted")
 
 
 @router.post("/{name}/enable", response_model=ServiceActionResponse)
-async def enable_service(
-    name: str,
-    request: Request,
-    session: dict = Depends(get_current_session)
-):
+def enable_service(name: str, request: Request, session: dict = Depends(get_current_session)):
     """
     Enable a service to start on boot.
     """
-    from wasm.managers.service_manager import ServiceManager
-    
-    service_manager = ServiceManager(verbose=False)
-    app_name = name
-    
-    status = service_manager.get_status(app_name)
-    if not status["exists"]:
-        raise HTTPException(status_code=404, detail=f"Service not found: {name}")
-    
-    try:
-        service_manager.enable(app_name)
-        return ServiceActionResponse(
-            success=True,
-            message=f"Service enabled: {name}",
-            service=name
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return _run_service_action(name, "enable", "enabled")
 
 
 @router.post("/{name}/disable", response_model=ServiceActionResponse)
-async def disable_service(
-    name: str,
-    request: Request,
-    session: dict = Depends(get_current_session)
-):
+def disable_service(name: str, request: Request, session: dict = Depends(get_current_session)):
     """
     Disable a service from starting on boot.
     """
-    from wasm.managers.service_manager import ServiceManager
-    
-    service_manager = ServiceManager(verbose=False)
-    app_name = name
-    
-    status = service_manager.get_status(app_name)
-    if not status["exists"]:
-        raise HTTPException(status_code=404, detail=f"Service not found: {name}")
-    
-    try:
-        service_manager.disable(app_name)
-        return ServiceActionResponse(
-            success=True,
-            message=f"Service disabled: {name}",
-            service=name
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return _run_service_action(name, "disable", "disabled")
 
 
 @router.get("/{name}/logs")
-async def get_service_logs(
+def get_service_logs(
     name: str,
     request: Request,
     lines: int = Query(default=100, ge=1, le=1000),
-    session: dict = Depends(get_current_session)
+    session: dict = Depends(get_current_session),
 ):
     """
     Get service logs from journalctl.
     """
-    from wasm.managers.service_manager import ServiceManager
-    service_manager = ServiceManager(verbose=False)
-    service_name = service_manager._resolve_service_name(name)
-
     try:
-        result = subprocess.run(
-            ["journalctl", "-u", service_name, "-n", str(lines), "--no-pager"],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-        logs = result.stdout or result.stderr or "No logs available"
-    except subprocess.TimeoutExpired:
-        logs = "Timeout retrieving logs"
-    except Exception as e:
-        logs = f"Error retrieving logs: {e}"
-    
-    return {
-        "service": name,
-        "logs": logs,
-        "lines": lines
-    }
+        service_name, _ = _resolve_unit(name)
+    except (ValidationError, SecurityError) as exc:
+        raise _bad_request(exc) from exc
+
+    service_manager = ServiceManager(verbose=False)
+    try:
+        logs = service_manager.logs(service_name, lines=lines) or "No logs available"
+    except WASMError as exc:
+        logs = f"Error retrieving logs: {exc}"
+
+    return {"service": service_name, "logs": logs, "lines": lines}
 
 
 @router.get("/{name}/config")
-async def get_service_config(
-    name: str,
-    request: Request,
-    session: dict = Depends(get_current_session)
-):
+def get_service_config(name: str, request: Request, session: dict = Depends(get_current_session)):
     """
     Get the systemd unit file content for a service.
     """
-    from pathlib import Path
-    from wasm.managers.service_manager import ServiceManager
+    try:
+        service_name, service_path = _resolve_unit(name)
+    except (ValidationError, SecurityError) as exc:
+        raise _bad_request(exc) from exc
 
-    service_manager = ServiceManager(verbose=False)
-    service_name = service_manager._resolve_service_name(name)
-    service_path = Path(f"/etc/systemd/system/{service_name}.service")
-    
-    if not service_path.exists():
+    if not service_path.is_file():
         raise HTTPException(status_code=404, detail=f"Service not found: {service_name}")
-    
+
     try:
         content = service_path.read_text()
-        return {
-            "service": service_name,
-            "config": content,
-            "path": str(service_path)
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error reading config: {e}")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Error reading config: {exc}") from exc
 
-
-class UpdateServiceConfigRequest(BaseModel):
-    """Request to update service configuration."""
-    config: str
+    return {"service": service_name, "config": content, "path": str(service_path)}
 
 
 @router.put("/{name}/config", response_model=ServiceActionResponse)
-async def update_service_config(
+def update_service_config(
     name: str,
     data: UpdateServiceConfigRequest,
     request: Request,
-    session: dict = Depends(get_current_session)
+    session: dict = Depends(get_current_session),
 ):
     """
     Update the systemd unit file content for a service.
     """
-    from pathlib import Path
-    from wasm.managers.service_manager import ServiceManager
-
-    service_manager = ServiceManager(verbose=False)
-    service_name = service_manager._resolve_service_name(name)
-    service_path = Path(f"/etc/systemd/system/{service_name}.service")
-    
-    if not service_path.exists():
-        raise HTTPException(status_code=404, detail=f"Service not found: {service_name}")
-    
     try:
-        # Write the new config
-        service_path.write_text(data.config)
-        
-        # Reload systemd daemon
-        subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=30)
-        
-        return ServiceActionResponse(
-            success=True,
-            message=f"Configuration updated for {service_name}. Restart the service to apply changes.",
-            service=service_name
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error updating config: {e}")
+        service_name, service_path = _resolve_unit(name)
+    except (ValidationError, SecurityError) as exc:
+        raise _bad_request(exc) from exc
+
+    if not service_path.is_file():
+        raise HTTPException(status_code=404, detail=f"Service not found: {service_name}")
+
+    # Through the manager, never straight to disk. The manager is where unit
+    # ownership is checked, and writing here would let the panel rewrite any
+    # unit in /etc/systemd/system, which is the exact hole the ownership guard
+    # exists to close.
+    try:
+        ServiceManager(verbose=False).update_config(service_name, data.config)
+    except (ValidationError, SecurityError) as exc:
+        raise _bad_request(exc) from exc
+    except ServiceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    return ServiceActionResponse(
+        success=True,
+        message=f"Configuration updated for {service_name}. Restart the service to apply changes.",
+        service=service_name,
+    )
 
 
 @router.post("", response_model=ServiceActionResponse)
-async def create_service(
-    data: CreateServiceRequest,
-    request: Request,
-    session: dict = Depends(get_current_session)
+def create_service(
+    data: CreateServiceRequest, request: Request, session: dict = Depends(get_current_session)
 ):
     """
     Create a new systemd service.
     """
-    from pathlib import Path
-
-    # New services don't use wasm- prefix
-    service_name = data.name
-    service_path = Path(f"/etc/systemd/system/{service_name}.service")
-    
-    if service_path.exists():
-        raise HTTPException(status_code=400, detail=f"Service already exists: {service_name}")
-    
-    # Use raw content if provided (advanced mode)
-    if data.raw_content:
-        service_content = data.raw_content
-    else:
-        # Validate command is provided in simple mode
-        if not data.command:
-            raise HTTPException(status_code=400, detail="Command is required in simple mode")
-        
-        # Build environment section
-        env_section = ""
-        if data.environment:
-            env_lines = [f"Environment=\"{k}={v}\"" for k, v in data.environment.items()]
-            env_section = "\n".join(env_lines) + "\n"
-        
-        # Create service file
-        service_content = f"""[Unit]
-Description=WASM Service: {data.name}
-After=network.target
-
-[Service]
-Type=simple
-User={data.user}
-WorkingDirectory={data.working_directory}
-ExecStart={data.command}
-Restart={data.restart}
-RestartSec=5
-{env_section}
-[Install]
-WantedBy=multi-user.target
-"""
-    
+    # Creation goes through the manager so that the name, the environment and
+    # the ownership rules are enforced in one place. Writing the file here,
+    # which is what this endpoint used to do, meant raw_content could put any
+    # content into any unit path as root while the manager's guard looked on.
+    service_manager = ServiceManager(verbose=False)
     try:
-        service_path.write_text(service_content)
-        
-        # Reload systemd
-        subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=30)
-        
-        # Enable the service
-        subprocess.run(
-            ["systemctl", "enable", service_name],
-            capture_output=True,
-            timeout=30
-        )
-        
-        return ServiceActionResponse(
-            success=True,
-            message=f"Service created: {service_name}",
-            service=service_name
-        )
-    except Exception as e:
-        # Clean up on failure
-        if service_path.exists():
-            service_path.unlink()
-        raise HTTPException(status_code=500, detail=f"Failed to create service: {e}")
+        service_name = validate_service_name(data.name).removesuffix(".service")
+        if data.raw_content is not None:
+            service_manager.create_from_unit(service_name, data.raw_content)
+        else:
+            if data.restart not in VALID_RESTART_POLICIES:
+                raise ValidationError(
+                    f"Invalid restart policy: {data.restart!r}",
+                    details=f"Use one of: {', '.join(sorted(VALID_RESTART_POLICIES))}.",
+                )
+            service_manager.create_service(
+                name=service_name,
+                command=data.command or "",
+                working_directory=data.working_directory,
+                user=data.user,
+                environment=data.environment or {},
+                restart=data.restart,
+            )
+    except (ValidationError, SecurityError) as exc:
+        raise _bad_request(exc) from exc
+    except ServiceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    service_manager.enable(service_name)
+
+    return ServiceActionResponse(
+        success=True, message=f"Service created: {service_name}", service=service_name
+    )
 
 
 @router.delete("/{name}", response_model=ServiceActionResponse)
-async def delete_service(
-    name: str,
-    request: Request,
-    session: dict = Depends(get_current_session)
-):
+def delete_service(name: str, request: Request, session: dict = Depends(get_current_session)):
     """
     Delete a systemd service.
     """
-    from pathlib import Path
-    from wasm.managers.service_manager import ServiceManager
+    try:
+        service_name, service_path = _resolve_unit(name)
+    except (ValidationError, SecurityError) as exc:
+        raise _bad_request(exc) from exc
+
+    if not service_path.is_file():
+        raise HTTPException(status_code=404, detail=f"Service not found: {service_name}")
 
     service_manager = ServiceManager(verbose=False)
-    service_name = service_manager._resolve_service_name(name)
-    service_path = Path(f"/etc/systemd/system/{service_name}.service")
-    
-    if not service_path.exists():
-        raise HTTPException(status_code=404, detail=f"Service not found: {service_name}")
-    
+    service_manager.stop(service_name)
+    service_manager.disable(service_name)
+
     try:
-        # Stop the service
-        subprocess.run(
-            ["systemctl", "stop", service_name],
-            capture_output=True,
-            timeout=30
-        )
-        
-        # Disable the service
-        subprocess.run(
-            ["systemctl", "disable", service_name],
-            capture_output=True,
-            timeout=30
-        )
-        
-        # Remove the service file
         service_path.unlink()
-        
-        # Reload systemd
-        subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=30)
-        
-        return ServiceActionResponse(
-            success=True,
-            message=f"Service deleted: {service_name}",
-            service=service_name
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to delete service: {e}")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to delete service: {exc}") from exc
+
+    service_manager.daemon_reload()
+
+    return ServiceActionResponse(
+        success=True, message=f"Service deleted: {service_name}", service=service_name
+    )

@@ -1,0 +1,41 @@
+{#
+  Backups.
+
+  A backup is only worth anything at the moment someone is frightened, so the
+  three facts that decide whether this is the right archive are in the row
+  itself: when it was taken, how big it is, and what is inside it. Nothing has
+  to be opened to choose.
+
+  Restoring is the most destructive thing this panel can do. Its question names
+  the archive, names the domain it lands on, and says in plain words that what
+  is deployed there now is overwritten.
+#}
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+
+{% block title %}Backups{% endblock %}
+
+{% block content %}
+
+{{ m.page_head("Backups", storage.summary if rows else none) }}
+
+{% if rows %}
+  <div class="rows">
+    {% for backup in rows %}
+      {% call m.row(backup.domain, backup.state, backup.meta, none,
+                    "row-" ~ backup.id, backup.note) %}
+        {{ m.action_button("Restore", backup.restore_endpoint, backup.restore_question) }}
+        {{ m.danger_button("Delete", backup.delete_endpoint, backup.id,
+                           "The archive is removed from disk and cannot be recovered.",
+                           backup.delete_question) }}
+      {% endcall %}
+    {% endfor %}
+  </div>
+{% else %}
+  {{ m.empty(
+      "No backups yet",
+      "A backup is a single archive holding the application files, its environment and, when you ask for them, its databases and volumes.",
+      command="wasm backup create -d example.com") }}
+{% endif %}
+
+{% endblock %}

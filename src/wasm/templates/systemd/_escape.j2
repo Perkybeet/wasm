@@ -1,0 +1,15 @@
+{#
+  Escaping macros for systemd unit files.
+
+  Rendering is the last line of defence: wasm.validators.environment rejects
+  control characters at the boundary, but any caller reaching a template
+  directly must still be unable to append directives to a unit. See that
+  module's docstring for the rules these macros implement.
+#}
+{%- macro line(value) -%}
+{{ value | string | replace('\n', ' ') | replace('\r', ' ') | replace('\x00', '') }}
+{%- endmacro -%}
+
+{%- macro env_value(value) -%}
+{{ value | string | replace('\\', '\\\\') | replace('"', '\\"') | replace('%', '%%') | replace('\n', ' ') | replace('\r', ' ') | replace('\x00', '') }}
+{%- endmacro -%}

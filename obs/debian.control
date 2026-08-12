@@ -21,16 +21,19 @@ Depends: ${python3:Depends},
          python3-pip,
          python3-yaml,
          python3-jinja2,
+         python3-click,
+         python3-questionary,
+         python3-rich,
          nginx | apache2,
          certbot
-Recommends: python3-inquirer,
-            python3-fastapi,
+# python3-inquirer does not exist in Debian or Ubuntu, so the interactive mode
+# it gated never worked on those distributions. Prompts use questionary and
+# rich, both of which are packaged everywhere WASM builds.
+Recommends: python3-fastapi,
+            python3-starlette,
+            python3-pydantic,
             python3-uvicorn,
-            python3-jose,
-            python3-passlib,
-            python3-bcrypt,
-            python3-psutil,
-            python3-aiofiles
+            python3-psutil
 Suggests: git,
           nodejs,
           npm

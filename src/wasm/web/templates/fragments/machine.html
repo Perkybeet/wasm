@@ -1,0 +1,44 @@
+{#
+  The machine strip. Rendered on its own so htmx can refresh just this element
+  without touching the rest of the page.
+
+  Everything here is set in mono with tabular figures, so a number changing
+  does not make the row jump.
+#}
+{% import "_macros.html" as m %}
+
+<header class="machine" id="machine-strip"
+        hx-get="/fragments/machine" hx-trigger="every 5s" hx-swap="outerHTML"
+        aria-label="Machine status">
+
+  <span class="machine__host" title="{{ machine.os }}">{{ machine.hostname }}</span>
+
+  {{ m.stat("up", machine.uptime) }}
+
+  <span class="machine__metric" title="Load average over 1, 5 and 15 minutes">
+    <span class="label">load</span>
+    <span class="num">{{ "%.2f" | format(machine.load[0]) }}</span>
+    {# A sparkline shows the shape of the last few minutes, which a single
+       number cannot. #}
+    <svg class="machine__spark" viewBox="0 0 80 18" preserveAspectRatio="none"
+         role="img" aria-label="Load over the last few minutes">
+      <polyline fill="none" stroke="currentColor" stroke-width="1.2"
+                points="{{ machine.load_history_points }}"/>
+    </svg>
+  </span>
+
+  {{ m.capacity("mem", machine.memory_used, machine.memory_total,
+                machine.memory_used_human, machine.memory_total_human) }}
+  {{ m.capacity("disk", machine.disk_used, machine.disk_total,
+                machine.disk_used_human, machine.disk_total_human) }}
+
+  <span class="machine__tally">
+    {% if machine.units_failed %}
+      <span class="badge badge--failed">{{ machine.units_failed }} failed</span>
+    {% endif %}
+    {% if machine.units_busy %}
+      <span class="badge badge--busy">{{ machine.units_busy }} working</span>
+    {% endif %}
+    <span class="badge badge--active">{{ machine.units_active }} running</span>
+  </span>
+</header>

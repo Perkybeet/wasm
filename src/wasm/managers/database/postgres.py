@@ -3,317 +3,361 @@
 # https://github.com/Perkybeet/wasm/blob/main/LICENSE
 
 """
-PostgreSQL database manager for WASM.
+PostgreSQL manager.
+
+Statements are fed to ``psql`` on stdin, never with ``-c``: a CREATE ROLE
+carries a password, and everything in argv is visible in ``ps``. Dumps are
+streamed to disk by the runner, so a dump containing quotes or binary bytes
+arrives intact.
 """
 
-import re
-from datetime import datetime
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Dict, List, Optional
 
 from wasm.core.exceptions import (
-    DatabaseError,
-    DatabaseNotFoundError,
-    DatabaseExistsError,
-    DatabaseUserError,
-    DatabaseEngineError,
     DatabaseBackupError,
+    DatabaseError,
+    DatabaseExistsError,
+    DatabaseNotFoundError,
     DatabaseQueryError,
+    DatabaseUserError,
 )
 from wasm.managers.database.base import (
+    QUERY_TIMEOUT,
+    TRANSFER_TIMEOUT,
+    BackupInfo,
     BaseDatabaseManager,
     DatabaseInfo,
     UserInfo,
-    BackupInfo,
+    format_size,
+    quote_identifier,
+    validate_name,
 )
 from wasm.managers.database.registry import DatabaseRegistry
 
+#: Privileges PostgreSQL accepts on a DATABASE object.
+DATABASE_PRIVILEGES = frozenset(
+    {
+        "ALL",
+        "ALL PRIVILEGES",
+        "CONNECT",
+        "CREATE",
+        "TEMP",
+        "TEMPORARY",
+    }
+)
+
+#: Privileges PostgreSQL accepts on a TABLE object.
+TABLE_PRIVILEGES = frozenset(
+    {
+        "ALL",
+        "ALL PRIVILEGES",
+        "DELETE",
+        "INSERT",
+        "MAINTAIN",
+        "REFERENCES",
+        "SELECT",
+        "TRIGGER",
+        "TRUNCATE",
+        "UPDATE",
+    }
+)
+
+#: pg_dump output formats that can be streamed to stdout. "directory" cannot.
+DUMP_FORMATS = frozenset({"plain", "custom", "tar"})
+
 
 class PostgresManager(BaseDatabaseManager):
-    """
-    Manager for PostgreSQL databases.
-    """
-    
+    """Manager for PostgreSQL databases."""
+
     ENGINE_NAME = "postgresql"
     DISPLAY_NAME = "PostgreSQL"
     DEFAULT_PORT = 5432
     SERVICE_NAME = "postgresql"
-    PACKAGE_NAMES = ["postgresql", "postgresql-contrib"]
-    
-    # System databases to exclude from listings
-    SYSTEM_DATABASES = {
-        "postgres",
-        "template0",
-        "template1",
-    }
-    
-    def __init__(self, verbose: bool = False):
-        """Initialize PostgreSQL manager."""
-        super().__init__(verbose=verbose)
+    PACKAGE_NAMES = ("postgresql", "postgresql-contrib")
+    CLIENT_BINARY = "psql"
+    VERSION_ARGV = ("psql", "--version")
+    VERSION_PATTERN = r"(\d+\.\d+)"
+    PURGE_PATHS = ("/var/lib/postgresql", "/etc/postgresql")
+    MAX_DATABASE_NAME_LENGTH = 63
+    MAX_USER_NAME_LENGTH = 63
+    VALID_PRIVILEGES = DATABASE_PRIVILEGES | TABLE_PRIVILEGES
+    DEFAULT_PRIVILEGES = ("ALL PRIVILEGES",)
 
-    # ==================== SQL Escaping (Security) ====================
+    #: The account that owns the cluster and can authenticate by peer.
+    SUPERUSER = "postgres"
+
+    #: Databases that belong to the cluster, not to a user.
+    SYSTEM_DATABASES = frozenset({"postgres", "template0", "template1"})
+
+    # ==================== SQL text ====================
 
     @staticmethod
     def _escape_identifier(value: str) -> str:
         """
-        Escape a SQL identifier (database name, username, etc.) for PostgreSQL.
+        Quote an identifier the way PostgreSQL does.
 
-        Uses double quotes and escapes any double quotes in the value.
-        This prevents SQL injection in identifiers.
+        Args:
+            value: Raw identifier.
+
+        Returns:
+            The identifier in double quotes, with embedded double quotes doubled.
         """
-        return '"' + value.replace('"', '""') + '"'
+        return quote_identifier(value, '"')
 
     @staticmethod
     def _escape_literal(value: str) -> str:
         """
-        Escape a SQL string literal for PostgreSQL.
+        Quote a string literal the way PostgreSQL does.
 
-        Escapes single quotes by doubling them and backslashes.
-        This prevents SQL injection in string values.
+        Args:
+            value: Raw string.
+
+        Returns:
+            The value in single quotes, with embedded single quotes doubled.
         """
         return "'" + value.replace("'", "''") + "'"
 
-    def is_installed(self) -> bool:
-        """Check if PostgreSQL is installed."""
-        result = self._run(["which", "psql"])
-        return result.success
-    
-    def get_version(self) -> Optional[str]:
-        """Get PostgreSQL version."""
-        result = self._run(["psql", "--version"])
-        if result.success:
-            match = re.search(r"(\d+\.\d+)", result.stdout)
-            if match:
-                return match.group(1)
-        return None
-    
-    def install(self) -> bool:
-        """Install PostgreSQL."""
-        self.logger.info(f"Installing {self.DISPLAY_NAME}...")
-        
-        # Update package list
-        result = self._run_sudo(["apt-get", "update"])
-        if not result.success:
-            raise DatabaseEngineError("Failed to update package list", result.stderr)
-        
-        # Install PostgreSQL
-        result = self._run_sudo([
-            "apt-get", "install", "-y",
-            *self.PACKAGE_NAMES,
-        ])
-        
-        if not result.success:
-            raise DatabaseEngineError(
-                f"Failed to install {self.DISPLAY_NAME}",
-                result.stderr
-            )
-        
-        # Enable and start service
-        self.enable()
-        self.start()
-        
-        return True
-    
-    def uninstall(self, purge: bool = False) -> bool:
-        """Uninstall PostgreSQL."""
-        self.logger.info(f"Uninstalling {self.DISPLAY_NAME}...")
-        
-        # Stop service
-        try:
-            self.stop()
-        except Exception as e:
-            self.logger.warning(f"Could not stop service during uninstall: {e}")
-        
-        action = "purge" if purge else "remove"
-        
-        result = self._run_sudo([
-            "apt-get", action, "-y",
-            *self.PACKAGE_NAMES,
-        ])
-        
-        if purge:
-            # Remove data directory
-            self._run_sudo(["rm", "-rf", "/var/lib/postgresql"])
-            self._run_sudo(["rm", "-rf", "/etc/postgresql"])
-        
-        return True
-    
+    def _psql_argv(self, database: str, *tail: str) -> list[str]:
+        """
+        Build a psql invocation that fails loudly and prints only data.
+
+        Args:
+            database: Database to connect to.
+            *tail: Arguments describing where the SQL comes from.
+
+        Returns:
+            The argument vector.
+        """
+        return [
+            "sudo",
+            "-u",
+            self.SUPERUSER,
+            "psql",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-d",
+            database,
+            "-t",
+            "-A",
+            *tail,
+        ]
+
     def _execute_sql(
         self,
         sql: str,
         database: str = "postgres",
-        return_output: bool = True,
+        *,
+        secrets: Sequence[str] = (),
+        timeout: int = QUERY_TIMEOUT,
+        env: Mapping[str, str] | None = None,
     ) -> tuple[bool, str]:
         """
-        Execute SQL command as postgres user.
-        
+        Run SQL as the cluster superuser, passing the statement on stdin.
+
         Args:
-            sql: SQL command.
-            database: Database to use.
-            return_output: Return query output.
-            
+            sql: The statement.
+            database: Database to connect to.
+            secrets: Values the statement carries that must not be logged.
+            timeout: Deadline in seconds.
+            env: Extra environment for psql, such as PGOPTIONS.
+
         Returns:
-            Tuple of (success, output).
+            Whether psql succeeded, and its output or its error text.
         """
-        cmd = [
-            "sudo", "-u", "postgres",
-            "psql", "-d", database,
-            "-t", "-A", "-c", sql
-        ]
-        
-        result = self._run(cmd)
+        result = self._exec(
+            self._psql_argv(database, "-f", "-"),
+            input=sql,
+            timeout=timeout,
+            secrets=secrets,
+            env=env,
+        )
         return result.success, result.stdout if result.success else result.stderr
-    
+
     # ==================== Database Management ====================
-    
+
     def create_database(
         self,
         name: str,
-        owner: Optional[str] = None,
-        encoding: Optional[str] = None,
+        owner: str | None = None,
+        encoding: str | None = None,
         **kwargs,
     ) -> DatabaseInfo:
-        """Create a new PostgreSQL database."""
+        """
+        Create a database.
+
+        Args:
+            name: Database name.
+            owner: Role that owns the database.
+            encoding: Character encoding, UTF8 by default.
+            **kwargs: Accepts ``template``.
+
+        Returns:
+            Information about the new database.
+
+        Raises:
+            DatabaseExistsError: When the database already exists.
+            DatabaseError: When the name is invalid or creation fails.
+        """
+        self.validate_database_name(name)
         if self.database_exists(name):
-            raise DatabaseExistsError(f"Database '{name}' already exists")
+            raise DatabaseExistsError(
+                f"Database '{name}' already exists",
+                details="Drop it first, or pick another name.",
+            )
 
         encoding = encoding or "UTF8"
         template = kwargs.get("template", "template0")
 
-        # Use escaped identifier to prevent SQL injection
-        safe_name = self._escape_identifier(name)
-        sql = f"CREATE DATABASE {safe_name} ENCODING '{encoding}' TEMPLATE {template}"
-
+        sql = (
+            f"CREATE DATABASE {self._escape_identifier(name)} "
+            f"ENCODING {self._escape_literal(encoding)} "
+            f"TEMPLATE {self._escape_identifier(template)}"
+        )
         if owner:
-            safe_owner = self._escape_identifier(owner)
-            sql += f" OWNER {safe_owner}"
-
+            self.validate_user_name(owner)
+            sql += f" OWNER {self._escape_identifier(owner)}"
         sql += ";"
-        
+
         success, output = self._execute_sql(sql)
-        
         if not success:
-            raise DatabaseError(f"Failed to create database '{name}'", output)
-        
+            raise DatabaseError(f"Failed to create database '{name}'", details=output.strip())
+
         self.logger.info(f"Created database: {name}")
         return self.get_database_info(name)
-    
-    def drop_database(self, name: str, force: bool = False) -> bool:
-        """Drop a PostgreSQL database."""
+
+    def drop_database(self, name: str, force: bool = False) -> None:
+        """
+        Drop a database.
+
+        Args:
+            name: Database name.
+            force: Terminate open connections first, and accept a missing
+                database as success.
+
+        Raises:
+            DatabaseNotFoundError: When the database does not exist.
+            DatabaseError: When the drop fails.
+        """
+        self.validate_database_name(name)
         if not self.database_exists(name):
             if force:
-                return True
-            raise DatabaseNotFoundError(f"Database '{name}' does not exist")
-
-        # Use escaped values to prevent SQL injection
-        safe_name_literal = self._escape_literal(name)
-        safe_name_ident = self._escape_identifier(name)
-
-        # Terminate existing connections if force
-        if force:
-            self._execute_sql(
-                f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = {safe_name_literal};"
+                return
+            raise DatabaseNotFoundError(
+                f"Database '{name}' does not exist",
+                details="Run 'wasm db list --engine postgresql' to see the databases.",
             )
 
-        sql = f"DROP DATABASE {safe_name_ident};"
-        success, output = self._execute_sql(sql)
-        
+        if force:
+            self._execute_sql(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "  # noqa: S608 - quoted literal, not interpolated data
+                f"WHERE datname = {self._escape_literal(name)};"
+            )
+
+        success, output = self._execute_sql(f"DROP DATABASE {self._escape_identifier(name)};")
         if not success:
-            raise DatabaseError(f"Failed to drop database '{name}'", output)
-        
+            raise DatabaseError(
+                f"Failed to drop database '{name}'",
+                details=output.strip() or "Retry with --force to close open connections.",
+            )
+
         self.logger.info(f"Dropped database: {name}")
-        return True
-    
+
     def database_exists(self, name: str) -> bool:
-        """Check if a database exists."""
-        # Use escaped literal to prevent SQL injection
-        safe_name = self._escape_literal(name)
-        sql = f"SELECT 1 FROM pg_database WHERE datname = {safe_name};"
-        success, output = self._execute_sql(sql)
-        return success and "1" in output
-    
-    def list_databases(self) -> List[DatabaseInfo]:
-        """List all databases."""
-        sql = """
-            SELECT datname, pg_encoding_to_char(encoding), pg_database_size(datname)
-            FROM pg_database WHERE datistemplate = false;
         """
-        success, output = self._execute_sql(sql)
-        
+        Report whether a database exists.
+
+        Args:
+            name: Database name.
+
+        Returns:
+            True when pg_database holds the name.
+        """
+        success, output = self._execute_sql(
+            f"SELECT 1 FROM pg_database WHERE datname = {self._escape_literal(name)};"  # noqa: S608 - quoted literal, not interpolated data
+        )
+        return success and output.strip() == "1"
+
+    def list_databases(self) -> list[DatabaseInfo]:
+        """
+        List the databases that do not belong to the cluster itself.
+
+        Returns:
+            One entry per user database.
+        """
+        success, output = self._execute_sql(
+            "SELECT datname, pg_encoding_to_char(encoding), pg_database_size(datname) "
+            "FROM pg_database WHERE datistemplate = false;"
+        )
         if not success:
             return []
-        
+
         databases = []
-        for line in output.strip().split("\n"):
+        for line in output.strip().splitlines():
             if not line:
                 continue
             parts = line.split("|")
-            if len(parts) >= 1:
-                name = parts[0]
-                if name in self.SYSTEM_DATABASES:
-                    continue
-                
-                size = None
-                if len(parts) >= 3:
-                    try:
-                        size = self._format_size(int(parts[2]))
-                    except (ValueError, TypeError):
-                        pass
-                
-                databases.append(DatabaseInfo(
+            name = parts[0]
+            if name in self.SYSTEM_DATABASES:
+                continue
+
+            size = None
+            if len(parts) >= 3 and parts[2].isdigit():
+                size = format_size(int(parts[2]))
+
+            databases.append(
+                DatabaseInfo(
                     name=name,
                     engine=self.ENGINE_NAME,
                     encoding=parts[1] if len(parts) > 1 else None,
                     size=size,
-                ))
-        
+                )
+            )
         return databases
-    
+
     def get_database_info(self, name: str) -> DatabaseInfo:
-        """Get detailed database information."""
+        """
+        Describe one database.
+
+        Args:
+            name: Database name.
+
+        Returns:
+            Size, owner, encoding and table count.
+
+        Raises:
+            DatabaseNotFoundError: When the database does not exist.
+        """
         if not self.database_exists(name):
             raise DatabaseNotFoundError(f"Database '{name}' does not exist")
 
-        # Use escaped literal to prevent SQL injection
-        safe_name = self._escape_literal(name)
+        literal = self._escape_literal(name)
+        success, output = self._execute_sql(
+            "SELECT datname, pg_encoding_to_char(encoding), pg_database_size(datname), r.rolname "  # noqa: S608 - quoted literal, not interpolated data
+            "FROM pg_database d JOIN pg_roles r ON d.datdba = r.oid "
+            f"WHERE datname = {literal};"
+        )
 
-        # Get database info
-        sql = f"""
-            SELECT
-                datname,
-                pg_encoding_to_char(encoding),
-                pg_database_size({safe_name}),
-                r.rolname as owner
-            FROM pg_database d
-            JOIN pg_roles r ON d.datdba = r.oid
-            WHERE datname = {safe_name};
-        """
-        success, output = self._execute_sql(sql)
-
-        encoding = None
-        size = None
-        owner = None
-
+        encoding: str | None = None
+        size: str | None = None
+        owner: str | None = None
         if success and output.strip():
             parts = output.strip().split("|")
             if len(parts) >= 4:
                 encoding = parts[1]
-                try:
-                    size = self._format_size(int(parts[2]))
-                except (ValueError, TypeError):
-                    pass
+                if parts[2].isdigit():
+                    size = format_size(int(parts[2]))
                 owner = parts[3]
 
-        # Get table count
-        sql = f"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_catalog = {safe_name};"
-        success, output = self._execute_sql(sql, database=name)
-        tables = 0
-        if success:
-            try:
-                tables = int(output.strip())
-            except (ValueError, TypeError):
-                pass
-        
+        success, output = self._execute_sql(
+            "SELECT COUNT(*) FROM information_schema.tables "  # noqa: S608 - quoted literal, not interpolated data
+            f"WHERE table_schema = 'public' AND table_catalog = {literal};",
+            database=name,
+        )
+        tables = int(output.strip()) if success and output.strip().isdigit() else 0
+
         return DatabaseInfo(
             name=name,
             engine=self.ENGINE_NAME,
@@ -322,32 +366,40 @@ class PostgresManager(BaseDatabaseManager):
             owner=owner,
             encoding=encoding,
         )
-    
-    @staticmethod
-    def _format_size(size: int) -> str:
-        """Format size in human readable format."""
-        for unit in ["B", "KB", "MB", "GB", "TB"]:
-            if size < 1024:
-                return f"{size:.1f} {unit}"
-            size /= 1024
-        return f"{size:.1f} PB"
-    
+
     # ==================== User Management ====================
-    
+
     def create_user(
         self,
         username: str,
-        password: Optional[str] = None,
+        password: str | None = None,
         host: str = "localhost",
         **kwargs,
     ) -> tuple[UserInfo, str]:
-        """Create a new PostgreSQL user (role)."""
+        """
+        Create a login role.
+
+        Args:
+            username: Role name.
+            password: Password. Generated when omitted.
+            host: Ignored; PostgreSQL restricts hosts in pg_hba.conf.
+            **kwargs: Accepts ``superuser``, ``createdb`` and ``createrole``.
+
+        Returns:
+            The role and its password.
+
+        Raises:
+            DatabaseUserError: When the role exists or creation fails.
+        """
+        self.validate_user_name(username)
         if self.user_exists(username):
-            raise DatabaseUserError(f"User '{username}' already exists")
+            raise DatabaseUserError(
+                f"User '{username}' already exists",
+                details="Drop the role first, or pick another name.",
+            )
 
         password = password or self.generate_password()
 
-        # Build CREATE ROLE command
         options = ["LOGIN"]
         if kwargs.get("superuser"):
             options.append("SUPERUSER")
@@ -356,337 +408,392 @@ class PostgresManager(BaseDatabaseManager):
         if kwargs.get("createrole"):
             options.append("CREATEROLE")
 
-        # Use escaped values to prevent SQL injection
-        safe_username = self._escape_identifier(username)
-        safe_password = self._escape_literal(password)
-        sql = f"CREATE ROLE {safe_username} WITH {' '.join(options)} PASSWORD {safe_password};"
-        success, output = self._execute_sql(sql)
-        
-        if not success:
-            raise DatabaseUserError(f"Failed to create user '{username}'", output)
-        
-        self.logger.info(f"Created user: {username}")
-        
-        user_info = UserInfo(
-            username=username,
-            engine=self.ENGINE_NAME,
-            host=host,
+        sql = (
+            f"CREATE ROLE {self._escape_identifier(username)} WITH {' '.join(options)} "
+            f"PASSWORD {self._escape_literal(password)};"
         )
-        
-        return user_info, password
-    
-    def drop_user(self, username: str, host: str = "localhost") -> bool:
-        """Drop a PostgreSQL user (role)."""
-        if not self.user_exists(username):
-            raise DatabaseUserError(f"User '{username}' does not exist")
-
-        # Use escaped identifier to prevent SQL injection
-        safe_username = self._escape_identifier(username)
-        sql = f"DROP ROLE {safe_username};"
-        success, output = self._execute_sql(sql)
-        
+        success, output = self._execute_sql(sql, secrets=(password,))
         if not success:
-            raise DatabaseUserError(f"Failed to drop user '{username}'", output)
-        
-        self.logger.info(f"Dropped user: {username}")
-        return True
-    
-    def user_exists(self, username: str, host: str = "localhost") -> bool:
-        """Check if a user exists."""
-        # Use escaped literal to prevent SQL injection
-        safe_username = self._escape_literal(username)
-        sql = f"SELECT 1 FROM pg_roles WHERE rolname = {safe_username};"
-        success, output = self._execute_sql(sql)
-        return success and "1" in output
-    
-    def list_users(self) -> List[UserInfo]:
-        """List all PostgreSQL users."""
-        sql = """
-            SELECT rolname, rolsuper, rolcreatedb, rolcreaterole
-            FROM pg_roles 
-            WHERE rolname NOT LIKE 'pg_%' 
-            ORDER BY rolname;
+            raise DatabaseUserError(f"Failed to create user '{username}'", details=output.strip())
+
+        self.logger.info(f"Created user: {username}")
+        return UserInfo(username=username, engine=self.ENGINE_NAME, host=host), password
+
+    def drop_user(self, username: str, host: str = "localhost") -> None:
         """
-        success, output = self._execute_sql(sql)
-        
+        Drop a role.
+
+        Args:
+            username: Role name.
+            host: Ignored; PostgreSQL restricts hosts in pg_hba.conf.
+
+        Raises:
+            DatabaseUserError: When the role is missing or still owns objects.
+        """
+        self.validate_user_name(username)
+        if not self.user_exists(username):
+            raise DatabaseUserError(
+                f"User '{username}' does not exist",
+                details="Run 'wasm db users --engine postgresql' to see the roles.",
+            )
+
+        success, output = self._execute_sql(f"DROP ROLE {self._escape_identifier(username)};")
+        if not success:
+            raise DatabaseUserError(
+                f"Failed to drop user '{username}'",
+                details=(
+                    output.strip()
+                    or "The role may still own objects; reassign them with REASSIGN OWNED."
+                ),
+            )
+
+        self.logger.info(f"Dropped user: {username}")
+
+    def user_exists(self, username: str, host: str = "localhost") -> bool:
+        """
+        Report whether a role exists.
+
+        Args:
+            username: Role name.
+            host: Ignored; PostgreSQL restricts hosts in pg_hba.conf.
+
+        Returns:
+            True when pg_roles holds the name.
+        """
+        success, output = self._execute_sql(
+            f"SELECT 1 FROM pg_roles WHERE rolname = {self._escape_literal(username)};"  # noqa: S608 - quoted literal, not interpolated data
+        )
+        return success and output.strip() == "1"
+
+    def list_users(self) -> list[UserInfo]:
+        """
+        List the roles that are not internal to PostgreSQL.
+
+        Returns:
+            One entry per role, with its cluster-wide attributes.
+        """
+        success, output = self._execute_sql(
+            "SELECT rolname, rolsuper, rolcreatedb, rolcreaterole FROM pg_roles "
+            "WHERE rolname NOT LIKE 'pg\\_%' ORDER BY rolname;"
+        )
         if not success:
             return []
-        
+
         users = []
-        for line in output.strip().split("\n"):
+        for line in output.strip().splitlines():
             if not line:
                 continue
             parts = line.split("|")
-            if len(parts) >= 1:
-                username = parts[0]
-                privileges = []
-                if len(parts) >= 2 and parts[1] == "t":
-                    privileges.append("SUPERUSER")
-                if len(parts) >= 3 and parts[2] == "t":
-                    privileges.append("CREATEDB")
-                if len(parts) >= 4 and parts[3] == "t":
-                    privileges.append("CREATEROLE")
-                
-                users.append(UserInfo(
-                    username=username,
-                    engine=self.ENGINE_NAME,
-                    privileges=privileges,
-                ))
-        
+            attributes = []
+            for index, name in ((1, "SUPERUSER"), (2, "CREATEDB"), (3, "CREATEROLE")):
+                if len(parts) > index and parts[index] == "t":
+                    attributes.append(name)
+            users.append(
+                UserInfo(username=parts[0], engine=self.ENGINE_NAME, privileges=attributes)
+            )
         return users
-    
+
     def grant_privileges(
         self,
         username: str,
         database: str,
-        privileges: List[str] = None,
+        privileges: Sequence[str] | None = None,
         host: str = "localhost",
-    ) -> bool:
-        """Grant privileges to a user on a database."""
-        privs = ", ".join(privileges) if privileges else "ALL PRIVILEGES"
+    ) -> None:
+        """
+        Grant whitelisted privileges on a database and on its public schema.
 
-        # Use escaped identifiers to prevent SQL injection
-        safe_database = self._escape_identifier(database)
-        safe_username = self._escape_identifier(username)
+        A privilege is applied where PostgreSQL accepts it: CONNECT and CREATE
+        on the database, SELECT and friends on the tables.
 
-        sql = f"GRANT {privs} ON DATABASE {safe_database} TO {safe_username};"
-        success, output = self._execute_sql(sql)
+        Args:
+            username: Role name.
+            database: Database name.
+            privileges: Privileges to grant. ALL PRIVILEGES when omitted.
+            host: Ignored; PostgreSQL restricts hosts in pg_hba.conf.
 
-        if not success:
-            raise DatabaseUserError(f"Failed to grant privileges", output)
+        Raises:
+            DatabaseUserError: When a privilege is not whitelisted or the grant
+                fails.
+        """
+        self.validate_user_name(username)
+        self.validate_database_name(database)
+        granted = self.validate_privileges(privileges)
 
-        # Also grant on all tables in public schema
-        sql = f"GRANT {privs} ON ALL TABLES IN SCHEMA public TO {safe_username};"
-        self._execute_sql(sql, database=database)
-        
-        self.logger.info(f"Granted {privs} on {database} to {username}")
-        return True
-    
+        role = self._escape_identifier(username)
+        for statement, target_database in self._privilege_statements(
+            "GRANT", granted, database, role, "TO"
+        ):
+            success, output = self._execute_sql(statement, database=target_database)
+            if not success:
+                raise DatabaseUserError(
+                    f"Failed to grant privileges on '{database}' to '{username}'",
+                    details=output.strip(),
+                )
+
+        self.logger.info(f"Granted {', '.join(granted)} on {database} to {username}")
+
     def revoke_privileges(
         self,
         username: str,
         database: str,
-        privileges: List[str] = None,
+        privileges: Sequence[str] | None = None,
         host: str = "localhost",
-    ) -> bool:
-        """Revoke privileges from a user on a database."""
-        privs = ", ".join(privileges) if privileges else "ALL PRIVILEGES"
+    ) -> None:
+        """
+        Revoke whitelisted privileges on a database and on its public schema.
 
-        # Use escaped identifiers to prevent SQL injection
-        safe_database = self._escape_identifier(database)
-        safe_username = self._escape_identifier(username)
+        Args:
+            username: Role name.
+            database: Database name.
+            privileges: Privileges to revoke. ALL PRIVILEGES when omitted.
+            host: Ignored; PostgreSQL restricts hosts in pg_hba.conf.
 
-        sql = f"REVOKE {privs} ON DATABASE {safe_database} FROM {safe_username};"
-        success, output = self._execute_sql(sql)
-        
-        if not success:
-            raise DatabaseUserError(f"Failed to revoke privileges", output)
-        
-        self.logger.info(f"Revoked {privs} on {database} from {username}")
-        return True
-    
+        Raises:
+            DatabaseUserError: When a privilege is not whitelisted or the revoke
+                fails.
+        """
+        self.validate_user_name(username)
+        self.validate_database_name(database)
+        revoked = self.validate_privileges(privileges)
+
+        role = self._escape_identifier(username)
+        for statement, target_database in self._privilege_statements(
+            "REVOKE", revoked, database, role, "FROM"
+        ):
+            success, output = self._execute_sql(statement, database=target_database)
+            if not success:
+                raise DatabaseUserError(
+                    f"Failed to revoke privileges on '{database}' from '{username}'",
+                    details=output.strip(),
+                )
+
+        self.logger.info(f"Revoked {', '.join(revoked)} on {database} from {username}")
+
+    def _privilege_statements(
+        self,
+        verb: str,
+        privileges: Sequence[str],
+        database: str,
+        role: str,
+        preposition: str,
+    ) -> list[tuple[str, str]]:
+        """
+        Split privileges over the object types that accept them.
+
+        Args:
+            verb: ``GRANT`` or ``REVOKE``.
+            privileges: Already whitelisted privileges.
+            database: Database name.
+            role: Quoted role identifier.
+            preposition: ``TO`` for a grant, ``FROM`` for a revoke.
+
+        Returns:
+            Pairs of statement and the database it must run against.
+        """
+        statements = []
+        database_privileges = [p for p in privileges if p in DATABASE_PRIVILEGES]
+        table_privileges = [p for p in privileges if p in TABLE_PRIVILEGES]
+
+        if database_privileges:
+            statements.append(
+                (
+                    f"{verb} {', '.join(database_privileges)} ON DATABASE "
+                    f"{self._escape_identifier(database)} {preposition} {role};",
+                    "postgres",
+                )
+            )
+        if table_privileges:
+            statements.append(
+                (
+                    f"{verb} {', '.join(table_privileges)} ON ALL TABLES IN SCHEMA public "
+                    f"{preposition} {role};",
+                    database,
+                )
+            )
+        return statements
+
     # ==================== Backup & Restore ====================
-    
+
     def backup(
         self,
         database: str,
-        output_path: Optional[Path] = None,
+        output_path: Path | None = None,
         compress: bool = True,
         **kwargs,
     ) -> BackupInfo:
-        """Create a PostgreSQL database backup using pg_dump."""
+        """
+        Dump a database with pg_dump.
+
+        Args:
+            database: Database name.
+            output_path: Custom destination.
+            compress: Pipe the dump through gzip.
+            **kwargs: Accepts ``format`` (plain, custom or tar) and ``schemas``.
+
+        Returns:
+            Information about the backup.
+
+        Raises:
+            DatabaseNotFoundError: When the database does not exist.
+            DatabaseBackupError: When the dump fails.
+        """
+        self.validate_database_name(database)
         if not self.database_exists(database):
             raise DatabaseNotFoundError(f"Database '{database}' does not exist")
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{self.ENGINE_NAME}-{database}-{timestamp}.sql"
-        if compress:
-            filename += ".gz"
-        
-        backup_path = output_path or (self.BACKUP_DIR / filename)
-        
-        # Create backup directory if needed
-        self._run_sudo(["mkdir", "-p", str(backup_path.parent)])
-        
-        format_opt = kwargs.get("format", "plain")  # plain, custom, directory, tar
 
-        # Handle per-schema backup
         schemas = kwargs.get("schemas")
         if schemas:
-            results = []
-            for schema in schemas:
-                info = self.backup_schema(database, schema, compress=compress)
-                results.append(info)
-            # Return info for the last schema (caller should use backup_all_schemas for full results)
-            return results[-1] if results else self.backup_schema(database, schemas[0], compress=compress)
+            backups = [
+                self.backup_schema(database, schema, compress=compress) for schema in schemas
+            ]
+            return backups[-1]
 
-        if compress and format_opt == "plain":
-            # Pipe through gzip
-            full_cmd = f"sudo -u postgres pg_dump {database} | gzip > {backup_path}"
-            result = self._run(["bash", "-c", full_cmd])
-        else:
-            cmd = ["sudo", "-u", "postgres", "pg_dump", "-Fc" if format_opt == "custom" else "", database]
-            cmd = [c for c in cmd if c]  # Remove empty strings
-            result = self._run(cmd)
-            if result.success:
-                self._run_sudo(["bash", "-c", f"echo '{result.stdout}' > {backup_path}"])
-        
-        if not result.success:
-            raise DatabaseBackupError(f"Failed to backup database '{database}'", result.stderr)
-        
-        # Get file stats
-        stat_result = self._run(["stat", "-c", "%s", str(backup_path)])
-        size = int(stat_result.stdout.strip()) if stat_result.success else 0
-        
-        self.logger.info(f"Created backup: {backup_path}")
-        
-        return BackupInfo(
-            path=backup_path,
+        dump_format = kwargs.get("format", "plain")
+        if dump_format not in DUMP_FORMATS:
+            raise DatabaseBackupError(
+                f"Unsupported pg_dump format: {dump_format}",
+                details=f"Use one of: {', '.join(sorted(DUMP_FORMATS))}.",
+            )
+
+        destination = self._backup_path(database, output_path, compress)
+        return self._dump_to_file(
+            self._pg_dump_argv(database, dump_format),
+            destination,
             database=database,
-            engine=self.ENGINE_NAME,
-            size=size,
-            created=datetime.now(),
-            compressed=compress,
+            compress=compress,
         )
 
-    def list_schemas(self, database: str) -> List[str]:
+    def _pg_dump_argv(
+        self, database: str, dump_format: str, schema: str | None = None
+    ) -> list[str]:
         """
-        List non-system schemas in a database.
+        Build a pg_dump invocation that writes to stdout.
+
+        Args:
+            database: Database name.
+            dump_format: One of :data:`DUMP_FORMATS`.
+            schema: Restrict the dump to this schema.
+
+        Returns:
+            The argument vector.
+        """
+        argv = [
+            "sudo",
+            "-u",
+            self.SUPERUSER,
+            "pg_dump",
+            "--no-password",
+            f"--format={dump_format}",
+        ]
+        if schema is not None:
+            argv.append(f"--schema={schema}")
+        argv.append(database)
+        return argv
+
+    def list_schemas(self, database: str) -> list[str]:
+        """
+        List the schemas a database holds, excluding the system ones.
 
         Args:
             database: Database name.
 
         Returns:
-            List of schema names, excluding pg_* and information_schema.
+            Schema names, sorted.
 
         Raises:
-            DatabaseNotFoundError: If database does not exist.
+            DatabaseNotFoundError: When the database does not exist.
         """
         if not self.database_exists(database):
             raise DatabaseNotFoundError(f"Database '{database}' does not exist")
 
-        sql = (
+        success, output = self._execute_sql(
             "SELECT schema_name FROM information_schema.schemata "
-            "WHERE schema_name NOT LIKE 'pg_%' "
-            "AND schema_name != 'information_schema' "
-            "ORDER BY schema_name;"
+            "WHERE schema_name NOT LIKE 'pg\\_%' AND schema_name != 'information_schema' "
+            "ORDER BY schema_name;",
+            database=database,
         )
-        success, output = self._execute_sql(sql, database=database)
-
         if not success:
             return []
-
-        schemas = []
-        for line in output.strip().split("\n"):
-            line = line.strip()
-            if line:
-                schemas.append(line)
-        return schemas
+        return [line.strip() for line in output.strip().splitlines() if line.strip()]
 
     def backup_schema(
         self,
         database: str,
         schema: str,
-        output_path: Optional[Path] = None,
+        output_path: Path | None = None,
         compress: bool = True,
     ) -> BackupInfo:
         """
-        Backup a single schema from a PostgreSQL database.
+        Dump a single schema.
 
         Args:
             database: Database name.
-            schema: Schema name to backup.
-            output_path: Optional output path.
-            compress: Whether to compress the backup.
+            schema: Schema to dump.
+            output_path: Custom destination.
+            compress: Pipe the dump through gzip.
 
         Returns:
-            BackupInfo for the created backup.
+            Information about the backup.
 
         Raises:
-            DatabaseNotFoundError: If database does not exist.
-            DatabaseBackupError: If backup fails.
+            DatabaseNotFoundError: When the database does not exist.
+            DatabaseBackupError: When the dump fails.
         """
+        self.validate_database_name(database)
+        validate_name(schema, kind="schema", engine=self.DISPLAY_NAME, max_length=63)
         if not self.database_exists(database):
             raise DatabaseNotFoundError(f"Database '{database}' does not exist")
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{self.ENGINE_NAME}-{database}-{schema}-{timestamp}.sql"
-        if compress:
-            filename += ".gz"
-
-        backup_path = output_path or (self.BACKUP_DIR / filename)
-        self._run_sudo(["mkdir", "-p", str(backup_path.parent)])
-
-        if compress:
-            full_cmd = f"sudo -u postgres pg_dump --schema={schema} {database} | gzip > {backup_path}"
-            result = self._run(["bash", "-c", full_cmd])
-        else:
-            result = self._run([
-                "sudo", "-u", "postgres", "pg_dump",
-                f"--schema={schema}", database,
-                "-f", str(backup_path),
-            ])
-
-        if not result.success:
-            raise DatabaseBackupError(
-                f"Failed to backup schema '{schema}' from '{database}'",
-                result.stderr,
-            )
-
-        stat_result = self._run(["stat", "-c", "%s", str(backup_path)])
-        size = int(stat_result.stdout.strip()) if stat_result.success else 0
-
-        self.logger.info(f"Created schema backup: {backup_path}")
-
-        return BackupInfo(
-            path=backup_path,
-            database=f"{database}/{schema}",
-            engine=self.ENGINE_NAME,
-            size=size,
-            created=datetime.now(),
-            compressed=compress,
+        destination = self._backup_path(
+            database, output_path, compress, label=f"{database}-{schema}"
         )
+        info = self._dump_to_file(
+            self._pg_dump_argv(database, "plain", schema=schema),
+            destination,
+            database=database,
+            compress=compress,
+        )
+        info.database = f"{database}/{schema}"
+        return info
 
     def backup_all_schemas(
         self,
         database: str,
-        output_dir: Optional[Path] = None,
+        output_dir: Path | None = None,
         compress: bool = True,
-    ) -> List[BackupInfo]:
+    ) -> list[BackupInfo]:
         """
-        Backup all non-system schemas from a database individually.
+        Dump every non-system schema of a database into its own file.
 
         Args:
             database: Database name.
-            output_dir: Directory for backup files.
-            compress: Whether to compress backups.
+            output_dir: Directory for the backup files.
+            compress: Pipe each dump through gzip.
 
         Returns:
-            List of BackupInfo for each schema backup.
+            One entry per schema that was dumped.
 
         Raises:
-            DatabaseNotFoundError: If database does not exist.
+            DatabaseNotFoundError: When the database does not exist.
         """
         schemas = self.list_schemas(database)
         if not schemas:
             self.logger.info(f"No user schemas found in {database}")
             return []
 
-        backup_dir = output_dir or self.BACKUP_DIR
         backups = []
-
         for schema in schemas:
+            destination = None
+            if output_dir is not None:
+                base = self._backup_path(database, None, compress, label=f"{database}-{schema}")
+                destination = Path(output_dir) / base.name
             try:
-                backup = self.backup_schema(
-                    database=database,
-                    schema=schema,
-                    output_path=backup_dir / f"{self.ENGINE_NAME}-{database}-{schema}-{datetime.now().strftime('%Y%m%d_%H%M%S')}.sql{'gz' if compress else ''}",
-                    compress=compress,
+                backups.append(
+                    self.backup_schema(database, schema, output_path=destination, compress=compress)
                 )
-                backups.append(backup)
-            except DatabaseBackupError as e:
-                self.logger.warning(f"Failed to backup schema {schema}: {e}")
-
+            except DatabaseBackupError as exc:
+                self.logger.warning(f"Failed to backup schema {schema}: {exc}")
         return backups
 
     def restore(
@@ -695,52 +802,109 @@ class PostgresManager(BaseDatabaseManager):
         backup_path: Path,
         drop_existing: bool = False,
         **kwargs,
-    ) -> bool:
-        """Restore a PostgreSQL database from backup."""
+    ) -> None:
+        """
+        Restore a database from a plain or gzipped dump.
+
+        Args:
+            database: Target database name.
+            backup_path: Path to the backup file.
+            drop_existing: Drop and recreate the database first.
+            **kwargs: Accepts ``format`` (plain or custom).
+
+        Raises:
+            DatabaseBackupError: When the file is missing or the restore fails.
+        """
+        self.validate_database_name(database)
         backup_path = Path(backup_path)
-        
         if not backup_path.exists():
-            raise DatabaseBackupError(f"Backup file not found: {backup_path}")
-        
+            raise DatabaseBackupError(
+                f"Backup file not found: {backup_path}",
+                details="Run 'wasm db backups' to list the backups WASM knows about.",
+            )
+
         if drop_existing and self.database_exists(database):
             self.drop_database(database, force=True)
-        
-        # Create database if it doesn't exist
         if not self.database_exists(database):
             self.create_database(database)
-        
-        # Restore based on compression
-        if backup_path.suffix == ".gz":
-            full_cmd = f"gunzip < {backup_path} | sudo -u postgres psql {database}"
-            result = self._run(["bash", "-c", full_cmd])
-        else:
-            result = self._run(["sudo", "-u", "postgres", "psql", database, "-f", str(backup_path)])
-        
+
+        dump_format = kwargs.get("format", "plain")
+        staged_name = f"{self.ENGINE_NAME}-restore-{database}{self.BACKUP_SUFFIX}"
+
+        # psql and pg_restore open the file themselves, as the postgres account,
+        # so the 0600 root-owned backup has to be staged for that account first.
+        with self._staged_backup(backup_path, staged_name, owner=self.SUPERUSER) as staged:
+            if dump_format == "custom":
+                argv = [
+                    "sudo",
+                    "-u",
+                    self.SUPERUSER,
+                    "pg_restore",
+                    "--no-password",
+                    "-d",
+                    database,
+                    str(staged),
+                ]
+            else:
+                argv = self._psql_argv(database, "-f", str(staged))
+            result = self._exec(argv, timeout=TRANSFER_TIMEOUT)
+
         if not result.success:
-            raise DatabaseBackupError(f"Failed to restore database '{database}'", result.stderr)
-        
+            raise DatabaseBackupError(
+                f"Failed to restore database '{database}'",
+                details=result.stderr.strip() or "The dump may have been taken in another format.",
+            )
+
         self.logger.info(f"Restored database: {database} from {backup_path}")
-        return True
-    
+
     # ==================== Query Execution ====================
-    
+
     def execute_query(
         self,
         database: str,
         query: str,
+        *,
+        read_only: bool = False,
         **kwargs,
     ) -> tuple[bool, str]:
-        """Execute a SQL query."""
+        """
+        Run an arbitrary statement against a database.
+
+        Args:
+            database: Database name.
+            query: The statement.
+            read_only: Refuse anything that would change data. Enforcement is
+                the server's, not a keyword allowlist: PostgreSQL lets a
+                data-modifying CTE hide behind a leading ``WITH``, so
+                ``WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x`` reads
+                as a SELECT to any parser simple enough to be trustworthy.
+            **kwargs: Unused.
+
+        Returns:
+            Success and the statement's output.
+
+        Raises:
+            DatabaseNotFoundError: When the database does not exist.
+            DatabaseQueryError: When the statement fails.
+        """
         if not self.database_exists(database):
             raise DatabaseNotFoundError(f"Database '{database}' does not exist")
-        
-        success, output = self._execute_sql(query, database=database)
-        
+
+        if read_only:
+            # A read-only transaction rejects INSERT, UPDATE, DELETE, DDL and
+            # data-modifying CTEs alike, and it cannot be escalated from inside
+            # because SET TRANSACTION READ WRITE is refused once the session
+            # default is read-only.
+            sql = f"BEGIN READ ONLY;\n{query}\nCOMMIT;\n"
+            env = {"PGOPTIONS": "-c default_transaction_read_only=on"}
+        else:
+            sql, env = query, None
+
+        success, output = self._execute_sql(sql, database=database, env=env)
         if not success:
-            raise DatabaseQueryError(f"Query failed", output)
-        
+            raise DatabaseQueryError("Query failed", details=output.strip())
         return success, output
-    
+
     def get_connection_string(
         self,
         database: str,
@@ -748,22 +912,41 @@ class PostgresManager(BaseDatabaseManager):
         password: str,
         host: str = "localhost",
     ) -> str:
-        """Get a PostgreSQL connection string."""
+        """
+        Build a libpq URI.
+
+        Args:
+            database: Database name.
+            username: Role name.
+            password: Password.
+            host: Host to connect to.
+
+        Returns:
+            The connection string.
+        """
         return f"postgresql://{username}:{password}@{host}:{self.DEFAULT_PORT}/{database}"
-    
+
     def get_interactive_command(
         self,
-        database: Optional[str] = None,
-        username: Optional[str] = None,
-    ) -> List[str]:
-        """Get the command to connect interactively."""
-        cmd = ["sudo", "-u", "postgres", "psql"]
+        database: str | None = None,
+        username: str | None = None,
+    ) -> list[str]:
+        """
+        Build the command that opens a psql session.
+
+        Args:
+            database: Database to connect to.
+            username: Role to connect as.
+
+        Returns:
+            The argument vector.
+        """
+        argv = ["sudo", "-u", self.SUPERUSER, "psql"]
         if database:
-            cmd.extend(["-d", database])
+            argv.extend(["-d", database])
         if username:
-            cmd.extend(["-U", username])
-        return cmd
+            argv.extend(["-U", username])
+        return argv
 
 
-# Register the manager
 DatabaseRegistry.register(PostgresManager, aliases=["postgres", "pg", "pgsql"])

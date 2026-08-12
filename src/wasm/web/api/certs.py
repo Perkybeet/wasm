@@ -1,368 +1,353 @@
 """
 Certificates API endpoints.
 
-Provides endpoints for managing SSL certificates.
+This module is a client of :class:`~wasm.managers.cert_manager.CertManager`. It
+used to invoke certbot itself, which meant the panel had its own opinion about
+which plugin to use, its own timeout, its own parsing of certbot's output and
+no idea that the CLI records the resulting SSL state in the store. Issuing a
+certificate from the panel therefore left the store believing the site was
+still plain HTTP.
+
+Two structural fixes live here as well:
+
+- **Literal routes are registered before parametrised ones.** ``/renew-all``
+  used to be declared two hundred lines after ``/{domain}`` and was
+  unreachable: FastAPI matches in registration order, so every request for it
+  was handled as a certificate named ``renew-all``.
+- **Certbot never runs on the request path.** Issuing and renewing take ACME
+  round trips measured in seconds to minutes, so they are queued on the job
+  manager and the endpoint answers ``202 Accepted`` with a job id.
 """
 
-import subprocess
-from pathlib import Path
-from typing import List, Optional
-from datetime import datetime
+from __future__ import annotations
 
-from fastapi import APIRouter, Request, HTTPException, Depends
+from datetime import date, datetime
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from wasm.managers.cert_manager import CertificateInfo, CertManager
 from wasm.web.api.auth import get_current_session
+from wasm.web.api.deps import JobAcceptedResponse, WASMErrorRoute, strict_domain
+from wasm.web.jobs import JobType, cert_create_job, cert_renew_job, get_job_manager
 
-router = APIRouter()
-
-LETSENCRYPT_LIVE = Path("/etc/letsencrypt/live")
+router = APIRouter(route_class=WASMErrorRoute)
 
 
 class CertInfo(BaseModel):
-    """Certificate information."""
+    """
+    One certificate as certbot reports it.
+
+    Attributes:
+        domain: Certificate (lineage) name.
+        domains: Every domain the certificate covers.
+        valid_until: Raw expiry line from certbot, including its validity note.
+        expires_on: Expiry date as ``YYYY-MM-DD`` when it could be parsed.
+        days_remaining: Whole days until expiry, negative once expired.
+        auto_renew: Whether certbot's renewal timer covers this certificate.
+        path: Directory holding the certificate files.
+        key_path: Path of the private key. The key itself is never read.
+    """
+
     domain: str
-    issuer: Optional[str] = None
-    valid_from: Optional[str] = None
-    valid_until: Optional[str] = None
-    days_remaining: Optional[int] = None
+    domains: list[str] = []
+    valid_until: str | None = None
+    expires_on: str | None = None
+    days_remaining: int | None = None
     auto_renew: bool = True
-    path: Optional[str] = None
+    path: str | None = None
+    key_path: str | None = None
 
 
 class CertListResponse(BaseModel):
     """Response for listing certificates."""
-    certificates: List[CertInfo]
+
+    certificates: list[CertInfo]
     total: int
 
 
 class CertActionResponse(BaseModel):
-    """Response for certificate actions."""
+    """Response for certificate actions that complete immediately."""
+
     success: bool
     message: str
     domain: str
 
 
-def _get_cert_info(domain: str) -> Optional[CertInfo]:
-    """Get certificate information for a domain."""
-    cert_path = LETSENCRYPT_LIVE / domain / "cert.pem"
-    
-    if not cert_path.exists():
+class CreateCertRequest(BaseModel):
+    """
+    Request to obtain a certificate.
+
+    Attributes:
+        email: Registration and expiry-notice address.
+        webserver: Web server whose certbot plugin should be used.
+        include_www: Also cover the ``www`` subdomain.
+    """
+
+    email: str | None = None
+    webserver: str = "nginx"
+    include_www: bool = False
+
+
+class RenewCertRequest(BaseModel):
+    """Request to renew certificates."""
+
+    force: bool = False
+
+
+def _days_remaining(expiry: str | None) -> int | None:
+    """
+    Work out how many days a certificate has left.
+
+    Args:
+        expiry: Expiry date as ``YYYY-MM-DD``, or None when certbot's output
+            could not be parsed.
+
+    Returns:
+        Whole days until expiry, or None when the date is unknown.
+    """
+    if not expiry:
         return None
-    
     try:
-        # Use openssl to get cert info
-        result = subprocess.run(
-            ["openssl", "x509", "-in", str(cert_path), "-noout", "-dates", "-issuer"],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        
-        if result.returncode != 0:
-            return CertInfo(
-                domain=domain,
-                path=str(cert_path.parent)
-            )
-        
-        output = result.stdout
-        
-        # Parse dates
-        valid_from = None
-        valid_until = None
-        days_remaining = None
-        issuer = None
-        
-        for line in output.split("\n"):
-            if line.startswith("notBefore="):
-                valid_from = line.split("=", 1)[1].strip()
-            elif line.startswith("notAfter="):
-                valid_until = line.split("=", 1)[1].strip()
-                # Calculate days remaining
-                try:
-                    # Parse date like "Dec 19 12:00:00 2025 GMT"
-                    exp_date = datetime.strptime(valid_until, "%b %d %H:%M:%S %Y %Z")
-                    days_remaining = (exp_date - datetime.now()).days
-                except Exception:
-                    pass
-            elif line.startswith("issuer="):
-                issuer = line.split("=", 1)[1].strip()
-        
-        return CertInfo(
-            domain=domain,
-            issuer=issuer,
-            valid_from=valid_from,
-            valid_until=valid_until,
-            days_remaining=days_remaining,
-            auto_renew=True,
-            path=str(cert_path.parent)
-        )
-    except Exception:
-        return CertInfo(
-            domain=domain,
-            path=str(cert_path.parent) if cert_path.exists() else None
-        )
+        expires = datetime.strptime(expiry, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    return (expires - date.today()).days
+
+
+def _to_cert_info(entry: CertificateInfo) -> CertInfo:
+    """
+    Convert a manager certificate entry into the API model.
+
+    Args:
+        entry: One entry of ``certbot certificates``.
+
+    Returns:
+        The API representation.
+    """
+    expiry = entry.get("expiry")
+    cert_path = entry.get("cert_path")
+    return CertInfo(
+        domain=entry.get("name", ""),
+        domains=list(entry.get("domains", [])),
+        valid_until=entry.get("expiry_full"),
+        expires_on=expiry,
+        days_remaining=_days_remaining(expiry),
+        path=cert_path,
+        key_path=entry.get("key_path"),
+    )
 
 
 @router.get("", response_model=CertListResponse)
-async def list_certificates(
-    request: Request,
-    session: dict = Depends(get_current_session)
-):
+def list_certificates(session: Annotated[dict, Depends(get_current_session)]) -> CertListResponse:
     """
-    List all SSL certificates.
+    List every certificate certbot knows about.
+
+    Args:
+        session: The authenticated session.
+
+    Returns:
+        The certificates, with days remaining computed for each.
     """
-    certificates = []
-    
-    if LETSENCRYPT_LIVE.exists():
-        for domain_dir in LETSENCRYPT_LIVE.iterdir():
-            if domain_dir.is_dir() and not domain_dir.name.startswith("."):
-                cert_info = _get_cert_info(domain_dir.name)
-                if cert_info:
-                    certificates.append(cert_info)
-    
-    return CertListResponse(
-        certificates=certificates,
-        total=len(certificates)
+    certificates = [
+        _to_cert_info(entry) for entry in CertManager(verbose=False).list_certificates()
+    ]
+    return CertListResponse(certificates=certificates, total=len(certificates))
+
+
+@router.post("/renew-all", response_model=JobAcceptedResponse, status_code=202)
+def renew_all_certificates(
+    session: Annotated[dict, Depends(get_current_session)], data: RenewCertRequest | None = None
+) -> JobAcceptedResponse:
+    """
+    Renew every certificate that is due.
+
+    Declared before ``/{domain}`` on purpose: a parametrised route registered
+    first would match ``renew-all`` as a domain and this endpoint would never
+    be reached.
+
+    Args:
+        data: Renewal options.
+        session: The authenticated session.
+
+    Returns:
+        The queued job.
+    """
+    force = data.force if data else False
+    job = get_job_manager().create_job(
+        job_type=JobType.CERT_RENEW,
+        name="Renew all certificates",
+        description="Renewing every certificate that is due",
+        func=cert_renew_job,
+        kwargs={"domain": None, "force": force},
+        metadata={"domain": "all", "force": force},
+    )
+    return JobAcceptedResponse(
+        job_id=job.id,
+        status=job.status.value,
+        message="Renewal queued",
+        job=job.to_dict(),
     )
 
 
 @router.get("/{domain}", response_model=CertInfo)
-async def get_certificate(
+def get_certificate(
+    domain: str, session: Annotated[dict, Depends(get_current_session)]
+) -> CertInfo:
+    """
+    Describe one certificate.
+
+    Args:
+        domain: Certificate name.
+        session: The authenticated session.
+
+    Returns:
+        The certificate description.
+
+    Raises:
+        HTTPException: 404 when no certificate covers the domain.
+    """
+    validated = strict_domain(domain)
+
+    entry = CertManager(verbose=False).get_cert_info(validated)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Certificate not found: {validated}")
+
+    return _to_cert_info(entry)
+
+
+@router.post("/{domain}", response_model=JobAcceptedResponse, status_code=202)
+def create_certificate(
     domain: str,
-    request: Request,
-    session: dict = Depends(get_current_session)
-):
+    session: Annotated[dict, Depends(get_current_session)],
+    data: CreateCertRequest | None = None,
+) -> JobAcceptedResponse:
     """
-    Get certificate details for a domain.
+    Obtain a certificate for a domain.
+
+    Args:
+        domain: Primary domain of the certificate.
+        data: Issuance options.
+        session: The authenticated session.
+
+    Returns:
+        The queued job.
     """
-    cert_info = _get_cert_info(domain)
-    
-    if not cert_info:
-        raise HTTPException(status_code=404, detail=f"Certificate not found: {domain}")
-    
-    return cert_info
+    validated = strict_domain(domain)
+    options = data or CreateCertRequest()
+
+    job = get_job_manager().create_job(
+        job_type=JobType.CERT_CREATE,
+        name=f"SSL for {validated}",
+        description=f"Obtaining an SSL certificate for {validated}",
+        func=cert_create_job,
+        kwargs={
+            "domain": validated,
+            "email": options.email,
+            "webserver": options.webserver,
+            "include_www": options.include_www,
+        },
+        metadata={"domain": validated},
+    )
+    return JobAcceptedResponse(
+        job_id=job.id,
+        status=job.status.value,
+        message=f"Certificate issuance queued for {validated}",
+        job=job.to_dict(),
+    )
 
 
-@router.post("/{domain}", response_model=CertActionResponse)
-async def create_certificate(
+@router.post("/{domain}/renew", response_model=JobAcceptedResponse, status_code=202)
+def renew_certificate(
     domain: str,
-    request: Request,
-    session: dict = Depends(get_current_session)
-):
+    session: Annotated[dict, Depends(get_current_session)],
+    data: RenewCertRequest | None = None,
+) -> JobAcceptedResponse:
     """
-    Create/obtain a new SSL certificate for a domain.
-    """
-    from wasm.validators.domain import validate_domain
-    
-    try:
-        validated_domain = validate_domain(domain)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    
-    try:
-        # Check if certbot is available
-        result = subprocess.run(
-            ["which", "certbot"],
-            capture_output=True
-        )
-        if result.returncode != 0:
-            raise HTTPException(
-                status_code=500,
-                detail="Certbot is not installed. Run: apt install certbot python3-certbot-nginx"
-            )
-        
-        # Run certbot
-        result = subprocess.run(
-            [
-                "certbot", "certonly",
-                "--nginx",
-                "-d", validated_domain,
-                "--non-interactive",
-                "--agree-tos",
-                "--register-unsafely-without-email"
-            ],
-            capture_output=True,
-            text=True,
-            timeout=120
-        )
-        
-        if result.returncode != 0:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Certbot failed: {result.stderr}"
-            )
-        
-        return CertActionResponse(
-            success=True,
-            message=f"Certificate obtained for {domain}",
-            domain=domain
-        )
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=500, detail="Certificate request timed out")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    Renew one certificate.
 
+    Args:
+        domain: Certificate name.
+        data: Renewal options.
+        session: The authenticated session.
 
-@router.post("/{domain}/renew", response_model=CertActionResponse)
-async def renew_certificate(
-    domain: str,
-    request: Request,
-    session: dict = Depends(get_current_session)
-):
+    Returns:
+        The queued job.
+
+    Raises:
+        HTTPException: 404 when no such certificate exists.
     """
-    Renew an existing SSL certificate.
-    """
-    cert_info = _get_cert_info(domain)
-    
-    if not cert_info:
-        raise HTTPException(status_code=404, detail=f"Certificate not found: {domain}")
-    
-    try:
-        result = subprocess.run(
-            ["certbot", "renew", "--cert-name", domain, "--force-renewal"],
-            capture_output=True,
-            text=True,
-            timeout=120
-        )
-        
-        if result.returncode != 0:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Renewal failed: {result.stderr}"
-            )
-        
-        return CertActionResponse(
-            success=True,
-            message=f"Certificate renewed for {domain}",
-            domain=domain
-        )
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=500, detail="Certificate renewal timed out")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    validated = strict_domain(domain)
+
+    manager = CertManager(verbose=False)
+    if not manager.cert_exists(validated):
+        raise HTTPException(status_code=404, detail=f"Certificate not found: {validated}")
+
+    force = data.force if data else False
+    job = get_job_manager().create_job(
+        job_type=JobType.CERT_RENEW,
+        name=f"Renew {validated}",
+        description=f"Renewing the certificate for {validated}",
+        func=cert_renew_job,
+        kwargs={"domain": validated, "force": force},
+        metadata={"domain": validated, "force": force},
+    )
+    return JobAcceptedResponse(
+        job_id=job.id,
+        status=job.status.value,
+        message=f"Renewal queued for {validated}",
+        job=job.to_dict(),
+    )
 
 
 @router.post("/{domain}/revoke", response_model=CertActionResponse)
-async def revoke_certificate(
-    domain: str,
-    request: Request,
-    session: dict = Depends(get_current_session)
-):
+def revoke_certificate(
+    domain: str, session: Annotated[dict, Depends(get_current_session)]
+) -> CertActionResponse:
     """
-    Revoke an SSL certificate.
+    Revoke a certificate and delete its files.
+
+    Args:
+        domain: Certificate name.
+        session: The authenticated session.
+
+    Returns:
+        The action outcome.
+
+    Raises:
+        CertificateError: When certbot refuses the revocation.
     """
-    cert_info = _get_cert_info(domain)
-    
-    if not cert_info:
-        raise HTTPException(status_code=404, detail=f"Certificate not found: {domain}")
-    
-    try:
-        # Try to find the certificate file
-        cert_path = Path(f"/etc/letsencrypt/live/{domain}/cert.pem")
-        
-        if cert_path.exists():
-            result = subprocess.run(
-                ["certbot", "revoke", "--cert-path", str(cert_path), "--non-interactive"],
-                capture_output=True,
-                text=True,
-                timeout=120
-            )
-        else:
-            # Try using --cert-name instead
-            result = subprocess.run(
-                ["certbot", "revoke", "--cert-name", domain, "--non-interactive"],
-                capture_output=True,
-                text=True,
-                timeout=120
-            )
-        
-        if result.returncode != 0:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Revocation failed: {result.stderr}"
-            )
-        
-        return CertActionResponse(
-            success=True,
-            message=f"Certificate revoked for {domain}",
-            domain=domain
-        )
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=500, detail="Certificate revocation timed out")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    validated = strict_domain(domain)
+
+    CertManager(verbose=False).revoke(validated)
+
+    return CertActionResponse(
+        success=True, message=f"Certificate revoked for {validated}", domain=validated
+    )
 
 
 @router.delete("/{domain}", response_model=CertActionResponse)
-async def delete_certificate(
-    domain: str,
-    request: Request,
-    session: dict = Depends(get_current_session)
-):
+def delete_certificate(
+    domain: str, session: Annotated[dict, Depends(get_current_session)]
+) -> CertActionResponse:
     """
-    Delete an SSL certificate.
-    """
-    cert_info = _get_cert_info(domain)
-    
-    if not cert_info:
-        raise HTTPException(status_code=404, detail=f"Certificate not found: {domain}")
-    
-    try:
-        result = subprocess.run(
-            ["certbot", "delete", "--cert-name", domain, "--non-interactive"],
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
-        
-        if result.returncode != 0:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Deletion failed: {result.stderr}"
-            )
-        
-        return CertActionResponse(
-            success=True,
-            message=f"Certificate deleted for {domain}",
-            domain=domain
-        )
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=500, detail="Certificate deletion timed out")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    Delete a certificate without revoking it.
 
+    Args:
+        domain: Certificate name.
+        session: The authenticated session.
 
-@router.post("/renew-all")
-async def renew_all_certificates(
-    request: Request,
-    session: dict = Depends(get_current_session)
-):
+    Returns:
+        The action outcome.
+
+    Raises:
+        CertificateError: When certbot refuses the deletion.
     """
-    Renew all certificates that are due for renewal.
-    """
-    try:
-        result = subprocess.run(
-            ["certbot", "renew"],
-            capture_output=True,
-            text=True,
-            timeout=300
-        )
-        
-        return {
-            "success": result.returncode == 0,
-            "output": result.stdout,
-            "errors": result.stderr if result.returncode != 0 else None
-        }
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=500, detail="Renewal process timed out")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    validated = strict_domain(domain)
+
+    CertManager(verbose=False).delete(validated)
+
+    return CertActionResponse(
+        success=True, message=f"Certificate deleted for {validated}", domain=validated
+    )

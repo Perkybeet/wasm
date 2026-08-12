@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.15.8
+Version:        1.0.0
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -17,24 +17,37 @@ BuildArch:      noarch
 
 # Build requirements - use python3 macros
 BuildRequires:  python3-devel
-BuildRequires:  python3-setuptools
-BuildRequires:  python3-pip
+%{?pyproject_buildrequires}
 
 # Fedora/RHEL specific
 %if 0%{?fedora} || 0%{?rhel}
 BuildRequires:  python3-wheel
+Requires:       python3-click >= 8.0
 Requires:       python3-jinja2 >= 3.1.0
 Requires:       python3-pyyaml >= 6.0
-# inquirer is optional (for interactive mode)
-Suggests:       python3-inquirer >= 3.1.0
+Requires:       python3-questionary
+Requires:       python3-rich
+# The panel is optional. Everything it needs is packaged in Fedora.
+Suggests:       python3-fastapi
+Suggests:       python3-starlette
+Suggests:       python3-pydantic
+Suggests:       python3-uvicorn
+Suggests:       python3-psutil
 %endif
 
 # openSUSE specific
 %if 0%{?suse_version}
 BuildRequires:  python3-wheel
+Requires:       python3-click >= 8.0
 Requires:       python3-Jinja2 >= 3.1.0
 Requires:       python3-PyYAML >= 6.0
-# inquirer may need to be installed via pip on SUSE
+Requires:       python3-questionary
+Requires:       python3-rich
+Suggests:       python3-fastapi
+Suggests:       python3-starlette
+Suggests:       python3-pydantic
+Suggests:       python3-uvicorn
+Suggests:       python3-psutil
 %endif
 
 # Runtime requirements (common)
@@ -60,30 +73,34 @@ Features:
  * Systemd service management
  * Interactive mode with guided prompts
  * One-command deployments
- * AI-powered security monitoring
+ * Resource and service observability
  * Backup and rollback system
- * Web dashboard for remote management (optional)
+ * Control panel for remote management (optional)
  * REST API with token-based authentication
 
 %prep
 %autosetup -n wasm-%{version}
 
 %build
-%py3_build
+%pyproject_wheel
 
 %install
-%py3_install
+%pyproject_install
 
-# Install completion scripts
-install -Dm644 src/wasm/completions/wasm.bash %{buildroot}%{_datadir}/bash-completion/completions/wasm
+# Shell completion, generated from the command tree rather than written by hand.
+# The hand-written scripts were 2,295 lines kept in step with 108 subcommands
+# from memory. Generating them needs no network, which this build does not have.
+PYTHONPATH=%{buildroot}%{python3_sitelib} _WASM_COMPLETE=bash_source python3 -m wasm \
+    > wasm.bash-completion
+install -Dm644 wasm.bash-completion %{buildroot}%{_datadir}/bash-completion/completions/wasm
 
-# For openSUSE: fish and zsh completions directories may not exist
-%if 0%{?suse_version}
-# SUSE: Only install if directories are provided by system packages
-# Skip fish/zsh completions on SUSE to avoid directory ownership issues
-%else
-install -Dm644 src/wasm/completions/wasm.fish %{buildroot}%{_datadir}/fish/vendor_completions.d/wasm.fish
-install -Dm644 src/wasm/completions/_wasm %{buildroot}%{_datadir}/zsh/site-functions/_wasm
+%if ! 0%{?suse_version}
+PYTHONPATH=%{buildroot}%{python3_sitelib} _WASM_COMPLETE=fish_source python3 -m wasm \
+    > wasm.fish-completion
+PYTHONPATH=%{buildroot}%{python3_sitelib} _WASM_COMPLETE=zsh_source python3 -m wasm \
+    > wasm.zsh-completion
+install -Dm644 wasm.fish-completion %{buildroot}%{_datadir}/fish/vendor_completions.d/wasm.fish
+install -Dm644 wasm.zsh-completion %{buildroot}%{_datadir}/zsh/site-functions/_wasm
 %endif
 
 # Install default configuration
@@ -100,7 +117,7 @@ install -d %{buildroot}/var/log/wasm
 %doc README.md
 %doc docs/
 %{python3_sitelib}/wasm/
-%{python3_sitelib}/wasm_cli*.egg-info/
+%{python3_sitelib}/wasm_cli-*.dist-info/
 %{_bindir}/wasm
 %{_mandir}/man1/wasm.1*
 %{_datadir}/bash-completion/completions/wasm
@@ -115,9 +132,6 @@ install -d %{buildroot}/var/log/wasm
 %post
 echo "WASM installed successfully!"
 echo "Run 'wasm setup' to configure the tool."
-echo ""
-echo "Note: You may need to install python3-inquirer via pip:"
-echo "  pip3 install inquirer"
 
 # Upgrade config file with new defaults (preserves user values)
 if [ -f /etc/wasm/config.yaml ]; then
@@ -134,9 +148,25 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
     systemctl daemon-reload
     systemctl restart wasm-monitor.service 2>/dev/null || true
     echo "wasm-monitor service updated and restarted"
+    echo ""
+    echo "NOTE: the monitor no longer terminates processes or deletes files."
+    echo "It decided what was malicious by matching substrings against a"
+    echo "process command line, and acted on that as root. It now reports"
+    echo "resource use, service health and notable processes, and acts on"
+    echo "nothing. The auto_terminate and use_ai settings are ignored."
 fi
 
 %changelog
+* Wed Aug 12 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.0.0-1
+- Security: closes six critical issues, including arbitrary code execution as root through systemd unit environment injection
+- Security: the process monitor no longer terminates processes or deletes directories; it reports instead of acting
+- Security: the panel serves no third-party asset, uses HttpOnly session cookies with CSRF, and writes an audit log
+- Security: database dumps, archive extraction and SQL privileges are validated instead of interpolated
+- Feature: control panel rebuilt as server-rendered pages, with no build step and no CDN
+- Feature: --dry-run is enforced at the execution and filesystem seams, so it holds for every command
+- Change: command line migrated to Click; every command, alias and option is preserved
+- Change: backup archives are self-contained and verified; format version 2.0.0
+- Packaging: supports Ubuntu 26.04 and Python 3.14; drops python-jose and python3-inquirer
 * Fri Mar 20 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.15.8-1
 - Feature: Auto-verify and expand SSL certificates for www subdomain coverage
 - Enhancement: cert_manager.obtain() checks domain coverage before skipping existing certs

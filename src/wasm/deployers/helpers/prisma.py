@@ -9,8 +9,8 @@ Handles detection and setup of Prisma in Node.js applications.
 """
 
 import json
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, List, Optional
 
 from wasm.core.logger import Logger
 
@@ -25,9 +25,9 @@ class PrismaHelper:
 
     def __init__(
         self,
-        logger: Optional[Logger] = None,
-        run_command: Optional[Callable] = None,
-        get_exec_command: Optional[Callable] = None,
+        logger: Logger | None = None,
+        run_command: Callable | None = None,
+        get_exec_command: Callable | None = None,
     ):
         """
         Initialize Prisma helper.

@@ -1,810 +1,413 @@
 """
-Process monitor for WASM.
+The monitor daemon: observability, not enforcement.
 
-Main monitoring system that scans processes, uses AI analysis,
-takes mitigation actions, and sends notifications.
+What this module used to do, running as root from a systemd unit: match a
+regular expression against a command line, call the result malicious,
+terminate the process tree, and hand the process working directory to
+``shutil.rmtree`` (so any process with ``cwd=/tmp`` cost the machine ``/tmp``).
+
+What it does now: read metrics, read the process table, read unit state, write
+down what stands out, and tell somebody. It never signals a process and never
+deletes a file. The one filesystem write it makes is its own systemd unit, at a
+fixed path, and only when an operator runs ``wasm monitor install``.
 """
 
+from __future__ import annotations
+
 import os
-import signal
 import time
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any
 
-from wasm.core.config import Config, SYSTEMD_DIR
-from wasm.core.exceptions import MonitorError, ServiceError
+from wasm.core.config import SYSTEMD_DIR, Config
+from wasm.core.exceptions import MonitorError, WASMError
 from wasm.core.logger import Logger
-from wasm.core.utils import run_command, run_command_sudo, write_file
-from wasm.monitor.ai_analyzer import AIProcessAnalyzer, AnalysisResult, ProcessInfo
-from wasm.monitor.email_notifier import EmailNotifier, ThreatReport
-from wasm.monitor.threat_store import ThreatStore
+from wasm.core.runner import CommandRunner, get_runner
+from wasm.core.utils import remove_file, write_file
+from wasm.monitor.email_notifier import EmailNotifier
+from wasm.monitor.metrics import (
+    SYSTEMCTL_TIMEOUT,
+    collect_resource_metrics,
+    collect_service_health,
+    list_processes,
+)
+from wasm.monitor.models import (
+    SEVERITY_WARNING,
+    ProcessObservation,
+    ResourceMetrics,
+    ServiceHealth,
+)
+from wasm.monitor.observation_store import DEFAULT_MAX_OBSERVATIONS, ObservationStore
+from wasm.monitor.signals import observe_processes
 
+#: Seconds between scans. A minute is enough for capacity planning and cheap
+#: enough to leave running on a small box.
+DEFAULT_SCAN_INTERVAL = 60
 
-# Default configuration values (exported for use in other modules)
-DEFAULT_SCAN_INTERVAL = 30  # Local scan every 30 seconds
-DEFAULT_AI_INTERVAL = 3600  # AI analysis every hour
+#: Floor for the scan interval. Walking /proc for every process is the most
+#: expensive thing this daemon does; doing it several times a second costs more
+#: CPU than whatever it would observe.
+MIN_SCAN_INTERVAL = 10
+
+#: Percentages above which a process is written down as a heavy consumer.
 DEFAULT_CPU_THRESHOLD = 80.0
 DEFAULT_MEMORY_THRESHOLD = 80.0
+
+#: How long observations are kept before they are purged.
+DEFAULT_RETENTION_DAYS = 30
+
+#: Retention is a housekeeping job, not a per-scan one. Running the delete once
+#: an hour instead of once a minute keeps the scan loop to reads.
+PURGE_INTERVAL_SECONDS = 3_600
+
+#: Filesystem usage from which a disk is called out in the log rather than left
+#: at debug level. Past this, a full disk is a matter of days.
+DISK_ALERT_PERCENT = 90.0
+
+#: What this package will not do, in the words used to check it. The CLI and the
+#: web panel print these, and tests assert them against the package source.
+MONITOR_SCOPE: tuple[str, ...] = (
+    "Never signals, terminates or restarts a process.",
+    "Never deletes or modifies a file, except the systemd unit it installs.",
+    "Never sends data about the machine anywhere except the configured SMTP relay.",
+    "Never inspects a process command line to decide anything.",
+)
 
 
 @dataclass
 class MonitorConfig:
-    """Process monitor configuration."""
+    """
+    Monitor settings.
+
+    There is deliberately no auto-terminate and no dry-run: with nothing
+    destructive left to switch off, a dry-run flag would only imply that the
+    other mode does something to the machine.
+
+    Attributes:
+        enabled: Whether the daemon should run at boot.
+        scan_interval: Seconds between scans.
+        cpu_threshold: CPU percentage above which a process is noted.
+        memory_threshold: Memory percentage above which a process is noted.
+        notify: Send observations by email.
+        watch_units: systemd units whose health is checked each scan.
+        retention_days: How long observations are kept.
+        max_observations: Hard ceiling on rows kept in the observation store.
+        log_file: Where the daemon writes its log.
+    """
 
     enabled: bool = False
     scan_interval: int = DEFAULT_SCAN_INTERVAL
-    ai_interval: int = DEFAULT_AI_INTERVAL
     cpu_threshold: float = DEFAULT_CPU_THRESHOLD
     memory_threshold: float = DEFAULT_MEMORY_THRESHOLD
-    auto_terminate: bool = True
-    # Note: terminate_malicious_only is enforced in _mitigate_threat()
-    # which only terminates processes with threat_level == "malicious"
-    terminate_malicious_only: bool = True
-    use_ai: bool = True
-    dry_run: bool = False
-    log_file: Optional[Path] = None
+    notify: bool = False
+    watch_units: tuple[str, ...] = field(default_factory=tuple)
+    retention_days: int = DEFAULT_RETENTION_DAYS
+    max_observations: int = DEFAULT_MAX_OBSERVATIONS
+    log_file: Path | None = None
+
+    def __post_init__(self) -> None:
+        """Clamp the scan interval so a config typo cannot pin a CPU."""
+        self.scan_interval = max(MIN_SCAN_INTERVAL, int(self.scan_interval))
 
 
 class ProcessMonitor:
     """
-    Main process monitoring system.
-    
-    Periodically scans system processes, uses AI analysis to detect
-    threats, takes mitigation actions, and sends email notifications.
+    Periodic observer of processes, resources and services.
+
+    Every public method here either reads the machine or writes to the
+    observation store. None of them changes the state of a process.
     """
-    
+
     SERVICE_NAME = "wasm-monitor"
-    
+
     def __init__(
         self,
-        config: Optional[MonitorConfig] = None,
+        config: MonitorConfig | None = None,
         verbose: bool = False,
-    ):
+        store: Any | None = None,
+        notifier: Any | None = None,
+        runner: CommandRunner | None = None,
+    ) -> None:
         """
-        Initialize process monitor.
-        
         Args:
-            config: Monitor configuration. If None, loads from global config.
+            config: Monitor settings. Loaded from the global config if None.
             verbose: Enable verbose logging.
+            store: Observation store. Created on first use if None.
+            notifier: Email notifier. Created on first use if None.
+            runner: Command runner. Defaults to the process-wide one.
         """
         self.verbose = verbose
         self.logger = Logger(verbose=verbose)
         self.global_config = Config()
-        
-        if config:
-            self.config = config
-        else:
-            self.config = self._load_config()
-        
-        self.analyzer = AIProcessAnalyzer(verbose=verbose)
-        self.notifier = EmailNotifier(verbose=verbose)
-        self.threat_store = ThreatStore(verbose=verbose)
+        self.config = config or self._load_config()
+        self.runner = runner or get_runner()
 
+        self._store = store
+        self._notifier = notifier
         self._running = False
-        self._terminated_pids: Set[int] = set()
-    
+        # Far enough in the past that the first loop iteration purges once.
+        self._last_purge = float("-inf")
+
     def _load_config(self) -> MonitorConfig:
-        """Load monitor configuration from global config."""
+        """
+        Read monitor settings from the global configuration.
+
+        Returns:
+            The settings, with defaults for anything unset.
+        """
+        get = self.global_config.get
         return MonitorConfig(
-            enabled=self.global_config.get("monitor.enabled", False),
-            scan_interval=self.global_config.get(
-                "monitor.scan_interval", DEFAULT_SCAN_INTERVAL
-            ),
-            ai_interval=self.global_config.get(
-                "monitor.ai_interval", DEFAULT_AI_INTERVAL
-            ),
-            cpu_threshold=self.global_config.get(
-                "monitor.cpu_threshold", DEFAULT_CPU_THRESHOLD
-            ),
-            memory_threshold=self.global_config.get(
-                "monitor.memory_threshold", DEFAULT_MEMORY_THRESHOLD
-            ),
-            auto_terminate=self.global_config.get("monitor.auto_terminate", True),
-            terminate_malicious_only=self.global_config.get(
-                "monitor.terminate_malicious_only", True
-            ),
-            use_ai=self.global_config.get("monitor.use_ai", True),
-            dry_run=self.global_config.get("monitor.dry_run", False),
-            log_file=Path(self.global_config.get(
-                "monitor.log_file", "/var/log/wasm/monitor.log"
-            )),
+            enabled=get("monitor.enabled", False),
+            scan_interval=int(get("monitor.scan_interval", DEFAULT_SCAN_INTERVAL)),
+            cpu_threshold=float(get("monitor.cpu_threshold", DEFAULT_CPU_THRESHOLD)),
+            memory_threshold=float(get("monitor.memory_threshold", DEFAULT_MEMORY_THRESHOLD)),
+            notify=bool(get("monitor.notify", False)),
+            watch_units=tuple(get("monitor.watch_units", []) or ()),
+            retention_days=int(get("monitor.retention_days", DEFAULT_RETENTION_DAYS)),
+            max_observations=int(get("monitor.max_observations", DEFAULT_MAX_OBSERVATIONS)),
+            log_file=Path(get("monitor.log_file", "/var/log/wasm/monitor.log")),
         )
-    
-    def _get_processes(self) -> List[ProcessInfo]:
-        """
-        Get list of all running processes.
-        
-        Returns:
-            List of ProcessInfo objects.
-        """
-        processes = []
-        
-        try:
-            import psutil
-            
-            for proc in psutil.process_iter([
-                'pid', 'name', 'username', 'cpu_percent', 'memory_percent',
-                'cmdline', 'create_time', 'ppid', 'status', 'num_threads',
-                'cwd'
-            ]):
-                try:
-                    info = proc.info
-                    cmdline = info.get('cmdline') or []
-                    command = ' '.join(cmdline) if cmdline else info.get('name', '')
-                    
-                    # Get parent info
-                    parent_pid = info.get('ppid')
-                    parent_name = None
-                    if parent_pid:
-                        try:
-                            parent = psutil.Process(parent_pid)
-                            parent_name = parent.name()
-                        except (psutil.NoSuchProcess, psutil.AccessDenied):
-                            pass
-                    
-                    # Get connections separately (not all systems support this)
-                    connections = []
-                    try:
-                        for conn in proc.net_connections():
-                            connections.append({
-                                'local': f"{conn.laddr.ip}:{conn.laddr.port}" if conn.laddr else "",
-                                'remote': f"{conn.raddr.ip}:{conn.raddr.port}" if conn.raddr else "",
-                                'status': conn.status,
-                            })
-                    except (psutil.AccessDenied, psutil.NoSuchProcess, AttributeError):
-                        pass
-                    
-                    # Get open files separately
-                    open_files = []
-                    try:
-                        for f in proc.open_files():
-                            open_files.append(f.path)
-                    except (psutil.AccessDenied, psutil.NoSuchProcess, AttributeError):
-                        pass
-                    
-                    processes.append(ProcessInfo(
-                        pid=info.get('pid', 0),
-                        name=info.get('name', ''),
-                        user=info.get('username', ''),
-                        cpu_percent=info.get('cpu_percent', 0.0) or 0.0,
-                        memory_percent=info.get('memory_percent', 0.0) or 0.0,
-                        command=command,
-                        create_time=info.get('create_time'),
-                        parent_pid=parent_pid,
-                        parent_name=parent_name,
-                        status=info.get('status', 'running'),
-                        num_threads=info.get('num_threads', 1),
-                        connections=connections,
-                        open_files=open_files,
-                        cwd=info.get('cwd', ''),
-                    ))
-                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                    continue
-                    
-        except ImportError:
-            # Fallback to ps command if psutil is not available
-            self.logger.warning("psutil not available, using fallback method")
-            processes = self._get_processes_fallback()
 
-        # Log processes exceeding thresholds (informational)
-        high_resource = [
-            p for p in processes
-            if p.cpu_percent > self.config.cpu_threshold
-            or p.memory_percent > self.config.memory_threshold
-        ]
-        if high_resource:
-            self.logger.debug(
-                f"Found {len(high_resource)} processes exceeding resource thresholds "
-                f"(CPU>{self.config.cpu_threshold}% or MEM>{self.config.memory_threshold}%)"
+    @property
+    def store(self) -> Any:
+        """The observation store, opened on first use."""
+        if self._store is None:
+            self._store = ObservationStore(
+                verbose=self.verbose,
+                max_observations=self.config.max_observations,
             )
-            for p in high_resource[:5]:  # Log top 5
-                self.logger.debug(
-                    f"  - {p.name} (PID {p.pid}): CPU={p.cpu_percent:.1f}%, "
-                    f"MEM={p.memory_percent:.1f}%"
-                )
+        return self._store
 
-        return processes
-    
-    def _get_processes_fallback(self) -> List[ProcessInfo]:
+    @property
+    def notifier(self) -> Any:
+        """The email notifier, built on first use."""
+        if self._notifier is None:
+            self._notifier = EmailNotifier(verbose=self.verbose)
+        return self._notifier
+
+    def collect_metrics(self) -> ResourceMetrics:
         """
-        Get processes using ps command (fallback method).
-
-        Note: This fallback provides limited information compared to psutil.
-        Fields like connections, open_files, cwd, parent_name, create_time,
-        and num_threads will be empty or default values.
+        Read the machine's resource counters.
 
         Returns:
-            List of ProcessInfo objects with limited data.
+            A point-in-time reading.
+
+        Raises:
+            MonitorError: When psutil is not installed.
         """
-        processes = []
+        return collect_resource_metrics()
 
-        # Use extended ps format to get more info including status
-        result = run_command([
-            "ps", "-eo", "pid,user,%cpu,%mem,stat,args", "--no-headers"
-        ])
-
-        if not result.success:
-            self.logger.warning(f"ps fallback failed: {result.stderr}")
-            return processes
-
-        for line in result.stdout.strip().split('\n'):
-            if not line:
-                continue
-
-            parts = line.split(None, 5)
-            if len(parts) < 5:
-                continue
-
-            try:
-                command = parts[5] if len(parts) > 5 else ""
-                # Extract process name from command (first word, basename)
-                name = ""
-                if command:
-                    first_word = command.split()[0]
-                    name = first_word.split('/')[-1]
-
-                processes.append(ProcessInfo(
-                    pid=int(parts[0]),
-                    name=name,
-                    user=parts[1],
-                    cpu_percent=float(parts[2]),
-                    memory_percent=float(parts[3]),
-                    command=command,
-                    status=self._parse_ps_stat(parts[4]),
-                    # Fields not available in fallback
-                    cwd="",
-                    connections=[],
-                    open_files=[],
-                    create_time=None,
-                    parent_pid=None,
-                    parent_name=None,
-                    num_threads=1,
-                ))
-            except (ValueError, IndexError) as e:
-                self.logger.debug(f"Failed to parse process line: {e}")
-                continue
-
-        return processes
-
-    def _parse_ps_stat(self, stat: str) -> str:
+    def check_services(self, units: list[str] | None = None) -> list[ServiceHealth]:
         """
-        Parse ps STAT field to human-readable status.
+        Ask systemd about the units being watched.
 
         Args:
-            stat: The STAT field from ps output (e.g., "Ss", "R+", "Sl").
+            units: Units to check. Defaults to the configured ones.
 
         Returns:
-            Human-readable status string.
+            One health record per unit.
         """
-        if not stat:
-            return "unknown"
-        first_char = stat[0].upper()
-        status_map = {
-            'R': 'running',
-            'S': 'sleeping',
-            'D': 'disk-sleep',
-            'Z': 'zombie',
-            'T': 'stopped',
-            'I': 'idle',
-            'W': 'waiting',
-            'X': 'dead',
-        }
-        return status_map.get(first_char, 'unknown')
-    
-    def _terminate_process(
-        self,
-        pid: int,
-        force: bool = False,
-    ) -> bool:
+        watched = list(units if units is not None else self.config.watch_units)
+        if not watched:
+            return []
+        return collect_service_health(watched, runner=self.runner)
+
+    def scan_once(self, cpu_sample_interval: float = 0.0) -> list[ProcessObservation]:
         """
-        Terminate a process.
-        
+        Take one look at the process table and record what stands out.
+
+        Nothing is terminated and nothing is deleted: the return value and the
+        observation store are the entire effect of a scan.
+
         Args:
-            pid: Process ID to terminate.
-            force: Use SIGKILL instead of SIGTERM.
-            
+            cpu_sample_interval: Seconds to spend sampling CPU usage. Zero in
+                the daemon loop, where the previous scan is the reference
+                point; a fraction of a second for a one-shot scan, which would
+                otherwise see 0% CPU for every process.
+
         Returns:
-            True if terminated successfully.
+            The observations made, warnings first.
+
+        Raises:
+            MonitorError: When the process table cannot be read.
         """
-        if self.config.dry_run:
-            self.logger.info(f"[DRY RUN] Would terminate process {pid}")
-            return True
-        
-        sig = signal.SIGKILL if force else signal.SIGTERM
-        
-        try:
-            os.kill(pid, sig)
-            self._terminated_pids.add(pid)
-            
-            # Wait a moment and check if killed
-            time.sleep(0.5)
-            
-            try:
-                os.kill(pid, 0)  # Check if still running
-                if not force:
-                    # Still running, try SIGKILL
-                    os.kill(pid, signal.SIGKILL)
-                    time.sleep(0.5)
-            except OSError:
-                pass  # Process is gone
-            
-            return True
-            
-        except OSError as e:
-            self.logger.error(f"Failed to terminate process {pid}: {e}")
-            return False
-    
-    def _terminate_process_tree(self, pid: int) -> List[int]:
-        """
-        Terminate a process and all its children.
-        
-        Args:
-            pid: Root process ID to terminate.
-            
-        Returns:
-            List of terminated PIDs.
-        """
-        terminated = []
-        
-        try:
-            import psutil
-            
-            try:
-                parent = psutil.Process(pid)
-                children = parent.children(recursive=True)
-                
-                # Terminate children first
-                for child in reversed(children):
-                    if self._terminate_process(child.pid):
-                        terminated.append(child.pid)
-                
-                # Terminate parent
-                if self._terminate_process(pid):
-                    terminated.append(pid)
-                    
-            except psutil.NoSuchProcess:
-                pass
-                
-        except ImportError:
-            # Fallback: just terminate the process
-            if self._terminate_process(pid):
-                terminated.append(pid)
-        
-        return terminated
-    
-    def _find_malicious_files(
-        self,
-        process: ProcessInfo,
-    ) -> List[Path]:
-        """
-        Find files associated with a malicious process.
-        
-        Args:
-            process: Process information.
-            
-        Returns:
-            List of suspicious file paths.
-        """
-        files = []
-        
-        # Check /proc for executable path
-        proc_exe = Path(f"/proc/{process.pid}/exe")
-        if proc_exe.exists():
-            try:
-                exe_path = proc_exe.resolve()
-                if exe_path.exists() and str(exe_path).startswith(('/tmp', '/var/tmp', '/dev/shm')):
-                    files.append(exe_path)
-            except (OSError, PermissionError):
-                pass
-        
-        # Check working directory
-        if process.cwd and process.cwd.startswith(('/tmp', '/var/tmp', '/dev/shm')):
-            cwd = Path(process.cwd)
-            if cwd.exists():
-                files.append(cwd)
-        
-        # Check open files
-        for f in process.open_files:
-            if f.startswith(('/tmp', '/var/tmp', '/dev/shm')):
-                fp = Path(f)
-                if fp.exists():
-                    files.append(fp)
-        
-        return files
-    
-    def _cleanup_malicious_files(
-        self,
-        files: List[Path],
-    ) -> List[str]:
-        """
-        Remove malicious files.
-        
-        Args:
-            files: List of files to remove.
-            
-        Returns:
-            List of removed file paths.
-        """
-        removed = []
-        
-        if self.config.dry_run:
-            for f in files:
-                self.logger.info(f"[DRY RUN] Would remove: {f}")
-                removed.append(str(f))
-            return removed
-        
-        for f in files:
-            try:
-                if f.is_dir():
-                    import shutil
-                    shutil.rmtree(f)
-                else:
-                    f.unlink()
-                removed.append(str(f))
-                self.logger.debug(f"Removed malicious file: {f}")
-            except (OSError, PermissionError) as e:
-                self.logger.warning(f"Failed to remove {f}: {e}")
-        
-        return removed
-    
-    def _check_for_persistence(
-        self,
-        process: ProcessInfo,
-    ) -> List[Dict[str, str]]:
-        """
-        Check for persistence mechanisms related to the process.
-        
-        Args:
-            process: Process information.
-            
-        Returns:
-            List of persistence findings.
-        """
-        findings = []
-        
-        # Check crontabs
-        for user in ['root', process.user]:
-            result = run_command_sudo(["crontab", "-u", user, "-l"])
-            if result.success:
-                for line in result.stdout.split('\n'):
-                    if process.name.lower() in line.lower():
-                        findings.append({
-                            'type': 'crontab',
-                            'user': user,
-                            'content': line,
-                        })
-        
-        # Check systemd user services
-        user_service_dir = Path(f"/home/{process.user}/.config/systemd/user")
-        if user_service_dir.exists():
-            for service_file in user_service_dir.glob("*.service"):
-                try:
-                    content = service_file.read_text()
-                    if process.name.lower() in content.lower():
-                        findings.append({
-                            'type': 'systemd_user',
-                            'path': str(service_file),
-                            'content': content[:200],
-                        })
-                except (OSError, PermissionError):
-                    pass
-        
-        # Check /etc/rc.local
-        rc_local = Path("/etc/rc.local")
-        if rc_local.exists():
-            try:
-                content = rc_local.read_text()
-                if process.name.lower() in content.lower():
-                    findings.append({
-                        'type': 'rc_local',
-                        'path': str(rc_local),
-                        'content': content[:200],
-                    })
-            except (OSError, PermissionError):
-                pass
-        
-        return findings
-    
-    def _mitigate_threat(
-        self,
-        result: AnalysisResult,
-    ) -> ThreatReport:
-        """
-        Take action to mitigate a detected threat.
-        
-        Args:
-            result: Analysis result for the threat.
-            
-        Returns:
-            ThreatReport with actions taken.
-        """
-        process = result.process
-        actions_taken = []
-        
-        # Only terminate if:
-        # 1. auto_terminate is enabled
-        # 2. threat_level is "malicious" (100% confirmed threat)
-        # Suspicious processes are NEVER auto-terminated, only reported
-        is_malicious = result.threat_level == "malicious"
-        should_terminate = (
-            self.config.auto_terminate and
-            is_malicious and
-            not self.config.dry_run
-        )
-        
-        if should_terminate:
-            self.logger.warning(f"MALICIOUS PROCESS DETECTED - Taking action on PID {process.pid}")
-            
-            if result.recommended_action == "terminate_tree":
-                terminated = self._terminate_process_tree(process.pid)
-                if terminated:
-                    actions_taken.append(
-                        f"TERMINATED process tree ({len(terminated)} processes)"
-                    )
-            else:
-                if self._terminate_process(process.pid):
-                    actions_taken.append("TERMINATED process")
-            
-            # Find and remove malicious files
-            malicious_files = self._find_malicious_files(process)
-            if malicious_files:
-                removed = self._cleanup_malicious_files(malicious_files)
-                if removed:
-                    actions_taken.append(f"Removed {len(removed)} malicious files")
-            
-            # Check for persistence
-            persistence = self._check_for_persistence(process)
-            if persistence:
-                actions_taken.append(
-                    f"Found {len(persistence)} persistence mechanisms (manual review needed)"
-                )
-        elif is_malicious and self.config.dry_run:
-            actions_taken.append("DRY RUN - Would terminate (malicious)")
-        elif is_malicious and not self.config.auto_terminate:
-            actions_taken.append("Auto-terminate disabled - manual action required (MALICIOUS)")
-        else:
-            # Suspicious but not malicious - only monitor
-            actions_taken.append("Monitoring only (suspicious, not confirmed malicious)")
-        
-        return ThreatReport(
-            process_name=process.name,
-            pid=process.pid,
-            user=process.user,
-            cpu_percent=process.cpu_percent,
-            memory_percent=process.memory_percent,
-            command=process.command,
-            threat_level=result.threat_level,
-            confidence=result.confidence,
-            reason=result.reason,
-            parent_pid=process.parent_pid,
-            parent_name=process.parent_name,
-            action_taken="; ".join(actions_taken) if actions_taken else None,
-        )
-    
-    def scan_once(
-        self,
-        force_ai: bool = False,
-        analyze_all: bool = False,
-    ) -> List[ThreatReport]:
-        """
-        Perform a single scan for threats.
-        
-        Args:
-            force_ai: Force AI analysis even if no suspicious processes found locally.
-            analyze_all: Analyze ALL processes with AI (expensive).
-            
-        Returns:
-            List of threat reports.
-        """
-        self.logger.info("Starting process scan...")
-        
-        # Get all processes
-        processes = self._get_processes()
-        self.logger.debug(f"Found {len(processes)} running processes")
-        
-        # Analyze for threats
-        results = self.analyzer.analyze_processes(
+        processes = list_processes(cpu_sample_interval=cpu_sample_interval)
+        self.logger.debug(f"Scanned {len(processes)} processes")
+
+        observations = observe_processes(
             processes,
-            use_ai=self.config.use_ai,
-            force_ai=force_ai,
-            analyze_all=analyze_all,
+            cpu_threshold=self.config.cpu_threshold,
+            memory_threshold=self.config.memory_threshold,
         )
-        
-        if not results:
-            self.logger.success("No threats detected")
+
+        if not observations:
+            self.logger.debug("Nothing worth reporting")
             return []
 
-        # Log analysis summary
-        summary = self.analyzer.get_analysis_summary(results)
-        self.logger.warning(
-            f"Detected {summary['total_threats']} threats: "
-            f"{summary['malicious_count']} malicious, "
-            f"{summary['suspicious_count']} suspicious "
-            f"(avg confidence: {summary['avg_confidence']:.1%})"
+        warnings = sum(1 for o in observations if o.severity == SEVERITY_WARNING)
+        self.logger.info(
+            f"Noted {len(observations)} process(es) ({warnings} warning(s)). "
+            "Report only: no process was signalled."
         )
-        
-        # Separate malicious from suspicious
-        malicious_results = [r for r in results if r.threat_level == "malicious"]
-        suspicious_results = [r for r in results if r.threat_level == "suspicious"]
-        
-        # Create initial reports for ALL detected threats (warning report)
-        initial_reports = [
-            ThreatReport(
-                process_name=r.process.name,
-                pid=r.process.pid,
-                user=r.process.user,
-                cpu_percent=r.process.cpu_percent,
-                memory_percent=r.process.memory_percent,
-                command=r.process.command,
-                threat_level=r.threat_level,
-                confidence=r.confidence,
-                reason=r.reason,
-                parent_pid=r.process.parent_pid,
-                parent_name=r.process.parent_name,
+        for observation in observations:
+            self.logger.debug(
+                f"  {observation.severity}: {observation.process.name} "
+                f"(PID {observation.process.pid}) - {observation.detail}"
             )
-            for r in results
-        ]
-        
-        # STEP 1: Send initial WARNING report (always, for all threats)
-        self.logger.info("Sending initial warning report...")
+
+        stored: list[int] = []
         try:
-            self.notifier.send_threat_alert(initial_reports, is_final=False)
-        except Exception as e:
-            self.logger.error(f"Failed to send initial alert: {e}")
-        
-        # STEP 2: Only mitigate MALICIOUS processes (not suspicious)
-        final_reports = []
-        mitigation_performed = False
-        
-        for result in malicious_results:
-            self.logger.info(
-                f"Processing MALICIOUS threat: {result.process.name} "
-                f"(PID: {result.process.pid})"
-            )
-            report = self._mitigate_threat(result)
-            final_reports.append(report)
-            
-            if report.action_taken and "TERMINATED" in report.action_taken:
-                mitigation_performed = True
-            
-            if report.action_taken:
-                self.logger.info(f"  Action: {report.action_taken}")
-        
-        # Log suspicious processes (no action taken)
-        for result in suspicious_results:
-            self.logger.info(
-                f"Suspicious process (monitoring only): {result.process.name} "
-                f"(PID: {result.process.pid})"
-            )
-            # Create report for suspicious (no action)
-            final_reports.append(ThreatReport(
-                process_name=result.process.name,
-                pid=result.process.pid,
-                user=result.process.user,
-                cpu_percent=result.process.cpu_percent,
-                memory_percent=result.process.memory_percent,
-                command=result.process.command,
-                threat_level=result.threat_level,
-                confidence=result.confidence,
-                reason=result.reason,
-                parent_pid=result.process.parent_pid,
-                parent_name=result.process.parent_name,
-                action_taken="Monitoring only (suspicious, not confirmed malicious)",
-            ))
-        
-        # STEP 3: Send final report for audit purposes
-        # Always send if there were any threats (for audit trail)
-        if final_reports:
-            report_type = "mitigation" if mitigation_performed else "audit"
-            self.logger.info(f"Sending {report_type} report ({len(final_reports)} threat(s))...")
-            try:
-                self.notifier.send_threat_alert(final_reports, is_final=True)
-            except Exception as e:
-                self.logger.error(f"Failed to send {report_type} report: {e}")
+            stored = self.store.save_many(observations) or []
+        except WASMError as exc:
+            self.logger.error(f"Failed to persist observations: {exc}")
+        except OSError as exc:
+            self.logger.error(f"Failed to persist observations: {exc}")
 
-        # STEP 4: Persist threats to database for audit
-        if final_reports:
+        # Only new rows are worth an email. The store collapses a process that
+        # keeps doing the same thing into one row per window, and the report
+        # follows it: otherwise one busy process is a mail every scan interval.
+        if self.config.notify and stored:
             try:
-                saved_ids = self.threat_store.save_threats(final_reports)
-                self.logger.debug(f"Persisted {len(saved_ids)} threat(s) to database")
-            except Exception as e:
-                self.logger.error(f"Failed to persist threats: {e}")
+                self.notifier.send_observation_alert(observations)
+            except WASMError as exc:
+                self.logger.error(f"Failed to send observation report: {exc}")
 
-        return final_reports
-    
+        return observations
+
+    def _log_metrics(self) -> None:
+        """
+        Record a one-line resource summary, best effort.
+
+        Readings are not persisted: a time series would grow without bound for
+        a panel that only ever shows the current value. The line goes to debug
+        unless something is close enough to hurting to be worth a journal entry.
+        """
+        try:
+            metrics = self.collect_metrics()
+        except MonitorError as exc:
+            self.logger.debug(f"Resource metrics unavailable: {exc}")
+            return
+
+        disks = ", ".join(f"{d.mountpoint} {d.percent:.0f}%" for d in metrics.disks)
+        summary = (
+            f"CPU {metrics.cpu_percent:.1f}% | RAM {metrics.memory_percent:.1f}% | "
+            f"procs {metrics.process_count} | disks: {disks or 'n/a'}"
+        )
+
+        full_disks = [d for d in metrics.disks if d.percent >= DISK_ALERT_PERCENT]
+        if full_disks or metrics.memory_percent >= self.config.memory_threshold:
+            self.logger.warning(summary)
+        else:
+            self.logger.debug(summary)
+
+    def _report_services(self) -> None:
+        """Log any watched unit that is not active."""
+        for health in self.check_services():
+            if not health.active:
+                self.logger.warning(f"Service {health.unit} is {health.active_state or 'unknown'}")
+
     def run(self) -> None:
         """
-        Run the monitor continuously.
-        
-        Performs local pattern-matching scans every scan_interval seconds (default 30s),
-        and full AI analysis every ai_interval seconds (default 3600s = 1 hour).
+        Observe the machine until :meth:`stop` is called.
+
+        Scans, resource metrics and service checks all happen once per
+        interval; old observations are purged hourly as they age out.
         """
         self._running = True
-        
-        scan_interval = self.config.scan_interval
-        ai_interval = self.config.ai_interval
-        
-        self.logger.info(
-            f"Starting process monitor (local scan: {scan_interval}s, AI: {ai_interval}s)"
-        )
-        
-        # Track time since last AI analysis
-        time_since_ai = 0
-        
+        interval = max(MIN_SCAN_INTERVAL, self.config.scan_interval)
+        self.logger.info(f"Starting process monitor (scan every {interval}s, report only)")
+
         while self._running:
             try:
-                # Determine if we should use AI this scan
-                use_ai_this_scan = time_since_ai >= ai_interval
-                
-                if use_ai_this_scan:
-                    self.logger.info("Running full scan with AI analysis...")
-                    self.scan_once(force_ai=False, analyze_all=False)
-                    time_since_ai = 0
-                else:
-                    # Local pattern matching only (quick scan)
-                    self.logger.debug("Running quick local scan...")
-                    
-                    # Get processes and do quick pattern check
-                    processes = self._get_processes()
-                    
-                    # Only do pattern matching, no AI
-                    threats = []
-                    for process in processes:
-                        quick_result = self.analyzer._quick_check(process)
-                        if quick_result:
-                            threats.append(quick_result)
-                    
-                    if threats:
-                        self.logger.warning(
-                            f"Quick scan found {len(threats)} potential threats - "
-                            "triggering full AI scan"
-                        )
-                        # Trigger immediate AI scan
-                        self.scan_once(force_ai=True, analyze_all=False)
-                        time_since_ai = 0
-                    else:
-                        self.logger.debug("Quick scan: No threats detected")
-                        time_since_ai += scan_interval
-                        
-            except Exception as e:
-                self.logger.error(f"Scan error: {e}")
-            
-            # Wait for next scan
-            for _ in range(scan_interval):
+                self._log_metrics()
+                self._report_services()
+                self.scan_once()
+            except WASMError as exc:
+                self.logger.error(f"Scan failed: {exc}")
+            except OSError as exc:
+                self.logger.error(f"Scan failed to read the system: {exc}")
+
+            self._purge_old_observations()
+
+            for _ in range(interval):
                 if not self._running:
                     break
                 time.sleep(1)
-        
+
         self.logger.info("Process monitor stopped")
-    
+
     def stop(self) -> None:
-        """Stop the monitor."""
+        """Ask the monitor loop to finish the current interval and exit."""
         self._running = False
-    
-    def install_service(self) -> bool:
+
+    def _purge_old_observations(self) -> None:
         """
-        Install the monitor as a systemd service.
-        
+        Drop observations past the retention window, best effort.
+
+        Throttled: with a 60 second interval this would otherwise be 1.440
+        DELETE statements a day to remove rows that age out once.
+        """
+        now = time.monotonic()
+        if now - self._last_purge < PURGE_INTERVAL_SECONDS:
+            return
+        self._last_purge = now
+
+        try:
+            self.store.purge_older_than(self.config.retention_days)
+            self.store.enforce_limit()
+        except WASMError as exc:
+            self.logger.debug(f"Retention purge skipped: {exc}")
+        except OSError as exc:
+            self.logger.debug(f"Retention purge skipped: {exc}")
+
+    @property
+    def unit_path(self) -> Path:
+        """Path of the systemd unit this monitor installs."""
+        return SYSTEMD_DIR / f"{self.SERVICE_NAME}.service"
+
+    def _wasm_executable(self) -> str:
+        """
+        Locate the wasm entry point for the unit's ExecStart.
+
+        systemd has no PATH of its own, so a relative command in a unit file is
+        a service that fails to start.
+
         Returns:
-            True if installed successfully.
+            An absolute path to the wasm executable.
+
+        Raises:
+            MonitorError: When wasm cannot be found on PATH.
         """
-        import shutil
-        import sys
-        
-        # Find the wasm executable path
-        wasm_path = shutil.which("wasm")
-        if not wasm_path:
-            # Fallback to python -m wasm
-            python_path = sys.executable
-            wasm_path = f"{python_path} -m wasm"
-        
-        service_content = f"""# WASM Process Monitor Service
-# Generated by WASM
+        for directory in os.environ.get("PATH", "").split(os.pathsep):
+            if not directory:
+                continue
+            candidate = Path(directory) / "wasm"
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate.resolve())
+
+        raise MonitorError(
+            "Could not find the wasm executable to reference from the systemd unit",
+            details="Install WASM system-wide (pip install wasm-cli) before installing the service.",
+        )
+
+    def _unit_content(self) -> str:
+        """
+        Render the systemd unit.
+
+        Returns:
+            The unit file body.
+
+        Raises:
+            MonitorError: When the wasm executable cannot be located.
+        """
+        wasm_path = self._wasm_executable()
+
+        return f"""# WASM process monitor
+# Generated by WASM. Do not edit; reinstall with: wasm monitor install
 
 [Unit]
-Description=WASM AI-Powered Process Monitor
+Description=WASM process and resource monitor
 Documentation=https://github.com/Perkybeet/wasm
 After=network.target
 
@@ -812,19 +415,18 @@ After=network.target
 Type=simple
 User=root
 Group=root
-
-# Command
 ExecStart={wasm_path} monitor run
-
-# Restart policy
 Restart=always
 RestartSec=30
 
-# Security
-NoNewPrivileges=false
-PrivateTmp=true
+# The monitor only reads the system; deny it the ability to do anything else.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/wasm /var/log/wasm
+PrivateDevices=true
+RestrictSUIDSGID=true
 
-# Logging
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier={self.SERVICE_NAME}
@@ -832,274 +434,192 @@ SyslogIdentifier={self.SERVICE_NAME}
 [Install]
 WantedBy=multi-user.target
 """
-        
-        service_file = SYSTEMD_DIR / f"{self.SERVICE_NAME}.service"
-        
-        try:
-            # Write service file using write_file with sudo
-            if not write_file(service_file, service_content, sudo=True, mode=0o644):
-                raise MonitorError(
-                    "Failed to create service file",
-                    details=f"Could not write to {service_file}",
-                )
-            
-            # Reload systemd
-            run_command_sudo(["systemctl", "daemon-reload"])
-            
-            self.logger.success(f"Monitor service installed: {service_file}")
-            return True
-            
-        except Exception as e:
+
+    def install_service(self) -> bool:
+        """
+        Write the systemd unit and reload systemd.
+
+        Returns:
+            True when the unit was installed.
+
+        Raises:
+            MonitorError: When the unit cannot be written or systemd refuses.
+        """
+        if not write_file(self.unit_path, self._unit_content(), mode=0o644):
             raise MonitorError(
-                "Failed to install monitor service",
-                details=str(e),
+                f"Failed to write {self.unit_path}",
+                details="Installing a systemd unit requires root: run with sudo.",
             )
-    
+
+        result = self.runner.run(["systemctl", "daemon-reload"], timeout=SYSTEMCTL_TIMEOUT)
+        if not result.success:
+            raise MonitorError(
+                "systemd rejected the reload after installing the monitor unit",
+                details=result.stderr or result.stdout,
+            )
+
+        self.logger.success(f"Monitor service installed: {self.unit_path}")
+        return True
+
+    def _systemctl(self, *args: str, action: str) -> bool:
+        """
+        Run a systemctl subcommand against the monitor unit.
+
+        Args:
+            args: Arguments after ``systemctl``.
+            action: Human-readable action, used in the error message.
+
+        Returns:
+            True when systemctl succeeded.
+
+        Raises:
+            MonitorError: When systemctl failed.
+        """
+        result = self.runner.run(["systemctl", *args], timeout=SYSTEMCTL_TIMEOUT)
+        if not result.success:
+            raise MonitorError(
+                f"Failed to {action} the monitor service",
+                details=result.stderr or result.stdout or f"systemctl exited {result.exit_code}",
+            )
+        return True
+
     def enable_service(self) -> bool:
         """
-        Enable and start the monitor service.
-        
+        Enable the monitor unit and start it now.
+
         Returns:
-            True if enabled successfully.
+            True when systemd accepted the change.
+
+        Raises:
+            MonitorError: When systemctl failed.
         """
-        try:
-            result = run_command_sudo([
-                "systemctl", "enable", "--now", self.SERVICE_NAME
-            ])
-            
-            if result.success:
-                self.logger.success("Monitor service enabled and started")
-                return True
-            else:
-                raise MonitorError(
-                    "Failed to enable monitor service",
-                    details=result.stderr,
-                )
-        except Exception as e:
-            raise MonitorError(
-                "Failed to enable monitor service",
-                details=str(e),
-            )
-    
+        self._systemctl("enable", "--now", self.SERVICE_NAME, action="enable")
+        self.logger.success("Monitor service enabled and started")
+        return True
+
     def disable_service(self) -> bool:
         """
-        Disable and stop the monitor service.
-        
+        Disable the monitor unit and stop it now.
+
         Returns:
-            True if disabled successfully.
+            True when systemd accepted the change.
+
+        Raises:
+            MonitorError: When systemctl failed.
         """
-        try:
-            result = run_command_sudo([
-                "systemctl", "disable", "--now", self.SERVICE_NAME
-            ])
-            
-            if result.success:
-                self.logger.success("Monitor service disabled and stopped")
-                return True
-            else:
-                raise MonitorError(
-                    "Failed to disable monitor service",
-                    details=result.stderr,
-                )
-        except Exception as e:
-            raise MonitorError(
-                "Failed to disable monitor service",
-                details=str(e),
-            )
-    
+        self._systemctl("disable", "--now", self.SERVICE_NAME, action="disable")
+        self.logger.success("Monitor service disabled and stopped")
+        return True
+
     def start_service(self) -> bool:
         """
-        Start the monitor service (without enabling on boot).
-        
+        Start the monitor unit without enabling it at boot.
+
         Returns:
-            True if started successfully.
+            True when systemd accepted the change.
+
+        Raises:
+            MonitorError: When systemctl failed.
         """
-        import subprocess
-        try:
-            # Use subprocess directly for reliability
-            result = subprocess.run(
-                ["systemctl", "start", self.SERVICE_NAME],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            
-            if result.returncode == 0:
-                self.logger.success("Monitor service started")
-                return True
-            else:
-                raise MonitorError(
-                    "Failed to start monitor service",
-                    details=result.stderr or result.stdout,
-                )
-        except subprocess.TimeoutExpired:
-            raise MonitorError(
-                "Failed to start monitor service",
-                details="Command timed out",
-            )
-        except Exception as e:
-            raise MonitorError(
-                "Failed to start monitor service",
-                details=str(e),
-            )
-    
+        self._systemctl("start", self.SERVICE_NAME, action="start")
+        self.logger.success("Monitor service started")
+        return True
+
     def stop_service(self) -> bool:
         """
-        Stop the monitor service (without disabling on boot).
-        
+        Stop the monitor unit without disabling it at boot.
+
         Returns:
-            True if stopped successfully.
+            True when systemd accepted the change.
+
+        Raises:
+            MonitorError: When systemctl failed.
         """
-        import subprocess
-        try:
-            # Use subprocess directly for reliability
-            result = subprocess.run(
-                ["systemctl", "stop", self.SERVICE_NAME],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            
-            if result.returncode == 0:
-                self.logger.success("Monitor service stopped")
-                return True
-            else:
-                raise MonitorError(
-                    "Failed to stop monitor service",
-                    details=result.stderr or result.stdout,
-                )
-        except subprocess.TimeoutExpired:
-            raise MonitorError(
-                "Failed to stop monitor service",
-                details="Command timed out",
-            )
-        except Exception as e:
-            raise MonitorError(
-                "Failed to stop monitor service",
-                details=str(e),
-            )
-    
+        self._systemctl("stop", self.SERVICE_NAME, action="stop")
+        self.logger.success("Monitor service stopped")
+        return True
+
     def uninstall_service(self) -> bool:
         """
-        Uninstall the monitor service.
-        
+        Stop the monitor unit and delete the unit file WASM wrote.
+
         Returns:
-            True if uninstalled successfully.
+            True when the unit is gone.
+
+        Raises:
+            MonitorError: When systemd refuses the reload.
         """
-        try:
-            # Stop and disable first
-            run_command_sudo([
-                "systemctl", "disable", "--now", self.SERVICE_NAME
-            ])
-            
-            # Remove service file
-            service_file = SYSTEMD_DIR / f"{self.SERVICE_NAME}.service"
-            if service_file.exists():
-                run_command_sudo(["rm", str(service_file)])
-            
-            # Reload systemd
-            run_command_sudo(["systemctl", "daemon-reload"])
-            
-            self.logger.success("Monitor service uninstalled")
-            return True
-            
-        except Exception as e:
+        # Disabling a unit that is already gone is not an error worth failing on.
+        self.runner.run(
+            ["systemctl", "disable", "--now", self.SERVICE_NAME],
+            timeout=SYSTEMCTL_TIMEOUT,
+        )
+
+        # The only file this package ever deletes: a constant path, written by
+        # install_service, removed on explicit operator request. Nothing here is
+        # derived from observed process data.
+        if self.unit_path.exists() and not remove_file(self.unit_path):
             raise MonitorError(
-                "Failed to uninstall monitor service",
-                details=str(e),
+                f"Failed to delete {self.unit_path}",
+                details="Removing a systemd unit requires root: run with sudo.",
             )
-    
-    def get_service_status(self) -> Dict[str, Any]:
+
+        result = self.runner.run(["systemctl", "daemon-reload"], timeout=SYSTEMCTL_TIMEOUT)
+        if not result.success:
+            raise MonitorError(
+                "systemd rejected the reload after removing the monitor unit",
+                details=result.stderr or result.stdout,
+            )
+
+        self.logger.success("Monitor service uninstalled")
+        return True
+
+    def get_service_status(self) -> dict[str, Any]:
         """
-        Get monitor service status.
-        
+        Report what systemd knows about the monitor unit.
+
         Returns:
-            Status dictionary.
+            Keys: installed, enabled, active, pid, uptime.
         """
-        service_file = SYSTEMD_DIR / f"{self.SERVICE_NAME}.service"
-        
-        status = {
-            "installed": service_file.exists(),
+        status: dict[str, Any] = {
+            "installed": self.unit_path.exists(),
             "enabled": False,
             "active": False,
             "pid": None,
             "uptime": None,
         }
-        
         if not status["installed"]:
             return status
-        
-        # Check if enabled - use subprocess directly for reliability
-        import subprocess
-        try:
-            result = subprocess.run(
-                ["systemctl", "is-enabled", self.SERVICE_NAME],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-            enabled_status = result.stdout.strip().lower()
-            status["enabled"] = enabled_status == "enabled"
-        except Exception as e:
-            self.logger.debug(f"Failed to check if monitor service is enabled: {e}")
 
-        # Check if active
-        try:
-            result = subprocess.run(
-                ["systemctl", "is-active", self.SERVICE_NAME],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-            active_status = result.stdout.strip().lower()
-            status["active"] = active_status in ("active", "activating")
-        except Exception as e:
-            self.logger.debug(f"Failed to check if monitor service is active: {e}")
+        enabled = self.runner.run(
+            ["systemctl", "is-enabled", self.SERVICE_NAME],
+            timeout=SYSTEMCTL_TIMEOUT,
+        )
+        status["enabled"] = enabled.output in ("enabled", "enabled-runtime")
 
-        # Get detailed status for PID and uptime
-        try:
-            result = subprocess.run(
-                ["systemctl", "show", self.SERVICE_NAME,
-                 "--property=MainPID,ActiveEnterTimestamp,ActiveState"],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-            
-            if result.returncode == 0:
-                for line in result.stdout.strip().split('\n'):
-                    if '=' not in line:
-                        continue
-                    key, value = line.split('=', 1)
-                    value = value.strip()
-                    
-                    if key == "MainPID" and value and value != "0":
-                        try:
-                            status["pid"] = int(value)
-                        except ValueError:
-                            pass
-                    elif key == "ActiveEnterTimestamp" and value:
-                        status["uptime"] = value
-                    elif key == "ActiveState":
-                        # Double-check active state
-                        if value.lower() in ("active", "activating"):
-                            status["active"] = True
-        except Exception as e:
-            self.logger.debug(f"Failed to get detailed status for monitor service: {e}")
+        active = self.runner.run(
+            ["systemctl", "is-active", self.SERVICE_NAME],
+            timeout=SYSTEMCTL_TIMEOUT,
+        )
+        status["active"] = active.output in ("active", "activating")
 
-        # As a final fallback, check if the process is actually running
-        if not status["pid"] and status["active"]:
-            try:
-                import psutil
-                for proc in psutil.process_iter(['pid', 'cmdline']):
-                    try:
-                        cmdline = proc.info.get('cmdline') or []
-                        if cmdline and 'wasm' in ' '.join(cmdline) and 'monitor' in ' '.join(cmdline) and 'run' in ' '.join(cmdline):
-                            status["pid"] = proc.info['pid']
-                            break
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        continue
-            except ImportError:
-                pass
-        
+        shown = self.runner.run(
+            [
+                "systemctl",
+                "show",
+                self.SERVICE_NAME,
+                "--property=MainPID,ActiveEnterTimestamp,ActiveState",
+            ],
+            timeout=SYSTEMCTL_TIMEOUT,
+        )
+        for line in shown.output.splitlines():
+            key, _, value = line.partition("=")
+            value = value.strip()
+            if key == "MainPID" and value.isdigit() and value != "0":
+                status["pid"] = int(value)
+            elif key == "ActiveEnterTimestamp" and value:
+                status["uptime"] = value
+            elif key == "ActiveState" and value.lower() in ("active", "activating"):
+                status["active"] = True
+
         return status

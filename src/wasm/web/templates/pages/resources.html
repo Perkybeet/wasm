@@ -1,0 +1,42 @@
+{#
+  One template for every resource list.
+
+  Applications, services, sites and databases are all the same shape: a dense
+  list of rows carrying a state rail. Rendering them from one template is what
+  keeps them looking and behaving alike, so an operator learns the screen once.
+
+  The endpoints come from the context, already built. A template that
+  concatenates "/api/" with a resource kind is a template that can be wrong
+  about a route, and a button that posts to an address which does not exist is
+  worse than no button.
+#}
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+
+{% block title %}{{ title }}{% endblock %}
+
+{% block content %}
+
+{{ m.page_head(title, subtitle) }}
+
+{% if rows %}
+  <div class="rows">
+    {% for item in rows %}
+      {% call m.row(item.domain, item.state, item.meta, item.href, "row-" ~ item.id,
+                    none, item.state_text) %}
+        {% if item.log_url %}
+          {{ m.follow_button("Logs", item.domain, item.log_url) }}
+        {% endif %}
+        {% if item.restart_endpoint %}
+          {{ m.action_button("Restart", item.restart_endpoint) }}
+        {% endif %}
+        {{ m.danger_button("Delete", item.delete_endpoint, item.domain,
+                           item.delete_consequence) }}
+      {% endcall %}
+    {% endfor %}
+  </div>
+{% else %}
+  {{ m.empty(empty_title, empty_body, command=command) }}
+{% endif %}
+
+{% endblock %}

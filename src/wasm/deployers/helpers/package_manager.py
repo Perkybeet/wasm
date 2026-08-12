@@ -10,12 +10,11 @@ Node.js package managers (npm, pnpm, yarn, bun).
 """
 
 from pathlib import Path
-from typing import List, Literal, Optional
+from typing import Literal
 
 from wasm.core.exceptions import DeploymentError
 from wasm.core.logger import Logger
 from wasm.core.utils import command_exists
-
 
 PackageManager = Literal["npm", "pnpm", "bun", "yarn", "auto"]
 
@@ -28,7 +27,7 @@ class PackageManagerHelper:
     Node.js package managers.
     """
 
-    def __init__(self, logger: Optional[Logger] = None):
+    def __init__(self, logger: Logger | None = None):
         """
         Initialize package manager helper.
 
@@ -96,20 +95,19 @@ class PackageManagerHelper:
                     "Or install Node.js manually which includes npm:\n"
                     "  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -\n"
                     "  sudo apt install -y nodejs"
-                )
+                ),
             )
 
         # Fall back to first available package manager
         fallback = available[0]
         self.logger.warning(
-            f"Package manager '{package_manager}' not installed. "
-            f"Using '{fallback}' instead."
+            f"Package manager '{package_manager}' not installed. Using '{fallback}' instead."
         )
         self.logger.info(f"Available package managers: {', '.join(available)}")
 
         return fallback
 
-    def get_available(self) -> List[str]:
+    def get_available(self) -> list[str]:
         """
         Get list of available package managers.
 
@@ -122,7 +120,7 @@ class PackageManagerHelper:
                 available.append(pm)
         return available
 
-    def get_install_command(self, package_manager: str) -> List[str]:
+    def get_install_command(self, package_manager: str) -> list[str]:
         """
         Get the install command for the package manager.
 
@@ -140,7 +138,7 @@ class PackageManagerHelper:
         }
         return commands.get(package_manager, ["npm", "ci"])
 
-    def get_run_command(self, package_manager: str, script: str) -> List[str]:
+    def get_run_command(self, package_manager: str, script: str) -> list[str]:
         """
         Get the run command for a script.
 
@@ -160,7 +158,7 @@ class PackageManagerHelper:
         else:
             return ["npm", "run", script]
 
-    def get_exec_command(self, package_manager: str, command: str) -> List[str]:
+    def get_exec_command(self, package_manager: str, command: str) -> list[str]:
         """
         Get the exec/dlx command for running a binary.
 
@@ -174,10 +172,10 @@ class PackageManagerHelper:
         cmd_parts = command.split()
 
         if package_manager == "pnpm":
-            return ["pnpm", "exec"] + cmd_parts
+            return ["pnpm", "exec", *cmd_parts]
         elif package_manager == "bun":
-            return ["bunx"] + cmd_parts
+            return ["bunx", *cmd_parts]
         elif package_manager == "yarn":
-            return ["yarn"] + cmd_parts
+            return ["yarn", *cmd_parts]
         else:
-            return ["npx"] + cmd_parts
+            return ["npx", *cmd_parts]

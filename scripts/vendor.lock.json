@@ -1,0 +1,67 @@
+{
+  "alpine.min.js": {
+    "licence": "MIT",
+    "sha256": "04656d770039b55ac7a37aeecb92191de2c7775f61f2d0183331cc16c13f3f1e",
+    "url": "https://cdn.jsdelivr.net/npm/alpinejs@3.16.1/dist/cdn.min.js"
+  },
+  "fonts/ibm-plex-mono-latin-400-normal.woff2": {
+    "licence": "OFL-1.1",
+    "sha256": "08949f728dc52d528e69b1667d15c89a5686a4ee9a296ff90983985f99c380f7",
+    "url": "https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-mono@5.3.0/files/ibm-plex-mono-latin-400-normal.woff2"
+  },
+  "fonts/ibm-plex-mono-latin-500-normal.woff2": {
+    "licence": "OFL-1.1",
+    "sha256": "01d285447409c8a588692162439a038b8cbd7871309ee20267b0d2d91c6e8e22",
+    "url": "https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-mono@5.3.0/files/ibm-plex-mono-latin-500-normal.woff2"
+  },
+  "fonts/ibm-plex-sans-condensed-latin-500-normal.woff2": {
+    "licence": "OFL-1.1",
+    "sha256": "e3b4fd97fd20bc70fda66d8d5f0745d8d6958068a024cb4724bbc1ffb6cbc183",
+    "url": "https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-sans-condensed@5.3.0/files/ibm-plex-sans-condensed-latin-500-normal.woff2"
+  },
+  "fonts/ibm-plex-sans-condensed-latin-600-normal.woff2": {
+    "licence": "OFL-1.1",
+    "sha256": "3d72a0923c5830358b0a8e25b258aecadbecbf542b6ee9a25f387803e37d56b9",
+    "url": "https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-sans-condensed@5.3.0/files/ibm-plex-sans-condensed-latin-600-normal.woff2"
+  },
+  "fonts/ibm-plex-sans-latin-400-normal.woff2": {
+    "licence": "OFL-1.1",
+    "sha256": "3b646991d30055a93a4ecc499713d4347953a74a947ecab435ab72070cbdab0e",
+    "url": "https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-sans@5.3.0/files/ibm-plex-sans-latin-400-normal.woff2"
+  },
+  "fonts/ibm-plex-sans-latin-500-normal.woff2": {
+    "licence": "OFL-1.1",
+    "sha256": "0717336fb31fcdcde4b8deb3675bb4a0f7f6d484864afcd6751ac29975962203",
+    "url": "https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-sans@5.3.0/files/ibm-plex-sans-latin-500-normal.woff2"
+  },
+  "fonts/ibm-plex-sans-latin-600-normal.woff2": {
+    "licence": "OFL-1.1",
+    "sha256": "8960851d691c054ed38e259bdcf1a6190d157b4203ed5bb32c632a863fb8ec2f",
+    "url": "https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-sans@5.3.0/files/ibm-plex-sans-latin-600-normal.woff2"
+  },
+  "htmx.min.js": {
+    "licence": "BSD-2-Clause",
+    "sha256": "71ea67185bfa8c98c39d31717c6fce5d852370fcdfd129db4543774d3145c0de",
+    "url": "https://cdn.jsdelivr.net/npm/htmx.org@2.0.10/dist/htmx.min.js"
+  },
+  "uplot.min.css": {
+    "licence": "MIT",
+    "sha256": "df630c6a8d6f8eeaff264b50f73ce5b114f646ffd9a0bb74f049b0a00135fa04",
+    "url": "https://cdn.jsdelivr.net/npm/uplot@1.6.32/dist/uPlot.min.css"
+  },
+  "uplot.min.js": {
+    "licence": "MIT",
+    "sha256": "19c8d4c6ad88929a79f4ae49d6f7161566dfd0ba3d15cc495e974f787eb78f1f",
+    "url": "https://cdn.jsdelivr.net/npm/uplot@1.6.32/dist/uPlot.iife.min.js"
+  },
+  "xterm.css": {
+    "licence": "MIT",
+    "sha256": "854a7c0fb70e8b1a083c16797ab827299fb18744f5ad34f227b48337e33293c6",
+    "url": "https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/css/xterm.css"
+  },
+  "xterm.js": {
+    "licence": "MIT",
+    "sha256": "14903579ff54664cd72f8e8699e6961a6272c21863ec1c3b118cdc8af5d4a972",
+    "url": "https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/lib/xterm.js"
+  }
+}

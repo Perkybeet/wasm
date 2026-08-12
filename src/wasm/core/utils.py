@@ -3,191 +3,188 @@ Utility functions for WASM.
 
 Common helper functions for shell commands, file operations,
 string manipulation, and other utilities.
+
+The command helpers here are a thin facade over
+:class:`~wasm.core.runner.CommandRunner`. They exist so that legacy call sites
+keep working, not as a second way to reach the machine: every one of them
+delegates, which is what makes ``--dry-run``, the timeout policy and the
+"no real subprocess in tests" guarantee hold for the whole program.
 """
+
+from __future__ import annotations
 
 import os
 import re
 import shutil
-import subprocess
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Dict, List, Optional, Union
 
+from wasm.core.runner import DEFAULT_TIMEOUT, CommandResult, CommandRunner, get_runner
 
-@dataclass
-class CommandResult:
-    """Result of a shell command execution."""
-    
-    success: bool
-    stdout: str
-    stderr: str
-    exit_code: int
-    command: str
-    
-    def __bool__(self) -> bool:
-        """Allow using result in boolean context."""
-        return self.success
+__all__ = [
+    "DEFAULT_COMMAND_TIMEOUT",
+    "TRUSTED_INSTALLER_URLS",
+    "CommandResult",
+    "check_root",
+    "command_exists",
+    "copy_file",
+    "create_symlink",
+    "domain_to_app_name",
+    "ensure_directory",
+    "find_available_port",
+    "format_bytes",
+    "format_duration",
+    "get_system_info",
+    "is_port_in_use",
+    "legacy_app_name",
+    "read_file",
+    "remove_directory",
+    "remove_file",
+    "run_command",
+    "run_trusted_installer",
+    "sanitize_name",
+    "validate_url",
+    "write_file",
+]
+
+#: Deadline used when a caller does not pass one. A finite default is the whole
+#: point: the previous ``timeout=None`` meant 89% of the call sites could hang
+#: a deploy forever.
+DEFAULT_COMMAND_TIMEOUT = DEFAULT_TIMEOUT
+
+#: Installer scripts are fetched and piped to bash; give them room to compile.
+INSTALLER_TIMEOUT = 300
 
 
 def run_command(
-    command: Union[str, List[str]],
-    cwd: Optional[Path] = None,
-    env: Optional[Dict[str, str]] = None,
-    capture_output: bool = True,
-    timeout: Optional[int] = None,
-    shell: bool = False,
+    command: Sequence[str],
+    cwd: Path | None = None,
+    env: Mapping[str, str] | None = None,
+    timeout: int = DEFAULT_COMMAND_TIMEOUT,
+    *,
+    runner: CommandRunner | None = None,
 ) -> CommandResult:
     """
-    Execute a shell command.
-    
+    Execute an external command through the process-wide command runner.
+
     Args:
-        command: Command to execute (string or list of arguments).
+        command: Program and arguments. Must be a sequence; a bare string is
+            rejected because splitting one is how quoted paths and injected
+            arguments used to become separate words.
         cwd: Working directory for the command.
-        env: Environment variables to set.
-        capture_output: Whether to capture stdout/stderr.
-        timeout: Command timeout in seconds.
-        shell: Whether to run command through shell.
-        
+        env: Extra environment variables, merged over the current environment.
+        timeout: Deadline in seconds. Always finite.
+        runner: Runner to execute with. Defaults to the process-wide runner,
+            which is what honours ``--dry-run``.
+
     Returns:
-        CommandResult with execution results.
+        The command outcome.
+
+    Raises:
+        ValueError: If ``command`` is a string or an empty sequence.
     """
-    # Prepare command
-    if isinstance(command, str) and not shell:
-        cmd_list = command.split()
-    else:
-        cmd_list = command
-    
-    cmd_str = command if isinstance(command, str) else " ".join(command)
-    
-    # Prepare environment
-    run_env = os.environ.copy()
-    if env:
-        run_env.update(env)
-    
-    try:
-        result = subprocess.run(
-            cmd_list,
-            cwd=cwd,
-            env=run_env,
-            capture_output=capture_output,
-            text=True,
-            timeout=timeout,
-            shell=shell,
+    if isinstance(command, (str, bytes)):
+        raise ValueError(
+            "run_command expects a sequence of arguments, not a string. "
+            "Pass ['git', 'clone', url] instead of 'git clone ' + url; "
+            "string splitting breaks quoted paths and hides injection."
         )
-        
-        return CommandResult(
-            success=result.returncode == 0,
-            stdout=result.stdout or "",
-            stderr=result.stderr or "",
-            exit_code=result.returncode,
-            command=cmd_str,
-        )
-    except subprocess.TimeoutExpired:
-        return CommandResult(
-            success=False,
-            stdout="",
-            stderr=f"Command timed out after {timeout} seconds",
-            exit_code=-1,
-            command=cmd_str,
-        )
-    except FileNotFoundError:
-        return CommandResult(
-            success=False,
-            stdout="",
-            stderr=f"Command not found: {cmd_list[0] if cmd_list else command}",
-            exit_code=127,
-            command=cmd_str,
-        )
-    except Exception as e:
-        return CommandResult(
-            success=False,
-            stdout="",
-            stderr=str(e),
-            exit_code=-1,
-            command=cmd_str,
-        )
+    active = runner if runner is not None else get_runner()
+    return active.run(list(command), cwd=cwd, env=env, timeout=timeout)
 
 
 def run_command_sudo(
-    command: Union[str, List[str]],
-    cwd: Optional[Path] = None,
-    env: Optional[Dict[str, str]] = None,
-    timeout: Optional[int] = None,
+    command: Sequence[str],
+    cwd: Path | None = None,
+    env: Mapping[str, str] | None = None,
+    timeout: int = DEFAULT_COMMAND_TIMEOUT,
 ) -> CommandResult:
     """
-    Execute a shell command with sudo.
-    
+    Deprecated. Execute a command as the current (root) account.
+
+    Decision D6 of the v1 design is that WASM requires root, so prefixing
+    argument vectors with ``sudo`` bought nothing and hid the requirement: on a
+    root shell it forked an extra process, and on a non-root shell it produced a
+    password prompt in the middle of a deploy. This shim survives only so that
+    call sites outside this module keep importing; it no longer adds ``sudo``.
+    New code must call :func:`run_command` or the runner directly.
+
     Args:
-        command: Command to execute.
-        cwd: Working directory.
-        env: Environment variables.
-        timeout: Command timeout in seconds.
-        
+        command: Program and arguments.
+        cwd: Working directory for the command.
+        env: Extra environment variables.
+        timeout: Deadline in seconds.
+
     Returns:
-        CommandResult with execution results.
+        The command outcome.
+
+    Raises:
+        ValueError: If ``command`` is a string or an empty sequence.
     """
-    if isinstance(command, str):
-        cmd_list = ["sudo"] + command.split()
-    else:
-        cmd_list = ["sudo"] + list(command)
-    
-    return run_command(cmd_list, cwd=cwd, env=env, timeout=timeout)
+    return run_command(command, cwd=cwd, env=env, timeout=timeout)
 
 
 # Whitelist of trusted installer URLs
-TRUSTED_INSTALLER_URLS = frozenset([
-    "https://deb.nodesource.com/setup_20.x",
-    "https://deb.nodesource.com/setup_22.x",
-    "https://bun.sh/install",
-    "https://get.pnpm.io/install.sh",
-])
+TRUSTED_INSTALLER_URLS = frozenset(
+    [
+        "https://deb.nodesource.com/setup_20.x",
+        "https://deb.nodesource.com/setup_22.x",
+        "https://bun.sh/install",
+        "https://get.pnpm.io/install.sh",
+    ]
+)
 
 
 def run_trusted_installer(
     url: str,
-    timeout: Optional[int] = 300,
+    timeout: int = INSTALLER_TIMEOUT,
+    *,
+    runner: CommandRunner | None = None,
 ) -> CommandResult:
     """
-    Execute a trusted installation script via curl | bash.
+    Download a whitelisted installer script and execute it with bash.
 
-    Only allows whitelisted URLs to prevent command injection.
-    This function is designed for installing well-known development tools
-    (Node.js, Bun, pnpm) from their official sources.
+    The script is fetched first and handed to ``bash -s`` on stdin, so there is
+    no shell pipeline and no point at which the URL is reinterpreted as shell
+    syntax. Only the whitelisted URLs are accepted.
 
     Args:
-        url: URL of the installer script (must be in whitelist).
-        timeout: Command timeout in seconds (default: 5 minutes).
+        url: URL of the installer script (must be in the whitelist).
+        timeout: Deadline in seconds for each of the two steps.
+        runner: Runner to execute with. Defaults to the process-wide runner.
 
     Returns:
-        CommandResult with execution results.
+        The outcome of the installer script, or of the download when it failed.
 
     Raises:
-        SecurityError: If URL is not in the trusted whitelist.
+        SecurityError: If the URL is not in the trusted whitelist.
     """
     from wasm.core.exceptions import SecurityError
 
     if url not in TRUSTED_INSTALLER_URLS:
         raise SecurityError(
             f"Untrusted installer URL: {url}",
-            f"Only the following URLs are allowed:\n"
-            + "\n".join(f"  - {u}" for u in sorted(TRUSTED_INSTALLER_URLS))
+            "Only the following URLs are allowed:\n"
+            + "\n".join(f"  - {u}" for u in sorted(TRUSTED_INSTALLER_URLS)),
         )
 
-    # Use shell=True only for pipe, but URL is validated above
-    return run_command(
-        f"curl -fsSL '{url}' | bash",
-        shell=True,
-        timeout=timeout,
-    )
+    active = runner if runner is not None else get_runner()
+    download = active.run(["curl", "-fsSL", url], timeout=timeout)
+    if not download.success:
+        return download
+
+    # ``bash -s`` reads the program from stdin, so the script never becomes part
+    # of an argument vector and never reaches a shell as text to be parsed.
+    return active.run(["bash", "-s"], input=download.stdout, timeout=timeout)
 
 
 def command_exists(command: str) -> bool:
     """
     Check if a command exists in PATH.
-    
+
     Args:
         command: Command name to check.
-        
+
     Returns:
         True if command exists, False otherwise.
     """
@@ -197,13 +194,13 @@ def command_exists(command: str) -> bool:
 def sanitize_name(name: str) -> str:
     """
     Sanitize a name for use as filename or service name.
-    
+
     Converts domain names or other strings to safe identifiers.
     Example: "my-app.example.com" -> "my-app-example-com"
-    
+
     Args:
         name: Name to sanitize.
-        
+
     Returns:
         Sanitized name.
     """
@@ -247,201 +244,174 @@ def legacy_app_name(domain: str) -> str:
 def ensure_directory(path: Path, mode: int = 0o755) -> bool:
     """
     Ensure a directory exists, creating it if necessary.
-    
+
     Args:
         path: Directory path.
         mode: Permission mode for new directories.
-        
+
     Returns:
         True if directory exists or was created.
     """
     try:
         path.mkdir(parents=True, exist_ok=True, mode=mode)
         return True
-    except Exception:
+    except OSError:
         return False
 
 
 def ensure_directory_sudo(path: Path, owner: str = "www-data", group: str = "www-data") -> bool:
     """
-    Ensure a directory exists using sudo.
-    
+    Ensure a directory exists and belongs to the given account.
+
     Args:
         path: Directory path.
-        owner: Owner user.
-        group: Owner group.
-        
+        owner: Owner user name.
+        group: Owner group name.
+
     Returns:
-        True if successful.
+        True if the directory exists and ownership was applied.
     """
-    result = run_command_sudo(["mkdir", "-p", str(path)])
-    if not result.success:
+    import grp
+    import pwd
+
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        uid = pwd.getpwnam(owner).pw_uid
+        gid = grp.getgrnam(group).gr_gid
+        os.chown(path, uid, gid)
+        return True
+    except (OSError, KeyError):
         return False
-    
-    result = run_command_sudo(["chown", f"{owner}:{group}", str(path)])
-    return result.success
 
 
 def copy_file(src: Path, dest: Path, sudo: bool = False) -> bool:
     """
     Copy a file.
-    
+
     Args:
         src: Source file path.
         dest: Destination file path.
-        sudo: Use sudo for the operation.
-        
+        sudo: Ignored. WASM already runs as root, so shelling out to ``sudo cp``
+            only added a process and a PATH dependency.
+
     Returns:
         True if successful.
     """
-    if sudo:
-        return run_command_sudo(["cp", str(src), str(dest)]).success
-    
     try:
         shutil.copy2(src, dest)
         return True
-    except Exception:
+    except OSError:
         return False
 
 
 def write_file(path: Path, content: str, sudo: bool = False, mode: int = 0o644) -> bool:
     """
     Write content to a file.
-    
+
     Args:
         path: File path.
         content: Content to write.
-        sudo: Use sudo for the operation.
+        sudo: Ignored. See :func:`copy_file`.
         mode: File permission mode.
-        
+
     Returns:
         True if successful.
     """
-    if sudo:
-        # Write to temp file, then move with sudo
-        import tempfile
-        try:
-            with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".tmp") as f:
-                f.write(content)
-                temp_path = f.name
-            
-            result = run_command_sudo(["mv", temp_path, str(path)])
-            if result.success:
-                run_command_sudo(["chmod", oct(mode)[2:], str(path)])
-            return result.success
-        except Exception:
-            return False
-    
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content)
         path.chmod(mode)
         return True
-    except Exception:
+    except OSError:
         return False
 
 
-def read_file(path: Path, sudo: bool = False) -> Optional[str]:
+def read_file(path: Path, sudo: bool = False) -> str | None:
     """
     Read content from a file.
-    
+
     Args:
         path: File path.
-        sudo: Use sudo for the operation.
-        
+        sudo: Ignored. See :func:`copy_file`.
+
     Returns:
-        File content or None if failed.
+        File content or None if it could not be read.
     """
-    if sudo:
-        result = run_command_sudo(["cat", str(path)])
-        return result.stdout if result.success else None
-    
     try:
         return path.read_text()
-    except Exception:
+    except OSError:
         return None
 
 
 def remove_file(path: Path, sudo: bool = False) -> bool:
     """
     Remove a file.
-    
+
     Args:
         path: File path.
-        sudo: Use sudo for the operation.
-        
+        sudo: Ignored. See :func:`copy_file`.
+
     Returns:
         True if successful.
     """
-    if sudo:
-        return run_command_sudo(["rm", "-f", str(path)]).success
-    
     try:
         path.unlink(missing_ok=True)
         return True
-    except Exception:
+    except OSError:
         return False
 
 
 def remove_directory(path: Path, sudo: bool = False) -> bool:
     """
     Remove a directory recursively.
-    
+
     Args:
         path: Directory path.
-        sudo: Use sudo for the operation.
-        
+        sudo: Ignored. See :func:`copy_file`.
+
     Returns:
         True if successful.
     """
-    if sudo:
-        return run_command_sudo(["rm", "-rf", str(path)]).success
-    
     try:
         shutil.rmtree(path, ignore_errors=True)
         return True
-    except Exception:
+    except OSError:
         return False
 
 
 def create_symlink(source: Path, link: Path, sudo: bool = False) -> bool:
     """
-    Create a symbolic link.
-    
+    Create a symbolic link, replacing any existing one.
+
     Args:
         source: Source path.
         link: Link path.
-        sudo: Use sudo for the operation.
-        
+        sudo: Ignored. See :func:`copy_file`.
+
     Returns:
         True if successful.
     """
-    if sudo:
-        # Remove existing link first
-        run_command_sudo(["rm", "-f", str(link)])
-        return run_command_sudo(["ln", "-s", str(source), str(link)]).success
-    
     try:
         link.unlink(missing_ok=True)
         link.symlink_to(source)
         return True
-    except Exception:
+    except OSError:
         return False
 
 
-def find_available_port(start: int = 3000, end: int = 9000) -> Optional[int]:
+def find_available_port(start: int = 3000, end: int = 9000) -> int | None:
     """
     Find an available port in the given range.
-    
+
     Args:
         start: Start of port range.
         end: End of port range.
-        
+
     Returns:
         Available port number or None.
     """
     import socket
-    
+
     for port in range(start, end):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -449,22 +419,22 @@ def find_available_port(start: int = 3000, end: int = 9000) -> Optional[int]:
                 return port
         except OSError:
             continue
-    
+
     return None
 
 
 def is_port_in_use(port: int) -> bool:
     """
     Check if a port is in use.
-    
+
     Args:
         port: Port number to check.
-        
+
     Returns:
         True if port is in use.
     """
     import socket
-    
+
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.bind(("127.0.0.1", port))
@@ -473,27 +443,27 @@ def is_port_in_use(port: int) -> bool:
         return True
 
 
-def get_system_info() -> Dict[str, str]:
+def get_system_info() -> dict[str, str]:
     """
     Get basic system information.
-    
+
     Returns:
         Dictionary with system information.
     """
     info = {}
-    
+
     # OS info
     result = run_command(["lsb_release", "-d", "-s"])
     info["os"] = result.stdout.strip() if result.success else "Unknown"
-    
+
     # Kernel
     result = run_command(["uname", "-r"])
     info["kernel"] = result.stdout.strip() if result.success else "Unknown"
-    
+
     # Check for nginx
     result = run_command(["nginx", "-v"])
     info["nginx"] = result.stderr.split("/")[1].strip() if result.success else "Not installed"
-    
+
     # Check for apache
     result = run_command(["apache2", "-v"])
     if result.success:
@@ -501,22 +471,22 @@ def get_system_info() -> Dict[str, str]:
         info["apache"] = match.group(1) if match else "Installed"
     else:
         info["apache"] = "Not installed"
-    
+
     # Node.js
     result = run_command(["node", "--version"])
     info["nodejs"] = result.stdout.strip() if result.success else "Not installed"
-    
+
     # Python
     result = run_command(["python3", "--version"])
     info["python"] = result.stdout.strip() if result.success else "Not installed"
-    
+
     return info
 
 
 def check_root() -> bool:
     """
     Check if running as root.
-    
+
     Returns:
         True if running as root.
     """
@@ -526,10 +496,10 @@ def check_root() -> bool:
 def validate_url(url: str) -> bool:
     """
     Validate a URL.
-    
+
     Args:
         url: URL to validate.
-        
+
     Returns:
         True if valid URL.
     """
@@ -542,37 +512,38 @@ def validate_url(url: str) -> bool:
         r"(?:/?|[/?]\S+)$",
         re.IGNORECASE,
     )
-    
+
     # Also check for git SSH format
     git_ssh_pattern = re.compile(r"^git@[\w.-]+:[\w./-]+\.git$")
-    
+
     return bool(url_pattern.match(url) or git_ssh_pattern.match(url))
 
 
 def format_bytes(bytes_size: int) -> str:
     """
     Format bytes to human readable string.
-    
+
     Args:
         bytes_size: Size in bytes.
-        
+
     Returns:
         Human readable size string.
     """
+    size = float(bytes_size)
     for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if bytes_size < 1024:
-            return f"{bytes_size:.1f} {unit}"
-        bytes_size /= 1024
-    return f"{bytes_size:.1f} PB"
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} PB"
 
 
 def format_duration(seconds: float) -> str:
     """
     Format seconds to human readable duration.
-    
+
     Args:
         seconds: Duration in seconds.
-        
+
     Returns:
         Human readable duration string.
     """

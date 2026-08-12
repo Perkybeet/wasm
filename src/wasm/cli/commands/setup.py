@@ -1,764 +1,1227 @@
+# Copyright (c) 2024-2026 Yago Lopez Prado
+# Licensed under WASM-NCSAL 1.0 (Commercial use prohibited)
+# https://github.com/Perkybeet/wasm/blob/main/LICENSE
+
 """
-Setup command handlers for WASM - initial setup, completions, permissions, and doctor.
+Setup commands: prepare the machine, then prove it is ready.
+
+The configuration directory is deliberately owner-only. ``config.yaml`` holds the
+MySQL root password, the SMTP account and the OpenAI API key, and WASM is a
+root-only tool (it drives systemd, nginx and certbot), so nothing legitimate
+reads that directory as another account. The consequence, and it is intentional:
+running the web panel or any WASM command as a non-root user will not be able to
+read ``/etc/wasm/config.yaml``. That is the privilege model, not a bug to be
+fixed by widening the directory.
+
+Two things this module refuses to do, because both were lies the previous
+version told:
+
+- **Install by guessing.** Every install used to be ``apt-get``, so on Fedora,
+  openSUSE or Arch the wizard reported progress while installing nothing. The
+  package manager is detected, and when there is none WASM says so instead of
+  failing one opaque command at a time.
+- **Report success it did not achieve.** ``setup init`` printed "Setup
+  Complete!" and exited 0 even when every single install had failed. The exit
+  status and the final message now describe what actually happened.
+- **Change the machine during a rehearsal.** ``setup init --dry-run`` created
+  /etc/wasm, wrote config.yaml and installed the man page, because the flag only
+  swapped the command runner and every one of those is a plain filesystem call.
+  Every write here now goes through :mod:`wasm.core.fs`, and each step reports
+  what is on disk afterwards rather than what it asked for.
 """
+
+from __future__ import annotations
 
 import os
 import sys
-import shutil
 from argparse import Namespace
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, NoReturn
 
-from wasm.core.logger import Logger
+import click
+
+from wasm.cli.app import Context, enable_dry_run, pass_context
+from wasm.core.config import (
+    DEFAULT_APPS_DIR,
+    DEFAULT_CONFIG_PATH,
+    DEFAULT_LOG_DIR,
+    SECRET_DIR_MODE,
+    secure_directory,
+)
 from wasm.core.exceptions import WASMError
-from wasm.core.config import DEFAULT_APPS_DIR, DEFAULT_LOG_DIR, DEFAULT_CONFIG_PATH
-from wasm.core.utils import command_exists, run_command, run_command_sudo, run_trusted_installer
+from wasm.core.fs import FileSystem, get_fs
+from wasm.core.logger import Logger, set_colors_disabled
+from wasm.core.utils import command_exists, run_command, run_trusted_installer
+
+if TYPE_CHECKING:
+    from wasm.core.dependencies import DependencyChecker, SetupSummary
+
+#: Where a system-wide man page belongs. A module constant so a test can point
+#: it somewhere harmless.
+MAN_PAGE_DIR = Path("/usr/share/man/man1")
+
+#: Shells WASM can generate completions for, in the order they are offered.
+COMPLETION_SHELLS = ("bash", "zsh", "fish")
+
+#: Environment variable Click reads to produce completions for ``wasm``.
+COMPLETE_VAR = "_WASM_COMPLETE"
 
 
-def handle_setup(args: Namespace) -> int:
+class SetupError(WASMError):
+    """The machine cannot be prepared as asked."""
+
+
+# ---------------------------------------------------------------------------
+# Global flags
+# ---------------------------------------------------------------------------
+
+
+def _fold_into_context(attribute: str) -> Callable[[click.Context, click.Parameter, bool], bool]:
     """
-    Handle setup commands.
-    
+    Build the callback that records a global flag on the shared context.
+
+    The root group turns ``--dry-run`` on when it comes before the subcommand.
+    When it comes after, the root callback has already run, so the flag is
+    turned on here through the same :func:`~wasm.cli.app.enable_dry_run`: a
+    second implementation is how ``wasm setup init --dry-run`` ended up swapping
+    the command runner and not the filesystem, and creating /etc/wasm anyway.
+
     Args:
-        args: Parsed arguments.
-        
+        attribute: Name of the :class:`~wasm.cli.app.Context` attribute to set.
+
     Returns:
-        Exit code.
+        A Click option callback.
     """
-    action = args.action
-    
-    handlers = {
-        "completions": _handle_completions,
-        "init": _handle_init,
-        "permissions": _handle_permissions,
-        "ssh": _handle_ssh,
-        "doctor": _handle_doctor,
-    }
-    
-    handler = handlers.get(action)
-    if not handler:
-        print(f"Unknown action: {action}", file=sys.stderr)
-        return 1
-    
-    try:
-        return handler(args)
-    except WASMError as e:
-        logger = Logger(verbose=args.verbose)
-        logger.error(str(e))
-        return 1
-    except Exception as e:
-        logger = Logger(verbose=args.verbose)
-        logger.error(f"Unexpected error: {e}")
-        if args.verbose:
-            import traceback
-            traceback.print_exc()
-        return 1
+
+    def fold(ctx: click.Context, param: click.Parameter, value: bool) -> bool:
+        if not value:
+            return value
+        state = ctx.ensure_object(Context)
+        setattr(state, attribute, True)
+        if attribute == "no_color":
+            set_colors_disabled(True)
+        elif attribute == "dry_run":
+            enable_dry_run(state)
+        return value
+
+    return fold
 
 
-def _handle_completions(args: Namespace) -> int:
-    """Handle completions setup command."""
-    logger = Logger(verbose=args.verbose)
-    shell = args.shell
-    
-    # Auto-detect shell if not specified
-    if not shell:
-        shell = _detect_shell()
-        if not shell:
-            logger.error("Could not detect shell. Please specify with --shell")
-            return 1
-    
-    logger.header("WASM Shell Completions Setup")
-    logger.key_value("Shell", shell)
-    logger.blank()
-    
-    # Get completion script path (from cli/commands/ up to wasm/completions/)
-    completions_dir = Path(__file__).parent.parent.parent / "completions"
-    
-    if shell == "bash":
-        return _install_bash_completions(logger, completions_dir, args.user_only)
-    elif shell == "zsh":
-        return _install_zsh_completions(logger, completions_dir, args.user_only)
-    elif shell == "fish":
-        return _install_fish_completions(logger, completions_dir, args.user_only)
-    else:
-        logger.error(f"Unsupported shell: {shell}")
-        return 1
+def global_flags(command: Callable[..., Any]) -> Callable[..., Any]:
+    """
+    Re-offer the root group's flags on a subcommand.
+
+    ``wasm setup init --verbose`` is in scripts, in the published documentation
+    and in muscle memory, so the flags have to keep parsing after the
+    subcommand name. None of these options owns a value: they are eager, they
+    do not reach the command function, and their callbacks only ever switch the
+    shared context on. A subcommand therefore cannot undo a flag the user set
+    before the subcommand name, which is exactly how ``wasm --dry-run monitor
+    scan`` used to run for real.
+
+    Args:
+        command: The function being decorated into a Click command.
+
+    Returns:
+        The decorated function.
+    """
+    options = [
+        click.option(
+            "-v",
+            "--verbose",
+            is_flag=True,
+            is_eager=True,
+            expose_value=False,
+            callback=_fold_into_context("verbose"),
+            help="Show the detail of each step.",
+        ),
+        click.option(
+            "--dry-run",
+            is_flag=True,
+            is_eager=True,
+            expose_value=False,
+            callback=_fold_into_context("dry_run"),
+            help="Rehearse without changing anything.",
+        ),
+        click.option(
+            "--no-color",
+            is_flag=True,
+            is_eager=True,
+            expose_value=False,
+            callback=_fold_into_context("no_color"),
+            help="Never emit colour.",
+        ),
+    ]
+    for option in reversed(options):
+        command = option(command)
+    return command
 
 
-def _detect_shell() -> str | None:
-    """Detect the current shell."""
-    shell_path = os.environ.get("SHELL", "")
-    if "bash" in shell_path:
-        return "bash"
-    elif "zsh" in shell_path:
-        return "zsh"
-    elif "fish" in shell_path:
-        return "fish"
+def _exit(code: int) -> NoReturn:
+    """
+    Leave the command with a status the calling shell can test.
+
+    Args:
+        code: Process exit status.
+
+    Raises:
+        click.exceptions.Exit: Always; this is how Click unwinds.
+    """
+    click.get_current_context().exit(code)
+
+
+# ---------------------------------------------------------------------------
+# Distribution packages
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PackageManager:
+    """
+    How to install software on one family of distributions.
+
+    Attributes:
+        program: Executable that drives the package database.
+        refresh: Argument vector that refreshes the package lists.
+        install: Argument vector prefix that installs without prompting.
+        packages: WASM's name for a package to this family's name for it.
+        services: WASM's name for a daemon to this family's unit name.
+    """
+
+    program: str
+    refresh: tuple[str, ...]
+    install: tuple[str, ...]
+    packages: dict[str, str]
+    services: dict[str, str]
+
+    def package_for(self, name: str) -> str | None:
+        """
+        Translate a WASM package name into a distribution package name.
+
+        Args:
+            name: WASM's name for the package, such as "certbot-nginx".
+
+        Returns:
+            The distribution's package name, or None when this family does not
+            ship it.
+        """
+        return self.packages.get(name)
+
+    def service_for(self, name: str) -> str:
+        """
+        Translate a WASM daemon name into a systemd unit name.
+
+        Args:
+            name: WASM's name for the daemon, such as "apache".
+
+        Returns:
+            The unit name to hand to systemctl.
+        """
+        return self.services.get(name, name)
+
+
+#: Supported package managers, most widely deployed first. Detection is by the
+#: presence of the executable, which is also what tells apt-based and dnf-based
+#: systems apart on machines that carry both.
+PACKAGE_MANAGERS: tuple[PackageManager, ...] = (
+    PackageManager(
+        program="apt-get",
+        refresh=("apt-get", "update"),
+        install=("apt-get", "install", "-y"),
+        packages={
+            "git": "git",
+            "curl": "curl",
+            "nginx": "nginx",
+            "apache": "apache2",
+            "certbot": "certbot",
+            "certbot-nginx": "python3-certbot-nginx",
+            "certbot-apache": "python3-certbot-apache",
+            "nodejs": "nodejs",
+        },
+        services={"nginx": "nginx", "apache": "apache2"},
+    ),
+    PackageManager(
+        program="dnf",
+        refresh=("dnf", "makecache"),
+        install=("dnf", "install", "-y"),
+        packages={
+            "git": "git",
+            "curl": "curl",
+            "nginx": "nginx",
+            "apache": "httpd",
+            "certbot": "certbot",
+            "certbot-nginx": "python3-certbot-nginx",
+            "certbot-apache": "python3-certbot-apache",
+            "nodejs": "nodejs",
+        },
+        services={"nginx": "nginx", "apache": "httpd"},
+    ),
+    PackageManager(
+        program="zypper",
+        refresh=("zypper", "--non-interactive", "refresh"),
+        install=("zypper", "--non-interactive", "install"),
+        packages={
+            "git": "git",
+            "curl": "curl",
+            "nginx": "nginx",
+            "apache": "apache2",
+            "certbot": "certbot",
+            "certbot-nginx": "python3-certbot-nginx",
+            "certbot-apache": "python3-certbot-apache",
+            "nodejs": "nodejs",
+        },
+        services={"nginx": "nginx", "apache": "apache2"},
+    ),
+    PackageManager(
+        program="pacman",
+        refresh=("pacman", "-Sy", "--noconfirm"),
+        install=("pacman", "-S", "--noconfirm", "--needed"),
+        packages={
+            "git": "git",
+            "curl": "curl",
+            "nginx": "nginx",
+            "apache": "apache",
+            "certbot": "certbot",
+            "certbot-nginx": "certbot-nginx",
+            "certbot-apache": "certbot-apache",
+            "nodejs": "nodejs",
+        },
+        services={"nginx": "nginx", "apache": "httpd"},
+    ),
+)
+
+
+def detect_package_manager() -> PackageManager | None:
+    """
+    Find the package manager this machine actually uses.
+
+    Returns:
+        The first supported package manager present, or None when WASM cannot
+        install software here.
+    """
+    for manager in PACKAGE_MANAGERS:
+        if command_exists(manager.program):
+            return manager
     return None
 
 
-def _install_bash_completions(logger: Logger, completions_dir: Path, user_only: bool) -> int:
-    """Install bash completions."""
-    source_file = completions_dir / "wasm.bash"
-    
-    if not source_file.exists():
-        logger.error("Bash completion script not found")
-        return 1
-    
-    if user_only:
-        target_dir = Path.home() / ".local" / "share" / "bash-completion" / "completions"
-        target_file = target_dir / "wasm"
-    else:
-        target_dir = Path("/etc/bash_completion.d")
-        target_file = target_dir / "wasm"
-        
-        if os.geteuid() != 0:
-            logger.error("System-wide installation requires root privileges")
-            logger.info("Use --user-only for user-local installation, or run with sudo")
-            return 1
-    
-    try:
-        target_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy(source_file, target_file)
-        logger.success(f"Installed bash completions to {target_file}")
-        logger.info("Restart your shell or run: source ~/.bashrc")
-        return 0
-    except PermissionError:
-        logger.error(f"Permission denied writing to {target_file}")
-        logger.info("Try running with sudo or use --user-only")
-        return 1
-
-
-def _install_zsh_completions(logger: Logger, completions_dir: Path, user_only: bool) -> int:
-    """Install zsh completions."""
-    source_file = completions_dir / "_wasm"
-    
-    if not source_file.exists():
-        logger.error("Zsh completion script not found")
-        return 1
-    
-    if user_only:
-        target_dir = Path.home() / ".zsh" / "completions"
-        target_file = target_dir / "_wasm"
-        fpath_hint = 'Add to .zshrc: fpath=(~/.zsh/completions $fpath)'
-    else:
-        target_dir = Path("/usr/share/zsh/site-functions")
-        if not target_dir.exists():
-            target_dir = Path("/usr/local/share/zsh/site-functions")
-        target_file = target_dir / "_wasm"
-        fpath_hint = None
-        
-        if os.geteuid() != 0:
-            logger.error("System-wide installation requires root privileges")
-            logger.info("Use --user-only for user-local installation, or run with sudo")
-            return 1
-    
-    try:
-        target_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy(source_file, target_file)
-        logger.success(f"Installed zsh completions to {target_file}")
-        if fpath_hint:
-            logger.info(fpath_hint)
-        logger.info("Run: autoload -Uz compinit && compinit")
-        return 0
-    except PermissionError:
-        logger.error(f"Permission denied writing to {target_file}")
-        logger.info("Try running with sudo or use --user-only")
-        return 1
-
-
-def _install_fish_completions(logger: Logger, completions_dir: Path, user_only: bool) -> int:
-    """Install fish completions."""
-    source_file = completions_dir / "wasm.fish"
-    
-    if not source_file.exists():
-        logger.error("Fish completion script not found")
-        return 1
-    
-    if user_only:
-        target_dir = Path.home() / ".config" / "fish" / "completions"
-        target_file = target_dir / "wasm.fish"
-    else:
-        target_dir = Path("/usr/share/fish/vendor_completions.d")
-        target_file = target_dir / "wasm.fish"
-        
-        if os.geteuid() != 0:
-            logger.error("System-wide installation requires root privileges")
-            logger.info("Use --user-only for user-local installation, or run with sudo")
-            return 1
-    
-    try:
-        target_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy(source_file, target_file)
-        logger.success(f"Installed fish completions to {target_file}")
-        logger.info("Completions should work immediately or run: exec fish")
-        return 0
-    except PermissionError:
-        logger.error(f"Permission denied writing to {target_file}")
-        logger.info("Try running with sudo or use --user-only")
-        return 1
-
-
-def _handle_init(args: Namespace) -> int:
+def _install_packages(
+    logger: Logger,
+    manager: PackageManager,
+    label: str,
+    names: list[str],
+) -> str | None:
     """
-    Handle initial system setup - comprehensive guided wizard.
-    
-    This is the main setup command that guides users through:
-    1. System requirements check
-    2. Directory creation
-    3. Web server selection and installation
-    4. Node.js and package managers setup
-    5. SSL configuration
-    6. Configuration file creation
-    """
-    logger = Logger(verbose=args.verbose)
-    
-    # Check for root
-    if os.geteuid() != 0:
-        logger.error("Initial setup requires root privileges")
-        logger.info("Run: sudo wasm setup init")
-        return 1
-    
-    logger.header("WASM Initial Setup Wizard")
-    logger.info("This wizard will configure your system for deploying web applications.")
-    logger.blank()
-    
-    # Check if inquirer is available for interactive mode
-    try:
-        import inquirer
-        from inquirer.themes import GreenPassion
-        has_inquirer = True
-    except ImportError:
-        has_inquirer = False
-        logger.warning("Interactive mode unavailable (inquirer not installed)")
-        logger.info("Running in non-interactive mode with defaults")
-    
-    # Import dependency checker
-    from wasm.core.dependencies import DependencyChecker
-    checker = DependencyChecker(verbose=args.verbose)
-    
-    # =========================================================================
-    # Phase 1: System Analysis
-    # =========================================================================
-    logger.step(1, 6, "Analyzing system requirements")
-    
-    summary = checker.get_setup_summary()
-    
-    # Display current status
-    logger.blank()
-    logger.info("Current System Status:")
-    
-    # OS Info
-    from wasm.core.utils import get_system_info
-    sys_info = get_system_info()
-    logger.key_value("  OS", sys_info.get("os", "Unknown"))
-    logger.key_value("  Kernel", sys_info.get("kernel", "Unknown"))
-    
-    # Web server
-    if summary["webserver"]:
-        logger.key_value("  Web Server", f"✓ {summary['webserver']}")
-    else:
-        logger.key_value("  Web Server", "✗ Not installed")
-    
-    # Node.js
-    if summary["nodejs"]["installed"]:
-        logger.key_value("  Node.js", f"✓ {summary['nodejs']['version']}")
-        installed_pms = [pm for pm, info in summary["nodejs"]["package_managers"].items() if info["installed"]]
-        logger.key_value("  Package Managers", ", ".join(installed_pms) if installed_pms else "npm only")
-    else:
-        logger.key_value("  Node.js", "✗ Not installed")
-    
-    # Python
-    if summary["python"]["installed"]:
-        logger.key_value("  Python", f"✓ {summary['python']['version']}")
-    else:
-        logger.key_value("  Python", "✗ Not installed")
-    
-    # Git
-    if command_exists("git"):
-        logger.key_value("  Git", "✓ Installed")
-    else:
-        logger.key_value("  Git", "✗ Not installed")
-    
-    # Certbot
-    if command_exists("certbot"):
-        logger.key_value("  Certbot", "✓ Installed")
-    else:
-        logger.key_value("  Certbot", "✗ Not installed")
-    
-    logger.blank()
-    
-    # =========================================================================
-    # Phase 2: Interactive Configuration (if available)
-    # =========================================================================
-    config_choices = {
-        "install_git": not command_exists("git"),
-        "install_webserver": summary["webserver"] is None,
-        "webserver_choice": "nginx",
-        "install_nodejs": not summary["nodejs"]["installed"],
-        "package_managers": ["npm"],  # Default to npm
-        "install_certbot": not command_exists("certbot"),
-        "ssl_email": "",
-    }
-    
-    if has_inquirer:
-        logger.step(2, 6, "Configuration options")
-        config_choices = _interactive_setup_prompts(logger, summary, checker)
-        if config_choices is None:
-            logger.info("Setup cancelled")
-            return 0
-    else:
-        logger.step(2, 6, "Using default configuration")
-    
-    # =========================================================================
-    # Phase 3: Install System Dependencies
-    # =========================================================================
-    logger.step(3, 6, "Installing system dependencies")
-    
-    # Update package lists first
-    logger.substep("Updating package lists...")
-    run_command_sudo(["apt-get", "update"])
-    
-    # Install git if needed
-    if config_choices.get("install_git") and not command_exists("git"):
-        logger.substep("Installing Git...")
-        result = run_command_sudo(["apt-get", "install", "-y", "git"])
-        if result.success:
-            logger.success("Git installed")
-        else:
-            logger.warning(f"Failed to install Git: {result.stderr}")
-    
-    # Install web server if needed
-    if config_choices.get("install_webserver"):
-        ws = config_choices.get("webserver_choice", "nginx")
-        logger.substep(f"Installing {ws}...")
-        
-        result = run_command_sudo(["apt-get", "install", "-y", ws])
-        if result.success:
-            logger.success(f"{ws} installed")
-            # Enable and start the service
-            run_command_sudo(["systemctl", "enable", ws])
-            run_command_sudo(["systemctl", "start", ws])
-        else:
-            logger.warning(f"Failed to install {ws}: {result.stderr}")
-    
-    # Install certbot if needed
-    if config_choices.get("install_certbot") and not command_exists("certbot"):
-        logger.substep("Installing Certbot...")
-        ws = config_choices.get("webserver_choice", "nginx")
-        certbot_pkg = f"python3-certbot-{ws}" if ws in ["nginx", "apache"] else "certbot"
-        
-        result = run_command_sudo(["apt-get", "install", "-y", "certbot", certbot_pkg])
-        if result.success:
-            logger.success("Certbot installed")
-        else:
-            logger.warning(f"Failed to install Certbot: {result.stderr}")
-    
-    # =========================================================================
-    # Phase 4: Install Node.js and Package Managers
-    # =========================================================================
-    logger.step(4, 6, "Setting up Node.js environment")
-    
-    if config_choices.get("install_nodejs") and not command_exists("node"):
-        logger.substep("Installing Node.js 20.x LTS...")
+    Install one or more packages, naming what went wrong if it fails.
 
-        # Install Node.js from NodeSource using trusted installer
-        try:
-            result = run_trusted_installer("https://deb.nodesource.com/setup_20.x")
-            if result.success:
-                result = run_command_sudo(["apt-get", "install", "-y", "nodejs"])
-                if result.success:
-                    logger.success("Node.js installed")
-                else:
-                    logger.warning(f"Failed to install Node.js: {result.stderr}")
-            else:
-                logger.warning("Failed to setup Node.js repository. Please install manually.")
-        except Exception as e:
-            logger.warning(f"Failed to setup Node.js: {e}")
-    
-    # Install package managers
-    selected_pms = config_choices.get("package_managers", ["npm"])
-    
-    for pm in selected_pms:
-        if pm == "npm":
-            continue  # npm comes with Node.js
-        
-        if command_exists(pm):
-            logger.substep(f"{pm} already installed")
-            continue
-        
-        logger.substep(f"Installing {pm}...")
-        
-        if pm == "pnpm":
-            result = run_command_sudo(["npm", "install", "-g", "pnpm"])
-        elif pm == "yarn":
-            result = run_command_sudo(["npm", "install", "-g", "yarn"])
-        elif pm == "bun":
-            # Bun has its own trusted installer
-            try:
-                result = run_trusted_installer("https://bun.sh/install")
-            except Exception as e:
-                logger.warning(f"Failed to install bun: {e}")
-                continue
-        else:
-            result = run_command_sudo(["npm", "install", "-g", pm])
-        
-        if result.success:
-            logger.success(f"{pm} installed")
-        else:
-            logger.warning(f"Failed to install {pm}: {result.stderr}")
-    
-    # =========================================================================
-    # Phase 5: Create WASM Directories
-    # =========================================================================
-    logger.step(5, 6, "Creating WASM directories")
-    
-    # Create apps directory
-    logger.substep(f"Creating apps directory: {DEFAULT_APPS_DIR}")
-    try:
-        DEFAULT_APPS_DIR.mkdir(parents=True, exist_ok=True)
-        os.chmod(DEFAULT_APPS_DIR, 0o755)
-        logger.success(f"Created {DEFAULT_APPS_DIR}")
-    except Exception as e:
-        logger.warning(f"Failed to create apps directory: {e}")
-    
-    # Create log directory
-    logger.substep(f"Creating log directory: {DEFAULT_LOG_DIR}")
-    try:
-        DEFAULT_LOG_DIR.mkdir(parents=True, exist_ok=True)
-        os.chmod(DEFAULT_LOG_DIR, 0o755)
-        logger.success(f"Created {DEFAULT_LOG_DIR}")
-    except Exception as e:
-        logger.warning(f"Failed to create log directory: {e}")
-    
-    # Create config directory
+    Args:
+        logger: Logger used to report progress.
+        manager: The detected package manager.
+        label: Human name of what is being installed, for the messages.
+        names: WASM package names to translate and install.
+
+    Returns:
+        None on success, or a sentence describing the failure.
+    """
+    resolved = [pkg for pkg in (manager.package_for(name) for name in names) if pkg]
+    if not resolved:
+        return f"{label} is not packaged for {manager.program}; install it by hand"
+
+    logger.substep(f"Installing {label} ({' '.join(resolved)})...")
+    result = run_command([*manager.install, *resolved])
+    if result.success:
+        logger.success(f"{label} installed")
+        return None
+
+    detail = (result.stderr or result.stdout).strip().splitlines()
+    reason = detail[-1] if detail else f"exit code {result.exit_code}"
+    logger.warning(f"Failed to install {label}: {reason}")
+    return f"{label}: {reason}"
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+
+def _create_config_directory(logger: Logger, fs: FileSystem | None = None) -> bool:
+    """
+    Create the directory that holds config.yaml, owner-only.
+
+    Args:
+        logger: Logger used to report progress.
+        fs: Filesystem to change. Defaults to the process-wide one.
+
+    Returns:
+        True if the directory exists and is private afterwards, or if this is a
+        rehearsal and nothing was created.
+    """
     config_dir = DEFAULT_CONFIG_PATH.parent
     logger.substep(f"Creating config directory: {config_dir}")
     try:
-        config_dir.mkdir(parents=True, exist_ok=True)
-        os.chmod(config_dir, 0o755)
-        logger.success(f"Created {config_dir}")
-    except Exception as e:
+        secure_directory(config_dir, fs=fs or get_fs())
+    except OSError as e:
         logger.warning(f"Failed to create config directory: {e}")
-    
-    # =========================================================================
-    # Phase 6: Create/Update Configuration File
-    # =========================================================================
-    logger.step(6, 6, "Creating configuration file")
-    
-    try:
-        from wasm.core.config import Config
-        config = Config()
-        
-        config_exists = DEFAULT_CONFIG_PATH.exists()
-        
-        # Update config with user choices
-        ssl_email = config_choices.get("ssl_email", "")
-        if ssl_email:
-            config.set("ssl.email", ssl_email)
-        
-        webserver = config_choices.get("webserver_choice", "nginx")
-        config.set("webserver", webserver)
-        
-        # Save enabled package managers to config
-        pms = config_choices.get("package_managers", ["npm"])
-        config.set("nodejs.package_managers", pms)
-        
-        config.save()
-        if config_exists:
-            logger.success(f"Updated {DEFAULT_CONFIG_PATH}")
-        else:
-            logger.success(f"Created {DEFAULT_CONFIG_PATH}")
-    except Exception as e:
-        logger.warning(f"Could not save config file: {e}")
+        return False
 
-    # Install man page
+    if not config_dir.is_dir():
+        # A rehearsal refused the creation. Nothing to inspect, and nothing to
+        # report as a failure either: the run was never going to change anything.
+        logger.debug(f"{config_dir} was not created")
+        return True
+
+    if config_dir.stat().st_mode & 0o077:
+        logger.warning(
+            f"{config_dir} is readable by other accounts; it holds credentials. "
+            f"Fix it with: chmod {SECRET_DIR_MODE:o} {config_dir}"
+        )
+        return False
+
+    logger.success(f"Created {config_dir}")
+    return True
+
+
+def _detect_shell() -> str | None:
+    """
+    Work out which shell invoked WASM.
+
+    Returns:
+        "bash", "zsh", "fish", or None when $SHELL says something else.
+    """
+    shell_path = os.environ.get("SHELL", "")
+    for shell in COMPLETION_SHELLS:
+        if shell in shell_path:
+            return shell
+    return None
+
+
+def _prompts_possible() -> bool:
+    """
+    Decide whether the wizard may ask questions.
+
+    Returns:
+        True when both ends of the terminal are attached, so a prompt would be
+        seen and could be answered.
+    """
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+# ---------------------------------------------------------------------------
+# setup completions
+# ---------------------------------------------------------------------------
+
+
+def completion_source(shell: str) -> str:
+    """
+    Generate the completion script for a shell from the command tree.
+
+    Generated, never handwritten: the tree has 108 subcommands and a
+    handwritten script goes stale the first time one is added.
+
+    Args:
+        shell: "bash", "zsh" or "fish".
+
+    Returns:
+        The script to install.
+
+    Raises:
+        SetupError: If Click cannot generate completions for that shell.
+    """
+    from click.shell_completion import get_completion_class
+
+    completion_cls = get_completion_class(shell)
+    if completion_cls is None:
+        raise SetupError(
+            f"Cannot generate completions for {shell}",
+            details=f"Supported shells: {', '.join(COMPLETION_SHELLS)}",
+        )
+
+    from wasm.cli.app import cli as root_command
+
+    return completion_cls(root_command, {}, "wasm", COMPLETE_VAR).source()
+
+
+def _completion_target(shell: str, user_only: bool) -> Path:
+    """
+    Work out where a shell looks for the completion file.
+
+    Args:
+        shell: "bash", "zsh" or "fish".
+        user_only: Install under the invoking user's home instead of system-wide.
+
+    Returns:
+        The file to write.
+    """
+    home = Path.home()
+    if shell == "bash":
+        if user_only:
+            return home / ".local/share/bash-completion/completions/wasm"
+        return Path("/etc/bash_completion.d/wasm")
+    if shell == "zsh":
+        if user_only:
+            return home / ".zsh/completions/_wasm"
+        system_dir = Path("/usr/share/zsh/site-functions")
+        if not system_dir.exists():
+            system_dir = Path("/usr/local/share/zsh/site-functions")
+        return system_dir / "_wasm"
+    if user_only:
+        return home / ".config/fish/completions/wasm.fish"
+    return Path("/usr/share/fish/vendor_completions.d/wasm.fish")
+
+
+def _completion_instructions(shell: str, target: Path, user_only: bool) -> list[str]:
+    """
+    Say what the user has to do for the new file to take effect.
+
+    Args:
+        shell: "bash", "zsh" or "fish".
+        target: Where the script was written.
+        user_only: Whether it went into the user's home.
+
+    Returns:
+        Lines to print, in order.
+    """
+    if shell == "bash":
+        lines = ["Start a new shell, or run: source " + str(target)]
+        if user_only:
+            lines.append("Requires bash-completion; on most systems it is already installed.")
+        return lines
+    if shell == "zsh":
+        lines = []
+        if user_only:
+            lines.append(f"Add to ~/.zshrc: fpath=({target.parent} $fpath)")
+        lines.append("Then run: autoload -Uz compinit && compinit")
+        return lines
+    return ["Completions are live in new shells, or run: exec fish"]
+
+
+def _run_completions(logger: Logger, shell: str | None, user_only: bool, to_stdout: bool) -> int:
+    """
+    Generate shell completions and install or print them.
+
+    Args:
+        logger: Logger used to report progress.
+        shell: Target shell, or None to detect it from $SHELL.
+        user_only: Install under the invoking user's home instead of system-wide.
+        to_stdout: Print the script instead of writing it anywhere.
+
+    Returns:
+        Exit code.
+    """
+    if not shell:
+        shell = _detect_shell()
+        if not shell:
+            logger.error(
+                "Could not tell which shell you use",
+                details=f"Name it: wasm setup completions --shell {'|'.join(COMPLETION_SHELLS)}",
+            )
+            return 1
+
+    script = completion_source(shell)
+
+    if to_stdout:
+        click.echo(script)
+        return 0
+
+    logger.header("WASM Shell Completions")
+    logger.key_value("Shell", shell)
+
+    target = _completion_target(shell, user_only)
+
+    if not user_only and os.geteuid() != 0:
+        logger.error(
+            f"Writing {target} needs root",
+            details="Run this with sudo, or use --user-only to install it for yourself.",
+        )
+        return 1
+
+    try:
+        get_fs().write_text(target, script)
+    except OSError as e:
+        logger.error(
+            f"Could not write {target}: {e}",
+            details="Run this with sudo, or use --user-only to install it for yourself.",
+        )
+        return 1
+
+    if not target.exists():
+        # A rehearsal. Saying it was installed and then telling the user to
+        # source a file that is not there is the lie this seam exists to stop.
+        return 0
+
+    logger.success(f"Installed {shell} completions to {target}")
+    for line in _completion_instructions(shell, target, user_only):
+        logger.info(line)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# setup init
+# ---------------------------------------------------------------------------
+
+
+def _report_current_state(logger: Logger, summary: SetupSummary) -> None:
+    """
+    Print what is already installed, before anything is changed.
+
+    Args:
+        logger: Logger used to report progress.
+        summary: System summary from the dependency checker.
+    """
+    from wasm.core.utils import get_system_info
+
+    logger.blank()
+    logger.info("Current System Status:")
+
+    sys_info = get_system_info()
+    logger.key_value("  OS", sys_info.get("os", "Unknown"))
+    logger.key_value("  Kernel", sys_info.get("kernel", "Unknown"))
+
+    webserver = summary["webserver"]
+    logger.key_value("  Web Server", webserver if webserver else "not installed")
+
+    if summary["nodejs"]["installed"]:
+        logger.key_value("  Node.js", str(summary["nodejs"]["version"]))
+        installed_pms = [
+            pm for pm, info in summary["nodejs"]["package_managers"].items() if info["installed"]
+        ]
+        logger.key_value("  Package Managers", ", ".join(installed_pms) if installed_pms else "npm")
+    else:
+        logger.key_value("  Node.js", "not installed")
+
+    if summary["python"]["installed"]:
+        logger.key_value("  Python", str(summary["python"]["version"]))
+    else:
+        logger.key_value("  Python", "not installed")
+
+    logger.key_value("  Git", "installed" if command_exists("git") else "not installed")
+    logger.key_value("  Certbot", "installed" if command_exists("certbot") else "not installed")
+    logger.blank()
+
+
+def normalise_webserver(name: str | None) -> str:
+    """
+    Translate a detected web server into the name the rest of WASM uses.
+
+    The dependency checker reports the package name it found, "apache2" on
+    Debian and "httpd" on Fedora, while the deployers compare against "apache".
+    Writing the package name into config.yaml is how a machine ends up
+    configured for a web server nothing recognises.
+
+    Args:
+        name: What was detected, or None when nothing was.
+
+    Returns:
+        "nginx" or "apache".
+    """
+    if name in ("apache2", "httpd", "apache"):
+        return "apache"
+    return "nginx"
+
+
+def _default_choices(summary: SetupSummary) -> dict[str, Any]:
+    """
+    Build the choices the wizard makes when nobody is there to answer.
+
+    Args:
+        summary: System summary from the dependency checker.
+
+    Returns:
+        The same shape the prompts return.
+    """
+    return {
+        "install_git": not command_exists("git"),
+        "install_webserver": summary["webserver"] is None,
+        "webserver_choice": normalise_webserver(summary["webserver"]),
+        "install_nodejs": not summary["nodejs"]["installed"],
+        "package_managers": ["npm"],
+        "install_certbot": not command_exists("certbot"),
+        "ssl_email": "",
+    }
+
+
+def _interactive_setup_prompts(summary: SetupSummary) -> dict[str, Any] | None:
+    """
+    Ask the operator what to install.
+
+    Uses questionary rather than inquirer: inquirer has no package in Debian or
+    Ubuntu, so on the distributions WASM targets most this wizard was never
+    interactive at all.
+
+    Args:
+        summary: System summary from the dependency checker.
+
+    Returns:
+        Configuration choices, or None if the operator cancelled.
+    """
+    import questionary
+
+    answers = _default_choices(summary)
+
+    if not command_exists("git"):
+        answers["install_git"] = questionary.confirm(
+            "Git is not installed. Install it now?", default=True
+        ).ask()
+        if answers["install_git"] is None:
+            return None
+
+    if summary["webserver"] is None:
+        install_webserver = questionary.confirm(
+            "No web server found. Install one?", default=True
+        ).ask()
+        if install_webserver is None:
+            return None
+        answers["install_webserver"] = install_webserver
+
+        if install_webserver:
+            choice = questionary.select(
+                "Which web server?",
+                choices=[
+                    questionary.Choice("Nginx (recommended)", value="nginx"),
+                    questionary.Choice("Apache", value="apache"),
+                ],
+                default="nginx",
+            ).ask()
+            if choice is None:
+                return None
+            answers["webserver_choice"] = choice
+
+    if not summary["nodejs"]["installed"]:
+        install_nodejs = questionary.confirm(
+            "Node.js is not installed. Install it? Required for JavaScript apps.", default=True
+        ).ask()
+        if install_nodejs is None:
+            return None
+        answers["install_nodejs"] = install_nodejs
+
+    selected = [
+        pm for pm, info in summary["nodejs"]["package_managers"].items() if info["installed"]
+    ]
+    package_managers = questionary.checkbox(
+        "Which package managers should be available? Space to toggle, Enter to confirm.",
+        choices=[
+            questionary.Choice("npm (ships with Node.js)", value="npm", checked=True),
+            questionary.Choice(
+                "pnpm (fast, disk efficient)", value="pnpm", checked="pnpm" in selected
+            ),
+            questionary.Choice("yarn", value="yarn", checked="yarn" in selected),
+            questionary.Choice("bun", value="bun", checked="bun" in selected),
+        ],
+    ).ask()
+    if package_managers is None:
+        return None
+    answers["package_managers"] = package_managers or ["npm"]
+
+    if not command_exists("certbot"):
+        install_certbot = questionary.confirm(
+            "Certbot is not installed. Install it? Required for HTTPS certificates.", default=True
+        ).ask()
+        if install_certbot is None:
+            return None
+        answers["install_certbot"] = install_certbot
+
+    ssl_email = questionary.text(
+        "Email for expiry notices from Let's Encrypt (Enter to skip)", default=""
+    ).ask()
+    if ssl_email is None:
+        return None
+    answers["ssl_email"] = ssl_email.strip()
+
+    return answers
+
+
+def _install_node_package_manager(logger: Logger, pm: str) -> str | None:
+    """
+    Install one Node.js package manager.
+
+    Args:
+        logger: Logger used to report progress.
+        pm: Package manager name.
+
+    Returns:
+        None on success, or a sentence describing the failure.
+    """
+    if pm == "bun":
+        # Bun is not packaged by any distribution WASM targets; its own
+        # installer is on the trusted whitelist.
+        result = run_trusted_installer("https://bun.sh/install")
+    else:
+        result = run_command(["npm", "install", "-g", pm])
+
+    if result.success:
+        logger.success(f"{pm} installed")
+        return None
+
+    reason = (result.stderr or result.stdout).strip().splitlines()
+    logger.warning(f"Failed to install {pm}: {reason[-1] if reason else result.exit_code}")
+    return f"{pm}: {reason[-1] if reason else f'exit code {result.exit_code}'}"
+
+
+def _install_dependencies(
+    logger: Logger, manager: PackageManager, choices: dict[str, Any]
+) -> list[str]:
+    """
+    Install everything the operator asked for.
+
+    Args:
+        logger: Logger used to report progress.
+        manager: The detected package manager.
+        choices: Answers from the prompts, or the non-interactive defaults.
+
+    Returns:
+        One sentence per failure. Empty when everything was installed.
+    """
+    failures: list[str] = []
+
+    logger.substep(f"Refreshing package lists with {manager.program}...")
+    refresh = run_command(list(manager.refresh))
+    if not refresh.success:
+        # Not fatal: the installs below may still succeed from a stale index,
+        # and saying so is more useful than stopping.
+        logger.warning(f"Could not refresh package lists ({manager.program})")
+
+    if choices.get("install_git") and not command_exists("git"):
+        failure = _install_packages(logger, manager, "Git", ["git"])
+        if failure:
+            failures.append(failure)
+
+    webserver = choices.get("webserver_choice", "nginx")
+    if choices.get("install_webserver"):
+        failure = _install_packages(logger, manager, webserver, [webserver])
+        if failure:
+            failures.append(failure)
+        else:
+            unit = manager.service_for(webserver)
+            run_command(["systemctl", "enable", unit])
+            run_command(["systemctl", "start", unit])
+
+    if choices.get("install_certbot") and not command_exists("certbot"):
+        plugin = f"certbot-{webserver}"
+        packages = ["certbot"]
+        if manager.package_for(plugin):
+            packages.append(plugin)
+        failure = _install_packages(logger, manager, "Certbot", packages)
+        if failure:
+            failures.append(failure)
+
+    return failures
+
+
+def _install_node_environment(
+    logger: Logger, manager: PackageManager, choices: dict[str, Any]
+) -> list[str]:
+    """
+    Install Node.js and the requested package managers.
+
+    Args:
+        logger: Logger used to report progress.
+        manager: The detected package manager.
+        choices: Answers from the prompts, or the non-interactive defaults.
+
+    Returns:
+        One sentence per failure. Empty when everything was installed.
+    """
+    failures: list[str] = []
+
+    if choices.get("install_nodejs") and not command_exists("node"):
+        logger.substep("Installing Node.js 20.x LTS...")
+        setup_result = run_trusted_installer("https://deb.nodesource.com/setup_20.x")
+        if setup_result.success:
+            failure = _install_packages(logger, manager, "Node.js", ["nodejs"])
+            if failure:
+                failures.append(failure)
+        else:
+            logger.warning("Could not add the NodeSource repository")
+            failures.append("Node.js: the NodeSource repository could not be added")
+
+    for pm in choices.get("package_managers", ["npm"]):
+        if pm == "npm":
+            continue  # npm ships with Node.js
+        if command_exists(pm):
+            logger.substep(f"{pm} already installed")
+            continue
+        if not command_exists("npm") and pm != "bun":
+            failures.append(f"{pm}: npm is not available to install it")
+            logger.warning(f"Cannot install {pm}: npm is not available")
+            continue
+        logger.substep(f"Installing {pm}...")
+        failure = _install_node_package_manager(logger, pm)
+        if failure:
+            failures.append(failure)
+
+    return failures
+
+
+def _create_directories(logger: Logger) -> list[str]:
+    """
+    Create the directories a deployment writes into.
+
+    Args:
+        logger: Logger used to report progress.
+
+    Returns:
+        One sentence per failure. Empty when all directories exist.
+    """
+    failures: list[str] = []
+    fs = get_fs()
+
+    # Served content and logs are deliberately world-readable: the web server's
+    # account has to traverse the first, and an operator should be able to tail
+    # the second without sudo. The config directory is not, and secure_directory
+    # is what enforces that.
+    for label, path in (("apps", DEFAULT_APPS_DIR), ("log", DEFAULT_LOG_DIR)):
+        logger.substep(f"Creating {label} directory: {path}")
+        try:
+            fs.make_dir(path, mode=0o755, parents=True)
+            if path.is_dir():
+                # mkdir's mode is masked by the umask, and a directory left by
+                # an earlier run may be anything at all; the web server's
+                # account has to be able to traverse this one.
+                fs.chmod(path, 0o755)
+        except OSError as e:
+            logger.warning(f"Failed to create {label} directory: {e}")
+            failures.append(f"{path}: {e}")
+        else:
+            # Report the directory that is there, not the one that was asked
+            # for: during a rehearsal the seam creates nothing.
+            if path.is_dir():
+                logger.success(f"Created {path}")
+            else:
+                logger.debug(f"{path} was not created")
+
+    if not _create_config_directory(logger, fs=fs):
+        failures.append(f"{DEFAULT_CONFIG_PATH.parent}: could not be created privately")
+
+    return failures
+
+
+def _write_config(logger: Logger, choices: dict[str, Any]) -> list[str]:
+    """
+    Record the operator's choices in config.yaml.
+
+    Args:
+        logger: Logger used to report progress.
+        choices: Answers from the prompts, or the non-interactive defaults.
+
+    Returns:
+        One sentence per failure. Empty when the file was written.
+    """
+    from wasm.core.config import Config
+
+    existed = DEFAULT_CONFIG_PATH.exists()
+    config = Config()
+
+    ssl_email = choices.get("ssl_email", "")
+    if ssl_email:
+        config.set("ssl.email", ssl_email)
+    config.set("webserver", choices.get("webserver_choice", "nginx"))
+    config.set("nodejs.package_managers", choices.get("package_managers", ["npm"]))
+
+    # save() reports failure by returning False, having logged the reason. An
+    # unchecked call is how a wizard ends up announcing a configuration file it
+    # never managed to write.
+    if not config.save():
+        logger.warning(f"Could not save {DEFAULT_CONFIG_PATH}")
+        return [f"{DEFAULT_CONFIG_PATH}: could not be written, see the error above"]
+
+    if not DEFAULT_CONFIG_PATH.exists():
+        # A rehearsal: the seam refused the write and reported it, so claiming
+        # the file was created would contradict what the operator just read.
+        logger.debug(f"{DEFAULT_CONFIG_PATH} was not written")
+        return []
+
+    logger.success(f"{'Updated' if existed else 'Created'} {DEFAULT_CONFIG_PATH}")
+    return []
+
+
+def _install_man_page(logger: Logger) -> None:
+    """
+    Copy the man page into place, if one shipped with this install.
+
+    A missing man page is not a setup failure, so nothing here is reported as
+    one.
+
+    Args:
+        logger: Logger used to report progress.
+    """
+    destination = MAN_PAGE_DIR / "wasm.1"
+    sources = [
+        Path(__file__).resolve().parents[4] / "man" / "wasm.1",
+        Path("/usr/local/share/man/man1/wasm.1"),
+        Path("/usr/share/man/man1/wasm.1"),
+    ]
+    source = next((path for path in sources if path.exists()), None)
+
+    if source is None:
+        logger.debug("No man page shipped with this install, skipping")
+        return
+    if source == destination:
+        logger.debug("Man page already installed")
+        return
+
     logger.substep("Installing man page...")
     try:
-        # Search for man page in multiple locations
-        man_source = None
-        search_paths = [
-            # Development: project root
-            Path(__file__).parent.parent.parent.parent.parent / "man" / "wasm.1",
-            # Installed via pip with data_files
-            Path("/usr/local/share/man/man1/wasm.1"),
-            Path("/usr/share/man/man1/wasm.1"),
-        ]
+        # Copied as text rather than with shutil: the seam is what makes a
+        # rehearsal leave nothing behind, and a man page is roff source.
+        get_fs().write_text(destination, source.read_text(encoding="utf-8"), mode=0o644)
+    except (OSError, UnicodeDecodeError) as e:
+        logger.debug(f"Could not install the man page: {e}")
+        return
 
-        for path in search_paths:
-            if path.exists():
-                man_source = path
-                break
+    if not destination.exists():
+        return
 
-        if man_source and man_source != Path("/usr/share/man/man1/wasm.1"):
-            man_dest = Path("/usr/share/man/man1/wasm.1")
-            shutil.copy(man_source, man_dest)
-            os.chmod(man_dest, 0o644)
-            run_command(["mandb", "-q"])
-            logger.success("Man page installed (man wasm)")
-        elif man_source:
-            logger.substep("Man page already installed")
-        else:
-            logger.debug("Man page source not found, skipping")
-    except Exception as e:
-        logger.debug(f"Could not install man page: {e}")
+    run_command(["mandb", "-q"])
+    logger.success("Man page installed (man wasm)")
 
-    # =========================================================================
-    # Final Summary
-    # =========================================================================
+
+def _report_final_state(logger: Logger, checker: DependencyChecker, failures: list[str]) -> None:
+    """
+    Say what the machine looks like now, and what did not work.
+
+    Args:
+        logger: Logger used to report progress.
+        checker: Dependency checker, re-queried after the installs.
+        failures: One sentence per thing that failed.
+    """
     logger.blank()
-    logger.header("Setup Complete!")
+    if failures:
+        logger.header("Setup finished with problems")
+    else:
+        logger.header("Setup complete")
     logger.blank()
-    
-    # Re-check status
+
     final_summary = checker.get_setup_summary()
-    
     logger.info("Final System Status:")
     if final_summary["webserver"]:
-        logger.key_value("  Web Server", f"✓ {final_summary['webserver']}")
-    
+        logger.key_value("  Web Server", str(final_summary["webserver"]))
     if command_exists("node"):
-        node_ver = checker.get_version("node")
-        logger.key_value("  Node.js", f"✓ {node_ver}")
-        
-        installed_pms = []
-        for pm in ["npm", "pnpm", "yarn", "bun"]:
-            if command_exists(pm):
-                installed_pms.append(pm)
-        logger.key_value("  Package Managers", ", ".join(installed_pms))
-    
+        logger.key_value("  Node.js", str(checker.get_version("node")))
+        installed = [pm for pm in ("npm", "pnpm", "yarn", "bun") if command_exists(pm)]
+        logger.key_value("  Package Managers", ", ".join(installed))
     if command_exists("certbot"):
-        logger.key_value("  SSL (Certbot)", "✓ Ready")
-    
+        logger.key_value("  SSL (Certbot)", "ready")
     if command_exists("git"):
-        logger.key_value("  Git", "✓ Ready")
-    
+        logger.key_value("  Git", "ready")
+
     logger.blank()
+    if failures:
+        logger.error(f"{len(failures)} step(s) did not complete:")
+        for failure in failures:
+            logger.list_item(failure)
+        logger.blank()
+        logger.info("Fix the causes above and run 'sudo wasm setup init' again.")
+        logger.blank()
+        return
+
     logger.info("Next steps:")
     logger.info("  1. Deploy your first app: wasm create -d example.com -s <git-url> -t nextjs")
-    logger.info("  2. Setup SSH for Git: wasm setup ssh --generate")
+    logger.info("  2. Set up SSH for Git: wasm setup ssh --generate")
     logger.info("  3. Install shell completions: wasm setup completions")
     logger.info("  4. Run diagnostics: wasm setup doctor")
     logger.blank()
-    
-    return 0
 
 
-def _interactive_setup_prompts(
-    logger: Logger,
-    summary: Dict,
-    checker
-) -> Optional[Dict]:
+def _run_init(logger: Logger, assume_defaults: bool) -> int:
     """
-    Interactive prompts for setup wizard.
-    
+    Prepare this machine for deployments.
+
     Args:
-        logger: Logger instance.
-        summary: System summary from checker.
-        checker: DependencyChecker instance.
-        
+        logger: Logger used to report progress.
+        assume_defaults: Install the defaults without asking anything.
+
     Returns:
-        Configuration choices dict or None if cancelled.
+        Exit code. Non-zero when any step failed, so a provisioning script that
+        checks the status sees the truth.
     """
-    import inquirer
-    from inquirer.themes import GreenPassion
-    
-    questions = []
-    
-    # Git installation
-    if not command_exists("git"):
-        questions.append(
-            inquirer.Confirm(
-                "install_git",
-                message="Git is not installed. Install it now?",
-                default=True,
-            )
+    if os.geteuid() != 0:
+        logger.error(
+            "Initial setup needs root",
+            details="Run: sudo wasm setup init",
         )
-    
-    # Web server selection
-    if summary["webserver"] is None:
-        questions.append(
-            inquirer.Confirm(
-                "install_webserver",
-                message="No web server found. Install one?",
-                default=True,
-            )
+        return 1
+
+    manager = detect_package_manager()
+    if manager is None:
+        supported = ", ".join(pm.program for pm in PACKAGE_MANAGERS)
+        logger.error(
+            "No supported package manager on this system",
+            details=(
+                f"WASM installs software with one of: {supported}. "
+                "Install nginx, git, certbot and Node.js by hand, then run "
+                "'wasm setup doctor' to confirm."
+            ),
         )
-        questions.append(
-            inquirer.List(
-                "webserver_choice",
-                message="Select web server to install",
-                choices=[
-                    ("Nginx (recommended)", "nginx"),
-                    ("Apache", "apache2"),
-                ],
-                default="nginx",
-                ignore=lambda answers: not answers.get("install_webserver", True),
-            )
-        )
+        return 1
+
+    logger.header("WASM Initial Setup")
+    logger.info("This prepares the machine for deploying web applications.")
+    logger.key_value("Package manager", manager.program)
+    logger.blank()
+
+    from wasm.core.dependencies import DependencyChecker
+
+    checker = DependencyChecker(verbose=logger.verbose)
+
+    logger.step(1, 6, "Analyzing system requirements")
+    summary = checker.get_setup_summary()
+    _report_current_state(logger, summary)
+
+    if assume_defaults:
+        logger.step(2, 6, "Using default configuration")
+        choices = _default_choices(summary)
     else:
-        # Store existing webserver choice
-        questions.append(
-            inquirer.List(
-                "webserver_choice",
-                message="Detected web server",
-                choices=[(summary["webserver"], summary["webserver"])],
-                default=summary["webserver"],
-            )
-        )
-    
-    # Node.js installation
-    if not summary["nodejs"]["installed"]:
-        questions.append(
-            inquirer.Confirm(
-                "install_nodejs",
-                message="Node.js is not installed. Install it now? (Required for JS apps)",
-                default=True,
-            )
-        )
-    
-    # Package managers selection
-    pm_choices = [
-        ("npm (default, comes with Node.js)", "npm"),
-        ("pnpm (fast, efficient)", "pnpm"),
-        ("yarn (reliable, feature-rich)", "yarn"),
-        ("bun (ultra-fast runtime)", "bun"),
-    ]
-    
-    # Pre-select installed ones
-    default_pms = ["npm"]
-    if summary["nodejs"]["installed"]:
-        for pm, info in summary["nodejs"]["package_managers"].items():
-            if info["installed"] and pm not in default_pms:
-                default_pms.append(pm)
-    
-    questions.append(
-        inquirer.Checkbox(
-            "package_managers",
-            message="Select package managers to install/enable (Space to toggle, Enter to confirm)",
-            choices=pm_choices,
-            default=default_pms,
-        )
-    )
-    
-    # Certbot installation
-    if not command_exists("certbot"):
-        questions.append(
-            inquirer.Confirm(
-                "install_certbot",
-                message="Certbot (SSL) is not installed. Install it now?",
-                default=True,
-            )
-        )
-    
-    # SSL email
-    questions.append(
-        inquirer.Text(
-            "ssl_email",
-            message="Email for SSL certificates (optional, press Enter to skip)",
-            default="",
-        )
-    )
-    
-    try:
-        answers = inquirer.prompt(questions, theme=GreenPassion())
-        return answers
-    except KeyboardInterrupt:
-        return None
+        logger.step(2, 6, "Configuration options")
+        answers = _interactive_setup_prompts(summary)
+        if answers is None:
+            logger.info("Setup cancelled")
+            return 130
+        choices = answers
+
+    failures: list[str] = []
+
+    logger.step(3, 6, "Installing system dependencies")
+    failures += _install_dependencies(logger, manager, choices)
+
+    logger.step(4, 6, "Setting up the Node.js environment")
+    failures += _install_node_environment(logger, manager, choices)
+
+    logger.step(5, 6, "Creating WASM directories")
+    failures += _create_directories(logger)
+
+    logger.step(6, 6, "Writing the configuration file")
+    failures += _write_config(logger, choices)
+    _install_man_page(logger)
+
+    _report_final_state(logger, checker, failures)
+    return 1 if failures else 0
 
 
-def _handle_permissions(args: Namespace) -> int:
-    """Handle permissions check and fix."""
-    logger = Logger(verbose=args.verbose)
-    
+# ---------------------------------------------------------------------------
+# setup permissions
+# ---------------------------------------------------------------------------
+
+
+def _run_permissions(logger: Logger) -> int:
+    """
+    Check that WASM can write where it needs to.
+
+    Args:
+        logger: Logger used to report progress.
+
+    Returns:
+        Exit code.
+    """
     logger.header("WASM Permissions Check")
     logger.blank()
-    
-    issues = []
-    
-    # Check apps directory
-    if DEFAULT_APPS_DIR.exists():
-        if os.access(DEFAULT_APPS_DIR, os.W_OK):
-            logger.success(f"Apps directory writable: {DEFAULT_APPS_DIR}")
+
+    issues: list[str] = []
+
+    for label, path in (("Apps", DEFAULT_APPS_DIR), ("Log", DEFAULT_LOG_DIR)):
+        if not path.exists():
+            logger.warning(f"{label} directory does not exist: {path}")
+            issues.append(str(path))
+        elif os.access(path, os.W_OK):
+            logger.success(f"{label} directory writable: {path}")
         else:
-            logger.warning(f"Apps directory not writable: {DEFAULT_APPS_DIR}")
-            issues.append(("apps_dir", DEFAULT_APPS_DIR))
-    else:
-        logger.warning(f"Apps directory does not exist: {DEFAULT_APPS_DIR}")
-        issues.append(("apps_dir_missing", DEFAULT_APPS_DIR))
-    
-    # Check log directory
-    if DEFAULT_LOG_DIR.exists():
-        if os.access(DEFAULT_LOG_DIR, os.W_OK):
-            logger.success(f"Log directory writable: {DEFAULT_LOG_DIR}")
-        else:
-            logger.warning(f"Log directory not writable: {DEFAULT_LOG_DIR}")
-            issues.append(("log_dir", DEFAULT_LOG_DIR))
-    else:
-        logger.warning(f"Log directory does not exist: {DEFAULT_LOG_DIR}")
-        issues.append(("log_dir_missing", DEFAULT_LOG_DIR))
-    
-    # Check config
+            logger.warning(f"{label} directory not writable: {path}")
+            issues.append(str(path))
+
+    # The config directory holds credentials, so "too open" is as much a problem
+    # as "not readable": WASM runs as root and nothing else needs to read it.
     config_dir = DEFAULT_CONFIG_PATH.parent
     if config_dir.exists():
-        if os.access(config_dir, os.R_OK):
-            logger.success(f"Config directory readable: {config_dir}")
-        else:
+        if not os.access(config_dir, os.R_OK):
             logger.warning(f"Config directory not readable: {config_dir}")
-            issues.append(("config_dir", config_dir))
-    
-    # Check nginx/apache access
+            issues.append(str(config_dir))
+        elif config_dir.stat().st_mode & 0o077:
+            logger.warning(
+                f"Config directory exposes credentials to other accounts: {config_dir} "
+                f"(expected mode {SECRET_DIR_MODE:o})"
+            )
+            issues.append(str(config_dir))
+        else:
+            logger.success(f"Config directory readable: {config_dir}")
+
     nginx_available = Path("/etc/nginx/sites-available")
     if nginx_available.exists():
         if os.access(nginx_available, os.W_OK):
-            logger.success(f"Nginx sites-available writable")
+            logger.success("Nginx sites-available writable")
         else:
-            logger.info(f"Nginx sites-available requires sudo")
-    
-    # Check systemd access
+            logger.info("Nginx sites-available requires root")
+
     systemd_dir = Path("/etc/systemd/system")
     if systemd_dir.exists():
         if os.access(systemd_dir, os.W_OK):
-            logger.success(f"Systemd directory writable")
+            logger.success("Systemd directory writable")
         else:
-            logger.info(f"Systemd directory requires sudo")
-    
+            logger.info("Systemd directory requires root")
+
     logger.blank()
-    
+
     if issues:
-        logger.warning("Some directories need to be created or have permissions fixed")
+        logger.warning("Some directories need to be created or have their permissions fixed")
         logger.info("Run: sudo wasm setup init")
     else:
-        logger.success("All permissions OK!")
-        logger.info("Note: Operations that modify nginx/systemd still require sudo")
-    
+        logger.success("All permissions OK")
+        logger.info("Note: changing nginx or systemd still requires root")
+
     return 0
 
 
-def _handle_ssh(args: Namespace) -> int:
-    """Handle SSH key setup and verification."""
-    import os
+# ---------------------------------------------------------------------------
+# setup ssh
+# ---------------------------------------------------------------------------
+
+
+def _print_public_key(logger: Logger, public_key: str) -> None:
+    """
+    Show a public key with the lines that make it easy to copy.
+
+    Args:
+        logger: Logger used to report progress.
+        public_key: The key material.
+    """
+    logger.blank()
+    click.echo("-" * 70)
+    click.echo(public_key)
+    click.echo("-" * 70)
+    logger.blank()
+
+
+def _run_ssh(
+    logger: Logger, generate: bool, key_type: str, show: bool, test_host: str | None
+) -> int:
+    """
+    Set up or inspect the SSH key WASM clones private repositories with.
+
+    Args:
+        logger: Logger used to report progress.
+        generate: Create a key when none exists.
+        key_type: Key algorithm to generate.
+        show: Print the public key.
+        test_host: Host to open a test connection to, such as github.com.
+
+    Returns:
+        Exit code.
+    """
     from wasm.validators.ssh import (
-        ssh_key_exists,
-        get_public_key,
         generate_ssh_key,
-        test_ssh_connection,
-        get_ssh_directory,
         get_all_ssh_keys,
+        get_public_key,
+        get_ssh_directory,
+        ssh_key_exists,
+        test_ssh_connection,
     )
-    
-    logger = Logger(verbose=args.verbose)
-    
+
     logger.header("WASM SSH Setup")
     logger.blank()
-    
-    # Check if SSH key exists
+
     key_exists, key_path = ssh_key_exists()
-    ssh_dir = get_ssh_directory()
-    
-    # Show current SSH status
-    logger.key_value("SSH Directory", str(ssh_dir))
-    
+    logger.key_value("SSH Directory", str(get_ssh_directory()))
+
     if key_exists:
         logger.key_value("SSH Key Found", str(key_path))
         all_keys = get_all_ssh_keys()
@@ -766,53 +1229,39 @@ def _handle_ssh(args: Namespace) -> int:
             logger.key_value("Additional Keys", ", ".join(str(k.name) for k in all_keys[1:]))
     else:
         logger.key_value("SSH Key Found", "None")
-    
+
     logger.blank()
-    
-    # If --generate flag is set or no key exists, offer to generate
-    generate_flag = getattr(args, "generate", False)
-    key_type = getattr(args, "key_type", "ed25519")
-    
+
     if not key_exists:
-        if generate_flag:
-            logger.step(1, 3, "Generating SSH key")
-            hostname = os.uname().nodename
-            success, new_key_path, msg = generate_ssh_key(
-                key_type=key_type,
-                comment=f"wasm@{hostname}",
+        if not generate:
+            logger.error(
+                "No SSH key on this system",
+                details=(
+                    "Create one with: wasm setup ssh --generate\n"
+                    f"Or by hand with: ssh-keygen -t {key_type}"
+                ),
             )
-            
-            if success and new_key_path:
-                logger.success(f"SSH key generated: {new_key_path}")
-                key_path = new_key_path
-                key_exists = True
-            else:
-                logger.error(msg)
-                return 1
-        else:
-            logger.warning("No SSH key found on this system")
-            logger.blank()
-            logger.info("To generate a new SSH key, run:")
-            logger.info("  wasm setup ssh --generate")
-            logger.blank()
-            logger.info("Or manually with:")
-            logger.info(f"  ssh-keygen -t {key_type}")
             return 1
-    
-    # Show public key if --show flag or after generation
-    show_flag = getattr(args, "show", False)
+
+        logger.step(1, 3, "Generating SSH key")
+        success, new_key_path, message = generate_ssh_key(
+            key_type=key_type,
+            comment=f"wasm@{os.uname().nodename}",
+        )
+        if not success or new_key_path is None:
+            logger.error(message)
+            return 1
+
+        logger.success(f"SSH key generated: {new_key_path}")
+        key_path = new_key_path
+        key_exists = True
+
     public_key = get_public_key(key_path)
-    
-    if show_flag or (generate_flag and key_exists):
+
+    if show or generate:
         if public_key:
             logger.info("Your public SSH key:")
-            logger.blank()
-            print("─" * 70)
-            print(public_key)
-            print("─" * 70)
-            logger.blank()
-            
-            # Provide instructions based on the host
+            _print_public_key(logger, public_key)
             logger.info("Add this key to your Git provider:")
             logger.blank()
             logger.info("  GitHub:    https://github.com/settings/keys")
@@ -820,258 +1269,352 @@ def _handle_ssh(args: Namespace) -> int:
             logger.info("  Bitbucket: https://bitbucket.org/account/settings/ssh-keys/")
             logger.blank()
         else:
-            logger.warning("Could not read public key")
-    
-    # Test connection if --test flag is set
-    test_host = getattr(args, "test_host", None)
+            logger.warning("Could not read the public key")
+
     if test_host:
         logger.info(f"Testing SSH connection to {test_host}...")
-        success, msg = test_ssh_connection(test_host)
-        
+        success, message = test_ssh_connection(test_host)
         if success:
-            logger.success(f"SSH connection to {test_host} successful!")
-        else:
-            logger.error(f"SSH connection failed: {msg}")
-            logger.blank()
-            
-            if public_key:
-                logger.info("Make sure your public key is added to your Git provider.")
-                logger.info("Your public key:")
-                logger.blank()
-                print("─" * 70)
-                print(public_key)
-                print("─" * 70)
-            
-            return 1
-    
-    # Final summary
-    if key_exists and not show_flag and not test_host:
+            logger.success(f"SSH connection to {test_host} works")
+            return 0
+
+        logger.error(
+            f"SSH connection to {test_host} failed: {message}",
+            details=f"Add the public key below to the account you clone with on {test_host}.",
+        )
+        if public_key:
+            _print_public_key(logger, public_key)
+        return 1
+
+    if not show:
         logger.success("SSH key is configured")
         logger.blank()
         logger.info("Useful commands:")
-        logger.info("  wasm setup ssh --show       # Show your public key")
-        logger.info("  wasm setup ssh --test github.com  # Test connection")
-    
+        logger.info("  wasm setup ssh --show              Show your public key")
+        logger.info("  wasm setup ssh --test github.com   Test the connection")
+
     return 0
 
 
-def _handle_doctor(args: Namespace) -> int:
+# ---------------------------------------------------------------------------
+# setup doctor
+# ---------------------------------------------------------------------------
+
+
+def _run_doctor(logger: Logger) -> int:
     """
-    Handle doctor command - comprehensive system diagnostics.
-    
-    Checks all dependencies, configurations, and provides actionable
-    recommendations to fix any issues.
+    Check everything a deployment depends on and say how to fix what is broken.
+
+    Args:
+        logger: Logger used to report progress.
+
+    Returns:
+        Exit code. Non-zero when something is missing that deployments need.
     """
-    logger = Logger(verbose=args.verbose)
-    
     logger.header("WASM System Diagnostics")
     logger.blank()
-    
+
     from wasm.core.dependencies import DependencyChecker
-    checker = DependencyChecker(verbose=args.verbose)
-    
-    issues_found = 0
-    warnings_found = 0
-    
-    # =========================================================================
-    # Section 1: Core Dependencies
-    # =========================================================================
-    logger.info("═══ Core Dependencies ═══")
-    logger.blank()
-    
-    core_deps = [
-        ("git", "Git version control", "sudo apt install git"),
-        ("curl", "Data transfer tool", "sudo apt install curl"),
-    ]
-    
-    for cmd, desc, fix in core_deps:
-        if command_exists(cmd):
-            version = checker.get_version(cmd)
-            logger.success(f"{cmd}: {version or 'OK'}")
+
+    checker = DependencyChecker(verbose=logger.verbose)
+    manager = detect_package_manager()
+    install_hint = " ".join(manager.install) if manager else "your package manager"
+
+    issues = 0
+    warnings = 0
+
+    logger.section("Core Dependencies")
+    for command in ("git", "curl"):
+        if command_exists(command):
+            logger.success(f"{command}: {checker.get_version(command) or 'OK'}")
         else:
-            logger.error(f"{cmd}: NOT INSTALLED")
-            logger.info(f"  Fix: {fix}")
-            issues_found += 1
-    
+            logger.error(f"{command}: not installed")
+            logger.info(f"  Fix: sudo {install_hint} {command}")
+            issues += 1
     logger.blank()
-    
-    # =========================================================================
-    # Section 2: Web Server
-    # =========================================================================
-    logger.info("═══ Web Server ═══")
-    logger.blank()
-    
-    nginx_installed = command_exists("nginx")
-    apache_installed = command_exists("apache2")
-    
-    if nginx_installed:
-        version = checker.get_version("nginx", "-v")
-        logger.success(f"nginx: {version}")
-        
-        # Check if running
-        result = run_command(["systemctl", "is-active", "nginx"])
-        if result.stdout.strip() == "active":
-            logger.success("  nginx service: running")
-        else:
-            logger.warning("  nginx service: not running")
-            logger.info("  Fix: sudo systemctl start nginx")
-            warnings_found += 1
-    elif apache_installed:
-        logger.success("apache2: installed")
-        
-        result = run_command(["systemctl", "is-active", "apache2"])
-        if result.stdout.strip() == "active":
-            logger.success("  apache2 service: running")
-        else:
-            logger.warning("  apache2 service: not running")
-            warnings_found += 1
+
+    logger.section("Web Server")
+    if command_exists("nginx"):
+        logger.success(f"nginx: {checker.get_version('nginx', '-v')}")
+        warnings += _report_unit_state(logger, "nginx")
+    elif command_exists("apache2") or command_exists("httpd"):
+        unit = "apache2" if command_exists("apache2") else "httpd"
+        logger.success(f"{unit}: installed")
+        warnings += _report_unit_state(logger, unit)
     else:
-        logger.error("Web server: NOT INSTALLED")
-        logger.info("  Fix: sudo apt install nginx")
-        issues_found += 1
-    
+        logger.error("Web server: not installed")
+        logger.info(f"  Fix: sudo {install_hint} nginx")
+        issues += 1
     logger.blank()
-    
-    # =========================================================================
-    # Section 3: Node.js Environment
-    # =========================================================================
-    logger.info("═══ Node.js Environment ═══")
-    logger.blank()
-    
+
+    logger.section("Node.js Environment")
     if command_exists("node"):
-        version = checker.get_version("node")
-        logger.success(f"node: {version}")
-        
-        # Check npm
+        logger.success(f"node: {checker.get_version('node')}")
         if command_exists("npm"):
-            npm_version = checker.get_version("npm")
-            logger.success(f"npm: {npm_version}")
+            logger.success(f"npm: {checker.get_version('npm')}")
         else:
-            logger.error("npm: NOT INSTALLED (should come with Node.js)")
-            issues_found += 1
-        
-        # Check other package managers
-        for pm in ["pnpm", "yarn", "bun"]:
+            logger.error("npm: not installed, although it ships with Node.js")
+            issues += 1
+        for pm in ("pnpm", "yarn", "bun"):
             if command_exists(pm):
-                pm_version = checker.get_version(pm)
-                logger.success(f"{pm}: {pm_version}")
+                logger.success(f"{pm}: {checker.get_version(pm)}")
             else:
                 logger.info(f"{pm}: not installed (optional)")
     else:
-        logger.error("node: NOT INSTALLED")
-        logger.info("  Fix: curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - && sudo apt install -y nodejs")
-        issues_found += 1
-    
+        logger.error("node: not installed")
+        logger.info("  Fix: sudo wasm setup init")
+        issues += 1
     logger.blank()
-    
-    # =========================================================================
-    # Section 4: Python Environment
-    # =========================================================================
-    logger.info("═══ Python Environment ═══")
-    logger.blank()
-    
+
+    logger.section("Python Environment")
     if command_exists("python3"):
-        version = checker.get_version("python3")
-        logger.success(f"python3: {version}")
-        
+        logger.success(f"python3: {checker.get_version('python3')}")
         if command_exists("pip3"):
-            pip_version = checker.get_version("pip3")
-            logger.success(f"pip3: {pip_version}")
+            logger.success(f"pip3: {checker.get_version('pip3')}")
         else:
             logger.warning("pip3: not installed")
-            logger.info("  Fix: sudo apt install python3-pip")
-            warnings_found += 1
+            logger.info(f"  Fix: sudo {install_hint} python3-pip")
+            warnings += 1
     else:
-        logger.warning("python3: not installed (needed for Python apps)")
-        warnings_found += 1
-    
+        logger.warning("python3: not installed, needed for Python apps")
+        warnings += 1
     logger.blank()
-    
-    # =========================================================================
-    # Section 5: SSL/TLS
-    # =========================================================================
-    logger.info("═══ SSL/TLS (Certbot) ═══")
-    logger.blank()
-    
+
+    logger.section("SSL/TLS (Certbot)")
     if command_exists("certbot"):
-        version = checker.get_version("certbot")
-        logger.success(f"certbot: {version}")
+        logger.success(f"certbot: {checker.get_version('certbot')}")
     else:
-        logger.warning("certbot: NOT INSTALLED")
-        logger.info("  Fix: sudo apt install certbot python3-certbot-nginx")
-        warnings_found += 1
-    
+        logger.warning("certbot: not installed")
+        logger.info(f"  Fix: sudo {install_hint} certbot")
+        warnings += 1
     logger.blank()
-    
-    # =========================================================================
-    # Section 6: WASM Configuration
-    # =========================================================================
-    logger.info("═══ WASM Configuration ═══")
-    logger.blank()
-    
-    # Check directories
-    if DEFAULT_APPS_DIR.exists():
-        logger.success(f"Apps directory: {DEFAULT_APPS_DIR}")
-    else:
-        logger.error(f"Apps directory: {DEFAULT_APPS_DIR} (NOT FOUND)")
-        logger.info("  Fix: sudo wasm setup init")
-        issues_found += 1
-    
-    if DEFAULT_LOG_DIR.exists():
-        logger.success(f"Log directory: {DEFAULT_LOG_DIR}")
-    else:
-        logger.error(f"Log directory: {DEFAULT_LOG_DIR} (NOT FOUND)")
-        issues_found += 1
-    
+
+    logger.section("WASM Configuration")
+    for label, path in (("Apps directory", DEFAULT_APPS_DIR), ("Log directory", DEFAULT_LOG_DIR)):
+        if path.exists():
+            logger.success(f"{label}: {path}")
+        else:
+            logger.error(f"{label}: {path} not found")
+            logger.info("  Fix: sudo wasm setup init")
+            issues += 1
+
     if DEFAULT_CONFIG_PATH.exists():
         logger.success(f"Config file: {DEFAULT_CONFIG_PATH}")
     else:
-        logger.warning(f"Config file: {DEFAULT_CONFIG_PATH} (NOT FOUND)")
+        logger.warning(f"Config file: {DEFAULT_CONFIG_PATH} not found")
         logger.info("  Fix: sudo wasm setup init")
-        warnings_found += 1
-    
+        warnings += 1
     logger.blank()
-    
-    # =========================================================================
-    # Section 7: SSH Configuration
-    # =========================================================================
-    logger.info("═══ SSH Configuration ═══")
-    logger.blank()
-    
+
+    logger.section("SSH Configuration")
     from wasm.validators.ssh import ssh_key_exists, test_ssh_connection
-    
+
     key_exists, key_path = ssh_key_exists()
     if key_exists:
         logger.success(f"SSH key: {key_path}")
-        
-        # Test GitHub connection
-        success, msg = test_ssh_connection("github.com")
+        success, _ = test_ssh_connection("github.com")
         if success:
             logger.success("GitHub SSH: connected")
         else:
             logger.warning("GitHub SSH: not configured")
-            logger.info("  Add your SSH key to GitHub: https://github.com/settings/keys")
+            logger.info("  Add your key to GitHub: https://github.com/settings/keys")
     else:
-        logger.warning("SSH key: NOT FOUND")
+        logger.warning("SSH key: not found")
         logger.info("  Fix: wasm setup ssh --generate")
-        warnings_found += 1
-    
+        warnings += 1
     logger.blank()
-    
-    # =========================================================================
-    # Summary
-    # =========================================================================
-    logger.info("═══ Summary ═══")
-    logger.blank()
-    
-    if issues_found == 0 and warnings_found == 0:
-        logger.success("✓ All checks passed! Your system is ready for deployments.")
-    elif issues_found == 0:
-        logger.warning(f"⚠ {warnings_found} warning(s) found. System can function but some features may be limited.")
+
+    logger.section("Summary")
+    if not issues and not warnings:
+        logger.success("All checks passed. This machine is ready for deployments.")
+    elif not issues:
+        logger.warning(f"{warnings} warning(s). Deployments will work, some features will not.")
     else:
-        logger.error(f"✗ {issues_found} issue(s) and {warnings_found} warning(s) found.")
-        logger.info("Run 'sudo wasm setup init' to fix most issues automatically.")
-    
+        logger.error(f"{issues} issue(s) and {warnings} warning(s) found.")
+        logger.info("Run 'sudo wasm setup init' to fix most of these automatically.")
     logger.blank()
-    
-    return 0 if issues_found == 0 else 1
+
+    return 0 if issues == 0 else 1
+
+
+def _report_unit_state(logger: Logger, unit: str) -> int:
+    """
+    Say whether a systemd unit is running.
+
+    Args:
+        logger: Logger used to report progress.
+        unit: Systemd unit name.
+
+    Returns:
+        1 if the unit is not running, so the caller can count it as a warning.
+    """
+    result = run_command(["systemctl", "is-active", unit])
+    if result.stdout.strip() == "active":
+        logger.success(f"  {unit} service: running")
+        return 0
+    logger.warning(f"  {unit} service: not running")
+    logger.info(f"  Fix: sudo systemctl start {unit}")
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# argparse bridge
+# ---------------------------------------------------------------------------
+
+
+def handle_setup(args: Namespace) -> int:
+    """
+    Dispatch a setup action parsed by argparse.
+
+    Kept while the argparse parser is still wired up; both entry points call the
+    same functions, so there is one implementation of each action.
+
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        Exit code.
+    """
+    logger = Logger(verbose=getattr(args, "verbose", False))
+    action = getattr(args, "action", None)
+
+    try:
+        if action == "completions":
+            return _run_completions(
+                logger,
+                shell=getattr(args, "shell", None),
+                user_only=getattr(args, "user_only", False),
+                to_stdout=False,
+            )
+        if action == "init":
+            return _run_init(logger, assume_defaults=not _prompts_possible())
+        if action == "permissions":
+            return _run_permissions(logger)
+        if action == "ssh":
+            return _run_ssh(
+                logger,
+                generate=getattr(args, "generate", False),
+                key_type=getattr(args, "key_type", "ed25519"),
+                show=getattr(args, "show", False),
+                test_host=getattr(args, "test_host", None),
+            )
+        if action == "doctor":
+            return _run_doctor(logger)
+    except WASMError as e:
+        logger.error(str(e), details=e.details or "")
+        return 1
+
+    print(f"Unknown action: {action}", file=sys.stderr)
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# Click commands
+# ---------------------------------------------------------------------------
+
+
+@click.group("setup")
+@global_flags
+def cli() -> None:
+    """Prepare this server, and check that it stayed prepared."""
+
+
+@cli.command("init")
+@click.option(
+    "-y",
+    "--yes",
+    is_flag=True,
+    help="Take the defaults instead of asking. Use this in provisioning scripts.",
+)
+@global_flags
+@pass_context
+def init(ctx: Context, yes: bool) -> None:
+    """
+    Install what deployments need and create WASM's directories.
+
+    Needs root: it installs packages, writes to /etc and to /var.
+    """
+    _exit(_run_init(ctx.logger, assume_defaults=yes or not _prompts_possible()))
+
+
+@cli.command("completions")
+@click.option(
+    "-s",
+    "--shell",
+    type=click.Choice(COMPLETION_SHELLS),
+    help="Shell to generate for. Detected from $SHELL when omitted.",
+)
+@click.option(
+    "-u",
+    "--user-only",
+    is_flag=True,
+    help="Install for the current user instead of system-wide. Needs no root.",
+)
+@click.option(
+    "--stdout",
+    "to_stdout",
+    is_flag=True,
+    help="Print the script instead of installing it, to pipe or inspect.",
+)
+@global_flags
+@pass_context
+def completions(ctx: Context, shell: str | None, user_only: bool, to_stdout: bool) -> None:
+    """
+    Install tab completion for wasm.
+
+    The script is generated from the command tree, so it never falls behind the
+    commands it completes.
+    """
+    _exit(_run_completions(ctx.logger, shell=shell, user_only=user_only, to_stdout=to_stdout))
+
+
+@cli.command("permissions")
+@global_flags
+@pass_context
+def permissions(ctx: Context) -> None:
+    """Check that WASM can write to the directories it owns."""
+    _exit(_run_permissions(ctx.logger))
+
+
+@cli.command("ssh")
+@click.option("-g", "--generate", is_flag=True, help="Create a key if this machine has none.")
+@click.option(
+    "-t",
+    "--type",
+    "key_type",
+    type=click.Choice(["ed25519", "rsa", "ecdsa"]),
+    default="ed25519",
+    show_default=True,
+    help="Algorithm to generate the key with.",
+)
+@click.option("-T", "--test", "test_host", metavar="HOST", help="Try to connect to a Git host.")
+@click.option("-S", "--show", is_flag=True, help="Print the public key to add to your Git host.")
+@global_flags
+@pass_context
+def ssh(ctx: Context, generate: bool, key_type: str, test_host: str | None, show: bool) -> None:
+    """
+    Set up the SSH key WASM clones private repositories with.
+
+    With no options it reports what is already configured.
+    """
+    _exit(
+        _run_ssh(
+            ctx.logger,
+            generate=generate,
+            key_type=key_type,
+            show=show,
+            test_host=test_host,
+        )
+    )
+
+
+@cli.command("doctor")
+@global_flags
+@pass_context
+def doctor(ctx: Context) -> None:
+    """
+    Diagnose this machine and say how to fix what is wrong.
+
+    Exits non-zero when something deployments depend on is missing.
+    """
+    _exit(_run_doctor(ctx.logger))

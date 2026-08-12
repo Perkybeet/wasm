@@ -11,7 +11,6 @@ pipeline information for monorepo deployments.
 
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Set
 
 from wasm.core.logger import Logger
 
@@ -24,7 +23,7 @@ class TurboHelper:
     and dependency order calculation.
     """
 
-    def __init__(self, logger: Optional[Logger] = None):
+    def __init__(self, logger: Logger | None = None):
         """
         Initialize Turborepo helper.
 
@@ -32,8 +31,8 @@ class TurboHelper:
             logger: Logger instance for output.
         """
         self.logger = logger or Logger()
-        self._config: Optional[Dict] = None
-        self._config_path: Optional[Path] = None
+        self._config: dict | None = None
+        self._config_path: Path | None = None
 
     def detect(self, app_path: Path) -> bool:
         """
@@ -61,7 +60,7 @@ class TurboHelper:
 
         return False
 
-    def load_config(self, app_path: Path) -> Dict:
+    def load_config(self, app_path: Path) -> dict:
         """
         Load and parse turbo.json configuration.
 
@@ -93,7 +92,7 @@ class TurboHelper:
             self._config_path = app_path
             return self._config
 
-    def _default_config(self) -> Dict:
+    def _default_config(self) -> dict:
         """
         Return default Turborepo configuration.
 
@@ -117,7 +116,7 @@ class TurboHelper:
             }
         }
 
-    def get_build_command(self, app_path: Path) -> List[str]:
+    def get_build_command(self, app_path: Path) -> list[str]:
         """
         Get the build command for the monorepo.
 
@@ -139,7 +138,7 @@ class TurboHelper:
         # Fallback to turbo run build
         return ["pnpm", "exec", "turbo", "run", "build"]
 
-    def get_build_outputs(self, app_path: Path) -> List[str]:
+    def get_build_outputs(self, app_path: Path) -> list[str]:
         """
         Get expected build output directories.
 
@@ -157,11 +156,11 @@ class TurboHelper:
 
         # Default outputs if not specified
         if not outputs:
-            outputs = [".next/**", "dist/**", "build/**"]
+            return [".next/**", "dist/**", "build/**"]
 
-        return outputs
+        return [str(o) for o in outputs]
 
-    def get_task_dependencies(self, task_name: str, app_path: Path) -> List[str]:
+    def get_task_dependencies(self, task_name: str, app_path: Path) -> list[str]:
         """
         Get dependencies for a specific task.
 
@@ -183,7 +182,7 @@ class TurboHelper:
 
         return direct_deps
 
-    def get_global_dependencies(self, app_path: Path) -> List[str]:
+    def get_global_dependencies(self, app_path: Path) -> list[str]:
         """
         Get global dependencies that affect all tasks.
 
@@ -203,15 +202,15 @@ class TurboHelper:
 
         # Common global dependencies
         if not global_deps:
-            global_deps = [
+            return [
                 "pnpm-lock.yaml",
                 "package.json",
                 "tsconfig.json",
             ]
 
-        return global_deps
+        return [str(d) for d in global_deps]
 
-    def get_env_vars(self, app_path: Path) -> Set[str]:
+    def get_env_vars(self, app_path: Path) -> set[str]:
         """
         Get environment variables that should be considered for builds.
 
@@ -257,7 +256,7 @@ class TurboHelper:
         # Cache is enabled by default unless explicitly disabled
         return task_config.get("cache", True) is not False
 
-    def get_filter_args(self, workspaces: List[str]) -> List[str]:
+    def get_filter_args(self, workspaces: list[str]) -> list[str]:
         """
         Generate filter arguments for turbo to only build specific workspaces.
 
@@ -296,7 +295,7 @@ class TurboHelper:
         # Cap at 30 minutes
         return min(base_timeout + workspace_timeout, 1800)
 
-    def get_parallel_count(self) -> Optional[int]:
+    def get_parallel_count(self) -> int | None:
         """
         Get recommended parallelization count for builds.
 
@@ -306,7 +305,7 @@ class TurboHelper:
         # Let Turborepo decide based on available CPUs
         return None
 
-    def validate_config(self, app_path: Path) -> List[str]:
+    def validate_config(self, app_path: Path) -> list[str]:
         """
         Validate turbo.json configuration.
 
@@ -330,8 +329,7 @@ class TurboHelper:
         tasks = config.get("tasks", config.get("pipeline", {}))
         if "build" not in tasks:
             warnings.append(
-                "No 'build' task defined in turbo.json. "
-                "Build command may not work as expected."
+                "No 'build' task defined in turbo.json. Build command may not work as expected."
             )
 
         return warnings

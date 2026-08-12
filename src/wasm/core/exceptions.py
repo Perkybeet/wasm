@@ -9,15 +9,15 @@ to provide clear and actionable error messages.
 class WASMError(Exception):
     """
     Base exception for all WASM errors.
-    
+
     All custom exceptions should inherit from this class.
     """
-    
+
     def __init__(self, message: str, details: str = ""):
         self.message = message
         self.details = details
         super().__init__(self.message)
-    
+
     def __str__(self) -> str:
         if self.details:
             return f"{self.message}\n  Details: {self.details}"
@@ -26,32 +26,36 @@ class WASMError(Exception):
 
 class ConfigError(WASMError):
     """Raised when there's a configuration error."""
+
     pass
 
 
 class ValidationError(WASMError):
     """Raised when input validation fails."""
+
     pass
 
 
 class DeploymentError(WASMError):
     """Raised when deployment fails at any step."""
+
     pass
 
 
 class BuildError(DeploymentError):
     """Raised when application build fails."""
+
     pass
 
 
 class OutOfMemoryError(BuildError):
     """
     Raised when build fails due to Out of Memory (OOM) condition.
-    
+
     This is detected when the process exits with code 137 (128 + SIGKILL)
     which typically indicates the OOM killer terminated the process.
     """
-    
+
     def __init__(self, message: str = "Build killed due to insufficient memory", details: str = ""):
         suggestions = """
 The build process was killed by the system (exit code 137), typically caused by
@@ -80,48 +84,54 @@ Solutions to try:
 5. Disable Turbopack (if using Next.js 15+):
    In next.config.js, ensure you're not using experimental turbo features
    for production builds."""
-        
+
         if details:
             full_details = f"{details}\n{suggestions}"
         else:
             full_details = suggestions
-        
+
         super().__init__(message, full_details)
 
 
 class SourceError(WASMError):
     """Raised when source fetching fails (git clone, download, etc.)."""
+
     pass
 
 
 class ServiceError(WASMError):
     """Raised when systemd service operations fail."""
+
     pass
 
 
 class SiteError(WASMError):
     """Raised when site configuration fails."""
+
     pass
 
 
 class NginxError(SiteError):
     """Raised when Nginx operations fail."""
+
     pass
 
 
 class ApacheError(SiteError):
     """Raised when Apache operations fail."""
+
     pass
 
 
 class CertificateError(WASMError):
     """Raised when SSL certificate operations fail."""
+
     pass
 
 
 class CommandError(WASMError):
     """Raised when a shell command execution fails."""
-    
+
     def __init__(self, message: str, command: str = "", exit_code: int = 0, stderr: str = ""):
         self.command = command
         self.exit_code = exit_code
@@ -138,105 +148,124 @@ class CommandError(WASMError):
 
 class DependencyError(WASMError):
     """Raised when a required dependency is missing."""
+
     pass
 
 
 class PermissionError(WASMError):
     """Raised when there are insufficient permissions."""
+
     pass
 
 
 class PortError(WASMError):
     """Raised when there are port-related issues."""
+
     pass
 
 
 class DomainError(WASMError):
     """Raised when there are domain-related issues."""
+
     pass
 
 
 class TemplateError(WASMError):
     """Raised when template rendering fails."""
+
     pass
 
 
 class RollbackError(WASMError):
     """Raised when rollback operation fails."""
+
     pass
 
 
 class MonitorError(WASMError):
     """Raised when process monitoring operations fail."""
+
     pass
 
 
 class AIAnalysisError(WASMError):
     """Raised when AI analysis fails."""
+
     pass
 
 
 class EmailError(WASMError):
     """Raised when email notification fails."""
+
     pass
 
 
 class SSHError(WASMError):
     """
     Raised when SSH authentication or configuration fails.
-    
+
     Provides detailed guidance for resolving SSH issues.
     """
+
     pass
 
 
 class SetupError(WASMError):
     """
     Raised when required setup/configuration is missing.
-    
+
     Used when prerequisites are not met (e.g., missing SSH keys,
     missing dependencies, etc.)
     """
+
     pass
 
 
 class DatabaseError(WASMError):
     """Base exception for database operations."""
+
     pass
 
 
 class DatabaseConnectionError(DatabaseError):
     """Raised when database connection fails."""
+
     pass
 
 
 class DatabaseNotFoundError(DatabaseError):
     """Raised when a database does not exist."""
+
     pass
 
 
 class DatabaseExistsError(DatabaseError):
     """Raised when trying to create a database that already exists."""
+
     pass
 
 
 class DatabaseUserError(DatabaseError):
     """Raised when database user operations fail."""
+
     pass
 
 
 class DatabaseEngineError(DatabaseError):
     """Raised when database engine operations fail (install, start, stop)."""
+
     pass
 
 
 class DatabaseBackupError(DatabaseError):
     """Raised when database backup/restore operations fail."""
+
     pass
 
 
 class DatabaseQueryError(DatabaseError):
     """Raised when a database query fails."""
+
     pass
 
 
@@ -246,19 +275,23 @@ class SecurityError(WASMError):
 
     Used to prevent command injection and other security vulnerabilities.
     """
+
     pass
 
 
 class BackupError(WASMError):
     """Raised when backup operations fail."""
+
     pass
 
 
 class DockerError(WASMError):
     """Raised when Docker operations fail."""
+
     pass
 
 
 class EnvConfigError(WASMError):
     """Raised when environment configuration fails."""
+
     pass

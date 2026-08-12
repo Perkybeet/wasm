@@ -1,0 +1,20 @@
+{#
+  Something was asked for that this machine does not have.
+
+  It is the empty state, with the same manners: name what is missing, say what
+  to do next, and give the command that answers the question from a terminal.
+  The status code says 404 as well, so a proxy, a log and a person all agree on
+  what happened.
+#}
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+
+{% block title %}{{ title }}{% endblock %}
+
+{% block content %}
+
+{{ m.page_head(section, none) }}
+
+{{ m.empty(title, body, command=command) }}
+
+{% endblock %}

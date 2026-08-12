@@ -3,564 +3,772 @@
 # https://github.com/Perkybeet/wasm/blob/main/LICENSE
 
 """
-MongoDB database manager for WASM.
+MongoDB manager.
+
+Scripts are piped into ``mongosh`` on stdin rather than passed with ``--eval``,
+because a ``createUser`` script carries a password and argv is world readable.
+Every value interpolated into a script is rendered with :func:`json.dumps`, which
+is a valid JavaScript literal for strings, numbers and objects alike, so a
+database name can never become code.
 """
+
+from __future__ import annotations
 
 import json
 import re
-from datetime import datetime
+import tempfile
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from wasm.core.exceptions import (
-    DatabaseError,
-    DatabaseNotFoundError,
-    DatabaseExistsError,
-    DatabaseUserError,
-    DatabaseEngineError,
     DatabaseBackupError,
+    DatabaseEngineError,
+    DatabaseError,
+    DatabaseExistsError,
+    DatabaseNotFoundError,
     DatabaseQueryError,
+    DatabaseUserError,
 )
 from wasm.managers.database.base import (
+    PACKAGE_TIMEOUT,
+    QUERY_TIMEOUT,
+    TRANSFER_TIMEOUT,
+    BackupInfo,
     BaseDatabaseManager,
     DatabaseInfo,
     UserInfo,
-    BackupInfo,
+    format_size,
 )
 from wasm.managers.database.registry import DatabaseRegistry
 
+#: Roles MongoDB ships. A deployment may define its own, which are accepted as
+#: long as the name is a plain identifier.
+BUILT_IN_ROLES = frozenset(
+    {
+        "backup",
+        "clusterAdmin",
+        "clusterManager",
+        "clusterMonitor",
+        "dbAdmin",
+        "dbAdminAnyDatabase",
+        "dbOwner",
+        "enableSharding",
+        "hostManager",
+        "read",
+        "readAnyDatabase",
+        "readWrite",
+        "readWriteAnyDatabase",
+        "restore",
+        "root",
+        "userAdmin",
+        "userAdminAnyDatabase",
+    }
+)
+
+#: Custom role names WASM is willing to pass on. ``str.isalnum`` would also
+#: accept letters from any script, and a role name that is only distinguishable
+#: from another by its Unicode block is not a role name anyone typed on purpose.
+CUSTOM_ROLE_PATTERN = re.compile(r"\A[A-Za-z0-9_]+\Z")
+
+#: Release series of the packages this manager installs.
+SERVER_SERIES = "7.0"
+
+#: Where the repository signing key is stored.
+KEYRING_PATH = Path(f"/usr/share/keyrings/mongodb-server-{SERVER_SERIES}.gpg")
+
+#: The apt source list this manager owns.
+SOURCES_PATH = Path(f"/etc/apt/sources.list.d/mongodb-org-{SERVER_SERIES}.list")
+
 
 class MongoDBManager(BaseDatabaseManager):
-    """
-    Manager for MongoDB databases.
-    """
-    
+    """Manager for MongoDB deployments."""
+
     ENGINE_NAME = "mongodb"
     DISPLAY_NAME = "MongoDB"
     DEFAULT_PORT = 27017
     SERVICE_NAME = "mongod"
-    PACKAGE_NAMES = ["mongodb-org"]
-    
-    # System databases to exclude from listings
-    SYSTEM_DATABASES = {
-        "admin",
-        "config",
-        "local",
-    }
-    
-    def __init__(self, verbose: bool = False):
-        """Initialize MongoDB manager."""
-        super().__init__(verbose=verbose)
-    
-    def is_installed(self) -> bool:
-        """Check if MongoDB is installed."""
-        result = self._run(["which", "mongod"])
-        return result.success
-    
-    def get_version(self) -> Optional[str]:
-        """Get MongoDB version."""
-        result = self._run(["mongod", "--version"])
-        if result.success:
-            match = re.search(r"db version v(\d+\.\d+\.\d+)", result.stdout)
-            if match:
-                return match.group(1)
-        return None
-    
-    def install(self) -> bool:
-        """Install MongoDB."""
-        self.logger.info(f"Installing {self.DISPLAY_NAME}...")
-        
-        # Import MongoDB GPG key
-        result = self._run_sudo([
-            "bash", "-c",
-            "curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc | "
-            "gpg --dearmor -o /usr/share/keyrings/mongodb-server-7.0.gpg"
-        ])
-        
-        # Add MongoDB repository
-        result = self._run_sudo([
-            "bash", "-c",
-            'echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] '
-            'https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse" | '
-            "tee /etc/apt/sources.list.d/mongodb-org-7.0.list"
-        ])
-        
-        # Update package list
-        result = self._run_sudo(["apt-get", "update"])
-        if not result.success:
-            raise DatabaseEngineError("Failed to update package list", result.stderr)
-        
-        # Install MongoDB
-        result = self._run_sudo([
-            "apt-get", "install", "-y",
-            *self.PACKAGE_NAMES,
-        ])
-        
-        if not result.success:
-            raise DatabaseEngineError(
-                f"Failed to install {self.DISPLAY_NAME}",
-                result.stderr
+    PACKAGE_NAMES = ("mongodb-org",)
+    CLIENT_BINARY = "mongod"
+    VERSION_ARGV = ("mongod", "--version")
+    VERSION_PATTERN = r"db version v(\d+\.\d+\.\d+)"
+    PURGE_PATHS = ("/var/lib/mongodb", "/var/log/mongodb", "/etc/mongod.conf")
+    BACKUP_SUFFIX = ".tar.gz"
+    MAX_DATABASE_NAME_LENGTH = 63
+    MAX_USER_NAME_LENGTH = 63
+
+    #: Databases that belong to the deployment, not to a user.
+    SYSTEM_DATABASES = frozenset({"admin", "config", "local"})
+
+    #: Shells to try, newest first.
+    SHELLS = ("mongosh", "mongo")
+
+    # ==================== Installation ====================
+
+    def _pre_install(self) -> None:
+        """
+        Add the upstream repository, since no distribution ships mongodb-org.
+
+        Raises:
+            DatabaseEngineError: When the key cannot be fetched or converted.
+        """
+        with tempfile.TemporaryDirectory(prefix="wasm-mongodb-") as workdir:
+            armoured = Path(workdir) / "server.asc"
+            result = self.runner.capture_to_file(
+                ["curl", "-fsSL", f"https://www.mongodb.org/static/pgp/server-{SERVER_SERIES}.asc"],
+                armoured,
+                timeout=PACKAGE_TIMEOUT,
             )
-        
-        # Enable and start service
-        self.enable()
-        self.start()
-        
-        return True
-    
-    def uninstall(self, purge: bool = False) -> bool:
-        """Uninstall MongoDB."""
-        self.logger.info(f"Uninstalling {self.DISPLAY_NAME}...")
-        
-        # Stop service
+            if not result.success:
+                raise DatabaseEngineError(
+                    "Failed to download the MongoDB signing key",
+                    details=result.stderr.strip() or "Check outbound HTTPS access.",
+                )
+
+            result = self._exec(
+                ["gpg", "--batch", "--yes", "--dearmor", "-o", str(KEYRING_PATH), str(armoured)],
+                timeout=QUERY_TIMEOUT,
+            )
+            if not result.success:
+                raise DatabaseEngineError(
+                    "Failed to install the MongoDB signing key",
+                    details=result.stderr.strip() or f"Could not write {KEYRING_PATH}.",
+                )
+
+        source = (
+            f"deb [ arch=amd64,arm64 signed-by={KEYRING_PATH} ] "
+            f"https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/{SERVER_SERIES} multiverse\n"
+        )
         try:
-            self.stop()
-        except Exception:
-            pass
-        
-        action = "purge" if purge else "remove"
-        
-        result = self._run_sudo([
-            "apt-get", action, "-y",
-            *self.PACKAGE_NAMES,
-        ])
-        
-        if purge:
-            # Remove data directory
-            self._run_sudo(["rm", "-rf", "/var/lib/mongodb"])
-            self._run_sudo(["rm", "-rf", "/var/log/mongodb"])
-            self._run_sudo(["rm", "-rf", "/etc/mongod.conf"])
-        
-        return True
-    
+            SOURCES_PATH.write_text(source)
+        except OSError as exc:
+            raise DatabaseEngineError(
+                "Failed to add the MongoDB apt source",
+                details=f"{exc}. Write {SOURCES_PATH} manually and retry.",
+            ) from exc
+
+    # ==================== Shell ====================
+
+    @classmethod
+    def validate_privileges(cls, privileges: Sequence[str] | None) -> tuple[str, ...]:
+        """
+        Check role names before they reach ``grantRolesToUser``.
+
+        Args:
+            privileges: Roles requested by the caller, or None for the default.
+
+        Returns:
+            The roles, without repeats.
+
+        Raises:
+            DatabaseUserError: When a role is not built in and does not look like
+                a custom role name.
+        """
+        requested = list(privileges) if privileges else ["readWrite"]
+
+        roles: list[str] = []
+        for role in requested:
+            if not isinstance(role, str) or (
+                role not in BUILT_IN_ROLES and not CUSTOM_ROLE_PATTERN.match(role)
+            ):
+                raise DatabaseUserError(
+                    f"Invalid MongoDB role: {role!r}",
+                    details=(
+                        f"Use a built-in role ({', '.join(sorted(BUILT_IN_ROLES))}) or the name "
+                        "of a custom role, made of letters, digits and underscores."
+                    ),
+                )
+            if role not in roles:
+                roles.append(role)
+        return tuple(roles)
+
+    def _shell(self) -> str:
+        """
+        Pick the shell binary this host provides.
+
+        Returns:
+            The name of the shell to run.
+
+        Raises:
+            DatabaseEngineError: When no MongoDB shell is installed.
+        """
+        for shell in self.SHELLS:
+            if self.runner.exists(shell):
+                return shell
+        raise DatabaseEngineError(
+            "No MongoDB shell found",
+            details="Install mongosh (or the legacy mongo client) and retry.",
+        )
+
     def _execute_mongo(
         self,
-        command: str,
+        script: str,
         database: str = "admin",
+        *,
+        secrets: Sequence[str] = (),
+        timeout: int = QUERY_TIMEOUT,
     ) -> tuple[bool, str]:
         """
-        Execute MongoDB command using mongosh.
-        
+        Run a JavaScript snippet, passing it on stdin.
+
         Args:
-            command: JavaScript command to execute.
-            database: Database to use.
-            
+            script: The snippet.
+            database: Database the shell connects to.
+            secrets: Values the snippet carries that must not be logged.
+            timeout: Deadline in seconds.
+
         Returns:
-            Tuple of (success, output).
+            Whether the shell succeeded, and its output or its error text.
         """
-        # Try mongosh first (MongoDB 6+), fall back to mongo
-        for shell in ["mongosh", "mongo"]:
-            which_result = self._run(["which", shell])
-            if which_result.success:
-                cmd = [shell, database, "--quiet", "--eval", command]
-                result = self._run(cmd)
-                return result.success, result.stdout if result.success else result.stderr
-        
-        return False, "MongoDB shell not found (mongosh or mongo)"
-    
+        result = self._exec(
+            [self._shell(), database, "--quiet"],
+            input=script,
+            timeout=timeout,
+            secrets=secrets,
+        )
+        return result.success, result.stdout if result.success else result.stderr
+
     def _execute_mongo_json(
         self,
-        command: str,
+        expression: str,
         database: str = "admin",
     ) -> tuple[bool, Any]:
-        """Execute MongoDB command and parse JSON output."""
-        # Wrap command to output JSON
-        json_cmd = f"EJSON.stringify({command})"
-        success, output = self._execute_mongo(json_cmd, database)
-        
+        """
+        Run an expression and parse its extended JSON result.
+
+        Args:
+            expression: The JavaScript expression.
+            database: Database the shell connects to.
+
+        Returns:
+            Whether the shell succeeded, and the parsed value or the raw output.
+        """
+        success, output = self._execute_mongo(f"EJSON.stringify({expression})", database)
         if success and output.strip():
             try:
                 return True, json.loads(output.strip())
             except json.JSONDecodeError:
                 return success, output
-        
         return success, output
-    
+
+    @staticmethod
+    def _js(value: Any) -> str:
+        """
+        Render a Python value as a JavaScript literal.
+
+        Args:
+            value: The value to embed in a script.
+
+        Returns:
+            A literal that the shell parses as data, never as code.
+        """
+        return json.dumps(value)
+
     # ==================== Database Management ====================
-    
+
     def create_database(
         self,
         name: str,
-        owner: Optional[str] = None,
-        encoding: Optional[str] = None,
+        owner: str | None = None,
+        encoding: str | None = None,
         **kwargs,
     ) -> DatabaseInfo:
         """
-        Create a new MongoDB database.
-        
-        MongoDB creates databases on first use, so we just insert a temp document.
+        Create a database by creating, then dropping, a placeholder collection.
+
+        Args:
+            name: Database name.
+            owner: Ignored; MongoDB users are granted roles instead.
+            encoding: Ignored; MongoDB stores BSON.
+            **kwargs: Unused.
+
+        Returns:
+            Information about the new database.
+
+        Raises:
+            DatabaseExistsError: When the database already exists.
+            DatabaseError: When the name is invalid or creation fails.
         """
+        self.validate_database_name(name)
         if self.database_exists(name):
-            raise DatabaseExistsError(f"Database '{name}' already exists")
-        
-        # Create a collection to instantiate the database
-        cmd = f"db.getSiblingDB('{name}').createCollection('_wasm_init')"
-        success, output = self._execute_mongo(cmd)
-        
+            raise DatabaseExistsError(
+                f"Database '{name}' already exists",
+                details="Drop it first, or pick another name.",
+            )
+
+        success, output = self._execute_mongo(
+            f"db.getSiblingDB({self._js(name)}).createCollection('_wasm_init')"
+        )
         if not success:
-            raise DatabaseError(f"Failed to create database '{name}'", output)
-        
-        # Drop the temp collection
-        self._execute_mongo(f"db.getSiblingDB('{name}')._wasm_init.drop()")
-        
+            raise DatabaseError(f"Failed to create database '{name}'", details=output.strip())
+
+        self._execute_mongo(f"db.getSiblingDB({self._js(name)})._wasm_init.drop()")
+
         self.logger.info(f"Created database: {name}")
         return self.get_database_info(name)
-    
-    def drop_database(self, name: str, force: bool = False) -> bool:
-        """Drop a MongoDB database."""
-        if not self.database_exists(name) and not force:
-            raise DatabaseNotFoundError(f"Database '{name}' does not exist")
-        
-        cmd = f"db.getSiblingDB('{name}').dropDatabase()"
-        success, output = self._execute_mongo(cmd)
-        
+
+    def drop_database(self, name: str, force: bool = False) -> None:
+        """
+        Drop a database.
+
+        Args:
+            name: Database name.
+            force: Accept a missing database as success.
+
+        Raises:
+            DatabaseNotFoundError: When the database does not exist.
+            DatabaseError: When the drop fails.
+        """
+        self.validate_database_name(name)
+        if not self.database_exists(name):
+            if force:
+                return
+            raise DatabaseNotFoundError(
+                f"Database '{name}' does not exist",
+                details="Run 'wasm db list --engine mongodb' to see the databases.",
+            )
+
+        success, output = self._execute_mongo(f"db.getSiblingDB({self._js(name)}).dropDatabase()")
         if not success:
-            raise DatabaseError(f"Failed to drop database '{name}'", output)
-        
+            raise DatabaseError(f"Failed to drop database '{name}'", details=output.strip())
+
         self.logger.info(f"Dropped database: {name}")
-        return True
-    
+
     def database_exists(self, name: str) -> bool:
-        """Check if a database exists."""
-        cmd = "db.adminCommand('listDatabases').databases.map(d => d.name)"
-        success, output = self._execute_mongo(cmd)
-        
-        if success:
-            return name in output
-        return False
-    
-    def list_databases(self) -> List[DatabaseInfo]:
-        """List all databases."""
-        cmd = "db.adminCommand('listDatabases')"
-        success, data = self._execute_mongo_json(cmd)
-        
+        """
+        Report whether a database exists.
+
+        Args:
+            name: Database name.
+
+        Returns:
+            True when the deployment lists the name.
+        """
+        success, data = self._execute_mongo_json(
+            "db.adminCommand('listDatabases').databases.map(d => d.name)"
+        )
         if not success:
+            return False
+        if isinstance(data, list):
+            return name in data
+        return f'"{name}"' in str(data)
+
+    def list_databases(self) -> list[DatabaseInfo]:
+        """
+        List the databases that do not belong to the deployment itself.
+
+        Returns:
+            One entry per user database.
+        """
+        success, data = self._execute_mongo_json("db.adminCommand('listDatabases')")
+        if not success or not isinstance(data, dict):
             return []
-        
+
         databases = []
-        if isinstance(data, dict) and "databases" in data:
-            for db_info in data["databases"]:
-                name = db_info.get("name", "")
-                if name in self.SYSTEM_DATABASES:
-                    continue
-                
-                size = db_info.get("sizeOnDisk", 0)
-                
-                databases.append(DatabaseInfo(
+        for entry in data.get("databases", []):
+            name = entry.get("name", "")
+            if name in self.SYSTEM_DATABASES:
+                continue
+            size = entry.get("sizeOnDisk", 0)
+            databases.append(
+                DatabaseInfo(
                     name=name,
                     engine=self.ENGINE_NAME,
-                    size=self._format_size(size),
-                    extra={"sizeOnDisk": size, "empty": db_info.get("empty", False)},
-                ))
-        
+                    size=format_size(size),
+                    extra={"sizeOnDisk": size, "empty": entry.get("empty", False)},
+                )
+            )
         return databases
-    
+
     def get_database_info(self, name: str) -> DatabaseInfo:
-        """Get detailed database information."""
+        """
+        Describe one database.
+
+        Args:
+            name: Database name.
+
+        Returns:
+            Size and collection count.
+
+        Raises:
+            DatabaseNotFoundError: When the database does not exist.
+        """
         if not self.database_exists(name):
             raise DatabaseNotFoundError(f"Database '{name}' does not exist")
-        
-        # Get database stats
-        cmd = f"db.getSiblingDB('{name}').stats()"
-        success, data = self._execute_mongo_json(cmd)
-        
+
+        success, data = self._execute_mongo_json(f"db.getSiblingDB({self._js(name)}).stats()")
+
         size = None
         collections = 0
-        
         if success and isinstance(data, dict):
-            size = self._format_size(data.get("dataSize", 0))
+            size = format_size(data.get("dataSize", 0))
             collections = data.get("collections", 0)
-        
+
         return DatabaseInfo(
             name=name,
             engine=self.ENGINE_NAME,
             size=size,
-            tables=collections,  # Using tables field for collection count
+            tables=collections,
             extra=data if isinstance(data, dict) else {},
         )
-    
-    @staticmethod
-    def _format_size(size: int) -> str:
-        """Format size in human readable format."""
-        for unit in ["B", "KB", "MB", "GB", "TB"]:
-            if size < 1024:
-                return f"{size:.1f} {unit}"
-            size /= 1024
-        return f"{size:.1f} PB"
-    
+
     # ==================== User Management ====================
-    
+
     def create_user(
         self,
         username: str,
-        password: Optional[str] = None,
+        password: str | None = None,
         host: str = "localhost",
         **kwargs,
     ) -> tuple[UserInfo, str]:
-        """Create a new MongoDB user."""
+        """
+        Create a user with roles on a database.
+
+        Args:
+            username: User name.
+            password: Password. Generated when omitted.
+            host: Recorded for the caller; MongoDB has no per-host users.
+            **kwargs: Accepts ``database`` and ``roles``.
+
+        Returns:
+            The user and its password.
+
+        Raises:
+            DatabaseUserError: When the user exists or creation fails.
+        """
+        self.validate_user_name(username)
         if self.user_exists(username):
-            raise DatabaseUserError(f"User '{username}' already exists")
-        
+            raise DatabaseUserError(
+                f"User '{username}' already exists",
+                details="Drop the user first, or pick another name.",
+            )
+
         password = password or self.generate_password()
         database = kwargs.get("database", "admin")
-        roles = kwargs.get("roles", [{"role": "readWrite", "db": database}])
-        
-        # Build create user command
-        roles_json = json.dumps(roles)
-        cmd = f"""
-            db.getSiblingDB('{database}').createUser({{
-                user: '{username}',
-                pwd: '{password}',
-                roles: {roles_json}
-            }})
-        """
-        
-        success, output = self._execute_mongo(cmd)
-        
+        self.validate_database_name(database)
+
+        roles: list[dict[str, str]] = []
+        for entry in kwargs.get("roles") or self.validate_privileges(None):
+            name = entry.get("role", "") if isinstance(entry, dict) else entry
+            target = entry.get("db", database) if isinstance(entry, dict) else database
+            self.validate_database_name(target)
+            roles.append({"role": self.validate_privileges([name])[0], "db": target})
+
+        script = (
+            f"db.getSiblingDB({self._js(database)}).createUser({{"
+            f"user: {self._js(username)}, pwd: {self._js(password)}, roles: {self._js(roles)}}})"
+        )
+        success, output = self._execute_mongo(script, secrets=(password,))
         if not success:
-            raise DatabaseUserError(f"Failed to create user '{username}'", output)
-        
+            raise DatabaseUserError(f"Failed to create user '{username}'", details=output.strip())
+
         self.logger.info(f"Created user: {username}")
-        
-        user_info = UserInfo(
+        user = UserInfo(
             username=username,
             engine=self.ENGINE_NAME,
             host=host,
             databases=[database],
-            privileges=[r.get("role", "") for r in roles if isinstance(r, dict)],
+            privileges=[role["role"] for role in roles],
         )
-        
-        return user_info, password
-    
-    def drop_user(self, username: str, host: str = "localhost") -> bool:
-        """Drop a MongoDB user."""
+        return user, password
+
+    def drop_user(self, username: str, host: str = "localhost") -> None:
+        """
+        Drop a user from the admin database.
+
+        Args:
+            username: User name.
+            host: Ignored; MongoDB has no per-host users.
+
+        Raises:
+            DatabaseUserError: When the user is missing or the drop fails.
+        """
+        self.validate_user_name(username)
         if not self.user_exists(username):
-            raise DatabaseUserError(f"User '{username}' does not exist")
-        
-        cmd = f"db.dropUser('{username}')"
-        success, output = self._execute_mongo(cmd, database="admin")
-        
+            raise DatabaseUserError(
+                f"User '{username}' does not exist",
+                details="Run 'wasm db users --engine mongodb' to see the users.",
+            )
+
+        success, output = self._execute_mongo(f"db.dropUser({self._js(username)})")
         if not success:
-            raise DatabaseUserError(f"Failed to drop user '{username}'", output)
-        
+            raise DatabaseUserError(f"Failed to drop user '{username}'", details=output.strip())
+
         self.logger.info(f"Dropped user: {username}")
-        return True
-    
+
     def user_exists(self, username: str, host: str = "localhost") -> bool:
-        """Check if a user exists."""
-        cmd = f"db.getUser('{username}')"
-        success, output = self._execute_mongo(cmd, database="admin")
-        return success and output.strip() and output.strip() != "null"
-    
-    def list_users(self) -> List[UserInfo]:
-        """List all MongoDB users."""
-        cmd = "db.getUsers()"
-        success, data = self._execute_mongo_json(cmd, database="admin")
-        
+        """
+        Report whether a user exists in the admin database.
+
+        Args:
+            username: User name.
+            host: Ignored; MongoDB has no per-host users.
+
+        Returns:
+            True when getUser returns a document.
+        """
+        success, output = self._execute_mongo(f"db.getUser({self._js(username)})")
+        return bool(success and output.strip() and output.strip() != "null")
+
+    def list_users(self) -> list[UserInfo]:
+        """
+        List the users of the admin database.
+
+        Returns:
+            One entry per user, with its roles and databases.
+        """
+        success, data = self._execute_mongo_json("db.getUsers()")
         if not success:
             return []
-        
+
+        if isinstance(data, dict):
+            entries = data.get("users", [])
+        elif isinstance(data, list):
+            entries = data
+        else:
+            entries = []
+
         users = []
-        user_list = data.get("users", []) if isinstance(data, dict) else data if isinstance(data, list) else []
-        
-        for user_data in user_list:
-            if isinstance(user_data, dict):
-                username = user_data.get("user", "")
-                roles = user_data.get("roles", [])
-                
-                databases = list(set(
-                    r.get("db", "") for r in roles
-                    if isinstance(r, dict) and r.get("db")
-                ))
-                privileges = list(set(
-                    r.get("role", "") for r in roles
-                    if isinstance(r, dict)
-                ))
-                
-                users.append(UserInfo(
-                    username=username,
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            roles = [role for role in entry.get("roles", []) if isinstance(role, dict)]
+            users.append(
+                UserInfo(
+                    username=entry.get("user", ""),
                     engine=self.ENGINE_NAME,
-                    databases=databases,
-                    privileges=privileges,
-                ))
-        
+                    databases=sorted({role.get("db", "") for role in roles if role.get("db")}),
+                    privileges=sorted({role.get("role", "") for role in roles}),
+                )
+            )
         return users
-    
+
     def grant_privileges(
         self,
         username: str,
         database: str,
-        privileges: List[str] = None,
+        privileges: Sequence[str] | None = None,
         host: str = "localhost",
-    ) -> bool:
-        """Grant roles to a user on a database."""
-        roles = privileges or ["readWrite"]
-        
-        roles_json = json.dumps([{"role": r, "db": database} for r in roles])
-        cmd = f"db.grantRolesToUser('{username}', {roles_json})"
-        
-        success, output = self._execute_mongo(cmd, database="admin")
-        
+    ) -> None:
+        """
+        Grant roles on a database to a user.
+
+        Args:
+            username: User name.
+            database: Database the roles apply to.
+            privileges: Role names. readWrite when omitted.
+            host: Ignored; MongoDB has no per-host users.
+
+        Raises:
+            DatabaseUserError: When a role is invalid or the grant fails.
+        """
+        self.validate_user_name(username)
+        self.validate_database_name(database)
+        roles = [{"role": role, "db": database} for role in self.validate_privileges(privileges)]
+
+        success, output = self._execute_mongo(
+            f"db.grantRolesToUser({self._js(username)}, {self._js(roles)})"
+        )
         if not success:
-            raise DatabaseUserError(f"Failed to grant privileges", output)
-        
-        self.logger.info(f"Granted {roles} on {database} to {username}")
-        return True
-    
+            raise DatabaseUserError(
+                f"Failed to grant roles on '{database}' to '{username}'", details=output.strip()
+            )
+
+        self.logger.info(f"Granted {[role['role'] for role in roles]} on {database} to {username}")
+
     def revoke_privileges(
         self,
         username: str,
         database: str,
-        privileges: List[str] = None,
+        privileges: Sequence[str] | None = None,
         host: str = "localhost",
-    ) -> bool:
-        """Revoke roles from a user on a database."""
-        roles = privileges or ["readWrite"]
-        
-        roles_json = json.dumps([{"role": r, "db": database} for r in roles])
-        cmd = f"db.revokeRolesFromUser('{username}', {roles_json})"
-        
-        success, output = self._execute_mongo(cmd, database="admin")
-        
+    ) -> None:
+        """
+        Revoke roles on a database from a user.
+
+        Args:
+            username: User name.
+            database: Database the roles apply to.
+            privileges: Role names. readWrite when omitted.
+            host: Ignored; MongoDB has no per-host users.
+
+        Raises:
+            DatabaseUserError: When a role is invalid or the revoke fails.
+        """
+        self.validate_user_name(username)
+        self.validate_database_name(database)
+        roles = [{"role": role, "db": database} for role in self.validate_privileges(privileges)]
+
+        success, output = self._execute_mongo(
+            f"db.revokeRolesFromUser({self._js(username)}, {self._js(roles)})"
+        )
         if not success:
-            raise DatabaseUserError(f"Failed to revoke privileges", output)
-        
-        self.logger.info(f"Revoked {roles} on {database} from {username}")
-        return True
-    
+            raise DatabaseUserError(
+                f"Failed to revoke roles on '{database}' from '{username}'",
+                details=output.strip(),
+            )
+
+        self.logger.info(
+            f"Revoked {[role['role'] for role in roles]} on {database} from {username}"
+        )
+
     # ==================== Backup & Restore ====================
-    
+
     def backup(
         self,
         database: str,
-        output_path: Optional[Path] = None,
+        output_path: Path | None = None,
         compress: bool = True,
         **kwargs,
     ) -> BackupInfo:
-        """Create a MongoDB database backup using mongodump."""
+        """
+        Dump a database with mongodump and pack the result into a tarball.
+
+        mongodump writes a directory tree, so the archive, not the dump itself, is
+        what lands in the backup directory.
+
+        Args:
+            database: Database name.
+            output_path: Custom destination for the tarball.
+            compress: Compress the dumped BSON files.
+            **kwargs: Unused.
+
+        Returns:
+            Information about the backup.
+
+        Raises:
+            DatabaseNotFoundError: When the database does not exist.
+            DatabaseBackupError: When the dump or the archiving fails.
+        """
+        self.validate_database_name(database)
         if not self.database_exists(database):
             raise DatabaseNotFoundError(f"Database '{database}' does not exist")
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        dirname = f"{self.ENGINE_NAME}-{database}-{timestamp}"
-        
-        backup_dir = self.BACKUP_DIR / dirname
-        
-        # Create backup directory
-        self._run_sudo(["mkdir", "-p", str(self.BACKUP_DIR)])
-        
-        # Run mongodump
-        cmd = ["mongodump", "--db", database, "--out", str(backup_dir)]
-        
-        if compress:
-            cmd.append("--gzip")
-        
-        result = self._run_sudo(cmd)
-        
-        if not result.success:
-            raise DatabaseBackupError(f"Failed to backup database '{database}'", result.stderr)
-        
-        # Create a tarball
-        tar_file = self.BACKUP_DIR / f"{dirname}.tar.gz"
-        self._run_sudo([
-            "tar", "-czf", str(tar_file),
-            "-C", str(self.BACKUP_DIR),
-            dirname
-        ])
-        
-        # Remove the directory
-        self._run_sudo(["rm", "-rf", str(backup_dir)])
-        
-        # Get file stats
-        stat_result = self._run(["stat", "-c", "%s", str(tar_file)])
-        size = int(stat_result.stdout.strip()) if stat_result.success else 0
-        
-        self.logger.info(f"Created backup: {tar_file}")
-        
-        return BackupInfo(
-            path=tar_file,
-            database=database,
-            engine=self.ENGINE_NAME,
-            size=size,
-            created=datetime.now(),
-            compressed=True,
-        )
-    
+
+        archive = self._backup_path(database, output_path, False)
+
+        with tempfile.TemporaryDirectory(prefix="wasm-mongodump-") as workdir:
+            argv = ["mongodump", "--db", database, "--out", workdir]
+            if compress:
+                argv.append("--gzip")
+
+            result = self._exec(argv, timeout=TRANSFER_TIMEOUT)
+            if not result.success:
+                raise DatabaseBackupError(
+                    f"Failed to back up '{database}'",
+                    details=result.stderr.strip() or "mongodump reported no error text.",
+                )
+
+            # "tar -czf <archive>" creates the archive with the process umask,
+            # which for root is 0644: the whole dump would be readable by every
+            # local account. Writing the archive to stdout hands the file to the
+            # runner, which creates it 0600 and removes it if tar fails.
+            info = self._dump_to_file(
+                ["tar", "-czf", "-", "-C", workdir, database],
+                archive,
+                database=database,
+                compress=False,
+                timeout=TRANSFER_TIMEOUT,
+            )
+
+        # The tarball is gzipped by tar itself, not by the runner's gzip stage.
+        info.compressed = True
+        return info
+
     def restore(
         self,
         database: str,
         backup_path: Path,
         drop_existing: bool = False,
         **kwargs,
-    ) -> bool:
-        """Restore a MongoDB database from backup."""
+    ) -> None:
+        """
+        Restore a database from a mongodump tarball or directory.
+
+        Args:
+            database: Target database name.
+            backup_path: Tarball or dump directory.
+            drop_existing: Drop the collections being restored first.
+            **kwargs: Unused.
+
+        Raises:
+            DatabaseBackupError: When the file is missing or the restore fails.
+        """
+        self.validate_database_name(database)
         backup_path = Path(backup_path)
-        
         if not backup_path.exists():
-            raise DatabaseBackupError(f"Backup file not found: {backup_path}")
-        
+            raise DatabaseBackupError(
+                f"Backup file not found: {backup_path}",
+                details="Run 'wasm db backups' to list the backups WASM knows about.",
+            )
+
         if drop_existing and self.database_exists(database):
             self.drop_database(database, force=True)
-        
-        # Create temp directory
-        import tempfile
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Extract tarball
-            if backup_path.suffix == ".gz" and ".tar" in backup_path.name:
-                result = self._run_sudo([
-                    "tar", "-xzf", str(backup_path),
-                    "-C", temp_dir
-                ])
-                
-                if not result.success:
-                    raise DatabaseBackupError("Failed to extract backup", result.stderr)
-                
-                # Find the dump directory
-                dump_dir = Path(temp_dir)
-                subdirs = list(dump_dir.iterdir())
-                if subdirs:
-                    dump_dir = subdirs[0]
-            else:
+
+        with tempfile.TemporaryDirectory(prefix="wasm-mongorestore-") as workdir:
+            if backup_path.is_dir():
                 dump_dir = backup_path
-            
-            # Run mongorestore
-            cmd = ["mongorestore", "--db", database, "--drop" if drop_existing else ""]
-            cmd = [c for c in cmd if c]  # Remove empty strings
-            
-            # Check if gzipped
-            gzip_files = list(dump_dir.rglob("*.gz"))
-            if gzip_files:
-                cmd.append("--gzip")
-            
-            cmd.append(str(dump_dir / database if (dump_dir / database).exists() else dump_dir))
-            
-            result = self._run_sudo(cmd)
-            
+            else:
+                result = self._exec(
+                    ["tar", "-xzf", str(backup_path), "-C", workdir],
+                    timeout=TRANSFER_TIMEOUT,
+                )
+                if not result.success:
+                    raise DatabaseBackupError(
+                        "Failed to extract the backup",
+                        details=result.stderr.strip() or f"{backup_path} is not a gzipped tar.",
+                    )
+                extracted = sorted(Path(workdir).iterdir())
+                dump_dir = extracted[0] if extracted else Path(workdir)
+
+            source = dump_dir / database if (dump_dir / database).is_dir() else dump_dir
+
+            argv = ["mongorestore", "--db", database]
+            if drop_existing:
+                argv.append("--drop")
+            if any(source.rglob("*.gz")):
+                argv.append("--gzip")
+            argv.append(str(source))
+
+            result = self._exec(argv, timeout=TRANSFER_TIMEOUT)
             if not result.success:
-                raise DatabaseBackupError(f"Failed to restore database '{database}'", result.stderr)
-        
+                raise DatabaseBackupError(
+                    f"Failed to restore database '{database}'",
+                    details=result.stderr.strip() or "mongorestore reported no error text.",
+                )
+
         self.logger.info(f"Restored database: {database} from {backup_path}")
-        return True
-    
+
     # ==================== Query Execution ====================
-    
+
     def execute_query(
         self,
         database: str,
         query: str,
         **kwargs,
     ) -> tuple[bool, str]:
-        """Execute a MongoDB command."""
+        """
+        Run a JavaScript snippet against a database.
+
+        Args:
+            database: Database name.
+            query: The snippet.
+            **kwargs: Unused.
+
+        Returns:
+            Success and the snippet's output.
+
+        Raises:
+            DatabaseNotFoundError: When the database does not exist.
+            DatabaseQueryError: When the snippet fails.
+        """
         if not self.database_exists(database):
             raise DatabaseNotFoundError(f"Database '{database}' does not exist")
-        
+
         success, output = self._execute_mongo(query, database=database)
-        
         if not success:
-            raise DatabaseQueryError(f"Query failed", output)
-        
-        return success, output if isinstance(output, str) else json.dumps(output, indent=2)
-    
+            raise DatabaseQueryError("Query failed", details=output.strip())
+        return success, output
+
     def get_connection_string(
         self,
         database: str,
@@ -568,28 +776,44 @@ class MongoDBManager(BaseDatabaseManager):
         password: str,
         host: str = "localhost",
     ) -> str:
-        """Get a MongoDB connection string."""
+        """
+        Build a MongoDB URI.
+
+        Args:
+            database: Database name.
+            username: User name.
+            password: Password.
+            host: Host to connect to.
+
+        Returns:
+            The connection string.
+        """
         return f"mongodb://{username}:{password}@{host}:{self.DEFAULT_PORT}/{database}"
-    
+
     def get_interactive_command(
         self,
-        database: Optional[str] = None,
-        username: Optional[str] = None,
-    ) -> List[str]:
-        """Get the command to connect interactively."""
-        # Prefer mongosh over mongo
-        for shell in ["mongosh", "mongo"]:
-            result = self._run(["which", shell])
-            if result.success:
-                cmd = [shell]
-                if database:
-                    cmd.append(database)
-                if username:
-                    cmd.extend(["--username", username])
-                return cmd
-        
-        return ["mongosh"]  # Default
+        database: str | None = None,
+        username: str | None = None,
+    ) -> list[str]:
+        """
+        Build the command that opens a shell session.
+
+        Args:
+            database: Database to connect to.
+            username: User to connect as.
+
+        Returns:
+            The argument vector.
+
+        Raises:
+            DatabaseEngineError: When no MongoDB shell is installed.
+        """
+        argv = [self._shell()]
+        if database:
+            argv.append(database)
+        if username:
+            argv.extend(["--username", username])
+        return argv
 
 
-# Register the manager
 DatabaseRegistry.register(MongoDBManager, aliases=["mongo", "mongod"])

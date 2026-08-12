@@ -1,0 +1,75 @@
+{#
+  Activity.
+
+  Everything this panel does that takes longer than a request runs as a job, so
+  this is the screen that answers "is it still going?" and "why did it stop?".
+
+  A failed job shows what the tool said, verbatim and in mono, with the one
+  line of advice above it. It is never summarised: the operator is going to
+  paste that text into a search box or into an issue, and a friendly rewrite of
+  systemd's own words would be worthless there.
+#}
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+
+{% block title %}Activity{% endblock %}
+
+{% block content %}
+
+{{ m.page_head("Activity", (running | length) ~ " in flight" if running else none) }}
+
+<section style="margin-bottom: var(--space-6)">
+  <h2 class="label" style="margin-bottom: var(--space-2)">Working now</h2>
+
+  {% if running %}
+    <div class="rows">
+      {% for job in running %}
+        {% call m.row(job.name, job.state,
+                      [("step", job.current_step),
+                       ("progress", job.progress ~ "/" ~ job.total_steps),
+                       ("on", job.resource),
+                       ("started", job.started)],
+                      none, "row-" ~ job.id, job.description, job.status) %}
+          {{ m.follow_button("Logs", job.name, job.log_url) }}
+          {{ m.action_button("Cancel", job.cancel_endpoint,
+                             "Cancel " ~ job.name ~ "? The step already running is left to finish, and the machine is left half changed.") }}
+        {% endcall %}
+      {% endfor %}
+    </div>
+  {% else %}
+    <p class="muted">Nothing is running. This machine is idle.</p>
+  {% endif %}
+</section>
+
+<section>
+  <h2 class="label" style="margin-bottom: var(--space-2)">Recently finished</h2>
+
+  {% if recent %}
+    {% for job in recent %}
+      <div class="rows" style="margin-bottom: var(--space-3)">
+        {% call m.row(job.name, job.state,
+                      [("on", job.resource),
+                       ("result", job.status),
+                       ("finished", job.finished)],
+                      none, "row-" ~ job.id, job.description) %}
+          {{ m.badge(job.state, job.status) }}
+        {% endcall %}
+      </div>
+
+      {% if job.error %}
+        {{ m.problem(job.fix, job.error) }}
+      {% endif %}
+
+      {% if job.output %}
+        <details style="margin-bottom: var(--space-5)">
+          <summary class="label">Output of {{ job.name }}</summary>
+          <pre class="problem__output">{{ job.output }}</pre>
+        </details>
+      {% endif %}
+    {% endfor %}
+  {% else %}
+    <p class="muted">Nothing has finished on this machine yet.</p>
+  {% endif %}
+</section>
+
+{% endblock %}

@@ -1,74 +1,100 @@
 """
-Jobs API endpoints for WASM Web Interface.
+Jobs API endpoints.
 
-Provides endpoints for managing background jobs.
+The queue itself lives in :mod:`wasm.web.jobs`; this module only translates
+HTTP into calls on it. The job functions it queues are the same ones the
+resource endpoints queue, so ``POST /api/jobs/deploy`` and ``POST /api/apps``
+run identical code - they used to be two different implementations of a
+deployment, one of which shelled out to the ``wasm`` binary.
+
+Literal routes are declared before ``/{job_id}``: registered the other way
+round, ``/active`` and ``/cleanup`` would be matched as job identifiers.
 """
 
-from typing import Optional, List
-from fastapi import APIRouter, HTTPException, Depends, Query
+from __future__ import annotations
+
+import re
+from typing import Annotated, Any
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from wasm.web.auth import require_auth
+from wasm.core.exceptions import ValidationError
+from wasm.validators.names import validate_filename
+from wasm.web.api.auth import get_current_session
+from wasm.web.api.deps import WASMErrorRoute, strict_domain
 from wasm.web.jobs import (
-    get_job_manager,
-    JobType,
-    JobStatus,
     Job,
-    deploy_app_job,
-    update_app_job,
-    delete_app_job,
+    JobStatus,
+    JobType,
     backup_app_job,
-    rollback_app_job,
     cert_create_job,
+    delete_app_job,
+    deploy_app_job,
+    get_job_manager,
+    rollback_app_job,
+    update_app_job,
 )
 
+router = APIRouter(prefix="/jobs", tags=["jobs"], route_class=WASMErrorRoute)
 
-router = APIRouter(prefix="/jobs", tags=["jobs"])
+#: Job identifiers are the first eight characters of a uuid4.
+JOB_ID_PATTERN = re.compile(r"^[0-9a-f]{1,36}$")
 
-
-# ============ Request/Response Models ============
 
 class DeployRequest(BaseModel):
     """Request to deploy a new application."""
+
     domain: str = Field(..., description="Domain name for the application")
     source: str = Field(..., description="Git repository URL or local path")
-    app_type: str = Field(..., description="Application type (nextjs, vite, python, etc.)")
-    port: Optional[int] = Field(None, description="Port number (auto-assigned if not provided)")
-    branch: str = Field("main", description="Git branch to deploy")
-    env_vars: Optional[dict] = Field(None, description="Environment variables")
+    app_type: str = Field(default="auto", description="Application type")
+    port: int | None = Field(default=None, description="Port, assigned when omitted")
+    branch: str | None = Field(default=None, description="Git branch to deploy")
+    env_vars: dict[str, str] | None = Field(default=None, description="Environment variables")
+    webserver: str = Field(default="nginx", description="Web server to configure")
+    ssl: bool = Field(default=True, description="Obtain a certificate")
 
 
 class UpdateRequest(BaseModel):
     """Request to update an application."""
+
     domain: str = Field(..., description="Domain of the application to update")
 
 
 class DeleteRequest(BaseModel):
     """Request to delete an application."""
+
     domain: str = Field(..., description="Domain of the application to delete")
-    remove_files: bool = Field(True, description="Remove application files")
-    remove_ssl: bool = Field(True, description="Remove SSL certificates")
+    remove_files: bool = Field(default=True, description="Remove application files")
+    remove_ssl: bool = Field(default=True, description="Remove SSL certificates")
 
 
 class BackupRequest(BaseModel):
-    """Request to create a backup."""
-    domain: str = Field(..., description="Domain of the application to backup")
+    """Request to back up an application."""
+
+    domain: str = Field(..., description="Domain of the application to back up")
+    description: str = Field(default="", description="Description for the backup")
 
 
 class RollbackRequest(BaseModel):
-    """Request to rollback an application."""
-    domain: str = Field(..., description="Domain of the application to rollback")
-    backup_id: Optional[str] = Field(None, description="Specific backup ID to restore")
+    """Request to roll an application back."""
+
+    domain: str = Field(..., description="Domain of the application")
+    backup_id: str | None = Field(default=None, description="Backup to roll back to")
 
 
 class CertRequest(BaseModel):
-    """Request to create SSL certificate."""
+    """Request to obtain a certificate."""
+
     domain: str = Field(..., description="Domain for the certificate")
-    email: Optional[str] = Field(None, description="Email for certificate notifications")
+    email: str | None = Field(default=None, description="Registration email")
+    webserver: str = Field(default="nginx", description="Certbot plugin to use")
+    include_www: bool = Field(default=False, description="Also cover the www subdomain")
 
 
 class JobResponse(BaseModel):
-    """Response containing job information."""
+    """One job, as the queue records it."""
+
     id: str
     type: str
     name: str
@@ -78,243 +104,394 @@ class JobResponse(BaseModel):
     total_steps: int
     current_step: str
     created_at: str
-    started_at: Optional[str]
-    completed_at: Optional[str]
-    result: Optional[dict]
-    error: Optional[str]
-    logs: List[dict]
-    metadata: dict
+    started_at: str | None = None
+    completed_at: str | None = None
+    result: dict[str, Any] | None = None
+    error: str | None = None
+    logs: list[dict[str, Any]] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class JobListResponse(BaseModel):
-    """Response containing list of jobs."""
-    jobs: List[JobResponse]
+    """Response for listing jobs."""
+
+    jobs: list[JobResponse]
     total: int
     active: int
 
 
-# ============ Endpoints ============
+class JobCreatedResponse(BaseModel):
+    """Response after queueing a job."""
+
+    message: str
+    job: JobResponse
+
+
+class JobActionResponse(BaseModel):
+    """Response for an action on a job."""
+
+    message: str
+    job_id: str | None = None
+
+
+class CleanupResponse(BaseModel):
+    """Response after dropping old jobs."""
+
+    message: str
+    removed: int
+
+
+def _to_response(job: Job) -> JobResponse:
+    """
+    Convert a job into its API representation.
+
+    Args:
+        job: The job.
+
+    Returns:
+        The API model.
+    """
+    return JobResponse(**job.to_dict())
+
+
+def _validated_job_id(job_id: str) -> str:
+    """
+    Check that a job identifier looks like one.
+
+    Args:
+        job_id: Identifier as supplied by the client.
+
+    Returns:
+        The identifier.
+
+    Raises:
+        ValidationError: When it is not a hexadecimal identifier.
+    """
+    if not JOB_ID_PATTERN.match(job_id):
+        raise ValidationError(
+            f"Invalid job id: {job_id!r}",
+            details="Job ids are hexadecimal, as returned when the job was queued.",
+        )
+    return job_id
+
+
+def _queued(message: str, job: Job) -> JobCreatedResponse:
+    """
+    Build the response for a freshly queued job.
+
+    Args:
+        message: Human-readable summary.
+        job: The queued job.
+
+    Returns:
+        The response body.
+    """
+    return JobCreatedResponse(message=message, job=_to_response(job))
+
 
 @router.get("", response_model=JobListResponse)
-async def list_jobs(
-    limit: int = Query(50, ge=1, le=100),
-    status: Optional[str] = Query(None),
-    _: dict = Depends(require_auth),
-):
-    """List all jobs."""
+def list_jobs(
+    session: Annotated[dict, Depends(get_current_session)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    status: Annotated[str | None, Query(description="Filter by job status")] = None,
+) -> JobListResponse:
+    """
+    List recent jobs.
+
+    Args:
+        limit: Maximum number of jobs to return.
+        status: Status to filter by.
+        session: The authenticated session.
+
+    Returns:
+        The jobs, newest first.
+
+    Raises:
+        ValidationError: When the status filter is not a known status.
+    """
     manager = get_job_manager()
     jobs = manager.get_all_jobs(limit=limit)
-    
-    # Filter by status if provided
+
     if status:
         try:
-            status_enum = JobStatus(status)
-            jobs = [j for j in jobs if j.status == status_enum]
-        except ValueError:
-            pass
-    
-    active_jobs = manager.get_active_jobs()
-    
-    return {
-        "jobs": [j.to_dict() for j in jobs],
-        "total": len(jobs),
-        "active": len(active_jobs),
-    }
+            wanted = JobStatus(status)
+        except ValueError as exc:
+            raise ValidationError(
+                f"Unknown job status: {status!r}",
+                details=f"Use one of: {', '.join(s.value for s in JobStatus)}.",
+            ) from exc
+        jobs = [job for job in jobs if job.status == wanted]
 
-
-@router.get("/active", response_model=JobListResponse)
-async def list_active_jobs(_: dict = Depends(require_auth)):
-    """List only active (pending/running) jobs."""
-    manager = get_job_manager()
-    jobs = manager.get_active_jobs()
-    
-    return {
-        "jobs": [j.to_dict() for j in jobs],
-        "total": len(jobs),
-        "active": len(jobs),
-    }
-
-
-@router.get("/{job_id}", response_model=JobResponse)
-async def get_job(job_id: str, _: dict = Depends(require_auth)):
-    """Get details of a specific job."""
-    manager = get_job_manager()
-    job = manager.get_job(job_id)
-    
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    return job.to_dict()
-
-
-@router.post("/{job_id}/cancel")
-async def cancel_job(job_id: str, _: dict = Depends(require_auth)):
-    """Cancel a pending job."""
-    manager = get_job_manager()
-    
-    if manager.cancel_job(job_id):
-        return {"message": "Job cancelled", "job_id": job_id}
-    
-    raise HTTPException(
-        status_code=400,
-        detail="Cannot cancel job (may already be running or completed)"
+    return JobListResponse(
+        jobs=[_to_response(job) for job in jobs],
+        total=len(jobs),
+        active=len(manager.get_active_jobs()),
     )
 
 
-@router.post("/deploy")
-async def create_deploy_job(request: DeployRequest, _: dict = Depends(require_auth)):
-    """Create a new deployment job."""
-    manager = get_job_manager()
-    
-    job = manager.create_job(
+@router.get("/active", response_model=JobListResponse)
+def list_active_jobs(session: Annotated[dict, Depends(get_current_session)]) -> JobListResponse:
+    """
+    List queued and running jobs.
+
+    Args:
+        session: The authenticated session.
+
+    Returns:
+        The active jobs.
+    """
+    jobs = get_job_manager().get_active_jobs()
+    return JobListResponse(
+        jobs=[_to_response(job) for job in jobs], total=len(jobs), active=len(jobs)
+    )
+
+
+@router.post("/deploy", response_model=JobCreatedResponse, status_code=202)
+def create_deploy_job(
+    request: DeployRequest, session: Annotated[dict, Depends(get_current_session)]
+) -> JobCreatedResponse:
+    """
+    Queue a deployment.
+
+    Args:
+        request: The deployment request.
+        session: The authenticated session.
+
+    Returns:
+        The queued job.
+    """
+    domain = strict_domain(request.domain)
+    job = get_job_manager().create_job(
         job_type=JobType.DEPLOY,
-        name=f"Deploy {request.domain}",
-        description=f"Deploying {request.app_type} application to {request.domain}",
+        name=f"Deploy {domain}",
+        description=f"Deploying a {request.app_type} application to {domain}",
         func=deploy_app_job,
         kwargs={
-            "domain": request.domain,
+            "domain": domain,
             "source": request.source,
             "app_type": request.app_type,
             "port": request.port,
             "branch": request.branch,
             "env_vars": request.env_vars,
+            "webserver": request.webserver,
+            "ssl": request.ssl,
         },
-        metadata={
-            "domain": request.domain,
-            "source": request.source,
-            "app_type": request.app_type,
-        },
-        total_steps=100,
+        metadata={"domain": domain, "source": request.source, "app_type": request.app_type},
     )
-    
-    return {
-        "message": "Deployment job created",
-        "job": job.to_dict(),
-    }
+    return _queued("Deployment job created", job)
 
 
-@router.post("/update")
-async def create_update_job(request: UpdateRequest, _: dict = Depends(require_auth)):
-    """Create an update job."""
-    manager = get_job_manager()
-    
-    job = manager.create_job(
+@router.post("/update", response_model=JobCreatedResponse, status_code=202)
+def create_update_job(
+    request: UpdateRequest, session: Annotated[dict, Depends(get_current_session)]
+) -> JobCreatedResponse:
+    """
+    Queue an update.
+
+    Args:
+        request: The update request.
+        session: The authenticated session.
+
+    Returns:
+        The queued job.
+    """
+    domain = strict_domain(request.domain)
+    job = get_job_manager().create_job(
         job_type=JobType.UPDATE,
-        name=f"Update {request.domain}",
-        description=f"Updating application at {request.domain}",
+        name=f"Update {domain}",
+        description=f"Updating the application at {domain}",
         func=update_app_job,
-        kwargs={"domain": request.domain},
-        metadata={"domain": request.domain},
-        total_steps=100,
+        kwargs={"domain": domain},
+        metadata={"domain": domain},
     )
-    
-    return {
-        "message": "Update job created",
-        "job": job.to_dict(),
-    }
+    return _queued("Update job created", job)
 
 
-@router.post("/delete")
-async def create_delete_job(request: DeleteRequest, _: dict = Depends(require_auth)):
-    """Create a deletion job."""
-    manager = get_job_manager()
-    
-    job = manager.create_job(
+@router.post("/delete", response_model=JobCreatedResponse, status_code=202)
+def create_delete_job(
+    request: DeleteRequest, session: Annotated[dict, Depends(get_current_session)]
+) -> JobCreatedResponse:
+    """
+    Queue a deletion.
+
+    Args:
+        request: The deletion request.
+        session: The authenticated session.
+
+    Returns:
+        The queued job.
+    """
+    domain = strict_domain(request.domain)
+    job = get_job_manager().create_job(
         job_type=JobType.DELETE,
-        name=f"Delete {request.domain}",
-        description=f"Deleting application at {request.domain}",
+        name=f"Delete {domain}",
+        description=f"Deleting the application at {domain}",
         func=delete_app_job,
         kwargs={
-            "domain": request.domain,
+            "domain": domain,
             "remove_files": request.remove_files,
             "remove_ssl": request.remove_ssl,
         },
-        metadata={"domain": request.domain},
-        total_steps=100,
+        metadata={"domain": domain},
     )
-    
-    return {
-        "message": "Deletion job created",
-        "job": job.to_dict(),
-    }
+    return _queued("Deletion job created", job)
 
 
-@router.post("/backup")
-async def create_backup_job(request: BackupRequest, _: dict = Depends(require_auth)):
-    """Create a backup job."""
-    manager = get_job_manager()
-    
-    job = manager.create_job(
+@router.post("/backup", response_model=JobCreatedResponse, status_code=202)
+def create_backup_job(
+    request: BackupRequest, session: Annotated[dict, Depends(get_current_session)]
+) -> JobCreatedResponse:
+    """
+    Queue a backup.
+
+    Args:
+        request: The backup request.
+        session: The authenticated session.
+
+    Returns:
+        The queued job.
+    """
+    domain = strict_domain(request.domain)
+    job = get_job_manager().create_job(
         job_type=JobType.BACKUP,
-        name=f"Backup {request.domain}",
-        description=f"Creating backup for {request.domain}",
+        name=f"Backup {domain}",
+        description=f"Creating a backup of {domain}",
         func=backup_app_job,
-        kwargs={"domain": request.domain},
-        metadata={"domain": request.domain},
-        total_steps=100,
+        kwargs={"domain": domain, "description": request.description},
+        metadata={"domain": domain},
     )
-    
-    return {
-        "message": "Backup job created",
-        "job": job.to_dict(),
-    }
+    return _queued("Backup job created", job)
 
 
-@router.post("/rollback")
-async def create_rollback_job(request: RollbackRequest, _: dict = Depends(require_auth)):
-    """Create a rollback job."""
-    manager = get_job_manager()
-    
-    job = manager.create_job(
+@router.post("/rollback", response_model=JobCreatedResponse, status_code=202)
+def create_rollback_job(
+    request: RollbackRequest, session: Annotated[dict, Depends(get_current_session)]
+) -> JobCreatedResponse:
+    """
+    Queue a rollback.
+
+    Args:
+        request: The rollback request.
+        session: The authenticated session.
+
+    Returns:
+        The queued job.
+    """
+    domain = strict_domain(request.domain)
+    backup_id = validate_filename(request.backup_id) if request.backup_id else None
+
+    job = get_job_manager().create_job(
         job_type=JobType.RESTORE,
-        name=f"Rollback {request.domain}",
-        description=f"Rolling back {request.domain}" + (f" to backup {request.backup_id}" if request.backup_id else ""),
+        name=f"Rollback {domain}",
+        description=(f"Rolling back {domain}" + (f" to backup {backup_id}" if backup_id else "")),
         func=rollback_app_job,
-        kwargs={
-            "domain": request.domain,
-            "backup_id": request.backup_id,
-        },
-        metadata={"domain": request.domain, "backup_id": request.backup_id},
-        total_steps=100,
+        kwargs={"domain": domain, "backup_id": backup_id},
+        metadata={"domain": domain, "backup_id": backup_id},
     )
-    
-    return {
-        "message": "Rollback job created",
-        "job": job.to_dict(),
-    }
+    return _queued("Rollback job created", job)
 
 
-@router.post("/cert")
-async def create_cert_job(request: CertRequest, _: dict = Depends(require_auth)):
-    """Create a certificate creation job."""
-    manager = get_job_manager()
-    
-    job = manager.create_job(
+@router.post("/cert", response_model=JobCreatedResponse, status_code=202)
+def create_cert_job(
+    request: CertRequest, session: Annotated[dict, Depends(get_current_session)]
+) -> JobCreatedResponse:
+    """
+    Queue a certificate issuance.
+
+    Args:
+        request: The certificate request.
+        session: The authenticated session.
+
+    Returns:
+        The queued job.
+    """
+    domain = strict_domain(request.domain)
+    job = get_job_manager().create_job(
         job_type=JobType.CERT_CREATE,
-        name=f"SSL for {request.domain}",
-        description=f"Creating SSL certificate for {request.domain}",
+        name=f"SSL for {domain}",
+        description=f"Obtaining an SSL certificate for {domain}",
         func=cert_create_job,
         kwargs={
-            "domain": request.domain,
+            "domain": domain,
             "email": request.email,
+            "webserver": request.webserver,
+            "include_www": request.include_www,
         },
-        metadata={"domain": request.domain},
-        total_steps=100,
+        metadata={"domain": domain},
     )
-    
-    return {
-        "message": "Certificate job created",
-        "job": job.to_dict(),
-    }
+    return _queued("Certificate job created", job)
 
 
-@router.delete("/cleanup")
-async def cleanup_jobs(
-    max_age_hours: int = Query(24, ge=1, le=168),
-    _: dict = Depends(require_auth),
-):
-    """Clean up old completed jobs."""
+@router.delete("/cleanup", response_model=CleanupResponse)
+def cleanup_jobs(
+    session: Annotated[dict, Depends(get_current_session)],
+    max_age_hours: Annotated[int, Query(ge=1, le=168)] = 24,
+) -> CleanupResponse:
+    """
+    Forget finished jobs older than a cutoff.
+
+    Args:
+        max_age_hours: Age above which a finished job is dropped.
+        session: The authenticated session.
+
+    Returns:
+        How many jobs were dropped.
+    """
+    removed = get_job_manager().cleanup_old_jobs(max_age_hours=max_age_hours)
+    return CleanupResponse(
+        message=f"Cleaned up jobs older than {max_age_hours} hours", removed=removed
+    )
+
+
+@router.get("/{job_id}", response_model=JobResponse)
+def get_job(job_id: str, session: Annotated[dict, Depends(get_current_session)]) -> JobResponse:
+    """
+    Describe one job.
+
+    Args:
+        job_id: Job identifier.
+        session: The authenticated session.
+
+    Returns:
+        The job.
+
+    Raises:
+        HTTPException: 404 when the job is unknown or has been cleaned up.
+    """
+    job = get_job_manager().get_job(_validated_job_id(job_id))
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+    return _to_response(job)
+
+
+@router.post("/{job_id}/cancel", response_model=JobActionResponse)
+def cancel_job(
+    job_id: str, session: Annotated[dict, Depends(get_current_session)]
+) -> JobActionResponse:
+    """
+    Cancel a job that has not started yet.
+
+    Args:
+        job_id: Job identifier.
+        session: The authenticated session.
+
+    Returns:
+        The action outcome.
+
+    Raises:
+        HTTPException: 404 when the job is unknown, 409 when it has already
+            started or finished.
+    """
+    validated = _validated_job_id(job_id)
     manager = get_job_manager()
-    manager.cleanup_old_jobs(max_age_hours=max_age_hours)
-    
-    return {"message": f"Cleaned up jobs older than {max_age_hours} hours"}
+
+    if manager.get_job(validated) is None:
+        raise HTTPException(status_code=404, detail=f"Job not found: {validated}")
+
+    if not manager.cancel_job(validated):
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot cancel this job: it is already running or finished",
+        )
+
+    return JobActionResponse(message="Job cancelled", job_id=validated)

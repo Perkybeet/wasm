@@ -11,11 +11,11 @@ apps within a monorepo structure.
 
 import json
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import ClassVar
 
 from wasm.core.exceptions import DeploymentError
 from wasm.core.logger import Logger
-from wasm.core.store import MonorepoWorkspace, AppType
+from wasm.core.store import AppType, MonorepoWorkspace
 
 
 class WorkspaceHelper:
@@ -27,7 +27,7 @@ class WorkspaceHelper:
     """
 
     # Mapping of framework indicators to app types
-    FRAMEWORK_INDICATORS = {
+    FRAMEWORK_INDICATORS: ClassVar = {
         "nextjs": ["next", "@next/core"],
         "nodejs": ["express", "fastify", "koa", "@nestjs/core", "hono"],
         "vite": ["vite", "@vitejs/plugin-react"],
@@ -35,14 +35,14 @@ class WorkspaceHelper:
     }
 
     # Default ports by app type
-    DEFAULT_PORTS = {
+    DEFAULT_PORTS: ClassVar = {
         "nextjs": 3001,
         "nodejs": 3000,
         "vite": 4173,
         "static": 80,
     }
 
-    def __init__(self, logger: Optional[Logger] = None):
+    def __init__(self, logger: Logger | None = None):
         """
         Initialize workspace helper.
 
@@ -51,7 +51,7 @@ class WorkspaceHelper:
         """
         self.logger = logger or Logger()
 
-    def parse_pnpm_workspace(self, app_path: Path) -> List[str]:
+    def parse_pnpm_workspace(self, app_path: Path) -> list[str]:
         """
         Parse pnpm-workspace.yaml to find workspace patterns.
 
@@ -67,9 +67,10 @@ class WorkspaceHelper:
 
         try:
             import yaml
+
             with open(workspace_file) as f:
-                config = yaml.safe_load(f)
-                return config.get("packages", [])
+                config = yaml.safe_load(f) or {}
+                return [str(pattern) for pattern in config.get("packages", [])]
         except ImportError:
             # Fallback: basic parsing without yaml library
             patterns = []
@@ -85,11 +86,11 @@ class WorkspaceHelper:
                     elif in_packages and not line.startswith("-") and line:
                         in_packages = False
             return patterns
-        except Exception as e:
+        except (OSError, UnicodeDecodeError) as e:
             self.logger.debug(f"Error parsing pnpm-workspace.yaml: {e}")
             return []
 
-    def discover_apps(self, app_path: Path) -> List[Path]:
+    def discover_apps(self, app_path: Path) -> list[Path]:
         """
         Discover deployable apps in the monorepo.
 
@@ -116,7 +117,7 @@ class WorkspaceHelper:
                     "      backend/\n"
                     "    packages/\n"
                     "    turbo.json"
-                )
+                ),
             )
 
         apps = []
@@ -138,7 +139,7 @@ class WorkspaceHelper:
                 details=(
                     "Each app in apps/ must have a package.json, "
                     "requirements.txt, or pyproject.toml"
-                )
+                ),
             )
 
         return sorted(apps, key=lambda p: p.name)
@@ -156,8 +157,7 @@ class WorkspaceHelper:
         package_json = app_dir / "package.json"
 
         # Check for Python apps first
-        if (app_dir / "requirements.txt").exists() or \
-           (app_dir / "pyproject.toml").exists():
+        if (app_dir / "requirements.txt").exists() or (app_dir / "pyproject.toml").exists():
             return AppType.PYTHON.value
 
         if not package_json.exists():
@@ -219,18 +219,21 @@ class WorkspaceHelper:
                 scripts = pkg.get("scripts", {})
 
                 # Check start script for port specification
-                start_script = scripts.get("start:prod") or \
-                               scripts.get("start:production") or \
-                               scripts.get("start", "")
+                start_script = (
+                    scripts.get("start:prod")
+                    or scripts.get("start:production")
+                    or scripts.get("start", "")
+                )
 
                 # Look for --port or -p flags
                 import re
-                port_match = re.search(r'(?:--port|-p)\s*[=\s]?\s*(\d+)', start_script)
+
+                port_match = re.search(r"(?:--port|-p)\s*[=\s]?\s*(\d+)", start_script)
                 if port_match:
                     return int(port_match.group(1))
 
                 # Look for PORT= in the script
-                env_port_match = re.search(r'PORT=(\d+)', start_script)
+                env_port_match = re.search(r"PORT=(\d+)", start_script)
                 if env_port_match:
                     return int(env_port_match.group(1))
 
@@ -240,7 +243,7 @@ class WorkspaceHelper:
         # Return default port based on app type
         return self.DEFAULT_PORTS.get(app_type, 3000)
 
-    def extract_start_command(self, app_dir: Path, app_type: str) -> Optional[str]:
+    def extract_start_command(self, app_dir: Path, app_type: str) -> str | None:
         """
         Extract or determine the start command for an app.
 
@@ -281,8 +284,7 @@ class WorkspaceHelper:
                 return "start"
 
             # For NestJS, check for dist/main.js
-            if (app_dir / "dist" / "main.js").exists() or \
-               (app_dir / "nest-cli.json").exists():
+            if (app_dir / "dist" / "main.js").exists() or (app_dir / "nest-cli.json").exists():
                 return "start:prod"
 
             return None
@@ -290,7 +292,7 @@ class WorkspaceHelper:
         except (json.JSONDecodeError, OSError):
             return None
 
-    def _python_start_command(self, app_dir: Path) -> Optional[str]:
+    def _python_start_command(self, app_dir: Path) -> str | None:
         """
         Determine start command for Python apps.
 
@@ -310,7 +312,7 @@ class WorkspaceHelper:
 
         return None
 
-    def generate_subdomain(self, app_name: str, all_apps: List[str]) -> str:
+    def generate_subdomain(self, app_name: str, all_apps: list[str]) -> str:
         """
         Generate a subdomain for an app based on its name.
 
@@ -347,7 +349,7 @@ class WorkspaceHelper:
     def analyze_workspace(
         self,
         app_dir: Path,
-        all_apps: List[str],
+        all_apps: list[str],
         port_offset: int = 0,
     ) -> MonorepoWorkspace:
         """
@@ -383,8 +385,8 @@ class WorkspaceHelper:
     def analyze_all_workspaces(
         self,
         app_path: Path,
-        subdomain_overrides: Optional[Dict[str, str]] = None,
-    ) -> List[MonorepoWorkspace]:
+        subdomain_overrides: dict[str, str] | None = None,
+    ) -> list[MonorepoWorkspace]:
         """
         Analyze all workspace apps in a monorepo.
 

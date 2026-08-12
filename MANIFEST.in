@@ -10,8 +10,8 @@ include pyproject.toml
 # Include source code (handled by setuptools, but explicit is better)
 recursive-include src *.py
 recursive-include src/wasm/templates *.j2
-recursive-include src/wasm/completions *
 recursive-include src/wasm/web/static *
+recursive-include src/wasm/web/templates *.html
 
 # Include documentation
 recursive-include docs *.md *.png *.jpg *.svg

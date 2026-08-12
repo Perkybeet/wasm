@@ -121,3 +121,6 @@ install-local.sh
 
 # Ruff linter cache
 .ruff_cache/
+
+# Development environment
+.venv/
