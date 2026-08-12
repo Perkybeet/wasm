@@ -13,7 +13,7 @@ project configuration files.
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import yaml
 
@@ -53,7 +53,7 @@ class NginxConfigBuilder:
     from Docker Compose port mappings.
     """
 
-    CONFIG_FILENAMES = ["wasm.nginx.yaml", "wasm.nginx.yml", "nginx.yaml", "nginx.yml"]
+    CONFIG_FILENAMES: ClassVar = ["wasm.nginx.yaml", "wasm.nginx.yml", "nginx.yaml", "nginx.yml"]
 
     def __init__(self, verbose: bool = False):
         self.verbose = verbose
@@ -91,7 +91,7 @@ class NginxConfigBuilder:
         try:
             data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         except yaml.YAMLError as e:
-            raise ValueError(f"Invalid YAML in {config_path}: {e}")
+            raise ValueError(f"Invalid YAML in {config_path}: {e}") from e
 
         if not data or not isinstance(data, dict):
             raise ValueError(f"Empty or invalid config in {config_path}")
@@ -139,7 +139,7 @@ class NginxConfigBuilder:
         try:
             data = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
         except yaml.YAMLError as e:
-            raise ValueError(f"Invalid Docker Compose file: {e}")
+            raise ValueError(f"Invalid Docker Compose file: {e}") from e
 
         config = NginxAdvancedConfig()
         services = data.get("services", {})

@@ -212,7 +212,7 @@ class TestBackupManager:
         assert manager is not None
         assert manager.backup_dir is not None
         assert manager.max_backups > 0
-        assert manager.BACKUP_VERSION == "1.0.0"
+        assert manager.BACKUP_VERSION == "2.0.0"
 
     def test_generate_backup_id(self, manager):
         """Test backup ID generation."""

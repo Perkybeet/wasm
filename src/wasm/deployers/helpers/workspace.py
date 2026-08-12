@@ -11,6 +11,7 @@ apps within a monorepo structure.
 
 import json
 from pathlib import Path
+from typing import ClassVar
 
 from wasm.core.exceptions import DeploymentError
 from wasm.core.logger import Logger
@@ -26,7 +27,7 @@ class WorkspaceHelper:
     """
 
     # Mapping of framework indicators to app types
-    FRAMEWORK_INDICATORS = {
+    FRAMEWORK_INDICATORS: ClassVar = {
         "nextjs": ["next", "@next/core"],
         "nodejs": ["express", "fastify", "koa", "@nestjs/core", "hono"],
         "vite": ["vite", "@vitejs/plugin-react"],
@@ -34,7 +35,7 @@ class WorkspaceHelper:
     }
 
     # Default ports by app type
-    DEFAULT_PORTS = {
+    DEFAULT_PORTS: ClassVar = {
         "nextjs": 3001,
         "nodejs": 3000,
         "vite": 4173,
@@ -68,8 +69,8 @@ class WorkspaceHelper:
             import yaml
 
             with open(workspace_file) as f:
-                config = yaml.safe_load(f)
-                return config.get("packages", [])
+                config = yaml.safe_load(f) or {}
+                return [str(pattern) for pattern in config.get("packages", [])]
         except ImportError:
             # Fallback: basic parsing without yaml library
             patterns = []
@@ -85,7 +86,7 @@ class WorkspaceHelper:
                     elif in_packages and not line.startswith("-") and line:
                         in_packages = False
             return patterns
-        except Exception as e:
+        except (OSError, UnicodeDecodeError) as e:
             self.logger.debug(f"Error parsing pnpm-workspace.yaml: {e}")
             return []
 

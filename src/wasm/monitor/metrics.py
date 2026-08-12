@@ -68,6 +68,20 @@ PSEUDO_FILESYSTEMS = frozenset(
 #: systemctl answers immediately or it is broken; a long deadline only hides that.
 SYSTEMCTL_TIMEOUT = 15
 
+#: Command lines are truncated here, once, at the boundary where they enter the
+#: program. A local user can give a process a 100 KB argv; kept whole, a scan
+#: per minute would write that to the observation database forever. This is
+#: enough to identify a process and bounded enough to store.
+MAX_COMMAND_LENGTH = 512
+
+#: Marker appended to a command line that was cut, so a reader knows it was.
+TRUNCATION_MARKER = "..."
+
+#: Seconds between the two passes of a one-shot CPU sample. psutil reports CPU
+#: usage as a delta between reads, so the first read of a fresh process is
+#: always 0.0: a single scan without this window reports an idle machine.
+DEFAULT_CPU_SAMPLE_INTERVAL = 0.5
+
 
 def _require_psutil() -> Any:
     """
@@ -87,9 +101,46 @@ def _require_psutil() -> Any:
     return psutil
 
 
-def list_processes() -> list[ProcessInfo]:
+def _truncate_command(cmdline: Sequence[str], fallback: str) -> str:
+    """
+    Join a command line, stopping once it is long enough to identify a process.
+
+    Args:
+        cmdline: Arguments as psutil reported them.
+        fallback: Value to use when the command line is empty, normally the
+            executable name.
+
+    Returns:
+        The joined command line, never longer than MAX_COMMAND_LENGTH.
+    """
+    if not cmdline:
+        return fallback[:MAX_COMMAND_LENGTH]
+
+    parts: list[str] = []
+    length = 0
+    for argument in cmdline:
+        parts.append(argument)
+        # +1 for the separating space; stop as soon as the budget is spent so a
+        # 20.000-argument argv is never fully joined into memory.
+        length += len(argument) + 1
+        if length > MAX_COMMAND_LENGTH:
+            break
+
+    joined = " ".join(parts)
+    if len(joined) <= MAX_COMMAND_LENGTH:
+        return joined
+    return joined[: MAX_COMMAND_LENGTH - len(TRUNCATION_MARKER)] + TRUNCATION_MARKER
+
+
+def list_processes(cpu_sample_interval: float = 0.0) -> list[ProcessInfo]:
     """
     Take a snapshot of every process the current user can see.
+
+    Args:
+        cpu_sample_interval: Seconds to wait between priming psutil's CPU
+            counters and reading them. Zero for a long-running loop, where the
+            previous scan is the reference point; a fraction of a second for a
+            one-shot scan, which would otherwise report 0% for everything.
 
     Returns:
         One ProcessInfo per process, in the order psutil reported them.
@@ -98,6 +149,16 @@ def list_processes() -> list[ProcessInfo]:
         MonitorError: When psutil is not installed.
     """
     ps = _require_psutil()
+
+    if cpu_sample_interval > 0:
+        # Priming pass: psutil caches the CPU times of each process, so the
+        # second read below is a real delta over this window.
+        for proc in ps.process_iter(["cpu_percent"]):
+            try:
+                proc.info  # noqa: B018 - touching info is what fills the cache
+            except (ps.NoSuchProcess, ps.AccessDenied, ps.ZombieProcess):
+                continue
+        time.sleep(cpu_sample_interval)
 
     raw: list[dict[str, Any]] = []
     for proc in ps.process_iter(list(PROCESS_ATTRS)):
@@ -120,7 +181,7 @@ def list_processes() -> list[ProcessInfo]:
                 user=entry.get("username") or "",
                 cpu_percent=entry.get("cpu_percent") or 0.0,
                 memory_percent=entry.get("memory_percent") or 0.0,
-                command=" ".join(cmdline) if cmdline else (entry.get("name") or ""),
+                command=_truncate_command(cmdline, entry.get("name") or ""),
                 status=entry.get("status") or "unknown",
                 num_threads=entry.get("num_threads") or 1,
                 parent_pid=parent_pid,
@@ -133,9 +194,30 @@ def list_processes() -> list[ProcessInfo]:
     return processes
 
 
+def _is_read_only(partition: Any) -> bool:
+    """
+    Report whether a mount is read-only.
+
+    Args:
+        partition: A psutil partition record.
+
+    Returns:
+        True when the mount options say read-only.
+    """
+    options = str(getattr(partition, "opts", "") or "")
+    return "ro" in options.split(",")
+
+
 def _collect_disks(ps: Any) -> tuple[DiskUsage, ...]:
     """
-    Read capacity for every real filesystem.
+    Read capacity for every real, writable filesystem.
+
+    Two filters keep the report meaningful on a normal machine. Read-only
+    mounts are skipped: every snap is a squashfs sitting at 100% by
+    construction, and a full filesystem nobody can write to is not a capacity
+    problem. Repeated devices are skipped as well, because bind mounts and
+    containers can mount the same filesystem dozens of times, and each one
+    costs a statvfs on every scan.
 
     Args:
         ps: The psutil module.
@@ -144,14 +226,18 @@ def _collect_disks(ps: Any) -> tuple[DiskUsage, ...]:
         Usage of each mounted filesystem that reports meaningful capacity.
     """
     disks: list[DiskUsage] = []
+    seen_devices: set[str] = set()
     try:
         partitions = ps.disk_partitions(all=False)
     except (OSError, PermissionError):
         return ()
 
     for partition in partitions:
-        if partition.fstype in PSEUDO_FILESYSTEMS:
+        if partition.fstype in PSEUDO_FILESYSTEMS or _is_read_only(partition):
             continue
+        if partition.device in seen_devices:
+            continue
+        seen_devices.add(partition.device)
         try:
             usage = ps.disk_usage(partition.mountpoint)
         except (OSError, PermissionError):

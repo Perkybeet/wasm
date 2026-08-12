@@ -11,10 +11,12 @@ environment variable management, and systemd integration.
 """
 
 import json
+import sqlite3
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import yaml
 
@@ -22,19 +24,27 @@ from wasm.core.config import Config
 from wasm.core.exceptions import (
     DeploymentError,
     DockerError,
+    WASMError,
 )
 from wasm.core.logger import Logger
+from wasm.core.runner import CommandResult, CommandRunner, get_runner
 from wasm.core.store import App, AppStatus, AppType, get_store
 from wasm.core.utils import (
     domain_to_app_name,
     remove_directory,
-    run_command,
-    run_command_sudo,
 )
+from wasm.deployers.interface import AppDeployer
+from wasm.deployers.registry import DeployerRegistry
 from wasm.managers.cert_manager import CertManager
 from wasm.managers.nginx_manager import NginxManager
 from wasm.managers.service_manager import ServiceManager
 from wasm.managers.source_manager import SourceManager
+
+#: Building images pulls layers and compiles; give it room but not forever.
+BUILD_TIMEOUT = 1800
+
+#: Bringing a stack up or down, and every query about it.
+COMPOSE_TIMEOUT = 300
 
 # Compose file priority order
 COMPOSE_FILE_PRIORITY = [
@@ -62,7 +72,7 @@ class DockerComposeService:
     is_web: bool = False
 
 
-class DockerComposeDeployer:
+class DockerComposeDeployer(AppDeployer):
     """
     Deployer for Docker Compose applications.
 
@@ -73,7 +83,13 @@ class DockerComposeDeployer:
 
     APP_TYPE = "docker-compose"
     DISPLAY_NAME = "Docker Compose"
-    DETECTION_FILES = [
+
+    # A compose file states how the author wants the whole thing run, which
+    # beats guessing from a package.json. See interface.py for the full order.
+    DETECTION_PRIORITY = 80
+    DEFAULT_PORT = 3000
+
+    DETECTION_FILES: ClassVar[list[str]] = [
         "docker-compose.prod.yml",
         "docker-compose.prod.yaml",
         "docker-compose.yml",
@@ -82,8 +98,15 @@ class DockerComposeDeployer:
         "compose.yaml",
     ]
 
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, runner: CommandRunner | None = None):
+        """
+        Args:
+            verbose: Enable verbose logging.
+            runner: Command runner used for every docker invocation. Defaults to
+                the process-wide runner, which is what enforces --dry-run.
+        """
         self.verbose = verbose
+        self._runner = runner
         self.logger = Logger(verbose=verbose)
         self.config = Config()
         self.store = get_store()
@@ -93,21 +116,21 @@ class DockerComposeDeployer:
         self.app_name = ""
         self.app_path = Path()
         self.source = ""
-        self.branch = None
+        self.branch: str | None = None
         self.webserver = "nginx"
         self.ssl = True
-        self.env_vars = {}
-        self.compose_file = None
-        self.compose_profiles = []
-        self.port = None
+        self.env_vars: dict[str, str] = {}
+        self.compose_file: str | None = None
+        self.compose_profiles: list[str] = []
+        self.port: int | None = None
 
         # Parsed state
         self.services: list[DockerComposeService] = []
-        self.compose_path = None
+        self.compose_path: Path | None = None
 
     # Framework config files that indicate docker-compose.yml is likely
     # just for local development (databases, caches, etc.)
-    FRAMEWORK_CONFIG_FILES = [
+    FRAMEWORK_CONFIG_FILES: ClassVar[list[str]] = [
         # Next.js
         "next.config.js",
         "next.config.mjs",
@@ -133,8 +156,7 @@ class DockerComposeDeployer:
         "manage.py",
     ]
 
-    @classmethod
-    def detect(cls, path: Path) -> bool:
+    def detect(self, path: Path) -> bool:
         """
         Detect if a path contains a Docker Compose project.
 
@@ -173,23 +195,31 @@ class DockerComposeDeployer:
 
         # Check for framework config files - if present, docker-compose.yml
         # is likely just for local development (databases, caches, etc.)
-        has_framework = any((path / f).exists() for f in cls.FRAMEWORK_CONFIG_FILES)
+        has_framework = any((path / f).exists() for f in self.FRAMEWORK_CONFIG_FILES)
         if has_framework:
             return False
 
         return True
 
+    @property
+    def runner(self) -> CommandRunner:
+        """The command runner this deployer executes through."""
+        return self._runner if self._runner is not None else get_runner()
+
     def configure(
         self,
         domain: str,
         source: str,
+        *,
+        port: int | None = None,
         webserver: str = "nginx",
         ssl: bool = True,
         branch: str | None = None,
         env_vars: dict[str, str] | None = None,
-        compose_file: str | None = None,
-        compose_profiles: list[str] | None = None,
-        port: int | None = None,
+        app_path: Path | None = None,
+        package_manager: str = "auto",
+        include_www: bool = False,
+        **options: Any,
     ) -> None:
         """
         Configure the deployer.
@@ -197,25 +227,71 @@ class DockerComposeDeployer:
         Args:
             domain: Target domain name.
             source: Git URL or local path.
+            port: Override port for the Nginx proxy.
             webserver: Web server to use.
             ssl: Whether to enable SSL.
             branch: Git branch.
             env_vars: Environment variables.
-            compose_file: Specific compose file to use.
-            compose_profiles: Docker Compose profiles to activate.
-            port: Override port for Nginx proxy.
+            app_path: Override the directory the application lives in.
+            package_manager: Ignored; images are built by docker.
+            include_www: Ignored; compose stacks are proxied on one hostname.
+            **options: ``compose_file`` selects a specific compose file and
+                ``compose_profiles`` activates Docker Compose profiles.
         """
         self.domain = domain
         self.source = source
         self.app_name = domain_to_app_name(domain)
-        self.app_path = self.config.apps_directory / self.app_name
+        self.app_path = app_path or (self.config.apps_directory / self.app_name)
         self.webserver = webserver
         self.ssl = ssl
         self.branch = branch
         self.env_vars = env_vars or {}
-        self.compose_file = compose_file
-        self.compose_profiles = compose_profiles or []
+        compose_file = options.get("compose_file")
+        self.compose_file = str(compose_file) if compose_file else None
+        self.compose_profiles = options.get("compose_profiles") or []
         self.port = port
+
+    def _compose(self, *args: str) -> list[str]:
+        """
+        Build a ``docker compose`` argument vector for this stack.
+
+        Args:
+            args: Subcommand and its arguments.
+
+        Returns:
+            The full argument vector, including the file and profile flags.
+        """
+        cmd = ["docker", "compose"]
+        if self.compose_path:
+            cmd.extend(["-f", str(self.compose_path)])
+        for profile in self.compose_profiles:
+            cmd.extend(["--profile", profile])
+        cmd.extend(args)
+        return cmd
+
+    def _run(
+        self,
+        command: Sequence[str],
+        timeout: int = COMPOSE_TIMEOUT,
+        *,
+        stream: bool = False,
+    ) -> CommandResult:
+        """
+        Execute a command in the application directory.
+
+        Args:
+            command: Program and arguments.
+            timeout: Deadline in seconds.
+            stream: Report output line by line, for image builds.
+
+        Returns:
+            The command outcome.
+        """
+        if stream:
+            return self.runner.stream(
+                command, on_line=self.logger.debug, cwd=self.app_path, timeout=timeout
+            )
+        return self.runner.run(command, cwd=self.app_path, timeout=timeout)
 
     def _is_headless(self) -> bool:
         """
@@ -226,7 +302,7 @@ class DockerComposeDeployer:
         """
         return not any(svc.is_web for svc in self.services)
 
-    def deploy(self) -> None:
+    def deploy(self) -> bool:
         """
         Execute the full deployment workflow.
 
@@ -243,6 +319,9 @@ class DockerComposeDeployer:
 
         For headless/worker apps (no exposed ports):
         Steps 6 and 7 are skipped automatically.
+
+        Returns:
+            True when the stack ended up deployed.
 
         Raises:
             DeploymentError: If any deployment step fails.
@@ -293,20 +372,44 @@ class DockerComposeDeployer:
             self.logger.blank()
             self.logger.key_value("Domain", self.domain)
             self.logger.key_value("Path", str(self.app_path))
-            self.logger.key_value("Compose File", str(self.compose_path.name))
+            self.logger.key_value("Compose File", self._compose_file_path().name)
             self.logger.key_value("Services", str(len(self.services)))
             if headless:
                 self.logger.key_value("Mode", "Headless worker (no web server)")
             else:
                 self.logger.key_value("SSL", "Yes" if self.ssl else "No")
 
+            return True
+
         except Exception as e:
             self.logger.error(f"Deployment failed: {e}")
             self._rollback()
             raise
 
+    def _compose_file_path(self) -> Path:
+        """
+        Return the compose file this stack is deployed from.
+
+        Returns:
+            The discovered compose file.
+
+        Raises:
+            DeploymentError: When called before discovery ran.
+        """
+        if self.compose_path is None:
+            raise DeploymentError(
+                "No compose file has been discovered yet",
+                details="_discover_compose_file() must run before the stack is used.",
+            )
+        return self.compose_path
+
     def _fetch_source(self) -> None:
         """Fetch source code via git clone or local copy."""
+        if self.source_already_fetched:
+            # AutoDeployer already placed the code here; fetching again would
+            # clean the directory and clone a second time.
+            self.logger.substep(f"Source already present at {self.app_path}")
+            return
         source_manager = SourceManager(verbose=self.verbose)
         source_manager.fetch(
             source=self.source,
@@ -340,9 +443,9 @@ class DockerComposeDeployer:
     def _parse_compose_services(self) -> None:
         """Parse Docker Compose file and extract service definitions."""
         try:
-            data = yaml.safe_load(self.compose_path.read_text(encoding="utf-8"))
+            data = yaml.safe_load(self._compose_file_path().read_text(encoding="utf-8"))
         except yaml.YAMLError as e:
-            raise DeploymentError(f"Invalid compose file: {e}")
+            raise DeploymentError(f"Invalid compose file: {e}") from e
 
         if not data or "services" not in data:
             raise DeploymentError("No services defined in compose file")
@@ -418,19 +521,19 @@ class DockerComposeDeployer:
             self.logger.substep("No environment configuration needed")
 
     def _build_images(self, no_cache: bool = False) -> None:
-        """Build Docker images defined in the compose file."""
-        cmd = ["docker", "compose"]
-        if self.compose_path:
-            cmd.extend(["-f", str(self.compose_path)])
+        """
+        Build Docker images defined in the compose file.
 
-        for profile in self.compose_profiles:
-            cmd.extend(["--profile", profile])
+        Args:
+            no_cache: Rebuild every layer from scratch.
 
-        cmd.append("build")
-        if no_cache:
-            cmd.append("--no-cache")
+        Raises:
+            DockerError: When the build fails.
+        """
+        cmd = self._compose("build", "--no-cache") if no_cache else self._compose("build")
 
-        result = run_command(cmd, cwd=self.app_path, timeout=600)
+        # Streamed: an image build is minutes of silence otherwise.
+        result = self._run(cmd, timeout=BUILD_TIMEOUT, stream=True)
         if not result.success:
             raise DockerError(
                 "Failed to build Docker images",
@@ -488,7 +591,7 @@ class DockerComposeDeployer:
             )
         elif len([s for s in self.services if s.is_web]) > 1:
             # Auto-derive from compose ports
-            config = builder.from_docker_compose(self.compose_path, self.domain)
+            config = builder.from_docker_compose(self._compose_file_path(), self.domain)
             nginx.create_advanced_site(
                 domain=self.domain,
                 config=config,
@@ -542,7 +645,7 @@ class DockerComposeDeployer:
                     app_path=str(self.app_path),
                 )
             elif len([s for s in self.services if s.is_web]) > 1:
-                config = builder.from_docker_compose(self.compose_path, self.domain)
+                config = builder.from_docker_compose(self._compose_file_path(), self.domain)
                 nginx.create_advanced_site(
                     domain=self.domain,
                     config=config,
@@ -565,7 +668,9 @@ class DockerComposeDeployer:
             nginx.reload()
             self.logger.substep("SSL certificate obtained")
 
-        except Exception as e:
+        except WASMError as e:
+            # A missing certificate is not a failed deployment: the stack still
+            # answers over HTTP, and DNS often needs longer than the deploy.
             self.logger.warning(f"SSL certificate failed: {e}")
             self.logger.warning("Continuing without SSL")
             self.ssl = False
@@ -617,13 +722,10 @@ class DockerComposeDeployer:
         Returns:
             True if all services are running.
         """
-        cmd = ["docker", "compose"]
-        if self.compose_path:
-            cmd.extend(["-f", str(self.compose_path)])
-        cmd.extend(["ps", "--format", "json"])
+        cmd = self._compose("ps", "--format", "json")
 
         for attempt in range(retries):
-            result = run_command(cmd, cwd=self.app_path)
+            result = self._run(cmd)
             if not result.success:
                 time.sleep(delay)
                 continue
@@ -677,7 +779,7 @@ class DockerComposeDeployer:
 
         try:
             self.store.create_app(app)
-        except Exception as e:
+        except (WASMError, sqlite3.Error) as e:
             self.logger.warning(f"Could not register app in store: {e}")
 
     def _rollback(self) -> None:
@@ -686,17 +788,14 @@ class DockerComposeDeployer:
 
         # Stop containers
         if self.compose_path and self.compose_path.exists():
-            cmd = ["docker", "compose"]
-            cmd.extend(["-f", str(self.compose_path)])
-            cmd.extend(["down", "--remove-orphans"])
-            run_command(cmd, cwd=self.app_path)
+            self._run(self._compose("down", "--remove-orphans"))
 
         # Remove systemd service
         try:
             service_manager = ServiceManager(verbose=self.verbose)
             service_manager.delete_service(self.app_name)
-        except Exception:
-            pass
+        except (WASMError, OSError) as e:
+            self.logger.debug(f"Service cleanup failed: {e}")
 
         # Remove nginx config (only if web-facing)
         if not self._is_headless():
@@ -705,8 +804,8 @@ class DockerComposeDeployer:
                 if nginx.site_exists(self.domain):
                     nginx.delete_site(self.domain)
                     nginx.reload()
-            except Exception:
-                pass
+            except (WASMError, OSError) as e:
+                self.logger.debug(f"Site cleanup failed: {e}")
 
         # Remove app directory
         if self.app_path.exists():
@@ -715,8 +814,8 @@ class DockerComposeDeployer:
         # Clean store
         try:
             self.store.delete_app(self.domain)
-        except Exception:
-            pass
+        except (WASMError, sqlite3.Error) as e:
+            self.logger.debug(f"Store cleanup failed: {e}")
 
         self.logger.info("Rollback complete")
 
@@ -740,7 +839,9 @@ class DockerComposeDeployer:
         """Restart (rebuild and recreate) the Docker Compose application."""
         service_manager = ServiceManager(verbose=self.verbose)
         # reload triggers ExecReload which does `docker compose up -d --build`
-        result = run_command_sudo(["systemctl", "reload", f"{self.app_name}.service"])
+        result = self.runner.run(
+            ["systemctl", "reload", f"{self.app_name}.service"], timeout=COMPOSE_TIMEOUT
+        )
         if not result.success:
             # Fallback to restart
             service_manager.restart(self.app_name)
@@ -756,15 +857,11 @@ class DockerComposeDeployer:
         Returns:
             Log output string.
         """
-        cmd = ["docker", "compose"]
-        if self.compose_path:
-            cmd.extend(["-f", str(self.compose_path)])
-        cmd.extend(["logs", "--tail", str(lines)])
-
+        cmd = self._compose("logs", "--tail", str(lines))
         if service:
             cmd.append(service)
 
-        result = run_command(cmd, cwd=self.app_path)
+        result = self._run(cmd)
         return result.stdout if result.success else result.stderr
 
     def status(self) -> dict[str, Any]:
@@ -774,12 +871,7 @@ class DockerComposeDeployer:
         Returns:
             Dictionary with service status information.
         """
-        cmd = ["docker", "compose"]
-        if self.compose_path:
-            cmd.extend(["-f", str(self.compose_path)])
-        cmd.extend(["ps", "--format", "json"])
-
-        result = run_command(cmd, cwd=self.app_path)
+        result = self._run(self._compose("ps", "--format", "json"))
         services = []
 
         if result.success:
@@ -807,12 +899,7 @@ class DockerComposeDeployer:
         # Rebuild and restart
         self._build_images()
 
-        cmd = ["docker", "compose"]
-        if self.compose_path:
-            cmd.extend(["-f", str(self.compose_path)])
-        cmd.extend(["up", "-d", "--remove-orphans"])
-
-        result = run_command(cmd, cwd=self.app_path, timeout=300)
+        result = self._run(self._compose("up", "-d", "--remove-orphans"))
         if not result.success:
             raise DockerError("Failed to update containers", result.stderr)
 
@@ -826,22 +913,19 @@ class DockerComposeDeployer:
             remove_volumes: Also remove Docker volumes.
         """
         # Stop and remove containers
-        cmd = ["docker", "compose"]
-        if self.compose_path and self.compose_path.exists():
-            cmd.extend(["-f", str(self.compose_path)])
-        cmd.append("down")
-        if remove_volumes:
-            cmd.append("--volumes")
-        cmd.append("--remove-orphans")
-
-        run_command(cmd, cwd=self.app_path)
+        down = (
+            ["down", "--volumes", "--remove-orphans"]
+            if remove_volumes
+            else ["down", "--remove-orphans"]
+        )
+        self._run(self._compose(*down))
 
         # Remove systemd service
         try:
             service_manager = ServiceManager(verbose=self.verbose)
             service_manager.delete_service(self.app_name)
-        except Exception:
-            pass
+        except (WASMError, OSError) as e:
+            self.logger.debug(f"Service cleanup failed: {e}")
 
         # Remove nginx config
         try:
@@ -849,21 +933,16 @@ class DockerComposeDeployer:
             if nginx.site_exists(self.domain):
                 nginx.delete_site(self.domain)
                 nginx.reload()
-        except Exception:
-            pass
+        except (WASMError, OSError) as e:
+            self.logger.debug(f"Site cleanup failed: {e}")
 
         # Clean store
         try:
             self.store.delete_site(self.domain)
             self.store.delete_service(self.app_name)
             self.store.delete_app(self.domain)
-        except Exception:
-            pass
+        except (WASMError, sqlite3.Error) as e:
+            self.logger.debug(f"Store cleanup failed: {e}")
 
 
-# Register in DeployerRegistry
-from wasm.deployers.registry import DeployerRegistry  # noqa: E402
-
-# DockerComposeDeployer doesn't inherit BaseDeployer, so we register
-# it directly in the registry dict for detection purposes
-DeployerRegistry._deployers[DockerComposeDeployer.APP_TYPE] = DockerComposeDeployer
+DeployerRegistry.register(DockerComposeDeployer)

@@ -156,9 +156,9 @@ class TurboHelper:
 
         # Default outputs if not specified
         if not outputs:
-            outputs = [".next/**", "dist/**", "build/**"]
+            return [".next/**", "dist/**", "build/**"]
 
-        return outputs
+        return [str(o) for o in outputs]
 
     def get_task_dependencies(self, task_name: str, app_path: Path) -> list[str]:
         """
@@ -202,13 +202,13 @@ class TurboHelper:
 
         # Common global dependencies
         if not global_deps:
-            global_deps = [
+            return [
                 "pnpm-lock.yaml",
                 "package.json",
                 "tsconfig.json",
             ]
 
-        return global_deps
+        return [str(d) for d in global_deps]
 
     def get_env_vars(self, app_path: Path) -> set[str]:
         """

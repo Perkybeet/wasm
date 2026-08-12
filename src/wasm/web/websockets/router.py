@@ -1,10 +1,17 @@
 """
 WebSocket router for real-time features.
 
-Handshakes authenticate with the session cookie, with the
-``Sec-WebSocket-Protocol`` header, or with a single-use ticket obtained from
-``POST /api/auth/ws-ticket``. A long-lived token is never accepted in the query
-string, because query strings are recorded by browsers, proxies and access logs.
+Handshakes are authenticated and rate limited by
+:class:`~wasm.web.server.SecurityMiddleware` before a handler is ever reached,
+so a route added here cannot forget to check credentials. The middleware leaves
+the session payload in ``scope["state"]["session"]``; the handlers below read it
+back through :func:`authenticate_websocket`, which re-verifies from scratch if
+the payload is absent so that the handlers are still safe on their own.
+
+Credentials travel in the session cookie, in the ``Sec-WebSocket-Protocol``
+header, or as a single-use ticket from ``POST /api/auth/ws-ticket``. A
+long-lived token is never accepted in the query string, because query strings
+are recorded by browsers, proxies and access logs.
 """
 
 from __future__ import annotations
@@ -16,53 +23,44 @@ from typing import Any
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
+from wasm.core.exceptions import ValidationError
 from wasm.core.utils import domain_to_app_name
+from wasm.validators.names import validate_service_name
 from wasm.web.auth import (
-    SESSION_COOKIE_NAME,
+    WS_CLOSE_UNAUTHORIZED,
+    WS_SUBPROTOCOL,
+    WS_TOKEN_PREFIX,
+    authenticate_connection,
     get_audit_logger,
     get_client_ip,
 )
-from wasm.web.server import get_token_manager
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-#: Subprotocol prefix carrying a session token, for clients that cannot send a
-#: cookie: ``Sec-WebSocket-Protocol: wasm.auth, wasm.token.<token>``.
-WS_SUBPROTOCOL = "wasm.auth"
-WS_TOKEN_PREFIX = "wasm.token."  # noqa: S105 - subprotocol prefix, not a credential
+__all__ = [
+    "WS_CLOSE_UNAUTHORIZED",
+    "WS_SUBPROTOCOL",
+    "WS_TOKEN_PREFIX",
+    "authenticate_websocket",
+    "router",
+]
 
-#: Close code used for a rejected handshake.
-WS_CLOSE_UNAUTHORIZED = 4401
+#: Upper bound on how long one journal stream may run before the client has to
+#: reconnect. A follow with no deadline is a process that outlives its session.
+LOG_STREAM_MAX_SECONDS = 12 * 3600
 
 # Active WebSocket connections
 _log_connections: dict[str, set[WebSocket]] = {}
 _system_connections: set[WebSocket] = set()
 
 
-def _subprotocol_token(websocket: WebSocket) -> str | None:
-    """
-    Extract a session token from the requested subprotocols.
-
-    Args:
-        websocket: The pending WebSocket connection.
-
-    Returns:
-        The token, or None when no subprotocol carries one.
-    """
-    header = websocket.headers.get("sec-websocket-protocol", "")
-    for entry in (part.strip() for part in header.split(",")):
-        if entry.startswith(WS_TOKEN_PREFIX):
-            return entry[len(WS_TOKEN_PREFIX) :]
-    return None
-
-
 async def authenticate_websocket(
     websocket: WebSocket, ticket: str | None = None
 ) -> dict[str, Any] | None:
     """
-    Authenticate a WebSocket handshake.
+    Return the session the middleware authenticated for this handshake.
 
     Args:
         websocket: The pending connection.
@@ -71,29 +69,12 @@ async def authenticate_websocket(
     Returns:
         The session payload when the handshake is authenticated, None otherwise.
     """
-    token_manager = get_token_manager()
-    client_ip = get_client_ip(websocket)
-
-    cookie = websocket.cookies.get(SESSION_COOKIE_NAME)
-    if cookie:
-        payload = token_manager.verify_session_token(cookie, client_ip)
-        if payload:
-            return payload
-
-    token = _subprotocol_token(websocket)
-    if token:
-        payload = token_manager.verify_session_token(token, client_ip)
-        if payload:
-            return payload
-        if token_manager.verify_master_token(token):
-            return {"type": "master", "sid": "master", "ip": client_ip}
-
-    if ticket:
-        payload = token_manager.consume_ws_ticket(ticket, client_ip)
-        if payload:
-            return payload
-
-    return None
+    session = websocket.scope.get("state", {}).get("session")
+    if isinstance(session, dict):
+        return session
+    # Defence in depth: a handler must not serve the journal just because the
+    # middleware was left out of an embedding application.
+    return authenticate_connection(websocket, ticket)
 
 
 async def _reject(websocket: WebSocket, path: str) -> None:
@@ -171,9 +152,16 @@ async def websocket_logs(
 
     from wasm.managers.service_manager import ServiceManager
 
-    app_name = domain_to_app_name(domain)
-    service_manager = ServiceManager(verbose=False)
-    service_name = service_manager._resolve_service_name(app_name)
+    try:
+        # The domain is client supplied and ends up as a journalctl unit
+        # selector, where '*' and '/' are not inert. Validate before spawning.
+        app_name = domain_to_app_name(domain)
+        service_manager = ServiceManager(verbose=False)
+        service_name = validate_service_name(service_manager._resolve_service_name(app_name))
+    except ValidationError as exc:
+        await websocket.send_json({"type": "error", "message": f"Invalid domain: {exc}"})
+        await websocket.close()
+        return
 
     # Add to connections
     if domain not in _log_connections:
@@ -213,10 +201,17 @@ async def websocket_logs(
         # Send initial message
         await websocket.send_json({"type": "connected", "domain": domain, "service": service_name})
 
+        if process.stdout is None or process.stderr is None:
+            await websocket.send_json({"type": "error", "message": "journalctl produced no output"})
+            return
+
+        stdout = process.stdout
+        stderr = process.stderr
+
         # Check for immediate stderr (e.g., service not found)
-        async def check_stderr():
+        async def check_stderr() -> None:
             try:
-                stderr_data = await asyncio.wait_for(process.stderr.read(1024), timeout=0.5)
+                stderr_data = await asyncio.wait_for(stderr.read(1024), timeout=0.5)
                 if stderr_data:
                     error_msg = stderr_data.decode("utf-8", errors="replace").strip()
                     if error_msg:
@@ -231,10 +226,10 @@ async def websocket_logs(
         await check_stderr()
 
         # Stream logs
-        async def read_logs():
+        async def read_logs() -> None:
             while True:
                 try:
-                    line = await process.stdout.readline()
+                    line = await stdout.readline()
                     if not line:
                         # Check if process exited
                         if process.returncode is not None:
@@ -248,7 +243,7 @@ async def websocket_logs(
                     break  # Connection closed or process terminated
 
         # Handle incoming messages (for ping/pong or commands)
-        async def handle_messages():
+        async def handle_messages() -> None:
             while True:
                 try:
                     data = await websocket.receive_text()
@@ -266,7 +261,9 @@ async def websocket_logs(
         msg_task = asyncio.create_task(handle_messages())
 
         done, pending = await asyncio.wait(
-            [log_task, msg_task], return_when=asyncio.FIRST_COMPLETED
+            [log_task, msg_task],
+            timeout=LOG_STREAM_MAX_SECONDS,
+            return_when=asyncio.FIRST_COMPLETED,
         )
 
         # Cancel pending tasks
@@ -431,10 +428,16 @@ async def websocket_events(websocket: WebSocket, ticket: str | None = Query(defa
             stderr=asyncio.subprocess.PIPE,
         )
 
-        async def read_events():
+        if process.stdout is None:
+            await websocket.send_json({"type": "error", "message": "journalctl produced no output"})
+            return
+
+        stdout = process.stdout
+
+        async def read_events() -> None:
             while True:
                 try:
-                    line = await process.stdout.readline()
+                    line = await stdout.readline()
                     if not line:
                         break
 
@@ -535,7 +538,7 @@ async def websocket_job(
     _job_connections[job_id].add(websocket)
 
     # Queue for job updates
-    update_queue = asyncio.Queue()
+    update_queue: asyncio.Queue[dict[str, object]] = asyncio.Queue()
 
     # Capture the current event loop for thread-safe callback
     loop = asyncio.get_running_loop()
@@ -640,7 +643,7 @@ async def websocket_all_jobs(
     manager = get_job_manager()
 
     # Queue for job updates
-    update_queue = asyncio.Queue()
+    update_queue: asyncio.Queue[dict[str, object]] = asyncio.Queue()
 
     # Capture the current event loop for thread-safe callback
     loop = asyncio.get_running_loop()

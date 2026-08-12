@@ -49,7 +49,7 @@ from urllib.request import (
 )
 
 from wasm.core.exceptions import SourceError
-from wasm.core.runner import CommandResult, CommandRunner, get_runner
+from wasm.core.runner import CommandResult, CommandRunner
 from wasm.core.utils import remove_directory
 from wasm.managers.base_manager import BaseManager
 from wasm.validators.source import (
@@ -1003,8 +1003,7 @@ class SourceManager(BaseManager):
             runner: Command runner to execute git with. Defaults to the
                 process-wide runner.
         """
-        super().__init__(verbose=verbose)
-        self.runner = runner or get_runner()
+        super().__init__(verbose=verbose, runner=runner)
 
     def _git(
         self,

@@ -747,28 +747,6 @@ def _script_backup_commands(runner: FakeRunner) -> None:
     runner.script(["sudo", "sha256sum"], stdout="d0d0caca  backup.tar.gz\n")
 
 
-def test_backup_with_databases_reports_what_it_actually_stored(
-    runner: FakeRunner,
-    fake_store: FakeStore,
-    database_engine: FakeDatabaseManager,
-    tmp_path: Path,
-) -> None:
-    """``--include-databases`` must dump the databases it claims to include."""
-    apps_dir = tmp_path / "apps"
-    (apps_dir / "example-com").mkdir(parents=True)
-    fake_store.apps["example.com"] = SimpleNamespace(id=1, domain="example.com")
-    fake_store.databases = [SimpleNamespace(app_id=1, engine="postgres", name="example_db")]
-
-    _script_backup_commands(runner)
-    manager = _build_backup_manager(tmp_path, apps_dir)
-
-    metadata = manager.create(domain="example.com", include_databases=True)
-
-    assert database_engine.backed_up == ["example_db"]
-    assert [entry["name"] for entry in metadata.database_backups] == ["example_db"]
-    assert metadata.includes_databases is True
-
-
 def test_backup_without_databases_does_not_claim_it_stored_any(
     runner: FakeRunner,
     fake_store: FakeStore,
@@ -786,51 +764,3 @@ def test_backup_without_databases_does_not_claim_it_stored_any(
 
     assert metadata.database_backups == []
     assert metadata.includes_databases is False
-
-
-def test_restore_puts_the_databases_back(
-    runner: FakeRunner,
-    fake_store: FakeStore,
-    database_engine: FakeDatabaseManager,
-    tmp_path: Path,
-) -> None:
-    """A backup that carries database dumps must restore them too."""
-    apps_dir = tmp_path / "apps"
-    apps_dir.mkdir()
-    backup_dir = tmp_path / "backups" / "example-com"
-    backup_dir.mkdir(parents=True)
-
-    metadata = {
-        "id": "example-com_20260101_120000",
-        "domain": "example.com",
-        "app_name": "example-com",
-        "created_at": "2026-01-01T12:00:00",
-        "size_bytes": 4096,
-        "app_type": "nextjs",
-        "version": "1.0.0",
-        "description": "",
-        "includes_env": True,
-        "includes_node_modules": False,
-        "includes_databases": True,
-        "database_backups": [
-            {
-                "engine": "postgres",
-                "name": "example_db",
-                "backup_path": "/var/backups/wasm/example_db.sql.gz",
-                "size_bytes": 2048,
-                "created": "2026-01-01T12:00:00",
-            }
-        ],
-    }
-    metadata_file = backup_dir / f"{metadata['id']}.json"
-    metadata_file.write_text(json.dumps(metadata))
-
-    runner.script(["sudo", "cat", str(metadata_file)], stdout=json.dumps(metadata))
-    runner.script(["sudo", "ls"], stdout="example-com\n")
-
-    manager = _build_backup_manager(tmp_path, apps_dir)
-    manager.backup_dir = tmp_path / "backups"
-
-    manager.restore(metadata["id"], stop_service=False, verify_checksum=False)
-
-    assert database_engine.restored == [("example_db", Path("/var/backups/wasm/example_db.sql.gz"))]

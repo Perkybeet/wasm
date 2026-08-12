@@ -172,10 +172,10 @@ class PackageManagerHelper:
         cmd_parts = command.split()
 
         if package_manager == "pnpm":
-            return ["pnpm", "exec"] + cmd_parts
+            return ["pnpm", "exec", *cmd_parts]
         elif package_manager == "bun":
-            return ["bunx"] + cmd_parts
+            return ["bunx", *cmd_parts]
         elif package_manager == "yarn":
-            return ["yarn"] + cmd_parts
+            return ["yarn", *cmd_parts]
         else:
-            return ["npx"] + cmd_parts
+            return ["npx", *cmd_parts]

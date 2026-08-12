@@ -5,25 +5,44 @@
 """
 Security tests for the global configuration and the SQLite store.
 
-Covers three classes of problem that were found in production code:
+Covers five classes of problem that were found in production code:
 
 * global state leaking between :class:`~wasm.core.config.Config` instances,
   because the defaults were shallow-copied and therefore shared,
-* files holding secrets (``config.yaml``, ``wasm.db``) created with
-  world-readable permissions,
-* absence of a reusable redaction helper for the web API.
+* files holding secrets (``config.yaml``, ``wasm.db``, deployed ``.env``)
+  created with world-readable permissions,
+* absence of a reusable redaction helper for the web API,
+* settings that no longer exist coming back permissive when a caller reads or
+  writes the container they used to live in,
+* writes to a secret file following a symlink planted by whoever can write in
+  the destination directory.
 """
 
 from __future__ import annotations
 
 import copy
+import json
+import os
+import stat
 from pathlib import Path
 
 import pytest
 import yaml
 
-from wasm.core.config import DEFAULT_CONFIG, Config, redact_secrets, secure_write
+from wasm.core.config import (
+    DEFAULT_CONFIG,
+    REDACTED,
+    Config,
+    _is_secret_key,
+    redact_secrets,
+    restore_redacted,
+    restrict_file,
+    secure_directory,
+    secure_write,
+)
+from wasm.core.exceptions import SecurityError
 from wasm.core.store import WASMStore
+from wasm.deployers.helpers.env_manager import EnvConfig, EnvManager, EnvVariable
 
 
 @pytest.fixture
@@ -300,3 +319,466 @@ class TestMonitorDefaults:
 
         saved = yaml.safe_load(config_path.read_text())
         assert "auto_terminate" not in saved["monitor"]
+
+
+def secret_paths(node: object, prefix: str = "") -> list[str]:
+    """
+    List the dotted paths of every scalar setting whose key names a secret.
+
+    Args:
+        node: Configuration subtree to walk.
+        prefix: Dotted path of ``node`` itself.
+
+    Returns:
+        Dotted paths of the scalar values that must never be served in clear.
+    """
+    found: list[str] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            if isinstance(value, (dict, list)):
+                found.extend(secret_paths(value, path))
+            elif _is_secret_key(str(key)):
+                found.append(path)
+    return found
+
+
+def _flat_paths(node: object, prefix: str = "") -> list[str]:
+    """
+    List the dotted path of every scalar leaf in a configuration tree.
+
+    Args:
+        node: Configuration subtree to walk.
+        prefix: Dotted path of ``node`` itself.
+
+    Returns:
+        Dotted paths of the scalar leaves.
+    """
+    if not isinstance(node, dict):
+        return [prefix]
+    found: list[str] = []
+    for key, value in node.items():
+        path = f"{prefix}.{key}" if prefix else str(key)
+        found.extend(_flat_paths(value, path))
+    return found
+
+
+def _lookup(tree: object, dotted_key: str) -> object:
+    """
+    Read a dotted path out of a configuration tree.
+
+    Args:
+        tree: Configuration mapping.
+        dotted_key: Dotted path of the setting.
+
+    Returns:
+        The value found, or None when the path does not exist.
+    """
+    node: object = tree
+    for part in dotted_key.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+class TestSecretInventory:
+    """The redaction markers must cover the secrets this project really ships."""
+
+    def test_every_known_secret_is_recognised(self) -> None:
+        """The real credential keys must be classified as secrets."""
+        paths = set(secret_paths(DEFAULT_CONFIG))
+
+        assert paths >= {
+            "monitor.openai.api_key",
+            "monitor.smtp.password",
+            "databases.credentials.mysql.password",
+            "databases.credentials.postgresql.password",
+            "databases.credentials.redis.password",
+            "databases.credentials.mongodb.password",
+        }
+
+    def test_redaction_touches_the_credentials_and_nothing_else(self) -> None:
+        """A false positive turns a numeric setting into "***" in the panel."""
+        redacted = redact_secrets(DEFAULT_CONFIG)
+
+        changed = {
+            path
+            for path in _flat_paths(DEFAULT_CONFIG)
+            if _lookup(redacted, path) != _lookup(DEFAULT_CONFIG, path)
+        }
+        assert changed == {
+            "monitor.openai.api_key",
+            "monitor.smtp.password",
+            "databases.credentials.mysql.password",
+            "databases.credentials.postgresql.password",
+            "databases.credentials.redis.password",
+            "databases.credentials.mongodb.password",
+        }
+
+    def test_no_secret_survives_a_full_tree_redaction(self, config_path: Path) -> None:
+        """Filling every secret in the tree and redacting must leak nothing."""
+        config = Config()
+        markers = {}
+        for index, path in enumerate(secret_paths(DEFAULT_CONFIG)):
+            marker = f"leaked-secret-{index}"
+            markers[path] = marker
+            config.set(path, marker)
+
+        dumped = yaml.safe_dump(redact_secrets(config.to_dict()))
+
+        for path, marker in markers.items():
+            assert marker not in dumped, f"{path} survived redaction"
+
+
+class TestRestoreRedacted:
+    """The panel sends back what it was shown, and it was shown ``***``."""
+
+    def test_placeholder_keeps_the_stored_secret(self) -> None:
+        """A redacted value must not overwrite the real one."""
+        current = {"monitor": {"smtp": {"password": "hunter2", "host": "old"}}}
+        incoming = {"monitor": {"smtp": {"password": REDACTED, "host": "new"}}}
+
+        result = restore_redacted(incoming, current)
+
+        assert result["monitor"]["smtp"]["password"] == "hunter2"
+        assert result["monitor"]["smtp"]["host"] == "new"
+
+    def test_a_real_new_secret_still_wins(self) -> None:
+        """Only the placeholder is ignored; a rotated secret must be stored."""
+        result = restore_redacted({"password": "rotated"}, {"password": "hunter2"})
+
+        assert result["password"] == "rotated"
+
+    def test_placeholder_without_a_stored_value_is_dropped(self) -> None:
+        """``***`` must never be persisted as if it were a password."""
+        result = restore_redacted({"password": REDACTED}, {})
+
+        assert result["password"] == ""
+
+    def test_placeholder_on_a_non_secret_key_is_kept(self) -> None:
+        """A literal ``***`` elsewhere is data, not a placeholder."""
+        result = restore_redacted({"comment": REDACTED}, {"comment": "old"})
+
+        assert result["comment"] == REDACTED
+
+    def test_inputs_are_not_mutated(self) -> None:
+        """Neither the request body nor the live config may be modified."""
+        current = {"password": "hunter2"}
+        incoming = {"password": REDACTED}
+
+        restore_redacted(incoming, current)
+
+        assert incoming == {"password": REDACTED}
+        assert current == {"password": "hunter2"}
+
+
+class TestRemovedKeysThroughTheParent:
+    """Reading the container must not resurrect a permissive default."""
+
+    def test_parent_lookup_pins_the_safe_value(self, config_path: Path) -> None:
+        """``get('monitor').get('auto_terminate', True)`` must be False."""
+        monitor = Config().get("monitor")
+
+        assert monitor.get("auto_terminate", True) is False
+        assert monitor.get("terminate_malicious_only", True) is False
+        assert monitor.get("dry_run", False) is True
+
+    def test_parent_lookup_of_a_missing_container_pins_too(self, config_path: Path) -> None:
+        """A default returned for a missing container must be pinned as well."""
+        config = Config()
+        config._config.pop("monitor", None)
+
+        monitor = config.get("monitor", {})
+
+        assert monitor.get("auto_terminate", True) is False
+
+    def test_writing_the_parent_cannot_reintroduce_the_key(self, config_path: Path) -> None:
+        """``set('monitor', ...)`` must obey the same guard as ``set`` on the leaf."""
+        config = Config()
+
+        config.set("monitor", {"enabled": True, "auto_terminate": True, "dry_run": False})
+
+        assert config.get("monitor.auto_terminate", True) is False
+        assert config.get("monitor").get("auto_terminate", True) is False
+        assert "auto_terminate" not in config.to_dict()["monitor"]
+        assert config.get("monitor.enabled") is True
+
+    def test_writing_the_parent_does_not_persist_the_key(self, config_path: Path) -> None:
+        """The saved file must not carry a setting the code no longer honours."""
+        config = Config()
+        config.set("monitor", {"enabled": True, "auto_terminate": True})
+
+        assert config.save() is True
+
+        saved = yaml.safe_load(config_path.read_text())
+        assert "auto_terminate" not in saved["monitor"]
+
+    def test_replace_cannot_reintroduce_the_key(self, config_path: Path) -> None:
+        """A full-configuration write must be filtered too."""
+        config = Config()
+
+        config.replace({"webserver": "apache", "monitor": {"auto_terminate": True}})
+
+        assert config.get("monitor.auto_terminate", True) is False
+        assert config.get("webserver") == "apache"
+
+
+class TestReplacePreservesSecrets:
+    """A full write coming from the panel carries placeholders, not secrets."""
+
+    def test_placeholders_do_not_erase_stored_secrets(self, config_path: Path) -> None:
+        """Saving the panel form back must keep the password that was hidden."""
+        config = Config()
+        config.set("monitor.smtp.password", "hunter2")
+
+        config.replace(
+            {
+                "monitor": {"smtp": {"password": REDACTED, "host": "smtp.example.com"}},
+                "webserver": "apache",
+            }
+        )
+
+        assert config.get("monitor.smtp.password") == "hunter2"
+        assert config.get("monitor.smtp.host") == "smtp.example.com"
+
+    def test_replace_does_not_alias_the_caller_dictionary(self, config_path: Path) -> None:
+        """The stored configuration must not share containers with the request."""
+        payload = {"monitor": {"enabled": True}}
+        config = Config()
+
+        config.replace(payload)
+        payload["monitor"]["enabled"] = False
+
+        assert config.get("monitor.enabled") is True
+
+
+class TestDeepMergeIsolation:
+    """``_deep_merge`` is the only thing keeping DEFAULT_CONFIG out of reach."""
+
+    def test_merge_shares_no_nested_container_with_its_inputs(self) -> None:
+        """A shallow copy here is how secrets leaked into the module defaults."""
+        base = {"outer": {"inner": {"value": 1}}}
+        override = {"other": {"value": 2}}
+
+        merged = Config._deep_merge(Config(), base, override)
+
+        assert merged["outer"] is not base["outer"]
+        assert merged["outer"]["inner"] is not base["outer"]["inner"]
+        assert merged["other"] is not override["other"]
+
+    def test_upgrade_does_not_leave_the_defaults_reachable(self, config_path: Path) -> None:
+        """After upgrade(), a secret written on the instance must stay local."""
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(yaml.safe_dump({"webserver": "apache"}))
+
+        config = Config()
+        result = config.upgrade()
+        assert result["upgraded"] is True
+
+        config.set("monitor.smtp.password", "leaked")
+        config.set("databases.credentials.mysql.password", "leaked")
+
+        assert DEFAULT_CONFIG["monitor"]["smtp"]["password"] == ""
+        assert DEFAULT_CONFIG["databases"]["credentials"]["mysql"]["password"] == ""
+
+
+class TestSecureDirectory:
+    """Every level created on the way to a secret must be private."""
+
+    def test_intermediate_directories_are_not_world_readable(self, sandbox: Path) -> None:
+        """pathlib creates parents with 0777 & umask unless the mode is passed."""
+        previous = os.umask(0o022)
+        try:
+            target = sandbox / "outer" / "middle" / "inner"
+
+            secure_directory(target)
+
+            for level in (sandbox / "outer", sandbox / "outer" / "middle", target):
+                assert level.stat().st_mode & 0o077 == 0, f"{level} is not private"
+        finally:
+            os.umask(previous)
+
+    def test_existing_directories_are_not_touched(self, sandbox: Path) -> None:
+        """A pre-existing shared parent must keep its mode; only new levels are ours."""
+        parent = sandbox / "shared"
+        parent.mkdir(mode=0o755)
+        parent.chmod(0o755)
+
+        secure_directory(parent / "wasm")
+
+        assert parent.stat().st_mode & 0o777 == 0o755
+        assert (parent / "wasm").stat().st_mode & 0o077 == 0
+
+
+class TestSymlinkAttacks:
+    """Whoever can write in /etc/wasm must not be able to redirect the write."""
+
+    def test_secure_write_refuses_to_follow_a_symlink(self, sandbox: Path) -> None:
+        """A symlinked config file must not become a write into the target."""
+        victim = sandbox / "victim.txt"
+        victim.write_text("original\n")
+        link = sandbox / "config.yaml"
+        link.symlink_to(victim)
+
+        with pytest.raises(SecurityError):
+            secure_write(link, "webserver: nginx\n")
+
+        assert victim.read_text() == "original\n"
+
+    def test_secure_write_refuses_a_dangling_symlink(self, sandbox: Path) -> None:
+        """A link to a not-yet-existing file must not create the target."""
+        target = sandbox / "not-there.txt"
+        link = sandbox / "config.yaml"
+        link.symlink_to(target)
+
+        with pytest.raises(SecurityError):
+            secure_write(link, "webserver: nginx\n")
+
+        assert not target.exists()
+
+    def test_restrict_file_does_not_chmod_through_a_symlink(self, sandbox: Path) -> None:
+        """restrict_file must inspect the link itself, not what it points at."""
+        victim = sandbox / "victim.txt"
+        victim.write_text("original\n")
+        victim.chmod(0o644)
+        link = sandbox / "config.yaml"
+        link.symlink_to(victim)
+
+        restrict_file(link)
+
+        assert victim.stat().st_mode & 0o777 == 0o644
+
+    def test_restrict_file_ignores_a_dangling_symlink(self, sandbox: Path) -> None:
+        """A broken link must not raise: exists() lies, lstat does not."""
+        link = sandbox / "config.yaml"
+        link.symlink_to(sandbox / "not-there.txt")
+
+        restrict_file(link)
+
+    def test_config_save_reports_failure_on_a_symlinked_path(self, config_path: Path) -> None:
+        """save() must fail closed rather than write through a planted link."""
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        victim = config_path.parent / "victim.txt"
+        victim.write_text("original\n")
+        config_path.symlink_to(victim)
+
+        assert Config().save() is False
+        assert victim.read_text() == "original\n"
+
+
+class TestEnvFilePermissions:
+    """Deployed .env files carry DATABASE_URL, API keys and generated secrets."""
+
+    def test_env_file_is_owner_only(self, sandbox: Path) -> None:
+        """A .env written next to the app must not be world readable."""
+        app_path = sandbox / "app"
+        app_path.mkdir()
+
+        written = EnvManager().write_env_files(app_path, {"DATABASE_URL": "postgres://s3cret"})
+
+        assert written == [app_path / ".env"]
+        assert (app_path / ".env").stat().st_mode & 0o077 == 0
+
+    def test_existing_world_readable_env_is_tightened(self, sandbox: Path) -> None:
+        """A .env left lax by an older version must be repaired on rewrite."""
+        app_path = sandbox / "app"
+        app_path.mkdir()
+        env_file = app_path / ".env"
+        env_file.write_text("OLD=1\n")
+        env_file.chmod(0o644)
+
+        EnvManager().write_env_files(app_path, {"API_KEY": "sk-live"})
+
+        assert env_file.stat().st_mode & 0o077 == 0
+
+    def test_mapped_env_files_are_owner_only(self, sandbox: Path) -> None:
+        """The monorepo path writes several files; all of them are secret.""" ""
+        app_path = sandbox / "app"
+        app_path.mkdir()
+
+        written = EnvManager().write_env_files(
+            app_path,
+            {"API_KEY": "sk-live", "PORT": "3000"},
+            file_mapping={"apps/web/.env": ["API_KEY"], ".env": ["PORT"]},
+        )
+
+        for path in written:
+            assert path.stat().st_mode & 0o077 == 0, f"{path} is not private"
+
+    def test_env_file_is_never_briefly_world_readable(self, sandbox: Path) -> None:
+        """The mode must come from the open(), not from a chmod afterwards."""
+        app_path = sandbox / "app"
+        app_path.mkdir()
+        modes: list[int] = []
+        real_open = os.open
+
+        def recording_open(path, flags, mode=0o777, **kwargs):
+            fd = real_open(path, flags, mode, **kwargs)
+            if str(path).endswith(".env"):
+                modes.append(stat.S_IMODE(os.fstat(fd).st_mode))
+            return fd
+
+        os.open = recording_open
+        try:
+            EnvManager().write_env_files(app_path, {"API_KEY": "sk-live"})
+        finally:
+            os.open = real_open
+
+        assert modes == [0o600]
+
+    def test_app_directory_is_not_tightened(self, sandbox: Path) -> None:
+        """The app tree is served by the web server; only the file is private."""
+        app_path = sandbox / "app"
+        app_path.mkdir(mode=0o755)
+        app_path.chmod(0o755)
+
+        EnvManager().write_env_files(app_path, {"API_KEY": "sk-live"})
+
+        assert app_path.stat().st_mode & 0o777 == 0o755
+
+    def test_env_config_json_is_owner_only(self, sandbox: Path) -> None:
+        """.wasm/env-config.json records the variable inventory and defaults."""
+        app_path = sandbox / "app"
+        app_path.mkdir()
+        config = EnvConfig(variables=[EnvVariable(name="API_KEY", secret=True, value="sk-live")])
+
+        EnvManager().save_config(app_path, config)
+
+        saved = app_path / ".wasm" / "env-config.json"
+        assert saved.stat().st_mode & 0o077 == 0
+        assert saved.parent.stat().st_mode & 0o077 == 0
+        assert json.loads(saved.read_text())["variables"][0]["name"] == "API_KEY"
+
+    def test_env_manager_refuses_to_write_through_a_symlink(self, sandbox: Path) -> None:
+        """A symlinked .env in a shared app directory must not leak elsewhere."""
+        app_path = sandbox / "app"
+        app_path.mkdir()
+        victim = sandbox / "victim.txt"
+        victim.write_text("original\n")
+        (app_path / ".env").symlink_to(victim)
+
+        with pytest.raises(SecurityError):
+            EnvManager().write_env_files(app_path, {"API_KEY": "sk-live"})
+
+        assert victim.read_text() == "original\n"
+
+
+class TestSetupCreatesAPrivateConfigDirectory:
+    """/etc/wasm holds config.yaml, and WASM runs as root: 0700 is the model."""
+
+    def test_config_directory_is_owner_only(
+        self, sandbox: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """setup must not widen the directory that holds the credentials."""
+        from wasm.cli.commands import setup as setup_cli
+
+        config_path = sandbox / "etc" / "wasm" / "config.yaml"
+        monkeypatch.setattr(setup_cli, "DEFAULT_CONFIG_PATH", config_path)
+        previous = os.umask(0o022)
+        try:
+            assert setup_cli._create_config_directory(setup_cli.Logger()) is True
+        finally:
+            os.umask(previous)
+
+        assert config_path.parent.stat().st_mode & 0o077 == 0

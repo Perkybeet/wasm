@@ -11,10 +11,14 @@ applications, shared databases, and unified build processes.
 
 import json
 import secrets
+import shutil
+import sqlite3
 import string
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any, ClassVar
 
 from wasm.core.config import Config
 from wasm.core.exceptions import (
@@ -22,8 +26,10 @@ from wasm.core.exceptions import (
     DeploymentError,
     OutOfMemoryError,
     ServiceError,
+    WASMError,
 )
 from wasm.core.logger import Icons, Logger
+from wasm.core.runner import CommandResult, CommandRunner, get_runner
 from wasm.core.store import (
     App,
     AppStatus,
@@ -34,7 +40,7 @@ from wasm.core.store import (
     Site,
     get_store,
 )
-from wasm.core.utils import command_exists, domain_to_app_name, run_command
+from wasm.core.utils import domain_to_app_name
 from wasm.deployers.helpers import (
     PackageManagerHelper,
     PathResolver,
@@ -42,11 +48,20 @@ from wasm.deployers.helpers import (
     TurboHelper,
     WorkspaceHelper,
 )
+from wasm.deployers.interface import AppDeployer
+from wasm.deployers.registry import DeployerRegistry
 from wasm.managers.apache_manager import ApacheManager
 from wasm.managers.cert_manager import CertManager
 from wasm.managers.nginx_manager import NginxManager
 from wasm.managers.service_manager import ServiceManager
 from wasm.managers.source_manager import SourceManager
+
+#: Installs and builds in a monorepo touch every workspace; they need minutes,
+#: but they still need a deadline.
+INSTALL_TIMEOUT = 1800
+
+#: Everything else here is a quick local command.
+COMMAND_TIMEOUT = 300
 
 
 @dataclass
@@ -62,7 +77,7 @@ class DatabaseConfig:
     db_number: int = 0  # For Redis
 
 
-class MonorepoDeployer:
+class MonorepoDeployer(AppDeployer):
     """
     Deployer for Turborepo/pnpm workspace monorepos.
 
@@ -79,30 +94,39 @@ class MonorepoDeployer:
     DISPLAY_NAME = "Monorepo (Turborepo/pnpm)"
 
     # Files used to detect this app type
-    DETECTION_FILES = [
+    DETECTION_FILES: ClassVar[list[str]] = [
         "turbo.json",
         "pnpm-workspace.yaml",
     ]
 
+    # A workspace with several deployable apps outranks every single-app signal
+    # inside it. See DEFAULT_DETECTION_PRIORITY in interface.py.
+    DETECTION_PRIORITY = 90
+
     # Default ports
     DEFAULT_BASE_PORT = 3000
+    DEFAULT_PORT = 3000
 
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, runner: CommandRunner | None = None):
         """
         Initialize the monorepo deployer.
 
         Args:
             verbose: Enable verbose logging.
+            runner: Command runner used for installs and builds. Defaults to the
+                process-wide runner, which is what enforces --dry-run.
         """
         self.verbose = verbose
+        self._runner = runner
         self.config = Config()
         self.logger = Logger(verbose=verbose)
         self.store = get_store()
 
-        # Managers
-        self.source_manager = SourceManager(verbose=verbose)
-        self.service_manager = ServiceManager(verbose=verbose)
-        self.cert_manager = CertManager(verbose=verbose)
+        # Managers are built on first use: detection instantiates every
+        # registered deployer just to ask "is this yours?".
+        self._source_manager: SourceManager | None = None
+        self._service_manager: ServiceManager | None = None
+        self._cert_manager: CertManager | None = None
 
         # Helpers
         self._pm_helper = PackageManagerHelper(logger=self.logger)
@@ -111,11 +135,12 @@ class MonorepoDeployer:
         self._turbo_helper = TurboHelper(logger=self.logger)
         self._prisma_helper: PrismaHelper | None = None
 
-        # Deployment configuration
-        self.domain: str | None = None
-        self.source: str | None = None
-        self.app_path: Path | None = None
-        self.app_name: str | None = None
+        # Deployment configuration. Empty rather than None until configure()
+        # runs: every value here is handed to a manager that requires one.
+        self.domain: str = ""
+        self.source: str = ""
+        self.app_path: Path = Path()
+        self.app_name: str = ""
         self.webserver: str = "nginx"
         self.ssl: bool = True
         self.branch: str | None = None
@@ -138,18 +163,76 @@ class MonorepoDeployer:
         self._created_sites: list[str] = []
         self._is_new_deployment: bool = True
 
+    @property
+    def runner(self) -> CommandRunner:
+        """The command runner this deployer executes through."""
+        return self._runner if self._runner is not None else get_runner()
+
+    @property
+    def source_manager(self) -> SourceManager:
+        """The manager that fetches source code."""
+        if self._source_manager is None:
+            self._source_manager = SourceManager(verbose=self.verbose)
+        return self._source_manager
+
+    @source_manager.setter
+    def source_manager(self, manager: SourceManager) -> None:
+        """
+        Replace the source manager.
+
+        Args:
+            manager: The manager to use instead of the default.
+        """
+        self._source_manager = manager
+
+    @property
+    def service_manager(self) -> ServiceManager:
+        """The manager that writes and drives systemd units."""
+        if self._service_manager is None:
+            self._service_manager = ServiceManager(verbose=self.verbose)
+        return self._service_manager
+
+    @service_manager.setter
+    def service_manager(self, manager: ServiceManager) -> None:
+        """
+        Replace the service manager.
+
+        Args:
+            manager: The manager to use instead of the default.
+        """
+        self._service_manager = manager
+
+    @property
+    def cert_manager(self) -> CertManager:
+        """The manager that obtains certificates."""
+        if self._cert_manager is None:
+            self._cert_manager = CertManager(verbose=self.verbose)
+        return self._cert_manager
+
+    @cert_manager.setter
+    def cert_manager(self, manager: CertManager) -> None:
+        """
+        Replace the certificate manager.
+
+        Args:
+            manager: The manager to use instead of the default.
+        """
+        self._cert_manager = manager
+
     def configure(
         self,
         domain: str,
         source: str,
+        *,
+        port: int | None = None,
         webserver: str = "nginx",
         ssl: bool = True,
         branch: str | None = None,
         env_vars: dict[str, str] | None = None,
         app_path: Path | None = None,
-        subdomain_overrides: dict[str, str] | None = None,
-        workspace_filter: list[str] | None = None,
-        skip_database: bool = False,
+        package_manager: str = "auto",
+        include_www: bool = False,
+        **options: Any,
     ) -> None:
         """
         Configure the deployer.
@@ -157,24 +240,28 @@ class MonorepoDeployer:
         Args:
             domain: Target domain (e.g., example.com).
             source: Source URL or path.
+            port: Base port. Workspaces are assigned consecutive ports from it.
             webserver: Web server to use (nginx/apache).
             ssl: Enable SSL.
             branch: Git branch.
             env_vars: Global environment variables.
             app_path: Custom application path.
-            subdomain_overrides: Dict mapping app names to subdomains.
-            workspace_filter: List of workspace names to deploy (None = all).
-            skip_database: Skip database provisioning.
+            package_manager: Ignored; a turbo/pnpm workspace uses pnpm.
+            include_www: Ignored; workspaces are served on their own subdomains.
+            **options: ``subdomain_overrides`` maps workspace names to
+                subdomains, ``workspace_filter`` limits which workspaces deploy,
+                and ``skip_database`` disables provisioning.
         """
         self.domain = domain
         self.source = source
+        self.base_port = port or self.DEFAULT_BASE_PORT
         self.webserver = webserver
         self.ssl = ssl
         self.branch = branch
         self.env_vars = env_vars or {}
-        self.subdomain_overrides = subdomain_overrides or {}
-        self.workspace_filter = workspace_filter
-        self.skip_database = skip_database
+        self.subdomain_overrides = options.get("subdomain_overrides") or {}
+        self.workspace_filter = options.get("workspace_filter")
+        self.skip_database = bool(options.get("skip_database", False))
 
         # Set app name and path
         self.app_name = domain_to_app_name(domain)
@@ -226,23 +313,45 @@ class MonorepoDeployer:
 
     def _run(
         self,
-        command: list[str],
+        command: Sequence[str],
         cwd: Path | None = None,
-        env: dict | None = None,
-        timeout: int | None = None,
-    ):
-        """Run a command and return result."""
+        env: Mapping[str, str] | None = None,
+        timeout: int = COMMAND_TIMEOUT,
+        *,
+        stream: bool = False,
+    ) -> CommandResult:
+        """
+        Execute a command inside the monorepo.
+
+        Args:
+            command: Program and arguments.
+            cwd: Working directory. Defaults to the monorepo root.
+            env: Extra environment, merged over the configured env_vars.
+            timeout: Deadline in seconds.
+            stream: Report output line by line while it runs, for installs and
+                builds that would otherwise look frozen for minutes.
+
+        Returns:
+            The command outcome.
+        """
         self.logger.debug(f"Running: {' '.join(command)}")
 
-        # Merge environment variables
-        run_env = self.env_vars.copy()
+        run_env = dict(self.env_vars)
         if env:
             run_env.update(env)
 
-        return run_command(
+        if stream:
+            return self.runner.stream(
+                command,
+                on_line=self.logger.debug,
+                cwd=cwd or self.app_path,
+                env=run_env or None,
+                timeout=timeout,
+            )
+        return self.runner.run(
             command,
             cwd=cwd or self.app_path,
-            env=run_env if run_env else None,
+            env=run_env or None,
             timeout=timeout,
         )
 
@@ -320,10 +429,9 @@ class MonorepoDeployer:
                     ssl_obtained = True
                     self.logger.substep("Updating site configurations with SSL")
                     self._create_sites(with_ssl=True)
-                except CertificateError as e:
-                    self.logger.warning(f"SSL certificate failed: {e.message}")
-                    self.logger.warning("Continuing deployment without SSL...")
-                except Exception as e:
+                except (CertificateError, WASMError) as e:
+                    # No certificate still leaves every workspace reachable over
+                    # HTTP; that is not worth throwing the build away for.
                     self.logger.warning(f"SSL certificate failed: {e}")
                     self.logger.warning("Continuing deployment without SSL...")
             else:
@@ -360,7 +468,9 @@ class MonorepoDeployer:
                 try:
                     self._rollback()
                     self.logger.info("Rollback completed successfully")
-                except Exception as rollback_error:
+                # Rollback is the last line of defence; whatever it hits, the
+                # original failure is what the caller must see.
+                except Exception as rollback_error:  # noqa: BLE001
                     self.logger.debug(f"Rollback error: {rollback_error}")
                     self.logger.warning("Rollback had some errors. Manual cleanup may be needed.")
 
@@ -371,7 +481,7 @@ class MonorepoDeployer:
         issues = []
 
         # Check pnpm is installed
-        if not command_exists("pnpm"):
+        if not self.runner.exists("pnpm"):
             issues.append("pnpm is not installed. Install it with: npm install -g pnpm")
 
         # Check git for git sources
@@ -380,10 +490,12 @@ class MonorepoDeployer:
             or self.source.startswith("https://")
             or self.source.endswith(".git")
         ):
-            if not command_exists("git"):
+            if not self.runner.exists("git"):
                 issues.append("git is not installed")
             else:
-                result = run_command(["git", "ls-remote", "--exit-code", self.source], timeout=30)
+                result = self.runner.run(
+                    ["git", "ls-remote", "--exit-code", self.source], timeout=30
+                )
                 if not result.success:
                     issues.append(f"Repository not accessible: {self.source}")
 
@@ -447,7 +559,7 @@ class MonorepoDeployer:
                     compose = yaml.safe_load(f)
 
                 services = compose.get("services", {})
-                for svc_name, svc_config in services.items():
+                for svc_config in services.values():
                     image = svc_config.get("image", "")
 
                     if "postgres" in image.lower():
@@ -474,7 +586,7 @@ class MonorepoDeployer:
 
             except ImportError:
                 self.logger.debug("PyYAML not available, skipping docker-compose parsing")
-            except Exception as e:
+            except (yaml.YAMLError, OSError, AttributeError) as e:
                 self.logger.debug(f"Error parsing docker-compose.yml: {e}")
 
         # Check for Prisma (indicates PostgreSQL needed)
@@ -490,7 +602,7 @@ class MonorepoDeployer:
                         password=self._generate_password(),
                         port=5432,
                     )
-            except Exception as e:
+            except OSError as e:
                 self.logger.debug(f"Error reading Prisma schema: {e}")
 
         return databases
@@ -509,7 +621,7 @@ class MonorepoDeployer:
                     self._provision_postgresql(db_config)
                 elif db_type == "redis":
                     self._provision_redis(db_config)
-            except Exception as e:
+            except WASMError as e:
                 self.logger.warning(f"Database provisioning failed for {db_type}: {e}")
                 self.logger.warning("You may need to configure the database manually")
 
@@ -549,25 +661,17 @@ class MonorepoDeployer:
                     raise
                 self.logger.debug(f"User {db_config.user} already exists")
 
-            # Grant privileges
+            # Grant privileges. This covers the public schema too, which is what
+            # Prisma migrations need; the previous code reached past the manager
+            # into its private _execute_sql to interpolate a user name straight
+            # into GRANT statements.
             try:
                 manager.grant_privileges(
                     database=db_config.name,
                     username=db_config.user,
                 )
-            except Exception:
-                pass  # May fail if already granted
-
-            # Grant schema permissions (needed for Prisma migrations)
-            try:
-                schema_sql = f"""
-                GRANT ALL ON SCHEMA public TO {db_config.user};
-                ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO {db_config.user};
-                ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO {db_config.user};
-                """
-                manager._execute_sql(schema_sql, database=db_config.name)
-            except Exception:
-                pass  # May fail but usually not critical
+            except WASMError as e:
+                self.logger.debug(f"Grant on {db_config.name} reported: {e}")
 
             # Register in store
             app = self.store.get_app(self.domain)
@@ -582,8 +686,8 @@ class MonorepoDeployer:
                 )
                 try:
                     self.store.create_database(db_record)
-                except Exception:
-                    pass  # May already exist
+                except (WASMError, sqlite3.Error) as e:
+                    self.logger.debug(f"Database row already present: {e}")
 
         except ImportError:
             self.logger.debug("Database manager not available")
@@ -692,8 +796,8 @@ class MonorepoDeployer:
                 data = json.loads(package_json.read_text())
                 scripts = data.get("scripts", {})
                 has_db_scripts = "db:generate" in scripts or "db:migrate" in scripts
-            except Exception:
-                pass
+            except (json.JSONDecodeError, OSError, AttributeError) as e:
+                self.logger.debug(f"Could not read {package_json}: {e}")
 
         if has_db_scripts:
             # Use project's own Prisma scripts
@@ -765,7 +869,7 @@ class MonorepoDeployer:
 
         try:
             # Change ownership recursively
-            result = run_command(
+            result = self.runner.run(
                 ["chown", "-R", f"{service_user}:{service_group}", str(self.app_path)],
                 timeout=60,
             )
@@ -773,11 +877,11 @@ class MonorepoDeployer:
                 self.logger.debug(f"chown failed: {result.stderr}")
 
             # Ensure directories are executable and writable
-            run_command(
+            self.runner.run(
                 ["chmod", "-R", "u+rwX,g+rX,o+rX", str(self.app_path)],
                 timeout=60,
             )
-        except Exception as e:
+        except OSError as e:
             self.logger.debug(f"Failed to set permissions: {e}")
 
     def _build_all(self) -> None:
@@ -808,13 +912,28 @@ class MonorepoDeployer:
                 )
             raise BuildError("Build failed", details=result.stderr or result.stdout)
 
-    def _create_sites(self, with_ssl: bool = False) -> None:
-        """Create nginx/apache site configurations for all workspaces."""
+    def _webserver_manager(self) -> NginxManager | ApacheManager:
+        """
+        Return the manager for the configured web server.
+
+        Returns:
+            An NginxManager or an ApacheManager.
+        """
         if self.webserver == "nginx":
-            manager = NginxManager(verbose=self.verbose)
+            return NginxManager(verbose=self.verbose)
+        return ApacheManager(verbose=self.verbose)
+
+    def _create_sites(self, with_ssl: bool = False) -> None:
+        """
+        Create nginx/apache site configurations for all workspaces.
+
+        Args:
+            with_ssl: Render the configurations with TLS enabled.
+        """
+        manager = self._webserver_manager()
+        if isinstance(manager, NginxManager):
             self._create_nginx_sites(manager, with_ssl)
         else:
-            manager = ApacheManager(verbose=self.verbose)
             self._create_apache_sites(manager, with_ssl)
 
         manager.reload()
@@ -1128,8 +1247,8 @@ class MonorepoDeployer:
 
             try:
                 self.service_manager.start(service_name)
-            except Exception as e:
-                raise ServiceError(f"Failed to start {service_name}", details=str(e))
+            except WASMError as e:
+                raise ServiceError(f"Failed to start {service_name}", details=str(e)) from e
 
             # Update status in store
             self.store.update_service_status(service_name, active=True, enabled=True)
@@ -1226,55 +1345,49 @@ class MonorepoDeployer:
             try:
                 self.service_manager.stop(service_name)
                 self.service_manager.delete_service(service_name)
-            except Exception as e:
+            except (WASMError, OSError) as e:
                 errors.append(f"Service cleanup error: {e}")
 
         # Remove site configuration
         try:
-            if self.webserver == "nginx":
-                manager = NginxManager(verbose=self.verbose)
-            else:
-                manager = ApacheManager(verbose=self.verbose)
+            manager = self._webserver_manager()
 
             if manager.site_exists(self.domain):
                 manager.disable_site(self.domain)
                 manager.delete_site(self.domain)
                 manager.reload()
-        except Exception as e:
+        except (WASMError, OSError) as e:
             errors.append(f"Site cleanup error: {e}")
 
         # Remove files
         if self.app_path and self.app_path.exists():
             try:
-                import shutil
-
                 shutil.rmtree(self.app_path)
-            except Exception as e:
+            except OSError as e:
                 errors.append(f"File cleanup error: {e}")
 
         # Clean store records
         try:
+            # The store deletes by natural key. Passing row ids matched nothing,
+            # so every failed monorepo deployment left its rows behind.
             for service_name in self._created_services:
                 service = self.store.get_service(service_name)
                 if service:
-                    self.store.delete_service(service.id)
+                    self.store.delete_service(service.name)
 
             for ws in self.workspaces:
                 site = self.store.get_site(f"{ws.subdomain}.{self.domain}")
                 if site:
-                    self.store.delete_site(site.id)
+                    self.store.delete_site(site.domain)
 
             app = self.store.get_app(self.domain)
             if app:
-                self.store.delete_app(app.id)
-        except Exception as e:
+                self.store.delete_app(app.domain)
+        except (WASMError, sqlite3.Error) as e:
             errors.append(f"Store cleanup error: {e}")
 
         if errors:
             self.logger.debug(f"Rollback errors: {errors}")
 
-
-# Register with DeployerRegistry
-from wasm.deployers.registry import DeployerRegistry
 
 DeployerRegistry.register(MonorepoDeployer)

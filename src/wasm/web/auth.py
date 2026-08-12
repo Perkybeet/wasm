@@ -17,12 +17,20 @@ equivalent to a root shell. The design decisions that follow from that:
   refuses, and unlike plain double-submit a cookie injected by a sibling
   subdomain does not match the stored value.
 - **Client identity comes from the TCP peer.** ``X-Forwarded-For`` is honoured
-  only when the peer is a configured trusted proxy. Otherwise the IP whitelist,
-  the rate limiter and the brute-force lockout could all be defeated by
-  rotating a header.
+  only when the peer is a configured trusted proxy, and only when the value it
+  carries parses as an IP address. Otherwise the IP whitelist, the rate limiter
+  and the brute-force lockout could all be defeated by rotating a header, or by
+  turning the limiter's key into a string the attacker picks.
+- **Every rejected credential is counted in one place.** Cookies, ``Bearer``
+  headers and WebSocket handshakes all fail through :func:`record_auth_failure`,
+  so a lockout cannot be escaped by changing channel or endpoint.
 - **Secrets and sessions are persisted, never invented on the fly.** A signing
   key that silently regenerates logs everyone out on restart and makes multiple
-  workers impossible; if the key cannot be written the server refuses to start.
+  workers impossible; if the key cannot be written, or exists but is empty, the
+  server refuses to start instead of quietly issuing a new one.
+- **Sessions die of old age.** Renewal keeps an active operator logged in, but
+  it rotates the session id and never pushes the absolute deadline, so a session
+  that is used continuously still expires.
 """
 
 from __future__ import annotations
@@ -41,8 +49,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import HTTPException, Request, WebSocket, status
+from fastapi import HTTPException, Request, status
 from jose import JWTError, jwt
+from starlette.requests import HTTPConnection
 
 from wasm.core.exceptions import SecurityError
 
@@ -88,6 +97,17 @@ SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 #: WebSocket tickets are single use and only have to survive the handshake.
 WS_TICKET_TTL = 30
 
+#: Close codes for a handshake the middleware refuses. They are in the private
+#: 4000-4999 range so a client can tell "log in again" from "you are blocked".
+WS_CLOSE_UNAUTHORIZED = 4401
+WS_CLOSE_FORBIDDEN = 4403
+WS_CLOSE_RATE_LIMITED = 4429
+
+#: Subprotocol prefix carrying a session token, for clients that cannot send a
+#: cookie: ``Sec-WebSocket-Protocol: wasm.auth, wasm.token.<token>``.
+WS_SUBPROTOCOL = "wasm.auth"
+WS_TOKEN_PREFIX = "wasm.token."  # noqa: S105 - subprotocol prefix, not a credential
+
 JWT_ALGORITHM = "HS256"
 JWT_ISSUER = "wasm-web"
 JWT_SUBJECT = "wasm_session"
@@ -96,6 +116,21 @@ JWT_EXPIRATION_HOURS = 12
 #: A session is re-issued once it is past this fraction of its lifetime, so an
 #: active operator is never logged out mid-deploy while idle sessions still die.
 SESSION_RENEW_RATIO = 0.5
+
+#: How long a rotated session id keeps working after it is replaced. Long
+#: enough for the requests a dashboard already had in flight, short enough that
+#: a captured cookie is worthless by the time it is replayed.
+SESSION_ROTATION_GRACE = 30
+
+#: Hard ceiling on a session's life, however active it is. Renewal resets the
+#: idle clock but never this one, so a stolen cookie that is kept warm still
+#: stops working within a day.
+SESSION_MAX_HOURS = 24
+
+#: The audit log is written by anonymous, unauthenticated events (a refused
+#: handshake is one), so it is rotated rather than allowed to fill the disk.
+AUDIT_MAX_BYTES = 5 * 1024 * 1024
+AUDIT_BACKUPS = 3
 
 FILE_MODE = 0o600
 DIR_MODE = 0o700
@@ -127,7 +162,8 @@ class SecurityConfig:
         rate_limit_window: Length of the rate limit window in seconds.
         max_failed_attempts: Failed logins before an IP is locked out.
         lockout_duration: Lockout length in seconds.
-        token_expiration_hours: Session lifetime in hours.
+        token_expiration_hours: Session lifetime in hours, refreshed by activity.
+        session_max_hours: Absolute lifetime, never extended by activity.
         require_https: Refuse to serve or start without TLS when true.
         ssl_certfile: Path to the TLS certificate chain.
         ssl_keyfile: Path to the TLS private key.
@@ -137,6 +173,8 @@ class SecurityConfig:
         bind_session_to_ip: Reject a session presented from a different IP.
         state_dir: Directory holding secrets, sessions and the audit log.
         audit_enabled: Whether privileged actions are written to the audit log.
+        audit_max_bytes: Size at which the audit log is rotated.
+        audit_backups: Rotated audit files kept before the oldest is deleted.
     """
 
     host: str = "127.0.0.1"
@@ -150,6 +188,7 @@ class SecurityConfig:
     max_failed_attempts: int = MAX_FAILED_ATTEMPTS
     lockout_duration: int = LOCKOUT_DURATION
     token_expiration_hours: int = JWT_EXPIRATION_HOURS
+    session_max_hours: int = SESSION_MAX_HOURS
     require_https: bool = False
     ssl_certfile: str | None = None
     ssl_keyfile: str | None = None
@@ -158,6 +197,8 @@ class SecurityConfig:
     bind_session_to_ip: bool = True
     state_dir: Path | None = None
     audit_enabled: bool = True
+    audit_max_bytes: int = AUDIT_MAX_BYTES
+    audit_backups: int = AUDIT_BACKUPS
 
     @property
     def resolved_state_dir(self) -> Path:
@@ -200,6 +241,7 @@ class SecurityConfig:
 _global_config: SecurityConfig | None = None
 _global_token_manager: TokenManager | None = None
 _global_audit_logger: AuditLogger | None = None
+_global_brute_force: BruteForceProtection | None = None
 
 
 def set_security_config(config: SecurityConfig) -> None:
@@ -264,6 +306,27 @@ def get_audit_logger() -> AuditLogger | None:
         The logger, or None when auditing is disabled.
     """
     return _global_audit_logger
+
+
+def set_brute_force_protection(protection: BruteForceProtection | None) -> None:
+    """
+    Install the lockout tracker shared by every credential channel.
+
+    Args:
+        protection: The tracker to install, or None to clear it.
+    """
+    global _global_brute_force
+    _global_brute_force = protection
+
+
+def get_brute_force_protection() -> BruteForceProtection | None:
+    """
+    Return the installed lockout tracker.
+
+    Returns:
+        The tracker, or None when the server has not been created yet.
+    """
+    return _global_brute_force
 
 
 def ensure_state_dir(path: Path) -> None:
@@ -603,7 +666,7 @@ class SessionStore:
         self._create_schema()
 
     def _create_schema(self) -> None:
-        """Create the session and ticket tables when missing."""
+        """Create the session and ticket tables when missing, and migrate old ones."""
         with self._lock, self._conn:
             self._conn.execute(
                 """
@@ -612,11 +675,22 @@ class SessionStore:
                     csrf_token TEXT NOT NULL,
                     client_ip TEXT NOT NULL,
                     issued_at REAL NOT NULL,
+                    created_at REAL NOT NULL DEFAULT 0,
                     expires_at REAL NOT NULL,
                     revoked INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
+            columns = {
+                row["name"] for row in self._conn.execute("PRAGMA table_info(sessions)").fetchall()
+            }
+            if "created_at" not in columns:
+                # Databases written before absolute expiry existed: the safest
+                # reading of an unknown birth date is "when it was last issued".
+                self._conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN created_at REAL NOT NULL DEFAULT 0"
+                )
+                self._conn.execute("UPDATE sessions SET created_at = issued_at")
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS ws_tickets (
@@ -628,7 +702,14 @@ class SessionStore:
                 """
             )
 
-    def create(self, sid: str, csrf_token: str, client_ip: str, expires_at: float) -> None:
+    def create(
+        self,
+        sid: str,
+        csrf_token: str,
+        client_ip: str,
+        expires_at: float,
+        created_at: float | None = None,
+    ) -> None:
         """
         Persist a new session.
 
@@ -637,13 +718,24 @@ class SessionStore:
             csrf_token: CSRF token bound to the session.
             client_ip: IP the session was issued to.
             expires_at: Expiry as a UNIX timestamp.
+            created_at: Birth of the login this session descends from. Defaults
+                to now; a rotation passes the original value so that renewal
+                cannot extend the absolute lifetime.
         """
+        now = time.time()
         with self._lock, self._conn:
             self._conn.execute(
                 "INSERT OR REPLACE INTO sessions "
-                "(sid, csrf_token, client_ip, issued_at, expires_at, revoked) "
-                "VALUES (?, ?, ?, ?, ?, 0)",
-                (sid, csrf_token, client_ip, time.time(), expires_at),
+                "(sid, csrf_token, client_ip, issued_at, created_at, expires_at, revoked) "
+                "VALUES (?, ?, ?, ?, ?, ?, 0)",
+                (
+                    sid,
+                    csrf_token,
+                    client_ip,
+                    now,
+                    now if created_at is None else created_at,
+                    expires_at,
+                ),
             )
         self.purge_expired()
 
@@ -676,6 +768,42 @@ class SessionStore:
             self._conn.execute(
                 "UPDATE sessions SET expires_at = ? WHERE sid = ?", (expires_at, sid)
             )
+
+    def rotate(self, old_sid: str, new_sid: str, csrf_token: str, expires_at: float) -> dict | None:
+        """
+        Replace a session with a fresh identifier in one transaction.
+
+        Args:
+            old_sid: Session being retired.
+            new_sid: Identifier of the replacement.
+            csrf_token: CSRF token of the replacement.
+            expires_at: Expiry of the replacement, as a UNIX timestamp.
+
+        Returns:
+            The row of the retired session, or None when it no longer exists.
+        """
+        now = time.time()
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT * FROM sessions WHERE sid = ? AND revoked = 0", (old_sid,)
+            ).fetchone()
+            if row is None:
+                return None
+            self._conn.execute(
+                "INSERT OR REPLACE INTO sessions "
+                "(sid, csrf_token, client_ip, issued_at, created_at, expires_at, revoked) "
+                "VALUES (?, ?, ?, ?, ?, ?, 0)",
+                (new_sid, csrf_token, row["client_ip"], now, row["created_at"], expires_at),
+            )
+            # The retired identifier is not deleted outright: a dashboard fires
+            # several requests at once and they all still carry the old cookie.
+            # It is given a short grace instead, after which a captured copy of
+            # the previous cookie is worthless.
+            self._conn.execute(
+                "UPDATE sessions SET expires_at = MIN(expires_at, ?) WHERE sid = ?",
+                (now + SESSION_ROTATION_GRACE, old_sid),
+            )
+        return dict(row)
 
     def revoke(self, sid: str) -> None:
         """
@@ -771,21 +899,39 @@ class AuditLogger:
     Each line is one JSON object: who acted, when, from where, on what, and how
     it ended. Tokens never reach this file; sessions are identified by their
     session id only.
+
+    Unauthenticated events are auditable too - a refused handshake is the most
+    interesting record there is - which means an anonymous client can drive the
+    write rate. The file is therefore rotated at a fixed size and a fixed number
+    of backups, so the worst an attacker achieves is erasing their own older
+    footprints rather than filling the disk of a machine WASM runs as root.
     """
 
-    def __init__(self, path: Path, enabled: bool = True) -> None:
+    def __init__(
+        self,
+        path: Path,
+        enabled: bool = True,
+        max_bytes: int = AUDIT_MAX_BYTES,
+        backups: int = AUDIT_BACKUPS,
+    ) -> None:
         """
         Prepare the audit log.
 
         Args:
             path: Log file path.
             enabled: When false, records are dropped.
+            max_bytes: Size at which the file is rotated.
+            backups: Number of rotated files kept.
 
         Raises:
             SecurityError: When the log file cannot be created.
         """
         self.path = path
         self.enabled = enabled
+        self.max_bytes = max(1024, max_bytes)
+        self.backups = max(0, backups)
+        self._lock = threading.Lock()
+        self._size = 0
         if not enabled:
             return
         ensure_state_dir(path.parent)
@@ -793,6 +939,7 @@ class AuditLogger:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, FILE_MODE)
             os.close(fd)
             os.chmod(path, FILE_MODE)
+            self._size = path.stat().st_size
         except OSError as exc:
             raise SecurityError(
                 f"Cannot open the web audit log {path}",
@@ -834,17 +981,41 @@ class AuditLogger:
             "resource": resource,
             "detail": detail,
         }
-        line = json.dumps({k: v for k, v in entry.items() if v is not None}) + "\n"
+        payload = (json.dumps({k: v for k, v in entry.items() if v is not None}) + "\n").encode()
         try:
-            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, FILE_MODE)
-            try:
-                os.write(fd, line.encode())
-            finally:
-                os.close(fd)
+            with self._lock:
+                if self._size + len(payload) > self.max_bytes:
+                    self._rotate()
+                fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, FILE_MODE)
+                try:
+                    os.write(fd, payload)
+                finally:
+                    os.close(fd)
+                self._size += len(payload)
         except OSError as exc:
             # Losing the audit trail must be noisy, but it must not take the
             # panel down mid-request.
             logger.error("Cannot write audit entry to %s: %s", self.path, exc)
+
+    def _rotate(self) -> None:
+        """
+        Move the current log aside, dropping the oldest backup.
+
+        Raises:
+            OSError: When the files cannot be renamed; the caller logs it.
+        """
+        if self.backups == 0:
+            self.path.unlink(missing_ok=True)
+        else:
+            oldest = self.path.with_name(f"{self.path.name}.{self.backups}")
+            oldest.unlink(missing_ok=True)
+            for index in range(self.backups - 1, 0, -1):
+                source = self.path.with_name(f"{self.path.name}.{index}")
+                if source.exists():
+                    source.rename(self.path.with_name(f"{self.path.name}.{index + 1}"))
+            if self.path.exists():
+                self.path.rename(self.path.with_name(f"{self.path.name}.1"))
+        self._size = 0
 
 
 @dataclass(frozen=True)
@@ -915,6 +1086,18 @@ class TokenManager:
                 ) from exc
             if existing:
                 return existing
+            # Overwriting a key file that exists but is empty would invalidate
+            # every session without anyone asking for it, and would hide the
+            # truncation (a full disk, an interrupted write, a bad restore).
+            raise SecurityError(
+                f"The web signing key {secret_file} exists but is empty",
+                details=(
+                    "WASM refuses to invent a new key silently, because that logs every "
+                    "operator out and hides whatever truncated the file. Restore the file "
+                    f"from backup, or delete it with 'rm {secret_file}' to start over, "
+                    "which revokes all existing sessions on purpose."
+                ),
+            )
 
         secret = secrets.token_hex(SECRET_KEY_LENGTH)
         write_private_file(secret_file, secret)
@@ -1035,7 +1218,7 @@ class TokenManager:
             "exp": int(expires.timestamp()),
             "iss": JWT_ISSUER,
         }
-        return jwt.encode(payload, self._secret_key, algorithm=JWT_ALGORITHM)
+        return str(jwt.encode(payload, self._secret_key, algorithm=JWT_ALGORITHM))
 
     def verify_session_token(
         self, token: str, client_ip: str | None = None
@@ -1058,7 +1241,7 @@ class TokenManager:
             return None
 
         try:
-            payload = jwt.decode(
+            payload: dict[str, Any] = jwt.decode(
                 token, self._secret_key, algorithms=[JWT_ALGORITHM], issuer=JWT_ISSUER
             )
         except JWTError:
@@ -1068,8 +1251,12 @@ class TokenManager:
         if not session_id:
             return None
 
-        record = self.sessions.get(session_id)
+        record = self.sessions.get(str(session_id))
         if record is None:
+            return None
+
+        if self._past_absolute_deadline(record):
+            self.sessions.revoke(str(session_id))
             return None
 
         if self.config.bind_session_to_ip and client_ip and record["client_ip"] != client_ip:
@@ -1080,37 +1267,78 @@ class TokenManager:
         payload["type"] = "session"
         return payload
 
+    def _absolute_seconds(self) -> float:
+        """
+        Return the hard lifetime of a login, in seconds.
+
+        Returns:
+            The absolute lifetime, never shorter than the idle lifetime.
+        """
+        return max(
+            float(self.config.session_max_hours) * 3600.0,
+            float(self.config.token_expiration_hours) * 3600.0,
+        )
+
+    def _past_absolute_deadline(self, record: dict[str, Any]) -> bool:
+        """
+        Report whether a session is older than the absolute limit.
+
+        Args:
+            record: A session row.
+
+        Returns:
+            True when the login it descends from is too old to keep using.
+        """
+        created = float(record.get("created_at") or record["issued_at"])
+        return time.time() - created >= self._absolute_seconds()
+
     def renew_session(self, payload: dict[str, Any]) -> IssuedSession | None:
         """
         Re-issue a session that is past half of its lifetime.
+
+        The replacement gets a new session id and a new CSRF token, and inherits
+        the original login's birth date: activity buys more idle time, never a
+        longer life. The old identifier is deleted, so a captured copy of the
+        previous cookie stops working the moment the operator's browser renews.
 
         Args:
             payload: A verified session payload.
 
         Returns:
-            The refreshed session, or None when renewal is not due yet.
+            The refreshed session, or None when renewal is not due yet or the
+            login has reached its absolute deadline.
         """
         session_id = payload.get("sid")
-        record = self.sessions.get(session_id) if session_id else None
+        record = self.sessions.get(str(session_id)) if session_id else None
         if record is None:
             return None
 
-        max_age = int(self.config.token_expiration_hours * 3600)
-        elapsed = time.time() - record["issued_at"]
-        if elapsed < max_age * SESSION_RENEW_RATIO:
+        if self._past_absolute_deadline(record):
+            self.sessions.revoke(str(session_id))
             return None
 
-        now = utcnow()
-        expires = now + timedelta(seconds=max_age)
-        self.sessions.extend(session_id, expires.timestamp())
-        token = self._encode(session_id, record["client_ip"], now, expires)
+        max_age = int(self.config.token_expiration_hours * 3600)
+        now_ts = time.time()
+        if now_ts - record["issued_at"] < max_age * SESSION_RENEW_RATIO:
+            return None
 
+        created = float(record.get("created_at") or record["issued_at"])
+        deadline = created + self._absolute_seconds()
+        now = utcnow()
+        expires = now + timedelta(seconds=min(float(max_age), deadline - now_ts))
+
+        new_sid = secrets.token_hex(16)
+        new_csrf = secrets.token_urlsafe(32)
+        if self.sessions.rotate(str(session_id), new_sid, new_csrf, expires.timestamp()) is None:
+            return None
+
+        token = self._encode(new_sid, record["client_ip"], now, expires)
         return IssuedSession(
             token=token,
-            session_id=session_id,
-            csrf_token=record["csrf_token"],
+            session_id=new_sid,
+            csrf_token=new_csrf,
             expires_at=expires.timestamp(),
-            max_age=max_age,
+            max_age=int(expires.timestamp() - now_ts),
         )
 
     def issue_ws_ticket(self, session_id: str, client_ip: str) -> tuple[str, int]:
@@ -1158,7 +1386,7 @@ class TokenManager:
             return None
 
         session = self.sessions.get(record["sid"])
-        if session is None:
+        if session is None or self._past_absolute_deadline(session):
             return None
 
         return {
@@ -1255,59 +1483,153 @@ def ip_matches(candidate: str, entries: list[str]) -> bool:
     return any(address in network for network in _parse_networks(entries))
 
 
-def get_client_ip(request: Request | WebSocket, config: SecurityConfig | None = None) -> str:
+def _as_ip_address(value: str) -> str | None:
+    """
+    Return the value when it is a bare IP address.
+
+    Args:
+        value: A candidate address, possibly with surrounding whitespace or
+            brackets around an IPv6 literal.
+
+    Returns:
+        The normalised address, or None when it is not an IP address at all.
+    """
+    candidate = value.strip()
+    if candidate.startswith("[") and candidate.endswith("]"):
+        candidate = candidate[1:-1]
+    try:
+        return str(ipaddress.ip_address(candidate))
+    except ValueError:
+        return None
+
+
+def get_client_ip(connection: HTTPConnection, config: SecurityConfig | None = None) -> str:
     """
     Determine the client address that security decisions are keyed on.
 
-    Forwarding headers are attacker-controlled unless the peer that sent them is
-    a proxy we deployed, so they are only read when the direct peer is listed in
-    ``trusted_proxies`` (empty by default).
+    The policy, in one sentence: **the peer address is the truth unless the peer
+    is a proxy we deployed, and even then only a parseable IP address is
+    believed.** Two rules follow from it.
+
+    - Forwarding headers are read only when the direct peer matches
+      ``trusted_proxies``, which is empty by default. Otherwise any client could
+      pick its own identity and rotate out of a lockout or a rate limit.
+    - A hop that is not a valid IP address is discarded rather than used. A
+      trusted proxy can be tricked into appending client-supplied garbage, and a
+      free-form string as the limiter's key is the same unbounded-rotation bug
+      one layer down.
 
     Args:
-        request: The incoming HTTP request or WebSocket connection.
+        connection: The incoming HTTP request or WebSocket handshake.
         config: Configuration to use; the installed one by default.
 
     Returns:
-        The client's IP address, or ``"unknown"`` when there is no peer.
+        The client's IP address, the peer address when no header applies, or
+        ``"unknown"`` when there is no peer at all.
     """
     config = config or get_security_config()
-    peer = request.client.host if request.client else ""
+    peer = connection.client.host if connection.client else ""
 
     if peer and config.trusted_proxies and ip_matches(peer, config.trusted_proxies):
-        forwarded_for = request.headers.get("X-Forwarded-For")
+        forwarded_for = connection.headers.get("X-Forwarded-For")
         if forwarded_for:
             # Walk right to left: the rightmost entry that is not one of our own
             # proxies is the first address our infrastructure actually observed.
-            for hop in reversed([h.strip() for h in forwarded_for.split(",") if h.strip()]):
+            for raw_hop in reversed(forwarded_for.split(",")):
+                hop = _as_ip_address(raw_hop)
+                if hop is None:
+                    # Anything unparseable ends the walk: entries to its left
+                    # were appended before it and are just as untrustworthy.
+                    break
                 if not ip_matches(hop, config.trusted_proxies):
                     return hop
-        real_ip = request.headers.get("X-Real-IP")
+        real_ip = connection.headers.get("X-Real-IP")
         if real_ip:
-            return real_ip.strip()
+            parsed = _as_ip_address(real_ip)
+            if parsed is not None:
+                return parsed
 
     return peer or "unknown"
 
 
-def is_secure_request(request: Request | WebSocket, config: SecurityConfig | None = None) -> bool:
+def is_secure_request(connection: HTTPConnection, config: SecurityConfig | None = None) -> bool:
     """
     Report whether the request reached the panel over TLS.
 
     Args:
-        request: The incoming request or WebSocket connection.
+        connection: The incoming request or WebSocket handshake.
         config: Configuration to use; the installed one by default.
 
     Returns:
-        True when the connection is TLS, directly or through a trusted proxy.
+        True when the connection is TLS, directly or through a trusted proxy
+        that declared it with ``X-Forwarded-Proto``.
     """
     config = config or get_security_config()
-    if request.url.scheme in ("https", "wss"):
+    if connection.url.scheme in ("https", "wss"):
         return True
 
-    peer = request.client.host if request.client else ""
+    peer = connection.client.host if connection.client else ""
     if peer and config.trusted_proxies and ip_matches(peer, config.trusted_proxies):
-        return request.headers.get("X-Forwarded-Proto", "").strip().lower() in ("https", "wss")
+        return connection.headers.get("X-Forwarded-Proto", "").strip().lower() in ("https", "wss")
 
     return False
+
+
+def _origin_host(origin: str) -> str | None:
+    """
+    Extract the host of an Origin header.
+
+    Args:
+        origin: The header value.
+
+    Returns:
+        The lowercase host with its port, or None when the value is opaque
+        (``null``) or not an absolute origin.
+    """
+    value = origin.strip().lower()
+    if not value or value == "null":
+        return None
+    _scheme, separator, remainder = value.partition("://")
+    if not separator or not remainder:
+        return None
+    return remainder.split("/", 1)[0] or None
+
+
+def is_allowed_origin(connection: HTTPConnection, config: SecurityConfig | None = None) -> bool:
+    """
+    Check the Origin of a handshake against the hosts allowed to open one.
+
+    A ``SameSite=Strict`` cookie is still sent by a sibling subdomain, because
+    same-site is not same-origin. Without this check an XSS anywhere under the
+    parent domain could open ``/ws/logs/{domain}`` and read the root journal, a
+    cross-site WebSocket hijack.
+
+    Args:
+        connection: The incoming handshake.
+        config: Configuration to use; the installed one by default.
+
+    Returns:
+        True when the request carries no Origin (a non-browser client, which
+        cannot be tricked into ambient authority), when it matches the Host the
+        request was addressed to, or when it is explicitly configured.
+    """
+    config = config or get_security_config()
+    origin = connection.headers.get("origin")
+    if not origin:
+        return True
+
+    origin_host = _origin_host(origin)
+    if origin_host is None:
+        return False
+
+    host_header = connection.headers.get("host", "").strip().lower()
+    if host_header and origin_host == host_header:
+        return True
+
+    allowed = {value.strip().lower() for value in config.cors_origins}
+    if origin.strip().lower() in allowed:
+        return True
+    return any(_origin_host(value) == origin_host for value in allowed)
 
 
 def is_safe_path(path: str) -> bool:
@@ -1359,21 +1681,160 @@ def _unauthorized(detail: str) -> HTTPException:
     )
 
 
-def _bearer_token(request: Request) -> str | None:
+def bearer_token(connection: HTTPConnection) -> str | None:
     """
     Extract a Bearer token from the Authorization header.
 
     Args:
-        request: The incoming request.
+        connection: The incoming request or handshake.
 
     Returns:
         The token, or None when the header is absent or not a Bearer header.
     """
-    header = request.headers.get("Authorization", "")
+    header = connection.headers.get("Authorization", "")
     scheme, _, credentials = header.partition(" ")
     if scheme.lower() != "bearer" or not credentials.strip():
         return None
     return credentials.strip()
+
+
+def subprotocol_token(connection: HTTPConnection) -> str | None:
+    """
+    Extract a session token from the requested WebSocket subprotocols.
+
+    Args:
+        connection: The pending handshake.
+
+    Returns:
+        The token, or None when no subprotocol carries one.
+    """
+    header = connection.headers.get("sec-websocket-protocol", "")
+    for entry in (part.strip() for part in header.split(",")):
+        if entry.startswith(WS_TOKEN_PREFIX):
+            return entry[len(WS_TOKEN_PREFIX) :] or None
+    return None
+
+
+def record_auth_failure(client_ip: str, resource: str, source: str) -> None:
+    """
+    Count and audit one rejected credential, whatever channel it arrived on.
+
+    This is the only place that increments the lockout counter for a bad
+    credential. A cookie, a ``Bearer`` header on any endpoint and a WebSocket
+    handshake all land here, so an attacker cannot reset the count by changing
+    endpoint or by moving from HTTP to ``/ws``.
+
+    Args:
+        client_ip: Address the credential came from.
+        resource: Path that was being reached.
+        source: Channel the credential arrived on, for the audit record.
+    """
+    protection = get_brute_force_protection()
+    if protection is not None:
+        protection.record_failure(client_ip)
+
+    audit = get_audit_logger()
+    if audit is not None:
+        audit.record(
+            action="auth.credential",
+            result="denied",
+            client_ip=client_ip,
+            resource=resource,
+            detail=f"invalid credential presented via {source}",
+        )
+
+
+def check_credential(credential: str, client_ip: str) -> dict[str, Any] | None:
+    """
+    Verify one credential without recording anything.
+
+    Args:
+        credential: A session token or the master token.
+        client_ip: Address presenting it.
+
+    Returns:
+        The session payload, or None when the credential is not valid.
+    """
+    manager = get_global_token_manager()
+    if manager is None or not credential:
+        return None
+
+    payload = manager.verify_session_token(credential, client_ip)
+    if payload is not None:
+        return payload
+
+    if manager.verify_master_token(credential):
+        return {"type": "master", "sid": "master", "ip": client_ip}
+
+    return None
+
+
+def verify_credential(
+    credential: str, client_ip: str, *, resource: str, source: str
+) -> dict[str, Any] | None:
+    """
+    Verify one credential, counting the failure when it does not match.
+
+    Args:
+        credential: A session token or the master token.
+        client_ip: Address presenting it.
+        resource: Path being reached, for the audit record.
+        source: Channel the credential arrived on.
+
+    Returns:
+        The session payload, or None when the credential is not valid.
+    """
+    payload = check_credential(credential, client_ip)
+    if payload is None:
+        record_auth_failure(client_ip, resource, source)
+    return payload
+
+
+def authenticate_connection(
+    connection: HTTPConnection, ticket: str | None = None
+) -> dict[str, Any] | None:
+    """
+    Authenticate a WebSocket handshake from every credential it may carry.
+
+    Order: session cookie, ``wasm.token.<token>`` subprotocol, ``Authorization:
+    Bearer``, then a single-use ticket from ``POST /api/auth/ws-ticket``. A
+    handshake that presents nothing usable counts as exactly one failure, not
+    one per channel tried.
+
+    Args:
+        connection: The pending handshake.
+        ticket: Single-use ticket from the query string, if any.
+
+    Returns:
+        The session payload, or None when the handshake is not authenticated.
+    """
+    manager = get_global_token_manager()
+    if manager is None:
+        return None
+
+    config = get_security_config()
+    client_ip = get_client_ip(connection, config)
+    resource = connection.scope.get("path", "")
+
+    candidates = (
+        connection.cookies.get(SESSION_COOKIE_NAME),
+        subprotocol_token(connection),
+        bearer_token(connection),
+    )
+    for credential in candidates:
+        if not credential:
+            continue
+        payload = check_credential(credential, client_ip)
+        if payload is not None:
+            return payload
+
+    if ticket:
+        payload = manager.consume_ws_ticket(ticket, client_ip)
+        if payload is not None:
+            return payload
+
+    record_auth_failure(client_ip, resource, "websocket")
+    return None
 
 
 def _check_csrf(request: Request, payload: dict[str, Any], client_ip: str) -> None:
@@ -1423,6 +1884,10 @@ async def require_auth(request: Request) -> dict[str, Any]:
     master token (for the CLI), or the session cookie. Cookie authentication
     additionally requires the CSRF header on every unsafe method.
 
+    Whichever channel is used, a credential that does not match is counted by
+    :func:`record_auth_failure`, so the lockout applies to master token guessing
+    on any endpoint and not only to ``/api/auth/login``.
+
     Args:
         request: The incoming request.
 
@@ -1442,29 +1907,26 @@ async def require_auth(request: Request) -> dict[str, Any]:
 
     config = get_security_config()
     client_ip = get_client_ip(request, config)
+    resource = request.url.path
 
-    bearer = _bearer_token(request)
+    bearer = bearer_token(request)
     if bearer:
-        payload = manager.verify_session_token(bearer, client_ip)
-        if payload:
-            request.state.session = payload
-            return payload
-        if manager.verify_master_token(bearer):
-            payload = {"type": "master", "sid": "master", "ip": client_ip}
-            request.state.session = payload
-            return payload
-        raise _unauthorized("Invalid or expired authentication token")
+        payload = verify_credential(bearer, client_ip, resource=resource, source="bearer")
+        if payload is None:
+            raise _unauthorized("Invalid or expired authentication token")
+        request.state.session = payload
+        return payload
 
     cookie = request.cookies.get(SESSION_COOKIE_NAME)
     if cookie:
-        payload = manager.verify_session_token(cookie, client_ip)
-        if payload:
-            _check_csrf(request, payload, client_ip)
-            request.state.session = payload
-            renewed = manager.renew_session(payload)
-            if renewed is not None:
-                request.state.renewed_session = renewed
-            return payload
-        raise _unauthorized("Session expired or revoked. Please log in again.")
+        payload = verify_credential(cookie, client_ip, resource=resource, source="cookie")
+        if payload is None:
+            raise _unauthorized("Session expired or revoked. Please log in again.")
+        _check_csrf(request, payload, client_ip)
+        request.state.session = payload
+        renewed = manager.renew_session(payload)
+        if renewed is not None:
+            request.state.renewed_session = renewed
+        return payload
 
     raise _unauthorized("Not authenticated")

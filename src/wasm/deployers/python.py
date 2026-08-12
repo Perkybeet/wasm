@@ -5,7 +5,9 @@ Python deployer for WASM.
 import os
 import re
 from pathlib import Path
+from typing import ClassVar
 
+from wasm.core.runner import CommandRunner
 from wasm.deployers.base import BaseDeployer
 from wasm.deployers.registry import DeployerRegistry
 
@@ -21,7 +23,7 @@ class PythonDeployer(BaseDeployer):
     APP_TYPE = "python"
     DISPLAY_NAME = "Python (Django/Flask/FastAPI)"
 
-    DETECTION_FILES = [
+    DETECTION_FILES: ClassVar[list[str]] = [
         "requirements.txt",
         "pyproject.toml",
         "setup.py",
@@ -30,17 +32,27 @@ class PythonDeployer(BaseDeployer):
 
     DEFAULT_PORT = 8000
 
-    SYSTEM_DEPS = ["python3", "pip3"]
+    # See DEFAULT_DETECTION_PRIORITY in interface.py for the full order.
+    DETECTION_PRIORITY = 50
 
-    def __init__(self, verbose: bool = False):
-        """Initialize Python deployer."""
-        super().__init__(verbose=verbose)
+    SYSTEM_DEPS: ClassVar[list[str]] = ["python3", "pip3"]
+
+    def __init__(self, verbose: bool = False, runner: CommandRunner | None = None):
+        """
+        Initialize the Python deployer.
+
+        Args:
+            verbose: Enable verbose logging.
+            runner: Command runner used for installs and builds. Defaults to the
+                process-wide runner.
+        """
+        super().__init__(verbose=verbose, runner=runner)
         self.framework = "generic"
-        self.wsgi_app = None
-        self.asgi_app = None
+        self.wsgi_app: str | None = None
+        self.asgi_app: str | None = None
         self.use_poetry = False
         self.use_pipenv = False
-        self.venv_path = None
+        self.venv_path: Path = Path()
 
     def detect(self, path: Path) -> bool:
         """Detect if path contains a Python project."""
@@ -72,7 +84,7 @@ class PythonDeployer(BaseDeployer):
 
         return "generic"
 
-    def _detect_app_module(self) -> tuple:
+    def _detect_app_module(self) -> tuple[str | None, str | None]:
         """Detect the WSGI/ASGI application module."""
         wsgi_app = None
         asgi_app = None
@@ -80,8 +92,8 @@ class PythonDeployer(BaseDeployer):
         # Check for common patterns
         if self.framework == "django":
             # Look for wsgi.py or asgi.py
-            for root, dirs, files in os.walk(self.app_path):
-                root = Path(root)
+            for raw_root, _dirs, files in os.walk(self.app_path):
+                root = Path(raw_root)
                 if "wsgi.py" in files:
                     # Get module path
                     rel_path = root.relative_to(self.app_path)
@@ -119,8 +131,17 @@ class PythonDeployer(BaseDeployer):
 
         return wsgi_app, asgi_app
 
-    def _detect_package_manager(self) -> tuple:
-        """Detect Python package manager."""
+    def _detect_python_package_manager(self) -> tuple[bool, bool]:
+        """
+        Detect which Python dependency manager the project uses.
+
+        Renamed from _detect_package_manager, which overrode a base method of
+        the same name that returns the *Node* package manager as a string. The
+        base class called it during pre_install and got a tuple back.
+
+        Returns:
+            Tuple of (uses_poetry, uses_pipenv).
+        """
         use_poetry = (self.app_path / "poetry.lock").exists()
         use_pipenv = (self.app_path / "Pipfile.lock").exists()
         return use_poetry, use_pipenv
@@ -162,7 +183,7 @@ class PythonDeployer(BaseDeployer):
     def pre_install(self) -> bool:
         """Pre-installation hook - create virtual environment."""
         self.framework = self._detect_framework()
-        self.use_poetry, self.use_pipenv = self._detect_package_manager()
+        self.use_poetry, self.use_pipenv = self._detect_python_package_manager()
 
         self.logger.debug(f"Framework: {self.framework}")
         self.logger.debug(f"Poetry: {self.use_poetry}, Pipenv: {self.use_pipenv}")
@@ -197,7 +218,7 @@ class PythonDeployer(BaseDeployer):
             packages.append("uvicorn")
 
         self.logger.substep("Installing gunicorn...")
-        result = self._run([str(venv_pip), "install"] + packages)
+        result = self._run([str(venv_pip), "install", *packages])
         if not result.success:
             self.logger.warning("Failed to install gunicorn")
 

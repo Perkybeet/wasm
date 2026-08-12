@@ -8,14 +8,24 @@ Environment variable manager for WASM.
 Handles discovering, prompting, and writing environment variables
 for deployed applications, with support for .env.example parsing,
 secret auto-generation, and interactive configuration.
+
+Everything this module writes holds credentials: a deployed ``.env`` carries
+``DATABASE_URL``, API keys and the secrets generated here, and
+``.wasm/env-config.json`` records the same inventory. Both go out through
+:func:`~wasm.core.config.secure_write`, which creates them 0600 in a single
+``os.open`` and refuses to follow a symlink. The application directory itself is
+left alone: it is served by the web server and read by the service account, so
+tightening it would break the deployment while doing nothing for the secrets,
+which are protected by the file mode.
 """
 
 import json
 import secrets
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
+from wasm.core.config import secure_write
 from wasm.core.exceptions import WASMError
 from wasm.core.logger import Logger
 
@@ -83,7 +93,7 @@ class EnvManager:
     """
 
     # Category detection by prefix
-    CATEGORY_PREFIXES = {
+    CATEGORY_PREFIXES: ClassVar[dict[str, str]] = {
         "DATABASE": "Database",
         "DB_": "Database",
         "POSTGRES": "Database",
@@ -115,7 +125,7 @@ class EnvManager:
     }
 
     # Secret detection patterns
-    SECRET_PATTERNS = [
+    SECRET_PATTERNS: ClassVar[list[str]] = [
         "PASSWORD",
         "_PASS",
         "SECRET",
@@ -194,7 +204,7 @@ class EnvManager:
         Returns:
             List of parsed environment variables.
         """
-        variables = []
+        variables: list[EnvVariable] = []
         current_description = ""
 
         try:
@@ -430,36 +440,44 @@ class EnvManager:
 
     def _write_single_env_file(self, path: Path, values: dict[str, str]) -> None:
         """
-        Write a single .env file.
+        Write a single .env file, readable by its owner only.
 
         Values are not quoted for systemd compatibility.
 
         Args:
             path: Path to write the .env file.
             values: Variable name -> value mapping.
+
+        Raises:
+            SecurityError: If the destination is a symlink.
+            OSError: If the file cannot be created or written.
         """
-        path.parent.mkdir(parents=True, exist_ok=True)
         lines = []
         for key, value in sorted(values.items()):
             # Don't quote values for systemd compatibility
             lines.append(f"{key}={value}")
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        secure_write(path, "\n".join(lines) + "\n", secure_parent=False)
         self.logger.debug(f"Wrote env file: {path}")
 
     def save_config(self, app_path: Path, config: EnvConfig) -> None:
         """
         Persist environment configuration to .wasm/env-config.json.
 
+        The file records the variable inventory, defaults included, so it is
+        written 0600 inside a 0700 directory. Nothing but WASM reads ``.wasm``,
+        so tightening that directory costs the deployment nothing.
+
         Args:
             app_path: Application root path.
             config: Environment configuration to save.
+
+        Raises:
+            SecurityError: If the destination is a symlink.
+            OSError: If the file cannot be created or written.
         """
-        wasm_dir = app_path / ".wasm"
-        wasm_dir.mkdir(parents=True, exist_ok=True)
-        config_file = wasm_dir / "env-config.json"
-        config_file.write_text(
+        secure_write(
+            app_path / ".wasm" / "env-config.json",
             json.dumps(config.to_dict(), indent=2),
-            encoding="utf-8",
         )
 
     def load_config(self, app_path: Path) -> EnvConfig | None:
@@ -511,7 +529,7 @@ class EnvManager:
         Returns:
             Dictionary of current environment variable values.
         """
-        values = {}
+        values: dict[str, str] = {}
         env_file = app_path / ".env"
         if not env_file.exists():
             return values

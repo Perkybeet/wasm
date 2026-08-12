@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
+from argparse import ArgumentParser, Namespace
 from pathlib import Path
 
 import pytest
@@ -19,6 +21,7 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from wasm.cli.commands.web import add_start_arguments, build_security_config
 from wasm.core.exceptions import SecurityError
 from wasm.web import auth as auth_module
 from wasm.web.auth import (
@@ -32,6 +35,14 @@ from wasm.web.server import create_app, get_token_manager
 
 #: Endpoints that answer without credentials, on purpose.
 PUBLIC_API_PATHS = frozenset({"/api/auth/login"})
+
+#: The bind address an operator reaches for when they want the panel "on the
+#: network". Every test that uses it expects a refusal or an explicit guard.
+ALL_INTERFACES = "0.0.0.0"  # noqa: S104 - the address under test, not a bind
+
+#: Every path of the panel that is public, including the pages a browser needs
+#: before it has a session. Anything not listed here has to demand credentials.
+PUBLIC_PATHS = frozenset({"/", "/login", "/health", "/api/auth/login"})
 
 
 def make_config(sandbox: Path, **overrides) -> SecurityConfig:
@@ -173,6 +184,8 @@ def test_ip_whitelist_cannot_be_bypassed_with_headers(sandbox: Path) -> None:
     ):
         response = client.get("/health", headers=headers)
         assert response.status_code == 403, f"{headers} got through: {response.text}"
+        # A refusal is still a response the browser renders: harden it too.
+        assert "default-src 'self'" in response.headers["Content-Security-Policy"]
 
 
 def test_ip_whitelist_allows_the_real_peer(sandbox: Path) -> None:
@@ -266,12 +279,18 @@ def test_secret_and_sessions_survive_a_restart(sandbox: Path) -> None:
     secret_file = config.secret_file
     secret = secret_file.read_text()
     session = first.create_session("10.0.0.1")
-    first.sessions.close()
 
     second = TokenManager(make_config(sandbox))
     assert secret_file.read_text() == secret
     assert second.verify_session_token(session.token, "10.0.0.1") is not None
+
+    # The token the restarted process issues must verify under the key the
+    # first one loaded: comparing the file alone would pass even if the key
+    # in memory had been replaced.
+    reissued = second.create_session("10.0.0.1")
+    assert first.verify_session_token(reissued.token, "10.0.0.1") is not None
     second.sessions.close()
+    first.sessions.close()
 
     assert secret_file.stat().st_mode & 0o777 == 0o600
 
@@ -300,6 +319,33 @@ def test_expired_sessions_are_purged(sandbox: Path) -> None:
     manager.sessions.close()
 
 
+def iter_routes(routes: list, prefix: str = "") -> list[tuple[str, object]]:
+    """
+    Collect every route of an application, including nested routers.
+
+    Args:
+        routes: Routes of an application or router.
+        prefix: Path prefix accumulated so far.
+
+    Returns:
+        Pairs of full path and route, for HTTP and WebSocket routes alike.
+    """
+    collected: list[tuple[str, object]] = []
+    for route in routes:
+        # FastAPI keeps included routers as an opaque node instead of flattening.
+        context = getattr(route, "include_context", None)
+        if context is not None:
+            collected.extend(iter_routes(context.included_router.routes, prefix + context.prefix))
+            continue
+        path = getattr(route, "path", None)
+        if path is not None and not hasattr(route, "routes"):
+            collected.append((prefix + path, route))
+            continue
+        if hasattr(route, "routes"):
+            collected.extend(iter_routes(route.routes, prefix))
+    return collected
+
+
 def iter_api_routes(routes: list, prefix: str = "") -> list[tuple[str, APIRoute]]:
     """
     Collect every API route, including the ones nested in included routers.
@@ -311,20 +357,9 @@ def iter_api_routes(routes: list, prefix: str = "") -> list[tuple[str, APIRoute]
     Returns:
         Pairs of full path and route.
     """
-    collected: list[tuple[str, APIRoute]] = []
-    for route in routes:
-        if isinstance(route, APIRoute):
-            collected.append((prefix + route.path, route))
-            continue
-        # FastAPI keeps included routers as an opaque node instead of flattening.
-        context = getattr(route, "include_context", None)
-        if context is not None:
-            collected.extend(
-                iter_api_routes(context.included_router.routes, prefix + context.prefix)
-            )
-        elif hasattr(route, "routes"):
-            collected.extend(iter_api_routes(route.routes, prefix))
-    return collected
+    return [
+        (path, route) for path, route in iter_routes(routes, prefix) if isinstance(route, APIRoute)
+    ]
 
 
 def test_every_api_route_requires_authentication(sandbox: Path) -> None:
@@ -516,6 +551,270 @@ def test_session_is_rejected_from_a_different_address(sandbox: Path) -> None:
     assert manager.verify_session_token(session.token, "10.0.0.1") is not None
     assert manager.verify_session_token(session.token, "10.0.0.2") is None
     manager.sessions.close()
+
+
+def test_bearer_guesses_across_endpoints_trigger_the_lockout(sandbox: Path) -> None:
+    """Changing endpoint must not reset the counter the way changing IP cannot."""
+    client = build_client(sandbox, max_failed_attempts=3, lockout_duration=60)
+    endpoints = [
+        "/api/auth/verify",
+        "/api/auth/sessions",
+        "/api/system/info",
+        "/api/auth/verify",
+        "/api/auth/sessions",
+        "/api/auth/verify",
+    ]
+
+    statuses = [
+        client.get(endpoint, headers={"Authorization": f"Bearer wasm_guess{index}"}).status_code
+        for index, endpoint in enumerate(endpoints)
+    ]
+
+    assert statuses[0] == 401, statuses
+    assert 429 in statuses, f"master token guessing was never locked out: {statuses}"
+    assert statuses[-1] == 429
+
+
+def test_bearer_failures_are_audited(sandbox: Path) -> None:
+    """A failed Bearer credential leaves a trace, like a failed login does."""
+    client = build_client(sandbox, max_failed_attempts=100)
+
+    client.get("/api/auth/verify", headers={"Authorization": "Bearer wasm_not_a_real_token"})
+
+    failures = [entry for entry in read_audit(sandbox) if entry["result"] == "denied"]
+    assert failures, "a rejected credential must be auditable"
+    assert all("wasm_not_a_real_token" not in json.dumps(entry) for entry in failures)
+
+
+def test_a_forwarded_header_that_is_not_an_ip_is_ignored(sandbox: Path) -> None:
+    """A trusted proxy cannot make an arbitrary string the rate limit key."""
+    client = build_client(
+        sandbox,
+        client_host="10.9.9.1",
+        trusted_proxies=["10.9.9.1"],
+        max_failed_attempts=3,
+        lockout_duration=60,
+    )
+
+    statuses = [
+        client.post(
+            "/api/auth/login",
+            json={"token": "wrong"},
+            headers={"X-Forwarded-For": f"not-an-ip-{attempt}"},
+        ).status_code
+        for attempt in range(8)
+    ]
+
+    assert statuses[-1] == 429, statuses
+
+
+def test_a_real_ip_header_that_is_not_an_ip_is_ignored(sandbox: Path) -> None:
+    """The same rule applies to X-Real-IP."""
+    client = build_client(
+        sandbox,
+        client_host="10.9.9.1",
+        trusted_proxies=["10.9.9.1"],
+        max_failed_attempts=3,
+        lockout_duration=60,
+    )
+
+    statuses = [
+        client.post(
+            "/api/auth/login",
+            json={"token": "wrong"},
+            headers={"X-Real-IP": f"host{attempt}.example.com"},
+        ).status_code
+        for attempt in range(8)
+    ]
+
+    assert statuses[-1] == 429, statuses
+
+
+def test_session_has_an_absolute_maximum_lifetime(sandbox: Path) -> None:
+    """A continuously used session must still die of old age."""
+    manager = TokenManager(make_config(sandbox, token_expiration_hours=12, session_max_hours=24))
+    session = manager.create_session("10.0.0.1")
+
+    assert manager.verify_session_token(session.token, "10.0.0.1") is not None
+
+    db = sqlite3.connect(sandbox / "state" / "web-sessions.db")
+    with db:
+        db.execute("UPDATE sessions SET created_at = created_at - 90000")
+    db.close()
+
+    assert manager.renew_session({"sid": session.session_id}) is None
+    assert manager.verify_session_token(session.token, "10.0.0.1") is None
+    manager.sessions.close()
+
+
+def test_renewal_rotates_the_session_identifier(sandbox: Path) -> None:
+    """Re-issuing a session must not keep the same sid and CSRF token forever."""
+    manager = TokenManager(make_config(sandbox, token_expiration_hours=1))
+    session = manager.create_session("10.0.0.1")
+
+    db = sqlite3.connect(sandbox / "state" / "web-sessions.db")
+    with db:
+        db.execute("UPDATE sessions SET issued_at = issued_at - 3500")
+    db.close()
+
+    renewed = manager.renew_session({"sid": session.session_id})
+    assert renewed is not None
+    assert renewed.session_id != session.session_id
+    assert renewed.csrf_token != session.csrf_token
+    assert manager.verify_session_token(renewed.token, "10.0.0.1") is not None
+
+    # The replaced identifier survives only long enough for the requests the
+    # dashboard already had in flight, so a captured copy is worthless.
+    retired = manager.sessions.get(session.session_id)
+    assert retired is not None
+    assert retired["expires_at"] <= time.time() + auth_module.SESSION_ROTATION_GRACE + 1
+
+    manager.sessions.extend(session.session_id, 0.0)
+    assert manager.verify_session_token(session.token, "10.0.0.1") is None
+    manager.sessions.close()
+
+
+def test_no_route_escapes_authentication(sandbox: Path) -> None:
+    """Walk every route, HTTP and WebSocket, and probe it anonymously."""
+    app = create_app(make_config(sandbox, max_failed_attempts=10_000))
+    client = TestClient(app, client=("testclient", 50000))
+
+    inventory = iter_routes(app.routes) + iter_routes(app.router.routes)
+    paths = {path for path, _ in inventory}
+    assert "/ws/system" in paths, "route discovery missed the websocket surface"
+
+    reachable: list[str] = []
+    for path, route in inventory:
+        if path in PUBLIC_PATHS:
+            continue
+        url = path.replace("{", "").replace("}", "")
+        if route.__class__.__name__.endswith("WebSocketRoute"):
+            try:
+                with client.websocket_connect(url):
+                    reachable.append(f"WS {path}")
+            except WebSocketDisconnect:
+                continue
+            continue
+        for method in sorted(getattr(route, "methods", set()) or {"GET"}):
+            if method in ("HEAD", "OPTIONS"):
+                continue
+            response = client.request(method, url, json={})
+            if response.status_code not in (401, 403):
+                reachable.append(f"{method} {path} -> {response.status_code}")
+
+    assert not reachable, f"routes reachable without credentials: {reachable}"
+
+
+def test_cors_preflight_is_subject_to_the_ip_whitelist(sandbox: Path) -> None:
+    """CORS must live inside the security middleware, not in front of it."""
+    client = build_client(
+        sandbox,
+        ip_whitelist=["10.0.0.5"],
+        enable_cors=True,
+        cors_origins=["https://panel.example.com"],
+    )
+
+    response = client.options(
+        "/api/auth/verify",
+        headers={
+            "Origin": "https://panel.example.com",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+
+    assert response.status_code == 403, response.text
+    assert "access-control-allow-origin" not in {k.lower() for k in response.headers}
+
+
+def test_an_empty_secret_file_is_not_silently_replaced(sandbox: Path) -> None:
+    """A truncated key file must abort startup instead of logging everyone out."""
+    config = make_config(sandbox)
+    manager = TokenManager(config)
+    session = manager.create_session("10.0.0.1")
+    manager.sessions.close()
+
+    config.secret_file.write_text("")
+
+    with pytest.raises(SecurityError) as excinfo:
+        TokenManager(make_config(sandbox))
+
+    assert excinfo.value.details
+    # And the sessions the key protects are still there to be recovered.
+    assert session.token
+
+
+def parse_start_args(argv: list[str]) -> Namespace:
+    """
+    Parse ``wasm web start`` arguments with the options the handler expects.
+
+    Args:
+        argv: Command line arguments after ``web start``.
+
+    Returns:
+        The parsed namespace.
+    """
+    parser = ArgumentParser(prog="wasm web start")
+    add_start_arguments(parser)
+    return parser.parse_args(argv)
+
+
+def test_binding_to_every_interface_without_protection_is_an_error() -> None:
+    """A root panel is not put on the network by a flag and a warning."""
+    with pytest.raises(SecurityError) as excinfo:
+        build_security_config(parse_start_args(["--host", ALL_INTERFACES]))
+
+    assert "--allow-ip" in excinfo.value.details
+    assert "--require-https" in excinfo.value.details
+
+
+def test_binding_to_every_interface_is_allowed_with_a_whitelist() -> None:
+    """Restricting who may connect is one of the ways to justify the exposure."""
+    config = build_security_config(
+        parse_start_args(
+            ["--host", ALL_INTERFACES, "--allow-ip", "10.0.0.0/24", "--allow-ip", "10.1.0.1"]
+        )
+    )
+
+    assert config.ip_whitelist == ["10.0.0.0/24", "10.1.0.1"]
+
+
+def test_require_https_without_material_is_an_error() -> None:
+    """Asking for TLS without a certificate must fail before the port is bound."""
+    with pytest.raises(SecurityError) as excinfo:
+        build_security_config(parse_start_args(["--host", ALL_INTERFACES, "--require-https"]))
+
+    assert "--tls-cert" in excinfo.value.details
+
+
+def test_loopback_is_the_default_and_needs_nothing() -> None:
+    """The safe default stays usable with no flags at all."""
+    config = build_security_config(parse_start_args([]))
+
+    assert config.host == "127.0.0.1"
+    assert config.require_https is False
+    assert config.trusted_proxies == []
+
+
+def test_declaring_a_tls_proxy_makes_the_cookie_secure(sandbox: Path) -> None:
+    """The nginx-in-front deployment issues a Secure cookie once declared."""
+    config = build_security_config(parse_start_args(["--trusted-proxy", "10.9.9.1"]))
+    config.state_dir = sandbox / "state"
+    app = create_app(config)
+    client = TestClient(app, client=("10.9.9.1", 50000))
+    token = get_token_manager().generate_master_token()
+
+    response = client.post(
+        "/api/auth/login",
+        json={"token": token},
+        headers={"X-Forwarded-Proto": "https", "X-Forwarded-For": "203.0.113.7"},
+    )
+
+    cookie_header = next(
+        value
+        for key, value in response.headers.multi_items()
+        if key.lower() == "set-cookie" and value.startswith(f"{SESSION_COOKIE_NAME}=")
+    )
+    assert "Secure" in cookie_header
 
 
 def test_rate_limiter_does_not_grow_without_bound() -> None:

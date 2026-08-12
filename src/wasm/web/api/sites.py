@@ -1,29 +1,70 @@
 """
 Sites API endpoints.
 
-Provides endpoints for managing web server sites (nginx/apache).
+This module is a client of :class:`~wasm.managers.webserver.WebServerManager`,
+through its nginx and apache bindings. It used to be a second implementation of
+them, and the two had already diverged in production in the worst possible way:
+the API wrote its virtual host to ``sites-available/example_com`` while every
+manager, the CLI and the store use ``sites-available/example.com``. A site
+created from the panel was therefore invisible to ``wasm site list``, could not
+be enabled, disabled or deleted from the CLI, and was skipped by certificate
+issuance. The file name is now produced by exactly one piece of code -
+:meth:`~wasm.managers.webserver.WebServerManager.config_path` - and the panel
+never renders a server block itself.
+
+Two further rules, the same ones the services API follows:
+
+- **Every domain is validated before it becomes a path.** The manager's
+  ``config_path`` is the single place a domain turns into a file name, and it
+  validates and contains it; :func:`wasm.web.api.deps.strict_domain` refuses at
+  the edge anything that would only survive by being rewritten.
+- **Handlers are synchronous.** They call nginx, apache2ctl and systemctl,
+  which block. Declared ``async def`` they would run on the event loop and
+  freeze the panel for every other client; declared ``def``, FastAPI runs them
+  in the threadpool.
 """
 
-import subprocess
-from pathlib import Path
+from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from typing import Annotated
 
-from wasm.core.config import (
-    APACHE_SITES_AVAILABLE,
-    APACHE_SITES_ENABLED,
-    NGINX_SITES_AVAILABLE,
-    NGINX_SITES_ENABLED,
-)
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
+
+from wasm.core.exceptions import SiteError, ValidationError
 from wasm.core.store import get_store
+from wasm.managers.apache_manager import ApacheManager
+from wasm.managers.nginx_manager import NginxManager
+from wasm.managers.webserver import WebServerManager
 from wasm.web.api.auth import get_current_session
+from wasm.web.api.deps import WASMErrorRoute, strict_domain
 
-router = APIRouter()
+router = APIRouter(route_class=WASMErrorRoute)
+
+#: Web server used when none is installed and none was requested.
+DEFAULT_WEBSERVER = "nginx"
+
+#: Manager class per web server name. This is the allowlist for the
+#: ``webserver`` field: anything not in it is a client error, not a fallback.
+#: Typed as the concrete classes because both expose their configuration
+#: directory as a class attribute, which detection reads without building one.
+MANAGERS: dict[str, type[NginxManager] | type[ApacheManager]] = {
+    "nginx": NginxManager,
+    "apache": ApacheManager,
+}
 
 
 class SiteInfo(BaseModel):
-    """Site information."""
+    """
+    A configured virtual host.
+
+    Attributes:
+        name: The domain, which is also the configuration file name.
+        webserver: Web server serving it.
+        enabled: Whether the site is enabled.
+        config_path: Absolute path of the configuration file.
+        has_ssl: Whether the configuration carries TLS directives.
+    """
 
     name: str
     webserver: str
@@ -48,112 +89,247 @@ class SiteActionResponse(BaseModel):
     site: str
 
 
+class SiteConfigResponse(BaseModel):
+    """Response carrying the raw configuration of a site."""
+
+    site: str
+    webserver: str
+    config: str
+    path: str
+
+
+class ReloadResponse(BaseModel):
+    """Response for a web server reload."""
+
+    success: bool
+    message: str
+    webserver: str
+
+
 class CreateSiteRequest(BaseModel):
-    """Request to create a new site."""
+    """
+    Request to create a site.
+
+    Attributes:
+        domain: Domain to serve. It is also the configuration file name.
+        webserver: Web server to configure, detected when omitted.
+        template: Manager template to render.
+        port: Upstream port for the proxy template.
+        ssl: Render the template with TLS directives.
+        enable: Enable the site once written.
+    """
 
     domain: str
-    webserver: str = "nginx"
-    template: str = "proxy"  # proxy or static
-    port: int = 3000
-    raw_config: str | None = None  # Raw config content for advanced mode
+    webserver: str | None = None
+    template: str = "proxy"
+    port: int = Field(default=3000, ge=1, le=65535)
+    ssl: bool = False
+    enable: bool = True
 
 
-def _detect_webserver() -> str:
-    """Detect which webserver is installed and active."""
-    try:
-        result = subprocess.run(["systemctl", "is-active", "nginx"], capture_output=True, text=True)
-        if result.returncode == 0:
-            return "nginx"
-    except Exception:
-        pass
+class UpdateSiteConfigRequest(BaseModel):
+    """Request to replace the raw configuration of a site."""
 
-    try:
-        result = subprocess.run(
-            ["systemctl", "is-active", "apache2"], capture_output=True, text=True
+    config: str
+
+
+def detect_webserver() -> str:
+    """
+    Work out which web server this host uses.
+
+    Returns:
+        ``nginx`` or ``apache``. Nginx is the answer when neither is installed,
+        because it is what a fresh deployment will configure.
+    """
+    for name, manager_class in MANAGERS.items():
+        if manager_class(verbose=False).is_installed():
+            return name
+
+    for name, manager_class in MANAGERS.items():
+        if manager_class.SITES_AVAILABLE.exists():
+            return name
+
+    return DEFAULT_WEBSERVER
+
+
+def _manager_for(webserver: str | None) -> tuple[str, WebServerManager]:
+    """
+    Resolve a web server name to its manager.
+
+    Args:
+        webserver: Requested web server, or None to detect one.
+
+    Returns:
+        Tuple of the resolved name and its manager.
+
+    Raises:
+        ValidationError: When the name is not a web server WASM supports.
+    """
+    name = (webserver or detect_webserver()).lower()
+    manager_class = MANAGERS.get(name)
+    if manager_class is None:
+        raise ValidationError(
+            f"Unknown web server: {webserver!r}",
+            details=f"Use one of: {', '.join(sorted(MANAGERS))}.",
         )
-        if result.returncode == 0:
-            return "apache"
-    except Exception:
-        pass
-
-    # Check if config directories exist
-    if NGINX_SITES_AVAILABLE.exists():
-        return "nginx"
-    if APACHE_SITES_AVAILABLE.exists():
-        return "apache"
-
-    return "nginx"  # Default
+    return name, manager_class(verbose=False)
 
 
-def _check_ssl_in_config(config_path: Path) -> bool:
-    """Check if a site config has SSL enabled."""
-    try:
-        content = config_path.read_text()
-        return "ssl_certificate" in content or "SSLCertificateFile" in content
-    except Exception:
-        return False
+def _has_ssl(config: str) -> bool:
+    """
+    Report whether a rendered configuration serves TLS.
+
+    Args:
+        config: The configuration file content.
+
+    Returns:
+        True when it carries a certificate directive.
+    """
+    return "ssl_certificate" in config or "SSLCertificateFile" in config
 
 
 @router.get("", response_model=SiteListResponse)
-async def list_sites(request: Request, session: dict = Depends(get_current_session)):
+def list_sites(session: Annotated[dict, Depends(get_current_session)]) -> SiteListResponse:
     """
-    List all configured sites.
+    List every configured site.
+
+    Args:
+        session: The authenticated session.
+
+    Returns:
+        The sites known to the store, falling back to what the manager finds on
+        disk when the store has no record of them.
     """
-    store = get_store()
-    webserver = _detect_webserver()
+    webserver, manager = _manager_for(None)
 
-    # Get sites from store
-    stored_sites = store.list_sites()
-
-    sites = []
-    for site in stored_sites:
-        sites.append(
-            SiteInfo(
-                name=site.domain,
-                webserver=site.webserver,
-                enabled=site.enabled,
-                config_path=site.config_path or "",
-                has_ssl=site.ssl_enabled,
-            )
+    sites = [
+        SiteInfo(
+            name=site.domain,
+            webserver=site.webserver,
+            enabled=site.enabled,
+            config_path=site.config_path or "",
+            has_ssl=site.ssl_enabled,
         )
+        for site in get_store().list_sites()
+    ]
 
-    # Fallback to filesystem if store is empty (for backwards compatibility)
     if not sites:
-        if webserver == "nginx":
-            available_dir = NGINX_SITES_AVAILABLE
-            enabled_dir = NGINX_SITES_ENABLED
-        else:
-            available_dir = APACHE_SITES_AVAILABLE
-            enabled_dir = APACHE_SITES_ENABLED
-
-        if available_dir.exists():
-            for config_file in available_dir.iterdir():
-                if config_file.is_file() and not config_file.name.startswith("."):
-                    enabled_link = enabled_dir / config_file.name
-                    sites.append(
-                        SiteInfo(
-                            name=config_file.name,
-                            webserver=webserver,
-                            enabled=enabled_link.exists(),
-                            config_path=str(config_file),
-                            has_ssl=_check_ssl_in_config(config_file),
-                        )
-                    )
+        sites = [
+            SiteInfo(
+                name=entry.domain,
+                webserver=entry.webserver,
+                enabled=entry.enabled,
+                config_path=entry.config_path,
+                has_ssl=_has_ssl(manager.get_site_config(entry.domain) or ""),
+            )
+            for entry in manager.list_sites()
+        ]
 
     return SiteListResponse(sites=sites, total=len(sites), webserver=webserver)
 
 
-@router.get("/{name}", response_model=SiteInfo)
-async def get_site(name: str, request: Request, session: dict = Depends(get_current_session)):
+@router.post("", response_model=SiteActionResponse)
+def create_site(
+    data: CreateSiteRequest, session: Annotated[dict, Depends(get_current_session)]
+) -> SiteActionResponse:
     """
-    Get details for a specific site.
+    Create a virtual host from one of the manager's templates.
+
+    The configuration file is named by the manager, which is what the CLI, the
+    store and certificate issuance all expect.
+
+    Args:
+        data: The create request.
+        session: The authenticated session.
+
+    Returns:
+        The action outcome.
+
+    Raises:
+        HTTPException: 409 when the site already exists.
+        ValidationError: When the template is not one the backend offers.
+        DomainError: When the domain is not acceptable.
+        SiteError: When the manager cannot write the configuration.
     """
-    store = get_store()
-    webserver = _detect_webserver()
+    domain = strict_domain(data.domain)
+    webserver, manager = _manager_for(data.webserver)
 
-    # Try store first
-    site = store.get_site(name)
+    templates = manager.list_templates()
+    if data.template not in templates:
+        raise ValidationError(
+            f"Unknown template: {data.template!r}",
+            details=f"Available {webserver} templates: {', '.join(templates) or 'none'}.",
+        )
 
+    if manager.site_exists(domain):
+        raise HTTPException(status_code=409, detail=f"Site already exists: {domain}")
+
+    manager.create_site(
+        domain, template=data.template, context={"port": data.port, "ssl": data.ssl}
+    )
+
+    if data.enable:
+        manager.enable_site(domain)
+
+    return SiteActionResponse(
+        success=True,
+        message=f"Site created: {domain}. Reload {webserver} to serve it.",
+        site=domain,
+    )
+
+
+@router.post("/reload", response_model=ReloadResponse)
+def reload_webserver(session: Annotated[dict, Depends(get_current_session)]) -> ReloadResponse:
+    """
+    Test and reload the web server configuration.
+
+    Registered before ``/{domain}`` so the literal path wins: FastAPI matches
+    routes in registration order, and a parametrised route declared first would
+    swallow this one.
+
+    Args:
+        session: The authenticated session.
+
+    Returns:
+        The reload outcome.
+
+    Raises:
+        HTTPException: 400 when the configuration does not pass its own test,
+            500 when the reload itself fails.
+    """
+    webserver, manager = _manager_for(None)
+
+    if not manager.test_config():
+        raise HTTPException(
+            status_code=400,
+            detail=f"{webserver} configuration test failed; the running config was kept",
+        )
+
+    if not manager.reload():
+        raise HTTPException(status_code=500, detail=f"Failed to reload {webserver}")
+
+    return ReloadResponse(success=True, message=f"{webserver} reloaded", webserver=webserver)
+
+
+@router.get("/{domain}", response_model=SiteInfo)
+def get_site(domain: str, session: Annotated[dict, Depends(get_current_session)]) -> SiteInfo:
+    """
+    Describe one site.
+
+    Args:
+        domain: Domain of the site.
+        session: The authenticated session.
+
+    Returns:
+        The site description.
+
+    Raises:
+        HTTPException: 404 when no such site exists.
+        DomainError: When the domain is not acceptable.
+    """
+    validated = strict_domain(domain)
+
+    site = get_store().get_site(validated)
     if site:
         return SiteInfo(
             name=site.domain,
@@ -163,305 +339,178 @@ async def get_site(name: str, request: Request, session: dict = Depends(get_curr
             has_ssl=site.ssl_enabled,
         )
 
-    # Fallback to filesystem
-    if webserver == "nginx":
-        available_dir = NGINX_SITES_AVAILABLE
-        enabled_dir = NGINX_SITES_ENABLED
-    else:
-        available_dir = APACHE_SITES_AVAILABLE
-        enabled_dir = APACHE_SITES_ENABLED
-
-    config_path = available_dir / name
-
-    if not config_path.exists():
-        raise HTTPException(status_code=404, detail=f"Site not found: {name}")
-
-    enabled_link = enabled_dir / name
+    webserver, manager = _manager_for(None)
+    if not manager.site_exists(validated):
+        raise HTTPException(status_code=404, detail=f"Site not found: {validated}")
 
     return SiteInfo(
-        name=name,
+        name=validated,
         webserver=webserver,
-        enabled=enabled_link.exists(),
-        config_path=str(config_path),
-        has_ssl=_check_ssl_in_config(config_path),
+        enabled=manager.site_enabled(validated),
+        config_path=str(manager.config_path(validated)),
+        has_ssl=_has_ssl(manager.get_site_config(validated) or ""),
     )
 
 
-@router.get("/{name}/config")
-async def get_site_config(
-    name: str, request: Request, session: dict = Depends(get_current_session)
-):
+@router.get("/{domain}/config", response_model=SiteConfigResponse)
+def get_site_config(
+    domain: str, session: Annotated[dict, Depends(get_current_session)]
+) -> SiteConfigResponse:
     """
-    Get the configuration content for a site.
+    Read the raw configuration of a site.
+
+    Args:
+        domain: Domain of the site.
+        session: The authenticated session.
+
+    Returns:
+        The configuration content.
+
+    Raises:
+        HTTPException: 404 when no such site exists.
+        DomainError: When the domain is not acceptable.
     """
-    webserver = _detect_webserver()
+    validated = strict_domain(domain)
+    webserver, manager = _manager_for(None)
 
-    if webserver == "nginx":
-        available_dir = NGINX_SITES_AVAILABLE
-    else:
-        available_dir = APACHE_SITES_AVAILABLE
+    content = manager.get_site_config(validated)
+    if content is None:
+        raise HTTPException(status_code=404, detail=f"Site not found: {validated}")
 
-    config_path = available_dir / name
-
-    if not config_path.exists():
-        raise HTTPException(status_code=404, detail=f"Site not found: {name}")
-
-    try:
-        content = config_path.read_text()
-        return {"site": name, "webserver": webserver, "config": content}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error reading config: {e}")
+    return SiteConfigResponse(
+        site=validated,
+        webserver=webserver,
+        config=content,
+        path=str(manager.config_path(validated)),
+    )
 
 
-class UpdateSiteConfigRequest(BaseModel):
-    """Request to update site configuration."""
-
-    config: str
-
-
-@router.put("/{name}/config", response_model=SiteActionResponse)
-async def update_site_config(
-    name: str,
+@router.put("/{domain}/config", response_model=SiteActionResponse)
+def update_site_config(
+    domain: str,
     data: UpdateSiteConfigRequest,
-    request: Request,
-    session: dict = Depends(get_current_session),
-):
+    session: Annotated[dict, Depends(get_current_session)],
+) -> SiteActionResponse:
     """
-    Update the configuration content for a site.
+    Replace the raw configuration of a site.
+
+    The path comes from the manager, so a hand-edited configuration can only
+    ever overwrite the file that domain already owns.
+
+    Args:
+        domain: Domain of the site.
+        data: The new configuration.
+        session: The authenticated session.
+
+    Returns:
+        The action outcome.
+
+    Raises:
+        HTTPException: 404 when no such site exists.
+        SiteError: When the file cannot be written.
+        DomainError: When the domain is not acceptable.
     """
-    webserver = _detect_webserver()
+    validated = strict_domain(domain)
+    webserver, manager = _manager_for(None)
 
-    if webserver == "nginx":
-        available_dir = NGINX_SITES_AVAILABLE
-    else:
-        available_dir = APACHE_SITES_AVAILABLE
+    if not manager.site_exists(validated):
+        raise HTTPException(status_code=404, detail=f"Site not found: {validated}")
 
-    config_path = available_dir / name
-
-    if not config_path.exists():
-        raise HTTPException(status_code=404, detail=f"Site not found: {name}")
-
+    config_path = manager.config_path(validated)
     try:
-        # Write the new config
         config_path.write_text(data.config)
+    except OSError as exc:
+        raise SiteError(
+            f"Could not write the configuration for {validated}",
+            details=str(exc),
+        ) from exc
 
-        return SiteActionResponse(
-            success=True,
-            message=f"Configuration updated for {name}. Reload web server to apply changes.",
-            site=name,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error updating config: {e}")
+    return SiteActionResponse(
+        success=True,
+        message=f"Configuration updated for {validated}. Reload {webserver} to apply it.",
+        site=validated,
+    )
 
 
-@router.post("", response_model=SiteActionResponse)
-async def create_site(
-    data: CreateSiteRequest, request: Request, session: dict = Depends(get_current_session)
-):
+@router.post("/{domain}/enable", response_model=SiteActionResponse)
+def enable_site(
+    domain: str, session: Annotated[dict, Depends(get_current_session)]
+) -> SiteActionResponse:
     """
-    Create a new site configuration.
+    Enable a site and reload the web server.
+
+    Args:
+        domain: Domain of the site.
+        session: The authenticated session.
+
+    Returns:
+        The action outcome.
+
+    Raises:
+        SiteError: When the manager refuses the operation.
+        DomainError: When the domain is not acceptable.
     """
-    webserver = data.webserver if data.webserver else _detect_webserver()
+    validated = strict_domain(domain)
+    _, manager = _manager_for(None)
 
-    if webserver == "nginx":
-        available_dir = NGINX_SITES_AVAILABLE
-        enabled_dir = NGINX_SITES_ENABLED
-    else:
-        available_dir = APACHE_SITES_AVAILABLE
-        enabled_dir = APACHE_SITES_ENABLED
+    manager.enable_site(validated)
+    manager.reload()
 
-    site_name = data.domain.replace(".", "_")
-    config_path = available_dir / site_name
-
-    if config_path.exists():
-        raise HTTPException(status_code=400, detail=f"Site already exists: {data.domain}")
-
-    # Generate config based on template
-    if webserver == "nginx":
-        if data.template == "static":
-            config = f"""server {{
-    listen 80;
-    server_name {data.domain};
-    root /var/www/{data.domain};
-    index index.html index.htm;
-
-    location / {{
-        try_files $uri $uri/ =404;
-    }}
-}}"""
-        else:  # proxy
-            config = f"""server {{
-    listen 80;
-    server_name {data.domain};
-
-    location / {{
-        proxy_pass http://127.0.0.1:{data.port};
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_cache_bypass $http_upgrade;
-    }}
-}}"""
-    else:  # apache
-        if data.template == "static":
-            config = f"""<VirtualHost *:80>
-    ServerName {data.domain}
-    DocumentRoot /var/www/{data.domain}
-
-    <Directory /var/www/{data.domain}>
-        Options Indexes FollowSymLinks
-        AllowOverride All
-        Require all granted
-    </Directory>
-</VirtualHost>"""
-        else:  # proxy
-            config = f"""<VirtualHost *:80>
-    ServerName {data.domain}
-
-    ProxyPreserveHost On
-    ProxyPass / http://127.0.0.1:{data.port}/
-    ProxyPassReverse / http://127.0.0.1:{data.port}/
-
-    <Proxy *>
-        Require all granted
-    </Proxy>
-</VirtualHost>"""
-
-    # Use raw config if provided (advanced mode)
-    if data.raw_config:
-        config = data.raw_config
-
-    try:
-        config_path.write_text(config)
-
-        # Enable the site by creating symlink
-        enabled_link = enabled_dir / site_name
-        if not enabled_link.exists():
-            enabled_link.symlink_to(config_path)
-
-        return SiteActionResponse(
-            success=True, message=f"Site created: {data.domain}", site=site_name
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error creating site: {e}")
+    return SiteActionResponse(success=True, message=f"Site enabled: {validated}", site=validated)
 
 
-@router.post("/{name}/enable", response_model=SiteActionResponse)
-async def enable_site(name: str, request: Request, session: dict = Depends(get_current_session)):
+@router.post("/{domain}/disable", response_model=SiteActionResponse)
+def disable_site(
+    domain: str, session: Annotated[dict, Depends(get_current_session)]
+) -> SiteActionResponse:
     """
-    Enable a site.
+    Disable a site and reload the web server.
+
+    Args:
+        domain: Domain of the site.
+        session: The authenticated session.
+
+    Returns:
+        The action outcome.
+
+    Raises:
+        SiteError: When the manager refuses the operation.
+        DomainError: When the domain is not acceptable.
     """
-    webserver = _detect_webserver()
+    validated = strict_domain(domain)
+    _, manager = _manager_for(None)
 
-    if webserver == "nginx":
-        from wasm.managers.nginx_manager import NginxManager
+    manager.disable_site(validated)
+    manager.reload()
 
-        manager = NginxManager(verbose=False)
-    else:
-        from wasm.managers.apache_manager import ApacheManager
-
-        manager = ApacheManager(verbose=False)
-
-    try:
-        manager.enable_site(name)
-
-        # Reload webserver
-        subprocess.run(
-            ["systemctl", "reload", webserver if webserver == "nginx" else "apache2"], check=True
-        )
-
-        return SiteActionResponse(success=True, message=f"Site enabled: {name}", site=name)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return SiteActionResponse(success=True, message=f"Site disabled: {validated}", site=validated)
 
 
-@router.post("/{name}/disable", response_model=SiteActionResponse)
-async def disable_site(name: str, request: Request, session: dict = Depends(get_current_session)):
-    """
-    Disable a site.
-    """
-    webserver = _detect_webserver()
-
-    if webserver == "nginx":
-        from wasm.managers.nginx_manager import NginxManager
-
-        manager = NginxManager(verbose=False)
-    else:
-        from wasm.managers.apache_manager import ApacheManager
-
-        manager = ApacheManager(verbose=False)
-
-    try:
-        manager.disable_site(name)
-
-        # Reload webserver
-        subprocess.run(
-            ["systemctl", "reload", webserver if webserver == "nginx" else "apache2"], check=True
-        )
-
-        return SiteActionResponse(success=True, message=f"Site disabled: {name}", site=name)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.delete("/{name}", response_model=SiteActionResponse)
-async def delete_site(name: str, request: Request, session: dict = Depends(get_current_session)):
+@router.delete("/{domain}", response_model=SiteActionResponse)
+def delete_site(
+    domain: str, session: Annotated[dict, Depends(get_current_session)]
+) -> SiteActionResponse:
     """
     Delete a site configuration.
+
+    Args:
+        domain: Domain of the site.
+        session: The authenticated session.
+
+    Returns:
+        The action outcome.
+
+    Raises:
+        HTTPException: 404 when no such site exists.
+        SiteError: When the manager refuses the operation.
+        DomainError: When the domain is not acceptable.
     """
-    webserver = _detect_webserver()
+    validated = strict_domain(domain)
+    _, manager = _manager_for(None)
 
-    if webserver == "nginx":
-        from wasm.managers.nginx_manager import NginxManager
+    if not manager.site_exists(validated):
+        raise HTTPException(status_code=404, detail=f"Site not found: {validated}")
 
-        manager = NginxManager(verbose=False)
-    else:
-        from wasm.managers.apache_manager import ApacheManager
+    manager.delete_site(validated)
 
-        manager = ApacheManager(verbose=False)
-
-    try:
-        manager.delete_site(name)
-
-        return SiteActionResponse(success=True, message=f"Site deleted: {name}", site=name)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to delete site: {e}")
-
-
-@router.post("/reload")
-async def reload_webserver(request: Request, session: dict = Depends(get_current_session)):
-    """
-    Reload the web server configuration.
-    """
-    webserver = _detect_webserver()
-    service_name = webserver if webserver == "nginx" else "apache2"
-
-    try:
-        # Test config first
-        if webserver == "nginx":
-            result = subprocess.run(["nginx", "-t"], capture_output=True, text=True)
-            if result.returncode != 0:
-                raise HTTPException(
-                    status_code=400, detail=f"Configuration test failed: {result.stderr}"
-                )
-        else:
-            result = subprocess.run(["apache2ctl", "configtest"], capture_output=True, text=True)
-            if result.returncode != 0:
-                raise HTTPException(
-                    status_code=400, detail=f"Configuration test failed: {result.stderr}"
-                )
-
-        # Reload
-        subprocess.run(["systemctl", "reload", service_name], check=True)
-
-        return {
-            "success": True,
-            "message": f"{webserver.capitalize()} reloaded successfully",
-            "webserver": webserver,
-        }
-    except subprocess.CalledProcessError as e:
-        raise HTTPException(status_code=500, detail=f"Failed to reload: {e}")
+    return SiteActionResponse(success=True, message=f"Site deleted: {validated}", site=validated)

@@ -4,7 +4,6 @@
 
 """Tests for the NginxConfigBuilder helper."""
 
-
 import pytest
 
 from wasm.deployers.helpers.nginx_config import (

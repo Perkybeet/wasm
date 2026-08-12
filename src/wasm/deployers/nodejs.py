@@ -4,7 +4,9 @@ Node.js deployer for WASM.
 
 import json
 from pathlib import Path
+from typing import ClassVar
 
+from wasm.core.runner import CommandRunner
 from wasm.deployers.base import BaseDeployer
 from wasm.deployers.registry import DeployerRegistry
 
@@ -20,15 +22,25 @@ class NodeJSDeployer(BaseDeployer):
     APP_TYPE = "nodejs"
     DISPLAY_NAME = "Node.js"
 
-    DETECTION_FILES = ["package.json"]
+    DETECTION_FILES: ClassVar[list[str]] = ["package.json"]
 
     DEFAULT_PORT = 3000
 
-    SYSTEM_DEPS = ["node", "npm"]
+    # See DEFAULT_DETECTION_PRIORITY in interface.py for the full order.
+    DETECTION_PRIORITY = 40
 
-    def __init__(self, verbose: bool = False):
-        """Initialize Node.js deployer."""
-        super().__init__(verbose=verbose)
+    SYSTEM_DEPS: ClassVar[list[str]] = ["node", "npm"]
+
+    def __init__(self, verbose: bool = False, runner: CommandRunner | None = None):
+        """
+        Initialize the Node.js deployer.
+
+        Args:
+            verbose: Enable verbose logging.
+            runner: Command runner used for installs and builds. Defaults to the
+                process-wide runner.
+        """
+        super().__init__(verbose=verbose, runner=runner)
         self.package_manager = "npm"
         self.start_script = "start"
         self.has_build = False
@@ -61,8 +73,8 @@ class NodeJSDeployer(BaseDeployer):
                 # Check for main field or start script
                 if "main" in pkg or "start" in pkg.get("scripts", {}):
                     return True
-        except Exception:
-            pass
+        except (json.JSONDecodeError, OSError, AttributeError) as e:
+            self.logger.debug(f"Failed to read package.json for Node.js detection: {e}")
 
         return False
 
@@ -85,8 +97,8 @@ class NodeJSDeployer(BaseDeployer):
                         self.start_script = "start:production"
                     else:
                         self.start_script = "start"
-            except Exception:
-                pass
+            except (json.JSONDecodeError, OSError, AttributeError) as e:
+                self.logger.debug(f"Failed to analyse package.json: {e}")
 
     def get_install_command(self) -> list[str]:
         """Get dependency installation command."""

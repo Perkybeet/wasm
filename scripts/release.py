@@ -314,9 +314,7 @@ def main(argv: list[str] | None = None) -> int:
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     parser.add_argument("version", nargs="?", help="new version, as X.Y.Z")
-    parser.add_argument(
-        "--check", action="store_true", help="verify consistency without writing"
-    )
+    parser.add_argument("--check", action="store_true", help="verify consistency without writing")
     parser.add_argument(
         "-m",
         "--message",

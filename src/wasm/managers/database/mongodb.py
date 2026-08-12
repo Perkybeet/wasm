@@ -15,9 +15,9 @@ database name can never become code.
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 from collections.abc import Sequence
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +65,11 @@ BUILT_IN_ROLES = frozenset(
         "userAdminAnyDatabase",
     }
 )
+
+#: Custom role names WASM is willing to pass on. ``str.isalnum`` would also
+#: accept letters from any script, and a role name that is only distinguishable
+#: from another by its Unicode block is not a role name anyone typed on purpose.
+CUSTOM_ROLE_PATTERN = re.compile(r"\A[A-Za-z0-9_]+\Z")
 
 #: Release series of the packages this manager installs.
 SERVER_SERIES = "7.0"
@@ -164,7 +169,7 @@ class MongoDBManager(BaseDatabaseManager):
         roles: list[str] = []
         for role in requested:
             if not isinstance(role, str) or (
-                role not in BUILT_IN_ROLES and not role.replace("_", "").isalnum()
+                role not in BUILT_IN_ROLES and not CUSTOM_ROLE_PATTERN.match(role)
             ):
                 raise DatabaseUserError(
                     f"Invalid MongoDB role: {role!r}",
@@ -640,7 +645,6 @@ class MongoDBManager(BaseDatabaseManager):
             raise DatabaseNotFoundError(f"Database '{database}' does not exist")
 
         archive = self._backup_path(database, output_path, False)
-        self._ensure_directory(archive.parent)
 
         with tempfile.TemporaryDirectory(prefix="wasm-mongodump-") as workdir:
             argv = ["mongodump", "--db", database, "--out", workdir]
@@ -654,33 +658,21 @@ class MongoDBManager(BaseDatabaseManager):
                     details=result.stderr.strip() or "mongodump reported no error text.",
                 )
 
-            result = self._exec(
-                ["tar", "-czf", str(archive), "-C", workdir, database],
+            # "tar -czf <archive>" creates the archive with the process umask,
+            # which for root is 0644: the whole dump would be readable by every
+            # local account. Writing the archive to stdout hands the file to the
+            # runner, which creates it 0600 and removes it if tar fails.
+            info = self._dump_to_file(
+                ["tar", "-czf", "-", "-C", workdir, database],
+                archive,
+                database=database,
+                compress=False,
                 timeout=TRANSFER_TIMEOUT,
             )
-            if not result.success:
-                raise DatabaseBackupError(
-                    f"Failed to archive the backup of '{database}'",
-                    details=result.stderr.strip() or f"Could not write {archive}.",
-                )
 
-        try:
-            size = archive.stat().st_size
-        except OSError as exc:
-            raise DatabaseBackupError(
-                f"Backup of '{database}' produced no file",
-                details=f"{exc}. tar reported success but {archive} is not readable.",
-            ) from exc
-
-        self.logger.info(f"Created backup: {archive}")
-        return BackupInfo(
-            path=archive,
-            database=database,
-            engine=self.ENGINE_NAME,
-            size=size,
-            created=datetime.now(),
-            compressed=True,
-        )
+        # The tarball is gzipped by tar itself, not by the runner's gzip stage.
+        info.compressed = True
+        return info
 
     def restore(
         self,

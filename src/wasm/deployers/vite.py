@@ -4,7 +4,9 @@ Vite deployer for WASM.
 
 import json
 from pathlib import Path
+from typing import ClassVar
 
+from wasm.core.runner import CommandRunner
 from wasm.deployers.base import BaseDeployer
 from wasm.deployers.registry import DeployerRegistry
 
@@ -21,7 +23,7 @@ class ViteDeployer(BaseDeployer):
     APP_TYPE = "vite"
     DISPLAY_NAME = "Vite (React/Vue/Svelte)"
 
-    DETECTION_FILES = [
+    DETECTION_FILES: ClassVar[list[str]] = [
         "vite.config.js",
         "vite.config.ts",
         "vite.config.mjs",
@@ -29,11 +31,21 @@ class ViteDeployer(BaseDeployer):
 
     DEFAULT_PORT = 5173
 
-    SYSTEM_DEPS = ["node", "npm"]
+    # See DEFAULT_DETECTION_PRIORITY in interface.py for the full order.
+    DETECTION_PRIORITY = 60
 
-    def __init__(self, verbose: bool = False):
-        """Initialize Vite deployer."""
-        super().__init__(verbose=verbose)
+    SYSTEM_DEPS: ClassVar[list[str]] = ["node", "npm"]
+
+    def __init__(self, verbose: bool = False, runner: CommandRunner | None = None):
+        """
+        Initialize the Vite deployer.
+
+        Args:
+            verbose: Enable verbose logging.
+            runner: Command runner used for installs and builds. Defaults to the
+                process-wide runner.
+        """
+        super().__init__(verbose=verbose, runner=runner)
         self.output_dir = "dist"
         self.is_ssr = False
 
@@ -48,8 +60,8 @@ class ViteDeployer(BaseDeployer):
         package_json = path / "package.json"
         if package_json.exists():
             try:
-                with open(package_json) as f:
-                    pkg = json.load(f)
+                with open(package_json) as handle:
+                    pkg = json.load(handle)
                     deps = pkg.get("dependencies", {})
                     dev_deps = pkg.get("devDependencies", {})
                     return "vite" in deps or "vite" in dev_deps

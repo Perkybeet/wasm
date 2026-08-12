@@ -2,7 +2,6 @@
 Interactive mode for WASM using inquirer.
 """
 
-
 try:
     import inquirer
     from inquirer.themes import GreenPassion
@@ -698,9 +697,7 @@ class InteractiveMode:
         answers = inquirer.prompt(questions, theme=GreenPassion())
         return answers["value"] if answers else default
 
-    def _run_command(
-        self, resource: str, action: str, target: str | None = None, **kwargs
-    ) -> int:
+    def _run_command(self, resource: str, action: str, target: str | None = None, **kwargs) -> int:
         """Run a command with arguments."""
         from argparse import Namespace
 

@@ -6,17 +6,28 @@
 Global configuration management for WASM.
 
 The configuration file holds credentials (MySQL root password, SMTP account,
-OpenAI API key), so this module owns two security guarantees:
+OpenAI API key), so this module owns four security guarantees:
 
 * every file it writes is created with :data:`SECRET_FILE_MODE` via ``os.open``,
   never with a ``chmod`` afterwards, which would leave a window where the
-  secrets are world readable,
+  secrets are world readable, and with ``O_NOFOLLOW``, so a symlink planted in
+  the destination directory cannot redirect the write,
+* every directory it creates on the way there gets :data:`SECRET_DIR_MODE`, not
+  just the last one,
 * the in-memory configuration is isolated from :data:`DEFAULT_CONFIG`; defaults
   are deep-copied on load and accessors hand out copies, so a secret set on one
-  instance cannot leak into the next one.
+  instance cannot leak into the next one,
+* settings listed in :data:`REMOVED_KEYS` cannot be read, written or persisted
+  through their container either, so a stale file or a stale panel form cannot
+  hand a permissive answer back.
+
+This is the only writer of ``config.yaml``. The web API and the CLI both go
+through :class:`Config`; a second writer is how the hardening was lost once
+already.
 """
 
 import copy
+import errno
 import logging
 import os
 import re
@@ -24,7 +35,9 @@ import stat
 from pathlib import Path
 from typing import Any, Optional
 
-import yaml
+import yaml  # type: ignore[import-untyped]
+
+from wasm.core.exceptions import SecurityError
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +176,11 @@ SECRET_KEY_MARKERS: frozenset[str] = frozenset(
     }
 )
 
+# Settings whose name contains a marker word but which hold no credential. The
+# list is explicit and short on purpose: everything not named here that looks
+# like a secret is treated as one.
+NON_SECRET_KEYS: frozenset[str] = frozenset({"token_expiration_hours"})
+
 REDACTED = "***"
 
 
@@ -173,7 +191,7 @@ def _is_secret_key(key: str) -> bool:
     The key is split on separators and camel case boundaries, and each resulting
     word is compared against :data:`SECRET_KEY_MARKERS`. Whole words only:
     ``api_key`` and ``AuthToken`` match, ``keyboard_layout`` and ``monkey`` do
-    not.
+    not. Names listed in :data:`NON_SECRET_KEYS` are excluded.
 
     Args:
         key: Configuration key name (not a dotted path).
@@ -182,6 +200,9 @@ def _is_secret_key(key: str) -> bool:
         True if the value behind this key must be redacted.
     """
     normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key).lower()
+    if normalized in NON_SECRET_KEYS:
+        return False
+
     words = re.split(r"[^a-z0-9]+", normalized)
     return any(word in SECRET_KEY_MARKERS for word in words)
 
@@ -215,16 +236,131 @@ def redact_secrets(config: Any) -> Any:
     return config
 
 
+def restore_redacted(incoming: Any, current: Any) -> Any:
+    """
+    Put the stored secrets back where a caller sent :data:`REDACTED`.
+
+    The web panel renders what :func:`redact_secrets` produced, so saving a form
+    the user did not touch posts ``***`` back. Storing that literally would
+    destroy the credential. Every secret key whose incoming value is the
+    placeholder takes the value already stored instead, or the empty string when
+    nothing was stored. Non-secret keys are copied verbatim: a literal ``***``
+    elsewhere is data, not a placeholder. Neither input is modified.
+
+    Args:
+        incoming: Configuration structure received from a caller.
+        current: Configuration structure currently stored.
+
+    Returns:
+        A deep copy of ``incoming`` with the placeholders resolved.
+    """
+    if isinstance(incoming, dict):
+        stored = current if isinstance(current, dict) else {}
+        resolved: dict[Any, Any] = {}
+        for key, value in incoming.items():
+            if _is_secret_key(str(key)) and value == REDACTED:
+                previous = stored.get(key, "")
+                resolved[key] = copy.deepcopy(previous) if previous != REDACTED else ""
+            else:
+                resolved[key] = restore_redacted(value, stored.get(key))
+        return resolved
+    if isinstance(incoming, (list, tuple)):
+        return [restore_redacted(item, None) for item in incoming]
+    return copy.deepcopy(incoming)
+
+
+def _removed_keys_under(prefix: str) -> dict[str, Any]:
+    """
+    Select the removed settings that live inside a given container.
+
+    Args:
+        prefix: Dotted path of the container.
+
+    Returns:
+        Mapping of the path relative to ``prefix`` to the pinned safe value.
+    """
+    head = f"{prefix}." if prefix else ""
+    return {
+        dotted[len(head) :]: safe
+        for dotted, safe in REMOVED_KEYS.items()
+        if dotted.startswith(head) and dotted != prefix
+    }
+
+
+def _pin_removed_keys(prefix: str, subtree: dict[str, Any]) -> dict[str, Any]:
+    """
+    Force the safe value of every removed setting inside a container.
+
+    Callers that predate the removal read ``config.get("monitor")`` and then
+    ``.get("auto_terminate", True)``; without the pin they get their own
+    permissive default back and the removal is void. Missing intermediate
+    containers are created for the same reason: an absent container answers
+    every lookup with the caller's default.
+
+    Args:
+        prefix: Dotted path of ``subtree``.
+        subtree: Container to pin, modified in place.
+
+    Returns:
+        The same container.
+    """
+    for relative, safe in _removed_keys_under(prefix).items():
+        *parents, leaf = relative.split(".")
+        node = subtree
+        for parent in parents:
+            child = node.get(parent)
+            if not isinstance(child, dict):
+                child = {}
+                node[parent] = child
+            node = child
+        node[leaf] = safe
+    return subtree
+
+
+def _strip_removed_under(prefix: str, value: Any) -> Any:
+    """
+    Drop removed settings from a value about to be stored under a container.
+
+    ``set("monitor", {...})`` must obey the same guard as
+    ``set("monitor.auto_terminate", ...)``; otherwise the guard is one dotted
+    path away from being bypassed.
+
+    Args:
+        prefix: Dotted path the value is stored at.
+        value: Value to filter, modified in place when it is a mapping.
+
+    Returns:
+        The filtered value.
+    """
+    if not isinstance(value, dict):
+        return value
+
+    for relative in _removed_keys_under(prefix):
+        *parents, leaf = relative.split(".")
+        node: Any = value
+        for parent in parents:
+            node = node.get(parent) if isinstance(node, dict) else None
+            if node is None:
+                break
+        if isinstance(node, dict) and leaf in node:
+            del node[leaf]
+            logger.debug("Ignoring removed configuration key %s.%s", prefix, relative)
+    return value
+
+
 def secure_directory(path: Path) -> None:
     """
     Create a directory that may hold secrets and enforce owner-only access.
 
-    A missing directory is created with :data:`SECRET_DIR_MODE`. An existing one
-    is only tightened when it belongs to the current user and is not a shared
-    directory (sticky bit): tightening ``/tmp`` or another shared location would
-    break the system for everyone else, and the 0600 mode of the files inside
-    already protects their content. A chmod that is refused is logged, not
-    raised, because the payload write must still go through.
+    Every level that is missing is created with :data:`SECRET_DIR_MODE`;
+    ``mkdir(parents=True)`` applies the mode to the last level only and leaves
+    the intermediate ones at ``0777 & ~umask``. Directories that already exist
+    are left alone, except the leaf, which is tightened when it belongs to the
+    current user and is not a shared directory (sticky bit): tightening ``/tmp``
+    or another shared location would break the system for everyone else, and the
+    0600 mode of the files inside already protects their content. A chmod that is
+    refused is logged, not raised, because the payload write must still go
+    through.
 
     Args:
         path: Directory to create or tighten.
@@ -232,7 +368,20 @@ def secure_directory(path: Path) -> None:
     Raises:
         OSError: If the directory cannot be created.
     """
-    path.mkdir(parents=True, exist_ok=True, mode=SECRET_DIR_MODE)
+    missing: list[Path] = []
+    node = path
+    while not node.exists():
+        missing.append(node)
+        if node.parent == node:
+            break
+        node = node.parent
+
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=SECRET_DIR_MODE)
+        except FileExistsError:
+            # Another process won the race; its mode is not ours to change.
+            continue
 
     info = path.stat()
     is_shared = bool(info.st_mode & stat.S_ISVTX)
@@ -249,38 +398,72 @@ def restrict_file(path: Path) -> None:
 
     Files created by earlier versions are world readable; this repairs them on
     the next open. Missing files are ignored, and a refused chmod is logged
-    rather than raised so the caller can still do its work.
+    rather than raised so the caller can still do its work. Symlinks are left
+    untouched: ``chmod`` follows them, so a link planted in the directory would
+    hand the mode change to a file of the attacker's choosing;
+    :func:`secure_write` refuses that path anyway.
 
     Args:
         path: File to tighten.
     """
-    if not path.exists() or not path.stat().st_mode & 0o077:
-        return
     try:
-        path.chmod(SECRET_FILE_MODE)
+        info = os.lstat(path)
+    except OSError:
+        # Missing, or a dangling symlink, for which exists() answers False.
+        return
+
+    if stat.S_ISLNK(info.st_mode):
+        logger.warning("Refusing to change permissions through the symlink %s", path)
+        return
+    if not info.st_mode & 0o077:
+        return
+
+    try:
+        os.chmod(path, SECRET_FILE_MODE)
     except OSError as exc:
         logger.warning("Could not restrict permissions on %s: %s", path, exc)
 
 
-def secure_write(path: Path, content: str) -> None:
+def secure_write(path: Path, content: str, secure_parent: bool = True) -> None:
     """
     Write a file that holds secrets, owner-readable only.
 
     The file is created through ``os.open`` with the restrictive mode already
-    applied, so it is never briefly world readable. An existing file with a lax
-    mode is tightened before its new content is written.
+    applied, so it is never briefly world readable, and with ``O_NOFOLLOW``, so
+    a symlink at ``path`` is refused instead of followed. An existing regular
+    file with a lax mode is tightened before its new content is written.
 
     Args:
         path: Destination file.
         content: Text to write.
+        secure_parent: Whether the parent directory must be private too. Pass
+            False for files that live inside a tree served to other accounts,
+            such as an application's ``.env``.
 
     Raises:
+        SecurityError: If ``path`` is a symlink.
         OSError: If the file cannot be created or written.
     """
-    secure_directory(path.parent)
+    if secure_parent:
+        secure_directory(path.parent)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
     restrict_file(path)
 
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, SECRET_FILE_MODE)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, SECRET_FILE_MODE)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise SecurityError(
+                f"Refusing to write secrets through the symlink {path}",
+                details=(
+                    "Something replaced the file with a symbolic link, which would "
+                    "redirect the write. Inspect the directory, remove the link and "
+                    "retry."
+                ),
+            ) from exc
+        raise
+
     with os.fdopen(fd, "w") as handle:
         handle.write(content)
 
@@ -353,7 +536,7 @@ class Config:
 
     def _load_env_overrides(self) -> None:
         """Load configuration overrides from environment variables."""
-        env_mappings = {
+        env_mappings: dict[str, str | tuple[str, str]] = {
             "WASM_APPS_DIR": "apps_directory",
             "WASM_WEBSERVER": "webserver",
             "WASM_SERVICE_USER": "service_user",
@@ -368,7 +551,7 @@ class Config:
                 else:
                     self._config[config_key] = value
 
-    def _deep_merge(self, base: dict, override: dict) -> dict:
+    def _deep_merge(self, base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
         """
         Deep merge two dictionaries.
 
@@ -395,7 +578,9 @@ class Config:
         Nested containers are returned as deep copies, so callers cannot mutate
         the configuration, and through it the module defaults, by accident.
         Keys listed in :data:`REMOVED_KEYS` always return their pinned safe
-        value and ignore ``default``.
+        value and ignore ``default``, and so do the same keys read through their
+        container: ``get("monitor")["auto_terminate"]`` is the pinned value, not
+        the caller's optimistic default.
 
         Args:
             key: Configuration key (supports dot notation for nested values).
@@ -408,15 +593,18 @@ class Config:
             return REMOVED_KEYS[key]
 
         keys = key.split(".")
-        value = self._config
+        value: Any = self._config
 
         for k in keys:
             if isinstance(value, dict) and k in value:
                 value = value[k]
             else:
-                return default
+                value = default
+                break
 
-        if isinstance(value, (dict, list)):
+        if isinstance(value, dict):
+            return _pin_removed_keys(key, copy.deepcopy(value))
+        if isinstance(value, list):
             return copy.deepcopy(value)
         return value
 
@@ -425,7 +613,12 @@ class Config:
         Set a configuration value.
 
         Keys listed in :data:`REMOVED_KEYS` are ignored: they no longer control
-        anything and must not be reintroduced into a saved config file.
+        anything and must not be reintroduced into a saved config file. Writing
+        the container they used to live in is filtered the same way, so the
+        guard cannot be bypassed by moving one level up. A :data:`REDACTED`
+        placeholder on a secret key keeps the stored secret, so a caller that
+        only ever saw the redacted configuration cannot destroy a credential by
+        writing back what it was shown.
 
         Args:
             key: Configuration key (supports dot notation).
@@ -443,17 +636,45 @@ class Config:
                 config[k] = {}
             config = config[k]
 
-        config[keys[-1]] = copy.deepcopy(value)
+        leaf = keys[-1]
+        resolved = restore_redacted({leaf: value}, {leaf: config.get(leaf)})[leaf]
+        config[leaf] = _strip_removed_under(key, resolved)
+
+    def replace(self, config: dict[str, Any]) -> None:
+        """
+        Replace the whole configuration with a caller-supplied mapping.
+
+        This is what a full update from the web panel goes through. Two things
+        happen on the way in: :data:`REDACTED` placeholders take the secret that
+        is currently stored, because the panel only ever saw the redacted dump,
+        and removed settings are dropped, because a stale form must not be able
+        to reintroduce them.
+
+        Args:
+            config: The new configuration.
+        """
+        resolved: dict[str, Any] = restore_redacted(config, self._config)
+        self._config = _strip_removed_keys(resolved)
+
+    @property
+    def path(self) -> Path:
+        """
+        Path of the file this configuration is read from and written to.
+
+        Returns:
+            The single configuration file path.
+        """
+        return DEFAULT_CONFIG_PATH
 
     @property
     def apps_directory(self) -> Path:
         """Get the applications directory path."""
-        return Path(self.get("apps_directory", str(DEFAULT_APPS_DIR)))
+        return Path(str(self.get("apps_directory", str(DEFAULT_APPS_DIR))))
 
     @property
     def webserver(self) -> str:
         """Get the default web server."""
-        return self.get("webserver", "nginx")
+        return str(self.get("webserver", "nginx"))
 
     def reload(self) -> None:
         """
@@ -477,22 +698,41 @@ class Config:
     @property
     def service_user(self) -> str:
         """Get the default service user."""
-        return self.get("service_user", "www-data")
+        return str(self.get("service_user", "www-data"))
 
     @property
     def service_group(self) -> str:
         """Get the default service group."""
-        return self.get("service_group", "www-data")
+        return str(self.get("service_group", "www-data"))
 
     @property
     def ssl_enabled(self) -> bool:
         """Check if SSL is enabled by default."""
-        return self.get("ssl.enabled", True)
+        return bool(self.get("ssl.enabled", True))
 
     @property
     def ssl_email(self) -> str:
         """Get the SSL certificate email."""
-        return self.get("ssl.email", "")
+        return str(self.get("ssl.email", ""))
+
+    def write(self, path: Path | None = None) -> Path:
+        """
+        Write the configuration to disk, reporting failures to the caller.
+
+        Args:
+            path: Optional path to write to. Defaults to the global config path.
+
+        Returns:
+            The path that was written.
+
+        Raises:
+            SecurityError: If the destination is a symlink.
+            OSError: If the file cannot be created or written.
+            yaml.YAMLError: If the configuration cannot be serialised.
+        """
+        save_path = path or DEFAULT_CONFIG_PATH
+        secure_write(save_path, yaml.dump(self._config, default_flow_style=False))
+        return save_path
 
     def save(self, path: Path | None = None) -> bool:
         """
@@ -502,17 +742,15 @@ class Config:
             path: Optional path to save to. Defaults to global config path.
 
         Returns:
-            True if saved successfully, False otherwise.
+            True if saved successfully, False otherwise. Callers that need the
+            reason should use :meth:`write`.
         """
         save_path = path or DEFAULT_CONFIG_PATH
 
         try:
-            secure_write(
-                save_path,
-                yaml.dump(self._config, default_flow_style=False),
-            )
+            self.write(save_path)
             return True
-        except (OSError, yaml.YAMLError) as exc:
+        except (OSError, yaml.YAMLError, SecurityError) as exc:
             logger.error("Could not save configuration to %s: %s", save_path, exc)
             return False
 

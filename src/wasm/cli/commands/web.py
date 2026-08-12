@@ -1,22 +1,46 @@
 """
 Web interface command handlers for WASM.
 
-Commands for starting and managing the web dashboard.
+This is the only way the panel is started in practice, so the security posture
+of a deployment is decided here. Two rules follow from the panel being a root
+shell with a login form:
+
+- **Everything ``SecurityConfig`` can enforce is reachable from the command
+  line.** A flag that only exists in Python is a flag nobody sets, which is how
+  a panel ends up running with ``require_https=False`` and an empty whitelist.
+- **Binding beyond loopback without protection is an error, not a warning.** A
+  warning scrolls past; the operator wanted the panel up, and it comes up. So
+  ``--host 0.0.0.0`` is refused unless the panel terminates TLS itself or only
+  answers a declared list of addresses.
 """
 
+from __future__ import annotations
+
+import importlib.util
 import os
 import signal
-import subprocess
 import sys
-from argparse import Namespace
+from argparse import ArgumentParser, Namespace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from wasm.core.exceptions import WASMError
+from wasm.core.exceptions import SecurityError, WASMError
 from wasm.core.logger import Logger
+from wasm.core.runner import get_runner
+
+if TYPE_CHECKING:
+    from wasm.web.auth import SecurityConfig
 
 # PID file location
 PID_FILE = Path("/var/run/wasm-web.pid")
 PID_FILE_USER = Path.home() / ".wasm" / "web.pid"
+
+#: Addresses that only the machine itself can reach. Anything else is exposed
+#: to a network and has to justify itself.
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", ""})
+
+#: Package installation is slow on a cold cache but must not hang a session.
+INSTALL_TIMEOUT = 900
 
 
 def get_pid_file() -> Path:
@@ -24,6 +48,119 @@ def get_pid_file() -> Path:
     if os.geteuid() == 0:
         return PID_FILE
     return PID_FILE_USER
+
+
+def add_start_arguments(parser: ArgumentParser) -> None:
+    """
+    Register the options that decide how exposed a panel is.
+
+    The CLI parser calls this for ``web start`` and ``web restart`` so that both
+    accept exactly the same security flags.
+
+    Args:
+        parser: The subcommand parser to extend.
+    """
+    parser.add_argument(
+        "--host",
+        "-H",
+        default="127.0.0.1",
+        help="Host to bind to (default: 127.0.0.1). Anything else requires --require-https "
+        "or --allow-ip",
+    )
+    parser.add_argument("--port", "-p", type=int, default=8080, help="Port to listen on")
+    parser.add_argument("--daemon", "-d", action="store_true", help="Run in background as daemon")
+    parser.add_argument(
+        "--require-https",
+        action="store_true",
+        help="Serve TLS directly and refuse cleartext requests. Needs --tls-cert and --tls-key",
+    )
+    parser.add_argument("--tls-cert", default=None, help="Path to the TLS certificate chain")
+    parser.add_argument("--tls-key", default=None, help="Path to the TLS private key")
+    parser.add_argument(
+        "--allow-ip",
+        action="append",
+        default=None,
+        metavar="ADDR/CIDR",
+        help="Only answer this address or network. Repeatable",
+    )
+    parser.add_argument(
+        "--trusted-proxy",
+        action="append",
+        default=None,
+        metavar="ADDR/CIDR",
+        help="Believe X-Forwarded-For and X-Forwarded-Proto from this peer. Declare your "
+        "TLS terminating proxy here so the session cookie is issued with Secure",
+    )
+
+
+def build_security_config(args: Namespace) -> SecurityConfig:
+    """
+    Turn parsed arguments into a security configuration.
+
+    Args:
+        args: Parsed command line arguments.
+
+    Returns:
+        The configuration the server should run with.
+
+    Raises:
+        SecurityError: When the requested combination would put a root panel on
+            a network unprotected.
+    """
+    from wasm.web.auth import SecurityConfig
+
+    host = getattr(args, "host", "127.0.0.1") or "127.0.0.1"
+    port = getattr(args, "port", 8080) or 8080
+    whitelist = list(getattr(args, "allow_ip", None) or [])
+    proxies = list(getattr(args, "trusted_proxy", None) or [])
+    require_https = bool(getattr(args, "require_https", False))
+    cert = getattr(args, "tls_cert", None)
+    key = getattr(args, "tls_key", None)
+
+    if require_https and not (cert and key):
+        raise SecurityError(
+            "--require-https needs a certificate and a private key",
+            details=(
+                "Pass --tls-cert and --tls-key. For a public domain: "
+                "'certbot certonly --standalone -d panel.example.com' then "
+                "--tls-cert /etc/letsencrypt/live/panel.example.com/fullchain.pem "
+                "--tls-key /etc/letsencrypt/live/panel.example.com/privkey.pem."
+            ),
+        )
+
+    if host not in LOOPBACK_HOSTS and not require_https and not whitelist:
+        raise SecurityError(
+            f"Refusing to expose the WASM panel on {host} without TLS or an IP whitelist",
+            details=(
+                "The panel drives systemd, nginx and certbot as root, so this would put a "
+                "root shell on the network in cleartext. Pick one:\n"
+                "  - keep it local and reach it over SSH: "
+                f"wasm web start --host 127.0.0.1 --port {port} "
+                f"(then 'ssh -L {port}:127.0.0.1:{port} user@server')\n"
+                "  - terminate TLS in the panel: --require-https --tls-cert CERT --tls-key KEY\n"
+                "  - restrict who may connect: --allow-ip 10.0.0.0/24 (repeatable)\n"
+                "If a reverse proxy already terminates TLS, bind to 127.0.0.1 and declare it "
+                "with --trusted-proxy so the session cookie is issued with the Secure flag."
+            ),
+        )
+
+    config = SecurityConfig(
+        host=host,
+        port=port,
+        rate_limit_enabled=True,
+        require_https=require_https,
+        ssl_certfile=cert,
+        ssl_keyfile=key,
+        ip_whitelist=whitelist,
+        trusted_proxies=proxies,
+    )
+
+    if host not in LOOPBACK_HOSTS:
+        # The Host header of a panel reachable by address or by name is not
+        # something we can enumerate for the operator.
+        config.allowed_hosts = []
+
+    return config
 
 
 def handle_web(args: Namespace) -> int:
@@ -83,51 +220,24 @@ WEB_DEPENDENCIES = {
 
 
 def _check_dependencies() -> tuple[bool, list[str], list[str]]:
-    """Check if web dependencies are installed.
+    """
+    Check whether the web dependencies are importable.
 
     Returns:
-        Tuple of (all_installed, missing_apt_packages, missing_pip_packages)
+        Whether everything is present, the missing system packages, and the
+        missing pip requirements, in that order.
     """
-    missing_apt = []
-    missing_pip = []
+    missing_apt: list[str] = []
+    missing_pip: list[str] = []
 
-    try:
-        import fastapi
-    except ImportError:
-        missing_apt.append("python3-fastapi")
-        missing_pip.append("fastapi>=0.109.0")
+    for module, (apt_package, pip_requirement) in WEB_DEPENDENCIES.items():
+        # find_spec asks the import system without executing the module, so a
+        # dependency check cannot have side effects of its own.
+        if importlib.util.find_spec(module) is None:
+            missing_apt.append(apt_package)
+            missing_pip.append(pip_requirement)
 
-    try:
-        import uvicorn
-    except ImportError:
-        missing_apt.append("python3-uvicorn")
-        missing_pip.append("uvicorn[standard]>=0.27.0")
-
-    try:
-        import jose
-    except ImportError:
-        missing_apt.append("python3-jose")
-        missing_pip.append("python-jose[cryptography]>=3.3.0")
-
-    try:
-        import passlib
-    except ImportError:
-        missing_apt.append("python3-passlib")
-        missing_pip.append("passlib[bcrypt]>=1.7.4")
-
-    try:
-        import aiofiles
-    except ImportError:
-        missing_apt.append("python3-aiofiles")
-        missing_pip.append("aiofiles>=23.0.0")
-
-    try:
-        import psutil
-    except ImportError:
-        missing_apt.append("python3-psutil")
-        missing_pip.append("psutil>=5.9.0")
-
-    return (len(missing_apt) == 0, missing_apt, missing_pip)
+    return (not missing_apt, missing_apt, missing_pip)
 
 
 def _get_install_instructions(missing_apt: list[str], missing_pip: list[str]) -> list[str]:
@@ -181,30 +291,19 @@ def _install_with_pip(packages: list[str], verbose: bool = False, force: bool = 
     """
     logger = Logger(verbose=verbose)
 
-    try:
-        cmd = [sys.executable, "-m", "pip", "install", "--user"] + packages
+    cmd = [sys.executable, "-m", "pip", "install", "--user"]
+    # Add --break-system-packages for externally managed environments
+    if force or _is_externally_managed():
+        cmd.append("--break-system-packages")
+    cmd.extend(packages)
 
-        # Add --break-system-packages for externally managed environments
-        if force or _is_externally_managed():
-            cmd.insert(4, "--break-system-packages")
+    logger.info(f"Installing: {' '.join(packages)}")
 
-        logger.info(f"Installing: {' '.join(packages)}")
-
-        result = subprocess.run(
-            cmd,
-            capture_output=not verbose,
-            text=True,
-        )
-
-        if result.returncode != 0:
-            if not verbose and result.stderr:
-                logger.error(result.stderr)
-            return False
-
-        return True
-    except Exception as e:
-        logger.error(f"Failed to install packages: {e}")
+    result = get_runner().run(cmd, timeout=INSTALL_TIMEOUT)
+    if not result.success:
+        logger.error(result.stderr or result.stdout or f"pip exited with {result.exit_code}")
         return False
+    return True
 
 
 def _install_with_apt(packages: list[str], verbose: bool = False) -> bool:
@@ -219,26 +318,19 @@ def _install_with_apt(packages: list[str], verbose: bool = False) -> bool:
     """
     logger = Logger(verbose=verbose)
 
-    try:
-        cmd = ["sudo", "apt-get", "install", "-y"] + packages
+    logger.info(f"Installing: {' '.join(packages)}")
 
-        logger.info(f"Installing: {' '.join(packages)}")
-
-        result = subprocess.run(
-            cmd,
-            capture_output=not verbose,
-            text=True,
-        )
-
-        if result.returncode != 0:
-            if not verbose and result.stderr:
-                logger.error(result.stderr)
-            return False
-
-        return True
-    except Exception as e:
-        logger.error(f"Failed to install packages: {e}")
+    # WASM requires root; there is no sudo to escalate with and nothing to
+    # escalate from. See the v1 design note on privilege.
+    result = get_runner().run(
+        ["apt-get", "install", "-y", *packages],
+        timeout=INSTALL_TIMEOUT,
+        env={"DEBIAN_FRONTEND": "noninteractive"},
+    )
+    if not result.success:
+        logger.error(result.stderr or result.stdout or f"apt-get exited with {result.exit_code}")
         return False
+    return True
 
 
 def _prompt_install(missing_apt: list[str], missing_pip: list[str], verbose: bool = False) -> bool:
@@ -343,27 +435,35 @@ def _handle_start(args: Namespace) -> int:
             # Process not running, remove stale PID file
             pid_file.unlink(missing_ok=True)
 
-    # Get configuration
-    host = getattr(args, "host", "127.0.0.1") or "127.0.0.1"
-    port = getattr(args, "port", 8080) or 8080
-    daemon = getattr(args, "daemon", False)
+    # Refuses an unsafe exposure before anything is bound or written.
+    config = build_security_config(args)
+    host = config.host
 
-    # Security warning for 0.0.0.0
-    if host == "0.0.0.0":
-        logger.warning("⚠️  Binding to 0.0.0.0 exposes the server to all network interfaces!")
-        logger.warning("⚠️  Make sure your firewall is configured properly.")
+    if config.ip_whitelist:
+        logger.info(f"Only these clients may connect: {', '.join(config.ip_whitelist)}")
+    if config.trusted_proxies:
+        logger.info(f"Forwarding headers believed from: {', '.join(config.trusted_proxies)}")
+    elif host in LOOPBACK_HOSTS and not config.require_https:
+        logger.warning(
+            "Serving plain HTTP on loopback. Behind a TLS proxy, pass --trusted-proxy "
+            "so the session cookie is issued with the Secure flag."
+        )
 
-    if daemon:
-        # Run in background
-        return _start_daemon(host, port, args.verbose)
-    else:
-        # Run in foreground
-        return _start_foreground(host, port)
+    if getattr(args, "daemon", False):
+        return _start_daemon(config, args.verbose)
+    return _start_foreground(config)
 
 
-def _start_foreground(host: str, port: int) -> int:
-    """Start the web server in foreground."""
-    from wasm.web.auth import SecurityConfig
+def _start_foreground(config: SecurityConfig) -> int:
+    """
+    Start the web server in the foreground.
+
+    Args:
+        config: The security configuration to serve with.
+
+    Returns:
+        Exit code.
+    """
     from wasm.web.server import run_server
 
     # Create PID file
@@ -372,32 +472,25 @@ def _start_foreground(host: str, port: int) -> int:
     pid_file.write_text(str(os.getpid()))
 
     try:
-        # Configure security
-        config = SecurityConfig(
-            host=host,
-            port=port,
-            rate_limit_enabled=True,
-        )
-
-        # Allow all hosts if binding to 0.0.0.0
-        if host == "0.0.0.0":
-            config.allowed_hosts = []
-
-        # Run server
-        run_server(
-            host=host,
-            port=port,
-            config=config,
-            show_token=True,
-        )
+        run_server(host=config.host, port=config.port, config=config, show_token=True)
         return 0
     finally:
         pid_file.unlink(missing_ok=True)
 
 
-def _start_daemon(host: str, port: int, verbose: bool) -> int:
-    """Start the web server as a daemon."""
+def _start_daemon(config: SecurityConfig, verbose: bool) -> int:
+    """
+    Start the web server as a daemon.
+
+    Args:
+        config: The security configuration to serve with.
+        verbose: Whether to log verbosely.
+
+    Returns:
+        Exit code.
+    """
     logger = Logger(verbose=verbose)
+    scheme = "https" if config.require_https else "http"
 
     # Fork process
     pid = os.fork()
@@ -405,7 +498,7 @@ def _start_daemon(host: str, port: int, verbose: bool) -> int:
     if pid > 0:
         # Parent process
         logger.success(f"Web server started in background (PID: {pid})")
-        logger.info(f"Server running at http://{host}:{port}")
+        logger.info(f"Server running at {scheme}://{config.host}:{config.port}")
         logger.info("Use 'wasm web status' to check status")
         logger.info("Use 'wasm web stop' to stop the server")
         return 0
@@ -441,14 +534,9 @@ def _start_daemon(host: str, port: int, verbose: bool) -> int:
 
     # Start server
     try:
-        from wasm.web.auth import SecurityConfig
         from wasm.web.server import run_server
 
-        config = SecurityConfig(host=host, port=port)
-        if host == "0.0.0.0":
-            config.allowed_hosts = []
-
-        run_server(host=host, port=port, config=config, show_token=False)
+        run_server(host=config.host, port=config.port, config=config, show_token=False)
     finally:
         pid_file.unlink(missing_ok=True)
 
@@ -499,7 +587,7 @@ def _handle_status(args: Namespace) -> int:
     logger.header("WASM Web Interface Status")
 
     if not pid_file.exists():
-        logger.key_value("Status", "🔴 Not running")
+        logger.key_value("Status", "not running")
         return 0
 
     try:
@@ -508,7 +596,7 @@ def _handle_status(args: Namespace) -> int:
         # Check if process is running
         os.kill(pid, 0)
 
-        logger.key_value("Status", "🟢 Running")
+        logger.key_value("Status", "running")
         logger.key_value("PID", str(pid))
 
         # Try to get more info
@@ -524,7 +612,7 @@ def _handle_status(args: Namespace) -> int:
         return 0
 
     except ProcessLookupError:
-        logger.key_value("Status", "🔴 Not running (stale PID)")
+        logger.key_value("Status", "not running (stale PID)")
         pid_file.unlink(missing_ok=True)
         return 0
     except ValueError:
@@ -576,7 +664,7 @@ def _handle_token(args: Namespace) -> int:
         new_token = token_manager.rotate_secrets()
         logger.success("New access token generated")
         logger.blank()
-        print(f"🔐 Access Token: {new_token}")
+        print(f"Access Token: {new_token}")
         logger.blank()
         logger.warning("All existing sessions have been revoked")
         logger.info("Restart the web server to apply the new token")

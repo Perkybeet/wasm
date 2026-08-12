@@ -333,6 +333,9 @@ def _bare_deployer() -> _Deployer:
     deployer.verbose = False
     deployer.logger = MagicMock()
     deployer.store = MagicMock(spec=WASMStore)
+    # The registrar is created lazily from the store, so the private slot has
+    # to exist on an instance built without running __init__.
+    deployer._registrar = None
     deployer.service_manager = MagicMock(spec=ServiceManager)
     deployer.domain = "app.com"
     deployer.app_name = "app-com"

@@ -3,8 +3,12 @@ Static site deployer for WASM.
 """
 
 from pathlib import Path
+from typing import ClassVar
 
+from wasm.core.logger import Icons
+from wasm.core.runner import CommandRunner
 from wasm.deployers.base import BaseDeployer
+from wasm.deployers.pipeline import DeployStep
 from wasm.deployers.registry import DeployerRegistry
 
 
@@ -19,16 +23,26 @@ class StaticDeployer(BaseDeployer):
     APP_TYPE = "static"
     DISPLAY_NAME = "Static Site"
 
-    DETECTION_FILES = ["index.html"]
+    DETECTION_FILES: ClassVar[list[str]] = ["index.html"]
 
     DEFAULT_PORT = 80  # Not used for static sites
 
-    SYSTEM_DEPS = []
+    # See DEFAULT_DETECTION_PRIORITY in interface.py for the full order.
+    DETECTION_PRIORITY = 10
 
-    def __init__(self, verbose: bool = False):
-        """Initialize static deployer."""
-        super().__init__(verbose=verbose)
-        self.static_dir = None
+    SYSTEM_DEPS: ClassVar[list[str]] = []
+
+    def __init__(self, verbose: bool = False, runner: CommandRunner | None = None):
+        """
+        Initialize the static deployer.
+
+        Args:
+            verbose: Enable verbose logging.
+            runner: Command runner used for installs and builds. Defaults to the
+                process-wide runner.
+        """
+        super().__init__(verbose=verbose, runner=runner)
+        self.static_dir: Path | None = None
 
     def detect(self, path: Path) -> bool:
         """Detect if path contains a static site."""
@@ -105,10 +119,6 @@ class StaticDeployer(BaseDeployer):
         self.logger.substep("Static site - no service needed")
         return True
 
-    def start(self) -> bool:
-        """No start needed for static sites."""
-        return True
-
     def stop(self) -> bool:
         """No stop needed for static sites."""
         return True
@@ -125,91 +135,57 @@ class StaticDeployer(BaseDeployer):
             return True
         return False
 
-    def deploy(self, total_steps: int = 5) -> bool:
+    def build_pipeline(self) -> list[DeployStep]:
         """
-        Deploy static site with fewer steps.
+        Describe the shorter workflow a static site needs.
 
-        Args:
-            total_steps: Total number of deployment steps.
+        There is nothing to install, nothing to build and no service to run, so
+        those steps are dropped rather than made into no-ops. This used to be a
+        full copy of ``deploy()`` with its own try/except and its own store
+        updates, which is how it ended up without any rollback at all.
 
         Returns:
-            True if deployment was successful.
+            The steps to execute, each with the undo that reverses it.
         """
-        from datetime import datetime
+        return [
+            DeployStep(
+                title="Fetching source code",
+                icon=Icons.DOWNLOAD,
+                run=self._step_fetch,
+                undo=self.remove_source,
+            ),
+            DeployStep(
+                title="Preparing static files",
+                icon=Icons.FOLDER,
+                run=self.pre_install,
+            ),
+            DeployStep(
+                title="Creating site configuration",
+                icon=Icons.GLOBE,
+                run=lambda: self.create_site(with_ssl=False),
+                undo=self.remove_site,
+            ),
+            DeployStep(
+                title="Obtaining SSL certificate",
+                icon=Icons.LOCK,
+                run=self._step_certificate,
+                skip_if=lambda: not self.ssl,
+            ),
+            DeployStep(
+                title="Verifying deployment",
+                icon=Icons.CHECK,
+                run=self._step_start,
+            ),
+        ]
 
-        from wasm.core.exceptions import CertificateError
-        from wasm.core.logger import Icons
-        from wasm.core.store import AppStatus
+    def start(self) -> bool:
+        """
+        Nothing to start: the web server serves the files directly.
 
-        # Track if SSL was successfully obtained
-        ssl_obtained = False
-
-        # Register app in store at the start
-        app = self._register_app_in_store(AppStatus.DEPLOYING.value)
-
-        try:
-            # Step 1: Fetch source
-            self.logger.step(1, total_steps, "Fetching source code", Icons.DOWNLOAD)
-            self.fetch_source()
-
-            # Step 2: Prepare
-            self.logger.step(2, total_steps, "Preparing static files", Icons.FOLDER)
-            self.pre_install()
-
-            # Step 3: Create site (initially WITHOUT SSL if SSL is requested)
-            self.logger.step(3, total_steps, "Creating site configuration", Icons.GLOBE)
-            self.create_site(with_ssl=False)
-
-            # Step 4: SSL certificate (best effort - continue if it fails)
-            if self.ssl:
-                self.logger.step(4, total_steps, "Obtaining SSL certificate", Icons.LOCK)
-                try:
-                    self.obtain_certificate()
-                    ssl_obtained = True
-                    # Update site config with SSL
-                    self.logger.substep("Updating site configuration with SSL")
-                    self.create_site(with_ssl=True)
-                except CertificateError as e:
-                    self.logger.warning(f"SSL certificate failed: {e.message}")
-                    self.logger.warning("Continuing deployment without SSL...")
-                    self.logger.substep("Site will be available via HTTP only")
-                except Exception as e:
-                    self.logger.warning(f"SSL certificate failed: {e}")
-                    self.logger.warning("Continuing deployment without SSL...")
-                    self.logger.substep("Site will be available via HTTP only")
-            else:
-                self.logger.step(4, total_steps, "Skipping SSL certificate", Icons.LOCK)
-
-            # Step 5: Verify
-            self.logger.step(5, total_steps, "Verifying deployment", Icons.CHECK)
-
-            # Update app status to running
-            app.status = AppStatus.RUNNING.value
-            app.ssl_enabled = ssl_obtained
-            app.deployed_at = datetime.now().isoformat()
-            self.store.update_app(app)
-
-            if self.health_check():
-                self.logger.success("Static site deployed successfully!")
-                self.logger.blank()
-                protocol = "https" if ssl_obtained else "http"
-                self.logger.key_value("URL", f"{protocol}://{self.domain}")
-                self.logger.key_value("Root", str(self.static_dir or self.app_path))
-                if self.ssl and not ssl_obtained:
-                    self.logger.blank()
-                    self.logger.warning("SSL was requested but could not be obtained.")
-                    self.logger.info("To add SSL later, run: wasm cert create -d " + self.domain)
-                return True
-            else:
-                self.logger.warning("Deployment completed but verification failed")
-                return True
-
-        except Exception as e:
-            # Update app status to failed
-            app.status = AppStatus.FAILED.value
-            self.store.update_app(app)
-            self.logger.error(f"Deployment failed: {e}")
-            raise
+        Returns:
+            True.
+        """
+        return True
 
 
 # Register the deployer

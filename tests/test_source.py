@@ -1,6 +1,5 @@
 """Tests for source validator."""
 
-
 import pytest
 
 from wasm.core.exceptions import SourceError

@@ -5,18 +5,104 @@ Handles checking, installing, and managing system and runtime dependencies
 needed for deploying various types of applications.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import ClassVar, TypedDict
 
+from wasm.core.exceptions import SecurityError
 from wasm.core.runner import CommandRunner, get_runner
-from wasm.core.utils import (
-    TRUSTED_INSTALLER_URLS,
-    command_exists,
-    run_command,
-    run_command_sudo,
-    run_trusted_installer,
-)
+from wasm.core.utils import TRUSTED_INSTALLER_URLS, run_trusted_installer
+
+#: Package installs pull from the network and unpack; a minute is not enough
+#: and no deadline at all is how a deploy hangs on a stalled mirror.
+INSTALL_TIMEOUT = 600
+
+#: System probes ("is the docker daemon up?") answer immediately or not at all.
+PROBE_TIMEOUT = 20
+
+
+class PackageManagerInfo(TypedDict):
+    """Static facts about a Node.js package manager."""
+
+    lock_file: str
+    install_cmd: str
+    comes_with_node: bool
+
+
+class PackageManagerSummary(TypedDict):
+    """Installed state of a single Node.js package manager."""
+
+    installed: bool
+    version: str | None
+
+
+class RuntimeSummary(TypedDict):
+    """Installed state of a language runtime and its package managers."""
+
+    installed: bool
+    version: str | None
+    package_managers: dict[str, PackageManagerSummary]
+
+
+class SetupSummary(TypedDict):
+    """System readiness report produced by :meth:`DependencyChecker.get_setup_summary`."""
+
+    system_ready: bool
+    webserver: str | None
+    nodejs: RuntimeSummary
+    python: RuntimeSummary
+    missing_required: list[str]
+    missing_optional: list[str]
+    recommendations: list[str]
+
+
+def _chained_commands(script: str) -> list[list[str]]:
+    """
+    Split an install recipe into the argument vectors that follow the installer.
+
+    Recipes in this module are written as human-readable shell one-liners
+    ("curl ... | bash - && apt-get install -y nodejs"). Only the part after the
+    installer pipeline is turned into commands, and each is a plain argument
+    vector: no quoting, no redirection, no substitution.
+
+    Args:
+        script: The recipe string from a :class:`Dependency`.
+
+    Returns:
+        One argument vector per chained command, in order.
+    """
+    if "&&" not in script:
+        return []
+    vectors: list[list[str]] = []
+    for chunk in script.split("&&")[1:]:
+        # ``sudo`` in the recipes predates decision D6 (WASM runs as root).
+        words = [w for w in chunk.split() if w and w != "sudo"]
+        if words:
+            vectors.append(words)
+    return vectors
+
+
+def _npm_global_install_argv(script: str) -> list[str] | None:
+    """
+    Recognise the ``npm install -g <package>`` recipe shape.
+
+    Args:
+        script: The recipe string from a :class:`Dependency`.
+
+    Returns:
+        The argument vector to run, or None when the recipe is a different
+        shape and must not be executed.
+    """
+    words = script.split()
+    if words[:2] != ["npm", "install"]:
+        return None
+    # Anything with shell metacharacters is not the simple shape it looks like.
+    if any(ch in script for ch in "|;&><$`\n"):
+        return None
+    return words
 
 
 class DependencyStatus(Enum):
@@ -201,7 +287,7 @@ class DependencyChecker:
     """
 
     # All known dependencies by category
-    ALL_DEPENDENCIES: dict[str, list[Dependency]] = {
+    ALL_DEPENDENCIES: ClassVar[dict[str, list[Dependency]]] = {
         "system": SYSTEM_DEPENDENCIES,
         "webserver": WEBSERVER_DEPENDENCIES,
         "nodejs": NODEJS_DEPENDENCIES,
@@ -210,7 +296,7 @@ class DependencyChecker:
     }
 
     # Package manager info
-    PACKAGE_MANAGERS = {
+    PACKAGE_MANAGERS: ClassVar[dict[str, PackageManagerInfo]] = {
         "npm": {
             "lock_file": "package-lock.json",
             "install_cmd": "npm install -g npm",
@@ -338,8 +424,8 @@ class DependencyChecker:
         is_installed = self.check_command(pm)
         version = self.get_version(pm) if is_installed else None
 
-        pm_info = self.PACKAGE_MANAGERS.get(pm, {})
-        install_cmd = pm_info.get("install_cmd", f"npm install -g {pm}")
+        pm_info = self.PACKAGE_MANAGERS.get(pm)
+        install_cmd = pm_info["install_cmd"] if pm_info else f"npm install -g {pm}"
 
         install_instructions = f"Install with: {install_cmd}"
 
@@ -356,8 +442,7 @@ class DependencyChecker:
             Package manager name or None if not detected.
         """
         for pm, info in self.PACKAGE_MANAGERS.items():
-            lock_file = info.get("lock_file")
-            if lock_file and (app_path / lock_file).exists():
+            if (app_path / info["lock_file"]).exists():
                 return pm
 
         # Default to npm if package.json exists
@@ -375,7 +460,7 @@ class DependencyChecker:
         """
         missing = []
 
-        for category, deps in self.ALL_DEPENDENCIES.items():
+        for deps in self.ALL_DEPENDENCIES.values():
             for dep in deps:
                 if dep.required:
                     status, _ = self.check_dependency(dep)
@@ -441,14 +526,14 @@ class DependencyChecker:
                 missing.append("docker: Docker is required for docker-compose deployments")
             else:
                 # Verify Docker daemon is running
-                result = run_command(["docker", "info"])
+                result = self.runner.run(["docker", "info"], timeout=PROBE_TIMEOUT)
                 if not result.success:
                     missing.append(
-                        "docker: Docker daemon is not running. Start with: sudo systemctl start docker"
+                        "docker: Docker daemon is not running. Start with: systemctl start docker"
                     )
 
                 # Check Docker Compose v2
-                result = run_command(["docker", "compose", "version"])
+                result = self.runner.run(["docker", "compose", "version"], timeout=PROBE_TIMEOUT)
                 if not result.success:
                     missing.append("docker compose: Docker Compose v2 plugin is required")
 
@@ -471,12 +556,12 @@ class DependencyChecker:
         else:
             # Check if certbot nginx plugin is available when using nginx
             if has_nginx:
-                result = run_command(["certbot", "plugins"])
+                result = self.runner.run(["certbot", "plugins"], timeout=PROBE_TIMEOUT)
                 if result.success and "* nginx" not in result.stdout:
                     warnings.append(
                         "certbot nginx plugin not installed. "
                         "Webroot method will be used for SSL. "
-                        "For faster SSL setup, install: sudo apt install python3-certbot-nginx"
+                        "For faster SSL setup, install: apt install python3-certbot-nginx"
                     )
 
         can_deploy = len(missing) == 0
@@ -499,6 +584,13 @@ class DependencyChecker:
         """
         Install a dependency.
 
+        Only two installation shapes are supported, and both are argument
+        vectors: an apt package, or a whitelisted installer script fetched and
+        piped to bash. The previous third shape, handing an arbitrary
+        ``install_script`` string to ``sh -c``, is gone: the strings came from a
+        table in this module, but the mechanism accepted anything, so a future
+        entry (or a future caller building a Dependency) got a shell for free.
+
         Args:
             dep: Dependency to install.
 
@@ -506,46 +598,47 @@ class DependencyChecker:
             Tuple of (success, message).
         """
         if dep.install_apt:
-            result = run_command_sudo(["apt-get", "install", "-y", dep.install_apt])
+            result = self.runner.run(
+                ["apt-get", "install", "-y", dep.install_apt], timeout=INSTALL_TIMEOUT
+            )
             if result.success:
                 return True, f"Installed {dep.name} via apt"
             return False, f"Failed to install {dep.name}: {result.stderr}"
 
-        if dep.install_script:
-            script = dep.install_script
+        if not dep.install_script:
+            return False, f"No installation method available for {dep.name}"
 
-            # Check if script uses a trusted installer URL
-            for url in TRUSTED_INSTALLER_URLS:
-                if url in script:
-                    try:
-                        result = run_trusted_installer(url)
-                        # If the script includes additional commands (e.g., && apt-get install),
-                        # run the rest separately
-                        if "&&" in script:
-                            post_cmd = script.split("&&", 1)[1].strip()
-                            if post_cmd.startswith("sudo"):
-                                result = run_command_sudo(post_cmd.replace("sudo", "").split())
-                        if result.success:
-                            return True, f"Installed {dep.name}"
-                        return False, f"Failed to install {dep.name}: {result.stderr}"
-                    except Exception as e:
-                        return False, f"Failed to install {dep.name}: {e}"
+        script = dep.install_script
 
-            # For simple npm commands, convert to list format
-            if script.startswith("npm install"):
-                parts = script.split()
-                result = run_command_sudo(parts)
-                if result.success:
-                    return True, f"Installed {dep.name}"
+        # A trusted installer URL: fetch it, run it, then run whatever the
+        # recipe chains after it as its own argument vector.
+        for url in TRUSTED_INSTALLER_URLS:
+            if url not in script:
+                continue
+            try:
+                result = run_trusted_installer(url, runner=self.runner)
+            except SecurityError as e:
+                return False, f"Failed to install {dep.name}: {e}"
+            if not result.success:
                 return False, f"Failed to install {dep.name}: {result.stderr}"
 
-            # For other scripts, run with shell but log a warning
-            result = run_command(script, shell=True)
+            for follow_up in _chained_commands(script):
+                result = self.runner.run(follow_up, timeout=INSTALL_TIMEOUT)
+                if not result.success:
+                    return False, f"Failed to install {dep.name}: {result.stderr}"
+            return True, f"Installed {dep.name}"
+
+        argv = _npm_global_install_argv(script)
+        if argv is not None:
+            result = self.runner.run(argv, timeout=INSTALL_TIMEOUT)
             if result.success:
                 return True, f"Installed {dep.name}"
             return False, f"Failed to install {dep.name}: {result.stderr}"
 
-        return False, f"No installation method available for {dep.name}"
+        return (
+            False,
+            f"Unsupported install recipe for {dep.name}: {script}",
+        )
 
     def install_package_manager(self, pm: str) -> tuple[bool, str]:
         """
@@ -571,30 +664,36 @@ class DependencyChecker:
         if pm == "bun":
             # Bun has its own trusted installer
             try:
-                result = run_trusted_installer("https://bun.sh/install")
-            except Exception as e:
+                result = run_trusted_installer("https://bun.sh/install", runner=self.runner)
+            except SecurityError as e:
                 return False, f"Failed to install bun: {e}"
         else:
             # Install via npm globally
-            result = run_command_sudo(["npm", "install", "-g", pm])
+            result = self.runner.run(["npm", "install", "-g", pm], timeout=INSTALL_TIMEOUT)
 
         if result.success:
             return True, f"Successfully installed {pm}"
 
         return False, f"Failed to install {pm}: {result.stderr}"
 
-    def get_setup_summary(self) -> dict[str, any]:
+    def get_setup_summary(self) -> SetupSummary:
         """
         Get a comprehensive summary of system setup status.
 
         Returns:
-            Dict with setup status information.
+            The setup status, keyed as described by :class:`SetupSummary`.
         """
-        summary = {
+        nodejs: RuntimeSummary = {
+            "installed": False,
+            "version": None,
+            "package_managers": {},
+        }
+        python: RuntimeSummary = {"installed": False, "version": None, "package_managers": {}}
+        summary: SetupSummary = {
             "system_ready": True,
             "webserver": None,
-            "nodejs": {"installed": False, "version": None, "package_managers": {}},
-            "python": {"installed": False, "version": None},
+            "nodejs": nodejs,
+            "python": python,
             "missing_required": [],
             "missing_optional": [],
             "recommendations": [],
@@ -602,7 +701,7 @@ class DependencyChecker:
 
         # Check system deps
         for dep in SYSTEM_DEPENDENCIES:
-            status, version = self.check_dependency(dep)
+            status, _version = self.check_dependency(dep)
             if status == DependencyStatus.NOT_INSTALLED:
                 if dep.required:
                     summary["system_ready"] = False
@@ -618,35 +717,35 @@ class DependencyChecker:
         else:
             summary["system_ready"] = False
             summary["missing_required"].append("webserver (nginx or apache2)")
-            summary["recommendations"].append("Install nginx: sudo apt install nginx")
+            summary["recommendations"].append("Install nginx: apt install nginx")
 
         # Check Node.js
         if self.check_command("node"):
-            summary["nodejs"]["installed"] = True
-            summary["nodejs"]["version"] = self.get_version("node")
+            nodejs["installed"] = True
+            nodejs["version"] = self.get_version("node")
 
             # Check package managers
             for pm in ["npm", "pnpm", "yarn", "bun"]:
                 is_installed, version, _ = self.check_package_manager(pm)
-                summary["nodejs"]["package_managers"][pm] = {
+                nodejs["package_managers"][pm] = {
                     "installed": is_installed,
                     "version": version,
                 }
         else:
             summary["recommendations"].append(
-                "Install Node.js: curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - && sudo apt install -y nodejs"
+                "Install Node.js: wasm setup init (installs the NodeSource 20.x release)"
             )
 
         # Check Python
         if self.check_command("python3"):
-            summary["python"]["installed"] = True
-            summary["python"]["version"] = self.get_version("python3")
+            python["installed"] = True
+            python["version"] = self.get_version("python3")
 
         # Check certbot
         if not self.check_command("certbot"):
             summary["missing_optional"].append("certbot")
             summary["recommendations"].append(
-                "Install certbot for SSL: sudo apt install certbot python3-certbot-nginx"
+                "Install certbot for SSL: apt install certbot python3-certbot-nginx"
             )
 
         return summary
@@ -657,6 +756,7 @@ def check_deployment_ready(
     package_manager: str = "auto",
     app_path: Path | None = None,
     verbose: bool = False,
+    runner: CommandRunner | None = None,
 ) -> tuple[bool, list[str], list[str]]:
     """
     Quick check if system is ready for deployment.
@@ -666,11 +766,13 @@ def check_deployment_ready(
         package_manager: Package manager to use.
         app_path: Path to application.
         verbose: Enable verbose output.
+        runner: Command runner used to probe the system. Defaults to the
+            process-wide runner.
 
     Returns:
         Tuple of (ready, missing, warnings).
     """
-    checker = DependencyChecker(verbose=verbose)
+    checker = DependencyChecker(verbose=verbose, runner=runner)
     return checker.verify_deployment_requirements(app_type, package_manager, app_path)
 
 

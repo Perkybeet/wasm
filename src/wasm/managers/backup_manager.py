@@ -1,46 +1,118 @@
+# Copyright (c) 2024-2026 Yago López Prado
+# Licensed under WASM-NCSAL 1.0 (Commercial use prohibited)
+# https://github.com/Perkybeet/wasm/blob/main/LICENSE
+
 """
 Backup manager for WASM.
 
-Handles creating, listing, restoring, and managing backups
-for deployed web applications.
+A backup is a promise that the data can come back. Three things used to break
+that promise, and this module exists in its current shape because of them:
 
-The metadata a backup carries is a promise about what is inside it. Two of
-those promises used to be false: ``--include-databases`` recorded
-``includes_databases: true`` while a broken store lookup meant no dump was ever
-taken, and ``restore()`` put the files back but ignored the database dumps the
-metadata listed. Both are silent data loss in the one feature whose entire
-purpose is not losing data, so this module now refuses to claim more than it
-did.
+- **The archive was files only.** ``--include-databases`` recorded
+  ``includes_databases: true`` in the metadata and left the dump wherever the
+  engine manager happened to write it, on the same machine, tracked by nothing.
+  Rotation and ``delete()`` never touched those files, and an archive copied to
+  another host restored an application with an empty database. A backup is now
+  **self-contained**: dumps and Docker volume archives live *inside* the
+  ``.tar.gz`` under :data:`PAYLOAD_DIR`, together with a manifest describing
+  them, and :meth:`BackupManager.restore_archive` can restore a bare archive
+  file with no metadata and no store next to it.
+- **Extraction trusted the archive.** ``restore()`` ran ``tar -xzf``, which
+  writes ``../`` members outside the destination and follows symlinks. The
+  member-by-member extractor written for :mod:`wasm.managers.source_manager` is
+  reused here rather than re-implemented.
+- **``verify()`` verified nothing** it could not see: it shelled out to
+  ``sha256sum`` and ``tar -tzf``. Both checks now run in process, and the
+  archive is opened and walked, so a corrupted backup is found before a restore
+  needs it.
+
+**Size limits.** The whole application tree, every dump and every volume go into
+one archive, so a backup is as large as the data it protects. Extraction is
+bounded by :data:`MAX_BACKUP_ENTRIES` and :data:`MAX_BACKUP_BYTES` (overridable
+through ``backup.max_entries`` and ``backup.max_bytes``); an archive past those
+limits is refused rather than allowed to fill the disk during a restore.
+
+WASM requires root, so file operations happen in process and external commands
+(docker, chown, the hooks) go through the :class:`~wasm.core.runner.CommandRunner`
+with a timeout. There is no ``sudo`` here.
 """
 
+from __future__ import annotations
+
+import fnmatch
 import hashlib
 import json
+import shutil
 import sqlite3
+import tarfile
 import tempfile
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
-from typing import Any, ClassVar
+from pathlib import Path, PurePosixPath
+from typing import Any, ClassVar, Protocol, runtime_checkable
 
 from wasm.core.config import Config
-from wasm.core.exceptions import DatabaseError, ServiceError, WASMError
+from wasm.core.exceptions import (
+    BackupError,
+    DatabaseError,
+    SecurityError,
+    ServiceError,
+    ValidationError,
+    WASMError,
+)
 from wasm.core.logger import Logger
 from wasm.core.runner import DEFAULT_TIMEOUT, CommandResult, CommandRunner, get_runner
 from wasm.core.store import get_store
-from wasm.core.utils import domain_to_app_name, remove_directory
+from wasm.core.utils import domain_to_app_name
 from wasm.managers.service_manager import ServiceManager
+from wasm.managers.source_manager import SourceError, extract_archive
+from wasm.validators.names import resolve_within, validate_app_name, validate_filename
 
-#: Archiving or extracting an application tree is the slow part of a backup.
-_ARCHIVE_TIMEOUT = 600
+__all__ = [
+    "DATABASES_DIR",
+    "MANIFEST_NAME",
+    "MAX_BACKUP_BYTES",
+    "MAX_BACKUP_ENTRIES",
+    "PAYLOAD_DIR",
+    "VOLUMES_DIR",
+    "BackupError",
+    "BackupManager",
+    "BackupMetadata",
+    "RollbackManager",
+]
 
 #: Docker has to pull alpine the first time a volume is backed up.
 _DOCKER_TIMEOUT = 600
 
+#: Deadline for chown over a restored tree.
+_OWNERSHIP_TIMEOUT = 300
 
-class BackupError(WASMError):
-    """Exception raised for backup-related errors."""
+#: Deadline for a user-supplied hook.
+_HOOK_TIMEOUT = 600
 
-    pass
+#: gzip level. 9 costs several times the CPU of 6 for a few percent of size on
+#: an application tree, and a backup that takes too long is a backup nobody runs.
+_COMPRESS_LEVEL = 6
+
+#: Reserved top-level directory inside the archive. Everything that is not the
+#: application tree lives under it.
+PAYLOAD_DIR = "wasm-backup"
+
+#: Database dumps, inside :data:`PAYLOAD_DIR`.
+DATABASES_DIR = "databases"
+
+#: Docker volume archives, inside :data:`PAYLOAD_DIR`.
+VOLUMES_DIR = "volumes"
+
+#: Description of the archive's own contents, inside :data:`PAYLOAD_DIR`.
+MANIFEST_NAME = "manifest.json"
+
+#: Members allowed out of a backup archive during a restore.
+MAX_BACKUP_ENTRIES = 2_000_000
+
+#: Bytes allowed out of a backup archive during a restore.
+MAX_BACKUP_BYTES = 256 * 1024**3
 
 
 @dataclass
@@ -69,7 +141,12 @@ class BackupMetadata:
     tags: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary."""
+        """
+        Convert to a JSON-serialisable dictionary.
+
+        Returns:
+            The metadata as plain data.
+        """
         return {
             "id": self.id,
             "domain": self.domain,
@@ -94,8 +171,16 @@ class BackupMetadata:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "BackupMetadata":
-        """Create from dictionary."""
+    def from_dict(cls, data: dict[str, Any]) -> BackupMetadata:
+        """
+        Create metadata from a dictionary.
+
+        Args:
+            data: Metadata as read from a ``.json`` sidecar or a manifest.
+
+        Returns:
+            The parsed metadata.
+        """
         return cls(
             id=data["id"],
             domain=data["domain"],
@@ -121,8 +206,13 @@ class BackupMetadata:
 
     @property
     def size_human(self) -> str:
-        """Get human-readable size."""
-        size = self.size_bytes
+        """
+        Render the archive size in the largest unit that keeps it under 1024.
+
+        Returns:
+            A human-readable size.
+        """
+        size = float(self.size_bytes)
         for unit in ["B", "KB", "MB", "GB"]:
             if size < 1024:
                 return f"{size:.1f} {unit}"
@@ -131,7 +221,12 @@ class BackupMetadata:
 
     @property
     def age(self) -> str:
-        """Get human-readable age."""
+        """
+        Render how long ago the backup was taken.
+
+        Returns:
+            A human-readable age, or "unknown" for an unparsable timestamp.
+        """
         try:
             created = datetime.fromisoformat(self.created_at)
             delta = datetime.now() - created
@@ -154,8 +249,8 @@ class BackupManager:
     """
     Manager for application backups.
 
-    Handles creating, listing, restoring, and managing backups
-    for WASM-deployed applications.
+    Creates self-contained archives, lists and verifies them, restores them and
+    enforces retention.
     """
 
     # Default backup directory
@@ -189,16 +284,17 @@ class BackupManager:
     # Maximum backups to keep per app (default)
     DEFAULT_MAX_BACKUPS = 10
 
-    # Backup format version
-    BACKUP_VERSION = "1.0.0"
+    # Archive layout version. 1.x archives kept the application tree at the top
+    # level and pointed at dumps living outside the archive.
+    BACKUP_VERSION = "2.0.0"
 
-    def __init__(self, verbose: bool = False, runner: CommandRunner | None = None):
+    def __init__(self, verbose: bool = False, runner: CommandRunner | None = None) -> None:
         """
-        Initialize backup manager.
+        Initialize the backup manager.
 
         Args:
             verbose: Enable verbose logging.
-            runner: Command runner used for tar, docker and friends. Defaults
+            runner: Command runner used for docker, chown and hooks. Defaults
                 to the process-wide runner.
         """
         self.verbose = verbose
@@ -207,14 +303,17 @@ class BackupManager:
         self._runner = runner
         self.service_manager = ServiceManager(verbose=verbose, runner=runner)
 
-        # Get backup directory from config or use default
         self.backup_dir = Path(self.config.get("backup.directory", str(self.DEFAULT_BACKUP_DIR)))
         self.max_backups = self.config.get("backup.max_per_app", self.DEFAULT_MAX_BACKUPS)
+        self.max_entries = int(self.config.get("backup.max_entries", MAX_BACKUP_ENTRIES))
+        self.max_bytes = int(self.config.get("backup.max_bytes", MAX_BACKUP_BYTES))
+
+    # -- plumbing ---------------------------------------------------------
 
     @property
     def runner(self) -> CommandRunner:
         """
-        The command runner used for every external command.
+        Return the command runner used for every external command.
 
         Returns:
             The injected runner, or the process-wide one.
@@ -223,7 +322,7 @@ class BackupManager:
 
     def _exec(
         self,
-        argv: list[str],
+        argv: Sequence[str],
         *,
         cwd: Path | None = None,
         env: dict[str, str] | None = None,
@@ -243,94 +342,103 @@ class BackupManager:
         """
         return self.runner.run([str(a) for a in argv], cwd=cwd, env=env, timeout=timeout)
 
-    def _exec_sudo(
-        self,
-        argv: list[str],
-        *,
-        cwd: Path | None = None,
-        timeout: int = DEFAULT_TIMEOUT,
-    ) -> CommandResult:
-        """
-        Run a privileged command through the shared runner.
-
-        Args:
-            argv: Program and arguments.
-            cwd: Working directory.
-            timeout: Deadline in seconds.
-
-        Returns:
-            The command outcome.
-        """
-        return self._exec(["sudo", *argv], cwd=cwd, timeout=timeout)
-
-    def _run(
-        self,
-        command: list[str],
-        cwd: Path | None = None,
-        env: dict[str, str] | None = None,
-        timeout: int = DEFAULT_TIMEOUT,
-    ) -> CommandResult:
-        """
-        Execute an unprivileged command.
-
-        Args:
-            command: Program and arguments.
-            cwd: Working directory.
-            env: Extra environment variables.
-            timeout: Deadline in seconds.
-
-        Returns:
-            The command outcome.
-        """
-        return self._exec(command, cwd=cwd, env=env, timeout=timeout)
-
     def _ensure_backup_dir(self) -> None:
-        """Ensure backup directory exists with proper permissions."""
-        if not self.backup_dir.exists():
-            result = self._exec_sudo(["mkdir", "-p", str(self.backup_dir)])
-            if not result.success:
-                raise BackupError(f"Failed to create backup directory: {self.backup_dir}")
+        """
+        Ensure the backup directory exists and is not world readable.
 
-            # Set permissions
-            self._exec_sudo(["chmod", "750", str(self.backup_dir)])
+        Raises:
+            BackupError: If the directory cannot be created.
+        """
+        try:
+            self.backup_dir.mkdir(parents=True, exist_ok=True)
+            self.backup_dir.chmod(0o750)
+        except OSError as exc:
+            raise BackupError(
+                f"Failed to create backup directory: {self.backup_dir}",
+                details=f"{exc}. WASM must run as root.",
+            ) from exc
 
     def _get_app_backup_dir(self, app_name: str) -> Path:
-        """Get backup directory for a specific app."""
+        """
+        Return the backup directory of one application.
+
+        Args:
+            app_name: Application name.
+
+        Returns:
+            The per-application directory under :attr:`backup_dir`.
+        """
         return self.backup_dir / app_name
 
     def _generate_backup_id(self, domain: str) -> str:
-        """Generate unique backup ID."""
+        """
+        Build a unique backup identifier.
+
+        Args:
+            domain: Domain the backup belongs to.
+
+        Returns:
+            An identifier of the form ``<domain-with-dashes>_<timestamp>``.
+        """
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         return f"{domain.replace('.', '-')}_{timestamp}"
 
     def _calculate_checksum(self, file_path: Path) -> str:
-        """Calculate SHA256 checksum of a file."""
+        """
+        Calculate the SHA256 checksum of a file.
+
+        Args:
+            file_path: File to hash.
+
+        Returns:
+            The hex digest.
+
+        Raises:
+            BackupError: If the file cannot be read.
+        """
         sha256 = hashlib.sha256()
-        with open(file_path, "rb") as f:
-            for chunk in iter(lambda: f.read(8192), b""):
-                sha256.update(chunk)
+        try:
+            with open(file_path, "rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    sha256.update(chunk)
+        except OSError as exc:
+            raise BackupError(f"Cannot read {file_path}", details=str(exc)) from exc
         return sha256.hexdigest()
 
-    def _get_git_info(self, app_path: Path) -> tuple:
-        """Get git commit and branch info."""
-        git_commit = None
-        git_branch = None
+    def _get_git_info(self, app_path: Path) -> tuple[str | None, str | None]:
+        """
+        Read the commit and branch of the deployed tree.
+
+        Args:
+            app_path: Application directory.
+
+        Returns:
+            The short commit and the branch, either of which may be None.
+        """
+        git_commit: str | None = None
+        git_branch: str | None = None
 
         if (app_path / ".git").exists():
-            # Get current commit
-            result = self._run(["git", "rev-parse", "HEAD"], cwd=app_path)
+            result = self._exec(["git", "rev-parse", "HEAD"], cwd=app_path)
             if result.success:
                 git_commit = result.stdout.strip()[:12]
 
-            # Get current branch
-            result = self._run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=app_path)
+            result = self._exec(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=app_path)
             if result.success:
                 git_branch = result.stdout.strip()
 
         return git_commit, git_branch
 
     def _detect_app_type(self, app_path: Path) -> str:
-        """Detect application type from files."""
+        """
+        Detect the application type from the files in the tree.
+
+        Args:
+            app_path: Application directory.
+
+        Returns:
+            The detected type, or "unknown".
+        """
         if (app_path / "next.config.js").exists() or (app_path / "next.config.mjs").exists():
             return "nextjs"
         elif (app_path / "vite.config.js").exists() or (app_path / "vite.config.ts").exists():
@@ -349,7 +457,17 @@ class BackupManager:
         include_build: bool = False,
         custom_excludes: list[str] | None = None,
     ) -> list[str]:
-        """Build list of patterns to exclude from backup."""
+        """
+        Build the list of patterns kept out of the archive.
+
+        Args:
+            include_node_modules: Keep ``node_modules`` in the archive.
+            include_build: Keep build output in the archive.
+            custom_excludes: Extra patterns from the caller.
+
+        Returns:
+            The exclusion patterns.
+        """
         excludes = self.DEFAULT_EXCLUDES.copy()
 
         if include_node_modules and "node_modules" in excludes:
@@ -364,6 +482,81 @@ class BackupManager:
             excludes.extend(custom_excludes)
 
         return excludes
+
+    @staticmethod
+    def _is_excluded(relative: PurePosixPath, patterns: Sequence[str]) -> bool:
+        """
+        Decide whether an archive member matches an exclusion pattern.
+
+        Args:
+            relative: Member path relative to the application root.
+            patterns: Patterns from :meth:`_build_exclude_list`.
+
+        Returns:
+            True when the member must be left out.
+        """
+        text = relative.as_posix()
+        for pattern in patterns:
+            if "/" in pattern:
+                if (
+                    text == pattern
+                    or text.startswith(f"{pattern}/")
+                    or fnmatch.fnmatch(text, pattern)
+                    or fnmatch.fnmatch(text, f"{pattern}/*")
+                ):
+                    return True
+            elif any(fnmatch.fnmatch(part, pattern) for part in relative.parts):
+                return True
+        return False
+
+    # -- archive construction --------------------------------------------
+
+    def _write_archive(
+        self,
+        destination: Path,
+        app_path: Path,
+        app_name: str,
+        payload_dir: Path,
+        excludes: Sequence[str],
+    ) -> None:
+        """
+        Write the backup archive: application tree plus payload.
+
+        The archive is built in process rather than by shelling out to ``tar``:
+        the payload has to be placed at an exact path, unsupported file types
+        (sockets, devices, FIFOs) have to be dropped rather than guessed at, and
+        a backup nobody can reason about is a backup nobody can trust.
+
+        Args:
+            destination: Archive file to create.
+            app_path: Application directory to archive.
+            app_name: Name the application tree takes inside the archive.
+            payload_dir: Directory holding dumps, volumes and the manifest.
+            excludes: Patterns to leave out of the application tree.
+
+        Raises:
+            BackupError: If the archive cannot be written.
+        """
+
+        def _filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
+            parts = PurePosixPath(info.name).parts[1:]
+            if parts and self._is_excluded(PurePosixPath(*parts), excludes):
+                return None
+            if not (info.isfile() or info.isdir() or info.issym() or info.islnk()):
+                self.logger.debug(f"Skipping unsupported file type in backup: {info.name}")
+                return None
+            return info
+
+        try:
+            with tarfile.open(destination, "w:gz", compresslevel=_COMPRESS_LEVEL) as archive:
+                archive.add(app_path, arcname=app_name, recursive=True, filter=_filter)
+                archive.add(payload_dir, arcname=PAYLOAD_DIR, recursive=True)
+        except (tarfile.TarError, OSError) as exc:
+            destination.unlink(missing_ok=True)
+            raise BackupError(
+                f"Failed to create backup archive for {app_name}",
+                details=str(exc),
+            ) from exc
 
     def create(
         self,
@@ -382,142 +575,143 @@ class BackupManager:
         pre_backup_hook: str | None = None,
     ) -> BackupMetadata:
         """
-        Create a backup of an application.
+        Create a self-contained backup of an application.
 
         Args:
             domain: Domain name of the application.
             description: Optional description for the backup.
-            include_env: Include .env files in backup.
-            include_node_modules: Include node_modules (large!).
+            include_env: Include ``.env`` files in the backup.
+            include_node_modules: Include ``node_modules`` (large).
             include_build: Include build artifacts.
-            include_databases: Include associated database dumps.
-            include_docker_volumes: Include Docker named volumes.
-            schemas: PostgreSQL schemas to backup (None = all).
+            include_databases: Dump the associated databases into the archive.
+            include_docker_volumes: Put the named Docker volumes in the archive.
+            schemas: Not supported; see Raises.
             redis_method: Redis backup method ("rdb" or "aof").
-            retention_count: Max backups to keep (overrides default).
+            retention_count: Max backups to keep (overrides the default).
             retention_days: Max age in days for backups.
             tags: Optional tags for the backup.
-            pre_backup_hook: Optional command to run before backup.
+            pre_backup_hook: Optional command to run before the backup.
 
         Returns:
-            BackupMetadata for the created backup.
+            Metadata describing the archive that was written.
 
         Raises:
-            BackupError: If backup fails.
+            BackupError: If the application is missing, a dump fails, or the
+                archive cannot be written. Also when ``schemas`` is given: a
+                per-schema dump is written by the engine outside the archive,
+                which is exactly the promise this module no longer makes.
+            ValidationError: If the domain does not yield a usable app name.
         """
-        app_name = domain_to_app_name(domain)
-        app_path = self.config.apps_directory / app_name
+        if schemas:
+            raise BackupError(
+                "Per-schema dumps cannot be placed inside a self-contained backup",
+                details="Back up the whole database, or use 'wasm db backup --schema' separately.",
+            )
 
+        app_name = validate_app_name(domain_to_app_name(domain))
+        if app_name == PAYLOAD_DIR:
+            raise BackupError(
+                f"Application name '{app_name}' is reserved inside a backup archive",
+                details="Rename the deployment; this name collides with the archive payload.",
+            )
+
+        app_path = self.config.apps_directory / app_name
         if not app_path.exists():
-            raise BackupError(f"Application not found: {domain}")
+            raise BackupError(
+                f"Application not found: {domain}",
+                details=f"Nothing to back up at {app_path}.",
+            )
 
         self._ensure_backup_dir()
-
-        # Create app backup directory
         app_backup_dir = self._get_app_backup_dir(app_name)
-        if not app_backup_dir.exists():
-            self._exec_sudo(["mkdir", "-p", str(app_backup_dir)])
+        try:
+            app_backup_dir.mkdir(parents=True, exist_ok=True)
+            app_backup_dir.chmod(0o750)
+        except OSError as exc:
+            raise BackupError(
+                f"Failed to create backup directory: {app_backup_dir}",
+                details=str(exc),
+            ) from exc
 
-        # Generate backup ID
         backup_id = self._generate_backup_id(domain)
         backup_file = app_backup_dir / f"{backup_id}.tar.gz"
         metadata_file = app_backup_dir / f"{backup_id}.json"
 
         self.logger.debug(f"Creating backup: {backup_id}")
 
-        # Run pre-backup hook if specified
         if pre_backup_hook:
             self.logger.debug(f"Running pre-backup hook: {pre_backup_hook}")
-            result = self._run(["bash", "-c", pre_backup_hook], cwd=app_path)
+            result = self._exec(
+                ["bash", "-c", pre_backup_hook], cwd=app_path, timeout=_HOOK_TIMEOUT
+            )
             if not result.success:
                 self.logger.warning(f"Pre-backup hook failed: {result.stderr}")
 
-        # Get git info
         git_commit, git_branch = self._get_git_info(app_path)
-
-        # Detect app type
         app_type = self._detect_app_type(app_path)
-
-        # Build exclude list
         excludes = self._build_exclude_list(
             include_node_modules=include_node_modules,
             include_build=include_build,
         )
+        if not include_env:
+            excludes.extend([".env", ".env.*"])
 
-        # Handle .env files
-        env_files = []
-        if include_env:
-            for env_file in app_path.glob(".env*"):
-                if env_file.is_file():
-                    env_files.append(env_file.name)
-        else:
-            excludes.extend([".env", ".env.*", ".env.local", ".env.production"])
+        with tempfile.TemporaryDirectory(prefix="wasm-backup-") as staging:
+            staging_path = Path(staging)
+            payload_dir = staging_path / PAYLOAD_DIR
+            payload_dir.mkdir(mode=0o700)
 
-        # Create tar archive with compression
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
-                tmp_path = Path(tmp.name)
-
-            # Build tar command with excludes
-            tar_cmd = ["tar", "-czf", str(tmp_path)]
-            for pattern in excludes:
-                tar_cmd.extend(["--exclude", pattern])
-            tar_cmd.extend(["-C", str(app_path.parent), app_name])
-
-            self.logger.debug(f"Running: {' '.join(tar_cmd)}")
-            result = self._exec(tar_cmd, timeout=_ARCHIVE_TIMEOUT)
-
-            if not result.success:
-                raise BackupError(f"Tar failed: {result.stderr}")
-
-            # Move to backup location
-            result = self._exec_sudo(["mv", str(tmp_path), str(backup_file)])
-            if not result.success:
-                raise BackupError(f"Failed to move backup: {result.stderr}")
-
-            # Set permissions
-            self._exec_sudo(["chmod", "640", str(backup_file)])
-
-        except (BackupError, OSError) as e:
-            # Cleanup on failure
-            if tmp_path.exists():
-                tmp_path.unlink()
-            raise BackupError(f"Backup creation failed: {e}") from e
-
-        # Get backup size
-        result = self._run(["stat", "-c", "%s", str(backup_file)])
-        size_bytes = int(result.stdout.strip()) if result.success else 0
-
-        # Calculate checksum
-        # Read file as root to calculate checksum
-        result = self._exec_sudo(["sha256sum", str(backup_file)])
-        checksum = result.stdout.split()[0] if result.success else None
-
-        # Backup associated databases if requested
-        database_backups: list[dict[str, Any]] = []
-        schema_backup_list: list[dict[str, Any]] = []
-        if include_databases:
-            database_backups = self._backup_databases(domain)
-            if not database_backups:
-                self.logger.warning(
-                    f"No database was backed up for {domain}: the archive contains files only"
+            database_backups: list[dict[str, Any]] = []
+            if include_databases:
+                database_backups = self._dump_databases(
+                    domain, payload_dir / DATABASES_DIR, redis_method=redis_method
                 )
+                if not database_backups:
+                    self.logger.warning(
+                        f"No database was backed up for {domain}: the archive contains files only"
+                    )
 
-        # Backup Docker volumes if requested
-        docker_volume_backup_list: list[dict[str, Any]] = []
-        if include_docker_volumes:
-            volumes = self._discover_docker_volumes(app_path)
-            if volumes:
-                docker_volume_backup_list = self._backup_docker_volumes(
-                    domain, volumes, app_backup_dir
-                )
+            volume_backups: list[dict[str, Any]] = []
+            if include_docker_volumes:
+                volumes = self._discover_docker_volumes(app_path)
+                if volumes:
+                    volume_backups = self._dump_docker_volumes(volumes, payload_dir / VOLUMES_DIR)
 
-        # Create metadata
+            created_at = datetime.now().isoformat()
+            manifest: dict[str, Any] = {
+                "manifest_version": self.BACKUP_VERSION,
+                "id": backup_id,
+                "domain": domain,
+                "app_name": app_name,
+                "app_root": app_name,
+                "app_type": app_type,
+                "created_at": created_at,
+                "databases": database_backups,
+                "volumes": volume_backups,
+            }
+            (payload_dir / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2))
+
+            staged_archive = staging_path / "archive.tar.gz"
+            self._write_archive(staged_archive, app_path, app_name, payload_dir, excludes)
+
+            size_bytes = staged_archive.stat().st_size
+            checksum = self._calculate_checksum(staged_archive)
+
+            try:
+                shutil.move(str(staged_archive), str(backup_file))
+                backup_file.chmod(0o640)
+            except OSError as exc:
+                backup_file.unlink(missing_ok=True)
+                raise BackupError(
+                    f"Failed to store backup archive: {backup_file}",
+                    details=str(exc),
+                ) from exc
+
         metadata = BackupMetadata(
             id=backup_id,
             domain=domain,
             app_name=app_name,
-            created_at=datetime.now().isoformat(),
+            created_at=created_at,
             size_bytes=size_bytes,
             app_type=app_type,
             version=self.BACKUP_VERSION,
@@ -528,26 +722,26 @@ class BackupManager:
             # The flags describe the archive, not the request: a backup that
             # dumped nothing must not claim to carry a database.
             includes_databases=bool(database_backups),
-            includes_docker_volumes=bool(docker_volume_backup_list),
+            includes_docker_volumes=bool(volume_backups),
             database_backups=database_backups,
-            docker_volume_backups=docker_volume_backup_list,
-            schema_backups=schema_backup_list,
+            docker_volume_backups=volume_backups,
+            schema_backups=[],
             git_commit=git_commit,
             git_branch=git_branch,
             checksum=checksum,
             tags=tags or [],
         )
 
-        # Save metadata
-        metadata_content = json.dumps(metadata.to_dict(), indent=2)
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
-            tmp.write(metadata_content)
-            tmp_meta_path = Path(tmp.name)
+        try:
+            metadata_file.write_text(json.dumps(metadata.to_dict(), indent=2))
+            metadata_file.chmod(0o640)
+        except OSError as exc:
+            backup_file.unlink(missing_ok=True)
+            raise BackupError(
+                f"Failed to write backup metadata: {metadata_file}",
+                details=str(exc),
+            ) from exc
 
-        self._exec_sudo(["mv", str(tmp_meta_path), str(metadata_file)])
-        self._exec_sudo(["chmod", "644", str(metadata_file)])
-
-        # Rotate backups using policy if specified, otherwise default
         if retention_count is not None or retention_days is not None:
             self.rotate_by_policy(
                 app_name,
@@ -561,6 +755,24 @@ class BackupManager:
 
         return metadata
 
+    # -- listing ----------------------------------------------------------
+
+    def _read_metadata_file(self, path: Path) -> BackupMetadata | None:
+        """
+        Read one metadata sidecar.
+
+        Args:
+            path: The ``.json`` file to read.
+
+        Returns:
+            The metadata, or None when the file is unreadable or malformed.
+        """
+        try:
+            return BackupMetadata.from_dict(json.loads(path.read_text()))
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            self.logger.debug(f"Error reading metadata {path}: {exc}")
+            return None
+
     def list_backups(
         self,
         domain: str | None = None,
@@ -569,28 +781,26 @@ class BackupManager:
         limit: int | None = None,
     ) -> list[BackupMetadata]:
         """
-        List backups for an application or all applications.
+        List backups for one application or for all of them.
 
         Args:
             domain: Filter by domain (None for all).
             app_name: Filter by app name directly (alternative to domain).
-            tags: Filter by tags.
+            tags: Only return backups carrying one of these tags.
             limit: Maximum number of backups to return.
 
         Returns:
-            List of BackupMetadata objects.
+            The backups whose archive is present, newest first.
         """
-        backups = []
+        backups: list[BackupMetadata] = []
 
         if not self.backup_dir.exists():
             return backups
 
-        # Determine which directories to scan
         if app_name:
             dirs_to_scan = [self._get_app_backup_dir(app_name)]
         elif domain:
-            resolved_app_name = domain_to_app_name(domain)
-            dirs_to_scan = [self._get_app_backup_dir(resolved_app_name)]
+            dirs_to_scan = [self._get_app_backup_dir(domain_to_app_name(domain))]
         else:
             dirs_to_scan = [d for d in self.backup_dir.iterdir() if d.is_dir()]
 
@@ -599,30 +809,18 @@ class BackupManager:
                 continue
 
             for metadata_file in app_dir.glob("*.json"):
-                try:
-                    # Read metadata (may need sudo)
-                    result = self._exec_sudo(["cat", str(metadata_file)])
-                    if result.success:
-                        data = json.loads(result.stdout)
-                        metadata = BackupMetadata.from_dict(data)
-
-                        # Check if backup file exists
-                        backup_file = app_dir / f"{metadata.id}.tar.gz"
-                        result = self._exec_sudo(["test", "-f", str(backup_file)])
-                        if not result.success:
-                            continue
-
-                        # Filter by tags
-                        if tags:
-                            if not any(tag in metadata.tags for tag in tags):
-                                continue
-
-                        backups.append(metadata)
-                except (OSError, ValueError, KeyError) as e:
-                    self.logger.debug(f"Error reading metadata {metadata_file}: {e}")
+                metadata = self._read_metadata_file(metadata_file)
+                if metadata is None:
                     continue
 
-        # Sort by creation date (newest first)
+                if not (app_dir / f"{metadata.id}.tar.gz").is_file():
+                    continue
+
+                if tags and not any(tag in metadata.tags for tag in tags):
+                    continue
+
+                backups.append(metadata)
+
         backups.sort(key=lambda b: b.created_at, reverse=True)
 
         if limit:
@@ -632,43 +830,49 @@ class BackupManager:
 
     def get_backup(self, backup_id: str) -> BackupMetadata | None:
         """
-        Get a specific backup by ID.
+        Get one backup by identifier.
 
         Args:
-            backup_id: Backup ID.
+            backup_id: Backup identifier.
 
         Returns:
-            BackupMetadata or None if not found.
+            The metadata, or None when no such backup exists.
         """
-        # Search all backup directories
+        if not self.backup_dir.exists():
+            return None
+
+        try:
+            name = validate_filename(f"{backup_id}.json")
+        except ValidationError:
+            self.logger.debug(f"Refusing to look up an unusable backup id: {backup_id!r}")
+            return None
+
         for app_dir in self.backup_dir.iterdir():
             if not app_dir.is_dir():
                 continue
 
-            metadata_file = app_dir / f"{backup_id}.json"
-            if metadata_file.exists():
-                try:
-                    result = self._exec_sudo(["cat", str(metadata_file)])
-                    if result.success:
-                        data = json.loads(result.stdout)
-                        return BackupMetadata.from_dict(data)
-                except (OSError, ValueError, KeyError) as e:
-                    self.logger.debug(f"Could not read backup metadata {metadata_file}: {e}")
+            metadata_file = app_dir / name
+            if metadata_file.is_file():
+                metadata = self._read_metadata_file(metadata_file)
+                if metadata is not None:
+                    return metadata
 
         return None
 
     def get_latest_backup(self, domain: str) -> BackupMetadata | None:
         """
-        Get the most recent backup for an application.
+        Get the most recent backup of an application.
 
         Args:
             domain: Domain name.
 
         Returns:
-            BackupMetadata or None if no backups exist.
+            The newest backup, or None when there is none.
         """
         backups = self.list_backups(domain=domain, limit=1)
         return backups[0] if backups else None
+
+    # -- restore ----------------------------------------------------------
 
     def restore(
         self,
@@ -681,232 +885,484 @@ class BackupManager:
         post_restore_hook: str | None = None,
     ) -> bool:
         """
-        Restore an application from backup.
+        Restore an application from a backup this manager knows about.
 
         Args:
-            backup_id: Backup ID to restore.
-            target_domain: Target domain (defaults to original).
-            restore_env: Restore .env files.
-            stop_service: Stop service before restore.
-            verify_checksum: Verify backup integrity.
-            pre_restore_hook: Command to run before restore.
-            post_restore_hook: Command to run after restore.
+            backup_id: Backup identifier.
+            target_domain: Target domain (defaults to the original).
+            restore_env: Restore the ``.env`` files from the archive.
+            stop_service: Stop the service before restoring.
+            verify_checksum: Check the archive against the recorded checksum.
+            pre_restore_hook: Command to run before the restore.
+            post_restore_hook: Command to run after the restore.
 
         Returns:
-            True if restore was successful.
+            True if the restore succeeded.
 
         Raises:
-            BackupError: If restore fails, including when a database dump the
-                metadata lists cannot be put back.
+            BackupError: If the backup is missing, corrupted, unsafe to extract,
+                or if a database it carries cannot be put back.
         """
-        # Get backup metadata
         metadata = self.get_backup(backup_id)
         if not metadata:
-            raise BackupError(f"Backup not found: {backup_id}")
+            raise BackupError(
+                f"Backup not found: {backup_id}",
+                details="Run 'wasm backup list' to see the backups WASM knows about.",
+            )
 
-        # Determine target
-        domain = target_domain or metadata.domain
-        app_name = domain_to_app_name(domain)
-        app_path = self.config.apps_directory / app_name
-
-        # Get backup file path
         source_app_name = domain_to_app_name(metadata.domain)
         backup_file = self._get_app_backup_dir(source_app_name) / f"{backup_id}.tar.gz"
+        if not backup_file.is_file():
+            raise BackupError(
+                f"Backup file not found: {backup_file}",
+                details="The metadata is there but the archive is not.",
+            )
 
-        # Verify backup file exists
-        result = self._exec_sudo(["test", "-f", str(backup_file)])
-        if not result.success:
-            raise BackupError(f"Backup file not found: {backup_file}")
+        return self.restore_archive(
+            backup_file,
+            target_domain=target_domain or metadata.domain,
+            restore_env=restore_env,
+            stop_service=stop_service,
+            expected_checksum=metadata.checksum if verify_checksum else None,
+            fallback=metadata,
+            pre_restore_hook=pre_restore_hook,
+            post_restore_hook=post_restore_hook,
+        )
 
-        # Verify checksum
-        if verify_checksum and metadata.checksum:
-            self.logger.debug("Verifying backup checksum...")
-            result = self._exec_sudo(["sha256sum", str(backup_file)])
-            if result.success:
-                current_checksum = result.stdout.split()[0]
-                if current_checksum != metadata.checksum:
-                    raise BackupError("Backup checksum mismatch - file may be corrupted")
-            else:
-                self.logger.warning("Could not verify checksum")
+    def restore_archive(
+        self,
+        archive: Path,
+        *,
+        target_domain: str | None = None,
+        restore_env: bool = True,
+        stop_service: bool = True,
+        expected_checksum: str | None = None,
+        fallback: BackupMetadata | None = None,
+        pre_restore_hook: str | None = None,
+        post_restore_hook: str | None = None,
+    ) -> bool:
+        """
+        Restore an application from an archive file, wherever it lives.
 
-        # Stop service if requested
-        service_was_running = False
-        if stop_service:
-            try:
-                status = self.service_manager.get_status(app_name)
-                service_was_running = status.get("active", False)
-                if service_was_running:
-                    self.logger.debug(f"Stopping service: {app_name}")
-                    self.service_manager.stop(app_name)
-            except ServiceError as e:
-                self.logger.warning(f"Could not stop service before restore: {e}")
+        This is the method that makes a backup portable: the archive carries its
+        own manifest, so a file copied from another machine restores the
+        application tree *and* the databases and volumes it contains, with no
+        metadata sidecar and no store entry.
 
-        # Run pre-restore hook
-        if pre_restore_hook:
-            self.logger.debug(f"Running pre-restore hook: {pre_restore_hook}")
-            result = self._run(["bash", "-c", pre_restore_hook], cwd=app_path)
-            if not result.success:
-                self.logger.warning(f"Pre-restore hook failed: {result.stderr}")
+        Args:
+            archive: Path to the ``.tar.gz`` backup.
+            target_domain: Domain to restore into. Defaults to the one recorded
+                in the archive manifest.
+            restore_env: Restore the ``.env`` files from the archive. When
+                False, the ``.env`` currently deployed is kept.
+            stop_service: Stop the service before restoring.
+            expected_checksum: SHA256 the archive must match, when known.
+            fallback: Metadata of an older archive that carries no manifest.
+            pre_restore_hook: Command to run before the restore.
+            post_restore_hook: Command to run after the restore.
 
-        # Backup current .env if it exists and we're not restoring env
-        env_backup = None
-        env_file = app_path / ".env"
-        if not restore_env and env_file.exists():
-            result = self._exec_sudo(["cat", str(env_file)])
-            if result.success:
-                env_backup = result.stdout
+        Returns:
+            True if the restore succeeded.
 
-        # Create temporary extraction directory and backup current state
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_path = Path(tmp_dir)
-            current_backup_path = tmp_path / "current_backup"
-            extracted_path = None
+        Raises:
+            BackupError: If the archive is missing, does not match its checksum,
+                contains a member that is unsafe to extract, does not say which
+                application it belongs to, or carries data that cannot be put
+                back.
+        """
+        archive = Path(archive)
+        if not archive.is_file():
+            raise BackupError(
+                f"Backup archive not found: {archive}",
+                details="Pass the path of a .tar.gz written by 'wasm backup create'.",
+            )
 
-            # Step 1: Backup current app directory if it exists (for rollback)
-            had_existing_app = app_path.exists()
-            if had_existing_app:
-                self.logger.debug("Creating temporary backup of current state")
-                result = self._exec_sudo(["cp", "-a", str(app_path), str(current_backup_path)])
-                if not result.success:
-                    self.logger.warning(f"Could not create safety backup: {result.stderr}")
-                    # Continue anyway, but mark that we don't have a backup
-                    had_existing_app = False
-
-            try:
-                # Step 2: Extract backup to temp directory
-                extract_path = tmp_path / "extracted"
-                self._exec_sudo(["mkdir", "-p", str(extract_path)])
-
-                self.logger.debug(f"Extracting backup to {extract_path}")
-                result = self._exec_sudo(
-                    ["tar", "-xzf", str(backup_file), "-C", str(extract_path)],
-                    timeout=_ARCHIVE_TIMEOUT,
+        if expected_checksum:
+            self.logger.debug("Verifying backup checksum")
+            if self._calculate_checksum(archive) != expected_checksum:
+                raise BackupError(
+                    f"Backup checksum mismatch: {archive.name}",
+                    details="The archive does not match the checksum recorded when it was "
+                    "created. Restoring it would restore corrupted data.",
                 )
 
+        with tempfile.TemporaryDirectory(prefix="wasm-restore-") as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            extracted = tmp_path / "extracted"
+
+            try:
+                extract_archive(
+                    archive,
+                    extracted,
+                    archive_format="tar.gz",
+                    max_entries=self.max_entries,
+                    max_total_bytes=self.max_bytes,
+                )
+            except SourceError as exc:
+                raise BackupError(
+                    f"Refusing to restore {archive.name}",
+                    details=str(exc),
+                ) from exc
+
+            manifest = self._read_manifest(extracted)
+            domain = target_domain or self._manifest_domain(manifest, fallback)
+            try:
+                app_name = validate_app_name(domain_to_app_name(domain))
+            except ValidationError as exc:
+                raise BackupError(
+                    f"Cannot restore into {domain!r}",
+                    details=f"{exc}. The target domain does not yield a usable directory name.",
+                ) from exc
+            app_path = self.config.apps_directory / app_name
+            app_root = self._locate_app_root(extracted, manifest, fallback)
+
+            service_was_running = self._stop_service_for_restore(app_name, stop_service)
+
+            if pre_restore_hook:
+                self.logger.debug(f"Running pre-restore hook: {pre_restore_hook}")
+                result = self._exec(
+                    ["bash", "-c", pre_restore_hook], cwd=app_path, timeout=_HOOK_TIMEOUT
+                )
                 if not result.success:
-                    raise BackupError(f"Failed to extract backup: {result.stderr}")
+                    self.logger.warning(f"Pre-restore hook failed: {result.stderr}")
 
-                # Find extracted app directory
-                result = self._exec_sudo(["ls", str(extract_path)])
-                if not result.success or not result.stdout.strip():
-                    raise BackupError("Backup archive is empty")
+            env_backup: str | None = None
+            env_file = app_path / ".env"
+            if not restore_env and env_file.is_file():
+                try:
+                    env_backup = env_file.read_text()
+                except OSError as exc:
+                    self.logger.warning(f"Could not read the current .env: {exc}")
 
-                extracted_dir_name = result.stdout.strip().split("\n")[0]
-                extracted_path = extract_path / extracted_dir_name
+            self._swap_in_tree(app_root, app_path, tmp_path)
 
-                # Step 3: Remove current app directory
-                if app_path.exists():
-                    self.logger.debug(f"Removing current app: {app_path}")
-                    remove_directory(app_path, sudo=True)
+            if env_backup is not None:
+                self.logger.debug("Restoring the previously deployed .env file")
+                env_file.write_text(env_backup)
+                env_file.chmod(0o600)
 
-                # Step 4: Move extracted content to app path
-                self.logger.debug(f"Moving restored content to {app_path}")
+            service_user = self.config.service_user
+            self._exec(
+                ["chown", "-R", f"{service_user}:{service_user}", str(app_path)],
+                timeout=_OWNERSHIP_TIMEOUT,
+            )
 
-                # Ensure parent exists
-                self._exec_sudo(["mkdir", "-p", str(app_path.parent)])
+            # Putting only the files back was silent data loss for every
+            # application whose state lives in a database or a volume.
+            self._restore_databases(manifest, extracted, fallback)
+            self._restore_docker_volumes(manifest, extracted, fallback)
 
-                result = self._exec_sudo(["mv", str(extracted_path), str(app_path)])
-
-                if not result.success:
-                    raise BackupError(f"Failed to restore files: {result.stderr}")
-
-            except (BackupError, OSError):
-                # Rollback: restore the original app directory if we had a backup
-                if had_existing_app and current_backup_path.exists():
-                    self.logger.warning("Restore failed, rolling back to previous state...")
-                    try:
-                        # Remove any partial restore
-                        if app_path.exists():
-                            remove_directory(app_path, sudo=True)
-                        # Restore original
-                        self._exec_sudo(["mv", str(current_backup_path), str(app_path)])
-                        self.logger.info("Rollback successful - original state restored")
-                    except OSError as rollback_error:
-                        self.logger.error(f"Rollback failed: {rollback_error}")
-                        self.logger.error("Manual intervention may be required")
-                raise
-
-        # Restore .env backup if we had one
-        if env_backup:
-            self.logger.debug("Restoring original .env file")
-            with tempfile.NamedTemporaryFile(mode="w", delete=False) as tmp:
-                tmp.write(env_backup)
-                tmp_env_path = Path(tmp.name)
-            self._exec_sudo(["mv", str(tmp_env_path), str(env_file)])
-            self._exec_sudo(["chmod", "600", str(env_file)])
-
-        # Set proper ownership
-        service_user = self.config.service_user
-        self._exec_sudo(["chown", "-R", f"{service_user}:{service_user}", str(app_path)])
-
-        # Put the data back. Restoring only the files was silent data loss for
-        # every application whose state lives in a database or a volume.
-        self._restore_databases(metadata)
-        self._restore_docker_volumes(metadata)
-
-        # Run post-restore hook
         if post_restore_hook:
             self.logger.debug(f"Running post-restore hook: {post_restore_hook}")
-            result = self._run(["bash", "-c", post_restore_hook], cwd=app_path)
+            result = self._exec(
+                ["bash", "-c", post_restore_hook], cwd=app_path, timeout=_HOOK_TIMEOUT
+            )
             if not result.success:
                 self.logger.warning(f"Post-restore hook failed: {result.stderr}")
 
-        # Restart service if it was running
         if service_was_running:
             self.logger.debug(f"Starting service: {app_name}")
             self.service_manager.start(app_name)
 
         return True
 
-    def delete(self, backup_id: str) -> bool:
+    def _stop_service_for_restore(self, app_name: str, stop_service: bool) -> bool:
         """
-        Delete a backup.
+        Stop the application's service before its files are replaced.
 
         Args:
-            backup_id: Backup ID to delete.
+            app_name: Application name.
+            stop_service: Whether the caller asked for the service to be stopped.
 
         Returns:
-            True if deleted successfully.
+            True when the service was running and must be started again.
+        """
+        if not stop_service:
+            return False
+        try:
+            status = self.service_manager.get_status(app_name)
+            running = bool(status.get("active", False))
+            if running:
+                self.logger.debug(f"Stopping service: {app_name}")
+                self.service_manager.stop(app_name)
+            return running
+        except ServiceError as exc:
+            self.logger.warning(f"Could not stop service before restore: {exc}")
+            return False
+
+    def _swap_in_tree(self, app_root: Path, app_path: Path, workspace: Path) -> None:
+        """
+        Replace the deployed tree with the extracted one, or put it back.
+
+        Args:
+            app_root: Extracted application tree.
+            app_path: Directory the application is deployed in.
+            workspace: Temporary directory used to hold the previous tree.
 
         Raises:
-            BackupError: If deletion fails.
+            BackupError: If the swap fails. The previous tree is restored first
+                when one existed.
+        """
+        safety_copy = workspace / "previous"
+        had_existing = app_path.exists()
+
+        if had_existing:
+            self.logger.debug("Copying the current state aside in case the restore fails")
+            try:
+                shutil.copytree(app_path, safety_copy, symlinks=True)
+            except OSError as exc:
+                self.logger.warning(f"Could not create safety copy: {exc}")
+                had_existing = False
+
+        try:
+            if app_path.exists():
+                shutil.rmtree(app_path)
+            app_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(app_root), str(app_path))
+        except OSError as exc:
+            if had_existing and safety_copy.exists():
+                self.logger.warning("Restore failed, rolling back to the previous state")
+                try:
+                    if app_path.exists():
+                        shutil.rmtree(app_path)
+                    shutil.move(str(safety_copy), str(app_path))
+                    self.logger.info("Rollback successful - original state restored")
+                except OSError as rollback_error:
+                    self.logger.error(f"Rollback failed: {rollback_error}")
+                    self.logger.error(f"The previous tree is still at {safety_copy}")
+            raise BackupError(
+                f"Failed to restore files into {app_path}",
+                details=str(exc),
+            ) from exc
+
+    def _read_manifest(self, extracted: Path) -> dict[str, Any] | None:
+        """
+        Read the manifest an archive carries about itself.
+
+        Args:
+            extracted: Directory the archive was extracted into.
+
+        Returns:
+            The manifest, or None for a 1.x archive that has none.
+
+        Raises:
+            BackupError: If the manifest exists but is not readable JSON.
+        """
+        manifest_file = extracted / PAYLOAD_DIR / MANIFEST_NAME
+        if not manifest_file.is_file():
+            return None
+        try:
+            data = json.loads(manifest_file.read_text())
+        except (OSError, ValueError) as exc:
+            raise BackupError(
+                "Backup manifest is unreadable",
+                details=f"{exc}. The archive is corrupted or was not written by WASM.",
+            ) from exc
+        if not isinstance(data, dict):
+            raise BackupError(
+                "Backup manifest is not an object",
+                details="The archive was not written by WASM.",
+            )
+        return data
+
+    @staticmethod
+    def _manifest_domain(
+        manifest: dict[str, Any] | None,
+        fallback: BackupMetadata | None,
+    ) -> str:
+        """
+        Work out which application an archive belongs to.
+
+        Args:
+            manifest: Manifest read from inside the archive.
+            fallback: Metadata sidecar, for archives with no manifest.
+
+        Returns:
+            The domain to restore into.
+
+        Raises:
+            BackupError: When neither source names a domain.
+        """
+        domain = (manifest or {}).get("domain") or (fallback.domain if fallback else None)
+        if not domain or not isinstance(domain, str):
+            raise BackupError(
+                "This archive does not say which application it belongs to",
+                details="Pass --target-domain to restore it explicitly.",
+            )
+        return domain
+
+    def _locate_app_root(
+        self,
+        extracted: Path,
+        manifest: dict[str, Any] | None,
+        fallback: BackupMetadata | None,
+    ) -> Path:
+        """
+        Find the application tree inside an extracted archive.
+
+        Args:
+            extracted: Directory the archive was extracted into.
+            manifest: Manifest read from inside the archive.
+            fallback: Metadata sidecar, for archives with no manifest.
+
+        Returns:
+            The directory holding the application tree.
+
+        Raises:
+            BackupError: When the archive holds no application tree, or more
+                than one and nothing says which is the right one.
+        """
+        candidates = [
+            name
+            for name in ((manifest or {}).get("app_root"), fallback.app_name if fallback else None)
+            if isinstance(name, str) and name
+        ]
+        for name in candidates:
+            try:
+                root = resolve_within(extracted, name)
+            except (ValidationError, SecurityError) as exc:
+                raise BackupError(
+                    f"Backup names an application root outside the archive: {name!r}",
+                    details=str(exc),
+                ) from exc
+            if root.is_dir():
+                return root
+
+        directories = [
+            entry for entry in extracted.iterdir() if entry.is_dir() and entry.name != PAYLOAD_DIR
+        ]
+        if len(directories) == 1:
+            return directories[0]
+
+        raise BackupError(
+            "Backup archive does not contain a single application directory",
+            details=f"Found: {sorted(entry.name for entry in directories) or 'nothing'}.",
+        )
+
+    # -- deletion and retention ------------------------------------------
+
+    def _sidecar_paths(self, metadata: BackupMetadata, app_backup_dir: Path) -> list[Path]:
+        """
+        Collect the extra files a 1.x backup left next to its archive.
+
+        Paths recorded in metadata are attacker-influenced in the sense that a
+        metadata file may have been written by an older, buggier version or
+        edited by hand, so only paths that resolve inside the application's own
+        backup directory are ever returned.
+
+        Args:
+            metadata: Metadata of the backup being deleted.
+            app_backup_dir: The application's backup directory.
+
+        Returns:
+            The sidecar files that belong to this backup.
+        """
+        recorded = [entry.get("path") for entry in metadata.docker_volume_backups]
+        recorded += [entry.get("backup_path") for entry in metadata.database_backups]
+
+        paths: list[Path] = []
+        for raw in recorded:
+            if not raw or not isinstance(raw, str):
+                continue
+            candidate = Path(raw)
+            try:
+                inside = resolve_within(app_backup_dir, candidate.name)
+            except (ValidationError, SecurityError):
+                self.logger.debug(f"Ignoring recorded path with an unusable name: {raw}")
+                continue
+            if candidate.resolve() != inside:
+                # The recorded file lives somewhere else entirely: whatever it
+                # is, it is not this backup's to delete.
+                self.logger.debug(f"Leaving alone a recorded path outside the backup dir: {raw}")
+                continue
+            paths.append(inside)
+        return paths
+
+    def _prune_orphan_metadata(self, app_name: str) -> int:
+        """
+        Delete metadata sidecars whose archive is gone.
+
+        A sidecar with no archive is invisible to :meth:`list_backups`, so it
+        would otherwise survive every rotation forever and keep claiming a
+        backup that no longer exists. Archives without a sidecar are left alone:
+        they are still restorable with :meth:`restore_archive`.
+
+        Args:
+            app_name: Application name.
+
+        Returns:
+            Number of sidecars removed.
+        """
+        app_backup_dir = self._get_app_backup_dir(app_name)
+        if not app_backup_dir.is_dir():
+            return 0
+
+        removed = 0
+        for metadata_file in app_backup_dir.glob("*.json"):
+            if (app_backup_dir / f"{metadata_file.stem}.tar.gz").is_file():
+                continue
+            try:
+                metadata_file.unlink()
+                removed += 1
+                self.logger.debug(f"Removed orphan backup metadata: {metadata_file.name}")
+            except OSError as exc:
+                self.logger.warning(f"Failed to delete {metadata_file}: {exc}")
+        return removed
+
+    def delete(self, backup_id: str) -> bool:
+        """
+        Delete a backup and everything that belongs to it.
+
+        Args:
+            backup_id: Backup identifier.
+
+        Returns:
+            True if the backup was deleted.
+
+        Raises:
+            BackupError: If the backup does not exist.
         """
         metadata = self.get_backup(backup_id)
         if not metadata:
-            raise BackupError(f"Backup not found: {backup_id}")
+            raise BackupError(
+                f"Backup not found: {backup_id}",
+                details="Run 'wasm backup list' to see the backups WASM knows about.",
+            )
 
-        app_name = domain_to_app_name(metadata.domain)
-        app_backup_dir = self._get_app_backup_dir(app_name)
+        app_backup_dir = self._get_app_backup_dir(domain_to_app_name(metadata.domain))
 
-        backup_file = app_backup_dir / f"{backup_id}.tar.gz"
-        metadata_file = app_backup_dir / f"{backup_id}.json"
+        targets = [
+            app_backup_dir / f"{backup_id}.tar.gz",
+            app_backup_dir / f"{backup_id}.json",
+            *self._sidecar_paths(metadata, app_backup_dir),
+        ]
 
-        # Delete files
-        for file_path in [backup_file, metadata_file]:
-            result = self._exec_sudo(["rm", "-f", str(file_path)])
-            if not result.success:
-                self.logger.warning(f"Failed to delete: {file_path}")
+        for path in targets:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                self.logger.warning(f"Failed to delete {path}: {exc}")
 
         self.logger.debug(f"Deleted backup: {backup_id}")
         return True
 
     def _rotate_backups(self, app_name: str) -> None:
         """
-        Rotate old backups to keep only the most recent ones.
+        Keep only the most recent backups of an application.
 
         Args:
             app_name: Application name.
         """
+        self._prune_orphan_metadata(app_name)
         backups = self.list_backups(app_name=app_name)
 
         if len(backups) > self.max_backups:
-            # Delete oldest backups
             for backup in backups[self.max_backups :]:
                 try:
                     self.delete(backup.id)
                     self.logger.debug(f"Rotated old backup: {backup.id}")
-                except BackupError as e:
-                    self.logger.warning(f"Failed to rotate backup {backup.id}: {e}")
+                except BackupError as exc:
+                    self.logger.warning(f"Failed to rotate backup {backup.id}: {exc}")
 
     def rotate_by_policy(
         self,
@@ -915,73 +1371,317 @@ class BackupManager:
         max_age_days: int | None = None,
     ) -> int:
         """
-        Rotate backups based on count and/or age policy.
+        Rotate backups by count and/or age.
 
         Args:
             app_name: Application name.
             max_count: Maximum number of backups to keep.
-            max_age_days: Maximum age of backups in days.
+            max_age_days: Maximum age of a backup, in days.
 
         Returns:
             Number of backups deleted.
         """
-        backups = self.list_backups(app_name=app_name)
+        from datetime import timedelta
+
+        self._prune_orphan_metadata(app_name)
         deleted = 0
 
-        # Delete by age first
         if max_age_days:
-            from datetime import timedelta
-
             cutoff = datetime.now() - timedelta(days=max_age_days)
-            for backup in backups:
+            for backup in self.list_backups(app_name=app_name):
                 try:
-                    created = datetime.fromisoformat(backup.created_at)
-                    if created < cutoff:
+                    if datetime.fromisoformat(backup.created_at) < cutoff:
                         self.delete(backup.id)
                         deleted += 1
                         self.logger.debug(f"Rotated old backup (age): {backup.id}")
-                except (BackupError, ValueError) as e:
-                    self.logger.warning(f"Failed to rotate backup {backup.id}: {e}")
+                except (BackupError, ValueError) as exc:
+                    self.logger.warning(f"Failed to rotate backup {backup.id}: {exc}")
 
-        # Then by count (re-fetch after age-based deletion)
         if max_count:
             remaining = self.list_backups(app_name=app_name)
-            if len(remaining) > max_count:
-                for backup in remaining[max_count:]:
-                    try:
-                        self.delete(backup.id)
-                        deleted += 1
-                        self.logger.debug(f"Rotated old backup (count): {backup.id}")
-                    except BackupError as e:
-                        self.logger.warning(f"Failed to rotate backup {backup.id}: {e}")
+            for backup in remaining[max_count:]:
+                try:
+                    self.delete(backup.id)
+                    deleted += 1
+                    self.logger.debug(f"Rotated old backup (count): {backup.id}")
+                except BackupError as exc:
+                    self.logger.warning(f"Failed to rotate backup {backup.id}: {exc}")
 
         return deleted
 
-    def _backup_docker_volumes(
+    # -- databases --------------------------------------------------------
+
+    def _dump_databases(
         self,
         domain: str,
-        volume_names: list[str],
-        output_dir: Path,
+        destination: Path,
+        *,
+        redis_method: str = "rdb",
     ) -> list[dict[str, Any]]:
         """
-        Backup Docker volumes.
+        Dump every database of an application into the archive payload.
 
-        Uses a temporary Alpine container to tar the volume contents.
+        A dump that fails is fatal: an archive whose metadata claims a database
+        it does not carry is the bug this whole module was rewritten for.
 
         Args:
-            domain: Application domain.
-            volume_names: List of Docker volume names.
-            output_dir: Directory to store volume backups.
+            domain: Domain name of the application.
+            destination: Directory inside the payload to write the dumps into.
+            redis_method: Method handed to Redis-like engines.
 
         Returns:
-            List of volume backup info dictionaries.
+            One entry per database actually dumped, each pointing at a path
+            *inside* the archive. Empty when the application has no database.
+
+        Raises:
+            BackupError: If a registered database could not be dumped.
         """
-        volume_backups = []
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # The engine managers pull in optional client libraries; a machine
+        # without them can still back up files.
+        try:
+            from wasm.managers.database.registry import DatabaseRegistry
+        except ImportError as exc:
+            raise BackupError(
+                "Database backup requested but the database managers are unavailable",
+                details=f"{exc}. Install the database extras or drop --include-databases.",
+            ) from exc
 
+        try:
+            app = get_store().get_app(domain)
+        except (WASMError, sqlite3.Error) as exc:
+            raise BackupError(
+                f"Could not read the application record for {domain}",
+                details=str(exc),
+            ) from exc
+
+        if not app or not app.id:
+            self.logger.debug(f"No app found in store for {domain}")
+            return []
+
+        databases = get_store().list_databases(app_id=app.id)
+        if not databases:
+            self.logger.debug(f"No databases associated with {domain}")
+            return []
+
+        destination.mkdir(parents=True, exist_ok=True)
+        destination.chmod(0o700)
+
+        self.logger.info(f"Backing up {len(databases)} database(s) for {domain}")
+
+        dumps: list[dict[str, Any]] = []
+        for db in databases:
+            manager = DatabaseRegistry.get(db.engine, verbose=self.verbose)
+            if not manager:
+                raise BackupError(
+                    f"No manager available for database engine: {db.engine}",
+                    details=f"Database '{db.name}' is registered for {domain} but cannot be dumped.",
+                )
+
+            if not manager.is_installed():
+                raise BackupError(
+                    f"{db.engine} is not installed, cannot back up '{db.name}'",
+                    details=f"Install {db.engine} or run the backup without --include-databases.",
+                )
+
+            suffix = getattr(manager, "BACKUP_SUFFIX", ".dump")
+            filename = validate_filename(f"{db.engine}-{db.name}{suffix}.gz")
+            target = destination / filename
+
+            kwargs: dict[str, Any] = {}
+            if db.engine.lower() in {"redis", "valkey"}:
+                kwargs["method"] = redis_method
+
+            try:
+                info = manager.backup(database=db.name, output_path=target, compress=True, **kwargs)
+            except (DatabaseError, OSError) as exc:
+                raise BackupError(
+                    f"Failed to back up {db.engine} database '{db.name}'",
+                    details=str(exc),
+                ) from exc
+
+            written = Path(info.path)
+            if written != target:
+                # An engine that ignores output_path would leave the dump
+                # outside the archive, which is exactly what must not happen.
+                shutil.move(str(written), str(target))
+
+            if not target.is_file():
+                raise BackupError(
+                    f"Dump of '{db.name}' did not reach the backup archive",
+                    details=f"{db.engine} reported success but {target} does not exist.",
+                )
+
+            dumps.append(
+                {
+                    "engine": db.engine,
+                    "name": db.name,
+                    "archive_path": f"{PAYLOAD_DIR}/{DATABASES_DIR}/{filename}",
+                    "size_bytes": target.stat().st_size,
+                    "created": datetime.now().isoformat(),
+                }
+            )
+
+            self.logger.info(f"  Backed up {db.engine} database: {db.name}")
+
+        return dumps
+
+    def _payload_entries(
+        self,
+        manifest: dict[str, Any] | None,
+        fallback: BackupMetadata | None,
+        key: str,
+        legacy: str,
+    ) -> list[dict[str, Any]]:
+        """
+        Read one list of payload entries from the manifest or the sidecar.
+
+        Args:
+            manifest: Manifest read from inside the archive.
+            fallback: Metadata sidecar, for archives with no manifest.
+            key: Manifest key holding the entries.
+            legacy: Attribute of the metadata holding the same entries.
+
+        Returns:
+            The entries, or an empty list.
+        """
+        if manifest is not None:
+            entries = manifest.get(key, [])
+            return [entry for entry in entries if isinstance(entry, dict)]
+        if fallback is not None:
+            return list(getattr(fallback, legacy, []))
+        return []
+
+    def _resolve_payload_file(self, extracted: Path, entry: dict[str, Any], label: str) -> Path:
+        """
+        Locate the file an archive entry points at.
+
+        Args:
+            extracted: Directory the archive was extracted into.
+            entry: Manifest or metadata entry.
+            label: What the entry describes, for error messages.
+
+        Returns:
+            The path of the file inside the extracted archive, or the external
+            path recorded by a 1.x backup when the archive carries none.
+
+        Raises:
+            BackupError: If the entry points nowhere usable.
+        """
+        relative = entry.get("archive_path")
+        if isinstance(relative, str) and relative:
+            try:
+                path = resolve_within(extracted, relative)
+            except (ValidationError, SecurityError) as exc:
+                raise BackupError(
+                    f"Backup entry for {label} points outside the archive",
+                    details=str(exc),
+                ) from exc
+            if path.is_file():
+                return path
+            raise BackupError(
+                f"Backup claims a {label} it does not carry: {relative}",
+                details="The archive is incomplete; do not trust it as a backup.",
+            )
+
+        # A 1.x archive kept its dumps outside. Restoring one is only possible
+        # on the machine that created it, which is the defect, not the design.
+        external = entry.get("backup_path") or entry.get("path")
+        if isinstance(external, str) and external and Path(external).is_file():
+            self.logger.warning(
+                f"Restoring {label} from {external}, which lives outside the archive. "
+                "Re-create this backup to make it portable."
+            )
+            return Path(external)
+
+        raise BackupError(
+            f"Backup lists a {label} that cannot be found",
+            details=f"Recorded location: {external or 'none'}.",
+        )
+
+    def _restore_databases(
+        self,
+        manifest: dict[str, Any] | None,
+        extracted: Path,
+        fallback: BackupMetadata | None,
+    ) -> None:
+        """
+        Restore every database dump the archive carries.
+
+        Args:
+            manifest: Manifest read from inside the archive.
+            extracted: Directory the archive was extracted into.
+            fallback: Metadata sidecar, for archives with no manifest.
+
+        Raises:
+            BackupError: If a dump is missing or an engine refuses it.
+        """
+        entries = self._payload_entries(manifest, fallback, "databases", "database_backups")
+        if not entries:
+            return
+
+        try:
+            from wasm.managers.database.registry import DatabaseRegistry
+        except ImportError as exc:
+            raise BackupError(
+                "This backup contains databases but the database managers are unavailable",
+                details=f"{exc}. Install the database extras before restoring.",
+            ) from exc
+
+        self.logger.info(f"Restoring {len(entries)} database(s)")
+
+        for entry in entries:
+            engine = str(entry.get("engine", ""))
+            name = str(entry.get("name", ""))
+            dump_path = self._resolve_payload_file(extracted, entry, f"dump of '{name}'")
+
+            manager = DatabaseRegistry.get(engine, verbose=self.verbose)
+            if not manager:
+                raise BackupError(
+                    f"No manager available for database engine: {engine}",
+                    details=f"Cannot restore database '{name}'.",
+                )
+
+            try:
+                manager.restore(database=name, backup_path=dump_path)
+            except (DatabaseError, OSError) as exc:
+                raise BackupError(
+                    f"Failed to restore {engine} database '{name}' from {dump_path.name}",
+                    details=str(exc),
+                ) from exc
+
+            self.logger.info(f"  Restored {engine} database: {name}")
+
+    # -- docker volumes ---------------------------------------------------
+
+    def _dump_docker_volumes(
+        self,
+        volume_names: Sequence[str],
+        destination: Path,
+    ) -> list[dict[str, Any]]:
+        """
+        Archive Docker volumes into the backup payload.
+
+        A throw-away Alpine container tars the volume contents, because the
+        volume is only reachable from inside Docker.
+
+        Args:
+            volume_names: Named volumes to archive.
+            destination: Directory inside the payload to write into.
+
+        Returns:
+            One entry per volume actually archived.
+        """
+        destination.mkdir(parents=True, exist_ok=True)
+
+        volume_backups: list[dict[str, Any]] = []
         for vol_name in volume_names:
-            backup_file = output_dir / f"volume-{vol_name}-{timestamp}.tar.gz"
+            try:
+                filename = validate_filename(f"{vol_name}.tar.gz")
+            except ValidationError as exc:
+                self.logger.warning(f"Skipping Docker volume with an unusable name: {exc}")
+                continue
 
+            target = destination / filename
             result = self._exec(
                 [
                     "docker",
@@ -990,11 +1690,11 @@ class BackupManager:
                     "-v",
                     f"{vol_name}:/data:ro",
                     "-v",
-                    f"{output_dir}:/backup",
+                    f"{destination}:/backup",
                     "alpine",
                     "tar",
                     "czf",
-                    f"/backup/{backup_file.name}",
+                    f"/backup/{filename}",
                     "-C",
                     "/data",
                     ".",
@@ -1002,35 +1702,39 @@ class BackupManager:
                 timeout=_DOCKER_TIMEOUT,
             )
 
-            if result.success:
-                stat_result = self._exec(["stat", "-c", "%s", str(backup_file)])
-                size = int(stat_result.stdout.strip()) if stat_result.success else 0
-
-                volume_backups.append(
-                    {
-                        "volume": vol_name,
-                        "path": str(backup_file),
-                        "size_bytes": size,
-                    }
-                )
-                self.logger.debug(f"Backed up volume: {vol_name}")
-            else:
+            if not result.success:
                 self.logger.warning(f"Failed to backup volume {vol_name}: {result.stderr}")
+                continue
+
+            if not target.is_file():
+                self.logger.warning(
+                    f"Docker reported success but produced no archive for volume {vol_name}"
+                )
+                continue
+
+            volume_backups.append(
+                {
+                    "volume": vol_name,
+                    "archive_path": f"{PAYLOAD_DIR}/{VOLUMES_DIR}/{filename}",
+                    "size_bytes": target.stat().st_size,
+                }
+            )
+            self.logger.debug(f"Backed up volume: {vol_name}")
 
         return volume_backups
 
     def _discover_docker_volumes(self, app_path: Path) -> list[str]:
         """
-        Discover Docker volumes from a compose file.
+        Discover named Docker volumes from a compose file.
 
         Args:
-            app_path: Application path containing compose file.
+            app_path: Application path containing the compose file.
 
         Returns:
-            List of named volume names.
+            The named volumes declared by the compose file.
         """
         try:
-            import yaml
+            import yaml  # type: ignore[import-untyped]
         except ImportError:
             return []
 
@@ -1049,155 +1753,34 @@ class BackupManager:
                     volumes = data.get("volumes", {})
                     if isinstance(volumes, dict):
                         return list(volumes.keys())
-                except (OSError, yaml.YAMLError, AttributeError) as e:
-                    self.logger.debug(f"Could not read volumes from {compose_file}: {e}")
+                except (OSError, yaml.YAMLError, AttributeError) as exc:
+                    self.logger.debug(f"Could not read volumes from {compose_file}: {exc}")
                 break
 
         return []
 
-    def _backup_databases(self, domain: str) -> list[dict[str, Any]]:
+    def _restore_docker_volumes(
+        self,
+        manifest: dict[str, Any] | None,
+        extracted: Path,
+        fallback: BackupMetadata | None,
+    ) -> None:
         """
-        Backup databases associated with an application.
-
-        A dump that fails is fatal. The previous version swallowed every error
-        into a warning, so ``--include-databases`` produced an archive whose
-        metadata claimed a database it did not have.
+        Restore every Docker volume archive the backup carries.
 
         Args:
-            domain: Domain name of the application.
-
-        Returns:
-            One entry per database that was actually dumped. Empty when the
-            application has no database registered.
+            manifest: Manifest read from inside the archive.
+            extracted: Directory the archive was extracted into.
+            fallback: Metadata sidecar, for archives with no manifest.
 
         Raises:
-            BackupError: If a registered database could not be dumped.
+            BackupError: If a volume archive is missing or cannot be unpacked.
         """
-        database_backups: list[dict[str, Any]] = []
+        entries = self._payload_entries(manifest, fallback, "volumes", "docker_volume_backups")
 
-        # The engine managers pull in optional client libraries; a machine
-        # without them can still back up files.
-        try:
-            from wasm.managers.database.registry import DatabaseRegistry
-        except ImportError as e:
-            raise BackupError(
-                "Database backup requested but the database managers are unavailable",
-                details=f"{e}. Install the database extras or drop --include-databases.",
-            ) from e
-
-        try:
-            app = get_store().get_app(domain)
-        except (WASMError, sqlite3.Error) as e:
-            raise BackupError(
-                f"Could not read the application record for {domain}",
-                details=str(e),
-            ) from e
-
-        if not app or not app.id:
-            self.logger.debug(f"No app found in store for {domain}")
-            return database_backups
-
-        databases = get_store().list_databases(app_id=app.id)
-        if not databases:
-            self.logger.debug(f"No databases associated with {domain}")
-            return database_backups
-
-        self.logger.info(f"Backing up {len(databases)} database(s) for {domain}")
-
-        for db in databases:
-            manager = DatabaseRegistry.get(db.engine, verbose=self.verbose)
-            if not manager:
-                raise BackupError(
-                    f"No manager available for database engine: {db.engine}",
-                    details=f"Database '{db.name}' is registered for {domain} but cannot be dumped.",
-                )
-
-            if not manager.is_installed():
-                raise BackupError(
-                    f"{db.engine} is not installed, cannot back up '{db.name}'",
-                    details=f"Install {db.engine} or run the backup without --include-databases.",
-                )
-
-            try:
-                backup_info = manager.backup(database=db.name, compress=True)
-            except (DatabaseError, OSError) as e:
-                raise BackupError(
-                    f"Failed to back up {db.engine} database '{db.name}'",
-                    details=str(e),
-                ) from e
-
-            database_backups.append(
-                {
-                    "engine": db.engine,
-                    "name": db.name,
-                    "backup_path": str(backup_info.path),
-                    "size_bytes": backup_info.size,
-                    "created": backup_info.created.isoformat(),
-                }
-            )
-
-            self.logger.info(f"  Backed up {db.engine} database: {db.name}")
-
-        return database_backups
-
-    def _restore_databases(self, metadata: BackupMetadata) -> None:
-        """
-        Restore every database dump a backup carries.
-
-        Args:
-            metadata: Metadata of the backup being restored.
-
-        Raises:
-            BackupError: If a dump is missing or an engine refuses it.
-        """
-        if not metadata.database_backups:
-            return
-
-        try:
-            from wasm.managers.database.registry import DatabaseRegistry
-        except ImportError as e:
-            raise BackupError(
-                "This backup contains databases but the database managers are unavailable",
-                details=f"{e}. Install the database extras before restoring.",
-            ) from e
-
-        self.logger.info(f"Restoring {len(metadata.database_backups)} database(s)")
-
-        for entry in metadata.database_backups:
-            engine = entry.get("engine", "")
-            name = entry.get("name", "")
-            dump_path = Path(entry.get("backup_path", ""))
-
-            manager = DatabaseRegistry.get(engine, verbose=self.verbose)
-            if not manager:
-                raise BackupError(
-                    f"No manager available for database engine: {engine}",
-                    details=f"Cannot restore database '{name}'.",
-                )
-
-            try:
-                manager.restore(database=name, backup_path=dump_path)
-            except (DatabaseError, OSError) as e:
-                raise BackupError(
-                    f"Failed to restore {engine} database '{name}' from {dump_path}",
-                    details=str(e),
-                ) from e
-
-            self.logger.info(f"  Restored {engine} database: {name}")
-
-    def _restore_docker_volumes(self, metadata: BackupMetadata) -> None:
-        """
-        Restore every Docker volume archive a backup carries.
-
-        Args:
-            metadata: Metadata of the backup being restored.
-
-        Raises:
-            BackupError: If a volume archive cannot be unpacked.
-        """
-        for entry in metadata.docker_volume_backups:
-            volume = entry.get("volume", "")
-            archive = Path(entry.get("path", ""))
+        for entry in entries:
+            volume = str(entry.get("volume", ""))
+            archive = self._resolve_payload_file(extracted, entry, f"volume '{volume}'")
 
             result = self._exec(
                 [
@@ -1226,75 +1809,103 @@ class BackupManager:
 
             self.logger.info(f"  Restored Docker volume: {volume}")
 
+    # -- verification -----------------------------------------------------
+
     def verify(self, backup_id: str) -> dict[str, Any]:
         """
-        Verify a backup's integrity.
+        Verify a backup's integrity, by reading it.
+
+        The archive is hashed and walked in process: a backup that cannot be
+        opened, or whose bytes changed since it was written, is reported as
+        invalid before a restore needs it. When the metadata claims databases,
+        the payload is checked for the dumps it names.
 
         Args:
-            backup_id: Backup ID to verify.
+            backup_id: Backup identifier.
 
         Returns:
-            Verification results dictionary.
+            A dictionary with ``valid``, ``errors``, ``warnings`` and, when the
+            archive could be read, ``checksum_ok``, ``files_ok`` and
+            ``file_count``.
         """
-        results = {
-            "valid": True,
-            "errors": [],
-            "warnings": [],
-        }
+        errors: list[str] = []
+        warnings: list[str] = []
+        results: dict[str, Any] = {"valid": True, "errors": errors, "warnings": warnings}
 
         metadata = self.get_backup(backup_id)
         if not metadata:
             results["valid"] = False
-            results["errors"].append("Backup metadata not found")
+            errors.append("Backup metadata not found")
             return results
 
         app_name = domain_to_app_name(metadata.domain)
         backup_file = self._get_app_backup_dir(app_name) / f"{backup_id}.tar.gz"
 
-        # Check if backup file exists
-        result = self._exec_sudo(["test", "-f", str(backup_file)])
-        if not result.success:
+        if not backup_file.is_file():
             results["valid"] = False
-            results["errors"].append("Backup file not found")
+            errors.append("Backup file not found")
             return results
 
-        # Verify checksum
         if metadata.checksum:
-            result = self._exec_sudo(["sha256sum", str(backup_file)])
-            if result.success:
-                current_checksum = result.stdout.split()[0]
-                if current_checksum != metadata.checksum:
+            try:
+                if self._calculate_checksum(backup_file) != metadata.checksum:
                     results["valid"] = False
-                    results["errors"].append("Checksum mismatch")
+                    errors.append("Checksum mismatch: the archive changed since it was created")
                 else:
                     results["checksum_ok"] = True
-            else:
-                results["warnings"].append("Could not verify checksum")
+            except BackupError as exc:
+                results["valid"] = False
+                errors.append(f"Could not read the archive: {exc.message}")
+                return results
         else:
-            results["warnings"].append("No checksum stored in metadata")
+            warnings.append("No checksum stored in metadata")
 
-        # Test archive integrity
-        result = self._exec_sudo(["tar", "-tzf", str(backup_file)])
-        if not result.success:
+        try:
+            with tarfile.open(backup_file, "r:gz") as archive:
+                names = archive.getnames()
+        except (tarfile.TarError, OSError, EOFError) as exc:
             results["valid"] = False
-            results["errors"].append("Archive is corrupted")
-        else:
-            results["files_ok"] = True
-            results["file_count"] = len(result.stdout.strip().split("\n"))
+            errors.append(f"Archive is corrupted: {exc}")
+            return results
 
+        results["files_ok"] = True
+        results["file_count"] = len(names)
+
+        members = set(names)
+        if metadata.includes_databases:
+            expected = [
+                entry.get("archive_path")
+                for entry in metadata.database_backups
+                if entry.get("archive_path")
+            ]
+            if not expected:
+                warnings.append(
+                    "This backup predates self-contained archives: its database dumps live "
+                    "outside the archive and will not travel with it"
+                )
+            for path in expected:
+                if path not in members:
+                    results["valid"] = False
+                    errors.append(f"Archive claims a database dump it does not carry: {path}")
+
+        if metadata.size_bytes and backup_file.stat().st_size != metadata.size_bytes:
+            warnings.append("Archive size differs from the size recorded in the metadata")
+
+        results["message"] = "Backup is valid" if results["valid"] else "; ".join(errors)
         return results
 
     def get_storage_usage(self) -> dict[str, Any]:
         """
-        Get backup storage usage statistics.
+        Report how much disk the backups take.
 
         Returns:
-            Storage usage dictionary.
+            Totals overall and per application.
         """
-        usage = {
+        by_app: dict[str, dict[str, int]] = {}
+        usage: dict[str, Any] = {
             "total_size_bytes": 0,
             "total_backups": 0,
-            "by_app": {},
+            "by_app": by_app,
         }
 
         if not self.backup_dir.exists():
@@ -1304,39 +1915,68 @@ class BackupManager:
             if not app_dir.is_dir():
                 continue
 
-            app_name = app_dir.name
             app_backups = list(app_dir.glob("*.tar.gz"))
-
             app_size = 0
             for backup_file in app_backups:
-                result = self._exec_sudo(["stat", "-c", "%s", str(backup_file)])
-                if result.success:
-                    app_size += int(result.stdout.strip())
+                try:
+                    app_size += backup_file.stat().st_size
+                except OSError as exc:
+                    self.logger.debug(f"Could not stat {backup_file}: {exc}")
 
-            usage["by_app"][app_name] = {
-                "count": len(app_backups),
-                "size_bytes": app_size,
-            }
+            by_app[app_dir.name] = {"count": len(app_backups), "size_bytes": app_size}
             usage["total_size_bytes"] += app_size
             usage["total_backups"] += len(app_backups)
 
         return usage
 
 
+@runtime_checkable
+class _InPlaceRebuilder(Protocol):
+    """
+    The part of a deployer a rollback needs: rebuild what is already on disk.
+
+    A rollback must not re-fetch the source; the restored tree *is* the source.
+    Deployers that cannot rebuild in place (a static site has nothing to build)
+    simply do not satisfy this protocol.
+    """
+
+    def install_dependencies(self) -> bool:
+        """
+        Install the application's dependencies.
+
+        Returns:
+            True when the install succeeded.
+        """
+
+    def build(self) -> bool:
+        """
+        Build the application in place.
+
+        Returns:
+            True when the build succeeded.
+        """
+
+
 class RollbackManager:
     """
     Manager for application rollbacks.
 
-    Provides high-level rollback functionality including
-    automatic pre-deploy backups and quick rollback.
+    Provides automatic pre-deploy backups and a one-step return to a previous
+    state.
     """
 
-    def __init__(self, verbose: bool = False):
-        """Initialize rollback manager."""
+    def __init__(self, verbose: bool = False, runner: CommandRunner | None = None) -> None:
+        """
+        Initialize the rollback manager.
+
+        Args:
+            verbose: Enable verbose logging.
+            runner: Command runner passed to the managers it drives.
+        """
         self.verbose = verbose
         self.logger = Logger(verbose=verbose)
-        self.backup_manager = BackupManager(verbose=verbose)
-        self.service_manager = ServiceManager(verbose=verbose)
+        self.backup_manager = BackupManager(verbose=verbose, runner=runner)
+        self.service_manager = ServiceManager(verbose=verbose, runner=runner)
         self.config = Config()
 
     def create_pre_deploy_backup(
@@ -1345,14 +1985,14 @@ class RollbackManager:
         description: str = "Pre-deploy backup",
     ) -> BackupMetadata | None:
         """
-        Create a backup before deployment.
+        Create a backup before a deployment.
 
         Args:
             domain: Domain name.
             description: Backup description.
 
         Returns:
-            BackupMetadata or None if app doesn't exist.
+            The backup metadata, or None when there is nothing deployed yet.
         """
         app_name = domain_to_app_name(domain)
         app_path = self.config.apps_directory / app_name
@@ -1375,34 +2015,36 @@ class RollbackManager:
         rebuild: bool = True,
     ) -> bool:
         """
-        Rollback an application to a previous state.
+        Roll an application back to a previous state.
 
         Args:
             domain: Domain name.
-            backup_id: Specific backup ID (defaults to latest non-auto backup).
-            rebuild: Rebuild application after restore.
+            backup_id: Specific backup (defaults to the latest manual one).
+            rebuild: Rebuild the application after the restore.
 
         Returns:
-            True if rollback was successful.
+            True if the rollback succeeded.
+
+        Raises:
+            BackupError: If there is no backup to roll back to, or the restore
+                fails.
         """
-        # Get backup to restore
         if backup_id:
             metadata = self.backup_manager.get_backup(backup_id)
             if not metadata:
                 raise BackupError(f"Backup not found: {backup_id}")
         else:
-            # Get latest backup that is NOT an auto/safety backup
             all_backups = self.backup_manager.list_backups(domain=domain)
             metadata = None
             for backup in all_backups:
-                # Skip auto-generated safety backups
+                # Skip auto-generated safety backups.
                 if "auto" not in backup.tags and "pre-deploy" not in backup.tags:
                     metadata = backup
                     break
 
             if not metadata:
-                # If all backups are auto, use the oldest one (most stable)
                 if all_backups:
+                    # All of them are automatic: the oldest is the most stable.
                     metadata = all_backups[-1]
                 else:
                     raise BackupError(f"No backups found for: {domain}")
@@ -1412,56 +2054,58 @@ class RollbackManager:
         if metadata.git_commit:
             self.logger.info(f"  Commit: {metadata.git_commit}")
 
-        # Restore from backup
         self.backup_manager.restore(
             backup_id=metadata.id,
             restore_env=True,
             stop_service=True,
         )
 
-        # Rebuild if requested
+        app_name = domain_to_app_name(domain)
+
         if rebuild:
-            app_name = domain_to_app_name(domain)
             app_path = self.config.apps_directory / app_name
 
             self.logger.info("Rebuilding application...")
 
-            # Detect app type and run build
             from wasm.deployers import detect_app_type, get_deployer
 
             app_type = detect_app_type(app_path, verbose=self.verbose)
             if app_type:
                 deployer = get_deployer(app_type, verbose=self.verbose)
-                deployer.app_path = app_path
-                deployer.app_name = app_name
-                deployer.domain = domain
+                # The source is already on disk: this is a rebuild in place, not
+                # a deployment, so the restored directory is its own source.
+                deployer.configure(domain, source=str(app_path), app_path=app_path)
 
-                try:
-                    deployer.install_dependencies()
-                    deployer.build()
-                except WASMError as e:
-                    self.logger.warning(f"Rebuild failed: {e}")
-                    self.logger.info("Application restored but may need manual rebuild")
+                if isinstance(deployer, _InPlaceRebuilder):
+                    try:
+                        deployer.install_dependencies()
+                        deployer.build()
+                    except WASMError as exc:
+                        self.logger.warning(f"Rebuild failed: {exc}")
+                        self.logger.info("Application restored but may need manual rebuild")
+                else:
+                    self.logger.warning(
+                        f"The {app_type} deployer cannot rebuild in place; "
+                        "the files are restored but not rebuilt"
+                    )
 
-        # Start service (if it exists)
-        app_name = domain_to_app_name(domain)
         try:
             status = self.service_manager.get_status(app_name)
             if status.get("exists"):
                 self.service_manager.start(app_name)
-        except ServiceError as e:
-            self.logger.debug(f"Could not start service: {e}")
+        except ServiceError as exc:
+            self.logger.debug(f"Could not start service: {exc}")
 
         return True
 
     def list_rollback_points(self, domain: str) -> list[BackupMetadata]:
         """
-        List available rollback points for an application.
+        List the backups an application can be rolled back to.
 
         Args:
             domain: Domain name.
 
         Returns:
-            List of available backups.
+            The available backups, newest first.
         """
         return self.backup_manager.list_backups(domain=domain)

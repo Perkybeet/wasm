@@ -12,6 +12,7 @@ handling for systemd services that require global system paths.
 import os
 import shlex
 import shutil
+from typing import ClassVar
 
 from wasm.core.logger import Logger
 
@@ -26,7 +27,7 @@ class PathResolver:
     """
 
     # System paths to search (in order of preference)
-    SYSTEM_PATHS = [
+    SYSTEM_PATHS: ClassVar[list[str]] = [
         "/usr/bin",
         "/usr/local/bin",
         "/bin",
@@ -37,7 +38,7 @@ class PathResolver:
     ]
 
     # Patterns indicating private/user-specific paths
-    PRIVATE_PATTERNS = [
+    PRIVATE_PATTERNS: ClassVar[list[str]] = [
         "/root/",
         "/.nvm/",
         "/.local/",

@@ -1,38 +1,59 @@
 """
 FastAPI server for the WASM web panel.
 
-Everything security relevant that is not per-endpoint lives here: the request
-middleware (client identification, IP whitelist, HTTPS enforcement, rate
-limiting, lockout, response hardening headers and the audit trail for
-mutations) and the startup checks that refuse to run an unsafe configuration.
+Everything security relevant that is not per-endpoint lives here: the
+connection middleware (client identification, IP whitelist, HTTPS enforcement,
+rate limiting, lockout, WebSocket authentication and Origin checking, response
+hardening headers and the audit trail for mutations) and the startup checks
+that refuse to run an unsafe configuration.
+
+**Why a raw ASGI middleware and not ``BaseHTTPMiddleware``.** Starlette's
+HTTP middleware is only invoked for ``scope["type"] == "http"``. The panel also
+serves ``/ws/*``, which streams the root journal and the machine's metrics, so
+with an HTTP-only middleware the entire WebSocket surface was outside the IP
+whitelist, outside the HTTPS requirement, outside the rate limiter and outside
+the lockout. :class:`SecurityMiddleware` speaks ASGI directly, so ``http`` and
+``websocket`` connections go through exactly the same checks, and the
+WebSocket handshake is authenticated centrally instead of once per handler.
 """
 
 from __future__ import annotations
 
 import logging
 import socket
-from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import parse_qs
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import MutableHeaders
+from starlette.requests import HTTPConnection
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from wasm.core.exceptions import SecurityError
 from wasm.web.auth import (
     SAFE_METHODS,
+    WS_CLOSE_FORBIDDEN,
+    WS_CLOSE_RATE_LIMITED,
+    WS_CLOSE_UNAUTHORIZED,
     AuditLogger,
     BruteForceProtection,
     RateLimiter,
     SecurityConfig,
     TokenManager,
+    authenticate_connection,
+    bearer_token,
+    get_audit_logger,
     get_client_ip,
     get_security_config,
     ip_matches,
+    is_allowed_origin,
     is_secure_request,
     set_audit_logger,
+    set_brute_force_protection,
     set_security_config,
     set_token_manager,
 )
@@ -57,6 +78,10 @@ CONTENT_SECURITY_POLICY = (
 )
 
 HSTS_VALUE = "max-age=31536000; includeSubDomains"
+
+#: Endpoints that exist to be given a credential by an anonymous client, and
+#: are therefore the ones a lockout has to guard even before authentication.
+AUTH_PATHS = frozenset({"/api/auth/login", "/api/auth/token"})
 
 _token_manager: TokenManager | None = None
 _rate_limiter: RateLimiter | None = None
@@ -110,6 +135,9 @@ def get_brute_force() -> BruteForceProtection:
         _brute_force = BruteForceProtection(
             max_attempts=config.max_failed_attempts, lockout_duration=config.lockout_duration
         )
+        # The counter has to be the same object the credential checks in
+        # wasm.web.auth reach for, or failures would be split across channels.
+        set_brute_force_protection(_brute_force)
     return _brute_force
 
 
@@ -159,7 +187,12 @@ def create_app(config: SecurityConfig | None = None) -> FastAPI:
     if security_config.require_https:
         verify_tls_material(security_config)
 
-    _audit_logger = AuditLogger(security_config.audit_log, enabled=security_config.audit_enabled)
+    _audit_logger = AuditLogger(
+        security_config.audit_log,
+        enabled=security_config.audit_enabled,
+        max_bytes=security_config.audit_max_bytes,
+        backups=security_config.audit_backups,
+    )
     set_audit_logger(_audit_logger)
 
     _token_manager = TokenManager(security_config)
@@ -173,6 +206,7 @@ def create_app(config: SecurityConfig | None = None) -> FastAPI:
         max_attempts=security_config.max_failed_attempts,
         lockout_duration=security_config.lockout_duration,
     )
+    set_brute_force_protection(_brute_force)
 
     app = FastAPI(
         title="WASM Web Interface",
@@ -180,10 +214,11 @@ def create_app(config: SecurityConfig | None = None) -> FastAPI:
         version="1.0.0",
         docs_url=None,
         redoc_url=None,
+        # The schema of an API that runs systemd as root is a map for an
+        # attacker and is of no use to an anonymous client.
+        openapi_url=None,
         lifespan=lifespan,
     )
-
-    app.middleware("http")(_security_middleware)
 
     if security_config.enable_cors:
         # Credentials plus a wildcard origin would hand any site a root session,
@@ -203,6 +238,10 @@ def create_app(config: SecurityConfig | None = None) -> FastAPI:
             allow_methods=["GET", "POST", "PUT", "DELETE"],
             allow_headers=["Authorization", "Content-Type", "X-WASM-CSRF"],
         )
+
+    # Added last, so it is the outermost layer: CORS preflights are answered
+    # from inside the whitelist and the rate limiter, not in front of them.
+    app.add_middleware(SecurityMiddleware, config=security_config)
 
     from wasm.web.api import router as api_router
 
@@ -293,136 +332,339 @@ def verify_tls_material(config: SecurityConfig) -> tuple[str, str]:
     return certfile, keyfile
 
 
-async def _security_middleware(
-    request: Request, call_next: Callable[[Request], Awaitable[Response]]
-) -> Response:
+class SecurityMiddleware:
     """
-    Apply connection-level security to every request.
+    Connection-level security for every scope the panel serves.
 
-    Args:
-        request: The incoming request.
-        call_next: The next handler in the chain.
-
-    Returns:
-        The response, with hardening headers applied.
+    The checks run in the order that keeps the cheapest and most absolute first:
+    an address that is not allowed to talk to the panel never reaches the rate
+    limiter, and an address that is being rate limited never reaches credential
+    verification. The WebSocket handshake is authenticated here rather than in
+    each handler, so a new ``@router.websocket`` route cannot forget to do it.
     """
-    config = get_security_config()
-    client_ip = get_client_ip(request, config)
-    audit = get_audit()
 
-    if config.ip_whitelist and not ip_matches(client_ip, config.ip_whitelist):
-        if audit:
-            audit.record(
-                action="http.request",
-                result="denied",
-                client_ip=client_ip,
-                resource=request.url.path,
-                detail="IP not whitelisted",
-            )
-        return _harden(
-            JSONResponse(status_code=403, content={"detail": "Access denied: IP not whitelisted"}),
-            request,
-            config,
-        )
+    def __init__(self, app: ASGIApp, config: SecurityConfig) -> None:
+        """
+        Wrap an ASGI application.
 
-    if config.require_https and not is_secure_request(request, config):
-        return _harden(
-            JSONResponse(
+        Args:
+            app: The application to protect.
+            config: The security configuration of this deployment.
+        """
+        self.app = app
+        self.config = config
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """
+        Apply the security policy, then delegate to the wrapped application.
+
+        Args:
+            scope: The ASGI connection scope.
+            receive: ASGI receive channel.
+            send: ASGI send channel.
+        """
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+
+        config = self.config
+        connection = HTTPConnection(scope)
+        client_ip = get_client_ip(connection, config)
+        path = str(scope.get("path", ""))
+        audit = get_audit_logger()
+
+        if config.ip_whitelist and not ip_matches(client_ip, config.ip_whitelist):
+            if audit:
+                audit.record(
+                    action=f"{scope['type']}.request",
+                    result="denied",
+                    client_ip=client_ip,
+                    resource=path,
+                    detail="IP not whitelisted",
+                )
+            await self._deny(
+                scope,
+                receive,
+                send,
+                connection,
                 status_code=403,
-                content={"detail": "HTTPS is required to reach this panel."},
-            ),
-            request,
-            config,
-        )
+                ws_code=WS_CLOSE_FORBIDDEN,
+                detail="Access denied: IP not whitelisted",
+            )
+            return
 
-    if config.rate_limit_enabled and not get_rate_limiter().is_allowed(client_ip):
-        return _harden(
-            JSONResponse(
+        if config.require_https and not is_secure_request(connection, config):
+            await self._deny(
+                scope,
+                receive,
+                send,
+                connection,
+                status_code=403,
+                ws_code=WS_CLOSE_FORBIDDEN,
+                detail="HTTPS is required to reach this panel.",
+            )
+            return
+
+        if config.rate_limit_enabled and not get_rate_limiter().is_allowed(client_ip):
+            await self._deny(
+                scope,
+                receive,
+                send,
+                connection,
                 status_code=429,
-                content={"detail": "Too many requests. Please try again later."},
+                ws_code=WS_CLOSE_RATE_LIMITED,
+                detail="Too many requests. Please try again later.",
                 headers={
                     "Retry-After": str(config.rate_limit_window),
                     "X-RateLimit-Remaining": "0",
                 },
-            ),
-            request,
-            config,
-        )
+            )
+            return
 
-    if request.url.path in ("/api/auth/login", "/api/auth/token"):
-        brute_force = get_brute_force()
-        if brute_force.is_locked(client_ip):
-            remaining = brute_force.get_lockout_remaining(client_ip)
+        if scope["type"] == "websocket" and not is_allowed_origin(connection, config):
             if audit:
                 audit.record(
-                    action="auth.login",
-                    result="locked",
+                    action="ws.connect",
+                    result="denied",
                     client_ip=client_ip,
-                    resource=request.url.path,
-                    detail=f"locked for {remaining} seconds",
+                    resource=path,
+                    detail="origin not allowed",
                 )
-            return _harden(
-                JSONResponse(
-                    status_code=429,
-                    content={
-                        "detail": f"Too many failed attempts. Locked for {remaining} seconds."
-                    },
-                    headers={"Retry-After": str(remaining)},
-                ),
-                request,
-                config,
+            await self._deny(
+                scope,
+                receive,
+                send,
+                connection,
+                status_code=403,
+                ws_code=WS_CLOSE_FORBIDDEN,
+                detail="Origin not allowed for this panel.",
             )
+            return
 
-    response = await call_next(request)
+        if self._guards_credentials(scope, connection, path):
+            brute_force = get_brute_force()
+            if brute_force.is_locked(client_ip):
+                remaining = brute_force.get_lockout_remaining(client_ip)
+                if audit:
+                    audit.record(
+                        action="auth.lockout",
+                        result="locked",
+                        client_ip=client_ip,
+                        resource=path,
+                        detail=f"locked for {remaining} seconds",
+                    )
+                await self._deny(
+                    scope,
+                    receive,
+                    send,
+                    connection,
+                    status_code=429,
+                    ws_code=WS_CLOSE_RATE_LIMITED,
+                    detail=f"Too many failed attempts. Locked for {remaining} seconds.",
+                    headers={"Retry-After": str(remaining)},
+                )
+                return
 
-    renewed = getattr(request.state, "renewed_session", None)
-    if renewed is not None:
+        if scope["type"] == "websocket":
+            session = authenticate_connection(connection, _query_ticket(scope))
+            if session is None:
+                await self._deny(
+                    scope,
+                    receive,
+                    send,
+                    connection,
+                    status_code=401,
+                    ws_code=WS_CLOSE_UNAUTHORIZED,
+                    detail="Authentication required",
+                )
+                return
+            scope.setdefault("state", {})["session"] = session
+            await self.app(scope, receive, send)
+            return
+
+        await self.app(scope, receive, self._wrap_send(scope, connection, client_ip, send))
+
+    @staticmethod
+    def _guards_credentials(scope: Scope, connection: HTTPConnection, path: str) -> bool:
+        """
+        Report whether the lockout applies to this connection.
+
+        The lockout exists to stop credential guessing, so it covers everything
+        that can carry a guess: the login endpoints, any request presenting a
+        Bearer token, and every WebSocket handshake. A browser that already
+        holds a valid session cookie is deliberately not blocked, so one
+        attacker cannot lock the operator out of their own panel.
+
+        Args:
+            scope: The ASGI connection scope.
+            connection: A view over the scope.
+            path: The request path.
+
+        Returns:
+            True when a locked-out client must be refused.
+        """
+        if scope["type"] == "websocket":
+            return True
+        if path in AUTH_PATHS:
+            return True
+        return bearer_token(connection) is not None
+
+    def _wrap_send(
+        self, scope: Scope, connection: HTTPConnection, client_ip: str, send: Send
+    ) -> Send:
+        """
+        Decorate the response as it leaves: cookies, audit and hardening.
+
+        Args:
+            scope: The ASGI connection scope.
+            connection: A view over the scope.
+            client_ip: The resolved client address.
+            send: The original ASGI send channel.
+
+        Returns:
+            A send channel that rewrites ``http.response.start``.
+        """
+
+        async def wrapped(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                self._harden_headers(headers, connection)
+                self._apply_renewed_session(scope, headers, connection)
+                if self.config.rate_limit_enabled:
+                    headers["X-RateLimit-Remaining"] = str(
+                        get_rate_limiter().get_remaining(client_ip)
+                    )
+                    headers["X-RateLimit-Limit"] = str(self.config.rate_limit_requests)
+                self._audit_mutation(scope, client_ip, int(message["status"]))
+            await send(message)
+
+        return wrapped
+
+    def _apply_renewed_session(
+        self, scope: Scope, headers: MutableHeaders, connection: HTTPConnection
+    ) -> None:
+        """
+        Attach the cookies of a session that was re-issued during the request.
+
+        Args:
+            scope: The ASGI connection scope, carrying the endpoint's state.
+            headers: Headers of the outgoing response.
+            connection: A view over the scope.
+        """
+        renewed = scope.get("state", {}).get("renewed_session")
+        if renewed is None:
+            return
+
         from wasm.web.api.auth import set_session_cookies
 
-        set_session_cookies(response, renewed, secure=is_secure_request(request, config))
+        carrier = Response()
+        set_session_cookies(carrier, renewed, secure=is_secure_request(connection, self.config))
+        for key, value in carrier.raw_headers:
+            if key.decode("latin-1").lower() == "set-cookie":
+                headers.append("set-cookie", value.decode("latin-1"))
 
-    if audit and request.url.path.startswith("/api") and request.method.upper() not in SAFE_METHODS:
-        session = getattr(request.state, "session", None)
+    def _audit_mutation(self, scope: Scope, client_ip: str, status_code: int) -> None:
+        """
+        Record a state-changing API call in the audit log.
+
+        Args:
+            scope: The ASGI connection scope.
+            client_ip: The resolved client address.
+            status_code: Status the endpoint answered with.
+        """
+        audit = get_audit_logger()
+        method = str(scope.get("method", "GET")).upper()
+        path = str(scope.get("path", ""))
+        if audit is None or not path.startswith("/api") or method in SAFE_METHODS:
+            return
+
+        session = scope.get("state", {}).get("session")
         audit.record(
-            action=f"api.{request.method.lower()}",
-            result="ok" if response.status_code < 400 else f"error:{response.status_code}",
+            action=f"api.{method.lower()}",
+            result="ok" if status_code < 400 else f"error:{status_code}",
             client_ip=client_ip,
             actor=str(session.get("sid")) if session else "anonymous",
-            resource=request.url.path,
+            resource=path,
         )
 
-    if config.rate_limit_enabled:
-        remaining = get_rate_limiter().get_remaining(client_ip)
-        response.headers["X-RateLimit-Remaining"] = str(remaining)
-        response.headers["X-RateLimit-Limit"] = str(config.rate_limit_requests)
+    def _harden_headers(self, headers: MutableHeaders, connection: HTTPConnection) -> None:
+        """
+        Set the response hardening headers.
 
-    return _harden(response, request, config)
+        Args:
+            headers: Headers of the outgoing response.
+            connection: The connection being answered.
+        """
+        headers["Content-Security-Policy"] = CONTENT_SECURITY_POLICY
+        headers["X-Content-Type-Options"] = "nosniff"
+        headers["X-Frame-Options"] = "DENY"
+        headers["Referrer-Policy"] = "no-referrer"
+        headers["Cross-Origin-Opener-Policy"] = "same-origin"
+        headers["Cache-Control"] = "no-store"
+        headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+
+        if self.config.require_https or is_secure_request(connection, self.config):
+            headers["Strict-Transport-Security"] = HSTS_VALUE
+
+    async def _deny(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        connection: HTTPConnection,
+        *,
+        status_code: int,
+        ws_code: int,
+        detail: str,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        """
+        Refuse a connection in the shape its protocol understands.
+
+        Args:
+            scope: The ASGI connection scope.
+            receive: ASGI receive channel.
+            send: ASGI send channel.
+            connection: A view over the scope.
+            status_code: HTTP status for an ``http`` scope.
+            ws_code: Close code for a ``websocket`` scope.
+            detail: Message for the client.
+            headers: Extra response headers.
+        """
+        if scope["type"] == "websocket":
+            # Closing before accepting is how ASGI refuses a handshake; the
+            # server turns it into an HTTP error for the client. The connect
+            # event is consumed first because that is the order the protocol
+            # servers expect, and a client that already gave up sends
+            # websocket.disconnect instead.
+            message = await receive()
+            if message["type"] != "websocket.connect":
+                return
+            await send({"type": "websocket.close", "code": ws_code, "reason": detail[:120]})
+            return
+
+        response = JSONResponse(
+            status_code=status_code, content={"detail": detail}, headers=headers
+        )
+        self._harden_headers(MutableHeaders(raw=response.raw_headers), connection)
+        await response(scope, receive, send)
 
 
-def _harden(response: Response, request: Request, config: SecurityConfig) -> Response:
+def _query_ticket(scope: Scope) -> str | None:
     """
-    Add the response hardening headers.
+    Read the single-use WebSocket ticket from the query string.
 
     Args:
-        response: The response to decorate.
-        request: The request it answers.
-        config: The active configuration.
+        scope: The ASGI connection scope.
 
     Returns:
-        The same response, with security headers set.
+        The ticket, or None when the handshake carries none.
     """
-    response.headers["Content-Security-Policy"] = CONTENT_SECURITY_POLICY
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
-    response.headers["Cache-Control"] = "no-store"
-    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
-
-    if config.require_https or is_secure_request(request, config):
-        response.headers["Strict-Transport-Security"] = HSTS_VALUE
-
-    return response
+    raw = scope.get("query_string", b"")
+    if not raw:
+        return None
+    values = parse_qs(raw.decode("latin-1")).get("ticket")
+    return values[0] if values else None
 
 
 def _login_fallback_html() -> str:

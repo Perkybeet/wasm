@@ -4,7 +4,6 @@
 
 """Tests for the EnvManager helper."""
 
-
 import pytest
 
 from wasm.deployers.helpers.env_manager import (

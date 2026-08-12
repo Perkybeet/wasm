@@ -1,40 +1,81 @@
-# Copyright (c) 2024-2025 Yago López Prado
+# Copyright (c) 2024-2026 Yago Lopez Prado
 # Licensed under WASM-NCSAL 1.0 (Commercial use prohibited)
 # https://github.com/Perkybeet/wasm/blob/main/LICENSE
 
 """
 Database API endpoints.
 
-Provides REST API endpoints for database management.
+A client of :mod:`wasm.managers.database`: every statement this module causes
+to run is built by an engine manager, which is where quoting, privilege
+whitelists and the command runner live.
+
+The one endpoint that needs a decision of its own is ``POST /query``. A
+database console in a server panel is a legitimate feature - it is why an
+operator opens the panel instead of ssh - but the previous version accepted any
+string and handed it to the engine as the superuser, with no record of who ran
+what. It was neither a console nor a safety net, only an unlogged root shell
+into every database on the host. It is kept, and made explicit:
+
+- **Read-only by default.** ``mode`` defaults to ``read`` and only statements
+  that begin with a read keyword are accepted. Writing requires
+  ``mode="write"`` in the body, so no client writes by accident.
+- **One statement at a time.** An embedded ``;`` is refused, which is what
+  turns "one SELECT" into "one SELECT and one DROP".
+- **Audited.** Every attempt is logged to ``wasm.audit`` with the session, the
+  engine, the database and the statement, accepted or not.
+- **Bounded output.** The response is truncated to ``max_rows`` lines and says
+  so, so a ``SELECT *`` over a large table cannot pull the panel over.
+
+Read mode is only offered for engines whose read grammar WASM actually knows
+(PostgreSQL and MySQL). For the others a query is a write by definition, and
+the client has to say so.
 """
 
+from __future__ import annotations
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+import logging
+from pathlib import Path
+from typing import Annotated, Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from wasm.core.exceptions import (
-    DatabaseBackupError,
     DatabaseEngineError,
     DatabaseError,
-    DatabaseExistsError,
-    DatabaseNotFoundError,
-    DatabaseUserError,
+    DatabaseQueryError,
 )
 from wasm.managers.database import (
     BaseDatabaseManager,
     DatabaseRegistry,
     get_db_manager,
 )
+from wasm.managers.service_manager import ServiceManager
+from wasm.validators.names import resolve_within, validate_filename
 from wasm.web.api.auth import get_current_session
+from wasm.web.api.deps import JobAcceptedResponse, WASMErrorRoute
+from wasm.web.jobs import JobType, database_engine_job, get_job_manager
 
-router = APIRouter()
+router = APIRouter(route_class=WASMErrorRoute)
 
+#: Append-only record of privileged actions. Kept separate from the module
+#: logger so an operator can route it somewhere durable.
+audit_log = logging.getLogger("wasm.audit")
 
-# ==================== Pydantic Models ====================
+#: Engines whose read-only grammar WASM knows well enough to enforce it.
+READ_MODE_ENGINES = frozenset({"postgres", "postgresql", "mysql", "mariadb"})
+
+#: Statements accepted in read mode. Anything else needs mode="write".
+READ_STATEMENT_KEYWORDS = frozenset(
+    {"select", "show", "explain", "describe", "desc", "with", "table", "values"}
+)
+
+#: Longest statement accepted, so the console cannot be used as a file upload.
+MAX_QUERY_LENGTH = 20_000
 
 
 class EngineInfo(BaseModel):
-    """Database engine information."""
+    """A database engine and whether it is usable on this host."""
 
     name: str
     display_name: str
@@ -51,7 +92,7 @@ class EngineListResponse(BaseModel):
 
 
 class EngineStatusResponse(BaseModel):
-    """Response for engine status."""
+    """Response for the status of one engine."""
 
     engine: str
     display_name: str
@@ -62,8 +103,17 @@ class EngineStatusResponse(BaseModel):
     service: str
 
 
+class EngineLogsResponse(BaseModel):
+    """Response carrying journal output for an engine's service."""
+
+    engine: str
+    service: str
+    logs: str
+    lines: int
+
+
 class DatabaseInfoResponse(BaseModel):
-    """Database information response."""
+    """One database."""
 
     name: str
     engine: str
@@ -90,13 +140,13 @@ class CreateDatabaseRequest(BaseModel):
 
 
 class UserInfoResponse(BaseModel):
-    """Database user information response."""
+    """One database user."""
 
     username: str
     engine: str
     host: str = "localhost"
-    databases: list[str] = []
-    privileges: list[str] = []
+    databases: list[str] = Field(default_factory=list)
+    privileges: list[str] = Field(default_factory=list)
 
 
 class UserListResponse(BaseModel):
@@ -111,15 +161,19 @@ class CreateUserRequest(BaseModel):
 
     username: str = Field(..., description="Username")
     engine: str = Field(..., description="Database engine")
-    password: str | None = Field(
-        default=None, description="Password (generated if not provided)"
-    )
+    password: str | None = Field(default=None, description="Password, generated when omitted")
     database: str | None = Field(default=None, description="Grant access to this database")
     host: str = Field(default="localhost", description="Host restriction")
 
 
 class CreateUserResponse(BaseModel):
-    """Response after creating a user."""
+    """
+    Response after creating a user.
+
+    The password is returned exactly once, at creation: WASM stores only what
+    the engine stores, which is a hash, so there is nowhere to read it from
+    later. It is deliberately absent from every other response.
+    """
 
     username: str
     password: str
@@ -127,17 +181,17 @@ class CreateUserResponse(BaseModel):
 
 
 class GrantPrivilegesRequest(BaseModel):
-    """Request to grant privileges."""
+    """Request to grant or revoke privileges."""
 
     username: str = Field(..., description="Username")
     database: str = Field(..., description="Database name")
     engine: str = Field(..., description="Database engine")
-    privileges: list[str] | None = Field(default=None, description="Privileges to grant")
+    privileges: list[str] | None = Field(default=None, description="Privileges to act on")
     host: str = Field(default="localhost", description="Host restriction")
 
 
 class BackupInfoResponse(BaseModel):
-    """Backup information response."""
+    """One database backup."""
 
     path: str
     database: str
@@ -149,46 +203,80 @@ class BackupInfoResponse(BaseModel):
 
 
 class BackupListResponse(BaseModel):
-    """Response for listing backups."""
+    """Response for listing database backups."""
 
     backups: list[BackupInfoResponse]
     total: int
 
 
 class CreateBackupRequest(BaseModel):
-    """Request to create a backup."""
+    """Request to dump a database."""
 
     database: str = Field(..., description="Database name")
     engine: str = Field(..., description="Database engine")
-    compress: bool = Field(default=True, description="Compress the backup")
+    compress: bool = Field(default=True, description="Compress the dump")
 
 
 class RestoreBackupRequest(BaseModel):
-    """Request to restore a backup."""
+    """
+    Request to restore a database.
+
+    Attributes:
+        database: Database to restore into.
+        engine: Engine that owns it.
+        backup_name: File name of the dump, which must be one of the engine's
+            own backups. A full path is not accepted: it would let the panel
+            read any file on the host as the database superuser.
+        drop_existing: Drop the database before restoring.
+    """
 
     database: str = Field(..., description="Database name")
     engine: str = Field(..., description="Database engine")
-    backup_path: str = Field(..., description="Path to backup file")
-    drop_existing: bool = Field(default=False, description="Drop existing database first")
+    backup_name: str = Field(..., description="File name of the dump to restore")
+    drop_existing: bool = Field(default=False, description="Drop the database first")
 
 
 class QueryRequest(BaseModel):
-    """Request to execute a query."""
+    """
+    Request to run a statement.
+
+    Attributes:
+        database: Database to run against.
+        engine: Engine that owns it.
+        query: The statement. One statement only.
+        mode: ``read`` refuses anything that is not a read statement; ``write``
+            is the explicit opt-in for statements that change data.
+        max_rows: Most output lines to return.
+    """
 
     database: str = Field(..., description="Database name")
     engine: str = Field(..., description="Database engine")
-    query: str = Field(..., description="Query to execute")
+    query: str = Field(..., description="Statement to run")
+    mode: Literal["read", "write"] = Field(default="read", description="Read-only unless 'write'")
+    max_rows: int = Field(default=200, ge=1, le=10_000, description="Output lines to return")
 
 
 class QueryResponse(BaseModel):
-    """Response for query execution."""
+    """
+    Result of a statement.
+
+    Attributes:
+        success: Whether the engine accepted the statement.
+        output: The engine's output, truncated to ``max_rows`` lines.
+        mode: The mode the statement ran in.
+        truncated: Whether output was cut.
+        returned_rows: How many lines the response carries.
+    """
 
     success: bool
     output: str
+    mode: str
+    truncated: bool = False
+    returned_rows: int = 0
 
 
 class ConnectionStringRequest(BaseModel):
-    """Request for connection string."""
+    """Request for a connection string."""
 
     database: str
     username: str
@@ -198,70 +286,241 @@ class ConnectionStringRequest(BaseModel):
 
 
 class ConnectionStringResponse(BaseModel):
-    """Response with connection string."""
+    """
+    Response with a connection string.
+
+    The string embeds the password the caller supplied, which is the point of
+    the endpoint; nothing here is read from the server.
+    """
 
     connection_string: str
 
 
 class ActionResponse(BaseModel):
-    """Generic action response."""
+    """Generic action outcome."""
 
     success: bool
     message: str
 
 
-# ==================== Helper Functions ====================
-
-
 def get_manager(engine: str) -> BaseDatabaseManager:
-    """Get database manager or raise HTTP exception."""
+    """
+    Resolve an engine name to its manager.
+
+    Args:
+        engine: Engine name as supplied by the client.
+
+    Returns:
+        The engine manager.
+
+    Raises:
+        DatabaseEngineError: When the engine is not one WASM supports. The name
+            is checked against the registry, which is the allowlist.
+    """
     manager = get_db_manager(engine, verbose=False)
-    if not manager:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown database engine: {engine}. Available: {', '.join(DatabaseRegistry.list_engines())}",
+    if manager is None:
+        raise DatabaseEngineError(
+            f"Unknown database engine: {engine}",
+            details=f"Available engines: {', '.join(DatabaseRegistry.list_engines())}.",
         )
     return manager
 
 
 def check_running(manager: BaseDatabaseManager) -> None:
-    """Check if engine is running or raise HTTP exception."""
+    """
+    Refuse an operation when the engine cannot serve it.
+
+    Args:
+        manager: The engine manager.
+
+    Raises:
+        DatabaseEngineError: When the engine is not installed or not running.
+    """
     if not manager.is_installed():
-        raise HTTPException(status_code=400, detail=f"{manager.DISPLAY_NAME} is not installed")
+        raise DatabaseEngineError(
+            f"{manager.DISPLAY_NAME} is not installed",
+            details=f"Install it with POST /api/databases/engines/{manager.ENGINE_NAME}/install.",
+        )
     if not manager.is_running():
-        raise HTTPException(status_code=400, detail=f"{manager.DISPLAY_NAME} is not running")
+        raise DatabaseEngineError(
+            f"{manager.DISPLAY_NAME} is not running",
+            details=f"Start it with POST /api/databases/engines/{manager.ENGINE_NAME}/start.",
+        )
 
 
-# ==================== Engine Endpoints ====================
+def _database_name(manager: BaseDatabaseManager, name: str) -> str:
+    """
+    Validate a database name with the engine's own rule.
+
+    The engine's validator is used rather than
+    :func:`wasm.validators.names.validate_database_name` because the alphabets
+    genuinely differ - a Redis database is a number - and the engine manager is
+    the one that has to quote it.
+
+    Args:
+        manager: The engine manager.
+        name: Candidate database name.
+
+    Returns:
+        The validated name.
+
+    Raises:
+        DatabaseError: When the engine will not accept the name.
+    """
+    return manager.validate_database_name(name)
+
+
+def _user_name(manager: BaseDatabaseManager, username: str) -> str:
+    """
+    Validate a user name with the engine's own rule.
+
+    Args:
+        manager: The engine manager.
+        username: Candidate user name.
+
+    Returns:
+        The validated name.
+
+    Raises:
+        DatabaseError: When the engine will not accept the name.
+    """
+    return manager.validate_user_name(username)
+
+
+def _reject_multiple_statements(query: str) -> str:
+    """
+    Reduce a statement to one statement.
+
+    Args:
+        query: The statement as supplied.
+
+    Returns:
+        The statement, stripped, without its optional trailing semicolon.
+
+    Raises:
+        DatabaseQueryError: When the text is empty, too long, or holds more
+            than one statement.
+    """
+    statement = query.strip()
+    if not statement:
+        raise DatabaseQueryError(
+            "Empty statement",
+            details="Send the statement to run in the 'query' field.",
+        )
+    if len(statement) > MAX_QUERY_LENGTH:
+        raise DatabaseQueryError(
+            f"Statement is too long: {len(statement)} characters",
+            details=f"The console accepts at most {MAX_QUERY_LENGTH} characters.",
+        )
+
+    stripped = statement.removesuffix(";").rstrip()
+    if ";" in stripped:
+        raise DatabaseQueryError(
+            "Only one statement may be sent at a time",
+            details="Remove the embedded ';' and send the statements one by one.",
+        )
+    return stripped
+
+
+def _check_read_only(engine: str, statement: str) -> None:
+    """
+    Refuse a statement that is not a read in read mode.
+
+    Args:
+        engine: Engine name.
+        statement: The single statement to run.
+
+    Raises:
+        DatabaseQueryError: When the engine has no read grammar WASM enforces,
+            or the statement does not begin with a read keyword.
+    """
+    if engine.lower() not in READ_MODE_ENGINES:
+        raise DatabaseQueryError(
+            f"Read-only mode is not available for {engine}",
+            details=(
+                "WASM only enforces a read-only grammar for PostgreSQL and MySQL. "
+                "Send mode='write' to run this statement, knowing it may change data."
+            ),
+        )
+
+    keyword = statement.split(None, 1)[0].lower() if statement.split() else ""
+    if keyword not in READ_STATEMENT_KEYWORDS:
+        raise DatabaseQueryError(
+            f"Statement is not read-only: {keyword or statement[:20]!r}",
+            details=(
+                "Read mode accepts: "
+                f"{', '.join(sorted(READ_STATEMENT_KEYWORDS))}. "
+                "Send mode='write' to run a statement that changes data."
+            ),
+        )
+
+
+def _truncate(output: str, max_rows: int) -> tuple[str, bool, int]:
+    """
+    Cut the engine's output to a bounded number of lines.
+
+    Args:
+        output: Raw output.
+        max_rows: Maximum number of lines to keep.
+
+    Returns:
+        Tuple of the kept text, whether anything was dropped, and how many
+        lines were kept.
+    """
+    lines = output.splitlines()
+    if len(lines) <= max_rows:
+        return output, False, len(lines)
+    return "\n".join(lines[:max_rows]), True, max_rows
+
+
+# ==================== Engines ====================
 
 
 @router.get("/engines", response_model=EngineListResponse)
-async def list_engines(session: dict = Depends(get_current_session)):
-    """List all available database engines."""
-    engines = []
-    for engine_name in DatabaseRegistry.list_engines():
-        manager = get_db_manager(engine_name, verbose=False)
-        if manager:
-            engines.append(
-                EngineInfo(
-                    name=manager.ENGINE_NAME,
-                    display_name=manager.DISPLAY_NAME,
-                    installed=manager.is_installed(),
-                    version=manager.get_version() if manager.is_installed() else None,
-                    running=manager.is_running() if manager.is_installed() else False,
-                    port=manager.DEFAULT_PORT,
-                )
-            )
+def list_engines(session: Annotated[dict, Depends(get_current_session)]) -> EngineListResponse:
+    """
+    List every engine WASM can manage and its state on this host.
 
+    Args:
+        session: The authenticated session.
+
+    Returns:
+        The engines.
+    """
+    engines: list[EngineInfo] = []
+    for name in DatabaseRegistry.list_engines():
+        manager = get_db_manager(name, verbose=False)
+        if manager is None:
+            continue
+        installed = manager.is_installed()
+        engines.append(
+            EngineInfo(
+                name=manager.ENGINE_NAME,
+                display_name=manager.DISPLAY_NAME,
+                installed=installed,
+                version=manager.get_version() if installed else None,
+                running=manager.is_running() if installed else False,
+                port=manager.DEFAULT_PORT,
+            )
+        )
     return EngineListResponse(engines=engines)
 
 
 @router.get("/engines/{engine}/status", response_model=EngineStatusResponse)
-async def get_engine_status(engine: str, session: dict = Depends(get_current_session)):
-    """Get status of a specific database engine."""
-    manager = get_manager(engine)
-    status = manager.get_status()
+def get_engine_status(
+    engine: str, session: Annotated[dict, Depends(get_current_session)]
+) -> EngineStatusResponse:
+    """
+    Report the state of one engine.
 
+    Args:
+        engine: Engine name.
+        session: The authenticated session.
+
+    Returns:
+        The engine status.
+    """
+    status = get_manager(engine).get_status()
     return EngineStatusResponse(
         engine=status["engine"],
         display_name=status["display_name"],
@@ -273,482 +532,727 @@ async def get_engine_status(engine: str, session: dict = Depends(get_current_ses
     )
 
 
-@router.post("/engines/{engine}/install", response_model=ActionResponse)
-async def install_engine(
-    engine: str, background_tasks: BackgroundTasks, session: dict = Depends(get_current_session)
-):
-    """Install a database engine."""
-    manager = get_manager(engine)
+@router.get("/engines/{engine}/logs", response_model=EngineLogsResponse)
+def get_engine_logs(
+    engine: str,
+    session: Annotated[dict, Depends(get_current_session)],
+    lines: Annotated[int, Query(ge=1, le=1000)] = 100,
+) -> EngineLogsResponse:
+    """
+    Read journal output for an engine's service.
 
+    Args:
+        engine: Engine name.
+        lines: How many lines to return.
+        session: The authenticated session.
+
+    Returns:
+        The log output.
+    """
+    manager = get_manager(engine)
+    service = manager.SERVICE_NAME
+    logs = ServiceManager(verbose=False).logs(service, lines=lines) or "No logs available"
+    return EngineLogsResponse(engine=manager.ENGINE_NAME, service=service, logs=logs, lines=lines)
+
+
+@router.post("/engines/{engine}/install", response_model=JobAcceptedResponse, status_code=202)
+def install_engine(
+    engine: str, session: Annotated[dict, Depends(get_current_session)]
+) -> JobAcceptedResponse:
+    """
+    Queue the installation of an engine.
+
+    Installation drives the distribution package manager, so it runs as a job.
+
+    Args:
+        engine: Engine name.
+        session: The authenticated session.
+
+    Returns:
+        The queued job.
+
+    Raises:
+        HTTPException: 409 when the engine is already installed.
+    """
+    manager = get_manager(engine)
     if manager.is_installed():
-        return ActionResponse(success=True, message=f"{manager.DISPLAY_NAME} is already installed")
+        raise HTTPException(status_code=409, detail=f"{manager.DISPLAY_NAME} is already installed")
 
-    try:
-        manager.install()
-        return ActionResponse(
-            success=True, message=f"{manager.DISPLAY_NAME} installed successfully"
-        )
-    except DatabaseEngineError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    job = get_job_manager().create_job(
+        job_type=JobType.CUSTOM,
+        name=f"Install {manager.DISPLAY_NAME}",
+        description=f"Installing {manager.DISPLAY_NAME}",
+        func=database_engine_job,
+        kwargs={"engine": manager.ENGINE_NAME, "action": "install"},
+        metadata={"engine": manager.ENGINE_NAME},
+    )
+    return JobAcceptedResponse(
+        job_id=job.id,
+        status=job.status.value,
+        message=f"Installation queued for {manager.DISPLAY_NAME}",
+        job=job.to_dict(),
+    )
 
 
-@router.post("/engines/{engine}/uninstall", response_model=ActionResponse)
-async def uninstall_engine(
-    engine: str, purge: bool = False, session: dict = Depends(get_current_session)
-):
-    """Uninstall a database engine."""
+@router.post("/engines/{engine}/uninstall", response_model=JobAcceptedResponse, status_code=202)
+def uninstall_engine(
+    engine: str,
+    session: Annotated[dict, Depends(get_current_session)],
+    purge: Annotated[bool, Query(description="Also remove configuration and data")] = False,
+) -> JobAcceptedResponse:
+    """
+    Queue the removal of an engine.
+
+    Args:
+        engine: Engine name.
+        purge: Also remove configuration and data.
+        session: The authenticated session.
+
+    Returns:
+        The queued job.
+    """
     manager = get_manager(engine)
 
-    if not manager.is_installed():
-        return ActionResponse(success=True, message=f"{manager.DISPLAY_NAME} is not installed")
-
-    try:
-        manager.uninstall(purge=purge)
-        return ActionResponse(success=True, message=f"{manager.DISPLAY_NAME} uninstalled")
-    except DatabaseEngineError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    job = get_job_manager().create_job(
+        job_type=JobType.CUSTOM,
+        name=f"Uninstall {manager.DISPLAY_NAME}",
+        description=f"Uninstalling {manager.DISPLAY_NAME}",
+        func=database_engine_job,
+        kwargs={"engine": manager.ENGINE_NAME, "action": "uninstall", "purge": purge},
+        metadata={"engine": manager.ENGINE_NAME, "purge": purge},
+    )
+    return JobAcceptedResponse(
+        job_id=job.id,
+        status=job.status.value,
+        message=f"Removal queued for {manager.DISPLAY_NAME}",
+        job=job.to_dict(),
+    )
 
 
 @router.post("/engines/{engine}/start", response_model=ActionResponse)
-async def start_engine(engine: str, session: dict = Depends(get_current_session)):
-    """Start a database engine."""
+def start_engine(
+    engine: str, session: Annotated[dict, Depends(get_current_session)]
+) -> ActionResponse:
+    """
+    Start an engine's service.
+
+    Args:
+        engine: Engine name.
+        session: The authenticated session.
+
+    Returns:
+        The action outcome.
+    """
     manager = get_manager(engine)
-
     if not manager.is_installed():
-        raise HTTPException(status_code=400, detail=f"{manager.DISPLAY_NAME} is not installed")
-
+        raise DatabaseEngineError(
+            f"{manager.DISPLAY_NAME} is not installed",
+            details="Install it before starting it.",
+        )
     if manager.is_running():
         return ActionResponse(success=True, message=f"{manager.DISPLAY_NAME} is already running")
 
-    try:
-        manager.start()
-        return ActionResponse(success=True, message=f"{manager.DISPLAY_NAME} started")
-    except DatabaseEngineError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    manager.start()
+    return ActionResponse(success=True, message=f"{manager.DISPLAY_NAME} started")
 
 
 @router.post("/engines/{engine}/stop", response_model=ActionResponse)
-async def stop_engine(engine: str, session: dict = Depends(get_current_session)):
-    """Stop a database engine."""
-    manager = get_manager(engine)
+def stop_engine(
+    engine: str, session: Annotated[dict, Depends(get_current_session)]
+) -> ActionResponse:
+    """
+    Stop an engine's service.
 
+    Args:
+        engine: Engine name.
+        session: The authenticated session.
+
+    Returns:
+        The action outcome.
+    """
+    manager = get_manager(engine)
     if not manager.is_running():
         return ActionResponse(success=True, message=f"{manager.DISPLAY_NAME} is not running")
 
-    try:
-        manager.stop()
-        return ActionResponse(success=True, message=f"{manager.DISPLAY_NAME} stopped")
-    except DatabaseEngineError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    manager.stop()
+    return ActionResponse(success=True, message=f"{manager.DISPLAY_NAME} stopped")
 
 
 @router.post("/engines/{engine}/restart", response_model=ActionResponse)
-async def restart_engine(engine: str, session: dict = Depends(get_current_session)):
-    """Restart a database engine."""
+def restart_engine(
+    engine: str, session: Annotated[dict, Depends(get_current_session)]
+) -> ActionResponse:
+    """
+    Restart an engine's service.
+
+    Args:
+        engine: Engine name.
+        session: The authenticated session.
+
+    Returns:
+        The action outcome.
+    """
     manager = get_manager(engine)
-
     if not manager.is_installed():
-        raise HTTPException(status_code=400, detail=f"{manager.DISPLAY_NAME} is not installed")
-
-    try:
-        manager.restart()
-        return ActionResponse(success=True, message=f"{manager.DISPLAY_NAME} restarted")
-    except DatabaseEngineError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/engines/{engine}/logs")
-async def get_engine_logs(
-    engine: str, lines: int = 100, session: dict = Depends(get_current_session)
-):
-    """Get database engine service logs from journalctl."""
-    import subprocess
-
-    manager = get_manager(engine)
-
-    if not manager.is_installed():
-        raise HTTPException(status_code=400, detail=f"{manager.DISPLAY_NAME} is not installed")
-
-    service_name = manager.SERVICE_NAME
-
-    try:
-        result = subprocess.run(
-            ["journalctl", "-u", service_name, "-n", str(lines), "--no-pager"],
-            capture_output=True,
-            text=True,
-            timeout=30,
+        raise DatabaseEngineError(
+            f"{manager.DISPLAY_NAME} is not installed",
+            details="Install it before restarting it.",
         )
-        logs = result.stdout or result.stderr or "No logs available"
-    except subprocess.TimeoutExpired:
-        logs = "Timeout retrieving logs"
-    except Exception as e:
-        logs = f"Error retrieving logs: {e}"
 
-    return {"engine": engine, "service": service_name, "logs": logs, "lines": lines}
+    manager.restart()
+    return ActionResponse(success=True, message=f"{manager.DISPLAY_NAME} restarted")
 
 
-# ==================== Database Endpoints ====================
+# ==================== Databases ====================
 
 
 @router.get("/databases", response_model=DatabaseListResponse)
-async def list_databases(
-    engine: str | None = None, session: dict = Depends(get_current_session)
-):
-    """List all databases."""
-    all_databases = []
+def list_databases(
+    session: Annotated[dict, Depends(get_current_session)],
+    engine: Annotated[str | None, Query(description="Restrict to one engine")] = None,
+) -> DatabaseListResponse:
+    """
+    List databases across the running engines.
 
-    if engine:
-        managers = [get_manager(engine)]
-    else:
-        managers = DatabaseRegistry.get_installed(verbose=False)
+    Args:
+        engine: Engine to restrict the listing to.
+        session: The authenticated session.
 
+    Returns:
+        Every database the running engines report.
+    """
+    managers = [get_manager(engine)] if engine else DatabaseRegistry.get_installed(verbose=False)
+
+    databases: list[DatabaseInfoResponse] = []
     for manager in managers:
         if not manager.is_running():
             continue
-
         try:
-            databases = manager.list_databases()
-            for db in databases:
-                all_databases.append(
-                    DatabaseInfoResponse(
-                        name=db.name,
-                        engine=db.engine,
-                        size=db.size,
-                        tables=db.tables,
-                        owner=db.owner,
-                        encoding=db.encoding,
-                    )
-                )
-        except Exception:
+            entries = manager.list_databases()
+        except DatabaseError:
+            # One unhealthy engine must not empty the whole listing.
+            logging.getLogger(__name__).warning(
+                "Could not list databases for %s", manager.ENGINE_NAME, exc_info=True
+            )
             continue
+        databases.extend(
+            DatabaseInfoResponse(
+                name=db.name,
+                engine=db.engine,
+                size=db.size,
+                tables=db.tables,
+                owner=db.owner,
+                encoding=db.encoding,
+            )
+            for db in entries
+        )
 
-    return DatabaseListResponse(databases=all_databases, total=len(all_databases))
+    return DatabaseListResponse(databases=databases, total=len(databases))
 
 
 @router.post("/databases", response_model=DatabaseInfoResponse)
-async def create_database(
-    request: CreateDatabaseRequest, session: dict = Depends(get_current_session)
-):
-    """Create a new database."""
+def create_database(
+    request: CreateDatabaseRequest, session: Annotated[dict, Depends(get_current_session)]
+) -> DatabaseInfoResponse:
+    """
+    Create a database.
+
+    Args:
+        request: The create request.
+        session: The authenticated session.
+
+    Returns:
+        The new database.
+
+    Raises:
+        DatabaseExistsError: When the database already exists.
+    """
     manager = get_manager(request.engine)
     check_running(manager)
 
-    try:
-        info = manager.create_database(
-            name=request.name,
-            owner=request.owner,
-            encoding=request.encoding,
-        )
-        return DatabaseInfoResponse(
-            name=info.name,
-            engine=info.engine,
-            size=info.size,
-            tables=info.tables,
-            owner=info.owner,
-            encoding=info.encoding,
-        )
-    except DatabaseExistsError as e:
-        raise HTTPException(status_code=409, detail=str(e))
-    except DatabaseError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    name = _database_name(manager, request.name)
+    owner = _user_name(manager, request.owner) if request.owner else None
+
+    info = manager.create_database(name=name, owner=owner, encoding=request.encoding)
+    return DatabaseInfoResponse(
+        name=info.name,
+        engine=info.engine,
+        size=info.size,
+        tables=info.tables,
+        owner=info.owner,
+        encoding=info.encoding,
+    )
 
 
 @router.get("/databases/{engine}/{name}", response_model=DatabaseInfoResponse)
-async def get_database_info(engine: str, name: str, session: dict = Depends(get_current_session)):
-    """Get information about a specific database."""
+def get_database_info(
+    engine: str, name: str, session: Annotated[dict, Depends(get_current_session)]
+) -> DatabaseInfoResponse:
+    """
+    Describe one database.
+
+    Args:
+        engine: Engine name.
+        name: Database name.
+        session: The authenticated session.
+
+    Returns:
+        The database description.
+
+    Raises:
+        DatabaseNotFoundError: When no such database exists.
+    """
     manager = get_manager(engine)
     check_running(manager)
 
-    try:
-        info = manager.get_database_info(name)
-        return DatabaseInfoResponse(
-            name=info.name,
-            engine=info.engine,
-            size=info.size,
-            tables=info.tables,
-            owner=info.owner,
-            encoding=info.encoding,
-        )
-    except DatabaseNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except DatabaseError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    info = manager.get_database_info(_database_name(manager, name))
+    return DatabaseInfoResponse(
+        name=info.name,
+        engine=info.engine,
+        size=info.size,
+        tables=info.tables,
+        owner=info.owner,
+        encoding=info.encoding,
+    )
 
 
 @router.delete("/databases/{engine}/{name}", response_model=ActionResponse)
-async def drop_database(
-    engine: str, name: str, force: bool = False, session: dict = Depends(get_current_session)
-):
-    """Drop a database."""
+def drop_database(
+    engine: str,
+    name: str,
+    session: Annotated[dict, Depends(get_current_session)],
+    force: Annotated[bool, Query(description="Disconnect clients first")] = False,
+) -> ActionResponse:
+    """
+    Drop a database.
+
+    Args:
+        engine: Engine name.
+        name: Database name.
+        force: Disconnect open sessions before dropping.
+        session: The authenticated session.
+
+    Returns:
+        The action outcome.
+
+    Raises:
+        DatabaseNotFoundError: When no such database exists.
+    """
     manager = get_manager(engine)
     check_running(manager)
 
-    try:
-        manager.drop_database(name, force=force)
-        return ActionResponse(success=True, message=f"Database '{name}' dropped")
-    except DatabaseNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except DatabaseError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    validated = _database_name(manager, name)
+    audit_log.info(
+        "drop_database engine=%s database=%s session=%s",
+        manager.ENGINE_NAME,
+        validated,
+        session.get("session_id", "unknown"),
+    )
+    manager.drop_database(validated, force=force)
+
+    return ActionResponse(success=True, message=f"Database '{validated}' dropped")
 
 
-# ==================== User Endpoints ====================
-
-
-@router.get("/users/{engine}", response_model=UserListResponse)
-async def list_users(engine: str, session: dict = Depends(get_current_session)):
-    """List all database users."""
-    manager = get_manager(engine)
-    check_running(manager)
-
-    try:
-        users = manager.list_users()
-        return UserListResponse(
-            users=[
-                UserInfoResponse(
-                    username=u.username,
-                    engine=u.engine,
-                    host=u.host,
-                    databases=u.databases,
-                    privileges=u.privileges,
-                )
-                for u in users
-            ],
-            total=len(users),
-        )
-    except DatabaseError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+# ==================== Users ====================
 
 
 @router.post("/users", response_model=CreateUserResponse)
-async def create_user(request: CreateUserRequest, session: dict = Depends(get_current_session)):
-    """Create a new database user."""
+def create_user(
+    request: CreateUserRequest, session: Annotated[dict, Depends(get_current_session)]
+) -> CreateUserResponse:
+    """
+    Create a database user.
+
+    Args:
+        request: The create request.
+        session: The authenticated session.
+
+    Returns:
+        The user and its password, which is shown exactly once.
+
+    Raises:
+        DatabaseUserError: When the engine refuses the user.
+    """
     manager = get_manager(request.engine)
     check_running(manager)
 
-    try:
-        user_info, password = manager.create_user(
-            username=request.username,
-            password=request.password,
-            host=request.host,
-            database=request.database,
-        )
+    username = _user_name(manager, request.username)
+    database = _database_name(manager, request.database) if request.database else None
 
-        # Grant privileges if database specified
-        if request.database:
-            try:
-                manager.grant_privileges(request.username, request.database, host=request.host)
-            except Exception:
-                pass
+    user_info, password = manager.create_user(
+        username=username,
+        password=request.password,
+        host=request.host,
+        database=database,
+    )
 
-        return CreateUserResponse(
-            username=user_info.username,
-            password=password,
-            message=f"User '{user_info.username}' created successfully",
-        )
-    except DatabaseUserError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except DatabaseError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    if database:
+        manager.grant_privileges(username, database, host=request.host)
 
+    audit_log.info(
+        "create_user engine=%s user=%s database=%s session=%s",
+        manager.ENGINE_NAME,
+        username,
+        database or "-",
+        session.get("session_id", "unknown"),
+    )
 
-@router.delete("/users/{engine}/{username}", response_model=ActionResponse)
-async def delete_user(
-    engine: str,
-    username: str,
-    host: str = "localhost",
-    session: dict = Depends(get_current_session),
-):
-    """Delete a database user."""
-    manager = get_manager(engine)
-    check_running(manager)
-
-    try:
-        manager.drop_user(username, host=host)
-        return ActionResponse(success=True, message=f"User '{username}' deleted")
-    except DatabaseUserError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except DatabaseError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return CreateUserResponse(
+        username=user_info.username,
+        password=password,
+        message=f"User '{user_info.username}' created",
+    )
 
 
 @router.post("/users/grant", response_model=ActionResponse)
-async def grant_privileges(
-    request: GrantPrivilegesRequest, session: dict = Depends(get_current_session)
-):
-    """Grant privileges to a user."""
+def grant_privileges(
+    request: GrantPrivilegesRequest, session: Annotated[dict, Depends(get_current_session)]
+) -> ActionResponse:
+    """
+    Grant privileges on a database.
+
+    Declared before ``/users/{engine}`` so the literal path wins.
+
+    Args:
+        request: The grant request.
+        session: The authenticated session.
+
+    Returns:
+        The action outcome.
+
+    Raises:
+        DatabaseUserError: When a privilege is not on the engine's whitelist.
+    """
     manager = get_manager(request.engine)
     check_running(manager)
 
-    try:
-        manager.grant_privileges(
-            request.username,
-            request.database,
-            privileges=request.privileges,
-            host=request.host,
-        )
-        return ActionResponse(
-            success=True,
-            message=f"Privileges granted to '{request.username}' on '{request.database}'",
-        )
-    except DatabaseUserError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except DatabaseError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    username = _user_name(manager, request.username)
+    database = _database_name(manager, request.database)
+
+    manager.grant_privileges(username, database, privileges=request.privileges, host=request.host)
+    audit_log.info(
+        "grant engine=%s user=%s database=%s privileges=%s session=%s",
+        manager.ENGINE_NAME,
+        username,
+        database,
+        request.privileges or "default",
+        session.get("session_id", "unknown"),
+    )
+
+    return ActionResponse(
+        success=True, message=f"Privileges granted to '{username}' on '{database}'"
+    )
 
 
 @router.post("/users/revoke", response_model=ActionResponse)
-async def revoke_privileges(
-    request: GrantPrivilegesRequest, session: dict = Depends(get_current_session)
-):
-    """Revoke privileges from a user."""
+def revoke_privileges(
+    request: GrantPrivilegesRequest, session: Annotated[dict, Depends(get_current_session)]
+) -> ActionResponse:
+    """
+    Revoke privileges on a database.
+
+    Args:
+        request: The revoke request.
+        session: The authenticated session.
+
+    Returns:
+        The action outcome.
+
+    Raises:
+        DatabaseUserError: When a privilege is not on the engine's whitelist.
+    """
     manager = get_manager(request.engine)
     check_running(manager)
 
-    try:
-        manager.revoke_privileges(
-            request.username,
-            request.database,
-            privileges=request.privileges,
-            host=request.host,
-        )
-        return ActionResponse(
-            success=True,
-            message=f"Privileges revoked from '{request.username}' on '{request.database}'",
-        )
-    except DatabaseUserError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except DatabaseError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    username = _user_name(manager, request.username)
+    database = _database_name(manager, request.database)
+
+    manager.revoke_privileges(username, database, privileges=request.privileges, host=request.host)
+    audit_log.info(
+        "revoke engine=%s user=%s database=%s privileges=%s session=%s",
+        manager.ENGINE_NAME,
+        username,
+        database,
+        request.privileges or "default",
+        session.get("session_id", "unknown"),
+    )
+
+    return ActionResponse(
+        success=True, message=f"Privileges revoked from '{username}' on '{database}'"
+    )
 
 
-# ==================== Backup Endpoints ====================
+@router.get("/users/{engine}", response_model=UserListResponse)
+def list_users(
+    engine: str, session: Annotated[dict, Depends(get_current_session)]
+) -> UserListResponse:
+    """
+    List the users of an engine.
+
+    Args:
+        engine: Engine name.
+        session: The authenticated session.
+
+    Returns:
+        The users. Passwords are never part of this response.
+    """
+    manager = get_manager(engine)
+    check_running(manager)
+
+    users = manager.list_users()
+    return UserListResponse(
+        users=[
+            UserInfoResponse(
+                username=user.username,
+                engine=user.engine,
+                host=user.host,
+                databases=user.databases,
+                privileges=user.privileges,
+            )
+            for user in users
+        ],
+        total=len(users),
+    )
+
+
+@router.delete("/users/{engine}/{username}", response_model=ActionResponse)
+def delete_user(
+    engine: str,
+    username: str,
+    session: Annotated[dict, Depends(get_current_session)],
+    host: Annotated[str, Query()] = "localhost",
+) -> ActionResponse:
+    """
+    Delete a database user.
+
+    Args:
+        engine: Engine name.
+        username: User to delete.
+        host: Host restriction the user was created with.
+        session: The authenticated session.
+
+    Returns:
+        The action outcome.
+
+    Raises:
+        DatabaseUserError: When the engine refuses the deletion.
+    """
+    manager = get_manager(engine)
+    check_running(manager)
+
+    validated = _user_name(manager, username)
+    audit_log.info(
+        "drop_user engine=%s user=%s session=%s",
+        manager.ENGINE_NAME,
+        validated,
+        session.get("session_id", "unknown"),
+    )
+    manager.drop_user(validated, host=host)
+
+    return ActionResponse(success=True, message=f"User '{validated}' deleted")
+
+
+# ==================== Backups ====================
 
 
 @router.get("/backups", response_model=BackupListResponse)
-async def list_backups(
-    engine: str | None = None,
-    database: str | None = None,
-    session: dict = Depends(get_current_session),
-):
-    """List available backups."""
-    all_backups = []
+def list_backups(
+    session: Annotated[dict, Depends(get_current_session)],
+    engine: Annotated[str | None, Query(description="Restrict to one engine")] = None,
+    database: Annotated[str | None, Query(description="Restrict to one database")] = None,
+) -> BackupListResponse:
+    """
+    List database dumps.
 
-    if engine:
-        managers = [get_manager(engine)]
-    else:
-        managers = DatabaseRegistry.get_installed(verbose=False)
+    Args:
+        engine: Engine to restrict the listing to.
+        database: Database to restrict the listing to.
+        session: The authenticated session.
 
+    Returns:
+        The dumps found on disk.
+    """
+    managers = [get_manager(engine)] if engine else DatabaseRegistry.get_installed(verbose=False)
+
+    backups: list[BackupInfoResponse] = []
     for manager in managers:
+        name = _database_name(manager, database) if database else None
         try:
-            backups = manager.list_backups(database=database)
-            for backup in backups:
-                backup_dict = backup.to_dict()
-                all_backups.append(
-                    BackupInfoResponse(
-                        path=backup_dict["path"],
-                        database=backup_dict["database"],
-                        engine=backup_dict["engine"],
-                        size=backup_dict["size"],
-                        size_human=backup_dict["size_human"],
-                        created=backup_dict["created"],
-                        compressed=backup_dict["compressed"],
-                    )
-                )
-        except Exception:
+            entries = manager.list_backups(database=name)
+        except DatabaseError:
+            logging.getLogger(__name__).warning(
+                "Could not list backups for %s", manager.ENGINE_NAME, exc_info=True
+            )
             continue
+        for backup in entries:
+            data = backup.to_dict()
+            backups.append(
+                BackupInfoResponse(
+                    path=data["path"],
+                    database=data["database"],
+                    engine=data["engine"],
+                    size=data["size"],
+                    size_human=data["size_human"],
+                    created=data["created"],
+                    compressed=data["compressed"],
+                )
+            )
 
-    return BackupListResponse(backups=all_backups, total=len(all_backups))
+    return BackupListResponse(backups=backups, total=len(backups))
 
 
 @router.post("/backups", response_model=BackupInfoResponse)
-async def create_backup(request: CreateBackupRequest, session: dict = Depends(get_current_session)):
-    """Create a database backup."""
+def create_backup(
+    request: CreateBackupRequest, session: Annotated[dict, Depends(get_current_session)]
+) -> BackupInfoResponse:
+    """
+    Dump a database.
+
+    Args:
+        request: The backup request.
+        session: The authenticated session.
+
+    Returns:
+        The new dump.
+
+    Raises:
+        DatabaseBackupError: When the dump fails.
+    """
     manager = get_manager(request.engine)
     check_running(manager)
 
-    try:
-        backup = manager.backup(
-            database=request.database,
-            compress=request.compress,
-        )
-        backup_dict = backup.to_dict()
-        return BackupInfoResponse(
-            path=backup_dict["path"],
-            database=backup_dict["database"],
-            engine=backup_dict["engine"],
-            size=backup_dict["size"],
-            size_human=backup_dict["size_human"],
-            created=backup_dict["created"],
-            compressed=backup_dict["compressed"],
-        )
-    except DatabaseNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except DatabaseBackupError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    database = _database_name(manager, request.database)
+    data = manager.backup(database=database, compress=request.compress).to_dict()
+
+    return BackupInfoResponse(
+        path=data["path"],
+        database=data["database"],
+        engine=data["engine"],
+        size=data["size"],
+        size_human=data["size_human"],
+        created=data["created"],
+        compressed=data["compressed"],
+    )
 
 
 @router.post("/backups/restore", response_model=ActionResponse)
-async def restore_backup(
-    request: RestoreBackupRequest, session: dict = Depends(get_current_session)
-):
-    """Restore a database from backup."""
+def restore_backup(
+    request: RestoreBackupRequest, session: Annotated[dict, Depends(get_current_session)]
+) -> ActionResponse:
+    """
+    Restore a database from one of the engine's own dumps.
+
+    The dump is named, not pathed: the file is resolved inside the engine's
+    backup directory, so the endpoint cannot be talked into reading
+    ``/etc/shadow`` as the database superuser.
+
+    Args:
+        request: The restore request.
+        session: The authenticated session.
+
+    Returns:
+        The action outcome.
+
+    Raises:
+        HTTPException: 404 when the named dump does not exist.
+        DatabaseBackupError: When the restore fails.
+    """
     manager = get_manager(request.engine)
     check_running(manager)
 
-    from pathlib import Path
+    database = _database_name(manager, request.database)
+    backup_path: Path = resolve_within(manager.BACKUP_DIR, validate_filename(request.backup_name))
 
-    backup_path = Path(request.backup_path)
+    if not backup_path.is_file():
+        raise HTTPException(status_code=404, detail=f"Backup not found: {request.backup_name}")
 
-    if not backup_path.exists():
-        raise HTTPException(status_code=404, detail=f"Backup file not found: {request.backup_path}")
+    audit_log.info(
+        "restore engine=%s database=%s backup=%s session=%s",
+        manager.ENGINE_NAME,
+        database,
+        backup_path.name,
+        session.get("session_id", "unknown"),
+    )
+    manager.restore(database=database, backup_path=backup_path, drop_existing=request.drop_existing)
 
-    try:
-        manager.restore(
-            database=request.database,
-            backup_path=backup_path,
-            drop_existing=request.drop_existing,
-        )
-        return ActionResponse(
-            success=True, message=f"Database '{request.database}' restored from backup"
-        )
-    except DatabaseBackupError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return ActionResponse(success=True, message=f"Database '{database}' restored")
 
 
-# ==================== Query Endpoint ====================
+# ==================== Console ====================
 
 
 @router.post("/query", response_model=QueryResponse)
-async def execute_query(request: QueryRequest, session: dict = Depends(get_current_session)):
-    """Execute a database query."""
+def execute_query(
+    request: QueryRequest, session: Annotated[dict, Depends(get_current_session)]
+) -> QueryResponse:
+    """
+    Run one statement against a database.
+
+    Read-only unless the body says ``mode="write"``. See the module docstring
+    for why the endpoint exists at all and what it refuses.
+
+    Args:
+        request: The query request.
+        session: The authenticated session.
+
+    Returns:
+        The engine's output, truncated to ``max_rows`` lines.
+
+    Raises:
+        DatabaseQueryError: When the statement is empty, is more than one
+            statement, or is not a read in read mode.
+    """
     manager = get_manager(request.engine)
     check_running(manager)
 
-    try:
-        success, output = manager.execute_query(
-            database=request.database,
-            query=request.query,
-        )
-        return QueryResponse(success=success, output=output)
-    except DatabaseNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except DatabaseError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    database = _database_name(manager, request.database)
+    statement = _reject_multiple_statements(request.query)
+
+    audit_log.info(
+        "query engine=%s database=%s mode=%s session=%s statement=%r",
+        manager.ENGINE_NAME,
+        database,
+        request.mode,
+        session.get("session_id", "unknown"),
+        statement,
+    )
+
+    if request.mode == "read":
+        _check_read_only(manager.ENGINE_NAME, statement)
+
+    success, output = manager.execute_query(database=database, query=statement)
+    text, truncated, rows = _truncate(output, request.max_rows)
+
+    return QueryResponse(
+        success=success,
+        output=text,
+        mode=request.mode,
+        truncated=truncated,
+        returned_rows=rows,
+    )
 
 
 @router.post("/connection-string", response_model=ConnectionStringResponse)
-async def get_connection_string(
-    request: ConnectionStringRequest, session: dict = Depends(get_current_session)
-):
-    """Generate a connection string."""
+def get_connection_string(
+    request: ConnectionStringRequest, session: Annotated[dict, Depends(get_current_session)]
+) -> ConnectionStringResponse:
+    """
+    Build a connection string from credentials the caller already has.
+
+    Args:
+        request: The connection details.
+        session: The authenticated session.
+
+    Returns:
+        The connection string.
+    """
     manager = get_manager(request.engine)
 
-    conn_string = manager.get_connection_string(
-        database=request.database,
-        username=request.username,
-        password=request.password,
-        host=request.host,
+    return ConnectionStringResponse(
+        connection_string=manager.get_connection_string(
+            database=_database_name(manager, request.database),
+            username=_user_name(manager, request.username),
+            password=request.password,
+            host=request.host,
+        )
     )
-
-    return ConnectionStringResponse(connection_string=conn_string)

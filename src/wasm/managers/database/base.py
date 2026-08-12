@@ -24,6 +24,7 @@ Three rules are enforced in this module and must not be relaxed by subclasses:
 
 from __future__ import annotations
 
+import os
 import re
 import secrets
 import string
@@ -66,17 +67,23 @@ BACKUP_DIR_MODE = 0o750
 #: the file it owns, unlistable so it cannot enumerate other backups.
 STAGING_DIR_MODE = 0o711
 
+# Every pattern below ends in \Z, never in $. In Python '$' also matches just
+# before a final newline, so "shop\n" satisfies a '$'-anchored whitelist: the
+# check would cover the first line and wave the rest through, which is the
+# opposite of what an allowlist is for. \Z matches the end of the string and
+# nothing else.
+
 #: Database and user names accepted by WASM. Deliberately narrower than what the
 #: engines accept: names come from HTTP requests and CLI arguments, and a name
 #: that needs quoting to be safe is a name nobody wants to type.
-NAME_PATTERN = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_$-]*$")
+NAME_PATTERN = re.compile(r"\A[A-Za-z0-9_][A-Za-z0-9_$-]*\Z")
 
 #: Filesystem paths that may be handed to a client's own file-reading command.
-SAFE_PATH_PATTERN = re.compile(r"^[A-Za-z0-9_./-]+$")
+SAFE_PATH_PATTERN = re.compile(r"\A[A-Za-z0-9_./-]+\Z")
 
 #: Privileges are keywords, optionally multi-word ("ALL PRIVILEGES"). Anything
 #: with punctuation is an injection attempt, not a privilege.
-PRIVILEGE_PATTERN = re.compile(r"^[A-Z]+(?: [A-Z]+)*$")
+PRIVILEGE_PATTERN = re.compile(r"\A[A-Z]+(?: [A-Z]+)*\Z")
 
 
 def quote_identifier(value: str, quote: str) -> str:
@@ -114,7 +121,7 @@ def validate_name(value: str, *, kind: str, engine: str, max_length: int) -> str
 
     Raises:
         DatabaseError: When the name is empty, too long or contains a character
-            outside ``[A-Za-z0-9_$-]``.
+            outside ``[A-Za-z0-9_$-]``, a trailing newline included.
     """
     if not isinstance(value, str) or not value:
         raise DatabaseError(
@@ -209,7 +216,8 @@ def validate_path(path: Path, *, purpose: str) -> Path:
 
     Raises:
         DatabaseBackupError: When the path contains anything but letters,
-            digits, dot, slash, dash or underscore.
+            digits, dot, slash, dash or underscore. A newline anywhere, final
+            one included, is what would end the command and start another.
     """
     if not SAFE_PATH_PATTERN.match(str(path)):
         raise DatabaseBackupError(
@@ -911,10 +919,13 @@ class BaseDatabaseManager(BaseManager):
 
     def _ensure_directory(self, path: Path, mode: int = BACKUP_DIR_MODE) -> Path:
         """
-        Create a directory, applying restrictive permissions to what we create.
+        Create a directory the caller chose, without touching an existing one.
 
-        An existing directory keeps its permissions: a caller may legitimately
-        point a backup at a directory whose mode is none of our business.
+        This is for destinations WASM does not own, such as the parent of a
+        ``--output`` path: an existing directory keeps its permissions, because
+        chmod-ing ``/tmp`` or a user's home would be a worse bug than a lax
+        backup directory. Directories WASM owns go through
+        :meth:`_ensure_private_directory` instead.
 
         Args:
             path: Directory to create.
@@ -926,17 +937,84 @@ class BaseDatabaseManager(BaseManager):
         Raises:
             DatabaseBackupError: When the directory cannot be created.
         """
-        existed = path.exists()
         try:
-            path.mkdir(parents=True, exist_ok=True)
-            if not existed:
-                path.chmod(mode)
+            # mkdir applies the mode at creation, so the directory is never
+            # briefly world readable the way a create-then-chmod leaves it.
+            # exist_ok keeps an existing directory exactly as it was.
+            path.mkdir(parents=True, exist_ok=True, mode=mode)
         except OSError as exc:
             raise DatabaseBackupError(
                 f"Cannot create the backup directory {path}",
                 details=f"{exc}. Check ownership and free space, then retry.",
             ) from exc
         return path
+
+    def _ensure_private_directory(self, path: Path, mode: int = BACKUP_DIR_MODE) -> Path:
+        """
+        Create or adopt a directory WASM owns, with its mode enforced.
+
+        Anything WASM writes as root into a directory it owns has to be sure the
+        directory is really the one it means: not a symlink pointing somewhere
+        else, not another account's, and not left group or world writable by an
+        earlier version or by whoever got there first. The mode is applied
+        through the open descriptor, so the inode that was inspected is the
+        inode that is modified and then written to.
+
+        Args:
+            path: Directory to create or adopt.
+            mode: Permissions the directory must end up with.
+
+        Returns:
+            The directory path.
+
+        Raises:
+            DatabaseBackupError: When the path is a symlink, is not a directory,
+                belongs to another account, or cannot be created.
+        """
+        self._ensure_directory(path.parent)
+        try:
+            try:
+                os.mkdir(path, mode)
+            except FileExistsError:
+                pass
+            # O_NOFOLLOW turns "someone replaced this with a symlink" into an
+            # error instead of a redirect; O_DIRECTORY does the same for a file.
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                owner = os.fstat(fd).st_uid
+                if owner != os.geteuid():
+                    raise DatabaseBackupError(
+                        f"The directory {path} belongs to uid {owner}",
+                        details=(
+                            "WASM refuses to write backups into a directory it does not own, "
+                            f"because whoever owns it decides who reads them. Remove {path} "
+                            "and retry."
+                        ),
+                    )
+                os.fchmod(fd, mode)
+            finally:
+                os.close(fd)
+        except OSError as exc:
+            raise DatabaseBackupError(
+                f"Cannot use the directory {path}",
+                details=(
+                    f"{exc}. It must be a real directory owned by this account, "
+                    "not a symlink or a file."
+                ),
+            ) from exc
+        return path
+
+    def _ensure_backup_directory(self, destination: Path) -> None:
+        """
+        Prepare the directory a backup is about to be written into.
+
+        Args:
+            destination: The backup file that is about to be created.
+        """
+        if destination.parent == self.BACKUP_DIR:
+            self._ensure_private_directory(destination.parent, BACKUP_DIR_MODE)
+        else:
+            self._ensure_directory(destination.parent)
 
     def _backup_path(
         self,
@@ -1002,7 +1080,7 @@ class BaseDatabaseManager(BaseManager):
         Raises:
             DatabaseBackupError: When the dump command fails or writes nothing.
         """
-        self._ensure_directory(destination.parent)
+        self._ensure_backup_directory(destination)
         result = self.runner.capture_to_file(
             argv,
             destination,
@@ -1051,6 +1129,11 @@ class BaseDatabaseManager(BaseManager):
         copied (or decompressed) into a traversable staging directory and handed
         to that account for the duration of the restore.
 
+        The staging directory is adopted, never merely reused: it is traversable
+        by design, so whoever gets there first must not be able to leave a
+        symlink behind it or a symlink inside it and turn a root copy into a
+        write of their choosing.
+
         Args:
             source: The backup file, plain or gzipped.
             staged_name: File name to use inside the staging directory.
@@ -1062,8 +1145,18 @@ class BaseDatabaseManager(BaseManager):
         Raises:
             DatabaseBackupError: When staging fails.
         """
-        staging_dir = self._ensure_directory(self.BACKUP_DIR / ".staging", STAGING_DIR_MODE)
+        self._ensure_private_directory(self.BACKUP_DIR, BACKUP_DIR_MODE)
+        staging_dir = self._ensure_private_directory(self.BACKUP_DIR / ".staging", STAGING_DIR_MODE)
         staged = staging_dir / staged_name
+        # Whatever is at the staged name is ours to remove: a leftover from a
+        # crashed restore, or a symlink someone planted to catch the copy.
+        try:
+            staged.unlink(missing_ok=True)
+        except OSError as exc:
+            raise DatabaseBackupError(
+                f"Cannot clear the staging path {staged}",
+                details=f"{exc}. Remove it by hand and retry.",
+            ) from exc
         try:
             if source.suffix == ".gz":
                 result = self.runner.capture_to_file(
@@ -1145,7 +1238,7 @@ class BaseDatabaseManager(BaseManager):
         # engine-database-YYYYmmdd_HHMMSS.ext, where the database name itself may
         # contain dashes, so the timestamp is what anchors the split.
         pattern = re.compile(
-            rf"^{re.escape(self.ENGINE_NAME)}-(?P<database>.+)-\d{{8}}_\d{{6}}(?P<ext>\..+)?$"
+            rf"\A{re.escape(self.ENGINE_NAME)}-(?P<database>.+)-\d{{8}}_\d{{6}}(?P<ext>\..+)?\Z"
         )
 
         backups: list[BackupInfo] = []

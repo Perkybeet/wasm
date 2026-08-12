@@ -4,7 +4,9 @@ Next.js deployer for WASM.
 
 import json
 from pathlib import Path
+from typing import ClassVar
 
+from wasm.core.runner import CommandRunner
 from wasm.deployers.base import BaseDeployer
 from wasm.deployers.registry import DeployerRegistry
 
@@ -20,7 +22,7 @@ class NextJSDeployer(BaseDeployer):
     APP_TYPE = "nextjs"
     DISPLAY_NAME = "Next.js"
 
-    DETECTION_FILES = [
+    DETECTION_FILES: ClassVar[list[str]] = [
         "next.config.js",
         "next.config.mjs",
         "next.config.ts",
@@ -28,11 +30,21 @@ class NextJSDeployer(BaseDeployer):
 
     DEFAULT_PORT = 3000
 
-    SYSTEM_DEPS = ["node", "npm"]
+    # See DEFAULT_DETECTION_PRIORITY in interface.py for the full order.
+    DETECTION_PRIORITY = 70
 
-    def __init__(self, verbose: bool = False):
-        """Initialize Next.js deployer."""
-        super().__init__(verbose=verbose)
+    SYSTEM_DEPS: ClassVar[list[str]] = ["node", "npm"]
+
+    def __init__(self, verbose: bool = False, runner: CommandRunner | None = None):
+        """
+        Initialize the Next.js deployer.
+
+        Args:
+            verbose: Enable verbose logging.
+            runner: Command runner used for installs and builds. Defaults to the
+                process-wide runner.
+        """
+        super().__init__(verbose=verbose, runner=runner)
         self.is_standalone = False
 
     def detect(self, path: Path) -> bool:
@@ -46,8 +58,8 @@ class NextJSDeployer(BaseDeployer):
         package_json = path / "package.json"
         if package_json.exists():
             try:
-                with open(package_json) as f:
-                    pkg = json.load(f)
+                with open(package_json) as handle:
+                    pkg = json.load(handle)
                     deps = pkg.get("dependencies", {})
                     dev_deps = pkg.get("devDependencies", {})
                     return "next" in deps or "next" in dev_deps

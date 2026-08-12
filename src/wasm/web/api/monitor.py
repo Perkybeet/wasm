@@ -1,18 +1,43 @@
 """
 Monitor API endpoints.
 
-Provides endpoints for the AI-powered process monitor.
+A thin translation of HTTP to :mod:`wasm.monitor`. Two things were wrong here
+and both are fixed by that rule:
+
+- The handlers built a ``MonitorConfig`` with ``auto_terminate``, ``use_ai`` and
+  ``dry_run``, and read ``threat_level`` off the results. None of those exist
+  since the monitor became observability, so every call returned 500. The
+  vocabulary now matches the model: observations, not threats; acknowledged,
+  not resolved.
+- They were ``async def`` while calling ``systemctl`` and walking ``/proc``,
+  which blocks the event loop for the whole panel. They are plain ``def``, so
+  FastAPI runs them in its threadpool.
 """
 
-import logging
+from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+import logging
+from typing import Annotated, Any
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
+from wasm.core.config import Config
+from wasm.core.exceptions import EmailError, MonitorError, WASMError
 from wasm.monitor import (
+    DEFAULT_CPU_SAMPLE_INTERVAL,
     DEFAULT_CPU_THRESHOLD,
+    DEFAULT_MAX_OBSERVATIONS,
     DEFAULT_MEMORY_THRESHOLD,
+    DEFAULT_RETENTION_DAYS,
     DEFAULT_SCAN_INTERVAL,
+    MONITOR_SCOPE,
+    EmailNotifier,
+    ObservationStore,
+    ProcessMonitor,
+    ProcessObservation,
+    collect_resource_metrics,
+    list_processes,
 )
 from wasm.web.api.auth import get_current_session
 
@@ -20,109 +45,68 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+#: Upper bound on rows any list endpoint returns, so a caller cannot ask the
+#: panel to serialise the whole observation store.
+MAX_PAGE_SIZE = 500
+
 
 class MonitorStatus(BaseModel):
-    """Monitor service status."""
+    """
+    State of the monitor systemd unit.
+
+    Attributes:
+        installed: Whether the unit file exists.
+        enabled: Whether the unit starts at boot.
+        active: Whether the unit is running now.
+        pid: Main PID, when running.
+        uptime: When the unit entered the active state.
+        scope: What the monitor will not do, for the panel to display.
+    """
 
     installed: bool
     enabled: bool
     active: bool
     pid: int | None = None
     uptime: str | None = None
+    scope: list[str] = []
 
 
-class MonitorConfig(BaseModel):
-    """Monitor configuration."""
+class MonitorSettings(BaseModel):
+    """
+    The monitor settings that exist.
+
+    Attributes:
+        scan_interval: Seconds between scans.
+        cpu_threshold: CPU percentage above which a process is noted.
+        memory_threshold: Memory percentage above which a process is noted.
+        retention_days: How long observations are kept.
+        max_observations: Row cap of the observation store.
+        notify: Whether reports are emailed.
+        watch_units: systemd units checked on each scan.
+    """
 
     scan_interval: int
     cpu_threshold: float
     memory_threshold: float
-    auto_terminate: bool
-    terminate_malicious_only: bool
-    use_ai: bool
-    dry_run: bool
+    retention_days: int
+    max_observations: int
+    notify: bool
+    watch_units: list[str]
 
 
-class ScanResult(BaseModel):
-    """Process scan result."""
-
-    pid: int
-    name: str
-    cpu_percent: float
-    memory_percent: float
-    is_suspicious: bool
-    risk_level: str | None = None
-    reason: str | None = None
-
-
-class ScanSummary(BaseModel):
-    """Summary of scan analysis."""
-
-    total_threats: int
-    malicious_count: int
-    suspicious_count: int
-    avg_confidence: float
-    recommended_terminations: int
-
-
-class ScanResponse(BaseModel):
-    """Response from a scan."""
-
-    scanned: int
-    suspicious: int
-    terminated: int
-    results: list[ScanResult]
-    summary: ScanSummary | None = None
-
-
-@router.get("/status", response_model=MonitorStatus)
-async def get_monitor_status(request: Request, session: dict = Depends(get_current_session)):
+class ProcessEntry(BaseModel):
     """
-    Get the status of the process monitor service.
+    One row of the process table.
+
+    Attributes:
+        pid: Process identifier.
+        name: Executable name.
+        user: Account the process runs as.
+        cpu_percent: CPU usage percentage.
+        memory_percent: Resident memory percentage.
+        command: Command line, already truncated by the collector.
+        status: Kernel process state.
     """
-    try:
-        from wasm.monitor.process_monitor import ProcessMonitor
-
-        monitor = ProcessMonitor(verbose=False)
-        status = monitor.get_service_status()
-
-        return MonitorStatus(
-            installed=status.get("installed", False),
-            enabled=status.get("enabled", False),
-            active=status.get("active", False),
-            pid=status.get("pid"),
-            uptime=status.get("uptime"),
-        )
-    except ImportError:
-        return MonitorStatus(installed=False, enabled=False, active=False)
-    except Exception as e:
-        logger.error(f"Failed to get monitor status: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to get monitor status: {e!s}")
-
-
-@router.get("/config", response_model=MonitorConfig)
-async def get_monitor_config(request: Request, session: dict = Depends(get_current_session)):
-    """
-    Get the current monitor configuration.
-    """
-    from wasm.core.config import Config
-
-    config = Config()
-    monitor_config = config.get("monitor", {})
-
-    return MonitorConfig(
-        scan_interval=monitor_config.get("scan_interval", DEFAULT_SCAN_INTERVAL),
-        cpu_threshold=monitor_config.get("cpu_threshold", DEFAULT_CPU_THRESHOLD),
-        memory_threshold=monitor_config.get("memory_threshold", DEFAULT_MEMORY_THRESHOLD),
-        auto_terminate=monitor_config.get("auto_terminate", True),
-        terminate_malicious_only=monitor_config.get("terminate_malicious_only", True),
-        use_ai=monitor_config.get("use_ai", True),
-        dry_run=monitor_config.get("dry_run", False),
-    )
-
-
-class ProcessInfo(BaseModel):
-    """Basic process information."""
 
     pid: int
     name: str
@@ -134,440 +118,608 @@ class ProcessInfo(BaseModel):
 
 
 class ProcessListResponse(BaseModel):
-    """Response with list of all processes."""
+    """
+    Processes visible to the panel.
+
+    Attributes:
+        total: Number of processes seen.
+        processes: The page requested.
+    """
 
     total: int
-    processes: list[ProcessInfo]
+    processes: list[ProcessEntry]
 
 
-@router.get("/processes", response_model=ProcessListResponse)
-async def get_all_processes(
-    request: Request,
-    limit: int = 100,
-    sort_by: str = "cpu",  # cpu, memory, name, pid
-    session: dict = Depends(get_current_session),
-):
+class ObservationEntry(BaseModel):
     """
-    Get list of all running processes.
+    One thing the monitor wrote down.
 
-    This shows ALL system processes, not just WASM-related ones.
+    Attributes:
+        id: Row identifier, absent for an observation not yet stored.
+        observed_at: When it was noticed, ISO 8601.
+        pid: Process identifier at the time.
+        process_name: Executable name.
+        user: Account the process ran as.
+        cpu_percent: CPU usage percentage.
+        memory_percent: Resident memory percentage.
+        command: Command line, truncated.
+        signal: Which check produced it.
+        severity: notice or warning.
+        detail: Human-readable explanation.
+        acknowledged: Whether an operator dismissed it.
     """
-    try:
-        import psutil
-    except ImportError:
-        raise HTTPException(
-            status_code=500, detail="psutil not available. Install with: pip install psutil"
-        )
 
-    processes = []
-
-    for proc in psutil.process_iter(
-        ["pid", "name", "username", "cpu_percent", "memory_percent", "cmdline", "status"]
-    ):
-        try:
-            info = proc.info
-            cmdline = info.get("cmdline") or []
-            command = " ".join(cmdline) if cmdline else info.get("name", "")
-
-            processes.append(
-                ProcessInfo(
-                    pid=info.get("pid", 0),
-                    name=info.get("name", "unknown"),
-                    user=info.get("username", "unknown"),
-                    cpu_percent=info.get("cpu_percent", 0.0) or 0.0,
-                    memory_percent=info.get("memory_percent", 0.0) or 0.0,
-                    command=command[:200],  # Limit command length
-                    status=info.get("status", "running"),
-                )
-            )
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            continue
-
-    # Sort
-    if sort_by == "cpu":
-        processes.sort(key=lambda p: p.cpu_percent, reverse=True)
-    elif sort_by == "memory":
-        processes.sort(key=lambda p: p.memory_percent, reverse=True)
-    elif sort_by == "name":
-        processes.sort(key=lambda p: p.name.lower())
-    elif sort_by == "pid":
-        processes.sort(key=lambda p: p.pid)
-
-    return ProcessListResponse(total=len(processes), processes=processes[:limit])
-
-
-@router.post("/scan", response_model=ScanResponse)
-async def run_scan(
-    request: Request,
-    dry_run: bool = True,
-    force_ai: bool = False,
-    analyze_all: bool = False,
-    session: dict = Depends(get_current_session),
-):
-    """
-    Run a threat scan on processes.
-
-    This analyzes processes for suspicious activity using AI.
-    By default runs in dry_run mode for safety.
-
-    Args:
-        dry_run: If True, don't terminate processes, just report.
-        force_ai: Force AI analysis even if no suspicious processes are found.
-        analyze_all: Analyze ALL processes with AI (expensive, use sparingly).
-    """
-    try:
-        from wasm.monitor import MonitorConfig
-        from wasm.monitor.process_monitor import ProcessMonitor
-    except ImportError:
-        raise HTTPException(
-            status_code=500,
-            detail="Monitor module not available. Install with: pip install wasm-cli[monitor]",
-        )
-
-    try:
-        # Load global config and merge with request parameters
-        from wasm.core.config import Config
-
-        global_config = Config()
-        monitor_settings = global_config.get("monitor", {})
-
-        # Create config respecting global settings, override dry_run from request
-        config = MonitorConfig(
-            enabled=True,  # Always enabled for single scan
-            scan_interval=0,  # Single scan, no interval
-            auto_terminate=monitor_settings.get("auto_terminate", True),
-            terminate_malicious_only=monitor_settings.get("terminate_malicious_only", True),
-            use_ai=monitor_settings.get("use_ai", True),
-            cpu_threshold=monitor_settings.get("cpu_threshold", DEFAULT_CPU_THRESHOLD),
-            memory_threshold=monitor_settings.get("memory_threshold", DEFAULT_MEMORY_THRESHOLD),
-            dry_run=dry_run,  # Override from request parameter
-        )
-        monitor = ProcessMonitor(config=config, verbose=False)
-
-        # Run threat scan with force_ai and analyze_all options
-        threat_reports = monitor.scan_once(force_ai=force_ai, analyze_all=analyze_all)
-
-        scan_results = []
-        suspicious_count = 0
-        terminated_count = 0
-
-        for report in threat_reports:
-            is_suspicious = report.threat_level in ("suspicious", "malicious")
-            if is_suspicious:
-                suspicious_count += 1
-
-            if report.action_taken and "TERMINATED" in report.action_taken:
-                terminated_count += 1
-
-            scan_results.append(
-                ScanResult(
-                    pid=report.pid,
-                    name=report.process_name,
-                    cpu_percent=report.cpu_percent,
-                    memory_percent=report.memory_percent,
-                    is_suspicious=is_suspicious,
-                    risk_level=report.threat_level,
-                    reason=report.reason,
-                )
-            )
-
-        # Get total process count for context
-        try:
-            import psutil
-
-            total_processes = len(list(psutil.process_iter()))
-        except (ImportError, Exception):
-            total_processes = len(scan_results)
-
-        # Generate summary if there were threats
-        summary = None
-        if threat_reports:
-            malicious = sum(1 for r in threat_reports if r.threat_level == "malicious")
-            suspicious = sum(1 for r in threat_reports if r.threat_level == "suspicious")
-            avg_conf = sum(r.confidence for r in threat_reports) / len(threat_reports)
-            summary = ScanSummary(
-                total_threats=len(threat_reports),
-                malicious_count=malicious,
-                suspicious_count=suspicious,
-                avg_confidence=avg_conf,
-                recommended_terminations=malicious,  # Only malicious are auto-terminated
-            )
-
-        return ScanResponse(
-            scanned=total_processes,
-            suspicious=suspicious_count,
-            terminated=terminated_count,
-            results=scan_results[:50],  # Limit results
-            summary=summary,
-        )
-    except Exception as e:
-        logger.error(f"Failed to run process scan: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to run process scan: {e!s}")
-
-
-@router.post("/enable")
-async def enable_monitor(request: Request, session: dict = Depends(get_current_session)):
-    """
-    Enable the monitor service.
-    """
-    try:
-        from wasm.monitor.process_monitor import ProcessMonitor
-
-        monitor = ProcessMonitor(verbose=False)
-        monitor.enable_service()
-
-        return {"success": True, "message": "Monitor service enabled"}
-    except ImportError:
-        raise HTTPException(status_code=500, detail="Monitor module not available")
-    except Exception as e:
-        logger.error(f"Failed to enable monitor service: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to enable monitor service: {e!s}")
-
-
-@router.post("/disable")
-async def disable_monitor(request: Request, session: dict = Depends(get_current_session)):
-    """
-    Disable the monitor service.
-    """
-    try:
-        from wasm.monitor.process_monitor import ProcessMonitor
-
-        monitor = ProcessMonitor(verbose=False)
-        monitor.disable_service()
-
-        return {"success": True, "message": "Monitor service disabled"}
-    except ImportError:
-        raise HTTPException(status_code=500, detail="Monitor module not available")
-    except Exception as e:
-        logger.error(f"Failed to disable monitor service: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to disable monitor service: {e!s}")
-
-
-@router.post("/start")
-async def start_monitor(request: Request, session: dict = Depends(get_current_session)):
-    """
-    Start the monitor service.
-    """
-    try:
-        from wasm.monitor.process_monitor import ProcessMonitor
-
-        monitor = ProcessMonitor(verbose=False)
-        monitor.start_service()
-
-        return {"success": True, "message": "Monitor service started"}
-    except ImportError:
-        raise HTTPException(status_code=500, detail="Monitor module not available")
-    except Exception as e:
-        logger.error(f"Failed to start monitor service: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to start monitor service: {e!s}")
-
-
-@router.post("/stop")
-async def stop_monitor(request: Request, session: dict = Depends(get_current_session)):
-    """
-    Stop the monitor service.
-    """
-    try:
-        from wasm.monitor.process_monitor import ProcessMonitor
-
-        monitor = ProcessMonitor(verbose=False)
-        monitor.stop_service()
-
-        return {"success": True, "message": "Monitor service stopped"}
-    except ImportError:
-        raise HTTPException(status_code=500, detail="Monitor module not available")
-    except Exception as e:
-        logger.error(f"Failed to stop monitor service: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to stop monitor service: {e!s}")
-
-
-@router.post("/install")
-async def install_monitor(request: Request, session: dict = Depends(get_current_session)):
-    """
-    Install the monitor service.
-    """
-    try:
-        from wasm.monitor.process_monitor import ProcessMonitor
-
-        monitor = ProcessMonitor(verbose=False)
-        monitor.install_service()
-
-        return {"success": True, "message": "Monitor service installed"}
-    except ImportError:
-        raise HTTPException(status_code=500, detail="Monitor module not available")
-    except Exception as e:
-        logger.error(f"Failed to install monitor service: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to install monitor service: {e!s}")
-
-
-@router.post("/uninstall")
-async def uninstall_monitor(request: Request, session: dict = Depends(get_current_session)):
-    """
-    Uninstall the monitor service.
-    """
-    try:
-        from wasm.monitor.process_monitor import ProcessMonitor
-
-        monitor = ProcessMonitor(verbose=False)
-        monitor.uninstall_service()
-
-        return {"success": True, "message": "Monitor service uninstalled"}
-    except ImportError:
-        raise HTTPException(status_code=500, detail="Monitor module not available")
-    except Exception as e:
-        logger.error(f"Failed to uninstall monitor service: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500, detail=f"Failed to uninstall monitor service: {e!s}"
-        )
-
-
-@router.post("/test-email")
-async def test_email(request: Request, session: dict = Depends(get_current_session)):
-    """
-    Send a test email notification.
-    """
-    try:
-        from wasm.core.config import Config
-        from wasm.monitor.email_notifier import EmailNotifier
-
-        # Reload config to get latest values from disk
-        config = Config()
-        config.reload()
-
-        # Check if SMTP is configured
-        smtp_host = config.get("monitor.smtp.host", "")
-        smtp_username = config.get("monitor.smtp.username", "")
-        recipients = config.get("monitor.email_recipients", [])
-
-        if not smtp_host:
-            raise HTTPException(
-                status_code=400,
-                detail="SMTP not configured. Please configure SMTP settings in Settings → Email first.",
-            )
-
-        if not smtp_username:
-            raise HTTPException(
-                status_code=400,
-                detail="SMTP username not configured. Please configure SMTP settings in Settings → Email.",
-            )
-
-        if not recipients:
-            raise HTTPException(
-                status_code=400,
-                detail="No email recipients configured. Please add recipients in Settings → Email.",
-            )
-
-        # Create fresh notifier that will read the reloaded config
-        notifier = EmailNotifier(verbose=True)
-        success = notifier.send_test_email()
-
-        if success:
-            return {"success": True, "message": "Test email sent successfully"}
-        else:
-            raise HTTPException(
-                status_code=500, detail="Failed to send test email - check SMTP configuration"
-            )
-    except ImportError as e:
-        raise HTTPException(status_code=500, detail=f"Email notifier module not available: {e}")
-    except HTTPException:
-        raise
-    except Exception as e:
-        error_msg = str(e)
-        # Clean up nested error messages
-        if "Details:" in error_msg:
-            error_msg = error_msg.split("Details:")[0].strip()
-        raise HTTPException(status_code=500, detail=f"Failed to send test email: {error_msg}")
-
-
-class ThreatHistoryItem(BaseModel):
-    """A threat from history."""
-
-    id: int
-    timestamp: str
+    id: int | None = None
+    observed_at: str
     pid: int
     process_name: str
-    user: str | None
-    cpu_percent: float | None
-    memory_percent: float | None
-    command: str | None
-    threat_level: str
-    confidence: float | None
-    reason: str | None
-    action_taken: str | None
-    resolved: bool
+    user: str | None = None
+    cpu_percent: float | None = None
+    memory_percent: float | None = None
+    command: str | None = None
+    signal: str
+    severity: str
+    detail: str | None = None
+    acknowledged: bool = False
 
 
-class ThreatHistoryResponse(BaseModel):
-    """Response with threat history."""
+class ObservationListResponse(BaseModel):
+    """
+    A page of stored observations.
 
-    threats: list[ThreatHistoryItem]
+    Attributes:
+        observations: The rows.
+        count: How many rows are in this page.
+        stats: Totals by severity and acknowledgement.
+    """
+
+    observations: list[ObservationEntry]
     count: int
     stats: dict[str, int] | None = None
 
 
-@router.get("/threats/history", response_model=ThreatHistoryResponse)
-async def get_threat_history(
-    request: Request,
-    limit: int = 50,
-    include_resolved: bool = False,
-    threat_level: str | None = None,
-    session: dict = Depends(get_current_session),
-):
+class ScanResponse(BaseModel):
     """
-    Get historical threats from the database.
+    Result of a single scan.
+
+    Attributes:
+        scanned: How many processes were inspected.
+        observations: What stood out, warnings first.
+        count: Number of observations.
+        scope: What the scan did not do.
+    """
+
+    scanned: int
+    observations: list[ObservationEntry]
+    count: int
+    scope: list[str] = []
+
+
+class DiskEntry(BaseModel):
+    """
+    Capacity of one filesystem.
+
+    Attributes:
+        mountpoint: Where it is mounted.
+        device: Backing device.
+        fstype: Filesystem type.
+        total_bytes: Size.
+        used_bytes: Bytes in use.
+        free_bytes: Bytes available.
+        percent: Percentage used.
+    """
+
+    mountpoint: str
+    device: str
+    fstype: str
+    total_bytes: int
+    used_bytes: int
+    free_bytes: int
+    percent: float
+
+
+class MetricsResponse(BaseModel):
+    """
+    A point-in-time reading of machine resources.
+
+    Attributes:
+        collected_at: When the reading was taken, ISO 8601.
+        cpu_percent: System-wide CPU usage.
+        cpu_count: Logical CPU count.
+        load_average: One, five and fifteen minute load averages.
+        memory_total_bytes: Total RAM.
+        memory_used_bytes: RAM in use.
+        memory_percent: RAM usage percentage.
+        swap_percent: Swap usage percentage.
+        disks: Capacity of each real filesystem.
+        net_bytes_sent: Bytes sent since boot.
+        net_bytes_recv: Bytes received since boot.
+        process_count: Number of processes.
+        uptime_seconds: Seconds since boot.
+    """
+
+    collected_at: str
+    cpu_percent: float
+    cpu_count: int
+    load_average: list[float]
+    memory_total_bytes: int
+    memory_used_bytes: int
+    memory_percent: float
+    swap_percent: float
+    disks: list[DiskEntry]
+    net_bytes_sent: int
+    net_bytes_recv: int
+    process_count: int
+    uptime_seconds: float
+
+
+#: The authentication dependency, as an annotated type. Declaring it here
+#: rather than as a default value keeps the dependency out of the signature's
+#: mutable defaults, which is the form FastAPI recommends.
+Session = Annotated[dict, Depends(get_current_session)]
+
+
+def _observation_entry(observation: ProcessObservation) -> ObservationEntry:
+    """
+    Convert an in-memory observation to its API shape.
 
     Args:
-        limit: Maximum number of threats to return (default 50).
-        include_resolved: Include resolved threats (default False).
-        threat_level: Filter by threat level (malicious, suspicious).
+        observation: What a scan noticed.
+
+    Returns:
+        The serialisable entry.
+    """
+    process = observation.process
+    return ObservationEntry(
+        observed_at=observation.observed_at.isoformat(),
+        pid=process.pid,
+        process_name=process.name,
+        user=process.user,
+        cpu_percent=process.cpu_percent,
+        memory_percent=process.memory_percent,
+        command=process.command,
+        signal=observation.signal,
+        severity=observation.severity,
+        detail=observation.detail,
+    )
+
+
+@router.get("/status", response_model=MonitorStatus)
+def get_monitor_status(session: Session) -> MonitorStatus:
+    """
+    Report what systemd knows about the monitor unit.
+
+    Args:
+        session: Authenticated session, injected.
+
+    Returns:
+        The unit state, plus the scope note the panel displays.
+
+    Raises:
+        HTTPException: When systemd could not be queried.
     """
     try:
-        from wasm.monitor import ThreatStore
+        status = ProcessMonitor(verbose=False).get_service_status()
+    except WASMError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-        store = ThreatStore(verbose=False)
-        threats = store.get_recent_threats(
+    return MonitorStatus(
+        installed=bool(status["installed"]),
+        enabled=bool(status["enabled"]),
+        active=bool(status["active"]),
+        pid=status["pid"],
+        uptime=status["uptime"],
+        scope=list(MONITOR_SCOPE),
+    )
+
+
+@router.get("/config", response_model=MonitorSettings)
+def get_monitor_config(session: Session) -> MonitorSettings:
+    """
+    Read the monitor settings.
+
+    Args:
+        session: Authenticated session, injected.
+
+    Returns:
+        The settings that exist, with defaults for anything unset.
+    """
+    config = Config()
+    settings = config.get("monitor", {}) or {}
+
+    return MonitorSettings(
+        scan_interval=int(settings.get("scan_interval", DEFAULT_SCAN_INTERVAL)),
+        cpu_threshold=float(settings.get("cpu_threshold", DEFAULT_CPU_THRESHOLD)),
+        memory_threshold=float(settings.get("memory_threshold", DEFAULT_MEMORY_THRESHOLD)),
+        retention_days=int(settings.get("retention_days", DEFAULT_RETENTION_DAYS)),
+        max_observations=int(settings.get("max_observations", DEFAULT_MAX_OBSERVATIONS)),
+        notify=bool(settings.get("notify", False)),
+        watch_units=list(settings.get("watch_units", []) or []),
+    )
+
+
+@router.get("/metrics", response_model=MetricsResponse)
+def get_metrics(session: Session) -> MetricsResponse:
+    """
+    Read CPU, memory, disk and network counters.
+
+    Args:
+        session: Authenticated session, injected.
+
+    Returns:
+        A single reading. Nothing is stored: the panel polls for the current
+        value, and a time series would grow without bound.
+
+    Raises:
+        HTTPException: When psutil is not installed.
+    """
+    try:
+        metrics = collect_resource_metrics()
+    except MonitorError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    return MetricsResponse(
+        collected_at=metrics.collected_at.isoformat(),
+        cpu_percent=metrics.cpu_percent,
+        cpu_count=metrics.cpu_count,
+        load_average=list(metrics.load_average),
+        memory_total_bytes=metrics.memory_total_bytes,
+        memory_used_bytes=metrics.memory_used_bytes,
+        memory_percent=metrics.memory_percent,
+        swap_percent=metrics.swap_percent,
+        disks=[
+            DiskEntry(
+                mountpoint=disk.mountpoint,
+                device=disk.device,
+                fstype=disk.fstype,
+                total_bytes=disk.total_bytes,
+                used_bytes=disk.used_bytes,
+                free_bytes=disk.free_bytes,
+                percent=disk.percent,
+            )
+            for disk in metrics.disks
+        ],
+        net_bytes_sent=metrics.net_bytes_sent,
+        net_bytes_recv=metrics.net_bytes_recv,
+        process_count=metrics.process_count,
+        uptime_seconds=metrics.uptime_seconds,
+    )
+
+
+@router.get("/processes", response_model=ProcessListResponse)
+def get_all_processes(
+    session: Session,
+    limit: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)] = 100,
+    sort_by: Annotated[str, Query(pattern="^(cpu|memory|name|pid)$")] = "cpu",
+) -> ProcessListResponse:
+    """
+    List the processes on the machine.
+
+    Args:
+        limit: Maximum number of rows to return.
+        sort_by: One of cpu, memory, name, pid.
+        session: Authenticated session, injected.
+
+    Returns:
+        The requested page, sorted as asked.
+
+    Raises:
+        HTTPException: When psutil is not installed.
+    """
+    try:
+        processes = list_processes()
+    except MonitorError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    keys = {
+        "cpu": (lambda p: -p.cpu_percent),
+        "memory": (lambda p: -p.memory_percent),
+        "name": (lambda p: p.name.lower()),
+        "pid": (lambda p: p.pid),
+    }
+    ordered = sorted(processes, key=keys[sort_by])
+
+    return ProcessListResponse(
+        total=len(processes),
+        processes=[
+            ProcessEntry(
+                pid=p.pid,
+                name=p.name,
+                user=p.user,
+                cpu_percent=p.cpu_percent,
+                memory_percent=p.memory_percent,
+                command=p.command,
+                status=p.status,
+            )
+            for p in ordered[:limit]
+        ],
+    )
+
+
+@router.post("/scan", response_model=ScanResponse)
+def run_scan(session: Session) -> ScanResponse:
+    """
+    Run one scan and return what stood out.
+
+    There is no dry-run parameter because there is no other mode: a scan reads
+    the process table and writes rows to the observation store.
+
+    Args:
+        session: Authenticated session, injected.
+
+    Returns:
+        The observations, warnings first.
+
+    Raises:
+        HTTPException: When the process table cannot be read.
+    """
+    monitor = ProcessMonitor(verbose=False)
+    try:
+        observations = monitor.scan_once(cpu_sample_interval=DEFAULT_CPU_SAMPLE_INTERVAL)
+        scanned = len(list_processes())
+    except MonitorError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    return ScanResponse(
+        scanned=scanned,
+        observations=[_observation_entry(o) for o in observations],
+        count=len(observations),
+        scope=list(MONITOR_SCOPE),
+    )
+
+
+@router.get("/observations", response_model=ObservationListResponse)
+def get_observations(
+    session: Session,
+    limit: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)] = 50,
+    include_acknowledged: bool = False,
+    severity: Annotated[str | None, Query(pattern="^(notice|warning)$")] = None,
+) -> ObservationListResponse:
+    """
+    Read stored observations, newest first.
+
+    Args:
+        limit: Maximum number of rows to return.
+        include_acknowledged: Include rows an operator already dismissed.
+        severity: Restrict to notice or warning.
+        session: Authenticated session, injected.
+
+    Returns:
+        The requested page and the store totals.
+
+    Raises:
+        HTTPException: When the store cannot be read.
+    """
+    try:
+        store = ObservationStore(verbose=False)
+        rows = store.recent(
             limit=limit,
-            include_resolved=include_resolved,
-            threat_level=threat_level,
+            include_acknowledged=include_acknowledged,
+            severity=severity,
         )
-        stats = store.get_stats()
+        stats = store.stats()
+    except (WASMError, OSError) as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Observation store unavailable: {exc}"
+        ) from exc
 
-        return ThreatHistoryResponse(
-            threats=[ThreatHistoryItem(**t) for t in threats],
-            count=len(threats),
-            stats=stats,
-        )
-    except ImportError:
-        raise HTTPException(status_code=500, detail="Monitor module not available")
-    except Exception as e:
-        logger.error(f"Failed to get threat history: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to get threat history: {e!s}")
+    return ObservationListResponse(
+        observations=[_row_to_entry(row) for row in rows],
+        count=len(rows),
+        stats=stats,
+    )
 
 
-@router.post("/threats/{threat_id}/resolve")
-async def resolve_threat(
-    request: Request, threat_id: int, session: dict = Depends(get_current_session)
-):
+def _row_to_entry(row: dict[str, Any]) -> ObservationEntry:
     """
-    Mark a threat as resolved.
+    Convert a stored row to its API shape.
 
     Args:
-        threat_id: The ID of the threat to resolve.
+        row: A row from the observation store.
+
+    Returns:
+        The serialisable entry.
+    """
+    return ObservationEntry(
+        id=row.get("id"),
+        observed_at=str(row.get("observed_at", "")),
+        pid=int(row.get("pid", 0)),
+        process_name=str(row.get("process_name", "")),
+        user=row.get("user"),
+        cpu_percent=row.get("cpu_percent"),
+        memory_percent=row.get("memory_percent"),
+        command=row.get("command"),
+        signal=str(row.get("signal", "")),
+        severity=str(row.get("severity", "")),
+        detail=row.get("detail"),
+        acknowledged=bool(row.get("acknowledged", 0)),
+    )
+
+
+@router.post("/observations/{observation_id}/acknowledge")
+def acknowledge_observation(
+    observation_id: int,
+    session: Session,
+) -> dict[str, Any]:
+    """
+    Mark an observation as seen.
+
+    Acknowledging changes a flag in WASM's own database. It does nothing to the
+    process the observation is about.
+
+    Args:
+        observation_id: Row identifier.
+        session: Authenticated session, injected.
+
+    Returns:
+        A success payload.
+
+    Raises:
+        HTTPException: When the row does not exist or the store is unreadable.
     """
     try:
-        from wasm.monitor import ThreatStore
+        acknowledged = ObservationStore(verbose=False).acknowledge(observation_id)
+    except (WASMError, OSError) as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Observation store unavailable: {exc}"
+        ) from exc
 
-        store = ThreatStore(verbose=False)
-        success = store.mark_resolved(threat_id)
+    if not acknowledged:
+        raise HTTPException(status_code=404, detail=f"Observation {observation_id} not found")
 
-        if success:
-            return {"success": True, "message": f"Threat #{threat_id} marked as resolved"}
-        else:
-            raise HTTPException(status_code=404, detail=f"Threat #{threat_id} not found")
-    except ImportError:
-        raise HTTPException(status_code=500, detail="Monitor module not available")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to resolve threat: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to resolve threat: {e!s}")
+    return {"success": True, "message": f"Observation {observation_id} acknowledged"}
+
+
+def _service_action(action: str) -> dict[str, Any]:
+    """
+    Run one systemd action against the monitor unit.
+
+    Args:
+        action: One of install, uninstall, enable, disable, start, stop.
+
+    Returns:
+        A success payload.
+
+    Raises:
+        HTTPException: When systemd or the filesystem refused.
+    """
+    monitor = ProcessMonitor(verbose=False)
+    methods = {
+        "install": monitor.install_service,
+        "uninstall": monitor.uninstall_service,
+        "enable": monitor.enable_service,
+        "disable": monitor.disable_service,
+        "start": monitor.start_service,
+        "stop": monitor.stop_service,
+    }
+
+    try:
+        methods[action]()
+    except WASMError as exc:
+        logger.error("Monitor service %s failed: %s", action, exc)
+        detail = getattr(exc, "details", "") or ""
+        raise HTTPException(
+            status_code=500,
+            detail=f"{exc}{f': {detail}' if detail else ''}",
+        ) from exc
+
+    return {"success": True, "message": f"Monitor service {action} completed"}
+
+
+@router.post("/install")
+def install_monitor(session: Session) -> dict[str, Any]:
+    """
+    Write the systemd unit.
+
+    Args:
+        session: Authenticated session, injected.
+
+    Returns:
+        A success payload.
+    """
+    return _service_action("install")
+
+
+@router.post("/uninstall")
+def uninstall_monitor(session: Session) -> dict[str, Any]:
+    """
+    Remove the systemd unit WASM wrote.
+
+    Args:
+        session: Authenticated session, injected.
+
+    Returns:
+        A success payload.
+    """
+    return _service_action("uninstall")
+
+
+@router.post("/enable")
+def enable_monitor(session: Session) -> dict[str, Any]:
+    """
+    Enable the unit and start it now.
+
+    Args:
+        session: Authenticated session, injected.
+
+    Returns:
+        A success payload.
+    """
+    return _service_action("enable")
+
+
+@router.post("/disable")
+def disable_monitor(session: Session) -> dict[str, Any]:
+    """
+    Disable the unit and stop it now.
+
+    Args:
+        session: Authenticated session, injected.
+
+    Returns:
+        A success payload.
+    """
+    return _service_action("disable")
+
+
+@router.post("/start")
+def start_monitor(session: Session) -> dict[str, Any]:
+    """
+    Start the unit without enabling it at boot.
+
+    Args:
+        session: Authenticated session, injected.
+
+    Returns:
+        A success payload.
+    """
+    return _service_action("start")
+
+
+@router.post("/stop")
+def stop_monitor(session: Session) -> dict[str, Any]:
+    """
+    Stop the unit without disabling it at boot.
+
+    Args:
+        session: Authenticated session, injected.
+
+    Returns:
+        A success payload.
+    """
+    return _service_action("stop")
+
+
+@router.post("/test-email")
+def test_email(session: Session) -> dict[str, Any]:
+    """
+    Send a test message through the configured SMTP relay.
+
+    Args:
+        session: Authenticated session, injected.
+
+    Returns:
+        A success payload.
+
+    Raises:
+        HTTPException: When SMTP is not configured or delivery failed.
+    """
+    notifier = EmailNotifier(verbose=False)
+
+    if not notifier.smtp_config.host:
+        raise HTTPException(
+            status_code=400,
+            detail="SMTP is not configured. Set monitor.smtp.host in Settings.",
+        )
+    if not notifier.recipients:
+        raise HTTPException(
+            status_code=400,
+            detail="No recipients configured. Set monitor.email_recipients in Settings.",
+        )
+
+    try:
+        notifier.send_test_email()
+    except EmailError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return {"success": True, "message": "Test email sent"}

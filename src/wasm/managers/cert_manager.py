@@ -1,160 +1,280 @@
-"""
-SSL certificate manager for WASM using Certbot.
+# Copyright (c) 2024-2026 Yago Lopez Prado
+# Licensed under WASM-NCSAL 1.0 (Commercial use prohibited)
+# https://github.com/Perkybeet/wasm/blob/main/LICENSE
 
-Certificate information crosses two module boundaries: ``certbot certificates``
-is parsed here and consumed by the CLI and by the health check. That data
-travels as a :class:`CertificateInfo`, so the key names are stated once instead
-of being guessed at each end. ``wasm health`` spent several releases looking for
-an ``expires`` key that this module never wrote.
+"""
+SSL certificates, driven through certbot.
+
+Certificate data crosses two module boundaries: ``certbot certificates`` is
+parsed here and read by the CLI and by ``wasm health``. It travels as a
+:class:`CertificateInfo`, so the field names are stated once instead of being
+guessed at each end - ``wasm health`` spent several releases looking for an
+``expires`` key that this module never wrote, and a plain dict answered that
+with ``None`` forever. Asking one of these records for a field it does not have
+is now a :class:`KeyError`, not a silent miss.
+
+The other thing this module has to get right is idempotence. Issuance is a rate
+limited network operation against Let's Encrypt, so "run it again" must be
+cheap and safe:
+
+- A certificate that already covers every requested domain is left alone.
+- One that covers some of them is expanded, never issued a second time under a
+  new lineage name. That is why every command passes ``--cert-name``: without
+  it certbot invents ``example.com-0001`` as soon as the domain set changes, and
+  the renewal timer then keeps two half-right certificates alive.
+- ``www`` is handled here rather than at each call site, because the rule for
+  when a bare domain deserves a ``www`` alias is a property of the domain.
 """
 
+from __future__ import annotations
+
+import os
 import re
 import sqlite3
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TypedDict
+from typing import Any, Literal, overload
 
 from wasm.core.exceptions import CertificateError, WASMError
-from wasm.core.runner import DEFAULT_TIMEOUT, CommandResult, CommandRunner, get_runner
-from wasm.core.store import get_store
-from wasm.managers.base_manager import BaseManager
+from wasm.core.runner import DEFAULT_TIMEOUT, CommandResult, CommandRunner
+from wasm.core.store import WASMStore, get_store
+from wasm.managers.base_manager import BaseManager, MappingRecord
+from wasm.validators.domain import is_valid_domain, should_include_www
 
 #: Issuing or renewing a certificate involves ACME round trips.
 _ISSUE_TIMEOUT = 300
 _RENEW_TIMEOUT = 600
 
+#: Where certbot keeps the ACME challenge files when no plugin is available.
+DEFAULT_WEBROOT = Path("/var/www/html")
 
-class CertificateInfo(TypedDict, total=False):
+#: Cron fallback for systems whose certbot package ships no systemd timer.
+_CRON_FILE = Path("/etc/cron.d/certbot-renew")
+_CRON_LINE = "0 0,12 * * * root certbot renew -q\n"
+
+#: Fields of :class:`CertificateInfo` that hold text, used to type the mapping
+#: accessor the CLI and the health check still read certificates through.
+_TextField = Literal["name", "expiry", "expiry_full", "cert_path", "key_path"]
+
+
+@dataclass
+class CertificateInfo(MappingRecord):
     """
     One entry of ``certbot certificates``.
-
-    A TypedDict rather than a dataclass because these values are already
-    consumed as mappings across the CLI and the web API; this pins the key
-    names without forcing every reader to change shape.
 
     Attributes:
         name: Certificate (lineage) name.
         domains: Every domain the certificate covers.
-        expiry: Expiry date as ``YYYY-MM-DD``, absent when certbot's output
+        expiry: Expiry date as ``YYYY-MM-DD``, or None when certbot's output
             could not be parsed.
         expiry_full: The raw expiry line, including certbot's validity note.
         cert_path: Path to the certificate file.
         key_path: Path to the private key.
     """
 
-    name: str
-    domains: list[str]
-    expiry: str
-    expiry_full: str
-    cert_path: str
-    key_path: str
+    name: str = ""
+    domains: list[str] = field(default_factory=list)
+    expiry: str | None = None
+    expiry_full: str = ""
+    cert_path: str = ""
+    key_path: str = ""
+
+    # The overloads exist so that a reader still using the mapping form keeps a
+    # real static type instead of Any. Reading ``cert.expiry`` is the intended
+    # way; these keep the transition from costing type safety at the call sites
+    # that have not moved yet.
+    @overload
+    def get(self, key: Literal["domains"], default: list[str] | None = ...) -> list[str]: ...
+
+    @overload
+    def get(self, key: _TextField, default: str) -> str: ...
+
+    @overload
+    def get(self, key: _TextField, default: None = ...) -> str | None: ...
+
+    @overload
+    def get(self, key: str, default: Any = ...) -> Any: ...
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """
+        Read a field, falling back to a default when it is unset.
+
+        Args:
+            key: Field name.
+            default: Returned when the field is unset.
+
+        Returns:
+            The field value, or the default.
+
+        Raises:
+            KeyError: When the key is not a field of this record.
+        """
+        return super().get(key, default)
+
+
+@dataclass
+class CertificatePaths(MappingRecord):
+    """
+    The four files a Let's Encrypt lineage publishes.
+
+    Attributes:
+        fullchain: Certificate plus intermediates, what a web server serves.
+        privkey: Private key.
+        cert: Leaf certificate on its own.
+        chain: Intermediates on their own.
+    """
+
+    fullchain: Path
+    privkey: Path
+    cert: Path
+    chain: Path
+
+
+@dataclass
+class CertificateTest(MappingRecord):
+    """
+    Result of inspecting a certificate file with openssl.
+
+    Attributes:
+        valid: Whether the file could be read and parsed.
+        error: Why it could not, when it could not.
+        not_before: Start of the validity window, as openssl prints it.
+        not_after: End of the validity window, as openssl prints it.
+        path: File that was inspected.
+    """
+
+    valid: bool
+    error: str | None = None
+    not_before: str | None = None
+    not_after: str | None = None
+    path: str | None = None
 
 
 class CertManager(BaseManager):
     """
     Manager for SSL certificates using Certbot.
 
-    Handles obtaining, renewing, and revoking Let's Encrypt certificates.
+    Handles obtaining, renewing and revoking Let's Encrypt certificates.
     """
 
     LETSENCRYPT_DIR = Path("/etc/letsencrypt")
     LIVE_DIR = LETSENCRYPT_DIR / "live"
 
-    def __init__(self, verbose: bool = False, runner: CommandRunner | None = None):
+    def __init__(self, verbose: bool = False, runner: CommandRunner | None = None) -> None:
         """
-        Initialize certificate manager.
+        Initialize the certificate manager.
 
         Args:
             verbose: Enable verbose logging.
             runner: Command runner to execute certbot with. Defaults to the
                 process-wide runner.
         """
-        super().__init__(verbose=verbose)
-        self.store = get_store()
-        self._runner = runner
+        super().__init__(verbose=verbose, runner=runner)
+        self._plugin_available: dict[str, bool] = {}
 
     @property
-    def runner(self) -> CommandRunner:
+    def store(self) -> WASMStore:
         """
-        The command runner used for every certbot invocation.
+        The persistence layer.
 
         Returns:
-            The injected runner, or the process-wide one.
+            The store singleton.
         """
-        return self._runner or get_runner()
+        return get_store()
 
     def _exec(
         self,
-        argv: list[str],
+        argv: Sequence[str],
         *,
         sudo: bool = True,
         timeout: int = DEFAULT_TIMEOUT,
     ) -> CommandResult:
         """
-        Run a command through the shared runner.
+        Run a certbot-adjacent command through the shared runner.
 
-        Certbot reads and writes ``/etc/letsencrypt``; it is run with
-        privileges by default because every unprivileged invocation lies.
+        Certbot reads and writes ``/etc/letsencrypt``. Every unprivileged
+        invocation lies: it cannot see its own configuration, exits non-zero,
+        and the caller concludes the machine has no certificates and no plugins.
+        That is how ``certbot plugins`` came to answer False for everything and
+        every issuance quietly degraded to ``--webroot /var/www/html``.
 
         Args:
             argv: Program and arguments.
-            sudo: Prefix the command with sudo.
+            sudo: Run the command with privileges.
             timeout: Deadline in seconds.
 
         Returns:
             The command outcome.
         """
-        return self.runner.run(["sudo", *argv] if sudo else argv, timeout=timeout)
+        # WASM requires root, so the prefix is redundant on a correct install
+        # and harmless on one where the operator used sudo to reach us. It stays
+        # until the CLI entry point enforces root by itself.
+        command = ["sudo", *argv] if sudo else list(argv)
+        return self._run(command, timeout=timeout)
 
     def is_installed(self) -> bool:
-        """Check if Certbot is installed."""
+        """
+        Check whether certbot is installed.
+
+        Returns:
+            True when certbot is on PATH.
+        """
         return self.runner.exists("certbot")
 
     def get_version(self) -> str | None:
-        """Get Certbot version."""
+        """
+        Get the certbot version.
+
+        Returns:
+            The version string, or None when it cannot be determined.
+        """
         result = self._exec(["certbot", "--version"])
-        if result.success:
-            match = re.search(r"certbot (\S+)", result.stdout)
-            if match:
-                return match.group(1)
-        return None
+        match = re.search(r"certbot (\S+)", f"{result.stdout}\n{result.stderr}")
+        return match.group(1) if match else None
+
+    # -- Reading existing certificates -------------------------------------
 
     def cert_exists(self, domain: str) -> bool:
         """
-        Check if a certificate exists for a domain.
+        Check whether a certificate exists for a domain.
 
         Args:
             domain: Domain name.
 
         Returns:
-            True if certificate exists.
+            True when the lineage has a full chain on disk.
         """
-        cert_path = self.LIVE_DIR / domain / "fullchain.pem"
-        return cert_path.exists()
+        return (self.LIVE_DIR / self._validated(domain) / "fullchain.pem").exists()
 
-    def get_cert_path(self, domain: str) -> dict[str, Path]:
+    def get_cert_path(self, domain: str) -> CertificatePaths:
         """
-        Get certificate file paths.
+        Get the certificate file paths for a domain.
 
         Args:
             domain: Domain name.
 
         Returns:
-            Dictionary with certificate paths.
+            The four files of the lineage.
+
+        Raises:
+            CertificateError: When the domain is not a valid domain name.
         """
-        base = self.LIVE_DIR / domain
-        return {
-            "fullchain": base / "fullchain.pem",
-            "privkey": base / "privkey.pem",
-            "cert": base / "cert.pem",
-            "chain": base / "chain.pem",
-        }
+        base = self.LIVE_DIR / self._validated(domain)
+        return CertificatePaths(
+            fullchain=base / "fullchain.pem",
+            privkey=base / "privkey.pem",
+            cert=base / "cert.pem",
+            chain=base / "chain.pem",
+        )
 
     def list_certificates(self) -> list[CertificateInfo]:
         """
-        List all certificates.
+        List every certificate certbot knows about.
 
         Returns:
-            One entry per certificate known to certbot.
+            One record per certificate, empty when certbot has none or cannot
+            be queried.
         """
         certificates: list[CertificateInfo] = []
 
@@ -162,94 +282,162 @@ class CertManager(BaseManager):
         if not result.success:
             return certificates
 
-        current_cert: CertificateInfo = {}
-        for line in result.stdout.split("\n"):
-            line = line.strip()
+        current: CertificateInfo | None = None
+        for raw in result.stdout.split("\n"):
+            line = raw.strip()
 
             if line.startswith("Certificate Name:"):
-                if current_cert:
-                    certificates.append(current_cert)
-                current_cert = {"name": line.split(":", 1)[1].strip()}
+                if current is not None:
+                    certificates.append(current)
+                current = CertificateInfo(name=line.split(":", 1)[1].strip())
+            elif current is None:
+                continue
             elif line.startswith("Domains:"):
-                current_cert["domains"] = line.split(":", 1)[1].strip().split()
+                current.domains = line.split(":", 1)[1].strip().split()
             elif line.startswith("Expiry Date:"):
                 expiry_str = line.split(":", 1)[1].strip()
-                # Parse expiry date
                 match = re.search(r"(\d{4}-\d{2}-\d{2})", expiry_str)
                 if match:
-                    current_cert["expiry"] = match.group(1)
-                current_cert["expiry_full"] = expiry_str
+                    current.expiry = match.group(1)
+                current.expiry_full = expiry_str
             elif line.startswith("Certificate Path:"):
-                current_cert["cert_path"] = line.split(":", 1)[1].strip()
+                current.cert_path = line.split(":", 1)[1].strip()
             elif line.startswith("Private Key Path:"):
-                current_cert["key_path"] = line.split(":", 1)[1].strip()
+                current.key_path = line.split(":", 1)[1].strip()
 
-        if current_cert:
-            certificates.append(current_cert)
+        if current is not None:
+            certificates.append(current)
 
         return certificates
 
     def get_cert_info(self, domain: str) -> CertificateInfo | None:
         """
-        Get certificate information for a domain.
+        Get the certificate covering a domain.
 
         Args:
             domain: Domain name.
 
         Returns:
-            Certificate information or None.
+            The certificate record, or None when no lineage covers the domain.
         """
-        certificates = self.list_certificates()
-
-        for cert in certificates:
-            if domain in cert.get("domains", []) or cert.get("name") == domain:
+        for cert in self.list_certificates():
+            if cert.name == domain or domain in cert.domains:
                 return cert
-
         return None
 
-    def cert_covers_domains(self, domain: str, required_domains: list[str]) -> bool:
+    def cert_covers_domains(self, domain: str, required_domains: Sequence[str]) -> bool:
         """
-        Check if an existing certificate covers all required domains.
+        Check whether an existing certificate covers every required domain.
 
         Args:
-            domain: Primary domain (certificate name).
-            required_domains: List of domains that must be covered.
+            domain: Primary domain, which is also the lineage name.
+            required_domains: Domains that must be covered.
 
         Returns:
-            True if all required domains are covered.
+            True when all of them are covered.
         """
         info = self.get_cert_info(domain)
-        if not info:
+        if info is None:
             return False
-
-        cert_domains = info.get("domains", [])
-        for d in required_domains:
-            if d not in cert_domains:
-                return False
-        return True
+        return all(d in info.domains for d in required_domains)
 
     def _check_certbot_plugin(self, plugin: str) -> bool:
         """
-        Check if a certbot plugin is available.
+        Check whether a certbot plugin is installed.
 
-        Without privileges certbot cannot read its own configuration and exits
-        non-zero, so this probe used to answer False for every plugin and every
-        issuance silently degraded to ``--webroot /var/www/html``.
+        The answer is cached for the life of the manager: issuing one
+        certificate asks the same question up to twice, and ``certbot plugins``
+        is not cheap.
 
         Args:
-            plugin: Plugin name (nginx, apache).
+            plugin: Plugin name, ``nginx`` or ``apache``.
 
         Returns:
-            True if plugin is available.
+            True when the plugin is available.
         """
+        if plugin in self._plugin_available:
+            return self._plugin_available[plugin]
+
         result = self._exec(["certbot", "plugins"])
-        if result.success:
-            return f"* {plugin}" in result.stdout
-        return False
+        available = result.success and f"* {plugin}" in result.stdout
+        self._plugin_available[plugin] = available
+        return available
+
+    # -- Issuance ----------------------------------------------------------
+
+    @staticmethod
+    def _validated(domain: str) -> str:
+        """
+        Normalise a domain and refuse anything that is not one.
+
+        A lineage name becomes a directory under ``/etc/letsencrypt/live`` and a
+        ``--cert-name`` argument, so it is checked before it is used even though
+        the runner never involves a shell.
+
+        Args:
+            domain: Candidate domain name.
+
+        Returns:
+            The domain, lowercased and stripped.
+
+        Raises:
+            CertificateError: When the domain is not a valid domain name.
+        """
+        candidate = domain.strip().lower()
+        valid, reason = is_valid_domain(candidate)
+        if not valid:
+            raise CertificateError(
+                f"Invalid domain: {domain!r}",
+                details=f"{reason}. Pass a bare host name such as example.com.",
+            )
+        return candidate
+
+    def certificate_domains(
+        self,
+        domain: str,
+        additional_domains: Sequence[str] | None = None,
+        include_www: bool = False,
+    ) -> list[str]:
+        """
+        Build the domain list a certificate should cover.
+
+        Args:
+            domain: Primary domain, first in the result and the lineage name.
+            additional_domains: Further domains to cover.
+            include_www: Add ``www.<domain>`` when the domain is a bare
+                registrable name. A subdomain or a domain that already starts
+                with ``www`` is left alone, because the alias would not resolve
+                and certbot would fail the whole order.
+
+        Returns:
+            The validated domains, deduplicated, primary domain first.
+
+        Raises:
+            CertificateError: When any domain is not a valid domain name.
+        """
+        primary = self._validated(domain)
+        ordered = [primary]
+
+        if include_www and should_include_www(primary):
+            ordered.append(f"www.{primary}")
+
+        for extra in additional_domains or []:
+            ordered.append(self._validated(extra))
+
+        # Duplicates make certbot issue a certificate whose SAN list does not
+        # match what was asked for, which then never compares equal on the next
+        # idempotence check.
+        seen: set[str] = set()
+        unique = []
+        for name in ordered:
+            if name not in seen:
+                seen.add(name)
+                unique.append(name)
+        return unique
 
     def create(
         self,
-        domains: list[str],
+        domains: Sequence[str],
         email: str | None = None,
         webserver: str | None = None,
         webroot: Path | None = None,
@@ -262,17 +450,17 @@ class CertManager(BaseManager):
         Args:
             domains: Domains to cover. The first one names the certificate.
             email: Email for registration and recovery.
-            webserver: Web server whose certbot plugin should be used
-                ("nginx" or "apache").
+            webserver: Web server whose certbot plugin should be used,
+                ``nginx`` or ``apache``.
             webroot: Webroot path for the webroot plugin.
-            dry_run: Test certificate issuance.
+            dry_run: Ask certbot for a test certificate.
             expand: Expand an existing certificate.
 
         Returns:
-            True if the certificate was obtained.
+            True when the certificate is in place.
 
         Raises:
-            CertificateError: If no domain was given or issuance fails.
+            CertificateError: When no domain was given or issuance fails.
         """
         if not domains:
             raise CertificateError(
@@ -300,142 +488,170 @@ class CertManager(BaseManager):
         nginx: bool = False,
         apache: bool = False,
         dry_run: bool = False,
-        additional_domains: list[str] | None = None,
+        additional_domains: Sequence[str] | None = None,
         expand: bool = False,
+        include_www: bool = False,
     ) -> bool:
         """
-        Obtain a new certificate.
+        Obtain a certificate, or confirm that a suitable one already exists.
 
         Args:
-            domain: Primary domain name.
+            domain: Primary domain, which becomes the lineage name.
             email: Email for registration and recovery.
-            webroot: Webroot path for webroot plugin.
-            standalone: Use standalone plugin.
-            nginx: Use nginx plugin.
-            apache: Use apache plugin.
-            dry_run: Test certificate issuance.
-            additional_domains: Additional domains for the certificate.
-            expand: Expand existing certificate to include additional domains.
+            webroot: Webroot path for the webroot plugin.
+            standalone: Use the standalone plugin.
+            nginx: Use the nginx plugin.
+            apache: Use the apache plugin.
+            dry_run: Ask certbot for a test certificate.
+            additional_domains: Further domains to cover.
+            expand: Expand the existing certificate even when it already covers
+                the requested domains.
+            include_www: Also cover ``www.<domain>`` when that makes sense.
 
         Returns:
-            True if certificate was obtained successfully.
+            True when the certificate covering every requested domain exists.
 
         Raises:
-            CertificateError: If certificate issuance fails.
+            CertificateError: When a domain is invalid or issuance fails.
         """
-        if self.cert_exists(domain) and not dry_run:
-            # If additional domains requested, check if cert already covers them
-            if additional_domains:
-                all_required = [domain, *additional_domains]
-                if self.cert_covers_domains(domain, all_required):
-                    self.logger.info(
-                        f"Certificate already covers all domains: {', '.join(all_required)}"
-                    )
-                    return True
-                # Cert exists but doesn't cover all domains - need to expand
-                self.logger.info(
-                    f"Expanding certificate to include: {', '.join(additional_domains)}"
-                )
-                expand = True
-            elif not expand:
-                self.logger.warning(f"Certificate already exists for {domain}")
+        requested = self.certificate_domains(domain, additional_domains, include_www)
+        primary = requested[0]
+
+        if self.cert_exists(primary) and not dry_run:
+            if self.cert_covers_domains(primary, requested) and not expand:
+                self.logger.info(f"Certificate already covers all domains: {', '.join(requested)}")
                 return True
+            self.logger.info(f"Expanding certificate to cover: {', '.join(requested)}")
+            expand = True
 
-        # Build command
-        cmd = ["certbot", "certonly"]
+        cmd = self._build_issue_command(
+            requested,
+            email=email,
+            webroot=webroot,
+            standalone=standalone,
+            nginx=nginx,
+            apache=apache,
+            expand=expand,
+            dry_run=dry_run,
+        )
 
-        # Add email
+        result = self._exec(cmd, timeout=_ISSUE_TIMEOUT)
+        if not result.success:
+            raise CertificateError(
+                f"Failed to obtain certificate for {primary}",
+                details=(result.stderr or result.stdout).strip()
+                or "Check that the domain resolves to this host and port 80 is reachable.",
+            )
+
+        if not dry_run:
+            paths = self.get_cert_path(primary)
+            self._store_ssl_state(
+                primary,
+                enabled=True,
+                certificate=str(paths.fullchain),
+                key=str(paths.privkey),
+            )
+
+        self.logger.debug(f"Obtained certificate for: {primary}")
+        return True
+
+    def _build_issue_command(
+        self,
+        domains: Sequence[str],
+        *,
+        email: str | None,
+        webroot: Path | None,
+        standalone: bool,
+        nginx: bool,
+        apache: bool,
+        expand: bool,
+        dry_run: bool,
+    ) -> list[str]:
+        """
+        Assemble the ``certbot certonly`` argument vector.
+
+        Args:
+            domains: Validated domains, primary first.
+            email: Email for registration, or None to register without one.
+            webroot: Webroot path, which also selects the webroot plugin.
+            standalone: Use the standalone plugin.
+            nginx: Prefer the nginx plugin.
+            apache: Prefer the apache plugin.
+            expand: Add ``--expand``.
+            dry_run: Add ``--dry-run``.
+
+        Returns:
+            The full argument vector.
+        """
+        primary = domains[0]
+        # --cert-name pins the lineage: the same domain always renews and
+        # expands in place instead of spawning example.com-0001.
+        cmd = ["certbot", "certonly", "--cert-name", primary]
+
         email = email or self.config.ssl_email
         if email:
             cmd.extend(["--email", email])
         else:
             cmd.append("--register-unsafely-without-email")
 
-        # Non-interactive
         cmd.extend(["--non-interactive", "--agree-tos"])
+        cmd.extend(self._authenticator_args(webroot, standalone, nginx, apache))
 
-        # Plugin selection with fallback logic
-        use_webroot = False
-        webroot_path = webroot or Path("/var/www/html")
+        for name in domains:
+            cmd.extend(["-d", name])
 
-        if nginx:
-            # Check if nginx plugin is available
-            if self._check_certbot_plugin("nginx"):
-                cmd.append("--nginx")
-            else:
-                self.logger.warning(
-                    "certbot nginx plugin not installed. Using webroot method instead. "
-                    "Install with: sudo apt install python3-certbot-nginx"
-                )
-                use_webroot = True
-        elif apache:
-            # Check if apache plugin is available
-            if self._check_certbot_plugin("apache"):
-                cmd.append("--apache")
-            else:
-                self.logger.warning(
-                    "certbot apache plugin not installed. Using webroot method instead. "
-                    "Install with: sudo apt install python3-certbot-apache"
-                )
-                use_webroot = True
-        elif standalone:
-            cmd.append("--standalone")
-        elif webroot:
-            use_webroot = True
-        else:
-            # Auto-detect: prefer nginx plugin if available
-            nginx_installed = self.runner.exists("nginx")
-            if nginx_installed and self._check_certbot_plugin("nginx"):
-                cmd.append("--nginx")
-            elif nginx_installed:
-                # Nginx installed but plugin not available, use webroot
-                self.logger.warning(
-                    "certbot nginx plugin not installed. Using webroot method. "
-                    "Install with: sudo apt install python3-certbot-nginx"
-                )
-                use_webroot = True
-            else:
-                cmd.append("--standalone")
-
-        # Configure webroot if needed
-        if use_webroot:
-            cmd.extend(["--webroot", "-w", str(webroot_path)])
-
-        # Add domains
-        cmd.extend(["-d", domain])
-        if additional_domains:
-            for d in additional_domains:
-                cmd.extend(["-d", d])
-
-        # Expand existing certificate
-        if expand and self.cert_exists(domain):
+        if expand:
             cmd.append("--expand")
-
-        # Dry run
         if dry_run:
             cmd.append("--dry-run")
 
-        # Execute
-        result = self._exec(cmd, timeout=_ISSUE_TIMEOUT)
+        return cmd
 
-        if not result.success:
-            raise CertificateError(
-                f"Failed to obtain certificate for {domain}",
-                details=result.stderr,
+    def _authenticator_args(
+        self,
+        webroot: Path | None,
+        standalone: bool,
+        nginx: bool,
+        apache: bool,
+    ) -> list[str]:
+        """
+        Choose how certbot should prove control of the domain.
+
+        Args:
+            webroot: Explicit webroot path, which selects the webroot plugin.
+            standalone: Use the standalone plugin.
+            nginx: Prefer the nginx plugin.
+            apache: Prefer the apache plugin.
+
+        Returns:
+            The authenticator arguments.
+        """
+        if nginx or apache:
+            wanted = "nginx" if nginx else "apache"
+            if self._check_certbot_plugin(wanted):
+                return [f"--{wanted}"]
+            self.logger.warning(
+                f"certbot {wanted} plugin not installed. Using the webroot method instead. "
+                f"Install it with: apt install python3-certbot-{wanted}"
             )
+            return ["--webroot", "-w", str(webroot or DEFAULT_WEBROOT)]
 
-        # Update store with SSL info
-        if not dry_run:
-            cert_paths = self.get_cert_path(domain)
-            self._store_ssl_state(
-                domain,
-                enabled=True,
-                certificate=str(cert_paths["fullchain"]),
-                key=str(cert_paths["privkey"]),
+        if standalone:
+            return ["--standalone"]
+
+        if webroot is not None:
+            return ["--webroot", "-w", str(webroot)]
+
+        if self.runner.exists("nginx"):
+            if self._check_certbot_plugin("nginx"):
+                return ["--nginx"]
+            self.logger.warning(
+                "certbot nginx plugin not installed. Using the webroot method. "
+                "Install it with: apt install python3-certbot-nginx"
             )
+            return ["--webroot", "-w", str(DEFAULT_WEBROOT)]
 
-        self.logger.debug(f"Obtained certificate for: {domain}")
-        return True
+        return ["--standalone"]
 
     def _store_ssl_state(
         self,
@@ -471,8 +687,10 @@ class CertManager(BaseManager):
                 app.ssl_certificate = certificate
                 app.ssl_key = key
                 self.store.update_app(app)
-        except (WASMError, sqlite3.Error) as e:
-            self.logger.debug(f"Could not update SSL in store: {e}")
+        except (WASMError, sqlite3.Error) as exc:
+            self.logger.debug(f"Could not update SSL in store: {exc}")
+
+    # -- Renewal and removal -----------------------------------------------
 
     def renew(
         self,
@@ -484,32 +702,31 @@ class CertManager(BaseManager):
         Renew certificates.
 
         Args:
-            domain: Specific domain to renew (or all if None).
-            force: Force renewal even if not due.
-            dry_run: Test renewal without making changes.
+            domain: Lineage to renew, or None for every certificate that is due.
+            force: Renew even when the certificate is not near expiry.
+            dry_run: Rehearse the renewal against the staging environment.
 
         Returns:
-            True if renewal was successful.
+            True when certbot reported success.
+
+        Raises:
+            CertificateError: When the domain is invalid or renewal fails.
         """
-        cmd = ["certbot", "renew"]
+        cmd = ["certbot", "renew", "--non-interactive"]
 
         if domain:
-            cmd.extend(["--cert-name", domain])
-
+            cmd.extend(["--cert-name", self._validated(domain)])
         if force:
             cmd.append("--force-renewal")
-
         if dry_run:
             cmd.append("--dry-run")
 
-        cmd.append("--non-interactive")
-
         result = self._exec(cmd, timeout=_RENEW_TIMEOUT)
-
         if not result.success:
             raise CertificateError(
                 "Certificate renewal failed",
-                details=result.stderr,
+                details=(result.stderr or result.stdout).strip()
+                or "Run 'certbot renew --dry-run' to see what the ACME server reports.",
             )
 
         return True
@@ -520,141 +737,139 @@ class CertManager(BaseManager):
 
         Args:
             domain: Domain name.
-            delete: Also delete certificate files.
+            delete: Also delete the certificate files.
 
         Returns:
-            True if revocation was successful.
-        """
-        if not self.cert_exists(domain):
-            raise CertificateError(f"Certificate not found: {domain}")
+            True when the certificate was revoked.
 
-        cert_path = self.get_cert_path(domain)["fullchain"]
+        Raises:
+            CertificateError: When no such certificate exists or revocation
+                fails.
+        """
+        primary = self._validated(domain)
+        if not self.cert_exists(primary):
+            raise CertificateError(
+                f"Certificate not found: {primary}",
+                details=f"Nothing to revoke under {self.LIVE_DIR / primary}.",
+            )
 
         cmd = [
             "certbot",
             "revoke",
             "--cert-path",
-            str(cert_path),
+            str(self.get_cert_path(primary).fullchain),
             "--non-interactive",
         ]
-
         if delete:
             cmd.append("--delete-after-revoke")
 
         result = self._exec(cmd, timeout=_ISSUE_TIMEOUT)
-
         if not result.success:
             raise CertificateError(
-                f"Failed to revoke certificate for {domain}",
-                details=result.stderr,
+                f"Failed to revoke certificate for {primary}",
+                details=(result.stderr or result.stdout).strip(),
             )
 
-        self._store_ssl_state(domain, enabled=False)
-
-        self.logger.debug(f"Revoked certificate for: {domain}")
+        self._store_ssl_state(primary, enabled=False)
+        self.logger.debug(f"Revoked certificate for: {primary}")
         return True
 
     def delete(self, domain: str) -> bool:
         """
-        Delete a certificate (without revoking).
+        Delete a certificate without revoking it.
+
+        Deleting a lineage that is already gone is not an error: the caller
+        wanted it absent and it is absent.
 
         Args:
             domain: Domain name.
 
         Returns:
-            True if deletion was successful.
+            True when no certificate remains for the domain.
+
+        Raises:
+            CertificateError: When the domain is invalid or deletion fails.
         """
-        cmd = [
-            "certbot",
-            "delete",
-            "--cert-name",
-            domain,
-            "--non-interactive",
-        ]
+        primary = self._validated(domain)
+        if not self.cert_exists(primary):
+            self.logger.debug(f"No certificate to delete for: {primary}")
+            self._store_ssl_state(primary, enabled=False)
+            return True
 
-        result = self._exec(cmd, timeout=_ISSUE_TIMEOUT)
-
+        result = self._exec(
+            ["certbot", "delete", "--cert-name", primary, "--non-interactive"],
+            timeout=_ISSUE_TIMEOUT,
+        )
         if not result.success:
             raise CertificateError(
-                f"Failed to delete certificate for {domain}",
-                details=result.stderr,
+                f"Failed to delete certificate for {primary}",
+                details=(result.stderr or result.stdout).strip(),
             )
 
-        self._store_ssl_state(domain, enabled=False)
-
+        self._store_ssl_state(primary, enabled=False)
         return True
 
     def setup_auto_renewal(self) -> bool:
         """
-        Setup automatic certificate renewal via systemd timer.
+        Make certificates renew themselves.
+
+        Prefers the systemd timer the certbot packages ship; falls back to a
+        cron entry for systems that have neither the timer nor systemd.
 
         Returns:
-            True if setup was successful.
+            True when automatic renewal is in place.
         """
-        # Enable certbot timer if it exists
-        result = self._exec(["systemctl", "enable", "certbot.timer"])
-        if result.success:
+        if self._exec(["systemctl", "enable", "certbot.timer"]).success:
             self._exec(["systemctl", "start", "certbot.timer"])
             return True
 
-        # Otherwise, set up cron job
-        cron_cmd = "0 0,12 * * * root certbot renew -q"
-        cron_file = Path("/etc/cron.d/certbot-renew")
+        try:
+            _CRON_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _CRON_FILE.write_text(_CRON_LINE)
+            os.chmod(_CRON_FILE, 0o644)
+        except OSError as exc:
+            self.logger.error(f"Could not install the renewal cron entry: {exc}")
+            return False
 
-        from wasm.core.utils import write_file
+        return True
 
-        return write_file(cron_file, cron_cmd + "\n", sudo=True)
-
-    def test_cert(self, domain: str) -> dict:
+    def test_cert(self, domain: str) -> CertificateTest:
         """
-        Test certificate validity.
+        Inspect a certificate file with openssl.
 
         Args:
             domain: Domain name.
 
         Returns:
-            Dictionary with test results.
+            The validity window, or the reason it could not be read.
+
+        Raises:
+            CertificateError: When the domain is not a valid domain name.
         """
-        if not self.cert_exists(domain):
-            return {
-                "valid": False,
-                "error": "Certificate not found",
-            }
+        primary = self._validated(domain)
+        if not self.cert_exists(primary):
+            return CertificateTest(valid=False, error="Certificate not found")
 
-        cert_path = self.get_cert_path(domain)["fullchain"]
-
-        # Use openssl to check certificate
+        cert_path = self.get_cert_path(primary).fullchain
         result = self._exec(
-            [
-                "openssl",
-                "x509",
-                "-in",
-                str(cert_path),
-                "-noout",
-                "-dates",
-            ],
+            ["openssl", "x509", "-in", str(cert_path), "-noout", "-dates"],
             sudo=False,
         )
 
         if not result.success:
-            return {
-                "valid": False,
-                "error": result.stderr,
-            }
+            return CertificateTest(valid=False, error=result.stderr.strip() or "openssl failed")
 
-        # Parse dates
-        not_before = None
-        not_after = None
-
+        not_before: str | None = None
+        not_after: str | None = None
         for line in result.stdout.split("\n"):
             if line.startswith("notBefore="):
                 not_before = line.split("=", 1)[1].strip()
             elif line.startswith("notAfter="):
                 not_after = line.split("=", 1)[1].strip()
 
-        return {
-            "valid": True,
-            "not_before": not_before,
-            "not_after": not_after,
-            "path": str(cert_path),
-        }
+        return CertificateTest(
+            valid=True,
+            not_before=not_before,
+            not_after=not_after,
+            path=str(cert_path),
+        )

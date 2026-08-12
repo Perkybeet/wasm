@@ -6,32 +6,45 @@
 Base deployer class for WASM.
 
 Defines the interface and common functionality for all deployers.
+
+``deploy()`` is a pipeline description, not an implementation: each step names
+the manager that does the work and the undo that reverses it. Everything that
+belongs to a manager (nginx, systemd, certbot) or to the store lives there, not
+here.
 """
 
+from __future__ import annotations
+
 import shutil
-import sqlite3
-from abc import ABC, abstractmethod
+from abc import abstractmethod
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Literal
+from typing import Any, ClassVar, Literal
 
 from wasm.core.config import Config
 from wasm.core.exceptions import BuildError, DeploymentError, OutOfMemoryError, WASMError
-from wasm.core.logger import Logger
+from wasm.core.logger import Icons, Logger
+from wasm.core.runner import CommandResult, CommandRunner, get_runner
 from wasm.core.store import (
     App,
     AppStatus,
-    Service,
-    Site,
     get_store,
 )
-from wasm.core.utils import domain_to_app_name, run_command
+from wasm.core.utils import domain_to_app_name
 from wasm.deployers.helpers import (
     EnvManager,
     NginxConfigBuilder,
     PackageManagerHelper,
     PathResolver,
     PrismaHelper,
+    preflight,
 )
+from wasm.deployers.helpers.health import failure_output, wait_until_healthy
+from wasm.deployers.helpers.nginx_config import NginxAdvancedConfig
+from wasm.deployers.helpers.registration import StoreRegistrar
+from wasm.deployers.helpers.summary import print_deployment_summary
+from wasm.deployers.interface import AppDeployer
+from wasm.deployers.pipeline import DeployStep, run_pipeline
 from wasm.managers.apache_manager import ApacheManager
 from wasm.managers.cert_manager import CertManager
 from wasm.managers.nginx_manager import NginxManager
@@ -42,8 +55,17 @@ from wasm.validators.environment import validate_environment, validate_unit_valu
 # Type for package managers
 PackageManager = Literal["npm", "pnpm", "bun", "yarn", "auto"]
 
+#: Deadlines for the two commands that legitimately take minutes. Generous, but
+#: finite: an npm install that wedges on a private registry must eventually fail
+#: the deploy instead of holding the terminal forever.
+INSTALL_TIMEOUT = 1800
+BUILD_TIMEOUT = 2700
 
-class BaseDeployer(ABC):
+#: Everything else in a deployer is a quick local command.
+COMMAND_TIMEOUT = 300
+
+
+class BaseDeployer(AppDeployer):
     """
     Abstract base class for application deployers.
 
@@ -56,43 +78,53 @@ class BaseDeployer(ABC):
     DISPLAY_NAME: str = "Base Application"
 
     # Files used to detect this app type
-    DETECTION_FILES: list[str] = []
-    DETECTION_PATTERNS: list[str] = []
+    DETECTION_FILES: ClassVar[list[str]] = []
+    DETECTION_PATTERNS: ClassVar[list[str]] = []
 
     # Default port
     DEFAULT_PORT: int = 3000
 
     # System dependencies
-    SYSTEM_DEPS: list[str] = []
+    SYSTEM_DEPS: ClassVar[list[str]] = []
 
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, runner: CommandRunner | None = None):
         """
         Initialize the deployer.
 
         Args:
             verbose: Enable verbose logging.
+            runner: Command runner used for install and build commands. Defaults
+                to the process-wide runner, which is what enforces --dry-run.
         """
         self.verbose = verbose
         self.config = Config()
         self.logger = Logger(verbose=verbose)
         self.store = get_store()
+        self._runner = runner
 
-        # Managers
-        self.source_manager = SourceManager(verbose=verbose)
-        self.service_manager = ServiceManager(verbose=verbose)
-        self.cert_manager = CertManager(verbose=verbose)
+        # Managers are built on first use. Detection instantiates every
+        # registered deployer just to ask "is this yours?", and constructing
+        # four managers and a store connection to answer no is waste that also
+        # made a deployer impossible to create without a working system.
+        self._source_manager: SourceManager | None = None
+        self._service_manager: ServiceManager | None = None
+        self._cert_manager: CertManager | None = None
+        self._registrar: StoreRegistrar | None = None
 
         # Helpers
         self._pm_helper = PackageManagerHelper(logger=self.logger)
         self._path_resolver = PathResolver(logger=self.logger)
         self._prisma_helper: PrismaHelper | None = None  # Initialized after app_path is set
 
-        # Deployment configuration
-        self.domain: str | None = None
-        self.source: str | None = None
+        # Deployment configuration. These are empty, not None, until configure()
+        # runs: every one of them is fed straight to a manager that requires a
+        # value, and "Optional everywhere" only moved the check to twenty call
+        # sites that did not make it.
+        self.domain: str = ""
+        self.source: str = ""
         self.port: int = self.DEFAULT_PORT
-        self.app_path: Path | None = None
-        self.app_name: str | None = None
+        self.app_path: Path = Path()
+        self.app_name: str = ""
         self.webserver: str = "nginx"
         self.ssl: bool = True
         self.include_www: bool = False
@@ -106,25 +138,94 @@ class BaseDeployer(ABC):
         # Prisma support
         self.has_prisma: bool = False
 
+        # Deployment progress, shared between pipeline steps
+        self._ssl_obtained: bool = False
+        self._app_record: App | None = None
+
         # Advanced nginx config (detected from wasm.nginx.yaml)
         self._nginx_config_builder = NginxConfigBuilder(verbose=verbose)
-        self._nginx_advanced_config = None
+        self._nginx_advanced_config: NginxAdvancedConfig | None = None
 
         # Env manager
         self._env_manager = EnvManager(verbose=verbose)
+
+    @property
+    def runner(self) -> CommandRunner:
+        """The command runner this deployer executes through."""
+        return self._runner if self._runner is not None else get_runner()
+
+    @property
+    def source_manager(self) -> SourceManager:
+        """The manager that fetches source code."""
+        if self._source_manager is None:
+            self._source_manager = SourceManager(verbose=self.verbose)
+        return self._source_manager
+
+    @source_manager.setter
+    def source_manager(self, manager: SourceManager) -> None:
+        """
+        Replace the source manager.
+
+        Args:
+            manager: The manager to use instead of the default.
+        """
+        self._source_manager = manager
+
+    @property
+    def service_manager(self) -> ServiceManager:
+        """The manager that writes and drives systemd units."""
+        if self._service_manager is None:
+            self._service_manager = ServiceManager(verbose=self.verbose)
+        return self._service_manager
+
+    @service_manager.setter
+    def service_manager(self, manager: ServiceManager) -> None:
+        """
+        Replace the service manager.
+
+        Args:
+            manager: The manager to use instead of the default.
+        """
+        self._service_manager = manager
+
+    @property
+    def cert_manager(self) -> CertManager:
+        """The manager that obtains certificates."""
+        if self._cert_manager is None:
+            self._cert_manager = CertManager(verbose=self.verbose)
+        return self._cert_manager
+
+    @cert_manager.setter
+    def cert_manager(self, manager: CertManager) -> None:
+        """
+        Replace the certificate manager.
+
+        Args:
+            manager: The manager to use instead of the default.
+        """
+        self._cert_manager = manager
+
+    @property
+    def registrar(self) -> StoreRegistrar:
+        """The component that writes app, site and service rows."""
+        if self._registrar is None:
+            self._registrar = StoreRegistrar(self.store)
+        return self._registrar
 
     def configure(
         self,
         domain: str,
         source: str,
+        *,
         port: int | None = None,
         webserver: str = "nginx",
         ssl: bool = True,
         branch: str | None = None,
         env_vars: dict[str, str] | None = None,
         app_path: Path | None = None,
-        package_manager: PackageManager = "auto",
+        package_manager: str = "auto",
         include_www: bool = False,
+        **options: Any,
     ) -> None:
         """
         Configure the deployer.
@@ -140,6 +241,8 @@ class BaseDeployer(ABC):
             app_path: Custom application path.
             package_manager: Package manager to use (npm/pnpm/bun/auto).
             include_www: Include www subdomain in certificate and web server config.
+            **options: Accepted and ignored, so a caller can pass the union of
+                every deployer's settings without knowing which one it got.
         """
         from wasm.validators.domain import should_include_www
 
@@ -151,7 +254,7 @@ class BaseDeployer(ABC):
         self.include_www = include_www and should_include_www(domain)
         self.branch = branch
         self.env_vars = env_vars or {}
-        self._package_manager = package_manager
+        self._package_manager = package_manager  # type: ignore[assignment]
 
         # Set app name and path
         self.app_name = domain_to_app_name(domain)
@@ -159,26 +262,49 @@ class BaseDeployer(ABC):
 
     def _run(
         self,
-        command: list[str],
+        command: Sequence[str],
         cwd: Path | None = None,
-        env: dict | None = None,
-        timeout: int | None = None,
-    ):
-        """Run a command and return result."""
+        env: Mapping[str, str] | None = None,
+        timeout: int = COMMAND_TIMEOUT,
+        *,
+        stream: bool = False,
+    ) -> CommandResult:
+        """
+        Execute a command in the application directory.
+
+        Args:
+            command: Program and arguments.
+            cwd: Working directory. Defaults to the application directory.
+            env: Extra environment, merged over the configured env_vars.
+            timeout: Deadline in seconds.
+            stream: Print output line by line while the command runs. Used for
+                installs and builds, which otherwise look frozen for minutes.
+
+        Returns:
+            The command outcome.
+        """
         self.logger.debug(f"Running: {' '.join(command)}")
 
-        # Merge environment variables
-        run_env = self.env_vars.copy()
+        run_env = dict(self.env_vars)
         if env:
             run_env.update(env)
 
-        result = run_command(
-            command,
-            cwd=cwd or self.app_path,
-            env=run_env if run_env else None,
-            timeout=timeout,
-        )
-        self.logger.command_output(result.stdout, result.stderr)
+        if stream:
+            result = self.runner.stream(
+                command,
+                on_line=self.logger.debug,
+                cwd=cwd or self.app_path,
+                env=run_env or None,
+                timeout=timeout,
+            )
+        else:
+            result = self.runner.run(
+                command,
+                cwd=cwd or self.app_path,
+                env=run_env or None,
+                timeout=timeout,
+            )
+            self.logger.command_output(result.stdout, result.stderr)
         return result
 
     def _detect_package_manager(self) -> str:
@@ -241,30 +367,6 @@ class BaseDeployer(ABC):
             Exec command as list.
         """
         return self._pm_helper.get_exec_command(self.package_manager, command)
-
-    def _is_private_path(self, path: str) -> bool:
-        """
-        Check if path is in a private/user-specific directory.
-
-        Args:
-            path: Absolute path to check.
-
-        Returns:
-            True if path is in a private directory.
-        """
-        return self._path_resolver.is_private_path(path)
-
-    def _find_global_executable(self, executable: str) -> str | None:
-        """
-        Find executable in global/system paths only.
-
-        Args:
-            executable: Name of executable to find.
-
-        Returns:
-            Absolute path if found in system paths, None otherwise.
-        """
-        return self._path_resolver.find_global_executable(executable)
 
     def _resolve_absolute_path(self, command: str) -> str:
         """
@@ -513,101 +615,61 @@ class BaseDeployer(ABC):
         Returns:
             True if all dependencies are available.
         """
-        from wasm.core.utils import command_exists
-
         for dep in self.SYSTEM_DEPS:
-            if not command_exists(dep):
+            if not self.runner.exists(dep):
                 self.logger.warning(f"Missing dependency: {dep}")
                 return False
 
         return True
 
+    def _webserver_manager(self) -> NginxManager | ApacheManager:
+        """
+        Return the manager for the configured web server.
+
+        Returns:
+            An NginxManager or an ApacheManager.
+        """
+        if self.webserver == "nginx":
+            return NginxManager(verbose=self.verbose)
+        return ApacheManager(verbose=self.verbose)
+
     def pre_flight_check(self) -> bool:
         """
-        Perform pre-deployment validation checks.
+        Validate the machine before anything is changed.
 
-        Validates that all conditions are met before starting deployment:
-        - Repository is accessible (for git sources)
-        - Sufficient disk space
-        - Port is available
-        - System dependencies are installed
+        Every check runs, so one command reports every problem instead of the
+        first one. The checks themselves live in
+        :mod:`wasm.deployers.helpers.preflight`.
 
         Returns:
             True if all checks pass.
 
         Raises:
-            DeploymentError: If any check fails.
+            DeploymentError: If any check fails, listing all of them.
         """
-        checks_passed = True
-        issues = []
-
         self.logger.debug("Running pre-flight checks...")
 
-        # 1. Check system dependencies
-        if not self.check_dependencies():
-            issues.append(f"Missing system dependencies: {', '.join(self.SYSTEM_DEPS)}")
-            checks_passed = False
+        existing_app = self.store.get_app(self.domain) if self.domain else None
+        issues: list[str] = []
 
-        # 2. Check repository accessibility (for git sources)
-        if self.source and (
-            self.source.startswith("git@")
-            or self.source.startswith("https://")
-            or self.source.startswith("http://")
-            or self.source.startswith("git://")
-        ):
-            result = run_command(["git", "ls-remote", "--exit-code", self.source], timeout=30)
-            if not result.success:
-                issues.append(f"Repository not accessible: {self.source}")
-                if "Permission denied" in str(result.stderr):
-                    issues.append("Check SSH key configuration: wasm setup ssh --test")
-                checks_passed = False
+        missing = preflight.missing_programs(self.runner, self.SYSTEM_DEPS)
+        if missing:
+            issues.append(f"Missing system dependencies: {', '.join(missing)}")
 
-        # 3. Check disk space (require at least 1GB free)
-        import shutil
+        if self.source:
+            issues += preflight.repository_unreachable(self.runner, self.source)
 
-        try:
-            apps_dir = self.config.apps_directory
-            if apps_dir.exists():
-                stat = shutil.disk_usage(str(apps_dir))
-                free_gb = stat.free / (1024**3)
-                if free_gb < 1.0:
-                    issues.append(
-                        f"Insufficient disk space: {free_gb:.1f}GB free (need 1GB minimum)"
-                    )
-                    checks_passed = False
-        except Exception as e:
-            self.logger.debug(f"Could not check disk space: {e}")
+        issues += preflight.insufficient_disk_space(self.config.apps_directory)
 
-        # 4. Check if port is available
         if self.port:
-            import socket
+            issues += preflight.port_taken(
+                self.port,
+                allowed_owner_port=existing_app.port if existing_app else None,
+            )
 
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            try:
-                result = sock.connect_ex(("127.0.0.1", self.port))
-                if result == 0:
-                    # Port is in use - check if it's our own service
-                    existing_app = self.store.get_app(self.domain)
-                    if not existing_app or existing_app.port != self.port:
-                        issues.append(f"Port {self.port} is already in use")
-                        checks_passed = False
-            finally:
-                sock.close()
+        issues += preflight.webserver_down(self._webserver_manager(), self.webserver)
 
-        # 5. Check webserver is running
-        try:
-            if self.webserver == "nginx":
-                manager = NginxManager(verbose=self.verbose)
-            else:
-                manager = ApacheManager(verbose=self.verbose)
-
-            if not manager.is_running():
-                issues.append(f"{self.webserver} is not running")
-                checks_passed = False
-        except Exception as e:
-            self.logger.debug(f"Could not check webserver status: {e}")
-
-        if not checks_passed:
+        if issues:
             details = "\n".join(f"  - {issue}" for issue in issues)
             raise DeploymentError(
                 "Pre-flight checks failed", details=f"The following issues were found:\n{details}"
@@ -616,93 +678,80 @@ class BaseDeployer(ABC):
         self.logger.debug("All pre-flight checks passed")
         return True
 
+    # Undo actions ---------------------------------------------------------
+    #
+    # Each of these reverses exactly one pipeline step. They are idempotent and
+    # tolerate the resource never having been created, because a step can fail
+    # halfway through its own work.
+
+    def remove_source(self) -> None:
+        """Delete the fetched application directory."""
+        if self.app_path and self.app_path.exists():
+            self.logger.debug(f"Removing app files: {self.app_path}")
+            shutil.rmtree(self.app_path, ignore_errors=True)
+
+    def remove_site(self) -> None:
+        """Remove the web server site configuration for this domain."""
+        if not self.domain:
+            return
+        manager = self._webserver_manager()
+        if manager.site_exists(self.domain):
+            self.logger.debug(f"Removing site config: {self.domain}")
+            manager.disable_site(self.domain)
+            manager.delete_site(self.domain)
+            manager.reload()
+
+    def remove_service(self) -> None:
+        """Stop and delete the systemd service for this application."""
+        if not self.app_name:
+            return
+        status = self.service_manager.get_status(self.app_name)
+        if not status.get("exists"):
+            return
+        self.logger.debug(f"Removing service: {self.app_name}")
+        try:
+            self.service_manager.stop(self.app_name)
+        except WASMError as e:
+            self.logger.debug(f"Service was not running: {e}")
+        self.service_manager.delete_service(self.app_name)
+
+    def forget_records(self) -> None:
+        """Delete the app, site and service rows this deployment created."""
+        if self.domain:
+            self.registrar.forget(domain=self.domain, service_name=self.app_name)
+
     def rollback(self, keep_files: bool = False) -> bool:
         """
-        Rollback a partial deployment.
+        Undo everything a deployment may have created.
 
-        Cleans up any resources created during a failed deployment:
-        - Systemd service (if created)
-        - Web server configuration (if created)
-        - Application files (if keep_files=False)
-        - Store records
+        The pipeline undoes only the steps that ran, which is what a failed
+        deploy needs. This method is the blunt version, kept for callers that
+        want to clean up after the fact.
 
         Args:
             keep_files: If True, preserve the application files.
 
         Returns:
-            True if rollback completed successfully.
+            True if every cleanup action completed.
         """
-        self.logger.debug("Rolling back partial deployment...")
-        errors = []
+        actions: list[tuple[str, Callable[[], None]]] = [
+            ("service", self.remove_service),
+            ("site", self.remove_site),
+            ("store records", self.forget_records),
+        ]
+        if not keep_files:
+            actions.append(("files", self.remove_source))
 
-        # 1. Stop and remove service if it exists
-        try:
-            if self.app_name:
-                status = self.service_manager.get_status(self.app_name)
-                if status.get("exists"):
-                    self.logger.debug(f"Removing service: {self.app_name}")
-                    try:
-                        self.service_manager.stop(self.app_name)
-                    except WASMError as e:
-                        self.logger.debug(f"Service was not running: {e}")
-                    self.service_manager.delete_service(self.app_name)
-        except (WASMError, OSError) as e:
-            errors.append(f"Service cleanup failed: {e}")
-            self.logger.debug(f"Service cleanup error: {e}")
-
-        # 2. Remove web server configuration
-        try:
-            if self.domain and self.webserver:
-                if self.webserver == "nginx":
-                    manager = NginxManager(verbose=self.verbose)
-                else:
-                    manager = ApacheManager(verbose=self.verbose)
-
-                if manager.site_exists(self.domain):
-                    self.logger.debug(f"Removing site config: {self.domain}")
-                    manager.disable_site(self.domain)
-                    manager.delete_site(self.domain)
-                    manager.reload()
-        except (WASMError, OSError) as e:
-            errors.append(f"Site cleanup failed: {e}")
-            self.logger.debug(f"Site cleanup error: {e}")
-
-        # 3. Remove application files
-        if not keep_files and self.app_path and self.app_path.exists():
+        errors = 0
+        for what, action in actions:
             try:
-                self.logger.debug(f"Removing app files: {self.app_path}")
-                shutil.rmtree(self.app_path)
-            except OSError as e:
-                errors.append(f"File cleanup failed: {e}")
-                self.logger.debug(f"File cleanup error: {e}")
+                action()
+            # Cleanup is an error boundary: one failure must not abort the rest.
+            except Exception as e:  # noqa: BLE001
+                errors += 1
+                self.logger.debug(f"Rollback of {what} failed: {e}")
 
-        # 4. Clean up store records.
-        # The store deletes by natural key, so these take the service name and
-        # the domain. Passing row ids silently matched nothing.
-        try:
-            if self.domain:
-                if self.app_name:
-                    service = self.store.get_service(self.app_name)
-                    if service:
-                        self.store.delete_service(service.name)
-
-                site = self.store.get_site(self.domain)
-                if site:
-                    self.store.delete_site(site.domain)
-
-                app = self.store.get_app(self.domain)
-                if app:
-                    self.store.delete_app(app.domain)
-        except (WASMError, sqlite3.Error) as e:
-            errors.append(f"Store cleanup failed: {e}")
-            self.logger.debug(f"Store cleanup error: {e}")
-
-        if errors:
-            self.logger.debug(f"Rollback completed with {len(errors)} errors")
-        else:
-            self.logger.debug("Rollback completed successfully")
-
-        return len(errors) == 0
+        return errors == 0
 
     def pre_install(self) -> bool:
         """
@@ -773,6 +822,12 @@ class BaseDeployer(ABC):
         Returns:
             True if successful.
         """
+        if self.source_already_fetched:
+            # AutoDeployer put the code here to detect the type; fetching again
+            # with clean=True would delete it and clone it a second time.
+            self.logger.substep(f"Source already present at {self.app_path}")
+            return True
+
         self.logger.substep(f"Source: {self.source}")
         self.logger.substep(f"Target: {self.app_path}")
 
@@ -797,7 +852,7 @@ class BaseDeployer(ABC):
 
         self.logger.substep(f"Running: {' '.join(command)}")
 
-        result = self._run(command, timeout=600)
+        result = self._run(command, timeout=INSTALL_TIMEOUT, stream=True)
         if not result.success:
             # Try fallback install methods
             fallback_command = None
@@ -815,19 +870,10 @@ class BaseDeployer(ABC):
 
             if fallback_command:
                 self.logger.substep(f"Running: {' '.join(fallback_command)}")
-                result = self._run(fallback_command, timeout=600)
+                result = self._run(fallback_command, timeout=INSTALL_TIMEOUT, stream=True)
 
             if not result.success:
-                # Combine stdout and stderr for better error visibility
-                error_output = ""
-                if result.stderr:
-                    error_output = result.stderr
-                if result.stdout:
-                    if error_output:
-                        error_output += "\n" + result.stdout
-                    else:
-                        error_output = result.stdout
-
+                error_output = failure_output(result)
                 raise DeploymentError(
                     "Dependency installation failed",
                     details=error_output
@@ -856,17 +902,9 @@ class BaseDeployer(ABC):
 
         self.logger.substep(f"Running: {' '.join(command)}")
 
-        result = self._run(command, timeout=900)
+        result = self._run(command, timeout=BUILD_TIMEOUT, stream=True)
         if not result.success:
-            # Combine stdout and stderr for better error visibility
-            error_output = ""
-            if result.stderr:
-                error_output = result.stderr
-            if result.stdout:
-                if error_output:
-                    error_output += "\n" + result.stdout
-                else:
-                    error_output = result.stdout
+            error_output = failure_output(result)
 
             # Check for OOM killer (exit code 137 = 128 + SIGKILL)
             if result.exit_code == 137:
@@ -894,16 +932,20 @@ class BaseDeployer(ABC):
         Returns:
             True if successful.
         """
+        if not self.domain:
+            raise DeploymentError(
+                "Deployer was not configured",
+                details="Call configure(domain=..., source=...) before deploy().",
+            )
+
         context = self.get_template_context()
         # Override SSL setting based on parameter
         context["ssl"] = with_ssl
 
-        if self.webserver == "nginx":
-            manager = NginxManager(verbose=self.verbose)
-            template = self.get_nginx_template()
-        else:
-            manager = ApacheManager(verbose=self.verbose)
-            template = self.get_apache_template()
+        manager = self._webserver_manager()
+        template = (
+            self.get_nginx_template() if self.webserver == "nginx" else self.get_apache_template()
+        )
 
         self.logger.substep(f"Web server: {self.webserver}")
         self.logger.substep(f"Template: {template}")
@@ -914,56 +956,21 @@ class BaseDeployer(ABC):
         if manager.site_exists(self.domain):
             manager.update_site(self.domain, template=template, context=context)
         else:
-            # Create site
             manager.create_site(self.domain, template=template, context=context)
-            # Enable site
             manager.enable_site(self.domain)
 
-        # Reload web server
         manager.reload()
 
-        # Register site in store
-        self._register_site_in_store(with_ssl, template)
-
-        return True
-
-    def _register_site_in_store(self, with_ssl: bool, template: str) -> None:
-        """Register or update site in persistent store."""
-        from wasm.core.config import APACHE_SITES_AVAILABLE, NGINX_SITES_AVAILABLE
-
-        config_path = (
-            NGINX_SITES_AVAILABLE if self.webserver == "nginx" else APACHE_SITES_AVAILABLE
-        ) / self.domain
-
-        is_static = template == "static"
-
-        # Get app_id if app exists
-        app = self.store.get_app(self.domain)
-        app_id = app.id if app else None
-
-        existing_site = self.store.get_site(self.domain)
-
-        site = Site(
-            id=existing_site.id if existing_site else None,
-            app_id=app_id,
+        self.registrar.register_site(
             domain=self.domain,
             webserver=self.webserver,
-            config_path=str(config_path),
-            enabled=True,
-            is_static=is_static,
-            document_root=str(self.app_path) if is_static else None,
-            proxy_port=self.port if not is_static else None,
-            ssl_enabled=with_ssl,
-            ssl_certificate=f"/etc/letsencrypt/live/{self.domain}/fullchain.pem"
-            if with_ssl
-            else None,
-            ssl_key=f"/etc/letsencrypt/live/{self.domain}/privkey.pem" if with_ssl else None,
+            template=template,
+            app_path=self.app_path,
+            port=self.port,
+            with_ssl=with_ssl,
         )
 
-        if existing_site:
-            self.store.update_site(site)
-        else:
-            self.store.create_site(site)
+        return True
 
     def create_service(self) -> bool:
         """
@@ -976,6 +983,12 @@ class BaseDeployer(ABC):
             EnvironmentValidationError: If an environment variable or a unit
                 directive value cannot be written safely into the unit file.
         """
+        if not self.domain or not self.app_name:
+            raise DeploymentError(
+                "Deployer was not configured",
+                details="Call configure(domain=..., source=...) before deploy().",
+            )
+
         start_command = self.get_start_command()
 
         # Resolve to absolute path for systemd compatibility
@@ -1010,44 +1023,18 @@ class BaseDeployer(ABC):
         # Enable service
         self.service_manager.enable(self.app_name)
 
-        # Register service in store
-        self._register_service_in_store(start_command, env)
-
-        return True
-
-    def _register_service_in_store(self, command: str, env: dict[str, str]) -> None:
-        """Register service in persistent store."""
-        from wasm.core.config import SYSTEMD_DIR
-
-        # Get app_id if app exists
-        app = self.store.get_app(self.domain)
-        app_id = app.id if app else None
-
-        # Service name (no prefix for new format)
-        service_name = self.app_name
-        service_file = SYSTEMD_DIR / f"{self.app_name}.service"
-
-        existing_service = self.store.get_service(service_name)
-
-        service = Service(
-            id=existing_service.id if existing_service else None,
-            app_id=app_id,
-            name=service_name,
-            unit_file=str(service_file),
-            working_directory=str(self.app_path),
-            command=command,
+        self.registrar.register_service(
+            domain=self.domain,
+            name=self.app_name,
+            command=start_command,
+            working_directory=self.app_path,
+            environment=env,
+            port=self.port,
             user=self.config.service_user,
             group=self.config.service_group,
-            enabled=True,
-            status="inactive",  # Will be set to "active" after start
-            port=self.port,
-            environment=env,
         )
 
-        if existing_service:
-            self.store.update_service(service)
-        else:
-            self.store.create_service(service)
+        return True
 
     def obtain_certificate(self) -> bool:
         """
@@ -1121,202 +1108,191 @@ class BaseDeployer(ABC):
         Returns:
             True if application is healthy.
         """
-        import time
-        import urllib.request
-        from urllib.error import URLError
-
-        endpoint = self.get_health_check()
-        url = f"http://127.0.0.1:{self.port}{endpoint}"
-
+        url = f"http://127.0.0.1:{self.port}{self.get_health_check()}"
         self.logger.substep(f"Checking: {url}")
 
-        for i in range(retries):
-            try:
-                with urllib.request.urlopen(url, timeout=5) as response:
-                    if response.status == 200:
-                        return True
-            except URLError as e:
-                self.logger.debug(f"Health check URLError: {e}")
-            except Exception as e:
-                self.logger.debug(f"Health check failed with error: {e}")
+        return wait_until_healthy(url, retries=retries, delay=delay, on_attempt=self.logger.debug)
 
-            if i < retries - 1:
-                self.logger.debug(f"Health check attempt {i + 1} failed, retrying...")
-                time.sleep(delay)
+    def build_pipeline(self) -> list[DeployStep]:
+        """
+        Describe the deployment as an ordered list of steps.
 
-        return False
+        Subclasses override this to add, drop or reorder steps instead of
+        rewriting the whole ``deploy`` method, which is how static and vite
+        deployments used to end up with their own copies of the workflow.
+
+        Returns:
+            The steps to execute, each with the undo that reverses it.
+        """
+        return [
+            DeployStep(
+                title="Fetching source code",
+                icon=Icons.DOWNLOAD,
+                run=self._step_fetch,
+                undo=self.remove_source,
+            ),
+            DeployStep(
+                title="Installing dependencies",
+                icon=Icons.PACKAGE,
+                run=self.install_dependencies,
+            ),
+            DeployStep(
+                title="Building application",
+                icon=Icons.BUILD,
+                run=self.build,
+            ),
+            DeployStep(
+                title="Creating site configuration",
+                icon=Icons.GLOBE,
+                run=lambda: self.create_site(with_ssl=False),
+                undo=self.remove_site,
+            ),
+            DeployStep(
+                title="Obtaining SSL certificate",
+                icon=Icons.LOCK,
+                run=self._step_certificate,
+                skip_if=lambda: not self.ssl,
+            ),
+            DeployStep(
+                title="Creating systemd service",
+                icon=Icons.GEAR,
+                run=self.create_service,
+                undo=self.remove_service,
+            ),
+            DeployStep(
+                title="Starting application",
+                icon=Icons.ROCKET,
+                run=self._step_start,
+            ),
+        ]
+
+    def _step_fetch(self) -> None:
+        """Fetch the source, then read the configuration that ships with it."""
+        self.fetch_source()
+
+        # Both of these describe the code that was just fetched, so they cannot
+        # run any earlier.
+        self._detect_nginx_config()
+        if self._should_configure_env():
+            self._configure_env()
+
+    def _step_certificate(self) -> None:
+        """
+        Obtain a certificate and re-render the site with TLS enabled.
+
+        A certificate failure is not a deployment failure: the application is
+        still reachable over HTTP, and forcing a rollback here would throw away
+        a working build because DNS had not propagated yet.
+        """
+        from wasm.core.exceptions import CertificateError
+
+        try:
+            self.obtain_certificate()
+        except (CertificateError, WASMError) as e:
+            self.logger.warning(f"SSL certificate failed: {e}")
+            self.logger.warning("Continuing deployment without SSL...")
+            self.logger.substep("Application will be available via HTTP only")
+            return
+
+        self._ssl_obtained = True
+        self.logger.substep("Updating site configuration with SSL")
+        self.create_site(with_ssl=True)
+
+    def _step_start(self) -> None:
+        """Start the service and record that the deployment succeeded."""
+        from datetime import datetime
+
+        self.start()
+
+        if self._app_record is not None:
+            self._app_record.status = AppStatus.RUNNING.value
+            self._app_record.ssl_enabled = self._ssl_obtained
+            self._app_record.deployed_at = datetime.now().isoformat()
+            self.store.update_app(self._app_record)
+
+        if self.app_name:
+            self.store.update_service_status(self.app_name, active=True, enabled=True)
 
     def deploy(self, total_steps: int = 7) -> bool:
         """
         Run the full deployment workflow.
 
+        The workflow itself is :meth:`build_pipeline`. This method only handles
+        what surrounds it: validation, the store row that tracks progress, and
+        reporting. A step that fails undoes every step that ran before it,
+        including the app row, so a failed first deployment leaves nothing.
+
         Args:
-            total_steps: Total number of deployment steps.
+            total_steps: Ignored. The pipeline knows how many steps it has;
+                the parameter is kept so existing callers still work.
 
         Returns:
-            True if deployment was successful.
+            True if the application ended up deployed.
+
+        Raises:
+            WASMError: Whatever the failing step raised, after the rollback.
         """
-        from datetime import datetime
+        if not self.domain:
+            raise DeploymentError(
+                "Deployer was not configured",
+                details="Call configure(domain=..., source=...) before deploy().",
+            )
 
-        from wasm.core.exceptions import CertificateError
-        from wasm.core.logger import Icons
+        self._ssl_obtained = False
 
-        # Track if SSL was successfully obtained
-        ssl_obtained = False
-
-        # Track if this is a new deployment (for rollback)
-        is_new_deployment = not self.store.get_app(self.domain)
-
-        # Pre-flight checks (validation before starting)
         self.logger.debug("Running pre-flight validation...")
         self.pre_flight_check()
 
-        # Register app in store at the start
-        app = self._register_app_in_store(AppStatus.DEPLOYING.value)
+        # A redeployment must not lose its app row just because this attempt
+        # failed, so only a genuinely new app registers an undo for it.
+        is_new_deployment = self.store.get_app(self.domain) is None
+        self._app_record = self._register_app_in_store(AppStatus.DEPLOYING.value)
+
+        steps = self.build_pipeline()
+        if is_new_deployment:
+            steps.insert(
+                0,
+                DeployStep(
+                    title="Registering application",
+                    icon=Icons.PACKAGE,
+                    run=lambda: None,
+                    undo=self.forget_records,
+                ),
+            )
 
         try:
-            # Step 1: Fetch source
-            self.logger.step(1, total_steps, "Fetching source code", Icons.DOWNLOAD)
-            self.fetch_source()
-
-            # Post-fetch: detect advanced nginx config and auto-configure env
-            self._detect_nginx_config()
-            if self._should_configure_env():
-                self._configure_env()
-
-            # Step 2: Install dependencies
-            self.logger.step(2, total_steps, "Installing dependencies", Icons.PACKAGE)
-            self.install_dependencies()
-
-            # Step 3: Build
-            self.logger.step(3, total_steps, "Building application", Icons.BUILD)
-            self.build()
-
-            # Step 4: Create site (initially WITHOUT SSL to allow certbot validation)
-            self.logger.step(4, total_steps, "Creating site configuration", Icons.GLOBE)
-            self.create_site(with_ssl=False)
-
-            # Step 5: SSL certificate (best effort - continue if it fails)
-            if self.ssl:
-                self.logger.step(5, total_steps, "Obtaining SSL certificate", Icons.LOCK)
-                try:
-                    self.obtain_certificate()
-                    ssl_obtained = True
-                    # After obtaining certificate, update site config WITH SSL
-                    self.logger.substep("Updating site configuration with SSL")
-                    self.create_site(with_ssl=True)
-                except CertificateError as e:
-                    self.logger.warning(f"SSL certificate failed: {e.message}")
-                    self.logger.warning("Continuing deployment without SSL...")
-                    self.logger.substep("Application will be available via HTTP only")
-                except Exception as e:
-                    self.logger.warning(f"SSL certificate failed: {e}")
-                    self.logger.warning("Continuing deployment without SSL...")
-                    self.logger.substep("Application will be available via HTTP only")
-            else:
-                self.logger.step(5, total_steps, "Skipping SSL certificate", Icons.LOCK)
-
-            # Step 6: Create service
-            self.logger.step(6, total_steps, "Creating systemd service", Icons.GEAR)
-            self.create_service()
-
-            # Step 7: Start and verify
-            self.logger.step(7, total_steps, "Starting application", Icons.ROCKET)
-            self.start()
-
-            # Update app status to running
-            app.status = AppStatus.RUNNING.value
-            app.ssl_enabled = ssl_obtained
-            app.deployed_at = datetime.now().isoformat()
-            self.store.update_app(app)
-
-            # Update service status
-            self.store.update_service_status(self.app_name, active=True, enabled=True)
-
-            # Health check
-            if self.health_check():
-                self._show_deployment_summary(ssl_obtained)
-                return True
-            else:
-                self.logger.warning("Application started but health check failed")
-                self._show_deployment_summary(ssl_obtained)
-                self.logger.blank()
-                self.logger.info("Troubleshooting commands:")
-                self.logger.info(f"  wasm logs {self.domain}        # View application logs")
-                self.logger.info(f"  wasm status {self.domain}      # Check service status")
-                return True  # Still consider it successful
-
+            run_pipeline(steps, self.logger)
         except Exception as e:
-            # Update app status to failed
-            app.status = AppStatus.FAILED.value
-            self.store.update_app(app)
+            if not is_new_deployment and self._app_record is not None:
+                # The rows survive a failed redeployment; mark them honestly.
+                self._app_record.status = AppStatus.FAILED.value
+                self.store.update_app(self._app_record)
             self.logger.error(f"Deployment failed: {e}")
-
-            # Rollback partial deployment for new apps
-            if is_new_deployment:
-                self.logger.warning("Rolling back partial deployment...")
-                try:
-                    self.rollback(keep_files=False)
-                    self.logger.info("Rollback completed successfully")
-                except Exception as rollback_error:
-                    self.logger.debug(f"Rollback error: {rollback_error}")
-                    self.logger.warning("Rollback had some errors. Manual cleanup may be needed.")
-
             raise
 
-    def _show_deployment_summary(self, ssl_obtained: bool) -> None:
-        """
-        Show deployment summary with useful information.
+        self._report_result()
+        return True
 
-        Args:
-            ssl_obtained: Whether SSL certificate was obtained.
-        """
-        import socket
+    def _report_result(self) -> None:
+        """Print the summary, plus troubleshooting hints when unhealthy."""
+        healthy = self.health_check()
+        print_deployment_summary(
+            self.logger,
+            domain=self.domain or "",
+            app_name=self.app_name or "",
+            port=self.port,
+            app_path=self.app_path,
+            ssl_requested=self.ssl,
+            ssl_obtained=self._ssl_obtained,
+        )
+        if healthy:
+            return
 
-        self.logger.success("Application deployed successfully!")
+        self.logger.warning("Application started but health check failed")
         self.logger.blank()
-
-        # Basic info
-        protocol = "https" if ssl_obtained else "http"
-        self.logger.key_value("URL", f"{protocol}://{self.domain}")
-        self.logger.key_value("Service", self.app_name)
-        self.logger.key_value("Port", str(self.port))
-        self.logger.key_value("App Path", str(self.app_path))
-
-        # Get server IP for DNS configuration
-        try:
-            hostname = socket.gethostname()
-            # Try to get the public IP
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            try:
-                s.connect(("8.8.8.8", 80))
-                server_ip = s.getsockname()[0]
-            finally:
-                s.close()
-            self.logger.key_value("Server IP", server_ip)
-        except Exception:
-            pass
-
-        # SSL status
-        if self.ssl and not ssl_obtained:
-            self.logger.blank()
-            self.logger.warning("SSL was requested but could not be obtained.")
-            self.logger.info("To add SSL later, run: wasm cert create -d " + self.domain)
-
-        # Useful commands
-        self.logger.blank()
-        self.logger.info("Useful commands:")
-        self.logger.info(f"  wasm status {self.domain}      # Check application status")
+        self.logger.info("Troubleshooting commands:")
         self.logger.info(f"  wasm logs {self.domain}        # View application logs")
-        self.logger.info(f"  wasm restart {self.domain}     # Restart the application")
-        self.logger.info(f"  wasm update {self.domain}      # Update from source")
-
-        # DNS reminder if SSL failed
-        if self.ssl and not ssl_obtained:
-            self.logger.blank()
-            self.logger.info("DNS Configuration (for SSL):")
-            self.logger.info(f"  Add an A record pointing {self.domain} to your server IP")
-            self.logger.info(f"  Then run: wasm cert create -d {self.domain}")
+        self.logger.info(f"  wasm status {self.domain}      # Check service status")
 
     def _register_app_in_store(self, status: str) -> App:
         """
@@ -1328,29 +1304,16 @@ class BaseDeployer(ABC):
         Returns:
             The created or updated App object.
         """
-        existing_app = self.store.get_app(self.domain)
-
-        # Determine if this is a static app
-        is_static = not bool(self.get_start_command())
-
-        app = App(
-            id=existing_app.id if existing_app else None,
-            domain=self.domain,
+        return self.registrar.register_app(
+            domain=self.domain or "",
             app_type=self.APP_TYPE,
-            source=self.source,
+            source=self.source or "",
             branch=self.branch,
-            port=self.port if not is_static else None,
-            app_path=str(self.app_path),
+            port=self.port,
+            app_path=self.app_path,
             webserver=self.webserver,
             ssl_enabled=self.ssl,
             status=status,
-            is_static=is_static,
+            is_static=not bool(self.get_start_command()),
             env_vars=self.env_vars,
         )
-
-        if existing_app:
-            # Preserve created_at and deployed_at if updating
-            app.created_at = existing_app.created_at
-            return self.store.update_app(app)
-        else:
-            return self.store.create_app(app)

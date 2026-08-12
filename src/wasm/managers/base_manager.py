@@ -1,106 +1,272 @@
-# Copyright (c) 2024-2025 Yago López Prado
+# Copyright (c) 2024-2026 Yago Lopez Prado
 # Licensed under WASM-NCSAL 1.0 (Commercial use prohibited)
 # https://github.com/Perkybeet/wasm/blob/main/LICENSE
 
 """
-Base manager class for WASM.
+Infrastructure shared by every manager.
 
-Provides common functionality for all managers.
+Two things live here, and both exist to remove a defect class rather than to
+save typing.
+
+:class:`BaseManager` gives every adapter one way to reach the system: the
+injectable :class:`~wasm.core.runner.CommandRunner`. The previous version wrapped
+``core.utils.run_command``, which split strings into argv, accepted ``shell=``
+and defaulted to no timeout at all; three separate ways for a domain name to
+become a command. It also carried ``_run_sudo``. That is gone: WASM requires root
+(decision D6 of the v1 design), so a manager that re-elevates is either
+redundant or hiding the fact that it is running unprivileged.
+
+:class:`MappingRecord` is the bridge that lets a manager return a typed record
+where it used to return a bare dict. The contract that matters is the field
+names: ``wasm health`` spent several releases reading ``cert["expires"]`` from a
+mapping that only ever contained ``expiry``, and a plain dict answered that with
+``None`` instead of an error.
 """
 
+from __future__ import annotations
+
+import dataclasses
 from abc import ABC, abstractmethod
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 from wasm.core.config import Config
 from wasm.core.logger import Logger
-from wasm.core.utils import CommandResult, run_command, run_command_sudo
+from wasm.core.runner import DEFAULT_TIMEOUT, CommandResult, CommandRunner, get_runner
+
+
+class MappingRecord:
+    """
+    Mixin that lets a dataclass be read like the dict it replaces.
+
+    Managers used to hand dicts across module boundaries, so their readers index
+    and ``.get()`` them. Making the replacement records answer to that protocol
+    keeps those readers working while the field names become part of a type.
+
+    The one deliberate difference from a dict: an unknown key raises
+    :class:`KeyError` from :meth:`get` as well as from ``[]``. A key that is not
+    a field is a typo or a stale name, never a missing value, and returning the
+    default for it is exactly how the ``expires``/``expiry`` bug survived.
+    """
+
+    def _field_names(self) -> tuple[str, ...]:
+        """
+        List the fields of the concrete record.
+
+        Returns:
+            The field names, in declaration order.
+
+        Raises:
+            TypeError: When the mixin is used on a class that is not a
+                dataclass.
+        """
+        if not dataclasses.is_dataclass(self):
+            raise TypeError(f"{type(self).__name__} must be a dataclass to use MappingRecord")
+        return tuple(f.name for f in dataclasses.fields(self))
+
+    def _check_key(self, key: str) -> str:
+        """
+        Reject a key that is not a field of this record.
+
+        Args:
+            key: Key as written by the caller.
+
+        Returns:
+            The key, once it is known to name a field.
+
+        Raises:
+            KeyError: When the key is not a field.
+        """
+        if key not in self._field_names():
+            raise KeyError(
+                f"{type(self).__name__} has no field {key!r}. "
+                f"Available fields: {', '.join(self._field_names())}."
+            )
+        return key
+
+    def __getitem__(self, key: str) -> Any:
+        """
+        Read a field by name.
+
+        Args:
+            key: Field name.
+
+        Returns:
+            The field value.
+
+        Raises:
+            KeyError: When the key is not a field.
+        """
+        return getattr(self, self._check_key(key))
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        """
+        Write a field by name.
+
+        Args:
+            key: Field name.
+            value: New value.
+
+        Raises:
+            KeyError: When the key is not a field.
+        """
+        setattr(self, self._check_key(key), value)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """
+        Read a field, falling back to a default when it is unset.
+
+        Args:
+            key: Field name.
+            default: Returned when the field holds None or an empty value.
+
+        Returns:
+            The field value, or the default.
+
+        Raises:
+            KeyError: When the key is not a field of this record.
+        """
+        value = getattr(self, self._check_key(key))
+        if value is None or value == "" or value == []:
+            return default
+        return value
+
+    def keys(self) -> tuple[str, ...]:
+        """
+        List the field names.
+
+        Returns:
+            The field names, in declaration order.
+        """
+        return self._field_names()
+
+    def __iter__(self) -> Iterator[str]:
+        """
+        Iterate over field names, as a mapping does.
+
+        Returns:
+            An iterator over the field names.
+        """
+        return iter(self._field_names())
+
+    def __contains__(self, key: object) -> bool:
+        """
+        Report whether a name is a field of this record.
+
+        Args:
+            key: Candidate field name.
+
+        Returns:
+            True when the record has that field.
+        """
+        return isinstance(key, str) and key in self._field_names()
+
+    def to_dict(self) -> dict[str, Any]:
+        """
+        Convert the record to a plain dictionary.
+
+        Returns:
+            A mapping of field name to value.
+        """
+        return {name: getattr(self, name) for name in self._field_names()}
 
 
 class BaseManager(ABC):
     """
     Abstract base class for all managers.
 
-    Provides common functionality like configuration access,
-    logging, and command execution.
+    Provides configuration access, logging, and the single seam through which a
+    manager may touch the system.
     """
 
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, runner: CommandRunner | None = None) -> None:
         """
         Initialize the manager.
 
         Args:
             verbose: Enable verbose logging.
+            runner: Command runner to execute with. Defaults to the process-wide
+                runner, which is what makes ``--dry-run`` and the test fake work
+                without every call site knowing about them.
         """
         self.config = Config()
         self.logger = Logger(verbose=verbose)
         self.verbose = verbose
+        self._runner = runner
+
+    @property
+    def runner(self) -> CommandRunner:
+        """
+        The command runner used for every external process.
+
+        Returns:
+            The injected runner, or the process-wide one.
+        """
+        return self._runner or get_runner()
 
     def _run(
         self,
-        command: list,
+        argv: Sequence[str],
+        *,
         cwd: Path | None = None,
-        env: dict | None = None,
-        timeout: int | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout: int = DEFAULT_TIMEOUT,
+        stdin: str | None = None,
+        user: str | None = None,
+        check: bool = False,
+        secrets: Sequence[str] = (),
     ) -> CommandResult:
         """
-        Execute a command.
+        Execute a command through the shared runner.
 
         Args:
-            command: Command to execute.
+            argv: Program and arguments. Never a shell string: passing one is a
+                :class:`ValueError` from the runner, not a silent split.
             cwd: Working directory.
-            env: Environment variables.
-            timeout: Command timeout.
+            env: Extra environment variables, merged over the current one.
+            timeout: Deadline in seconds. There is no way to disable it; a
+                manager that waits forever is a manager that hangs a deploy.
+            stdin: Data written to the process stdin, then closed. This is how a
+                secret reaches a program without appearing in ``ps``.
+            user: Run as this account instead of root.
+            check: Raise CommandError instead of returning a failed result.
+            secrets: Literal values to redact from logs and from the result.
 
         Returns:
-            CommandResult with execution results.
+            The command outcome.
+
+        Raises:
+            CommandError: When check is True and the command failed.
         """
-        self.logger.debug(f"Running: {' '.join(command)}")
-        result = run_command(command, cwd=cwd, env=env, timeout=timeout)
+        result = self.runner.run(
+            argv,
+            cwd=cwd,
+            env=env,
+            timeout=timeout,
+            input=stdin,
+            user=user,
+            check=check,
+            secrets=secrets,
+        )
+        self.logger.debug(f"Ran: {result.command}")
         self.logger.command_output(result.stdout, result.stderr)
-
-        return result
-
-    def _run_sudo(
-        self,
-        command: list,
-        cwd: Path | None = None,
-        env: dict | None = None,
-        timeout: int | None = None,
-    ) -> CommandResult:
-        """
-        Execute a command with sudo.
-
-        Args:
-            command: Command to execute.
-            cwd: Working directory.
-            env: Environment variables.
-            timeout: Command timeout.
-
-        Returns:
-            CommandResult with execution results.
-        """
-        self.logger.debug(f"Running (sudo): {' '.join(command)}")
-        result = run_command_sudo(command, cwd=cwd, env=env, timeout=timeout)
-        self.logger.command_output(result.stdout, result.stderr)
-
         return result
 
     @abstractmethod
     def is_installed(self) -> bool:
         """
-        Check if the managed service/tool is installed.
+        Check if the managed service or tool is installed.
 
         Returns:
             True if installed.
         """
-        pass
 
     @abstractmethod
     def get_version(self) -> str | None:
         """
-        Get the version of the managed service/tool.
+        Get the version of the managed service or tool.
 
         Returns:
-            Version string or None.
+            Version string, or None when it cannot be determined.
         """
-        pass

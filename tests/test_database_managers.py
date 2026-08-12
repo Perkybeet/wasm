@@ -10,25 +10,32 @@ no password is ever visible in ``ps``.
 from __future__ import annotations
 
 import hashlib
+import re
+import stat
+import tarfile
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from wasm.core.exceptions import (
+    DatabaseBackupError,
     DatabaseError,
     DatabaseUserError,
 )
-from wasm.core.runner import FakeRunner
+from wasm.core.runner import FakeRunner, SubprocessRunner, set_runner
 from wasm.managers.database.base import (
+    NAME_PATTERN,
+    PRIVILEGE_PATTERN,
+    SAFE_PATH_PATTERN,
     quote_identifier,
     validate_name,
     validate_path,
 )
 from wasm.managers.database.mongodb import MongoDBManager
-from wasm.managers.database.mysql import MySQLManager
+from wasm.managers.database.mysql import MySQLManager, escape_option_file_value
 from wasm.managers.database.postgres import PostgresManager
-from wasm.managers.database.redis import RedisManager
+from wasm.managers.database.redis import ACL_COMMAND_PATTERN, ACL_PATTERN_RULE, RedisManager
 from wasm.managers.database.registry import DatabaseRegistry, get_db_manager
 
 # A dump that breaks every naive "echo '...' > file" implementation: single
@@ -40,6 +47,13 @@ NASTY_DUMP = (
 )
 
 PASSWORD = "s3cr3t'; DROP TABLE users; --"
+
+#: A password made only of characters no engine escaper rewrites. A test that
+#: looks for a transformed password in argv proves nothing: the escaper doubles
+#: the quote, so the literal never appears even when the whole statement is on
+#: the command line. This one survives every escaper unchanged, so finding it
+#: absent from argv is evidence rather than an artefact.
+PLAIN_PASSWORD = "correcthorsebatterystaple42"
 
 PSQL_PREFIX = ("sudo", "-u", "postgres", "psql")
 
@@ -167,17 +181,60 @@ def existing_user(manager, exists: bool = True) -> None:
 # ==================== The dump must survive ====================
 
 
-def test_postgres_backup_writes_the_dump_verbatim(
+def test_postgres_backup_streams_through_capture_to_file_not_through_run(
     postgres: PostgresManager, runner: FakeRunner
 ) -> None:
-    """A dump full of quotes and odd bytes must reach disk unchanged."""
+    """
+    The dump reaches disk through the runner's file sink, never through run().
+
+    Asserting on the bytes the fake wrote back would assert on the double: the
+    fake echoes its own scripted stdout. What production code decides, and what
+    this pins, is which runner entry point the dump goes through and with which
+    argv. Byte fidelity is proven against a real producer below.
+    """
     runner.script(PSQL_PREFIX, stdout="1")
-    runner.script(["sudo", "-u", "postgres", "pg_dump"], stdout=NASTY_DUMP)
+    runner.script(["sudo", "-u", "postgres", "pg_dump"], stdout="dump")
+    inputs_before = len(runner.inputs)
 
     info = postgres.backup("shop", compress=False)
 
-    assert info.path.read_text() == NASTY_DUMP
-    assert info.size == len(NASTY_DUMP.encode())
+    expected = (
+        "sudo",
+        "-u",
+        "postgres",
+        "pg_dump",
+        "--no-password",
+        "--format=plain",
+        "shop",
+    )
+    assert runner.written[info.path] == expected
+    # database_exists is the only run() call: the dump added none, so it cannot
+    # have been buffered through Python and written by the manager itself.
+    assert len(runner.inputs) - inputs_before == 1
+
+
+@pytest.mark.allow_subprocess
+def test_dump_to_file_preserves_every_byte_of_a_real_producer(tmp_path: Path) -> None:
+    """A dump with NUL bytes and invalid UTF-8 reaches disk byte for byte."""
+    payload = b"\x00\x01\xff\xfe" + NASTY_DUMP.encode() + b"\xc3\x28\n"
+    source = tmp_path / "payload.bin"
+    source.write_bytes(payload)
+
+    set_runner(SubprocessRunner())
+    try:
+        manager = PostgresManager()
+        manager.BACKUP_DIR = tmp_path / "backups"
+        destination = manager.BACKUP_DIR / "postgresql-shop.sql"
+
+        info = manager._dump_to_file(
+            ["cat", str(source)], destination, database="shop", compress=False
+        )
+    finally:
+        set_runner(None)
+
+    assert destination.read_bytes() == payload
+    assert info.size == len(payload)
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o600
 
 
 def test_no_manager_operation_ever_invokes_a_shell(
@@ -446,7 +503,7 @@ def test_mongodb_statement_argv(mongodb: MongoDBManager, runner: FakeRunner) -> 
 
 
 def test_mongodb_backup_argv(mongodb: MongoDBManager, runner: FakeRunner, tmp_path: Path) -> None:
-    """mongodump writes a tree, which tar then packs; neither needs a shell."""
+    """mongodump writes a tree, which tar packs onto stdout; neither needs a shell."""
     existing_database(mongodb)
     archive = tmp_path / "mongo.tar.gz"
     archive.write_bytes(b"archive")
@@ -457,8 +514,57 @@ def test_mongodb_backup_argv(mongodb: MongoDBManager, runner: FakeRunner, tmp_pa
     assert dump_call[:4] == ("mongodump", "--db", "shop", "--out")
     assert dump_call[-1] == "--gzip"
     assert tar_call[0] == "tar"
-    assert tar_call[1] == "-czf"
+    # -f - keeps tar off the archive file: the runner owns the destination and
+    # creates it 0600, which "tar -czf <archive>" would not.
+    assert tar_call[1:3] == ("-czf", "-")
     assert tar_call[-1] == "shop"
+    assert runner.written[archive] == tar_call
+
+
+def test_mongodb_backup_is_written_by_the_runner_not_by_tar(
+    mongodb: MongoDBManager, runner: FakeRunner
+) -> None:
+    """The archive must be the runner's file sink, which is the 0600 one."""
+    existing_database(mongodb)
+    runner.script(["tar"], stdout="archive-bytes")
+
+    info = mongodb.backup("shop", compress=True)
+
+    assert info.path in runner.written
+    assert info.compressed is True
+    assert not any(call[0] == "tar" and "-f" in call[:2] for call in runner.calls)
+
+
+@pytest.mark.allow_subprocess
+def test_mongodb_archive_lands_0600_with_a_real_tar(tmp_path: Path) -> None:
+    """
+    A real tar plus the real runner must leave a root-only archive.
+
+    "tar -czf <file>" creates the archive with the process umask, which on a
+    root shell is 0644: the whole dump would be readable by every local account.
+    """
+    tree = tmp_path / "dump" / "shop"
+    tree.mkdir(parents=True)
+    (tree / "users.bson").write_bytes(b"\x00\x01secret")
+
+    set_runner(SubprocessRunner())
+    try:
+        manager = MongoDBManager()
+        manager.BACKUP_DIR = tmp_path / "backups"
+        destination = manager.BACKUP_DIR / "mongodb-shop.tar.gz"
+
+        manager._dump_to_file(
+            ["tar", "-czf", "-", "-C", str(tmp_path / "dump"), "shop"],
+            destination,
+            database="shop",
+            compress=False,
+        )
+    finally:
+        set_runner(None)
+
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o600
+    with tarfile.open(destination, "r:gz") as archive:
+        assert "shop/users.bson" in archive.getnames()
 
 
 def test_redis_argv_table(redis: RedisManager, runner: FakeRunner) -> None:
@@ -678,13 +784,49 @@ def test_no_password_reaches_argv_in_any_engine(
     redis: RedisManager,
     runner: FakeRunner,
 ) -> None:
-    """Creating a user must never put the password on a command line."""
+    """
+    Creating a user must never put the password on a command line.
+
+    The password is deliberately free of characters any escaper rewrites, so if
+    a statement ever moves back from stdin into argv this test sees the secret
+    verbatim. Every representation the managers legitimately build is checked
+    too, so an "escaped" copy in argv cannot pass either.
+    """
+    hex_form = "".join(f"\\x{byte:02x}" for byte in PLAIN_PASSWORD.encode())
+    forms = (
+        PLAIN_PASSWORD,
+        hex_form,
+        f"'{PLAIN_PASSWORD}'",
+        f'"{PLAIN_PASSWORD}"',
+    )
+
     for manager in (postgres, mysql, mongodb, redis):
         existing_user(manager, exists=False)
-        manager.create_user("app", password=PASSWORD)
+        manager.create_user("app", password=PLAIN_PASSWORD)
 
     for call in runner.calls:
-        assert PASSWORD not in " ".join(call)
+        for arg in call:
+            for form in forms:
+                assert form not in arg, f"password leaked into argv: {call}"
+
+
+def test_the_argv_check_would_notice_a_statement_moved_back_into_argv(
+    postgres: PostgresManager, runner: FakeRunner
+) -> None:
+    """
+    Guard the guard: the plain password survives both SQL escapers unchanged.
+
+    If a future escaper started rewriting it, the test above would go quiet
+    without anyone noticing, which is exactly how the previous version of it
+    became vacuous.
+    """
+    assert PLAIN_PASSWORD in PostgresManager._escape_literal(PLAIN_PASSWORD)
+    assert PLAIN_PASSWORD in MySQLManager._escape_literal(PLAIN_PASSWORD)
+    # And this is why the old constant made the check unfalsifiable: escaping it
+    # destroys the literal, so it could not be found in argv even if the whole
+    # statement were there.
+    assert PASSWORD not in PostgresManager._escape_literal(PASSWORD)
+    assert PASSWORD not in MySQLManager._escape_literal(PASSWORD)
 
 
 def test_postgres_create_user_sends_the_statement_on_stdin(
@@ -800,6 +942,300 @@ def test_backup_listing_handles_database_names_with_dashes(
 
     assert {backup.database for backup in backups} == {"my-app", "other"}
     assert postgres.list_backups(database="my-app")[0].compressed is True
+
+
+# ==================== Anchoring: a trailing newline is not a suffix ====================
+
+
+@pytest.mark.parametrize("name", ["shop\n", "shop\r\n", "shop\n\n", "\nshop"])
+def test_validate_name_refuses_a_trailing_newline(name: str) -> None:
+    """
+    '$' matches before a final newline, so an anchored-looking pattern is not.
+
+    A name that passes here becomes a file name, a service name and part of a
+    connection string, so the whitelist has to mean what its docstring claims.
+    """
+    with pytest.raises(DatabaseError):
+        validate_name(name, kind="database", engine="PostgreSQL", max_length=63)
+
+
+@pytest.mark.parametrize(
+    "path", ["/backups/dump.sql\n", "/backups/dump.sql\n/etc/passwd", "/backups/dump.sql\r"]
+)
+def test_validate_path_refuses_a_trailing_newline(path: str) -> None:
+    """A newline ends a client command line, so it may not pass the path check."""
+    with pytest.raises(DatabaseBackupError):
+        validate_path(Path(path), purpose="a MySQL restore")
+
+
+@pytest.mark.parametrize("rule", ["+@all\n", "-@admin\r", "~cache:*\n", "&events.*\n"])
+def test_redis_acl_rules_refuse_a_trailing_newline(redis: RedisManager, rule: str) -> None:
+    """The ACL grammar is anchored at both ends, newline included."""
+    with pytest.raises(DatabaseUserError):
+        redis.validate_privileges([rule])
+
+
+@pytest.mark.parametrize(
+    ("pattern", "accepted"),
+    [
+        (NAME_PATTERN, "shop"),
+        (SAFE_PATH_PATTERN, "/backups/dump.sql"),
+        (PRIVILEGE_PATTERN, "ALL PRIVILEGES"),
+        (ACL_COMMAND_PATTERN, "+@all"),
+        (ACL_PATTERN_RULE, "~cache:*"),
+    ],
+)
+def test_every_whitelist_pattern_is_anchored_past_a_final_newline(
+    pattern: re.Pattern[str], accepted: str
+) -> None:
+    """
+    Every whitelist in these modules is checked for the same '$' mistake.
+
+    A pattern that accepts its own subject plus a newline is not a whitelist: it
+    is a whitelist for the first line and a free pass for the rest.
+    """
+    assert pattern.match(accepted)
+    assert not pattern.match(accepted + "\n")
+    assert not pattern.match(accepted + "\n" + accepted)
+
+
+# ==================== The MySQL option file ====================
+
+
+def test_mysql_option_file_is_quoted_escaped_and_root_only(
+    mysql: MySQLManager, runner: FakeRunner
+) -> None:
+    """The credentials file is 0600 and its values are quoted and escaped."""
+    mysql.config = StubConfig(
+        {"databases": {"credentials": {"mysql": {"user": "root", "password": "p\\a s#s"}}}}
+    )
+
+    with mysql._credentials() as credentials:
+        path = Path(credentials[0].split("=", 1)[1])
+        content = path.read_text()
+        mode = stat.S_IMODE(path.stat().st_mode)
+
+    assert mode == 0o600
+    assert content == '[client]\nuser="root"\npassword="p\\\\a\\ss#s"\n'
+
+
+def test_mysql_option_file_cannot_be_injected_with_a_newline(
+    mysql: MySQLManager, runner: FakeRunner
+) -> None:
+    """
+    A newline in the password may not open a second directive.
+
+    An option file is parsed line by line, so a raw newline in the value lets a
+    password add 'socket=' or 'plugin-dir=' to the [client] section and redirect
+    every later connection.
+    """
+    mysql.config = StubConfig(
+        {"databases": {"credentials": {"mysql": {"password": "secret\nsocket=/tmp/evil.sock"}}}}
+    )
+
+    with mysql._credentials() as credentials:
+        content = Path(credentials[0].split("=", 1)[1]).read_text()
+
+    assert content.splitlines() == ["[client]", 'password="secret\\nsocket=/tmp/evil.sock"']
+    assert "\nsocket=" not in content
+
+
+def test_mysql_option_file_refuses_a_password_it_cannot_represent(mysql: MySQLManager) -> None:
+    """A NUL byte truncates the value silently, so it is refused instead."""
+    mysql.config = StubConfig(
+        {"databases": {"credentials": {"mysql": {"password": "secret\x00rest"}}}}
+    )
+
+    with pytest.raises(DatabaseError):
+        with mysql._credentials():
+            pass
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("plain", '"plain"'),
+        ("with space", '"with\\sspace"'),
+        ("back\\slash", '"back\\\\slash"'),
+        ('quo"te', '"quo\\"te"'),
+        ("line\nbreak", '"line\\nbreak"'),
+        ("carriage\rreturn", '"carriage\\rreturn"'),
+        ("tab\there", '"tab\\there"'),
+        ("hash#comment", '"hash#comment"'),
+    ],
+)
+def test_option_file_values_use_the_escapes_mysql_documents(raw: str, expected: str) -> None:
+    """
+    Only \\b \\t \\n \\r \\\\ and \\s are read back as escapes by the client.
+
+    Anything else must survive as itself inside the quotes, which is what these
+    cases pin.
+    """
+    assert escape_option_file_value(raw) == expected
+
+
+# ==================== Backup and staging directories ====================
+
+
+def test_backup_directory_wasm_owns_is_root_only(
+    postgres: PostgresManager, runner: FakeRunner
+) -> None:
+    """WASM's own backup directory is created 0750 even under a lax umask."""
+    runner.script(PSQL_PREFIX, stdout="1")
+    runner.script(["sudo", "-u", "postgres", "pg_dump"], stdout="dump")
+
+    postgres.backup("shop", compress=False)
+
+    assert stat.S_IMODE(postgres.BACKUP_DIR.stat().st_mode) == 0o750
+
+
+def test_backup_directory_wasm_owns_is_tightened_when_it_already_exists(
+    postgres: PostgresManager, runner: FakeRunner
+) -> None:
+    """A pre-created backup directory does not keep a permissive mode."""
+    postgres.BACKUP_DIR.mkdir(parents=True)
+    postgres.BACKUP_DIR.chmod(0o777)
+    runner.script(PSQL_PREFIX, stdout="1")
+    runner.script(["sudo", "-u", "postgres", "pg_dump"], stdout="dump")
+
+    postgres.backup("shop", compress=False)
+
+    assert stat.S_IMODE(postgres.BACKUP_DIR.stat().st_mode) == 0o750
+
+
+def test_a_directory_the_caller_chose_keeps_its_own_mode(
+    postgres: PostgresManager, runner: FakeRunner, tmp_path: Path
+) -> None:
+    """--output into an existing directory is not an invitation to chmod it."""
+    chosen = tmp_path / "elsewhere"
+    chosen.mkdir()
+    chosen.chmod(0o755)
+    runner.script(PSQL_PREFIX, stdout="1")
+    runner.script(["sudo", "-u", "postgres", "pg_dump"], stdout="dump")
+
+    postgres.backup("shop", output_path=chosen / "dump.sql", compress=False)
+
+    assert stat.S_IMODE(chosen.stat().st_mode) == 0o755
+
+
+def test_staging_directory_mode_is_enforced_on_a_preexisting_one(
+    postgres: PostgresManager, runner: FakeRunner, tmp_path: Path
+) -> None:
+    """A .staging left world writable is tightened before root copies into it."""
+    staging = postgres.BACKUP_DIR / ".staging"
+    staging.mkdir(parents=True)
+    staging.chmod(0o777)
+    source = tmp_path / "dump.sql"
+    source.write_text(NASTY_DUMP)
+
+    with postgres._staged_backup(source, "postgresql-restore-shop.sql"):
+        assert stat.S_IMODE(staging.stat().st_mode) == 0o711
+
+
+def test_staging_directory_that_is_a_symlink_is_refused(
+    postgres: PostgresManager, runner: FakeRunner, tmp_path: Path
+) -> None:
+    """A symlink at .staging would turn a root cp into a write anywhere."""
+    elsewhere = tmp_path / "attacker"
+    elsewhere.mkdir()
+    postgres.BACKUP_DIR.mkdir(parents=True)
+    (postgres.BACKUP_DIR / ".staging").symlink_to(elsewhere, target_is_directory=True)
+    source = tmp_path / "dump.sql"
+    source.write_text(NASTY_DUMP)
+
+    with pytest.raises(DatabaseBackupError) as excinfo:
+        with postgres._staged_backup(source, "postgresql-restore-shop.sql"):
+            pass
+
+    assert "staging" in str(excinfo.value).lower()
+
+
+def test_a_preexisting_staged_file_is_removed_before_the_copy(
+    postgres: PostgresManager, runner: FakeRunner, tmp_path: Path
+) -> None:
+    """A symlink planted at the staged name must not survive to receive the copy."""
+    victim = tmp_path / "victim"
+    victim.write_text("important")
+    staging = postgres.BACKUP_DIR / ".staging"
+    staging.mkdir(parents=True)
+    (staging / "postgresql-restore-shop.sql").symlink_to(victim)
+    source = tmp_path / "dump.sql"
+    source.write_text(NASTY_DUMP)
+
+    with postgres._staged_backup(source, "postgresql-restore-shop.sql") as staged:
+        assert not staged.is_symlink()
+        assert not staged.exists()
+
+    assert victim.read_text() == "important"
+
+
+# ==================== One engine's dialect never leaks into another ====================
+
+
+def test_postgres_does_not_use_the_mysql_backslash_escape() -> None:
+    """
+    A backslash is data in PostgreSQL and an escape in MySQL.
+
+    Doubling it for PostgreSQL, which is what sharing one escaper would do,
+    silently changes every password and every literal that contains one.
+    """
+    assert PostgresManager._escape_literal("C:\\data") == "'C:\\data'"
+    assert MySQLManager._escape_literal("C:\\data") == "'C:\\\\data'"
+
+
+def test_neither_engine_borrows_the_other_quote_character() -> None:
+    """A backtick is ordinary text to PostgreSQL, and so is a double quote to MySQL."""
+    assert PostgresManager._escape_identifier("we`ird") == '"we`ird"'
+    assert MySQLManager._escape_identifier('we"ird') == '`we"ird`'
+
+
+@pytest.mark.parametrize(
+    ("manager", "privilege"),
+    [
+        (MySQLManager, "CONNECT"),
+        (MySQLManager, "TEMPORARY"),
+        (MySQLManager, "TRUNCATE"),
+        (PostgresManager, "SHOW DATABASES"),
+        (PostgresManager, "GRANT OPTION"),
+        (PostgresManager, "FILE"),
+        (PostgresManager, "SUPER"),
+    ],
+)
+def test_privilege_whitelists_do_not_leak_between_engines(manager, privilege: str) -> None:
+    """Consolidating the machinery must not consolidate the whitelists."""
+    with pytest.raises(DatabaseUserError):
+        manager.validate_privileges([privilege])
+
+
+@pytest.mark.parametrize("privilege", ["ALL PRIVILEGES", "GRANT OPTION", "SELECT, INSERT"])
+def test_sql_privileges_are_not_mongodb_roles(privilege: str) -> None:
+    """A multi-word SQL privilege is not a role name, built in or custom."""
+    with pytest.raises(DatabaseUserError):
+        MongoDBManager.validate_privileges([privilege])
+
+
+@pytest.mark.parametrize("privilege", ["ALL PRIVILEGES", "SELECT", "GRANT OPTION"])
+def test_sql_privileges_are_not_redis_acl_rules(privilege: str) -> None:
+    """Redis rules carry their own prefix, so no SQL keyword can pass as one."""
+    with pytest.raises(DatabaseUserError):
+        RedisManager.validate_privileges([privilege])
+
+
+def test_each_engine_keeps_its_own_name_limits_and_suffixes() -> None:
+    """The per-engine constants survived the move into the base class."""
+    assert MySQLManager.MAX_DATABASE_NAME_LENGTH == 64
+    assert MySQLManager.MAX_USER_NAME_LENGTH == 32
+    assert PostgresManager.MAX_DATABASE_NAME_LENGTH == 63
+    assert PostgresManager.MAX_USER_NAME_LENGTH == 63
+    assert MySQLManager.BACKUP_SUFFIX == ".sql"
+    assert PostgresManager.BACKUP_SUFFIX == ".sql"
+    assert MongoDBManager.BACKUP_SUFFIX == ".tar.gz"
+    assert RedisManager.BACKUP_SUFFIX == ".rdb"
+
+    # A 33 character user name is legal in PostgreSQL and not in MySQL.
+    assert PostgresManager.validate_user_name("u" * 33) == "u" * 33
+    with pytest.raises(DatabaseError):
+        MySQLManager.validate_user_name("u" * 33)
 
 
 def test_registry_still_resolves_every_engine() -> None:

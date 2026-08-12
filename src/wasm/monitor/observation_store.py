@@ -5,6 +5,15 @@ This replaces the old threat store. The rows are the same shape as before minus
 the fiction: there is no "action taken" column, because the monitor takes no
 actions, and nothing is "resolved", because nothing was ever a case. An
 observation is either still interesting or acknowledged by an operator.
+
+The database is bounded on three axes, because a daemon that writes every
+minute until the disk fills is an outage it caused itself:
+
+- Repeats are collapsed: the same process raising the same signal inside
+  :data:`DEFAULT_DEDUPE_WINDOW_SECONDS` updates nothing and inserts nothing.
+- Rows past the retention window are deleted (:meth:`purge_older_than`).
+- The row count is capped (:meth:`enforce_limit`), which is the backstop for a
+  machine that produces new offenders faster than retention removes them.
 """
 
 from __future__ import annotations
@@ -13,7 +22,7 @@ import os
 import sqlite3
 import threading
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +37,14 @@ USER_DB_RELATIVE_PATH = Path(".local/share/wasm/observations.db")
 
 #: A monitor scan must never block on the database.
 BUSY_TIMEOUT = 10
+
+#: Hard ceiling on stored rows. At roughly 300 bytes a row this is a couple of
+#: megabytes, which is what an observation log is worth.
+DEFAULT_MAX_OBSERVATIONS = 5_000
+
+#: A process still doing the same thing an hour later is the same observation.
+#: Without this, one busy process writes 1.440 identical rows a day.
+DEFAULT_DEDUPE_WINDOW_SECONDS = 3_600
 
 
 def default_db_path() -> Path:
@@ -56,14 +73,25 @@ class ObservationStore:
 
     SCHEMA_VERSION = 1
 
-    def __init__(self, db_path: Path | None = None, verbose: bool = False) -> None:
+    def __init__(
+        self,
+        db_path: Path | None = None,
+        verbose: bool = False,
+        max_observations: int = DEFAULT_MAX_OBSERVATIONS,
+        dedupe_window_seconds: int = DEFAULT_DEDUPE_WINDOW_SECONDS,
+    ) -> None:
         """
         Args:
             db_path: Database file. Defaults to :func:`default_db_path`.
             verbose: Enable verbose logging.
+            max_observations: Hard ceiling on stored rows. Zero disables the cap.
+            dedupe_window_seconds: How long the same process raising the same
+                signal counts as one observation. Zero disables deduplication.
         """
         self.logger = Logger(verbose=verbose)
         self.db_path = db_path or default_db_path()
+        self.max_observations = max(0, int(max_observations))
+        self.dedupe_window_seconds = max(0, int(dedupe_window_seconds))
         self._local = threading.local()
         self._init_db()
 
@@ -78,6 +106,10 @@ class ObservationStore:
         if connection is None:
             connection = sqlite3.connect(str(self.db_path), timeout=BUSY_TIMEOUT)
             connection.row_factory = sqlite3.Row
+            # The daemon writes this file while the web panel reads it; without
+            # WAL one of them gets "database is locked" instead of an answer.
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=NORMAL")
             self._local.connection = connection
         return connection
 
@@ -113,12 +145,51 @@ class ObservationStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_observations_severity ON observations(severity)"
             )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_observations_dedupe "
+                "ON observations(pid, signal, observed_at DESC)"
+            )
 
         self.logger.debug(f"Observation store ready at {self.db_path}")
 
+    def _is_repeat(self, observation: ProcessObservation) -> bool:
+        """
+        Report whether this observation was already written down recently.
+
+        Args:
+            observation: The candidate observation.
+
+        Returns:
+            True when the same process raised the same signal inside the
+            deduplication window.
+        """
+        if self.dedupe_window_seconds <= 0:
+            return False
+
+        observed_at = observation.observed_at or datetime.now()
+        cutoff = observed_at - timedelta(seconds=self.dedupe_window_seconds)
+        row = (
+            self._get_connection()
+            .execute(
+                """
+                SELECT 1 FROM observations
+                WHERE pid = ? AND process_name = ? AND signal = ? AND observed_at >= ?
+                LIMIT 1
+                """,
+                (
+                    observation.process.pid,
+                    observation.process.name,
+                    observation.signal,
+                    cutoff.isoformat(),
+                ),
+            )
+            .fetchone()
+        )
+        return row is not None
+
     def save(self, observation: ProcessObservation) -> int:
         """
-        Store one observation.
+        Store one observation, unconditionally.
 
         Args:
             observation: The observation to record.
@@ -155,15 +226,54 @@ class ObservationStore:
 
     def save_many(self, observations: Sequence[ProcessObservation]) -> list[int]:
         """
-        Store several observations.
+        Store several observations, skipping recent repeats.
+
+        This is the entry point the monitor uses. A process that stays over the
+        CPU threshold for a day is one row per deduplication window, not one row
+        per scan.
 
         Args:
             observations: The observations to record.
 
         Returns:
-            The row ids, in the order given.
+            The row ids of the observations that were actually inserted.
         """
-        return [self.save(observation) for observation in observations]
+        inserted = [
+            self.save(observation)
+            for observation in observations
+            if not self._is_repeat(observation)
+        ]
+        if inserted:
+            self.enforce_limit()
+        return inserted
+
+    def enforce_limit(self) -> int:
+        """
+        Drop the oldest rows once the store is over its ceiling.
+
+        Returns:
+            Number of rows dropped.
+        """
+        if self.max_observations <= 0:
+            return 0
+
+        conn = self._get_connection()
+        with conn:
+            cursor = conn.execute(
+                """
+                DELETE FROM observations
+                WHERE id NOT IN (
+                    SELECT id FROM observations ORDER BY id DESC LIMIT ?
+                )
+                """,
+                (self.max_observations,),
+            )
+        dropped = cursor.rowcount
+        if dropped > 0:
+            self.logger.debug(
+                f"Dropped {dropped} observation(s) over the {self.max_observations} row cap"
+            )
+        return dropped
 
     def recent(
         self,

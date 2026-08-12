@@ -86,9 +86,12 @@ class DatabaseRegistry:
             verbose: Enable verbose logging.
 
         Returns:
-            List of manager instances.
+            List of manager instances, one per registered engine.
         """
-        return [cls.get(engine, verbose) for engine in cls.list_engines()]
+        # get() is typed as optional because it also resolves user input; here
+        # the names come from the registry itself, so nothing can be missing.
+        managers = (cls.get(engine, verbose) for engine in cls.list_engines())
+        return [manager for manager in managers if manager is not None]
 
     @classmethod
     def get_installed(cls, verbose: bool = False) -> list[BaseDatabaseManager]:

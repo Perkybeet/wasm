@@ -14,8 +14,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 #: Signal kinds. A signal says why a process was written down, nothing else.
+#: There is deliberately no command-line signal: an unprivileged user chooses
+#: their own argv, so anything derived from it is an attacker-controlled input
+#: to a daemon that runs as root.
 SIGNAL_NAME_PATTERN = "name-pattern"
-SIGNAL_COMMAND_PATTERN = "command-pattern"
 SIGNAL_RESOURCE_USAGE = "resource-usage"
 
 #: Severities. Both mean "a human should look", they differ only in ordering.

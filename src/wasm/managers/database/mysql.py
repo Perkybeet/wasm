@@ -89,6 +89,58 @@ MYSQL_PRIVILEGES = frozenset(
 )
 
 
+#: Escapes MySQL's option file reader turns back into characters. The manual
+#: documents ``\b \t \n \r \\ \s``; the reader (mysys/my_default.cc) also
+#: accepts ``\"`` and ``\'``, and its comment stripper skips a quote that
+#: follows a backslash. Escaping both quote characters is therefore what keeps a
+#: '#' inside a password from being taken for a comment and truncating it.
+OPTION_FILE_ESCAPES = str.maketrans(
+    {
+        "\\": "\\\\",
+        '"': '\\"',
+        "'": "\\'",
+        "\n": "\\n",
+        "\r": "\\r",
+        "\t": "\\t",
+        "\b": "\\b",
+        # A quoted value keeps its inner spaces, but the reader trims the raw
+        # line first; \s survives both and costs nothing.
+        " ": "\\s",
+    }
+)
+
+
+def escape_option_file_value(value: str) -> str:
+    """
+    Render a value so a MySQL option file reads it back unchanged.
+
+    An option file is parsed line by line, so a raw newline in a password does
+    not corrupt the value: it ends the record and starts a new directive inside
+    the ``[client]`` section. ``socket=`` or ``plugin-dir=`` placed there
+    redirects every connection WASM makes afterwards. The escapes below are the
+    ones the client applies after the line split, so a newline arrives as data.
+
+    Args:
+        value: The raw value, such as a password taken from the configuration.
+
+    Returns:
+        The value, escaped and enclosed in double quotes.
+
+    Raises:
+        DatabaseError: When the value contains a NUL byte, which the reader
+            would silently truncate at rather than misparse.
+    """
+    if "\x00" in value:
+        raise DatabaseError(
+            "A MySQL credential contains a NUL byte",
+            details=(
+                "MySQL option files are read as C strings and would silently use only the "
+                "part before the NUL. Change the credential in /etc/wasm/config.yaml."
+            ),
+        )
+    return '"' + value.translate(OPTION_FILE_ESCAPES) + '"'
+
+
 class MySQLManager(BaseDatabaseManager):
     """Manager for MySQL and MariaDB, whichever is installed."""
 
@@ -217,6 +269,10 @@ class MySQLManager(BaseDatabaseManager):
 
         Yields:
             Arguments to place immediately after the program name.
+
+        Raises:
+            DatabaseError: When a credential cannot be written to an option file
+                without changing its value.
         """
         credentials = self.config.get("databases", {}).get("credentials", {}).get("mysql", {})
         user = credentials.get("user")
@@ -226,14 +282,17 @@ class MySQLManager(BaseDatabaseManager):
             yield ["-u", user] if user else []
             return
 
+        # The values are escaped before the file is created, so a credential
+        # that cannot be represented fails without leaving a file behind.
+        content = "[client]\n"
+        if user:
+            content += f"user={escape_option_file_value(str(user))}\n"
+        content += f"password={escape_option_file_value(str(password))}\n"
+
         # mkstemp creates the file 0600, so the password is never briefly
         # world readable the way a write-then-chmod would leave it.
         fd, path = tempfile.mkstemp(prefix="wasm_mysql_", suffix=".cnf")
         try:
-            content = "[client]\n"
-            if user:
-                content += f"user={user}\n"
-            content += f"password={password}\n"
             with os.fdopen(fd, "w") as handle:
                 handle.write(content)
             # This option is only honoured as the client's first argument.

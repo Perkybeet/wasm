@@ -38,12 +38,17 @@ from wasm.monitor.models import (
     ResourceMetrics,
     ServiceHealth,
 )
-from wasm.monitor.observation_store import ObservationStore
+from wasm.monitor.observation_store import DEFAULT_MAX_OBSERVATIONS, ObservationStore
 from wasm.monitor.signals import observe_processes
 
 #: Seconds between scans. A minute is enough for capacity planning and cheap
 #: enough to leave running on a small box.
 DEFAULT_SCAN_INTERVAL = 60
+
+#: Floor for the scan interval. Walking /proc for every process is the most
+#: expensive thing this daemon does; doing it several times a second costs more
+#: CPU than whatever it would observe.
+MIN_SCAN_INTERVAL = 10
 
 #: Percentages above which a process is written down as a heavy consumer.
 DEFAULT_CPU_THRESHOLD = 80.0
@@ -51,6 +56,23 @@ DEFAULT_MEMORY_THRESHOLD = 80.0
 
 #: How long observations are kept before they are purged.
 DEFAULT_RETENTION_DAYS = 30
+
+#: Retention is a housekeeping job, not a per-scan one. Running the delete once
+#: an hour instead of once a minute keeps the scan loop to reads.
+PURGE_INTERVAL_SECONDS = 3_600
+
+#: Filesystem usage from which a disk is called out in the log rather than left
+#: at debug level. Past this, a full disk is a matter of days.
+DISK_ALERT_PERCENT = 90.0
+
+#: What this package will not do, in the words used to check it. The CLI and the
+#: web panel print these, and tests assert them against the package source.
+MONITOR_SCOPE: tuple[str, ...] = (
+    "Never signals, terminates or restarts a process.",
+    "Never deletes or modifies a file, except the systemd unit it installs.",
+    "Never sends data about the machine anywhere except the configured SMTP relay.",
+    "Never inspects a process command line to decide anything.",
+)
 
 
 @dataclass
@@ -70,6 +92,7 @@ class MonitorConfig:
         notify: Send observations by email.
         watch_units: systemd units whose health is checked each scan.
         retention_days: How long observations are kept.
+        max_observations: Hard ceiling on rows kept in the observation store.
         log_file: Where the daemon writes its log.
     """
 
@@ -80,7 +103,12 @@ class MonitorConfig:
     notify: bool = False
     watch_units: tuple[str, ...] = field(default_factory=tuple)
     retention_days: int = DEFAULT_RETENTION_DAYS
+    max_observations: int = DEFAULT_MAX_OBSERVATIONS
     log_file: Path | None = None
+
+    def __post_init__(self) -> None:
+        """Clamp the scan interval so a config typo cannot pin a CPU."""
+        self.scan_interval = max(MIN_SCAN_INTERVAL, int(self.scan_interval))
 
 
 class ProcessMonitor:
@@ -118,6 +146,8 @@ class ProcessMonitor:
         self._store = store
         self._notifier = notifier
         self._running = False
+        # Far enough in the past that the first loop iteration purges once.
+        self._last_purge = float("-inf")
 
     def _load_config(self) -> MonitorConfig:
         """
@@ -135,6 +165,7 @@ class ProcessMonitor:
             notify=bool(get("monitor.notify", False)),
             watch_units=tuple(get("monitor.watch_units", []) or ()),
             retention_days=int(get("monitor.retention_days", DEFAULT_RETENTION_DAYS)),
+            max_observations=int(get("monitor.max_observations", DEFAULT_MAX_OBSERVATIONS)),
             log_file=Path(get("monitor.log_file", "/var/log/wasm/monitor.log")),
         )
 
@@ -142,7 +173,10 @@ class ProcessMonitor:
     def store(self) -> Any:
         """The observation store, opened on first use."""
         if self._store is None:
-            self._store = ObservationStore(verbose=self.verbose)
+            self._store = ObservationStore(
+                verbose=self.verbose,
+                max_observations=self.config.max_observations,
+            )
         return self._store
 
     @property
@@ -179,12 +213,18 @@ class ProcessMonitor:
             return []
         return collect_service_health(watched, runner=self.runner)
 
-    def scan_once(self) -> list[ProcessObservation]:
+    def scan_once(self, cpu_sample_interval: float = 0.0) -> list[ProcessObservation]:
         """
         Take one look at the process table and record what stands out.
 
         Nothing is terminated and nothing is deleted: the return value and the
         observation store are the entire effect of a scan.
+
+        Args:
+            cpu_sample_interval: Seconds to spend sampling CPU usage. Zero in
+                the daemon loop, where the previous scan is the reference
+                point; a fraction of a second for a one-shot scan, which would
+                otherwise see 0% CPU for every process.
 
         Returns:
             The observations made, warnings first.
@@ -192,7 +232,7 @@ class ProcessMonitor:
         Raises:
             MonitorError: When the process table cannot be read.
         """
-        processes = list_processes()
+        processes = list_processes(cpu_sample_interval=cpu_sample_interval)
         self.logger.debug(f"Scanned {len(processes)} processes")
 
         observations = observe_processes(
@@ -216,14 +256,18 @@ class ProcessMonitor:
                 f"(PID {observation.process.pid}) - {observation.detail}"
             )
 
+        stored: list[int] = []
         try:
-            self.store.save_many(observations)
+            stored = self.store.save_many(observations) or []
         except WASMError as exc:
             self.logger.error(f"Failed to persist observations: {exc}")
         except OSError as exc:
             self.logger.error(f"Failed to persist observations: {exc}")
 
-        if self.config.notify:
+        # Only new rows are worth an email. The store collapses a process that
+        # keeps doing the same thing into one row per window, and the report
+        # follows it: otherwise one busy process is a mail every scan interval.
+        if self.config.notify and stored:
             try:
                 self.notifier.send_observation_alert(observations)
             except WASMError as exc:
@@ -232,7 +276,13 @@ class ProcessMonitor:
         return observations
 
     def _log_metrics(self) -> None:
-        """Record a one-line resource summary, best effort."""
+        """
+        Record a one-line resource summary, best effort.
+
+        Readings are not persisted: a time series would grow without bound for
+        a panel that only ever shows the current value. The line goes to debug
+        unless something is close enough to hurting to be worth a journal entry.
+        """
         try:
             metrics = self.collect_metrics()
         except MonitorError as exc:
@@ -240,10 +290,16 @@ class ProcessMonitor:
             return
 
         disks = ", ".join(f"{d.mountpoint} {d.percent:.0f}%" for d in metrics.disks)
-        self.logger.debug(
+        summary = (
             f"CPU {metrics.cpu_percent:.1f}% | RAM {metrics.memory_percent:.1f}% | "
             f"procs {metrics.process_count} | disks: {disks or 'n/a'}"
         )
+
+        full_disks = [d for d in metrics.disks if d.percent >= DISK_ALERT_PERCENT]
+        if full_disks or metrics.memory_percent >= self.config.memory_threshold:
+            self.logger.warning(summary)
+        else:
+            self.logger.debug(summary)
 
     def _report_services(self) -> None:
         """Log any watched unit that is not active."""
@@ -256,10 +312,10 @@ class ProcessMonitor:
         Observe the machine until :meth:`stop` is called.
 
         Scans, resource metrics and service checks all happen once per
-        interval; old observations are purged as they age out.
+        interval; old observations are purged hourly as they age out.
         """
         self._running = True
-        interval = max(1, self.config.scan_interval)
+        interval = max(MIN_SCAN_INTERVAL, self.config.scan_interval)
         self.logger.info(f"Starting process monitor (scan every {interval}s, report only)")
 
         while self._running:
@@ -286,9 +342,20 @@ class ProcessMonitor:
         self._running = False
 
     def _purge_old_observations(self) -> None:
-        """Drop observations past the retention window, best effort."""
+        """
+        Drop observations past the retention window, best effort.
+
+        Throttled: with a 60 second interval this would otherwise be 1.440
+        DELETE statements a day to remove rows that age out once.
+        """
+        now = time.monotonic()
+        if now - self._last_purge < PURGE_INTERVAL_SECONDS:
+            return
+        self._last_purge = now
+
         try:
             self.store.purge_older_than(self.config.retention_days)
+            self.store.enforce_limit()
         except WASMError as exc:
             self.logger.debug(f"Retention purge skipped: {exc}")
         except OSError as exc:

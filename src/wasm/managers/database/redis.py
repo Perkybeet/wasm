@@ -58,11 +58,15 @@ ACL_KEYWORDS = frozenset(
     }
 )
 
+# Both rules end in \Z rather than '$': in Python '$' also matches before a
+# final newline, so a '$'-anchored rule would accept "+@all\n" and hand a value
+# with a line break to the server as if it were a bare keyword.
+
 #: Command and category rules: ``+get``, ``-@admin``, ``+client|list``.
-ACL_COMMAND_PATTERN = re.compile(r"^[+-]@?[A-Za-z0-9_|-]+$")
+ACL_COMMAND_PATTERN = re.compile(r"\A[+-]@?[A-Za-z0-9_|-]+\Z")
 
 #: Key and channel patterns: ``~*``, ``~cache:*``, ``&events.*``.
-ACL_PATTERN_RULE = re.compile(r"^(?:%(?:R|W|RW))?[~&][A-Za-z0-9_.:*?{}\[\]-]*$")
+ACL_PATTERN_RULE = re.compile(r"\A(?:%(?:R|W|RW))?[~&][A-Za-z0-9_.:*?{}\[\]-]*\Z")
 
 #: Default number of one-second polls spent waiting for persistence to finish.
 PERSISTENCE_POLL_SECONDS = 60

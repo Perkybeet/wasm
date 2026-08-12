@@ -1,5 +1,13 @@
 """
 Setup command handlers for WASM - initial setup, completions, permissions, and doctor.
+
+The configuration directory is deliberately owner-only. ``config.yaml`` holds the
+MySQL root password, the SMTP account and the OpenAI API key, and WASM is a
+root-only tool (it drives systemd, nginx and certbot), so nothing legitimate
+reads that directory as another account. The consequence, and it is intentional:
+running the web panel or any WASM command as a non-root user will not be able to
+read ``/etc/wasm/config.yaml``. That is the privilege model, not a bug to be
+fixed by widening the directory.
 """
 
 import os
@@ -7,11 +15,50 @@ import shutil
 import sys
 from argparse import Namespace
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
-from wasm.core.config import DEFAULT_APPS_DIR, DEFAULT_CONFIG_PATH, DEFAULT_LOG_DIR
+from wasm.core.config import (
+    DEFAULT_APPS_DIR,
+    DEFAULT_CONFIG_PATH,
+    DEFAULT_LOG_DIR,
+    SECRET_DIR_MODE,
+    secure_directory,
+)
 from wasm.core.exceptions import WASMError
 from wasm.core.logger import Logger
 from wasm.core.utils import command_exists, run_command, run_command_sudo, run_trusted_installer
+
+if TYPE_CHECKING:
+    from wasm.core.dependencies import DependencyChecker, SetupSummary
+
+
+def _create_config_directory(logger: Logger) -> bool:
+    """
+    Create the directory that holds config.yaml, owner-only.
+
+    Args:
+        logger: Logger used to report progress.
+
+    Returns:
+        True if the directory exists and is private afterwards.
+    """
+    config_dir = DEFAULT_CONFIG_PATH.parent
+    logger.substep(f"Creating config directory: {config_dir}")
+    try:
+        secure_directory(config_dir)
+    except OSError as e:
+        logger.warning(f"Failed to create config directory: {e}")
+        return False
+
+    if config_dir.stat().st_mode & 0o077:
+        logger.warning(
+            f"{config_dir} is readable by other accounts; it holds credentials. "
+            f"Fix it with: chmod {SECRET_DIR_MODE:o} {config_dir}"
+        )
+        return False
+
+    logger.success(f"Created {config_dir}")
+    return True
 
 
 def handle_setup(args: Namespace) -> int:
@@ -298,7 +345,7 @@ def _handle_init(args: Namespace) -> int:
     # =========================================================================
     # Phase 2: Interactive Configuration (if available)
     # =========================================================================
-    config_choices = {
+    config_choices: dict[str, Any] = {
         "install_git": not command_exists("git"),
         "install_webserver": summary["webserver"] is None,
         "webserver_choice": "nginx",
@@ -310,10 +357,11 @@ def _handle_init(args: Namespace) -> int:
 
     if has_inquirer:
         logger.step(2, 6, "Configuration options")
-        config_choices = _interactive_setup_prompts(logger, summary, checker)
-        if config_choices is None:
+        answers = _interactive_setup_prompts(logger, summary, checker)
+        if answers is None:
             logger.info("Setup cancelled")
             return 0
+        config_choices = answers
     else:
         logger.step(2, 6, "Using default configuration")
 
@@ -438,15 +486,7 @@ def _handle_init(args: Namespace) -> int:
     except Exception as e:
         logger.warning(f"Failed to create log directory: {e}")
 
-    # Create config directory
-    config_dir = DEFAULT_CONFIG_PATH.parent
-    logger.substep(f"Creating config directory: {config_dir}")
-    try:
-        config_dir.mkdir(parents=True, exist_ok=True)
-        os.chmod(config_dir, 0o755)
-        logger.success(f"Created {config_dir}")
-    except Exception as e:
-        logger.warning(f"Failed to create config directory: {e}")
+    _create_config_directory(logger)
 
     # =========================================================================
     # Phase 6: Create/Update Configuration File
@@ -552,7 +592,9 @@ def _handle_init(args: Namespace) -> int:
     return 0
 
 
-def _interactive_setup_prompts(logger: Logger, summary: dict, checker) -> dict | None:
+def _interactive_setup_prompts(
+    logger: Logger, summary: "SetupSummary", checker: "DependencyChecker"
+) -> dict[str, Any] | None:
     """
     Interactive prompts for setup wizard.
 
@@ -562,7 +604,7 @@ def _interactive_setup_prompts(logger: Logger, summary: dict, checker) -> dict |
         checker: DependencyChecker instance.
 
     Returns:
-        Configuration choices dict or None if cancelled.
+        Configuration choices dict, or None if the user cancelled.
     """
     import inquirer
     from inquirer.themes import GreenPassion
@@ -665,7 +707,7 @@ def _interactive_setup_prompts(logger: Logger, summary: dict, checker) -> dict |
     )
 
     try:
-        answers = inquirer.prompt(questions, theme=GreenPassion())
+        answers: dict[str, Any] | None = inquirer.prompt(questions, theme=GreenPassion())
         return answers
     except KeyboardInterrupt:
         return None
@@ -702,14 +744,21 @@ def _handle_permissions(args: Namespace) -> int:
         logger.warning(f"Log directory does not exist: {DEFAULT_LOG_DIR}")
         issues.append(("log_dir_missing", DEFAULT_LOG_DIR))
 
-    # Check config
+    # Check config. It holds credentials, so "too open" is as much a problem as
+    # "not readable": WASM runs as root and nothing else needs to read it.
     config_dir = DEFAULT_CONFIG_PATH.parent
     if config_dir.exists():
-        if os.access(config_dir, os.R_OK):
-            logger.success(f"Config directory readable: {config_dir}")
-        else:
+        if not os.access(config_dir, os.R_OK):
             logger.warning(f"Config directory not readable: {config_dir}")
             issues.append(("config_dir", config_dir))
+        elif config_dir.stat().st_mode & 0o077:
+            logger.warning(
+                f"Config directory exposes credentials to other accounts: {config_dir} "
+                f"(expected mode {SECRET_DIR_MODE:o})"
+            )
+            issues.append(("config_dir_mode", config_dir))
+        else:
+            logger.success(f"Config directory readable: {config_dir}")
 
     # Check nginx/apache access
     nginx_available = Path("/etc/nginx/sites-available")
