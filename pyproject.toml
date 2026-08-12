@@ -106,7 +106,12 @@ include = ["wasm*"]
 
 [tool.setuptools.package-data]
 wasm = [
+    # nginx, apache and systemd unit templates.
     "templates/**/*.j2",
+    # The panel: its pages, its stylesheet and every third-party asset it
+    # serves. All of it has to ship, because the panel renders server-side and
+    # fetches nothing from the network.
+    "web/templates/**/*.html",
     "web/static/**/*",
     "py.typed",
 ]

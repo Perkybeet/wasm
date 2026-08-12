@@ -11,6 +11,7 @@ include pyproject.toml
 recursive-include src *.py
 recursive-include src/wasm/templates *.j2
 recursive-include src/wasm/web/static *
+recursive-include src/wasm/web/templates *.html
 
 # Include documentation
 recursive-include docs *.md *.png *.jpg *.svg

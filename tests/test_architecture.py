@@ -393,6 +393,34 @@ class TestPackaging:
 
         check_ratchet(missing, self.UNDECLARED_KNOWN, "every import is declared")
 
+    def test_every_data_file_the_code_loads_is_declared(self):
+        """
+        A file the package reads at runtime has to be in package-data.
+
+        The panel's templates were not, so the wheel installed cleanly and then
+        could not render a single page. Nothing catches that except looking at
+        the artifact, or this.
+        """
+        declared = (REPO / "pyproject.toml").read_text(encoding="utf-8")
+
+        needed = {
+            "templates/**/*.j2": SRC / "templates",
+            "web/templates/**/*.html": SRC / "web/templates",
+            "web/static/**/*": SRC / "web/static",
+        }
+
+        missing = [
+            pattern
+            for pattern, directory in needed.items()
+            if directory.exists() and pattern not in declared
+        ]
+
+        assert not missing, (
+            "These directories hold files the package reads at runtime but are "
+            "not in [tool.setuptools.package-data]:\n"
+            + "\n".join(f"  {pattern}" for pattern in missing)
+        )
+
     def test_version_is_consistent_across_packaging_files(self):
         """The version lives in six files; drift caused corrective releases."""
         import subprocess
