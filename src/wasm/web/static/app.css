@@ -1,0 +1,956 @@
+/*
+ * WASM control panel.
+ *
+ * Hand-authored: there is no build step, so what you read here is exactly what
+ * the server sends. That matters for a tool distributed as a .deb and .rpm,
+ * where a generated stylesheet would either have to be committed alongside its
+ * source and drift, or require a toolchain the build environment does not have.
+ *
+ * The rule that holds the whole thing together: colour only ever encodes state.
+ * Navigation, surfaces, borders and text are achromatic. If you see colour on
+ * the screen, it is telling you something about the machine.
+ */
+
+/* ------------------------------------------------------------------ fonts */
+
+@font-face {
+  font-family: "IBM Plex Sans";
+  src: url("/static/vendor/fonts/ibm-plex-sans-latin-400-normal.woff2") format("woff2");
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  src: url("/static/vendor/fonts/ibm-plex-sans-latin-500-normal.woff2") format("woff2");
+  font-weight: 500;
+  font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  src: url("/static/vendor/fonts/ibm-plex-sans-latin-600-normal.woff2") format("woff2");
+  font-weight: 600;
+  font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Sans Condensed";
+  src: url("/static/vendor/fonts/ibm-plex-sans-condensed-latin-500-normal.woff2") format("woff2");
+  font-weight: 500;
+  font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Sans Condensed";
+  src: url("/static/vendor/fonts/ibm-plex-sans-condensed-latin-600-normal.woff2") format("woff2");
+  font-weight: 600;
+  font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("/static/vendor/fonts/ibm-plex-mono-latin-400-normal.woff2") format("woff2");
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("/static/vendor/fonts/ibm-plex-mono-latin-500-normal.woff2") format("woff2");
+  font-weight: 500;
+  font-display: swap;
+}
+
+/* ------------------------------------------------------------------ tokens */
+
+:root {
+  color-scheme: light dark;
+
+  --font-ui: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-label: "IBM Plex Sans Condensed", "IBM Plex Sans", ui-sans-serif, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  /* A fourth-based scale. Dense on purpose: this is an instrument panel. */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+  --space-7: 3rem;
+
+  --text-xs: 0.6875rem;
+  --text-sm: 0.8125rem;
+  --text-base: 0.875rem;
+  --text-lg: 1.0625rem;
+  --text-xl: 1.375rem;
+  --text-2xl: 1.875rem;
+
+  --radius-sm: 3px;
+  --radius: 5px;
+  --radius-lg: 8px;
+
+  --rail-width: 3px;
+  --machine-strip-height: 2.75rem;
+  --sidebar-width: 13.5rem;
+
+  --duration: 120ms;
+  --ease: cubic-bezier(0.2, 0, 0.15, 1);
+
+  /* Light is the mode that sets the identity: a dense technical datasheet,
+     which is rare in this category and reads as instrument rather than
+     hacker terminal. */
+  --bg: #fbfaf8;
+  --bg-sunken: #f3f1ed;
+  --surface: #ffffff;
+  --surface-hover: #f7f5f2;
+  --border: #e4e1dc;
+  --border-strong: #cfcbc4;
+  --text: #1a1d21;
+  --text-muted: #6b7178;
+  --text-faint: #969ba1;
+
+  --state-active: #1f7a4d;
+  --state-active-bg: #e8f4ed;
+  --state-idle: #6b7178;
+  --state-idle-bg: #eeecea;
+  --state-failed: #b3261e;
+  --state-failed-bg: #fbeae9;
+  --state-busy: #9a6700;
+  --state-busy-bg: #fdf3e0;
+
+  --focus: #1e5fb3;
+  --shadow-drawer: 0 -8px 24px rgb(0 0 0 / 8%);
+}
+
+:root[data-theme="dark"] {
+  --bg: #12161a;
+  --bg-sunken: #0d1114;
+  --surface: #191e24;
+  --surface-hover: #1f252c;
+  --border: #262d35;
+  --border-strong: #38414b;
+  --text: #e8eaed;
+  --text-muted: #8a929b;
+  --text-faint: #656d76;
+
+  --state-active: #3fa96e;
+  --state-active-bg: #14301f;
+  --state-idle: #8a929b;
+  --state-idle-bg: #21262c;
+  --state-failed: #e5534b;
+  --state-failed-bg: #351a19;
+  --state-busy: #d4a017;
+  --state-busy-bg: #32270c;
+
+  --focus: #58a6ff;
+  --shadow-drawer: 0 -8px 24px rgb(0 0 0 / 40%);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #12161a;
+    --bg-sunken: #0d1114;
+    --surface: #191e24;
+    --surface-hover: #1f252c;
+    --border: #262d35;
+    --border-strong: #38414b;
+    --text: #e8eaed;
+    --text-muted: #8a929b;
+    --text-faint: #656d76;
+
+    --state-active: #3fa96e;
+    --state-active-bg: #14301f;
+    --state-idle: #8a929b;
+    --state-idle-bg: #21262c;
+    --state-failed: #e5534b;
+    --state-failed-bg: #351a19;
+    --state-busy: #d4a017;
+    --state-busy-bg: #32270c;
+
+    --focus: #58a6ff;
+    --shadow-drawer: 0 -8px 24px rgb(0 0 0 / 40%);
+  }
+}
+
+/* ------------------------------------------------------------------- base */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: var(--text-base);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+h1 {
+  font-size: var(--text-xl);
+}
+h2 {
+  font-size: var(--text-lg);
+}
+h3 {
+  font-size: var(--text-base);
+}
+
+p {
+  margin: 0 0 var(--space-3);
+}
+
+a {
+  color: inherit;
+}
+
+code,
+kbd,
+pre,
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Any value that can change is set in tabular figures, so columns do not
+   jitter when a number updates. */
+.num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.95em;
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+::selection {
+  background: var(--focus);
+  color: #fff;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------------- typography */
+
+.label {
+  font-family: var(--font-label);
+  font-weight: 600;
+  font-size: var(--text-xs);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+.faint {
+  color: var(--text-faint);
+}
+
+/* ------------------------------------------------------- machine strip */
+
+/*
+ * The signature element. A persistent instrument status line for this one
+ * machine, present on every page. Not stat tiles: a single dense strip, in
+ * mono with tabular figures, so you always know which box you are about to
+ * change.
+ */
+.machine {
+  display: flex;
+  align-items: center;
+  gap: var(--space-5);
+  height: var(--machine-strip-height);
+  padding: 0 var(--space-4);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.machine::-webkit-scrollbar {
+  display: none;
+}
+
+.machine__host {
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.machine__metric {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  white-space: nowrap;
+  color: var(--text-muted);
+}
+
+.machine__metric > .num {
+  color: var(--text);
+}
+
+.machine__spark {
+  width: 5rem;
+  height: 1.125rem;
+  display: block;
+}
+
+/* A capacity bar reads faster than a percentage, and both together read
+   fastest. */
+.capacity {
+  width: 3.5rem;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.capacity__fill {
+  height: 100%;
+  background: var(--state-idle);
+  transition: width var(--duration) var(--ease);
+}
+
+.capacity--warn .capacity__fill {
+  background: var(--state-busy);
+}
+.capacity--critical .capacity__fill {
+  background: var(--state-failed);
+}
+
+.machine__tally {
+  display: flex;
+  gap: var(--space-3);
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+.machine__tally b {
+  font-weight: 500;
+}
+
+/* --------------------------------------------------------------- layout */
+
+.shell {
+  display: grid;
+  grid-template-columns: var(--sidebar-width) 1fr;
+  min-height: 100dvh;
+}
+
+.sidebar {
+  border-right: 1px solid var(--border);
+  background: var(--bg-sunken);
+  padding: var(--space-4) 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-4);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.nav {
+  display: flex;
+  flex-direction: column;
+}
+
+.nav__group {
+  padding: var(--space-3) var(--space-4) var(--space-1);
+}
+
+.nav__item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
+  color: var(--text-muted);
+  text-decoration: none;
+  border-left: var(--rail-width) solid transparent;
+  transition: background var(--duration) var(--ease);
+}
+
+.nav__item:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.nav__item[aria-current="page"] {
+  background: var(--surface);
+  color: var(--text);
+  font-weight: 500;
+  border-left-color: var(--text);
+}
+
+.nav__count {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.page {
+  padding: var(--space-5);
+  flex: 1;
+  min-width: 0;
+}
+
+.page__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  margin-bottom: var(--space-5);
+}
+
+.page__title {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.toolbar {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+/* ------------------------------------------------------------ state rail */
+
+/*
+ * Resources are rows, not floating cards, and each row carries a coloured rail
+ * on its leading edge. Running your eye down the left border tells you the
+ * health of everything without reading a word, and the same language is used
+ * for applications, services, sites, certificates and backups.
+ */
+.rows {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--surface);
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: var(--space-4);
+  align-items: center;
+  padding: var(--space-3) var(--space-4);
+  border-left: var(--rail-width) solid var(--state-idle);
+  border-bottom: 1px solid var(--border);
+  transition: background var(--duration) var(--ease);
+}
+
+.row:last-child {
+  border-bottom: none;
+}
+
+.row:hover {
+  background: var(--surface-hover);
+}
+
+.row--active {
+  border-left-color: var(--state-active);
+}
+.row--failed {
+  border-left-color: var(--state-failed);
+}
+.row--busy {
+  border-left-color: var(--state-busy);
+}
+
+.row__main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.row__name {
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.row__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.row__actions {
+  display: flex;
+  gap: var(--space-1);
+}
+
+/* A state change is the most important event this panel can show, so it is
+   the one thing that moves. */
+@keyframes rail-pulse {
+  0% {
+    box-shadow: inset var(--rail-width) 0 0 0 currentColor;
+  }
+  50% {
+    box-shadow: inset calc(var(--rail-width) * 3) 0 0 0 currentColor;
+  }
+  100% {
+    box-shadow: inset var(--rail-width) 0 0 0 currentColor;
+  }
+}
+
+.row--changed {
+  animation: rail-pulse 600ms var(--ease);
+}
+
+/* ------------------------------------------------------------- badges */
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-label);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: var(--state-idle-bg);
+  color: var(--state-idle);
+  white-space: nowrap;
+}
+
+.badge--active {
+  background: var(--state-active-bg);
+  color: var(--state-active);
+}
+.badge--failed {
+  background: var(--state-failed-bg);
+  color: var(--state-failed);
+}
+.badge--busy {
+  background: var(--state-busy-bg);
+  color: var(--state-busy);
+}
+
+.badge::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+/* -------------------------------------------------------------- controls */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-sm);
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background var(--duration) var(--ease),
+    border-color var(--duration) var(--ease);
+}
+
+.btn:hover:not(:disabled) {
+  background: var(--surface-hover);
+  border-color: var(--text-faint);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn--primary {
+  background: var(--text);
+  border-color: var(--text);
+  color: var(--bg);
+}
+
+.btn--primary:hover:not(:disabled) {
+  background: var(--text-muted);
+  border-color: var(--text-muted);
+}
+
+/* Destructive actions are the one place chrome earns colour, because the
+   consequence is irreversible. */
+.btn--danger {
+  color: var(--state-failed);
+  border-color: var(--state-failed);
+}
+
+.btn--danger:hover:not(:disabled) {
+  background: var(--state-failed-bg);
+}
+
+.btn--quiet {
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.btn--quiet:hover:not(:disabled) {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.btn--sm {
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--text-xs);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin-bottom: var(--space-4);
+}
+
+.field__hint {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+input[type="text"],
+input[type="password"],
+input[type="number"],
+input[type="email"],
+select,
+textarea {
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-sm);
+  width: 100%;
+}
+
+input[type="text"]:focus,
+input[type="password"]:focus,
+select:focus,
+textarea:focus {
+  border-color: var(--focus);
+}
+
+/* Anything the machine produced or consumes is set in mono, so the boundary
+   between prose and system data is always visible. */
+input.mono,
+textarea.mono {
+  font-family: var(--font-mono);
+}
+
+/* ---------------------------------------------------------------- tables */
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+}
+
+.table th {
+  font-family: var(--font-label);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  text-align: left;
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border-strong);
+  white-space: nowrap;
+}
+
+.table td {
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border);
+  vertical-align: baseline;
+}
+
+.table tr:last-child td {
+  border-bottom: none;
+}
+
+.table td.num {
+  text-align: right;
+}
+
+/* ----------------------------------------------------------- empty state */
+
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-7) var(--space-5);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius);
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.empty h2 {
+  color: var(--text);
+}
+
+/* ------------------------------------------------------------ system error */
+
+/*
+ * A message from nginx, systemd or certbot is never paraphrased. It is shown
+ * verbatim in mono, with the suggested fix above it, because this audience
+ * wants the real error.
+ */
+.problem {
+  border: 1px solid var(--state-failed);
+  border-left-width: var(--rail-width);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-4);
+}
+
+.problem__fix {
+  margin-bottom: var(--space-2);
+}
+
+.problem__output {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-sunken);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-x: auto;
+  color: var(--text-muted);
+}
+
+/* -------------------------------------------------------------- notices */
+
+.notice {
+  position: fixed;
+  right: var(--space-4);
+  bottom: calc(var(--space-4) + var(--log-drawer-offset, 0px));
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  z-index: 40;
+}
+
+.notice__item {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  min-width: 16rem;
+  max-width: 24rem;
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-left: var(--rail-width) solid var(--state-idle);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: 0 4px 12px rgb(0 0 0 / 10%);
+  font-size: var(--text-sm);
+}
+
+.notice__item--active {
+  border-left-color: var(--state-active);
+}
+.notice__item--failed {
+  border-left-color: var(--state-failed);
+}
+
+/* ---------------------------------------------------------- log drawer */
+
+/*
+ * The deliberate risk: logs are docked and persistent rather than hidden
+ * behind a click per resource. It costs vertical space, and it is justified
+ * because the moment logs matter most is mid-deploy, and because hiding them
+ * is what makes a web panel feel worse than an SSH session.
+ */
+.drawer {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border-top: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-drawer);
+  z-index: 30;
+}
+
+.drawer__bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-4);
+  cursor: pointer;
+  user-select: none;
+}
+
+.drawer__source {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.drawer__tools {
+  margin-left: auto;
+  display: flex;
+  gap: var(--space-1);
+}
+
+.drawer__body {
+  height: 18rem;
+  border-top: 1px solid var(--border);
+  overflow: hidden;
+  transition: height var(--duration) var(--ease);
+}
+
+.drawer[data-open="false"] .drawer__body {
+  height: 0;
+  border-top: none;
+}
+
+/* ----------------------------------------------------------- skeletons */
+
+@keyframes shimmer {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: -100% 0;
+  }
+}
+
+.skeleton {
+  border-radius: var(--radius-sm);
+  background: linear-gradient(
+    90deg,
+    var(--bg-sunken) 25%,
+    var(--surface-hover) 50%,
+    var(--bg-sunken) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.4s linear infinite;
+  color: transparent;
+}
+
+/* htmx marks in-flight requests; showing it beats a spinner nobody asked
+   for. */
+.htmx-request .btn,
+.btn.htmx-request {
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+/* -------------------------------------------------------------- responsive */
+
+@media (max-width: 60rem) {
+  .shell {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    position: fixed;
+    inset: 0 auto 0 0;
+    width: var(--sidebar-width);
+    z-index: 50;
+    transform: translateX(-100%);
+    transition: transform var(--duration) var(--ease);
+  }
+
+  .sidebar[data-open="true"] {
+    transform: none;
+  }
+
+  .row {
+    grid-template-columns: 1fr;
+    align-items: start;
+  }
+
+  .row__actions {
+    justify-content: flex-end;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@media print {
+  .sidebar,
+  .drawer,
+  .toolbar,
+  .notice {
+    display: none;
+  }
+}

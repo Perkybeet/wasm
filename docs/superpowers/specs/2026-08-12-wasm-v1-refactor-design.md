@@ -98,9 +98,16 @@ Debian ni Ubuntu, así que el modo interactivo nunca ha funcionado ahí.
 
 ### D3. Web: hipermedia server-driven, no SPA
 
-htmx 2.x + Jinja2 (con fragmentos) + Tailwind v4 + islas de Alpine.js, más xterm.js para
-terminal y logs y uPlot para métricas. Todo vendorizado con checksums, cero CDN, cero Node
-en runtime.
+htmx 2.x + Jinja2 (con fragmentos) + islas de Alpine.js, más xterm.js para terminal y logs y
+uPlot para métricas. Todo vendorizado con checksums, cero CDN, cero Node en runtime.
+
+**Sin Tailwind y sin ningún paso de build.** La investigación lo recomendaba para que "sin
+build" no significara "feo", pero ese argumento vale cuando se adopta un sistema de diseño
+ajeno. Al escribir uno propio (ver el documento de dirección de diseño), Tailwind solo aporta
+comodidad de escritura, y a cambio mete un binario en CI y un fichero CSS generado que puede
+divergir de su fuente. Para un paquete de distribución, que lo que se lee en el repositorio
+sea exactamente lo que se sirve vale más. El sistema de diseño son propiedades personalizadas
+de CSS y clases semánticas, escritas a mano.
 
 Dos razones, ambas verificadas:
 
