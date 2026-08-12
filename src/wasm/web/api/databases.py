@@ -1217,10 +1217,15 @@ def execute_query(
         statement,
     )
 
-    if request.mode == "read":
+    read_only = request.mode == "read"
+    if read_only:
         _check_read_only(manager.ENGINE_NAME, statement)
 
-    success, output = manager.execute_query(database=database, query=statement)
+    # The keyword check above is a courtesy that gives a clear error; it is not
+    # the guarantee. The guarantee is the server's own read-only transaction,
+    # because a leading keyword does not tell you what a statement does:
+    # WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x begins with WITH.
+    success, output = manager.execute_query(database=database, query=statement, read_only=read_only)
     text, truncated, rows = _truncate(output, request.max_rows)
 
     return QueryResponse(

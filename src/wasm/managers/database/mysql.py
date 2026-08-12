@@ -810,6 +810,8 @@ class MySQLManager(BaseDatabaseManager):
         self,
         database: str,
         query: str,
+        *,
+        read_only: bool = False,
         **kwargs,
     ) -> tuple[bool, str]:
         """
@@ -818,6 +820,9 @@ class MySQLManager(BaseDatabaseManager):
         Args:
             database: Database name.
             query: The statement.
+            read_only: Refuse anything that would change data. The server
+                enforces it, not a keyword allowlist, because a leading
+                keyword does not tell you what a statement does.
             **kwargs: Unused.
 
         Returns:
@@ -830,7 +835,8 @@ class MySQLManager(BaseDatabaseManager):
         if not self.database_exists(database):
             raise DatabaseNotFoundError(f"Database '{database}' does not exist")
 
-        success, output = self._execute_sql(query, database=database)
+        sql = f"START TRANSACTION READ ONLY;\n{query}\nCOMMIT;\n" if read_only else query
+        success, output = self._execute_sql(sql, database=database)
         if not success:
             raise DatabaseQueryError("Query failed", details=output.strip())
         return success, output

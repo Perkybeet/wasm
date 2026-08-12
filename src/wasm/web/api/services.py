@@ -25,7 +25,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from wasm.core.config import SYSTEMD_DIR
-from wasm.core.exceptions import SecurityError, ValidationError, WASMError
+from wasm.core.exceptions import SecurityError, ServiceError, ValidationError, WASMError
 from wasm.core.store import get_store
 from wasm.managers.service_manager import ServiceManager
 from wasm.validators.names import resolve_within, validate_service_name
@@ -489,13 +489,16 @@ def update_service_config(
     if not service_path.is_file():
         raise HTTPException(status_code=404, detail=f"Service not found: {service_name}")
 
+    # Through the manager, never straight to disk. The manager is where unit
+    # ownership is checked, and writing here would let the panel rewrite any
+    # unit in /etc/systemd/system, which is the exact hole the ownership guard
+    # exists to close.
     try:
-        service_path.write_text(data.config)
-        service_path.chmod(0o644)
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"Error updating config: {exc}") from exc
-
-    ServiceManager(verbose=False).daemon_reload()
+        ServiceManager(verbose=False).update_config(service_name, data.config)
+    except (ValidationError, SecurityError) as exc:
+        raise _bad_request(exc) from exc
+    except ServiceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     return ServiceActionResponse(
         success=True,
@@ -511,27 +514,34 @@ def create_service(
     """
     Create a new systemd service.
     """
-    # New services don't use the legacy prefix.
+    # Creation goes through the manager so that the name, the environment and
+    # the ownership rules are enforced in one place. Writing the file here,
+    # which is what this endpoint used to do, meant raw_content could put any
+    # content into any unit path as root while the manager's guard looked on.
+    service_manager = ServiceManager(verbose=False)
     try:
         service_name = validate_service_name(data.name).removesuffix(".service")
-        service_path = _unit_path(service_name)
-        service_content = data.raw_content or _render_unit(data, service_name)
+        if data.raw_content is not None:
+            service_manager.create_from_unit(service_name, data.raw_content)
+        else:
+            if data.restart not in VALID_RESTART_POLICIES:
+                raise ValidationError(
+                    f"Invalid restart policy: {data.restart!r}",
+                    details=f"Use one of: {', '.join(sorted(VALID_RESTART_POLICIES))}.",
+                )
+            service_manager.create_service(
+                name=service_name,
+                command=data.command or "",
+                working_directory=data.working_directory,
+                user=data.user,
+                environment=data.environment or {},
+                restart=data.restart,
+            )
     except (ValidationError, SecurityError) as exc:
         raise _bad_request(exc) from exc
+    except ServiceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    if service_path.exists():
-        raise HTTPException(status_code=400, detail=f"Service already exists: {service_name}")
-
-    try:
-        service_path.write_text(service_content)
-        service_path.chmod(0o644)
-    except OSError as exc:
-        # A half-written unit would be picked up by the next daemon-reload.
-        service_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=500, detail=f"Failed to create service: {exc}") from exc
-
-    service_manager = ServiceManager(verbose=False)
-    service_manager.daemon_reload()
     service_manager.enable(service_name)
 
     return ServiceActionResponse(

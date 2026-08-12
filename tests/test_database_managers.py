@@ -1246,3 +1246,42 @@ def test_registry_still_resolves_every_engine() -> None:
     assert isinstance(get_db_manager("mongo"), MongoDBManager)
     assert isinstance(get_db_manager("redis-server"), RedisManager)
     assert get_db_manager("nosuchengine") is None
+
+
+class TestReadOnlyEnforcement:
+    """
+    Read mode is enforced by the server, not by a keyword allowlist.
+
+    A leading keyword does not tell you what a statement does. PostgreSQL will
+    happily run ``WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x``, which
+    reads as a SELECT to any parser simple enough to trust.
+    """
+
+    def test_postgres_wraps_a_read_in_a_read_only_transaction(self, postgres, runner):
+        runner.script(["sudo", "-u", "postgres", "psql"], stdout="1\n")
+
+        postgres.execute_query(
+            database="app",
+            query="WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x",
+            read_only=True,
+        )
+
+        sent = runner.inputs[-1]
+        assert sent.startswith("BEGIN READ ONLY;")
+        assert sent.rstrip().endswith("COMMIT;")
+
+    def test_postgres_does_not_wrap_a_write(self, postgres, runner):
+        runner.script(["sudo", "-u", "postgres", "psql"], stdout="1\n")
+
+        postgres.execute_query(database="app", query="DELETE FROM t", read_only=False)
+
+        assert "BEGIN READ ONLY" not in (runner.inputs[-1] or "")
+
+    def test_mysql_wraps_a_read_in_a_read_only_transaction(self, mysql, runner):
+        runner.script(["mysql"], stdout="app\n")
+
+        mysql.execute_query(database="app", query="SELECT 1", read_only=True)
+
+        sent = runner.inputs[-1]
+        assert sent.startswith("START TRANSACTION READ ONLY;")
+        assert sent.rstrip().endswith("COMMIT;")

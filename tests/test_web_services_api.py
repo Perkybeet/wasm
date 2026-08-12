@@ -32,6 +32,7 @@ from wasm.validators.names import (
     validate_filename,
     validate_service_name,
 )
+from wasm.managers.service_manager import WASM_UNIT_MARKER, ServiceManager
 from wasm.web.api import services as services_api
 from wasm.web.api.auth import get_current_session
 
@@ -55,7 +56,9 @@ TRAVERSAL_NAMES = [
     ".hidden/../evil",
 ]
 
-RAW_UNIT = "[Service]\nExecStart=/bin/sh -c 'id > /tmp/pwned'\n"
+#: A unit body an operator could legitimately paste into advanced mode. It
+#: carries the marker, without which the manager refuses to write it.
+RAW_UNIT = f"# {WASM_UNIT_MARKER}\n[Service]\nExecStart=/bin/true\n"
 
 
 class FakeServiceManager:
@@ -299,11 +302,35 @@ class TestSymlinkEscape:
         assert outside.exists()
 
 
+@pytest.fixture
+def sandboxed_manager(unit_dir: Path, monkeypatch: pytest.MonkeyPatch, runner):
+    """
+    Point the real ServiceManager at the sandbox.
+
+    The happy-path tests use the real manager rather than a stub, because the
+    guarantee worth testing is that the endpoint delegates every write to it.
+    A stub would pass whether or not the endpoint still wrote the file itself,
+    which is exactly the hole this endpoint had.
+
+    Args:
+        unit_dir: The sandbox unit directory.
+        monkeypatch: Patching helper, scoped to the test.
+        runner: The FakeRunner fixture, so systemctl is never invoked.
+
+    Returns:
+        The FakeRunner, for asserting on the commands the manager issued.
+    """
+    monkeypatch.setattr(ServiceManager, "SYSTEMD_DIR", unit_dir)
+    monkeypatch.setattr(ServiceManager, "UNIT_SEARCH_DIRS", (unit_dir,))
+    monkeypatch.setattr(services_api, "ServiceManager", ServiceManager, raising=False)
+    return runner
+
+
 class TestHappyPath:
     """Legitimate requests keep working and land inside the unit directory."""
 
     def test_create_writes_unit_inside_unit_dir(
-        self, client: TestClient, unit_dir: Path, fake_manager
+        self, client: TestClient, unit_dir: Path, sandboxed_manager
     ) -> None:
         """A well-formed name creates the unit file in the configured directory."""
         response = client.post(
@@ -316,20 +343,48 @@ class TestHappyPath:
         assert unit.exists()
         assert "ExecStart=/usr/bin/node /var/www/apps/my-app/server.js" in unit.read_text()
 
+    def test_create_goes_through_the_manager(
+        self, client: TestClient, unit_dir: Path, sandboxed_manager
+    ) -> None:
+        """
+        The endpoint must not write the unit itself.
+
+        Writing here is how raw_content could put arbitrary content at a unit
+        path as root while the manager's ownership guard looked on.
+        """
+        client.post("/api/services", json={"name": "my-app", "command": "/bin/true"})
+
+        assert sandboxed_manager.ran("systemctl", "daemon-reload")
+
     def test_update_config_writes_inside_unit_dir(
-        self, client: TestClient, unit_dir: Path, fake_manager
+        self, client: TestClient, unit_dir: Path, sandboxed_manager
     ) -> None:
         """Updating an existing unit rewrites exactly that file."""
         unit = unit_dir / "my-app.service"
-        unit.write_text("[Service]\nExecStart=/bin/true\n")
+        unit.write_text(RAW_UNIT)
 
         response = client.put("/api/services/my-app/config", json={"config": RAW_UNIT})
 
         assert response.status_code == 200, response.text
         assert unit.read_text() == RAW_UNIT
 
+    def test_update_config_refuses_a_body_that_drops_the_marker(
+        self, client: TestClient, unit_dir: Path, sandboxed_manager
+    ) -> None:
+        """A rewrite cannot orphan the unit from WASM's own management."""
+        unit = unit_dir / "my-app.service"
+        unit.write_text(RAW_UNIT)
+
+        response = client.put(
+            "/api/services/my-app/config",
+            json={"config": "[Service]\nExecStart=/bin/true\n"},
+        )
+
+        assert 400 <= response.status_code < 500, response.text
+        assert unit.read_text() == RAW_UNIT
+
     def test_create_rejects_injected_directives_in_simple_mode(
-        self, client: TestClient, unit_dir: Path, fake_manager
+        self, client: TestClient, unit_dir: Path, sandboxed_manager
     ) -> None:
         """Newlines in simple-mode fields must not smuggle extra unit directives."""
         response = client.post(

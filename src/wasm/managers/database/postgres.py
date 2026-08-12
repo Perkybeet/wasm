@@ -13,7 +13,7 @@ arrives intact.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from wasm.core.exceptions import (
@@ -152,6 +152,7 @@ class PostgresManager(BaseDatabaseManager):
         *,
         secrets: Sequence[str] = (),
         timeout: int = QUERY_TIMEOUT,
+        env: Mapping[str, str] | None = None,
     ) -> tuple[bool, str]:
         """
         Run SQL as the cluster superuser, passing the statement on stdin.
@@ -161,6 +162,7 @@ class PostgresManager(BaseDatabaseManager):
             database: Database to connect to.
             secrets: Values the statement carries that must not be logged.
             timeout: Deadline in seconds.
+            env: Extra environment for psql, such as PGOPTIONS.
 
         Returns:
             Whether psql succeeded, and its output or its error text.
@@ -170,6 +172,7 @@ class PostgresManager(BaseDatabaseManager):
             input=sql,
             timeout=timeout,
             secrets=secrets,
+            env=env,
         )
         return result.success, result.stdout if result.success else result.stderr
 
@@ -860,6 +863,8 @@ class PostgresManager(BaseDatabaseManager):
         self,
         database: str,
         query: str,
+        *,
+        read_only: bool = False,
         **kwargs,
     ) -> tuple[bool, str]:
         """
@@ -868,6 +873,11 @@ class PostgresManager(BaseDatabaseManager):
         Args:
             database: Database name.
             query: The statement.
+            read_only: Refuse anything that would change data. Enforcement is
+                the server's, not a keyword allowlist: PostgreSQL lets a
+                data-modifying CTE hide behind a leading ``WITH``, so
+                ``WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x`` reads
+                as a SELECT to any parser simple enough to be trustworthy.
             **kwargs: Unused.
 
         Returns:
@@ -880,7 +890,17 @@ class PostgresManager(BaseDatabaseManager):
         if not self.database_exists(database):
             raise DatabaseNotFoundError(f"Database '{database}' does not exist")
 
-        success, output = self._execute_sql(query, database=database)
+        if read_only:
+            # A read-only transaction rejects INSERT, UPDATE, DELETE, DDL and
+            # data-modifying CTEs alike, and it cannot be escalated from inside
+            # because SET TRANSACTION READ WRITE is refused once the session
+            # default is read-only.
+            sql = f"BEGIN READ ONLY;\n{query}\nCOMMIT;\n"
+            env = {"PGOPTIONS": "-c default_transaction_read_only=on"}
+        else:
+            sql, env = query, None
+
+        success, output = self._execute_sql(sql, database=database, env=env)
         if not success:
             raise DatabaseQueryError("Query failed", details=output.strip())
         return success, output

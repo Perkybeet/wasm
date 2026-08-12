@@ -828,6 +828,69 @@ class ServiceManager(BaseManager):
 
         self.logger.debug(f"Created service: {unit}")
 
+    def create_from_unit(self, name: str, content: str) -> None:
+        """
+        Create a unit from a complete file the caller wrote by hand.
+
+        This exists because the panel offers an advanced mode where an operator
+        supplies the whole unit. That mode used to write the file directly,
+        which meant it could put any content at any unit path as root while the
+        ownership guard on this class looked on. Routing it here applies the
+        same rules as every other write.
+
+        Args:
+            name: Service name.
+            content: Complete unit file body.
+
+        Raises:
+            ServiceError: When a unit of that name already exists anywhere
+                systemd looks, when the body lacks the WASM marker, or when the
+                write fails.
+            ValidationError: When the name is not a safe unit name.
+        """
+        unit = self._get_service_name(name)
+        self._check_unit_body(unit, content)
+
+        info = self.inspect_unit(unit)
+        if info.exists:
+            if info.managed:
+                raise ServiceError(
+                    f"Service already exists: {info.unit}",
+                    details=f"Delete it first, or edit {info.path}.",
+                )
+            raise ServiceError(
+                f"Refusing to create a unit that is not WASM's to create: {info.unit}",
+                details=f"{info.reason}. Choose a different service name.",
+            )
+
+        self._write_unit_atomically(self._get_service_file(unit), content)
+        self.daemon_reload()
+
+    def _check_unit_body(self, unit: str, content: str) -> None:
+        """
+        Reject a unit body that WASM must not write.
+
+        Args:
+            unit: Unit name, for the error message.
+            content: Candidate unit body.
+
+        Raises:
+            ServiceError: When the marker is missing or the body is not text.
+        """
+        if WASM_UNIT_MARKER not in content:
+            raise ServiceError(
+                f"Refusing to write a unit without the WASM marker: {unit}",
+                details=(
+                    f"Keep the '# {WASM_UNIT_MARKER}' comment in the file. Without it "
+                    "WASM stops recognising the unit as its own and refuses to manage it."
+                ),
+            )
+        if "\x00" in content:
+            raise ServiceError(
+                f"Refusing to write a unit containing a NUL byte: {unit}",
+                details="A unit file is text; a NUL byte would truncate it.",
+            )
+
     def update_config(self, name: str, content: str) -> str:
         """
         Replace the body of a unit WASM manages.
