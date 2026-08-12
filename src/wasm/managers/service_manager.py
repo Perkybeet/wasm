@@ -657,6 +657,14 @@ class ServiceManager(BaseManager):
             "pid": details.get("MainPID", ""),
             "memory": details.get("MemoryCurrent", ""),
             "uptime": details.get("ActiveEnterTimestamp", ""),
+            # "active" alone cannot tell a healthy service from one systemd is
+            # restarting every few seconds: a crash loop spends most of its time
+            # in activating/auto-restart and reports active in between. These
+            # four are what distinguishes the two.
+            "active_state": details.get("ActiveState", ""),
+            "sub_state": details.get("SubState", ""),
+            "restarts": details.get("NRestarts", "0"),
+            "result": details.get("Result", ""),
         }
 
     # Creation -------------------------------------------------------------

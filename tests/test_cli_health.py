@@ -205,17 +205,24 @@ def invoke(*args: str, **kwargs: Any) -> Result:
     return CliRunner().invoke(cli_health.cli, list(args), **kwargs)
 
 
-def _app(domain: str) -> App:
+def _app(domain: str, *, is_static: bool = False) -> App:
     """
     Build an application record.
 
     Args:
         domain: The domain the app is served on.
+        is_static: Whether it is served from a directory rather than by a
+            systemd unit.
 
     Returns:
         The record the store would return.
     """
-    return App(id=1, domain=domain, app_path=f"/var/www/apps/{domain}")
+    return App(
+        id=1,
+        domain=domain,
+        app_path=f"/var/www/apps/{domain}",
+        is_static=is_static,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -308,19 +315,19 @@ def test_a_running_application_is_reported_as_running(server: Any) -> None:
     result = invoke(standalone_mode=False)
 
     assert result.return_value == 0, result.output
-    assert "Applications: 1/1 running" in result.output
+    assert "Applications: 1/1 serving" in result.output
     assert server.services.asked == ["example-com"], "the unit name was not built from the domain"
 
 
 def test_a_stopped_application_is_a_warning_not_a_running_count(server: Any) -> None:
-    """A stopped app is counted as stopped and named in the summary."""
+    """A stopped app is counted as needing attention and named in the summary."""
     server.store = _FakeStore([_app("example.com")])
     server.services = _FakeServices({"example-com": False})
 
     result = invoke(standalone_mode=False)
 
     assert result.return_value == 0, result.output
-    assert "Applications: 0/1 running, 1 stopped" in result.output
+    assert "Applications: 0/1 serving, 1 need attention" in result.output
 
 
 def test_an_unqueryable_application_does_not_fail_the_whole_check(server: Any) -> None:
@@ -331,7 +338,49 @@ def test_an_unqueryable_application_does_not_fail_the_whole_check(server: Any) -
     result = invoke(standalone_mode=False)
 
     assert result.return_value == 0, result.output
-    assert "0/1 running" in result.output
+    assert "0/1 serving" in result.output
+
+
+def test_a_static_site_is_not_reported_as_stopped(server: Any) -> None:
+    """
+    The false alarm an operator hit: five healthy static sites called stopped.
+
+    A static site is served by nginx from a directory. There is no systemd unit
+    for it, so asking systemd whether it is running can only ever say no.
+    """
+    server.store = _FakeStore([_app("example.com", is_static=True)])
+    server.services = _FakeServices({})
+
+    result = invoke(standalone_mode=False)
+
+    assert result.return_value == 0, result.output
+    assert "Applications: 1/1 serving (1 static)" in result.output
+    assert "need attention" not in result.output
+    assert server.services.asked == [], "a static site has no unit to ask about"
+
+
+def test_list_and_health_agree_on_the_same_machine(server: Any) -> None:
+    """
+    The two commands contradicted each other, which is why this exists.
+
+    They now share one resolver, so this asserts the seam rather than the
+    wording: given the same store and the same systemd, both reach the same
+    state for every application.
+    """
+    from wasm.core.app_state import RUNNING, STATIC, STOPPED, resolve_states
+
+    apps = [
+        _app("running.example.com"),
+        _app("stopped.example.com"),
+        _app("static.example.com", is_static=True),
+    ]
+    services = _FakeServices({"running-example-com": True, "stopped-example-com": False})
+
+    states = resolve_states(apps, services)
+
+    assert states["running.example.com"].label == RUNNING
+    assert states["stopped.example.com"].label == STOPPED
+    assert states["static.example.com"].label == STATIC
 
 
 def test_a_stopped_web_server_is_an_issue_and_exits_one(server: Any) -> None:

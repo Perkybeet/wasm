@@ -34,9 +34,11 @@ class InteractiveMode:
             raise WASMError(
                 "Interactive mode needs questionary, which is missing",
                 details=(
-                    "It is a hard dependency, so this means a broken install.\n"
-                    "  pip install --force-reinstall wasm-cli\n"
-                    "  or, on a distribution package: apt install python3-questionary"
+                    "Every other command works without it. To get it:\n"
+                    "  apt install python3-questionary        Debian 13, Ubuntu 24.04+\n"
+                    "  dnf install python3-questionary        Fedora 42+\n"
+                    "  pip install questionary                anywhere else\n"
+                    "It is not packaged for Debian 12, Ubuntu 22.04 or Leap 15."
                 ),
             )
 

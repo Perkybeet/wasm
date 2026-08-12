@@ -33,15 +33,16 @@ from typing import Any, TypeVar
 import click
 
 from wasm.cli.app import Context, enable_dry_run, pass_context
+from wasm.core.app_state import RUNNING, STATIC, resolve_states
 from wasm.core.config import Config
 from wasm.core.dependencies import check_deployment_ready
 from wasm.core.exceptions import DeploymentError, ServiceError, WASMError
-from wasm.core.logger import Logger, set_colors_disabled
+from wasm.core.logger import Logger, set_colors_disabled, state, styled
 from wasm.core.runner import (
     CommandResult,
     get_runner,
 )
-from wasm.core.store import AppStatus, get_store
+from wasm.core.store import get_store
 from wasm.core.utils import domain_to_app_name, remove_directory
 from wasm.deployers import detect_app_type, get_deployer
 from wasm.deployers.docker_compose import DockerComposeDeployer
@@ -464,29 +465,43 @@ def _list_apps(logger: Logger) -> int:
         logger.info("  wasm deploy -d example.com -s https://github.com/user/repo")
         return 0
 
+    # Asked of systemd and of the port, not read from the status column. That
+    # column is written at deploy time and never again, so it called everything
+    # Running while health, which did ask, reported half of them stopped.
+    states = resolve_states(apps, ServiceManager(verbose=logger.verbose))
+
     headers = ["Domain", "Type", "Status", "Port", "SSL"]
     rows = []
 
-    labels = {
-        AppStatus.RUNNING.value: "Running",
-        AppStatus.STOPPED.value: "Stopped",
-        AppStatus.DEPLOYING.value: "Deploying",
-        AppStatus.FAILED.value: "Failed",
-    }
-
     for app in apps:
-        status_str = labels.get(app.status, "Unknown")
-        port_str = str(app.port) if app.port else "static"
-        ssl_str = "yes" if app.ssl_enabled else "no"
+        current = states[app.domain]
+        rows.append(
+            [
+                styled(app.domain, "bold"),
+                app.app_type,
+                state(current.label),
+                styled(app.port, "") if app.port else state("static"),
+                state("yes") if app.ssl_enabled else state("no"),
+            ]
+        )
 
-        rows.append([app.domain, app.app_type, status_str, port_str, ssl_str])
+    logger.table(headers, rows, justify=["left", "left", "left", "right", "left"])
 
-    logger.table(headers, rows)
+    running = sum(1 for s in states.values() if s.label == RUNNING)
+    static = sum(1 for s in states.values() if s.label == STATIC)
+    unhealthy = [(domain, s) for domain, s in states.items() if not s.healthy]
 
     logger.blank()
-    running = sum(1 for a in apps if a.status == AppStatus.RUNNING.value)
-    static = sum(1 for a in apps if a.is_static)
     logger.info(f"Total: {len(apps)} apps ({running} running, {static} static)")
+
+    # The reason belongs next to the list. Making the operator run a second
+    # command to find out why something says Stopped is how the contradiction
+    # between these two commands went unnoticed for as long as it did.
+    if unhealthy:
+        logger.blank()
+        logger.warning(f"{len(unhealthy)} need attention:")
+        for domain, current in unhealthy:
+            logger.list_item(f"{domain} - {current.detail or current.label.lower()}")
 
     return 0
 

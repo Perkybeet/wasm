@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        1.0.3
+Version:        1.1.0
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -15,20 +15,48 @@ Source1:        wasm.default.yaml
 Source2:        wasm.1
 BuildArch:      noarch
 
+# On Leap 15.x, python3 is 3.6. It cannot parse this code, so building against
+# it produced a package that installed and then failed with SyntaxError on the
+# first command, which is worse than not building. The 3.11 flavor is packaged
+# there, so name it explicitly; %%python3_sitelib follows %%__python3.
+%if 0%{?suse_version} && 0%{?suse_version} < 1600
+%define __python3 /usr/bin/python3.11
+%define python3_pkgversion 311
+%else
+%define python3_pkgversion 3
+%endif
+
 # Build requirements. Deliberately only what builds a wheel: nothing here runs
 # the package, so no runtime import is needed at build time.
-BuildRequires:  python3-devel
-BuildRequires:  python3-setuptools
-BuildRequires:  python3-pip
-BuildRequires:  python3-wheel
+BuildRequires:  python%{python3_pkgversion}-devel
+BuildRequires:  python%{python3_pkgversion}-setuptools
+BuildRequires:  python%{python3_pkgversion}-pip
+BuildRequires:  python%{python3_pkgversion}-wheel
+
+# %%py3_build, %%py3_install and %%python3_sitelib live here. python3-devel
+# happens to pull it in, but python311-devel does not, and on Leap 15.x the
+# build then ran the literal string "%%py3_build" as a shell command.
+%if 0%{?suse_version}
+BuildRequires:  python-rpm-macros
+%endif
 
 # Fedora/RHEL specific
 %if 0%{?fedora} || 0%{?rhel}
 Requires:       python3-click >= 8.0
 Requires:       python3-jinja2 >= 3.1.0
 Requires:       python3-pyyaml >= 6.0
-Requires:       python3-questionary
 Requires:       python3-rich
+# questionary reached Fedora in 42. On 40 and 41 the package built and then
+# refused to install: the automatic generator turns the wheel metadata into
+# python3.Xdist(questionary), and nothing there provides it. Filter that and ask
+# for it softly. Interactive mode checks for it and says so when it is missing;
+# every other command works without it.
+%if 0%{?fedora} && 0%{?fedora} < 42
+%global __requires_exclude ^python3\\.[0-9]+dist\\(questionary\\)
+Recommends:     python3-questionary
+%else
+Requires:       python3-questionary
+%endif
 # The panel is optional. Everything it needs is packaged in Fedora.
 Suggests:       python3-fastapi
 Suggests:       python3-starlette
@@ -37,22 +65,34 @@ Suggests:       python3-uvicorn
 Suggests:       python3-psutil
 %endif
 
-# openSUSE specific
+# openSUSE specific. The package names are capitalised there, and on Leap 15.x
+# they carry the flavor prefix.
 %if 0%{?suse_version}
-Requires:       python3-click >= 8.0
-Requires:       python3-Jinja2 >= 3.1.0
-Requires:       python3-PyYAML >= 6.0
+Requires:       python%{python3_pkgversion}-click >= 8.0
+Requires:       python%{python3_pkgversion}-Jinja2 >= 3.1.0
+Requires:       python%{python3_pkgversion}-PyYAML >= 6.0
+Requires:       python%{python3_pkgversion}-rich
+Suggests:       python%{python3_pkgversion}-fastapi
+Suggests:       python%{python3_pkgversion}-starlette
+Suggests:       python%{python3_pkgversion}-pydantic
+Suggests:       python%{python3_pkgversion}-uvicorn
+Suggests:       python%{python3_pkgversion}-psutil
+%if 0%{?suse_version} < 1600
+Requires:       python311
+# questionary is not packaged for 3.11 on Leap. Interactive mode already checks
+# for it and explains its absence, and every other command works without it, so
+# it is recommended rather than required.
+Recommends:     python311-questionary
+%else
+Requires:       python3 >= 3.10
 Requires:       python3-questionary
-Requires:       python3-rich
-Suggests:       python3-fastapi
-Suggests:       python3-starlette
-Suggests:       python3-pydantic
-Suggests:       python3-uvicorn
-Suggests:       python3-psutil
+%endif
 %endif
 
 # Runtime requirements (common)
+%if 0%{?fedora} || 0%{?rhel}
 Requires:       python3 >= 3.10
+%endif
 
 # Suggested packages (not required for installation)
 Suggests:       nginx
@@ -83,17 +123,36 @@ Features:
 %autosetup -n wasm-%{version}
 
 %build
-# The pyproject macros where they exist (Fedora deprecated %py3_build in 43 and
+# The pyproject macros where they exist (Fedora deprecated %%py3_build in 43 and
 # the openSUSE guidelines forbid the legacy equivalents), and the old ones on
 # the distributions that do not have them yet.
-%if %{defined pyproject_wheel}
+#
+# Every %% above is doubled on purpose. A macro named in a comment inside a
+# scriptlet is still expanded, and these expand to several lines: the # only
+# comments out the first one and rpm runs the rest. That is what broke all
+# thirteen RPM targets in 1.0.3, where this comment ran setup.py with the
+# words "in 43 and" as its arguments.
+#
+# The branch is on the distribution, not on whether the macro exists. openSUSE
+# defines %%pyproject_wheel too, but wires it to whichever Python flavor is
+# primary that week (python314 as of writing) rather than to the interpreter
+# python3-devel installs, so the build asked for /usr/bin/python3.14 and there
+# was none. %%py3_build uses %%{__python3}, which is the one that is there.
+# Refuse to build against an interpreter that cannot run the result. Without
+# this, Leap 15.6 built a package against Python 3.6 and published it; it
+# installed cleanly and raised SyntaxError on the first command.
+%{__python3} -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' || { \
+    echo "wasm-cli needs Python 3.10 or newer, and %{__python3} is older."; \
+    exit 1; }
+
+%if 0%{?fedora} || 0%{?rhel}
 %pyproject_wheel
 %else
 %py3_build
 %endif
 
 %install
-%if %{defined pyproject_install}
+%if 0%{?fedora} || 0%{?rhel}
 %pyproject_install
 %else
 %py3_install
@@ -163,6 +222,17 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
 fi
 
 %changelog
+* Wed Aug 12 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.1.0-1
+- Fix: wasm list reports the state systemd and the port actually report, not the value written at deploy time; it and wasm health no longer contradict each other
+- Fix: a service systemd is restarting every few seconds, or one that accepts no connections, is no longer reported as running
+- Fix: static sites are no longer counted as stopped; they have no service to run
+- Fix: the RPM builds on Fedora and openSUSE again; a macro named in a comment inside the build section was expanded and ran
+- Fix: Leap 15.x builds against the packaged Python 3.11 instead of 3.6, which could not run the result
+- Fix: the package installs on Debian 12, Ubuntu 22.04 and Fedora 41, where python3-questionary does not exist
+- Fix: wasm web start refuses a port that is already taken instead of printing a token and then failing to bind
+- Fix: wasm --no-color applies to wasm health, and the logger follows a redirected stdout
+- Change: wasm list is a coloured table where colour encodes state, and it names what needs attention
+- Change: publishing waits for the .deb and the RPM to be built, installed and run in clean containers
 * Wed Aug 12 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.0.3-1
 - Fix: the Debian build dependencies in wasm.dsc and debian.control agree, and are the minimum that builds a wheel
 * Wed Aug 12 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.0.2-1
@@ -249,24 +319,24 @@ fi
 - Enhancement: Add create_advanced_site method to NginxManager
 - Enhancement: Improve PostgreSQL and Redis database managers
 
-* Thu Feb 06 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.14.4-1
+* Fri Feb 06 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.14.4-1
 - Fix: service_exists() not finding legacy wasm- prefixed services
 - Fix: Update command fails to restart legacy services
 
-* Thu Feb 06 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.14.3-1
+* Fri Feb 06 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.14.3-1
 - Fix: Monorepo detection too aggressive (single Next.js apps misdetected)
 - Fix: Update command crashes with MonorepoDeployer (missing pre_install)
 - Fix: Update checker shows false positive when already on latest version
 - Fix: Update checker recommends pip when installed via apt/dnf
 - Fix: Release workflow supports manual re-trigger via workflow_dispatch
 
-* Tue Feb 04 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.14.2-1
+* Wed Feb 04 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.14.2-1
 - Feature: Add MonorepoDeployer for Turborepo/pnpm workspace deployments
 - Feature: New CLI options --subdomains, --workspaces, --no-database
 - Fix: Update command now queries database for app_path (supports legacy apps)
 - Add workspace and turbo helpers for monorepo detection
 
-* Tue Jan 28 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.14.1-1
+* Wed Jan 28 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.14.1-1
 - Fix: API verify() returns correct keys (checksum_ok, files_ok)
 - Fix: BackupMetadata now persists includes_build field
 - Fix: Backup rotation uses direct app_name lookup
@@ -275,7 +345,7 @@ fi
 - Feature: New --include-databases flag for backup create
 - Enhancement: API and CLI now expose all backup options
 
-* Wed Jan 15 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.14.0-1
+* Thu Jan 15 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.14.0-1
 - Feature: New 'wasm health' command for system diagnostics
 - Feature: New 'wasm config' command (upgrade, show, path)
 - Feature: Automatic config migration on package upgrade
@@ -290,54 +360,54 @@ fi
 - Enhancement: Improved process fallback with better ps parsing
 - Enhancement: Notification report includes all threats for audit
 
-* Wed Jan 15 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.16-1
+* Thu Jan 15 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.16-1
 - Fix: Move python3-inquirer from Depends to Recommends
 - Fix: Package installs on systems without python3-inquirer in repos
 - Enhancement: Interactive mode now optional (install inquirer via pip)
 
-* Wed Jan 15 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.15-1
+* Thu Jan 15 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.15-1
 - Enhancement: Set update checker interval to instant (CHECK_INTERVAL = 0)
 - Enhancement: Change update notification color to softer yellow
 - Feature: Add --changelog flag to view current version changelog
 - Feature: New version.py module for version information display
 
-* Wed Jan 15 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.14-1
+* Thu Jan 15 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.14-1
 - Fix: OBS build failures - add missing python3-inquirer dependency
 - Enhancement: Ensure all OBS package dependencies are declared
 
-* Wed Jan 15 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.13-1
+* Thu Jan 15 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.13-1
 - Fix: Critical bare except clause in monitor API
 - Fix: Static apps (Vite) trying to restart non-existent services
 - Fix: Update checker now detects installation method
 - Feature: Update banner in web dashboard
 - Feature: /api/system/version endpoint for update checking
 
-* Tue Jan 14 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.12-1
+* Wed Jan 14 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.12-1
 - chore: Clean distribution packages (remove Docker files, dev tools)
 - feat: Add .gitattributes to exclude dev files from git archive
 - feat: Add MANIFEST.in to control PyPI source distribution
 
-* Tue Jan 14 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.11-1
+* Wed Jan 14 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.11-1
 - Fix: Environment variables with quotes properly stripped from .env files
 - Feature: Automatic update checker via GitHub Releases API
 - Enhancement: Update checker runs post-command to avoid delays
 
-* Wed Jan 08 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.7-1
+* Thu Jan 08 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.7-1
 - Fix: 'wasm store sync' now updates app status along with service status
 
-* Wed Jan 08 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.6-1
+* Thu Jan 08 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.6-1
 - Fix: 'wasm store sync' attribute naming (service.status vs service.active)
 
-* Wed Jan 08 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.5-1
+* Thu Jan 08 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.5-1
 - Fix: 'wasm store import' finds app directories with multiple naming conventions
 
-* Wed Jan 08 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.4-1
+* Thu Jan 08 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.4-1
 - Fix: 'wasm store import' using wrong attribute name (unit_file)
 
-* Wed Jan 08 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.3-1
+* Thu Jan 08 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.3-1
 - Fix: Corrupted debian.postrm script causing upgrade failure
 
-* Wed Jan 08 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.2-1
+* Thu Jan 08 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.2-1
 - Feature: SQLite persistence store for tracking deployed apps
 - New: Store tracks apps, sites, services, and databases
 - New: wasm store commands (init, stats, import, export, sync, path)
@@ -346,7 +416,7 @@ fi
 - Enhancement: Managers (nginx, apache, service, cert) register in store
 - Fix: GitHub Actions .deb build missing pybuild-plugin-pyproject
 
-* Mon Dec 30 2025 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.1-1
+* Tue Dec 30 2025 Perkybeet <yago.lopez.adeje@gmail.com> - 0.13.1-1
 - Fix: Systemd services failing with 'Permission denied' when using nvm
 - Fix: Detect and avoid private paths (nvm, ~/.local) in service ExecStart
 - Fix: Prefer global Node.js installation over user-specific nvm paths

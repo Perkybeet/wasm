@@ -143,7 +143,15 @@ jobs:
   deb-in-a-clean-container:
     name: Build the .deb as OBS would
     runs-on: ubuntu-latest
-    container: ubuntu:24.04
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest and newest of each. Debian 12 and Ubuntu 22.04 are here
+        # because they are the two releases without python3-questionary: the
+        # package built there and apt then refused to install it, and nothing
+        # in this workflow noticed because the job only listed the contents.
+        image: ["debian:12", "debian:13", "ubuntu:22.04", "ubuntu:24.04", "ubuntu:26.04"]
     steps:
       - name: Install only what a build host has
         run: |
@@ -195,9 +203,106 @@ jobs:
           done
           echo "Every expected file is in the package"
 
+      # Building and installing are different claims. Debian 12 and Ubuntu
+      # 22.04 built a package apt would not install, because it depended on
+      # python3-questionary and those two releases do not have it. Listing the
+      # contents said nothing about that.
+      - name: Install it and run it
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get install -y "$(ls ../wasm_*.deb)"
+          wasm --version
+          wasm --help > /dev/null
+          wasm list --help > /dev/null
+          echo "The package installs and the command runs"
+
+  # The same thing for the RPM distributions, which are thirteen of the
+  # twenty-two OBS targets and were the thirteen that failed.
+  #
+  # Two of the three defects it now catches were invisible on a developer
+  # machine: a macro named inside a comment in %build is still expanded, and
+  # the expansion is several lines, so the # comments out only the first one
+  # and rpm runs the rest. That single comment failed every Fedora and
+  # openSUSE target at once.
+  rpm-in-a-clean-container:
+    name: Build the RPM as OBS would
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # questionary reached Fedora in 42, so 41 is the one that proves the
+          # requirement filter works.
+          - image: "fedora:41"
+            install: "dnf install -y rpm-build python3-devel python3-setuptools python3-pip python3-wheel"
+          - image: "fedora:43"
+            install: "dnf install -y rpm-build python3-devel python3-setuptools python3-pip python3-wheel"
+          - image: "opensuse/tumbleweed"
+            install: "zypper --non-interactive --gpg-auto-import-keys refresh && zypper --non-interactive install -y rpm-build python3-devel python3-setuptools python3-pip python3-wheel python-rpm-macros tar gzip"
+          # Leap 15.6's python3 is 3.6, which cannot parse this code. It builds
+          # against the packaged 3.11 flavor instead, and this is what proves
+          # the resulting package targets that interpreter.
+          - image: "opensuse/leap:15.6"
+            install: "zypper --non-interactive --gpg-auto-import-keys refresh && zypper --non-interactive install -y rpm-build python311-devel python311-setuptools python311-pip python311-wheel python-rpm-macros tar gzip"
+          - image: "opensuse/leap:16.0"
+            install: "zypper --non-interactive --gpg-auto-import-keys refresh && zypper --non-interactive install -y rpm-build python3-devel python3-setuptools python3-pip python3-wheel python-rpm-macros tar gzip"
+    steps:
+      - name: Install only what a build host has
+        run: ${{ matrix.install }}
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      # The same tarball the OBS job uploads: git archive of the tag, so only
+      # committed files are in it and the build needs no network.
+      - name: Lay out the rpmbuild tree
+        run: |
+          version=$(awk '/^Version:/ {print $2; exit}' rpm/wasm.spec)
+          mkdir -p /rpmbuild/SOURCES /rpmbuild/SPECS
+          git config --global --add safe.directory "$PWD"
+          git archive --format=tar.gz --prefix="wasm-${version}/" HEAD ':!debian' \
+            > "/rpmbuild/SOURCES/wasm-${version}.tar.gz"
+          cp obs/wasm.default.yaml obs/wasm.1 /rpmbuild/SOURCES/
+          cp rpm/wasm.spec /rpmbuild/SPECS/
+
+      - name: Build
+        run: rpmbuild --define "_topdir /rpmbuild" -ba /rpmbuild/SPECS/wasm.spec
+
+      - name: Check the package holds what it should
+        run: |
+          rpm=$(find /rpmbuild/RPMS -name '*.rpm' | head -1)
+          echo "Built $rpm"
+          rpm -qlp "$rpm" > contents.txt
+          for path in \
+            share/bash-completion/completions/wasm \
+            share/man/man1/wasm.1 \
+            web/templates/base.html \
+            web/static/app.css \
+            web/static/vendor/htmx.min.js
+          do
+            grep -q "$path" contents.txt || { echo "MISSING from the package: $path"; exit 1; }
+          done
+          echo "Every expected file is in the package"
+
+      - name: Install it and run it
+        run: |
+          rpm=$(find /rpmbuild/RPMS -name '*.rpm' | head -1)
+          if command -v dnf > /dev/null; then
+            dnf install -y --nogpgcheck "$rpm"
+          else
+            zypper --non-interactive install --allow-unsigned-rpm -y "$rpm"
+          fi
+          wasm --version
+          wasm --help > /dev/null
+          wasm list --help > /dev/null
+          echo "The package installs and the command runs"
+
   release:
     name: Create Release
-    needs: [verify, quality, clean-install, deb-in-a-clean-container]
+    needs: [verify, quality, clean-install, deb-in-a-clean-container, rpm-in-a-clean-container]
     runs-on: ubuntu-latest
     outputs:
       upload_url: ${{ steps.create_release.outputs.upload_url }}

@@ -708,6 +708,38 @@ def _prompt_install(missing_apt: list[str], missing_pip: list[str], verbose: boo
 # ---------------------------------------------------------------------------
 
 
+def _port_in_use(host: str, port: int) -> bool:
+    """
+    Ask whether the panel's address is already taken.
+
+    Binding is the only reliable answer: a connection attempt says nothing
+    about a socket bound with no backlog, and reading ``ss`` output means
+    parsing a different format on every distribution.
+
+    Args:
+        host: Address the panel would bind.
+        port: Port the panel would bind.
+
+    Returns:
+        True when binding would fail because something holds the address.
+    """
+    family = socket.AF_INET6 if ":" in _strip_brackets(host) else socket.AF_INET
+    probe = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        # Deliberately not SO_REUSEADDR: with it the bind succeeds against a
+        # socket in TIME_WAIT, which is the case this is meant to catch.
+        probe.bind((_strip_brackets(host), port))
+    except OSError:
+        return True
+    except (ValueError, socket.gaierror):
+        # An address this process cannot even parse is not this check's problem;
+        # the bind that follows will report it properly.
+        return False
+    finally:
+        probe.close()
+    return False
+
+
 def _start(options: StartOptions, verbose: bool, *, dry_run: bool = False) -> int:
     """
     Start the panel, refusing an unsafe exposure first.
@@ -772,6 +804,21 @@ def _start(options: StartOptions, verbose: bool, *, dry_run: bool = False) -> in
         except (ProcessLookupError, ValueError):
             # Process not running, remove stale PID file
             get_fs().remove(pid_file, missing_ok=True)
+
+    # The PID file only catches a panel this machine still has a record of. A
+    # panel whose PID file was removed, or anything else on the port, walked
+    # past that check: the token was printed and then uvicorn failed with a
+    # bare OSError, leaving an operator holding a credential for a server that
+    # never started.
+    if not dry_run and _port_in_use(host, config.port):
+        logger.error(f"Something is already listening on {host}:{config.port}")
+        logger.info("If it is a panel this machine has forgotten about:")
+        logger.info("  wasm web stop")
+        logger.info("To see what holds the port:")
+        logger.info(f"  ss -ltnp 'sport = :{config.port}'")
+        logger.info("Or serve somewhere else:")
+        logger.info(f"  wasm web start --port {config.port + 1}")
+        return 1
 
     if config.ip_whitelist:
         logger.info(f"Only these clients may connect: {', '.join(config.ip_whitelist)}")

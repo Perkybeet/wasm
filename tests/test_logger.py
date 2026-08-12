@@ -123,3 +123,120 @@ class TestLogLevel:
         assert LogLevel.DEBUG.value < LogLevel.INFO.value
         assert LogLevel.INFO.value < LogLevel.WARNING.value
         assert LogLevel.WARNING.value < LogLevel.ERROR.value
+
+
+class TestStreamResolution:
+    """The logger has to write where output is being captured right now."""
+
+    def test_output_follows_a_redirected_stdout(self):
+        """
+        The default stream is resolved per write, not bound at import.
+
+        ``stream: TextIO = sys.stdout`` in the signature captured whatever
+        stdout was when the module was first imported, so a test runner or a
+        contextlib.redirect_stdout saw nothing and the real terminal got the
+        output instead.
+        """
+        import contextlib
+
+        logger = Logger()
+        buffer = StringIO()
+        with contextlib.redirect_stdout(buffer):
+            logger.info("Redirected message")
+
+        assert "Redirected message" in buffer.getvalue()
+
+    def test_an_explicit_stream_still_wins(self):
+        """Passing a stream keeps output there regardless of sys.stdout."""
+        import contextlib
+
+        explicit = StringIO()
+        logger = Logger(stream=explicit)
+        elsewhere = StringIO()
+        with contextlib.redirect_stdout(elsewhere):
+            logger.info("Explicit message")
+
+        assert "Explicit message" in explicit.getvalue()
+        assert elsewhere.getvalue() == ""
+
+
+class TestCheck:
+    """The health check's result lines."""
+
+    def test_a_check_shows_what_was_checked_and_what_was_found(self):
+        """
+        Args: none.
+        """
+        stream = StringIO()
+        logger = Logger(stream=stream)
+        logger.check("Disk Space", "135.1GB free", "ok")
+        output = stream.getvalue()
+
+        assert "Disk Space:" in output
+        assert "135.1GB free" in output
+
+    def test_an_unknown_outcome_does_not_raise(self):
+        """A health check must not fail because of its own formatting."""
+        stream = StringIO()
+        logger = Logger(stream=stream)
+        logger.check("Something", "value", "not-an-outcome")
+
+        assert "Something:" in stream.getvalue()
+
+    def test_no_color_leaves_no_escape_codes(self):
+        """``wasm --no-color health`` wrote escape codes anyway."""
+        stream = StringIO()
+        logger = Logger(stream=stream, no_color=True)
+        logger.check("Nginx", "Running", "ok")
+
+        assert "\033[" not in stream.getvalue()
+
+
+class TestTable:
+    """Tables carry the state colour; that is what makes a list scannable."""
+
+    def test_every_row_and_header_is_shown(self):
+        """
+        Args: none.
+        """
+        stream = StringIO()
+        logger = Logger(stream=stream, no_color=True)
+        logger.table(["Domain", "Status"], [["example.com", "Running"]])
+        output = stream.getvalue()
+
+        assert "Domain" in output
+        assert "example.com" in output
+        assert "Running" in output
+
+    def test_an_empty_table_prints_nothing(self):
+        """
+        Args: none.
+        """
+        stream = StringIO()
+        logger = Logger(stream=stream, no_color=True)
+        logger.table(["Domain"], [])
+
+        assert stream.getvalue() == ""
+
+    def test_a_state_carries_its_colour(self):
+        """
+        Args: none.
+        """
+        from wasm.core.logger import state
+
+        assert state("Running").style == "green"
+        assert state("Failed").style == "bold red"
+        assert state("Whatever it is").style == "", "an unknown state gets no arbitrary colour"
+
+    def test_square_brackets_in_a_value_are_not_markup(self):
+        """
+        Rich reads ``[bold]`` as markup, and cells hold arbitrary text.
+
+        A domain or an error message containing brackets would otherwise be
+        swallowed or would recolour the rest of the row.
+        """
+        stream = StringIO()
+        logger = Logger(stream=stream, no_color=True)
+        logger.table(["Message"], [["[red]not a style[/red]"]])
+
+        assert "[red]not a style[/red]" in stream.getvalue()

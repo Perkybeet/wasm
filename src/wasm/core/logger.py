@@ -13,17 +13,97 @@ top-level ``--no-color`` to reach them is a module-level override installed by
 :func:`set_colors_disabled`.
 """
 
+import io
 import json
 import logging
 import os
+import shutil
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, TextIO
+from typing import TYPE_CHECKING, Any, TextIO, cast
+
+from rich.box import SIMPLE_HEAD
+from rich.console import Console
+from rich.table import Table
+from rich.text import Text
+
+if TYPE_CHECKING:  # pragma: no cover - imported for types only
+    from rich.console import JustifyMethod
 
 _colors_disabled: bool = False
+
+#: Width used when the output is not a terminal. Rich would otherwise assume
+#: eighty columns and wrap, which turns a piped table into something no tool
+#: downstream can parse and breaks assertions on long lines in the tests.
+OFFLINE_WIDTH = 200
+
+#: What each state is allowed to look like.
+#:
+#: Colour encodes state and nothing else, so green always means the same thing
+#: wherever it appears and an operator can scan a column without reading it.
+#: Decorative colour is what made the previous output hard to skim: everything
+#: was cyan, so nothing stood out.
+STATE_STYLES: dict[str, str] = {
+    "running": "green",
+    "active": "green",
+    "enabled": "green",
+    "installed": "green",
+    "valid": "green",
+    "ok": "green",
+    "yes": "green",
+    "deploying": "cyan",
+    "building": "cyan",
+    "pending": "cyan",
+    "stopped": "yellow",
+    "inactive": "yellow",
+    "expiring": "yellow",
+    "degraded": "yellow",
+    "restarting": "bold yellow",
+    "no answer": "bold red",
+    "failed": "bold red",
+    "error": "bold red",
+    "expired": "bold red",
+    "missing": "bold red",
+    "no": "dim",
+    "none": "dim",
+    "static": "dim",
+    "unknown": "dim",
+    "disabled": "dim",
+    "n/a": "dim",
+}
+
+
+def state(value: Any) -> Text:
+    """
+    Render a state so its colour matches its meaning.
+
+    Args:
+        value: The state, matched case-insensitively against STATE_STYLES.
+            Anything unrecognised is rendered without colour rather than being
+            given an arbitrary one.
+
+    Returns:
+        Text ready to be placed in a table cell.
+    """
+    text = str(value)
+    return Text(text, style=STATE_STYLES.get(text.strip().lower(), ""))
+
+
+def styled(value: Any, style: str) -> Text:
+    """
+    Render a value with an explicit style.
+
+    Args:
+        value: What to show.
+        style: A Rich style, for example "bold" or "dim".
+
+    Returns:
+        Text ready to be placed in a table cell.
+    """
+    return Text(str(value), style=style)
 
 
 def set_colors_disabled(disabled: bool) -> None:
@@ -115,6 +195,16 @@ class Icons:
     SEARCH = "🔍"
 
 
+#: Marker and colour for each check outcome. The glyphs are the ones every
+#: other command uses, so a check result reads the same as a command result.
+CHECK_MARKERS: dict[str, tuple[str, str]] = {
+    "ok": (Icons.SUCCESS, Colors.GREEN),
+    "warning": (Icons.WARNING, Colors.YELLOW),
+    "error": (Icons.ERROR, Colors.RED),
+    "info": (Icons.INFO, Colors.BLUE),
+}
+
+
 class LogLevel(Enum):
     """Log levels for filtering output."""
 
@@ -145,7 +235,7 @@ class Logger:
         verbose: bool = False,
         no_color: bool = False,
         log_file: Path | None = None,
-        stream: TextIO = sys.stdout,
+        stream: TextIO | None = None,
     ):
         """
         Initialize the logger.
@@ -154,14 +244,39 @@ class Logger:
             verbose: Enable verbose output (shows debug messages).
             no_color: Disable colored output.
             log_file: Optional file path to write logs to.
-            stream: Output stream (defaults to stdout).
+            stream: Output stream. None means "whatever sys.stdout is when the
+                line is written", which is not the same as passing sys.stdout:
+                a default argument is bound once, at import, so anything that
+                replaces sys.stdout afterwards - a test runner capturing
+                output, contextlib.redirect_stdout, the daemon reopening its
+                streams - was written straight past.
         """
         self.verbose = verbose
-        self.stream = stream  # Must be set before colors_enabled() is called
+        self._stream = stream  # Must be set before colors_enabled() is called
         self.no_color = no_color or not colors_enabled(self.stream)
         self.log_file = log_file
         self._current_step = 0
         self._total_steps = 0
+
+    @property
+    def stream(self) -> TextIO:
+        """
+        Where output goes.
+
+        Returns:
+            The stream given at construction, or the current sys.stdout.
+        """
+        return self._stream if self._stream is not None else sys.stdout
+
+    @stream.setter
+    def stream(self, stream: TextIO | None) -> None:
+        """
+        Redirect this logger.
+
+        Args:
+            stream: The new stream, or None to follow sys.stdout again.
+        """
+        self._stream = stream
 
     def _colorize(self, text: str, color: str) -> str:
         """Apply color to text if colors are enabled."""
@@ -191,6 +306,50 @@ class Logger:
 
         ansi_pattern = re.compile(r"\033\[[0-9;]*m")
         return ansi_pattern.sub("", text)
+
+    def _width(self) -> int:
+        """
+        Decide how wide rendered output may be.
+
+        Returns:
+            The terminal width when writing to one, and OFFLINE_WIDTH otherwise.
+        """
+        if self.no_color:
+            return OFFLINE_WIDTH
+        isatty = getattr(self.stream, "isatty", None)
+        if isatty is None or not isatty():
+            return OFFLINE_WIDTH
+        return shutil.get_terminal_size(fallback=(100, 24)).columns
+
+    def _render(self, renderable: Any) -> None:
+        """
+        Draw a Rich renderable and send it through the one write path.
+
+        Rich is given its own buffer rather than the output stream so that the
+        result still reaches :meth:`_write`, which is what writes the log file
+        and strips the colour codes out of it. Two write paths would mean tables
+        never appearing in the log.
+
+        Args:
+            renderable: Anything Rich can draw.
+        """
+        buffer = io.StringIO()
+        console = Console(
+            file=buffer,
+            width=self._width(),
+            force_terminal=not self.no_color,
+            no_color=self.no_color,
+            # Rich's highlighter colours numbers, paths and UUIDs wherever it
+            # finds them. In a table of ports and domains that paints almost
+            # every cell, which is exactly the noise that makes colour stop
+            # meaning anything.
+            highlight=False,
+            markup=False,
+            emoji=False,
+            soft_wrap=False,
+        )
+        console.print(renderable)
+        self._write(buffer.getvalue().rstrip("\n"))
 
     def step(self, current: int, total: int, message: str, icon: str = "") -> None:
         """
@@ -307,6 +466,22 @@ class Logger:
                 detail = self._colorize(f"  {line}", Colors.DIM + Colors.RED)
                 self._write(detail)
 
+    def check(self, key: str, value: str, outcome: str = "info") -> None:
+        """
+        Print the result of one check.
+
+        Args:
+            key: What was checked.
+            value: What was found.
+            outcome: One of "ok", "warning", "error" or "info". Anything else
+                is treated as information rather than raising: a health check
+                is the last command that should fail because of its own output.
+        """
+        icon, colour = CHECK_MARKERS.get(outcome, CHECK_MARKERS["info"])
+        marker = self._colorize(icon, colour + Colors.BOLD)
+        name = self._colorize(f"{key}:", Colors.BOLD)
+        self._write(f"  {marker} {name} {self._colorize(value, colour)}")
+
     def blank(self) -> None:
         """Print a blank line."""
         self._write("")
@@ -318,11 +493,10 @@ class Logger:
         Args:
             title: Header text.
         """
-        line = "─" * 50
+        from rich.rule import Rule
+
         self._write("")
-        self._write(self._colorize(line, Colors.CYAN))
-        self._write(self._colorize(f"  {title}", Colors.CYAN + Colors.BOLD))
-        self._write(self._colorize(line, Colors.CYAN))
+        self._render(Rule(Text(title, style="bold"), align="left", style="cyan"))
         self._write("")
 
     def section(self, title: str) -> None:
@@ -381,40 +555,39 @@ class Logger:
         if current >= total:
             self._write("")
 
-    def table(self, headers: list, rows: list) -> None:
+    def table(self, headers: list, rows: list, justify: Sequence[str] | None = None) -> None:
         """
-        Print a formatted table.
+        Print a table.
+
+        Cells are plain values or, where the value means something, the Text
+        that :func:`state` and :func:`styled` return. Passing Text is how a
+        column gets colour: this method never guesses what a value means.
 
         Args:
-            headers: List of column headers.
-            rows: List of rows (each row is a list of values).
+            headers: Column headers.
+            rows: Rows, each a list of cells.
+            justify: Optional per-column alignment, one of "left", "right" or
+                "center". Numbers read better right-aligned.
         """
         if not rows:
             return
 
-        # Calculate column widths
-        all_rows = [headers, *rows]
-        col_widths = []
-        for col_idx in range(len(headers)):
-            max_width = max(len(str(row[col_idx])) for row in all_rows)
-            col_widths.append(max_width + 2)
+        table = Table(
+            box=SIMPLE_HEAD,
+            header_style="bold",
+            border_style="dim",
+            show_edge=False,
+            pad_edge=False,
+            expand=False,
+        )
+        for index, header in enumerate(headers):
+            alignment = justify[index] if justify and index < len(justify) else "left"
+            table.add_column(str(header), justify=cast("JustifyMethod", alignment), overflow="fold")
 
-        # Print header
-        header_line = ""
-        for idx, header in enumerate(headers):
-            header_line += self._colorize(str(header).ljust(col_widths[idx]), Colors.BOLD)
-        self._write(header_line)
-
-        # Print separator
-        separator = "─" * sum(col_widths)
-        self._write(self._colorize(separator, Colors.GRAY))
-
-        # Print rows
         for row in rows:
-            row_line = ""
-            for idx, cell in enumerate(row):
-                row_line += str(cell).ljust(col_widths[idx])
-            self._write(row_line)
+            table.add_row(*(cell if isinstance(cell, Text) else Text(str(cell)) for cell in row))
+
+        self._render(table)
 
     def box(self, title: str, content: list) -> None:
         """

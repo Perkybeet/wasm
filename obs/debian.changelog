@@ -1,3 +1,18 @@
+wasm (1.1.0-1) unstable; urgency=medium
+
+  * Fix: wasm list reports the state systemd and the port actually report, not the value written at deploy time; it and wasm health no longer contradict each other
+  * Fix: a service systemd is restarting every few seconds, or one that accepts no connections, is no longer reported as running
+  * Fix: static sites are no longer counted as stopped; they have no service to run
+  * Fix: the RPM builds on Fedora and openSUSE again; a macro named in a comment inside the build section was expanded and ran
+  * Fix: Leap 15.x builds against the packaged Python 3.11 instead of 3.6, which could not run the result
+  * Fix: the package installs on Debian 12, Ubuntu 22.04 and Fedora 41, where python3-questionary does not exist
+  * Fix: wasm web start refuses a port that is already taken instead of printing a token and then failing to bind
+  * Fix: wasm --no-color applies to wasm health, and the logger follows a redirected stdout
+  * Change: wasm list is a coloured table where colour encodes state, and it names what needs attention
+  * Change: publishing waits for the .deb and the RPM to be built, installed and run in clean containers
+
+ -- Yago Lopez Prado <yago.lopez.adeje@gmail.com>  Wed, 12 Aug 2026 17:45:39 +0000
+
 wasm (1.0.3-1) unstable; urgency=medium
 
   * Fix: the Debian build dependencies in wasm.dsc and debian.control agree, and are the minimum that builds a wheel

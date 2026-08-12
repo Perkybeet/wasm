@@ -260,6 +260,68 @@ def test_a_late_verbose_flag_reaches_the_shared_context(
     assert started["verbose"] is True
 
 
+def test_a_taken_port_is_refused_before_a_token_is_printed(
+    cli_runner: CliRunner,
+    deps_present: None,
+    pid_file: Path,
+    started: dict[str, Any],
+    ports: Any,
+) -> None:
+    """
+    The reported failure: the token was printed and then uvicorn crashed.
+
+    The PID file only catches a panel this machine still has a record of, so
+    anything else on the port walked straight through to the bind. That left
+    the operator holding a credential for a server that never started.
+    """
+    ports.taken.add(8080)
+
+    result = cli_runner.invoke(web.cli, ["start"])
+
+    assert result.exit_code == 1, result.output
+    assert "already listening on 127.0.0.1:8080" in result.output
+    assert "wasm web stop" in result.output
+    assert "config" not in started, "the server must not be started"
+    assert "Access Token" not in result.output
+
+
+def test_a_free_port_starts_normally(
+    cli_runner: CliRunner,
+    deps_present: None,
+    pid_file: Path,
+    started: dict[str, Any],
+    ports: Any,
+) -> None:
+    """
+    Args:
+        cli_runner: Click test runner.
+        deps_present: Panel dependencies reported as installed.
+        pid_file: Where the PID would be recorded.
+        started: Captures the configuration the server would run with.
+        ports: Port probe, with nothing declared taken.
+    """
+    result = cli_runner.invoke(web.cli, ["start"])
+
+    assert result.exit_code == 0, result.output
+    assert started["mode"] == "foreground"
+
+
+def test_a_rehearsal_does_not_probe_the_port(
+    cli_runner: CliRunner,
+    deps_present: None,
+    pid_file: Path,
+    started: dict[str, Any],
+    ports: Any,
+) -> None:
+    """``--dry-run`` reports what would happen; a taken port does not stop it."""
+    ports.taken.add(8080)
+
+    result = cli_runner.invoke(web.cli, ["--dry-run", "start"])
+
+    assert result.exit_code == 0, result.output
+    assert "would serve the panel" in result.output
+
+
 # ---------------------------------------------------------------------------
 # Refusing to put a root panel on the network
 # ---------------------------------------------------------------------------

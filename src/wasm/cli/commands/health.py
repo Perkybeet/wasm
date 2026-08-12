@@ -28,11 +28,11 @@ from datetime import datetime
 import click
 
 from wasm.cli.app import Context, pass_context
+from wasm.core.app_state import RUNNING, STATIC, resolve_states
 from wasm.core.config import Config
-from wasm.core.exceptions import ServiceError, WASMError
+from wasm.core.exceptions import WASMError
 from wasm.core.logger import Logger
 from wasm.core.store import get_store
-from wasm.core.utils import domain_to_app_name
 from wasm.managers.apache_manager import ApacheManager
 from wasm.managers.cert_manager import CertificateInfo, CertManager
 from wasm.managers.nginx_manager import NginxManager
@@ -50,21 +50,14 @@ def _print_status(logger: Logger, key: str, value: str, status: str) -> None:
     Print a key-value pair with status indicator.
 
     Args:
-        logger: Logger of the current command, kept for signature stability.
+        logger: Logger of the current command. Writing through it is what makes
+            ``wasm --no-color health`` colourless; the escape codes used to be
+            written to stdout directly, so the flag did nothing here.
         key: Name of the checked item.
         value: Human readable result.
         status: One of "ok", "warning", "error" or "info".
     """
-    if status == "ok":
-        indicator = "\033[32m[OK]\033[0m"
-    elif status == "warning":
-        indicator = "\033[33m[!]\033[0m"
-    elif status == "error":
-        indicator = "\033[31m[X]\033[0m"
-    else:  # info
-        indicator = "\033[34m[i]\033[0m"
-
-    print(f"  {indicator} {key}: {value}")
+    logger.check(key, value, status)
 
 
 def _days_until(expiry: str) -> int | None:
@@ -222,37 +215,35 @@ def run_health_check(verbose: bool = False) -> int:
     service_manager = ServiceManager(verbose=verbose)
 
     apps = store.list_apps()
-    apps_running = 0
-    apps_stopped = 0
-    apps_failed = 0
 
-    for app in apps:
-        try:
-            # The unit was created from domain_to_app_name(); a hand-rolled
-            # replace() disagrees with it for any domain that is not lowercase.
-            status = service_manager.get_status(domain_to_app_name(app.domain))
-        except ServiceError as e:
-            apps_failed += 1
-            warnings.append(f"App '{app.domain}' could not be queried: {e}")
-            continue
+    # The same resolver `wasm list` uses. When these two commands each decided
+    # for themselves what "running" meant, list reported fifteen applications
+    # running while this reported seven stopped, and five of the seven were
+    # static sites that have no service to run in the first place.
+    states = resolve_states(apps, service_manager)
 
-        if status.get("active"):
-            apps_running += 1
-        else:
-            apps_stopped += 1
-            warnings.append(f"App '{app.domain}' is not running")
+    apps_running = sum(1 for s in states.values() if s.label == RUNNING)
+    apps_static = sum(1 for s in states.values() if s.label == STATIC)
+    unhealthy = [(domain, s) for domain, s in states.items() if not s.healthy]
+
+    for domain, current in unhealthy:
+        warnings.append(f"App '{domain}' - {current.detail or current.label.lower()}")
 
     total_apps = len(apps)
+    served = apps_running + apps_static
     if total_apps > 0:
-        if apps_stopped > 0 or apps_failed > 0:
+        summary = f"{served}/{total_apps} serving"
+        if apps_static:
+            summary += f" ({apps_static} static)"
+        if unhealthy:
             _print_status(
                 logger,
                 "Applications",
-                f"{apps_running}/{total_apps} running, {apps_stopped} stopped",
+                f"{summary}, {len(unhealthy)} need attention",
                 "warning",
             )
         else:
-            _print_status(logger, "Applications", f"{apps_running}/{total_apps} running", "ok")
+            _print_status(logger, "Applications", summary, "ok")
     else:
         _print_status(logger, "Applications", "No applications deployed", "info")
 

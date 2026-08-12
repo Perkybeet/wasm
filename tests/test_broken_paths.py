@@ -479,14 +479,16 @@ def test_health_counts_a_running_application(
 ) -> None:
     """A deployed app whose unit is active must be reported as running."""
     runner.script(["systemctl", "is-active"], stdout="active\n")
-    health_environment.apps["example.com"] = SimpleNamespace(domain="example.com")
+    health_environment.apps["example.com"] = SimpleNamespace(
+        domain="example.com", is_static=False, port=3000
+    )
 
     from wasm.cli.commands.health import handle_health
 
     handle_health(Namespace(verbose=False))
 
     out = capfd.readouterr().out
-    assert "1/1 running" in out
+    assert "1/1 serving" in out
     assert "0/1" not in out
 
 

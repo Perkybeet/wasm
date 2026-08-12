@@ -99,6 +99,8 @@ class ServiceSpy:
         self.calls: list[tuple[str, str]] = []
         self.exists: bool = True
         self.status: dict[str, Any] = {"exists": True, "active": True, "enabled": True}
+        #: Per-unit overrides, for the commands that ask about several at once.
+        self.statuses: dict[str, dict[str, Any]] = {}
         self.journal: str = "a log line"
         self.verbose: bool = False
 
@@ -150,7 +152,7 @@ class ServiceSpy:
             The scripted status.
         """
         self.calls.append(("get_status", name))
-        return self.status
+        return self.statuses.get(name, self.status)
 
     def logs(self, name: str, lines: int = 50) -> str:
         """
@@ -779,12 +781,13 @@ def test_create_passes_compose_settings_through(
 
 
 def test_list_reports_every_deployed_app(
-    cli_runner: CliRunner, store: StoreSpy, console: io.StringIO
+    cli_runner: CliRunner, store: StoreSpy, services: ServiceSpy, console: io.StringIO
 ) -> None:
     """
     Args:
         cli_runner: Click test runner.
         store: Store spy.
+        services: Service manager spy.
         console: Buffer holding what the logger printed.
     """
     store.apps["example.com"] = make_app()
@@ -795,6 +798,118 @@ def test_list_reports_every_deployed_app(
     assert result.exit_code == 0, output
     assert "example.com" in output
     assert "Total: 1 apps" in output
+
+
+def test_list_reports_the_live_state_not_the_stored_one(
+    cli_runner: CliRunner, store: StoreSpy, services: ServiceSpy, console: io.StringIO
+) -> None:
+    """
+    The regression an operator hit: list said Running, health said stopped.
+
+    The status column is written at deploy time and never again, so list was
+    reporting what had been true once. systemd is the authority.
+    """
+    store.apps["example.com"] = make_app()
+    assert store.apps["example.com"].status == "running", "the stored value must disagree"
+    services.status = {"exists": True, "active": False, "enabled": True}
+
+    result = cli_runner.invoke(webapp.cli.commands["list"], [])
+    output = shown(result, console)
+
+    assert result.exit_code == 0, output
+    assert "Stopped" in output
+    assert "Running" not in output
+    assert ("get_status", "example-com") in services.calls
+
+
+def test_list_does_not_call_a_static_site_stopped(
+    cli_runner: CliRunner, store: StoreSpy, services: ServiceSpy, console: io.StringIO
+) -> None:
+    """
+    A static site has no unit, so asking systemd about it always says stopped.
+
+    Args:
+        cli_runner: Click test runner.
+        store: Store spy.
+        services: Service manager spy.
+        console: Buffer holding what the logger printed.
+    """
+    store.apps["example.com"] = make_app(is_static=True)
+
+    result = cli_runner.invoke(webapp.cli.commands["list"], [])
+    output = shown(result, console)
+
+    assert result.exit_code == 0, output
+    assert "Static" in output
+    assert "need attention" not in output
+    assert not [call for call in services.calls if call[0] == "get_status"], (
+        "a static site has no unit to ask about"
+    )
+
+
+def test_list_reports_a_crash_loop_rather_than_running(
+    cli_runner: CliRunner, store: StoreSpy, services: ServiceSpy, console: io.StringIO
+) -> None:
+    """
+    A service systemd restarts every few seconds reads as active in between.
+
+    Args:
+        cli_runner: Click test runner.
+        store: Store spy.
+        services: Service manager spy.
+        console: Buffer holding what the logger printed.
+    """
+    store.apps["example.com"] = make_app()
+    services.status = {
+        "exists": True,
+        "active": True,
+        "enabled": True,
+        "active_state": "activating",
+        "sub_state": "auto-restart",
+        "restarts": "37",
+    }
+
+    result = cli_runner.invoke(webapp.cli.commands["list"], [])
+    output = shown(result, console)
+
+    assert result.exit_code == 0, output
+    assert "Restarting" in output
+    assert "restarted 37 times" in output
+
+
+def test_list_reports_a_service_that_answers_nothing(
+    cli_runner: CliRunner,
+    store: StoreSpy,
+    services: ServiceSpy,
+    console: io.StringIO,
+    ports: Any,
+) -> None:
+    """
+    systemd being satisfied only means a process exists.
+
+    Args:
+        cli_runner: Click test runner.
+        store: Store spy.
+        services: Service manager spy.
+        console: Buffer holding what the logger printed.
+        ports: Port probe, told to refuse the application's port.
+    """
+    store.apps["example.com"] = make_app()
+    ports.closed.add(store.apps["example.com"].port)
+    services.status = {
+        "exists": True,
+        "active": True,
+        "enabled": True,
+        "active_state": "active",
+        "sub_state": "running",
+    }
+
+    result = cli_runner.invoke(webapp.cli.commands["list"], [])
+    output = shown(result, console)
+
+    assert result.exit_code == 0, output
+    assert "No answer" in output
+    assert "nothing accepts connections" in output
 
 
 def test_list_says_so_when_nothing_is_deployed(
