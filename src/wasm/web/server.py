@@ -5,27 +5,23 @@ Provides the main application server with security middleware,
 API routing, and static file serving.
 """
 
-import asyncio
 import logging
-import os
-import signal
 import socket
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-from fastapi import FastAPI, Request, Response, HTTPException, Depends
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from wasm.web.auth import (
-    TokenManager,
-    SecurityConfig,
-    RateLimiter,
     BruteForceProtection,
+    RateLimiter,
+    SecurityConfig,
+    TokenManager,
     get_client_ip,
 )
 
@@ -33,10 +29,10 @@ from wasm.web.auth import (
 STATIC_DIR = Path(__file__).parent / "static"
 
 # Global instances
-_token_manager: Optional[TokenManager] = None
-_rate_limiter: Optional[RateLimiter] = None
-_brute_force: Optional[BruteForceProtection] = None
-_security_config: Optional[SecurityConfig] = None
+_token_manager: TokenManager | None = None
+_rate_limiter: RateLimiter | None = None
+_brute_force: BruteForceProtection | None = None
+_security_config: SecurityConfig | None = None
 
 
 def get_token_manager() -> TokenManager:
@@ -53,8 +49,7 @@ def get_rate_limiter() -> RateLimiter:
     if _rate_limiter is None:
         config = _security_config or SecurityConfig()
         _rate_limiter = RateLimiter(
-            max_requests=config.rate_limit_requests,
-            window=config.rate_limit_window
+            max_requests=config.rate_limit_requests, window=config.rate_limit_window
         )
     return _rate_limiter
 
@@ -65,8 +60,7 @@ def get_brute_force() -> BruteForceProtection:
     if _brute_force is None:
         config = _security_config or SecurityConfig()
         _brute_force = BruteForceProtection(
-            max_attempts=config.max_failed_attempts,
-            lockout_duration=config.lockout_duration
+            max_attempts=config.max_failed_attempts, lockout_duration=config.lockout_duration
         )
     return _brute_force
 
@@ -80,33 +74,33 @@ async def lifespan(app: FastAPI):
     pass
 
 
-def create_app(config: Optional[SecurityConfig] = None) -> FastAPI:
+def create_app(config: SecurityConfig | None = None) -> FastAPI:
     """
     Create and configure the FastAPI application.
-    
+
     Args:
         config: Security configuration options.
-        
+
     Returns:
         Configured FastAPI application.
     """
     global _security_config, _token_manager, _rate_limiter, _brute_force
-    
+
     _security_config = config or SecurityConfig()
     _token_manager = TokenManager(_security_config)
     _rate_limiter = RateLimiter(
-        max_requests=_security_config.rate_limit_requests,
-        window=_security_config.rate_limit_window
+        max_requests=_security_config.rate_limit_requests, window=_security_config.rate_limit_window
     )
     _brute_force = BruteForceProtection(
         max_attempts=_security_config.max_failed_attempts,
-        lockout_duration=_security_config.lockout_duration
+        lockout_duration=_security_config.lockout_duration,
     )
-    
+
     # Set global token manager for auth dependency
     from wasm.web.auth import set_token_manager
+
     set_token_manager(_token_manager)
-    
+
     app = FastAPI(
         title="WASM Web Interface",
         description="Web-based dashboard for WASM - Web App System Management",
@@ -115,10 +109,10 @@ def create_app(config: Optional[SecurityConfig] = None) -> FastAPI:
         redoc_url=None,  # Disable ReDoc in production
         lifespan=lifespan,
     )
-    
+
     # Add security middleware
     app.middleware("http")(_security_middleware)
-    
+
     # Add CORS if enabled
     if _security_config.enable_cors:
         app.add_middleware(
@@ -128,19 +122,21 @@ def create_app(config: Optional[SecurityConfig] = None) -> FastAPI:
             allow_methods=["GET", "POST", "PUT", "DELETE"],
             allow_headers=["*"],
         )
-    
+
     # Register API routes
     from wasm.web.api import router as api_router
+
     app.include_router(api_router, prefix="/api")
-    
+
     # Register WebSocket routes
     from wasm.web.websockets import router as ws_router
+
     app.include_router(ws_router, prefix="/ws")
-    
+
     # Serve static files
     if STATIC_DIR.exists():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-    
+
     # Root route - serve dashboard
     @app.get("/", response_class=HTMLResponse)
     async def root(request: Request):
@@ -149,35 +145,31 @@ def create_app(config: Optional[SecurityConfig] = None) -> FastAPI:
         if index_path.exists():
             return FileResponse(index_path)
         return HTMLResponse(
-            content="<h1>WASM Web Interface</h1><p>Static files not found.</p>",
-            status_code=200
+            content="<h1>WASM Web Interface</h1><p>Static files not found.</p>", status_code=200
         )
-    
+
     # Login page
     @app.get("/login", response_class=HTMLResponse)
-    async def login_page(request: Request, token: Optional[str] = None):
+    async def login_page(request: Request, token: str | None = None):
         """Serve the login page or auto-login with token."""
         login_path = STATIC_DIR / "login.html"
         if login_path.exists():
             return FileResponse(login_path)
-        return HTMLResponse(
-            content=_generate_login_html(),
-            status_code=200
-        )
-    
+        return HTMLResponse(content=_generate_login_html(), status_code=200)
+
     # Health check endpoint (no auth required)
     @app.get("/health")
     async def health_check():
         """Health check endpoint."""
         return {"status": "healthy", "service": "wasm-web"}
-    
+
     return app
 
 
 async def _security_middleware(request: Request, call_next):
     """
     Security middleware for all requests.
-    
+
     Handles:
     - Rate limiting
     - IP whitelisting
@@ -186,16 +178,15 @@ async def _security_middleware(request: Request, call_next):
     """
     client_ip = get_client_ip(request)
     config = _security_config or SecurityConfig()
-    
+
     # Check IP whitelist if configured
     if config.ip_whitelist and client_ip not in config.ip_whitelist:
         # Also check if it's a local request
         if client_ip not in ["127.0.0.1", "::1", "localhost"]:
             return JSONResponse(
-                status_code=403,
-                content={"detail": "Access denied: IP not whitelisted"}
+                status_code=403, content={"detail": "Access denied: IP not whitelisted"}
             )
-    
+
     # Rate limiting
     if config.rate_limit_enabled:
         rate_limiter = get_rate_limiter()
@@ -206,9 +197,9 @@ async def _security_middleware(request: Request, call_next):
                 headers={
                     "Retry-After": str(config.rate_limit_window),
                     "X-RateLimit-Remaining": "0",
-                }
+                },
             )
-    
+
     # Check brute force lockout for auth endpoints
     if request.url.path in ["/api/auth/login", "/api/auth/token"]:
         brute_force = get_brute_force()
@@ -216,30 +207,26 @@ async def _security_middleware(request: Request, call_next):
             remaining = brute_force.get_lockout_remaining(client_ip)
             return JSONResponse(
                 status_code=429,
-                content={
-                    "detail": f"Too many failed attempts. Locked for {remaining} seconds."
-                },
-                headers={"Retry-After": str(remaining)}
+                content={"detail": f"Too many failed attempts. Locked for {remaining} seconds."},
+                headers={"Retry-After": str(remaining)},
             )
-    
+
     # Process request
     response = await call_next(request)
-    
+
     # Add security headers
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
-    
+
     # Add rate limit headers
     if config.rate_limit_enabled:
         rate_limiter = get_rate_limiter()
-        response.headers["X-RateLimit-Remaining"] = str(
-            rate_limiter.get_remaining(client_ip)
-        )
+        response.headers["X-RateLimit-Remaining"] = str(rate_limiter.get_remaining(client_ip))
         response.headers["X-RateLimit-Limit"] = str(config.rate_limit_requests)
-    
+
     return response
 
 
@@ -390,12 +377,12 @@ def get_local_ip() -> str:
 def run_server(
     host: str = "127.0.0.1",
     port: int = 8080,
-    config: Optional[SecurityConfig] = None,
+    config: SecurityConfig | None = None,
     show_token: bool = True,
 ) -> None:
     """
     Run the WASM web server.
-    
+
     Args:
         host: Host to bind to.
         port: Port to bind to.
@@ -403,21 +390,21 @@ def run_server(
         show_token: Whether to display the access token.
     """
     import uvicorn
-    
+
     # Create security config with provided host/port
     if config is None:
         config = SecurityConfig(host=host, port=port)
     else:
         config.host = host
         config.port = port
-    
+
     # Create app
     app = create_app(config)
-    
+
     # Generate and display token
     token_manager = get_token_manager()
     master_token = token_manager.generate_master_token()
-    
+
     if show_token:
         local_ip = get_local_ip() if host == "0.0.0.0" else host
         print()
@@ -430,7 +417,7 @@ def run_server(
         print("Keep this token secure! It grants full access to WASM.")
         print("=" * 60)
         print(flush=True)
-    
+
     # Run server
     uvicorn.run(
         app,

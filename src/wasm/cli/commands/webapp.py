@@ -6,37 +6,36 @@ import re
 import sys
 from argparse import Namespace
 from pathlib import Path
-from typing import Dict, Optional
 
 # Constants for .env file parsing
 MAX_ENV_FILE_SIZE = 1024 * 1024  # 1MB max
 MAX_ENV_LINE_LENGTH = 10000
-VALID_ENV_KEY_PATTERN = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+VALID_ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 from wasm.core.config import Config
+from wasm.core.exceptions import DeploymentError, WASMError
 from wasm.core.logger import Logger
-from wasm.core.exceptions import WASMError, DeploymentError
 from wasm.core.utils import domain_to_app_name
-from wasm.deployers import get_deployer, detect_app_type
-from wasm.managers.service_manager import ServiceManager
-from wasm.managers.nginx_manager import NginxManager
+from wasm.deployers import detect_app_type, get_deployer
 from wasm.managers.apache_manager import ApacheManager
+from wasm.managers.nginx_manager import NginxManager
+from wasm.managers.service_manager import ServiceManager
 from wasm.validators.domain import validate_domain
-from wasm.validators.port import validate_port, find_available_port
+from wasm.validators.port import find_available_port, validate_port
 
 
 def handle_webapp(args: Namespace) -> int:
     """
     Handle webapp commands.
-    
+
     Args:
         args: Parsed arguments.
-        
+
     Returns:
         Exit code.
     """
     action = args.action
-    
+
     handlers = {
         "create": _handle_create,
         "new": _handle_create,
@@ -55,12 +54,12 @@ def handle_webapp(args: Namespace) -> int:
         "rm": _handle_delete,
         "logs": _handle_logs,
     }
-    
+
     handler = handlers.get(action)
     if not handler:
         print(f"Unknown action: {action}", file=sys.stderr)
         return 1
-    
+
     try:
         return handler(args)
     except WASMError as e:
@@ -75,7 +74,9 @@ def handle_webapp(args: Namespace) -> int:
             for line in detail_lines[:max_lines]:
                 print(f"  {line}")
             if len(detail_lines) > max_lines:
-                print(f"  ... ({len(detail_lines) - max_lines} more lines, use --verbose for full output)")
+                print(
+                    f"  ... ({len(detail_lines) - max_lines} more lines, use --verbose for full output)"
+                )
             logger.blank()
         return 1
     except Exception as e:
@@ -83,6 +84,7 @@ def handle_webapp(args: Namespace) -> int:
         logger.error(f"Unexpected error: {e}")
         if args.verbose:
             import traceback
+
             traceback.print_exc()
         return 1
 
@@ -91,10 +93,10 @@ def _handle_create(args: Namespace) -> int:
     """Handle webapp create command."""
     logger = Logger(verbose=args.verbose)
     config = Config()
-    
+
     # Validate domain
     domain = validate_domain(args.domain)
-    
+
     # Validate/find port
     port = args.port
     if port:
@@ -103,31 +105,31 @@ def _handle_create(args: Namespace) -> int:
         port = find_available_port(preferred=3000)
         if not port:
             raise DeploymentError("No available port found")
-    
+
     # Determine app type
     app_type = args.type
     if app_type == "auto":
         # Will auto-detect after fetching source
         app_type = "nodejs"  # Default fallback
-    
+
     # Get package manager preference
     package_manager = getattr(args, "package_manager", "auto") or "auto"
-    
+
     # =========================================================================
     # Pre-deployment verification
     # =========================================================================
     from wasm.core.dependencies import check_deployment_ready
-    
+
     can_deploy, missing, warnings = check_deployment_ready(
         app_type=app_type,
         package_manager=package_manager,
         verbose=args.verbose,
     )
-    
+
     # Show warnings (non-blocking)
     for warning in warnings:
         logger.warning(warning)
-    
+
     # Check critical requirements
     if not can_deploy:
         logger.error("System is not ready for deployment")
@@ -142,7 +144,7 @@ def _handle_create(args: Namespace) -> int:
         logger.info("Or for detailed diagnostics:")
         logger.info("  wasm setup doctor")
         return 1
-    
+
     # Load environment variables from file
     env_vars = {}
     if args.env_file:
@@ -152,7 +154,9 @@ def _handle_create(args: Namespace) -> int:
                 # Check file size
                 file_size = env_path.stat().st_size
                 if file_size > MAX_ENV_FILE_SIZE:
-                    logger.error(f"Environment file too large: {file_size} bytes (max: {MAX_ENV_FILE_SIZE})")
+                    logger.error(
+                        f"Environment file too large: {file_size} bytes (max: {MAX_ENV_FILE_SIZE})"
+                    )
                     return 1
 
                 with open(env_path) as f:
@@ -192,7 +196,7 @@ def _handle_create(args: Namespace) -> int:
             except Exception as e:
                 logger.error(f"Failed to parse environment file {env_path}: {e}")
                 return 1
-    
+
     # Print deployment header
     logger.header("WASM Deployment")
     logger.key_value("Domain", domain)
@@ -204,6 +208,7 @@ def _handle_create(args: Namespace) -> int:
     include_www = getattr(args, "www", False)
     if not args.no_ssl and include_www:
         from wasm.validators.domain import should_include_www
+
         if should_include_www(domain):
             logger.key_value("WWW", f"www.{domain} included")
     logger.blank()
@@ -238,7 +243,7 @@ def _handle_create(args: Namespace) -> int:
     return 0
 
 
-def _handle_monorepo_create(args: Namespace, domain: str, env_vars: Dict, logger: Logger) -> int:
+def _handle_monorepo_create(args: Namespace, domain: str, env_vars: dict, logger: Logger) -> int:
     """Handle monorepo deployment specially."""
     from wasm.deployers.monorepo import MonorepoDeployer
 
@@ -280,7 +285,7 @@ def _handle_monorepo_create(args: Namespace, domain: str, env_vars: Dict, logger
 
 
 def _handle_docker_compose_create(
-    args: Namespace, domain: str, env_vars: Dict, logger: Logger
+    args: Namespace, domain: str, env_vars: dict, logger: Logger
 ) -> int:
     """Handle Docker Compose deployment."""
     from wasm.deployers.docker_compose import DockerComposeDeployer
@@ -307,25 +312,26 @@ def _handle_docker_compose_create(
 def _handle_list(args: Namespace) -> int:
     """Handle webapp list command."""
     logger = Logger(verbose=args.verbose)
-    
-    from wasm.core.store import get_store, AppStatus
+
+    from wasm.core.store import AppStatus, get_store
+
     store = get_store()
-    
+
     logger.header("Deployed Applications")
-    
+
     apps = store.list_apps()
-    
+
     if not apps:
         logger.info("No applications deployed")
         logger.blank()
         logger.info("Deploy an application with:")
         logger.info("  wasm deploy -d example.com -s https://github.com/user/repo")
         return 0
-    
+
     # Prepare table data
     headers = ["Domain", "Type", "Status", "Port", "SSL"]
     rows = []
-    
+
     for app in apps:
         # Determine status emoji
         if app.status == AppStatus.RUNNING.value:
@@ -338,20 +344,20 @@ def _handle_list(args: Namespace) -> int:
             status_str = "❌ Failed"
         else:
             status_str = "⚪ Unknown"
-        
+
         port_str = str(app.port) if app.port else "static"
         ssl_str = "✓" if app.ssl_enabled else "✗"
-        
+
         rows.append([app.domain, app.app_type, status_str, port_str, ssl_str])
-    
+
     logger.table(headers, rows)
-    
+
     # Show summary
     logger.blank()
     running = sum(1 for a in apps if a.status == AppStatus.RUNNING.value)
     static = sum(1 for a in apps if a.is_static)
     logger.info(f"Total: {len(apps)} apps ({running} running, {static} static)")
-    
+
     return 0
 
 
@@ -359,54 +365,55 @@ def _handle_status(args: Namespace) -> int:
     """Handle webapp status command."""
     logger = Logger(verbose=args.verbose)
     service_manager = ServiceManager(verbose=args.verbose)
-    
+
     from wasm.core.store import get_store
+
     store = get_store()
-    
+
     domain = validate_domain(args.domain)
     app_name = domain_to_app_name(domain)
-    
+
     # First check the store
     app_data = store.get_app_with_relations(domain)
-    
-    if not app_data or not app_data['app']:
+
+    if not app_data or not app_data["app"]:
         # Fallback to systemd check for legacy apps
         status = service_manager.get_status(app_name)
         if not status["exists"]:
             logger.warning(f"Application not found: {domain}")
             return 1
-        
+
         logger.header(f"Status: {domain}")
         logger.warning("Legacy app (not in store)")
         logger.key_value("Service", status["name"])
         logger.key_value("Active", "Yes" if status["active"] else "No")
         logger.key_value("Enabled", "Yes" if status["enabled"] else "No")
         return 0
-    
-    app = app_data['app']
-    site = app_data['site']
-    service = app_data['service']
-    databases = app_data['databases']
-    
+
+    app = app_data["app"]
+    site = app_data["site"]
+    service = app_data["service"]
+    databases = app_data["databases"]
+
     logger.header(f"Status: {domain}")
-    
+
     # App info
     logger.key_value("Type", app.app_type)
     logger.key_value("Status", app.status)
     logger.key_value("Path", app.app_path)
     logger.key_value("Static", "Yes" if app.is_static else "No")
-    
+
     if app.port:
         logger.key_value("Port", str(app.port))
-    
+
     if app.source:
         logger.key_value("Source", app.source)
         if app.branch:
             logger.key_value("Branch", app.branch)
-    
+
     if app.deployed_at:
         logger.key_value("Deployed", app.deployed_at)
-    
+
     # Site info
     if site:
         logger.blank()
@@ -414,30 +421,30 @@ def _handle_status(args: Namespace) -> int:
         logger.key_value("  Web Server", site.webserver)
         logger.key_value("  SSL", "Yes" if site.ssl_enabled else "No")
         logger.key_value("  Config", site.config_path)
-    
+
     # Service info (for non-static apps)
     if service:
         logger.blank()
         logger.info("Service:")
         logger.key_value("  Name", service.name)
-        
+
         # Get live status from systemd
         systemd_status = service_manager.get_status(app_name)
         logger.key_value("  Active", "Yes" if systemd_status.get("active") else "No")
         logger.key_value("  Enabled", "Yes" if systemd_status.get("enabled") else "No")
-        
+
         if systemd_status.get("pid"):
             logger.key_value("  PID", systemd_status["pid"])
         if systemd_status.get("uptime"):
             logger.key_value("  Started", systemd_status["uptime"])
-    
+
     # Database info
     if databases:
         logger.blank()
         logger.info(f"Databases ({len(databases)}):")
         for db in databases:
             logger.key_value(f"  {db.engine}", db.name)
-    
+
     return 0
 
 
@@ -446,6 +453,7 @@ def _handle_restart(args: Namespace) -> int:
     logger = Logger(verbose=args.verbose)
 
     from wasm.core.store import get_store
+
     store = get_store()
 
     domain = validate_domain(args.domain)
@@ -477,6 +485,7 @@ def _handle_stop(args: Namespace) -> int:
     logger = Logger(verbose=args.verbose)
 
     from wasm.core.store import get_store
+
     store = get_store()
 
     domain = validate_domain(args.domain)
@@ -508,6 +517,7 @@ def _handle_start(args: Namespace) -> int:
     logger = Logger(verbose=args.verbose)
 
     from wasm.core.store import get_store
+
     store = get_store()
 
     domain = validate_domain(args.domain)
@@ -550,6 +560,7 @@ def _handle_update(args: Namespace) -> int:
     config = Config()
 
     from wasm.core.store import get_store
+
     store = get_store()
 
     domain = validate_domain(args.domain)
@@ -568,23 +579,23 @@ def _handle_update(args: Namespace) -> int:
 
     if not app_path.exists():
         raise WASMError(f"Application not found: {domain}")
-    
+
     # Get package manager preference
     package_manager = getattr(args, "package_manager", "auto") or "auto"
-    
+
     logger.header(f"Updating: {domain}")
     logger.blank()
-    
+
     total_steps = 7
-    
+
     # Step 1: Create pre-update backup for potential rollback
     logger.step(1, total_steps, "Creating pre-update backup")
     try:
         from wasm.managers.backup_manager import RollbackManager
+
         rollback_manager = RollbackManager(verbose=args.verbose)
         backup = rollback_manager.create_pre_deploy_backup(
-            domain=domain,
-            description="Pre-update automatic backup"
+            domain=domain, description="Pre-update automatic backup"
         )
         if backup:
             logger.substep(f"Backup created: {backup.id}")
@@ -592,13 +603,14 @@ def _handle_update(args: Namespace) -> int:
             logger.substep("No existing app to backup")
     except Exception as e:
         logger.substep(f"Backup skipped: {e}")
-    
+
     # Step 2: Pull latest changes or fetch from new source
     from wasm.managers.source_manager import SourceManager
+
     source_manager = SourceManager(verbose=args.verbose)
-    
+
     new_source = getattr(args, "source", None)
-    
+
     if new_source:
         logger.step(2, total_steps, "Fetching from new source")
         logger.substep(f"Source: {new_source}")
@@ -608,10 +620,10 @@ def _handle_update(args: Namespace) -> int:
         env_file = app_path / ".env"
         if env_file.exists():
             env_backup = env_file.read_text()
-        
+
         # Fetch to a temp location first, then sync
         source_manager.fetch(new_source, app_path, branch=args.branch, force=True)
-        
+
         # Restore .env if it was backed up
         if env_backup:
             env_file.write_text(env_backup)
@@ -619,7 +631,7 @@ def _handle_update(args: Namespace) -> int:
     else:
         logger.step(2, total_steps, "Pulling latest changes")
         source_manager.pull(app_path, branch=args.branch)
-    
+
     # Step 3: Detect app type and configure deployer
     logger.step(3, total_steps, "Detecting application type")
 
@@ -635,18 +647,14 @@ def _handle_update(args: Namespace) -> int:
             logger.substep(f"Using default: {app_type}")
         else:
             logger.substep(f"Detected: {app_type}")
-    
+
     # Handle monorepo updates with dedicated flow
     if app_type == "monorepo":
-        return _handle_monorepo_update(
-            args, app_path, app_name, domain, logger, total_steps
-        )
+        return _handle_monorepo_update(args, app_path, app_name, domain, logger, total_steps)
 
     # Handle docker-compose updates
     if app_type == "docker-compose":
-        return _handle_docker_compose_update(
-            args, app_path, app_name, domain, logger
-        )
+        return _handle_docker_compose_update(args, app_path, app_name, domain, logger)
 
     deployer = get_deployer(app_type, verbose=args.verbose)
     deployer.app_path = app_path
@@ -701,6 +709,7 @@ def _handle_update(args: Namespace) -> int:
 
             # Quick health check
             import time
+
             time.sleep(2)  # Give the app a moment to start
 
             status = service_manager.get_status(app_name)
@@ -747,6 +756,7 @@ def _handle_monorepo_update(args, app_path, app_name, domain, logger, total_step
 
     # Find all services for this monorepo
     from wasm.core.store import get_store
+
     store = get_store()
     app = store.get_app(domain)
 
@@ -770,6 +780,7 @@ def _handle_monorepo_update(args, app_path, app_name, domain, logger, total_step
 
     if restarted:
         import time
+
         time.sleep(3)
         logger.success(f"Monorepo updated successfully: {domain}")
         logger.blank()
@@ -799,6 +810,7 @@ def _handle_docker_compose_update(args, app_path, app_name, domain, logger):
 
     logger.step(5, 5, "Restarting containers")
     from wasm.core.utils import run_command
+
     cmd = ["docker", "compose"]
     if deployer.compose_path:
         cmd.extend(["-f", str(deployer.compose_path)])
@@ -820,6 +832,7 @@ def _handle_delete(args: Namespace) -> int:
     config = Config()
 
     from wasm.core.store import get_store
+
     store = get_store()
 
     domain = validate_domain(args.domain)
@@ -835,7 +848,7 @@ def _handle_delete(args: Namespace) -> int:
         return 1
 
     # Dry-run mode: show what would be deleted
-    dry_run = getattr(args, 'dry_run', False)
+    dry_run = getattr(args, "dry_run", False)
     if dry_run:
         logger.header(f"Dry-run: Would delete {domain}")
         logger.blank()
@@ -885,12 +898,13 @@ def _handle_delete(args: Namespace) -> int:
 
     logger.header(f"Deleting: {domain}")
 
-    total_steps = 5
+    total_steps = 6
 
     # Stop Docker Compose containers if applicable
     if app and app.app_type == "docker-compose":
         logger.step(1, total_steps, "Stopping Docker Compose containers")
         from wasm.core.utils import run_command as _run_cmd
+
         for compose_name in ["docker-compose.prod.yml", "docker-compose.yml", "compose.yml"]:
             compose_file = app_path / compose_name
             if compose_file.exists():
@@ -927,24 +941,39 @@ def _handle_delete(args: Namespace) -> int:
     except Exception as e:
         logger.warning(f"Failed to remove apache site configuration: {e}")
 
+    # Delete SSL certificate
+    logger.step(3, total_steps, "Removing SSL certificate")
+    try:
+        from wasm.managers.cert_manager import CertManager
+
+        cert_manager = CertManager(verbose=args.verbose)
+        if cert_manager.is_installed() and cert_manager.cert_exists(domain):
+            cert_manager.delete(domain)
+            logger.substep(f"Certificate deleted: {domain}")
+        else:
+            logger.substep("No certificate found")
+    except Exception as e:
+        logger.warning(f"Failed to delete certificate: {e}")
+
     # Delete files
     if not args.keep_files:
-        logger.step(3, total_steps, "Removing application files")
+        logger.step(4, total_steps, "Removing application files")
         from wasm.core.utils import remove_directory
+
         remove_directory(app_path, sudo=True)
     else:
-        logger.step(3, total_steps, "Keeping application files")
+        logger.step(4, total_steps, "Keeping application files")
 
     # Delete from store
-    logger.step(4, total_steps, "Removing from database")
+    logger.step(5, total_steps, "Removing from database")
     if app:
         store.delete_site(domain)
         store.delete_service(app_name)
         store.delete_app(domain)
 
-    logger.step(5, total_steps, "Cleanup complete")
+    logger.step(6, total_steps, "Cleanup complete")
     logger.success(f"Application deleted: {domain}")
-    
+
     return 0
 
 
@@ -958,14 +987,16 @@ def _handle_logs(args: Namespace) -> int:
 
     # Check if this is a docker-compose app
     from wasm.core.store import get_store
+
     store = get_store()
     app = store.get_app(domain)
 
     if app and app.app_type == "docker-compose":
         config = Config()
         app_path = Path(app.app_path) if app.app_path else config.apps_directory / app_name
-        from wasm.core.utils import run_command as _run_cmd
         import subprocess
+
+        from wasm.core.utils import run_command as _run_cmd
 
         # Find compose file
         compose_file = None
@@ -997,13 +1028,18 @@ def _handle_logs(args: Namespace) -> int:
     if args.follow:
         # Use journalctl directly for follow mode
         import subprocess
+
         try:
-            subprocess.run([
-                "journalctl",
-                "-u", f"{service_name}.service",
-                "-f",
-                "-n", str(args.lines),
-            ])
+            subprocess.run(
+                [
+                    "journalctl",
+                    "-u",
+                    f"{service_name}.service",
+                    "-f",
+                    "-n",
+                    str(args.lines),
+                ]
+            )
         except KeyboardInterrupt:
             pass
         except FileNotFoundError:
@@ -1015,5 +1051,5 @@ def _handle_logs(args: Namespace) -> int:
     else:
         logs = service_manager.logs(app_name, lines=args.lines)
         print(logs)
-    
+
     return 0

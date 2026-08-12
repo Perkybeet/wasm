@@ -4,20 +4,20 @@ Backups API endpoints.
 Provides endpoints for managing application backups.
 """
 
-from typing import Any, Dict, List, Optional
-from pathlib import Path
+from typing import Any
 
-from fastapi import APIRouter, Request, HTTPException, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from wasm.web.api.auth import get_current_session
 from wasm.managers.backup_manager import BackupManager
+from wasm.web.api.auth import get_current_session
 
 router = APIRouter()
 
 
 class BackupInfo(BaseModel):
     """Backup information."""
+
     backup_id: str
     domain: str
     timestamp: str
@@ -25,57 +25,63 @@ class BackupInfo(BaseModel):
     size_human: str
     age: str
     description: str = ""
-    app_type: Optional[str] = None
+    app_type: str | None = None
     includes_env: bool = False
     includes_node_modules: bool = False
     includes_build: bool = False
     has_database: bool = False
-    database_backups: List[Dict[str, Any]] = Field(default_factory=list)
-    git_commit: Optional[str] = None
-    git_branch: Optional[str] = None
-    tags: List[str] = Field(default_factory=list)
+    database_backups: list[dict[str, Any]] = Field(default_factory=list)
+    git_commit: str | None = None
+    git_branch: str | None = None
+    tags: list[str] = Field(default_factory=list)
 
 
 class BackupListResponse(BaseModel):
     """Response for listing backups."""
-    backups: List[BackupInfo]
+
+    backups: list[BackupInfo]
     total: int
 
 
 class BackupStorageResponse(BaseModel):
     """Response for backup storage info."""
+
     path: str
     total_size: int
     total_size_human: str
     backup_count: int
-    domains: List[str]
+    domains: list[str]
 
 
 class CreateBackupRequest(BaseModel):
     """Request to create a new backup."""
+
     domain: str = Field(..., description="Domain of the app to backup")
     description: str = Field(default="", description="Description for the backup")
     include_env: bool = Field(default=True, description="Include .env files")
     include_node_modules: bool = Field(default=False, description="Include node_modules (large!)")
     include_build: bool = Field(default=False, description="Include build artifacts")
     include_database: bool = Field(default=False, description="Include database dumps")
-    tags: List[str] = Field(default_factory=list, description="Tags for the backup")
+    tags: list[str] = Field(default_factory=list, description="Tags for the backup")
 
 
 class RestoreBackupRequest(BaseModel):
     """Request to restore a backup."""
-    target_domain: Optional[str] = Field(default=None, description="Target domain to restore to")
+
+    target_domain: str | None = Field(default=None, description="Target domain to restore to")
 
 
 class BackupActionResponse(BaseModel):
     """Response for backup actions."""
+
     success: bool
     message: str
-    backup_id: Optional[str] = None
+    backup_id: str | None = None
 
 
 class VerifyBackupResponse(BaseModel):
     """Response for backup verification."""
+
     backup_id: str
     valid: bool
     checksum_ok: bool
@@ -86,9 +92,9 @@ class VerifyBackupResponse(BaseModel):
 @router.get("", response_model=BackupListResponse)
 async def list_backups(
     request: Request,
-    domain: Optional[str] = Query(None, description="Filter by domain"),
+    domain: str | None = Query(None, description="Filter by domain"),
     limit: int = Query(100, ge=1, le=1000),
-    session: dict = Depends(get_current_session)
+    session: dict = Depends(get_current_session),
 ):
     """
     List all backups, optionally filtered by domain.
@@ -96,52 +102,48 @@ async def list_backups(
     try:
         manager = BackupManager(verbose=False)
         backups_list = manager.list_backups(domain=domain, limit=limit)
-        
+
         backups = []
         for backup in backups_list:
-            backups.append(BackupInfo(
-                backup_id=backup.id,
-                domain=backup.domain,
-                timestamp=backup.created_at,
-                size=backup.size_bytes,
-                size_human=backup.size_human,
-                age=backup.age,
-                description=backup.description,
-                app_type=backup.app_type,
-                includes_env=backup.includes_env,
-                includes_node_modules=backup.includes_node_modules,
-                includes_build=backup.includes_build,
-                has_database=backup.includes_databases,
-                database_backups=backup.database_backups,
-                git_commit=backup.git_commit,
-                git_branch=backup.git_branch,
-                tags=backup.tags
-            ))
-        
-        return BackupListResponse(
-            backups=backups,
-            total=len(backups)
-        )
+            backups.append(
+                BackupInfo(
+                    backup_id=backup.id,
+                    domain=backup.domain,
+                    timestamp=backup.created_at,
+                    size=backup.size_bytes,
+                    size_human=backup.size_human,
+                    age=backup.age,
+                    description=backup.description,
+                    app_type=backup.app_type,
+                    includes_env=backup.includes_env,
+                    includes_node_modules=backup.includes_node_modules,
+                    includes_build=backup.includes_build,
+                    has_database=backup.includes_databases,
+                    database_backups=backup.database_backups,
+                    git_commit=backup.git_commit,
+                    git_branch=backup.git_branch,
+                    tags=backup.tags,
+                )
+            )
+
+        return BackupListResponse(backups=backups, total=len(backups))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to list backups: {e}")
 
 
 @router.get("/storage", response_model=BackupStorageResponse)
-async def get_storage_info(
-    request: Request,
-    session: dict = Depends(get_current_session)
-):
+async def get_storage_info(request: Request, session: dict = Depends(get_current_session)):
     """
     Get backup storage information.
     """
     try:
         manager = BackupManager(verbose=False)
         backup_dir = manager.backup_dir
-        
+
         total_size = 0
         backup_count = 0
         domains = set()
-        
+
         if backup_dir.exists():
             for app_dir in backup_dir.iterdir():
                 if app_dir.is_dir():
@@ -149,7 +151,7 @@ async def get_storage_info(
                     for backup_file in app_dir.glob("*.tar.gz"):
                         total_size += backup_file.stat().st_size
                         backup_count += 1
-        
+
         # Convert size to human readable
         if total_size >= 1073741824:  # 1 GB
             size_human = f"{total_size / 1073741824:.2f} GB"
@@ -159,13 +161,13 @@ async def get_storage_info(
             size_human = f"{total_size / 1024:.2f} KB"
         else:
             size_human = f"{total_size} B"
-        
+
         return BackupStorageResponse(
             path=str(backup_dir),
             total_size=total_size,
             total_size_human=size_human,
             backup_count=backup_count,
-            domains=sorted(list(domains))
+            domains=sorted(list(domains)),
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get storage info: {e}")
@@ -173,9 +175,7 @@ async def get_storage_info(
 
 @router.get("/{backup_id}", response_model=BackupInfo)
 async def get_backup(
-    backup_id: str,
-    request: Request,
-    session: dict = Depends(get_current_session)
+    backup_id: str, request: Request, session: dict = Depends(get_current_session)
 ):
     """
     Get details for a specific backup.
@@ -183,10 +183,10 @@ async def get_backup(
     try:
         manager = BackupManager(verbose=False)
         backup = manager.get_backup(backup_id)
-        
+
         if not backup:
             raise HTTPException(status_code=404, detail=f"Backup not found: {backup_id}")
-        
+
         return BackupInfo(
             backup_id=backup.id,
             domain=backup.domain,
@@ -203,7 +203,7 @@ async def get_backup(
             database_backups=backup.database_backups,
             git_commit=backup.git_commit,
             git_branch=backup.git_branch,
-            tags=backup.tags
+            tags=backup.tags,
         )
     except HTTPException:
         raise
@@ -213,27 +213,25 @@ async def get_backup(
 
 @router.post("", response_model=BackupActionResponse)
 async def create_backup(
-    data: CreateBackupRequest,
-    request: Request,
-    session: dict = Depends(get_current_session)
+    data: CreateBackupRequest, request: Request, session: dict = Depends(get_current_session)
 ):
     """
     Create a new backup for an application.
     """
     try:
         manager = BackupManager(verbose=False)
-        
+
         # Check if app exists
         from wasm.core.config import Config
         from wasm.core.utils import domain_to_app_name
-        
+
         config = Config()
         app_name = domain_to_app_name(data.domain)
         app_path = config.apps_directory / app_name
-        
+
         if not app_path.exists():
             raise HTTPException(status_code=404, detail=f"Application not found: {data.domain}")
-        
+
         backup_meta = manager.create(
             domain=data.domain,
             description=data.description,
@@ -243,11 +241,9 @@ async def create_backup(
             include_databases=data.include_database,
             tags=data.tags,
         )
-        
+
         return BackupActionResponse(
-            success=True,
-            message=f"Backup created: {backup_meta.id}",
-            backup_id=backup_meta.id
+            success=True, message=f"Backup created: {backup_meta.id}", backup_id=backup_meta.id
         )
     except HTTPException:
         raise
@@ -257,9 +253,7 @@ async def create_backup(
 
 @router.post("/{backup_id}/verify", response_model=VerifyBackupResponse)
 async def verify_backup(
-    backup_id: str,
-    request: Request,
-    session: dict = Depends(get_current_session)
+    backup_id: str, request: Request, session: dict = Depends(get_current_session)
 ):
     """
     Verify a backup's integrity.
@@ -267,13 +261,13 @@ async def verify_backup(
     try:
         manager = BackupManager(verbose=False)
         result = manager.verify(backup_id)
-        
+
         return VerifyBackupResponse(
             backup_id=backup_id,
             valid=result.get("valid", False),
             checksum_ok=result.get("checksum_ok", False),
             files_ok=result.get("files_ok", False),
-            message=result.get("message", "")
+            message=result.get("message", ""),
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to verify backup: {e}")
@@ -284,33 +278,28 @@ async def restore_backup(
     backup_id: str,
     data: RestoreBackupRequest,
     request: Request,
-    session: dict = Depends(get_current_session)
+    session: dict = Depends(get_current_session),
 ):
     """
     Restore an application from a backup.
     """
     try:
         manager = BackupManager(verbose=False)
-        
+
         # Get backup info
         backup = manager.get_backup(backup_id)
         if not backup:
             raise HTTPException(status_code=404, detail=f"Backup not found: {backup_id}")
-        
+
         # Determine target domain
         target_domain = data.target_domain or backup.domain
 
         # Perform restore
-        success = manager.restore(
-            backup_id=backup_id,
-            target_domain=target_domain
-        )
-        
+        success = manager.restore(backup_id=backup_id, target_domain=target_domain)
+
         if success:
             return BackupActionResponse(
-                success=True,
-                message=f"Backup restored to {target_domain}",
-                backup_id=backup_id
+                success=True, message=f"Backup restored to {target_domain}", backup_id=backup_id
             )
         else:
             raise HTTPException(status_code=500, detail="Restore operation failed")
@@ -322,28 +311,24 @@ async def restore_backup(
 
 @router.delete("/{backup_id}", response_model=BackupActionResponse)
 async def delete_backup(
-    backup_id: str,
-    request: Request,
-    session: dict = Depends(get_current_session)
+    backup_id: str, request: Request, session: dict = Depends(get_current_session)
 ):
     """
     Delete a backup.
     """
     try:
         manager = BackupManager(verbose=False)
-        
+
         # Check if backup exists
         backup = manager.get_backup(backup_id)
         if not backup:
             raise HTTPException(status_code=404, detail=f"Backup not found: {backup_id}")
-        
+
         success = manager.delete(backup_id)
-        
+
         if success:
             return BackupActionResponse(
-                success=True,
-                message=f"Backup deleted: {backup_id}",
-                backup_id=backup_id
+                success=True, message=f"Backup deleted: {backup_id}", backup_id=backup_id
             )
         else:
             raise HTTPException(status_code=500, detail="Delete operation failed")

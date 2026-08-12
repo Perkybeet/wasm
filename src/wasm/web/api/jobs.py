@@ -4,47 +4,49 @@ Jobs API endpoints for WASM Web Interface.
 Provides endpoints for managing background jobs.
 """
 
-from typing import Optional, List
-from fastapi import APIRouter, HTTPException, Depends, Query
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from wasm.web.auth import require_auth
 from wasm.web.jobs import (
-    get_job_manager,
-    JobType,
     JobStatus,
-    Job,
-    deploy_app_job,
-    update_app_job,
-    delete_app_job,
+    JobType,
     backup_app_job,
-    rollback_app_job,
     cert_create_job,
+    delete_app_job,
+    deploy_app_job,
+    get_job_manager,
+    rollback_app_job,
+    update_app_job,
 )
-
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
 
 # ============ Request/Response Models ============
 
+
 class DeployRequest(BaseModel):
     """Request to deploy a new application."""
+
     domain: str = Field(..., description="Domain name for the application")
     source: str = Field(..., description="Git repository URL or local path")
     app_type: str = Field(..., description="Application type (nextjs, vite, python, etc.)")
-    port: Optional[int] = Field(None, description="Port number (auto-assigned if not provided)")
+    port: int | None = Field(None, description="Port number (auto-assigned if not provided)")
     branch: str = Field("main", description="Git branch to deploy")
-    env_vars: Optional[dict] = Field(None, description="Environment variables")
+    env_vars: dict | None = Field(None, description="Environment variables")
 
 
 class UpdateRequest(BaseModel):
     """Request to update an application."""
+
     domain: str = Field(..., description="Domain of the application to update")
 
 
 class DeleteRequest(BaseModel):
     """Request to delete an application."""
+
     domain: str = Field(..., description="Domain of the application to delete")
     remove_files: bool = Field(True, description="Remove application files")
     remove_ssl: bool = Field(True, description="Remove SSL certificates")
@@ -52,23 +54,27 @@ class DeleteRequest(BaseModel):
 
 class BackupRequest(BaseModel):
     """Request to create a backup."""
+
     domain: str = Field(..., description="Domain of the application to backup")
 
 
 class RollbackRequest(BaseModel):
     """Request to rollback an application."""
+
     domain: str = Field(..., description="Domain of the application to rollback")
-    backup_id: Optional[str] = Field(None, description="Specific backup ID to restore")
+    backup_id: str | None = Field(None, description="Specific backup ID to restore")
 
 
 class CertRequest(BaseModel):
     """Request to create SSL certificate."""
+
     domain: str = Field(..., description="Domain for the certificate")
-    email: Optional[str] = Field(None, description="Email for certificate notifications")
+    email: str | None = Field(None, description="Email for certificate notifications")
 
 
 class JobResponse(BaseModel):
     """Response containing job information."""
+
     id: str
     type: str
     name: str
@@ -78,33 +84,35 @@ class JobResponse(BaseModel):
     total_steps: int
     current_step: str
     created_at: str
-    started_at: Optional[str]
-    completed_at: Optional[str]
-    result: Optional[dict]
-    error: Optional[str]
-    logs: List[dict]
+    started_at: str | None
+    completed_at: str | None
+    result: dict | None
+    error: str | None
+    logs: list[dict]
     metadata: dict
 
 
 class JobListResponse(BaseModel):
     """Response containing list of jobs."""
-    jobs: List[JobResponse]
+
+    jobs: list[JobResponse]
     total: int
     active: int
 
 
 # ============ Endpoints ============
 
+
 @router.get("", response_model=JobListResponse)
 async def list_jobs(
     limit: int = Query(50, ge=1, le=100),
-    status: Optional[str] = Query(None),
+    status: str | None = Query(None),
     _: dict = Depends(require_auth),
 ):
     """List all jobs."""
     manager = get_job_manager()
     jobs = manager.get_all_jobs(limit=limit)
-    
+
     # Filter by status if provided
     if status:
         try:
@@ -112,9 +120,9 @@ async def list_jobs(
             jobs = [j for j in jobs if j.status == status_enum]
         except ValueError:
             pass
-    
+
     active_jobs = manager.get_active_jobs()
-    
+
     return {
         "jobs": [j.to_dict() for j in jobs],
         "total": len(jobs),
@@ -127,7 +135,7 @@ async def list_active_jobs(_: dict = Depends(require_auth)):
     """List only active (pending/running) jobs."""
     manager = get_job_manager()
     jobs = manager.get_active_jobs()
-    
+
     return {
         "jobs": [j.to_dict() for j in jobs],
         "total": len(jobs),
@@ -140,10 +148,10 @@ async def get_job(job_id: str, _: dict = Depends(require_auth)):
     """Get details of a specific job."""
     manager = get_job_manager()
     job = manager.get_job(job_id)
-    
+
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    
+
     return job.to_dict()
 
 
@@ -151,13 +159,12 @@ async def get_job(job_id: str, _: dict = Depends(require_auth)):
 async def cancel_job(job_id: str, _: dict = Depends(require_auth)):
     """Cancel a pending job."""
     manager = get_job_manager()
-    
+
     if manager.cancel_job(job_id):
         return {"message": "Job cancelled", "job_id": job_id}
-    
+
     raise HTTPException(
-        status_code=400,
-        detail="Cannot cancel job (may already be running or completed)"
+        status_code=400, detail="Cannot cancel job (may already be running or completed)"
     )
 
 
@@ -165,7 +172,7 @@ async def cancel_job(job_id: str, _: dict = Depends(require_auth)):
 async def create_deploy_job(request: DeployRequest, _: dict = Depends(require_auth)):
     """Create a new deployment job."""
     manager = get_job_manager()
-    
+
     job = manager.create_job(
         job_type=JobType.DEPLOY,
         name=f"Deploy {request.domain}",
@@ -186,7 +193,7 @@ async def create_deploy_job(request: DeployRequest, _: dict = Depends(require_au
         },
         total_steps=100,
     )
-    
+
     return {
         "message": "Deployment job created",
         "job": job.to_dict(),
@@ -197,7 +204,7 @@ async def create_deploy_job(request: DeployRequest, _: dict = Depends(require_au
 async def create_update_job(request: UpdateRequest, _: dict = Depends(require_auth)):
     """Create an update job."""
     manager = get_job_manager()
-    
+
     job = manager.create_job(
         job_type=JobType.UPDATE,
         name=f"Update {request.domain}",
@@ -207,7 +214,7 @@ async def create_update_job(request: UpdateRequest, _: dict = Depends(require_au
         metadata={"domain": request.domain},
         total_steps=100,
     )
-    
+
     return {
         "message": "Update job created",
         "job": job.to_dict(),
@@ -218,7 +225,7 @@ async def create_update_job(request: UpdateRequest, _: dict = Depends(require_au
 async def create_delete_job(request: DeleteRequest, _: dict = Depends(require_auth)):
     """Create a deletion job."""
     manager = get_job_manager()
-    
+
     job = manager.create_job(
         job_type=JobType.DELETE,
         name=f"Delete {request.domain}",
@@ -232,7 +239,7 @@ async def create_delete_job(request: DeleteRequest, _: dict = Depends(require_au
         metadata={"domain": request.domain},
         total_steps=100,
     )
-    
+
     return {
         "message": "Deletion job created",
         "job": job.to_dict(),
@@ -243,7 +250,7 @@ async def create_delete_job(request: DeleteRequest, _: dict = Depends(require_au
 async def create_backup_job(request: BackupRequest, _: dict = Depends(require_auth)):
     """Create a backup job."""
     manager = get_job_manager()
-    
+
     job = manager.create_job(
         job_type=JobType.BACKUP,
         name=f"Backup {request.domain}",
@@ -253,7 +260,7 @@ async def create_backup_job(request: BackupRequest, _: dict = Depends(require_au
         metadata={"domain": request.domain},
         total_steps=100,
     )
-    
+
     return {
         "message": "Backup job created",
         "job": job.to_dict(),
@@ -264,11 +271,12 @@ async def create_backup_job(request: BackupRequest, _: dict = Depends(require_au
 async def create_rollback_job(request: RollbackRequest, _: dict = Depends(require_auth)):
     """Create a rollback job."""
     manager = get_job_manager()
-    
+
     job = manager.create_job(
         job_type=JobType.RESTORE,
         name=f"Rollback {request.domain}",
-        description=f"Rolling back {request.domain}" + (f" to backup {request.backup_id}" if request.backup_id else ""),
+        description=f"Rolling back {request.domain}"
+        + (f" to backup {request.backup_id}" if request.backup_id else ""),
         func=rollback_app_job,
         kwargs={
             "domain": request.domain,
@@ -277,7 +285,7 @@ async def create_rollback_job(request: RollbackRequest, _: dict = Depends(requir
         metadata={"domain": request.domain, "backup_id": request.backup_id},
         total_steps=100,
     )
-    
+
     return {
         "message": "Rollback job created",
         "job": job.to_dict(),
@@ -288,7 +296,7 @@ async def create_rollback_job(request: RollbackRequest, _: dict = Depends(requir
 async def create_cert_job(request: CertRequest, _: dict = Depends(require_auth)):
     """Create a certificate creation job."""
     manager = get_job_manager()
-    
+
     job = manager.create_job(
         job_type=JobType.CERT_CREATE,
         name=f"SSL for {request.domain}",
@@ -301,7 +309,7 @@ async def create_cert_job(request: CertRequest, _: dict = Depends(require_auth))
         metadata={"domain": request.domain},
         total_steps=100,
     )
-    
+
     return {
         "message": "Certificate job created",
         "job": job.to_dict(),
@@ -316,5 +324,5 @@ async def cleanup_jobs(
     """Clean up old completed jobs."""
     manager = get_job_manager()
     manager.cleanup_old_jobs(max_age_hours=max_age_hours)
-    
+
     return {"message": f"Cleaned up jobs older than {max_age_hours} hours"}

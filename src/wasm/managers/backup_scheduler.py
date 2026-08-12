@@ -9,8 +9,6 @@ Creates and manages systemd timers for automated application backups.
 """
 
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, List, Optional
 
 from jinja2 import Environment, PackageLoader
 
@@ -18,13 +16,12 @@ from wasm.core.config import SYSTEMD_DIR as _SYSTEMD_DIR
 from wasm.core.exceptions import BackupError
 from wasm.core.logger import Logger
 from wasm.core.utils import (
+    domain_to_app_name,
+    remove_file,
     run_command,
     run_command_sudo,
     write_file,
-    remove_file,
-    domain_to_app_name,
 )
-
 
 # Schedule aliases
 SCHEDULE_ALIASES = {
@@ -38,13 +35,14 @@ SCHEDULE_ALIASES = {
 @dataclass
 class BackupSchedule:
     """Configuration for a scheduled backup."""
+
     domain: str
     app_name: str
     schedule: str
     include_databases: bool = True
     retention_count: int = 7
     retention_days: int = 30
-    tags: List[str] = None
+    tags: list[str] = None
 
     def __post_init__(self):
         if self.tags is None:
@@ -157,18 +155,22 @@ class BackupScheduler:
         self.logger.info(f"Removed backup schedule: {timer_name}")
         return True
 
-    def list_schedules(self) -> List[Dict]:
+    def list_schedules(self) -> list[dict]:
         """
         List all WASM backup schedules.
 
         Returns:
             List of schedule information dictionaries.
         """
-        result = run_command([
-            "systemctl", "list-timers",
-            "--no-legend", "--no-pager",
-            "wasm-backup-*",
-        ])
+        result = run_command(
+            [
+                "systemctl",
+                "list-timers",
+                "--no-legend",
+                "--no-pager",
+                "wasm-backup-*",
+            ]
+        )
 
         schedules = []
         if not result.success:
@@ -184,10 +186,14 @@ class BackupScheduler:
                 app_name = timer_name.replace("wasm-backup-", "")
 
                 # Get timer details
-                detail_result = run_command([
-                    "systemctl", "show", f"{timer_name}.timer",
-                    "--property=TimersCalendar,LastTriggerUSec,NextElapseUSecRealtime",
-                ])
+                detail_result = run_command(
+                    [
+                        "systemctl",
+                        "show",
+                        f"{timer_name}.timer",
+                        "--property=TimersCalendar,LastTriggerUSec,NextElapseUSecRealtime",
+                    ]
+                )
 
                 schedule_info = {
                     "timer": timer_name,
@@ -205,7 +211,7 @@ class BackupScheduler:
 
         return schedules
 
-    def get_schedule(self, domain: str) -> Optional[BackupSchedule]:
+    def get_schedule(self, domain: str) -> BackupSchedule | None:
         """
         Get schedule for a specific domain.
 

@@ -13,7 +13,7 @@ project configuration files.
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Any
 
 import yaml
 
@@ -23,6 +23,7 @@ from wasm.core.logger import Logger
 @dataclass
 class NginxRoute:
     """A single Nginx location route."""
+
     path: str = "/"
     upstream_port: int = 3000
     upstream_name: str = ""
@@ -37,10 +38,11 @@ class NginxRoute:
 @dataclass
 class NginxAdvancedConfig:
     """Advanced Nginx configuration with multiple routes."""
-    routes: List[NginxRoute] = field(default_factory=list)
+
+    routes: list[NginxRoute] = field(default_factory=list)
     global_rate_limit: str = ""
-    security_headers: Dict[str, str] = field(default_factory=dict)
-    custom_directives: List[str] = field(default_factory=list)
+    security_headers: dict[str, str] = field(default_factory=dict)
+    custom_directives: list[str] = field(default_factory=list)
 
 
 class NginxConfigBuilder:
@@ -57,7 +59,7 @@ class NginxConfigBuilder:
         self.verbose = verbose
         self.logger = Logger(verbose=verbose)
 
-    def detect(self, app_path: Path) -> Optional[Path]:
+    def detect(self, app_path: Path) -> Path | None:
         """
         Find a wasm.nginx.yaml config file.
 
@@ -177,7 +179,7 @@ class NginxConfigBuilder:
         domain: str,
         ssl: bool = False,
         app_path: str = "",
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Build Jinja2 template context from configuration.
 
@@ -248,7 +250,7 @@ class NginxConfigBuilder:
             "custom_directives": config.custom_directives,
         }
 
-    def validate(self, config: NginxAdvancedConfig) -> List[str]:
+    def validate(self, config: NginxAdvancedConfig) -> list[str]:
         """
         Validate an advanced Nginx configuration.
 
@@ -280,7 +282,9 @@ class NginxConfigBuilder:
         # Validate rate limit format (e.g., "100r/s", "10r/m")
         rate_limit_pattern = re.compile(r"^\d+r/[sm]$")
         if config.global_rate_limit and not rate_limit_pattern.match(config.global_rate_limit):
-            errors.append(f"Invalid rate limit format: {config.global_rate_limit} (expected: NNr/s or NNr/m)")
+            errors.append(
+                f"Invalid rate limit format: {config.global_rate_limit} (expected: NNr/s or NNr/m)"
+            )
 
         for route in config.routes:
             if route.rate_limit and not rate_limit_pattern.match(route.rate_limit):

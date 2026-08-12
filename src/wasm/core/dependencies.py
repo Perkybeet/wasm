@@ -5,23 +5,22 @@ Handles checking, installing, and managing system and runtime dependencies
 needed for deploying various types of applications.
 """
 
-import shutil
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 from wasm.core.utils import (
+    TRUSTED_INSTALLER_URLS,
+    command_exists,
     run_command,
     run_command_sudo,
-    command_exists,
     run_trusted_installer,
-    TRUSTED_INSTALLER_URLS,
 )
 
 
 class DependencyStatus(Enum):
     """Status of a dependency check."""
+
     INSTALLED = "installed"
     NOT_INSTALLED = "not_installed"
     OUTDATED = "outdated"
@@ -31,19 +30,20 @@ class DependencyStatus(Enum):
 @dataclass
 class Dependency:
     """Represents a system dependency."""
+
     name: str
     command: str  # Command to check if installed
     description: str
     required: bool = True
     category: str = "system"  # system, nodejs, python, webserver
-    install_apt: Optional[str] = None  # apt package name
-    install_script: Optional[str] = None  # Custom install script/URL
+    install_apt: str | None = None  # apt package name
+    install_script: str | None = None  # Custom install script/URL
     version_flag: str = "--version"
-    min_version: Optional[str] = None
+    min_version: str | None = None
 
 
 # Core system dependencies
-SYSTEM_DEPENDENCIES: List[Dependency] = [
+SYSTEM_DEPENDENCIES: list[Dependency] = [
     Dependency(
         name="git",
         command="git",
@@ -71,7 +71,7 @@ SYSTEM_DEPENDENCIES: List[Dependency] = [
 ]
 
 # Web server dependencies
-WEBSERVER_DEPENDENCIES: List[Dependency] = [
+WEBSERVER_DEPENDENCIES: list[Dependency] = [
     Dependency(
         name="nginx",
         command="nginx",
@@ -101,7 +101,7 @@ WEBSERVER_DEPENDENCIES: List[Dependency] = [
 ]
 
 # Node.js runtime and package managers
-NODEJS_DEPENDENCIES: List[Dependency] = [
+NODEJS_DEPENDENCIES: list[Dependency] = [
     Dependency(
         name="node",
         command="node",
@@ -145,7 +145,7 @@ NODEJS_DEPENDENCIES: List[Dependency] = [
 ]
 
 # Docker dependencies
-DOCKER_DEPENDENCIES: List[Dependency] = [
+DOCKER_DEPENDENCIES: list[Dependency] = [
     Dependency(
         name="docker",
         command="docker",
@@ -165,7 +165,7 @@ DOCKER_DEPENDENCIES: List[Dependency] = [
 ]
 
 # Python dependencies
-PYTHON_DEPENDENCIES: List[Dependency] = [
+PYTHON_DEPENDENCIES: list[Dependency] = [
     Dependency(
         name="python3",
         command="python3",
@@ -198,16 +198,16 @@ class DependencyChecker:
     """
     Utility class to check and manage system dependencies.
     """
-    
+
     # All known dependencies by category
-    ALL_DEPENDENCIES: Dict[str, List[Dependency]] = {
+    ALL_DEPENDENCIES: dict[str, list[Dependency]] = {
         "system": SYSTEM_DEPENDENCIES,
         "webserver": WEBSERVER_DEPENDENCIES,
         "nodejs": NODEJS_DEPENDENCIES,
         "python": PYTHON_DEPENDENCIES,
         "docker": DOCKER_DEPENDENCIES,
     }
-    
+
     # Package manager info
     PACKAGE_MANAGERS = {
         "npm": {
@@ -231,36 +231,36 @@ class DependencyChecker:
             "comes_with_node": False,
         },
     }
-    
+
     def __init__(self, verbose: bool = False):
         """
         Initialize the dependency checker.
-        
+
         Args:
             verbose: Enable verbose output.
         """
         self.verbose = verbose
-    
+
     def check_command(self, command: str) -> bool:
         """
         Check if a command exists in PATH.
-        
+
         Args:
             command: Command name to check.
-            
+
         Returns:
             True if command exists.
         """
         return command_exists(command)
-    
-    def get_version(self, command: str, version_flag: str = "--version") -> Optional[str]:
+
+    def get_version(self, command: str, version_flag: str = "--version") -> str | None:
         """
         Get the version of an installed command.
-        
+
         Args:
             command: Command name.
             version_flag: Flag to get version.
-            
+
         Returns:
             Version string or None.
         """
@@ -270,78 +270,78 @@ class DependencyChecker:
             output = result.stdout.strip() or result.stderr.strip()
             return output.split("\n")[0] if output else None
         return None
-    
-    def check_dependency(self, dep: Dependency) -> Tuple[DependencyStatus, Optional[str]]:
+
+    def check_dependency(self, dep: Dependency) -> tuple[DependencyStatus, str | None]:
         """
         Check the status of a single dependency.
-        
+
         Args:
             dep: Dependency to check.
-            
+
         Returns:
             Tuple of (status, version).
         """
         if not self.check_command(dep.command):
             return DependencyStatus.NOT_INSTALLED, None
-        
+
         version = self.get_version(dep.command, dep.version_flag)
         return DependencyStatus.INSTALLED, version
-    
+
     def check_all_dependencies(
         self,
-        categories: Optional[List[str]] = None,
-    ) -> Dict[str, Dict[str, Tuple[DependencyStatus, Optional[str]]]]:
+        categories: list[str] | None = None,
+    ) -> dict[str, dict[str, tuple[DependencyStatus, str | None]]]:
         """
         Check all dependencies in specified categories.
-        
+
         Args:
             categories: Categories to check (None for all).
-            
+
         Returns:
             Dict of category -> {name: (status, version)}.
         """
         if categories is None:
             categories = list(self.ALL_DEPENDENCIES.keys())
-        
-        results: Dict[str, Dict[str, Tuple[DependencyStatus, Optional[str]]]] = {}
-        
+
+        results: dict[str, dict[str, tuple[DependencyStatus, str | None]]] = {}
+
         for category in categories:
             deps = self.ALL_DEPENDENCIES.get(category, [])
             results[category] = {}
-            
+
             for dep in deps:
                 status, version = self.check_dependency(dep)
                 results[category][dep.name] = (status, version)
-        
+
         return results
-    
-    def check_package_manager(self, pm: str) -> Tuple[bool, Optional[str], str]:
+
+    def check_package_manager(self, pm: str) -> tuple[bool, str | None, str]:
         """
         Check if a specific package manager is available.
-        
+
         Args:
             pm: Package manager name (npm, pnpm, yarn, bun).
-            
+
         Returns:
             Tuple of (is_installed, version, install_instructions).
         """
         is_installed = self.check_command(pm)
         version = self.get_version(pm) if is_installed else None
-        
+
         pm_info = self.PACKAGE_MANAGERS.get(pm, {})
         install_cmd = pm_info.get("install_cmd", f"npm install -g {pm}")
-        
+
         install_instructions = f"Install with: {install_cmd}"
-        
+
         return is_installed, version, install_instructions
-    
-    def detect_required_package_manager(self, app_path: Path) -> Optional[str]:
+
+    def detect_required_package_manager(self, app_path: Path) -> str | None:
         """
         Detect which package manager a project requires based on lock files.
-        
+
         Args:
             app_path: Path to the application.
-            
+
         Returns:
             Package manager name or None if not detected.
         """
@@ -349,56 +349,56 @@ class DependencyChecker:
             lock_file = info.get("lock_file")
             if lock_file and (app_path / lock_file).exists():
                 return pm
-        
+
         # Default to npm if package.json exists
         if (app_path / "package.json").exists():
             return "npm"
-        
+
         return None
-    
-    def get_missing_required(self) -> List[Dependency]:
+
+    def get_missing_required(self) -> list[Dependency]:
         """
         Get list of missing required dependencies.
-        
+
         Returns:
             List of missing required dependencies.
         """
         missing = []
-        
+
         for category, deps in self.ALL_DEPENDENCIES.items():
             for dep in deps:
                 if dep.required:
                     status, _ = self.check_dependency(dep)
                     if status == DependencyStatus.NOT_INSTALLED:
                         missing.append(dep)
-        
+
         return missing
-    
+
     def verify_deployment_requirements(
         self,
         app_type: str,
         package_manager: str = "auto",
-        app_path: Optional[Path] = None,
-    ) -> Tuple[bool, List[str], List[str]]:
+        app_path: Path | None = None,
+    ) -> tuple[bool, list[str], list[str]]:
         """
         Verify all requirements for a deployment are met.
-        
+
         Args:
             app_type: Type of application (nextjs, nodejs, python, static).
             package_manager: Requested package manager.
             app_path: Path to application (for detection).
-            
+
         Returns:
             Tuple of (can_deploy, missing_deps, warnings).
         """
         missing = []
         warnings = []
-        
+
         # Check basic system deps
         for dep in SYSTEM_DEPENDENCIES:
             if dep.required and not self.check_command(dep.command):
                 missing.append(f"{dep.name}: {dep.description}")
-        
+
         # Check app-type specific deps
         if app_type in ["nextjs", "nodejs", "vite"]:
             # Need Node.js
@@ -407,7 +407,7 @@ class DependencyChecker:
             else:
                 # Node.js is available, check package managers
                 available_pms = self.get_available_package_managers()
-                
+
                 if not available_pms:
                     missing.append("No package manager available. Install Node.js with npm.")
                 else:
@@ -415,7 +415,7 @@ class DependencyChecker:
                     required_pm = package_manager
                     if required_pm == "auto" and app_path:
                         required_pm = self.detect_required_package_manager(app_path) or "npm"
-                    
+
                     if required_pm and required_pm != "auto" and required_pm not in available_pms:
                         # The requested/detected PM is not available, but others are
                         available_list = ", ".join(available_pms)
@@ -424,7 +424,7 @@ class DependencyChecker:
                             f"Available: {available_list}. "
                             f"Use --pm to specify one, or install {required_pm}."
                         )
-        
+
         elif app_type == "docker-compose":
             # Need Docker and Docker Compose
             if not self.check_command("docker"):
@@ -433,7 +433,9 @@ class DependencyChecker:
                 # Verify Docker daemon is running
                 result = run_command(["docker", "info"])
                 if not result.success:
-                    missing.append("docker: Docker daemon is not running. Start with: sudo systemctl start docker")
+                    missing.append(
+                        "docker: Docker daemon is not running. Start with: sudo systemctl start docker"
+                    )
 
                 # Check Docker Compose v2
                 result = run_command(["docker", "compose", "version"])
@@ -445,14 +447,14 @@ class DependencyChecker:
                 missing.append("python3: Python 3 runtime is required for this app type")
             if not self.check_command("pip3"):
                 warnings.append("pip3: Python package manager is recommended")
-        
+
         # Check webserver
         has_nginx = self.check_command("nginx")
         has_apache = self.check_command("apache2")
-        
+
         if not has_nginx and not has_apache:
             missing.append("nginx/apache2: A web server is required")
-        
+
         # Check certbot for SSL
         if not self.check_command("certbot"):
             warnings.append("certbot: SSL certificate tool not found. SSL will be unavailable.")
@@ -466,14 +468,14 @@ class DependencyChecker:
                         "Webroot method will be used for SSL. "
                         "For faster SSL setup, install: sudo apt install python3-certbot-nginx"
                     )
-        
+
         can_deploy = len(missing) == 0
         return can_deploy, missing, warnings
-    
-    def get_available_package_managers(self) -> List[str]:
+
+    def get_available_package_managers(self) -> list[str]:
         """
         Get list of available/installed package managers.
-        
+
         Returns:
             List of installed package manager names.
         """
@@ -482,8 +484,8 @@ class DependencyChecker:
             if self.check_command(pm):
                 available.append(pm)
         return available
-    
-    def install_dependency(self, dep: Dependency) -> Tuple[bool, str]:
+
+    def install_dependency(self, dep: Dependency) -> tuple[bool, str]:
         """
         Install a dependency.
 
@@ -534,8 +536,8 @@ class DependencyChecker:
             return False, f"Failed to install {dep.name}: {result.stderr}"
 
         return False, f"No installation method available for {dep.name}"
-    
-    def install_package_manager(self, pm: str) -> Tuple[bool, str]:
+
+    def install_package_manager(self, pm: str) -> tuple[bool, str]:
         """
         Install a Node.js package manager.
 
@@ -547,7 +549,10 @@ class DependencyChecker:
         """
         # First verify npm/node is available
         if not self.check_command("npm"):
-            return False, "npm is required to install other package managers. Please install Node.js first."
+            return (
+                False,
+                "npm is required to install other package managers. Please install Node.js first.",
+            )
 
         pm_info = self.PACKAGE_MANAGERS.get(pm)
         if not pm_info:
@@ -567,11 +572,11 @@ class DependencyChecker:
             return True, f"Successfully installed {pm}"
 
         return False, f"Failed to install {pm}: {result.stderr}"
-    
-    def get_setup_summary(self) -> Dict[str, any]:
+
+    def get_setup_summary(self) -> dict[str, any]:
         """
         Get a comprehensive summary of system setup status.
-        
+
         Returns:
             Dict with setup status information.
         """
@@ -584,7 +589,7 @@ class DependencyChecker:
             "missing_optional": [],
             "recommendations": [],
         }
-        
+
         # Check system deps
         for dep in SYSTEM_DEPENDENCIES:
             status, version = self.check_dependency(dep)
@@ -594,7 +599,7 @@ class DependencyChecker:
                     summary["missing_required"].append(dep.name)
                 else:
                     summary["missing_optional"].append(dep.name)
-        
+
         # Check webserver
         if self.check_command("nginx"):
             summary["webserver"] = "nginx"
@@ -604,12 +609,12 @@ class DependencyChecker:
             summary["system_ready"] = False
             summary["missing_required"].append("webserver (nginx or apache2)")
             summary["recommendations"].append("Install nginx: sudo apt install nginx")
-        
+
         # Check Node.js
         if self.check_command("node"):
             summary["nodejs"]["installed"] = True
             summary["nodejs"]["version"] = self.get_version("node")
-            
+
             # Check package managers
             for pm in ["npm", "pnpm", "yarn", "bun"]:
                 is_installed, version, _ = self.check_package_manager(pm)
@@ -621,35 +626,37 @@ class DependencyChecker:
             summary["recommendations"].append(
                 "Install Node.js: curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - && sudo apt install -y nodejs"
             )
-        
+
         # Check Python
         if self.check_command("python3"):
             summary["python"]["installed"] = True
             summary["python"]["version"] = self.get_version("python3")
-        
+
         # Check certbot
         if not self.check_command("certbot"):
             summary["missing_optional"].append("certbot")
-            summary["recommendations"].append("Install certbot for SSL: sudo apt install certbot python3-certbot-nginx")
-        
+            summary["recommendations"].append(
+                "Install certbot for SSL: sudo apt install certbot python3-certbot-nginx"
+            )
+
         return summary
 
 
 def check_deployment_ready(
     app_type: str,
     package_manager: str = "auto",
-    app_path: Optional[Path] = None,
+    app_path: Path | None = None,
     verbose: bool = False,
-) -> Tuple[bool, List[str], List[str]]:
+) -> tuple[bool, list[str], list[str]]:
     """
     Quick check if system is ready for deployment.
-    
+
     Args:
         app_type: Application type.
         package_manager: Package manager to use.
         app_path: Path to application.
         verbose: Enable verbose output.
-        
+
     Returns:
         Tuple of (ready, missing, warnings).
     """
@@ -660,10 +667,10 @@ def check_deployment_ready(
 def get_package_manager_install_hint(pm: str) -> str:
     """
     Get installation instructions for a package manager.
-    
+
     Args:
         pm: Package manager name.
-        
+
     Returns:
         Installation instructions string.
     """

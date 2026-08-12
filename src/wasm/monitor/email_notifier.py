@@ -11,8 +11,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from pathlib import Path
-from typing import Dict, List, Optional
 
 from wasm.core.config import Config
 from wasm.core.exceptions import EmailError
@@ -22,15 +20,15 @@ from wasm.core.logger import Logger
 @dataclass
 class SMTPConfig:
     """SMTP server configuration."""
-    
+
     host: str
     port: int
     username: str
     password: str
     use_ssl: bool = True
     use_tls: bool = False
-    from_address: Optional[str] = None
-    
+    from_address: str | None = None
+
     def __post_init__(self):
         if not self.from_address:
             self.from_address = self.username
@@ -39,7 +37,7 @@ class SMTPConfig:
 @dataclass
 class ThreatReport:
     """Report of detected threat."""
-    
+
     process_name: str
     pid: int
     user: str
@@ -49,11 +47,11 @@ class ThreatReport:
     threat_level: str  # "suspicious", "malicious"
     confidence: float
     reason: str
-    parent_pid: Optional[int] = None
-    parent_name: Optional[str] = None
-    action_taken: Optional[str] = None
-    timestamp: Optional[datetime] = None
-    
+    parent_pid: int | None = None
+    parent_name: str | None = None
+    action_taken: str | None = None
+    timestamp: datetime | None = None
+
     def __post_init__(self):
         if not self.timestamp:
             self.timestamp = datetime.now()
@@ -62,20 +60,20 @@ class ThreatReport:
 class EmailNotifier:
     """
     Email notification system for process monitoring alerts.
-    
+
     Sends formatted HTML emails when threats are detected and
     after mitigation actions are completed.
     """
-    
+
     def __init__(
         self,
-        smtp_config: Optional[SMTPConfig] = None,
-        recipients: Optional[List[str]] = None,
+        smtp_config: SMTPConfig | None = None,
+        recipients: list[str] | None = None,
         verbose: bool = False,
     ):
         """
         Initialize email notifier.
-        
+
         Args:
             smtp_config: SMTP server configuration. If None, loads from config.
             recipients: List of email recipients. If None, loads from config.
@@ -85,17 +83,17 @@ class EmailNotifier:
         self.config = Config()
         # Always reload config to get latest values
         self.config.reload()
-        
+
         if smtp_config:
             self.smtp_config = smtp_config
         else:
             self.smtp_config = self._load_smtp_config()
-        
+
         if recipients:
             self.recipients = recipients
         else:
             self.recipients = self._load_recipients()
-    
+
     def _load_smtp_config(self) -> SMTPConfig:
         """Load SMTP configuration from global config."""
         return SMTPConfig(
@@ -107,21 +105,21 @@ class EmailNotifier:
             use_tls=self.config.get("monitor.smtp.use_tls", False),
             from_address=self.config.get("monitor.smtp.from_address", ""),
         )
-    
-    def _load_recipients(self) -> List[str]:
+
+    def _load_recipients(self) -> list[str]:
         """Load email recipients from global config."""
         recipients = self.config.get("monitor.email_recipients", [])
         if isinstance(recipients, str):
             return [recipients]
         return recipients or []
-    
+
     def _create_connection(self) -> smtplib.SMTP:
         """
         Create SMTP connection.
-        
+
         Returns:
             Connected SMTP object.
-            
+
         Raises:
             EmailError: If connection fails.
         """
@@ -140,10 +138,10 @@ class EmailNotifier:
                 )
                 if self.smtp_config.use_tls:
                     server.starttls()
-            
+
             server.login(self.smtp_config.username, self.smtp_config.password)
             return server
-            
+
         except smtplib.SMTPAuthenticationError as e:
             raise EmailError(
                 "SMTP authentication failed",
@@ -159,21 +157,21 @@ class EmailNotifier:
                 "Failed to establish SMTP connection",
                 details=str(e),
             )
-    
-    def _generate_threat_html(self, reports: List[ThreatReport], is_final: bool = False) -> str:
+
+    def _generate_threat_html(self, reports: list[ThreatReport], is_final: bool = False) -> str:
         """
         Generate HTML content for threat report email.
-        
+
         Args:
             reports: List of threat reports.
             is_final: Whether this is the final mitigation report.
-            
+
         Returns:
             HTML formatted email content.
         """
         hostname = self._get_hostname()
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
+
         if is_final:
             title = "🛡️ WASM Security Monitor - Mitigation Report"
             subtitle = "Actions taken to neutralize detected threats"
@@ -188,7 +186,7 @@ class EmailNotifier:
                 title = "⚠️ WASM Security Alert - Suspicious Activity Detected"
                 color = "#ffc107"
             subtitle = "Immediate attention may be required"
-        
+
         html = f"""
 <!DOCTYPE html>
 <html>
@@ -337,7 +335,7 @@ class EmailNotifier:
                                 <strong>📊 Threats detected:</strong> {len(reports)}
                             </div>
 """
-        
+
         for report in reports:
             if is_final and report.action_taken:
                 threat_class = "threat-neutralized"
@@ -348,7 +346,7 @@ class EmailNotifier:
             else:
                 threat_class = "threat-suspicious"
                 level_badge = '<span class="badge badge-warning">SUSPICIOUS</span>'
-            
+
             html += f"""
                             <div class="threat-card">
                                 <div class="threat-header {threat_class}">
@@ -377,7 +375,7 @@ class EmailNotifier:
                                             <td>{report.reason}</td>
                                         </tr>
 """
-            
+
             if report.parent_pid and report.parent_name:
                 html += f"""
                                         <tr>
@@ -385,7 +383,7 @@ class EmailNotifier:
                                             <td>{report.parent_name} (PID: {report.parent_pid})</td>
                                         </tr>
 """
-            
+
             if is_final and report.action_taken:
                 html += f"""
                                         <tr>
@@ -393,14 +391,14 @@ class EmailNotifier:
                                             <td><strong>{report.action_taken}</strong></td>
                                         </tr>
 """
-            
+
             html += f"""
                                     </table>
                                     <div class="command-box">{report.command}</div>
                                 </div>
                             </div>
 """
-        
+
         html += """
                         </div>
                         <div class="footer">
@@ -416,21 +414,21 @@ class EmailNotifier:
 </html>
 """
         return html
-    
-    def _generate_threat_text(self, reports: List[ThreatReport], is_final: bool = False) -> str:
+
+    def _generate_threat_text(self, reports: list[ThreatReport], is_final: bool = False) -> str:
         """
         Generate plain text content for threat report email.
-        
+
         Args:
             reports: List of threat reports.
             is_final: Whether this is the final mitigation report.
-            
+
         Returns:
             Plain text formatted email content.
         """
         hostname = self._get_hostname()
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
+
         if is_final:
             title = "WASM Security Monitor - Mitigation Report"
         else:
@@ -439,7 +437,7 @@ class EmailNotifier:
                 title = "WASM Security Alert - MALICIOUS PROCESS DETECTED"
             else:
                 title = "WASM Security Alert - Suspicious Activity Detected"
-        
+
         lines = [
             "=" * 60,
             title,
@@ -451,70 +449,77 @@ class EmailNotifier:
             "",
             "-" * 60,
         ]
-        
+
         for report in reports:
-            lines.extend([
-                "",
-                f"[{report.threat_level.upper()}] {report.process_name} (PID: {report.pid})",
-                f"  User: {report.user}",
-                f"  CPU: {report.cpu_percent:.1f}% | Memory: {report.memory_percent:.1f}%",
-                f"  Confidence: {report.confidence * 100:.0f}%",
-                f"  Reason: {report.reason}",
-            ])
-            
+            lines.extend(
+                [
+                    "",
+                    f"[{report.threat_level.upper()}] {report.process_name} (PID: {report.pid})",
+                    f"  User: {report.user}",
+                    f"  CPU: {report.cpu_percent:.1f}% | Memory: {report.memory_percent:.1f}%",
+                    f"  Confidence: {report.confidence * 100:.0f}%",
+                    f"  Reason: {report.reason}",
+                ]
+            )
+
             if report.parent_pid and report.parent_name:
                 lines.append(f"  Parent: {report.parent_name} (PID: {report.parent_pid})")
-            
+
             if is_final and report.action_taken:
                 lines.append(f"  Action: {report.action_taken}")
-            
-            lines.extend([
-                f"  Command: {report.command}",
+
+            lines.extend(
+                [
+                    f"  Command: {report.command}",
+                    "",
+                ]
+            )
+
+        lines.extend(
+            [
+                "-" * 60,
                 "",
-            ])
-        
-        lines.extend([
-            "-" * 60,
-            "",
-            "This is an automated message from WASM Security Monitor.",
-        ])
-        
+                "This is an automated message from WASM Security Monitor.",
+            ]
+        )
+
         return "\n".join(lines)
-    
+
     def _get_hostname(self) -> str:
         """Get system hostname."""
         import socket
+
         try:
             return socket.gethostname()
         except Exception:
             return "unknown"
-    
+
     def send_threat_alert(
         self,
-        reports: List[ThreatReport],
+        reports: list[ThreatReport],
         is_final: bool = False,
     ) -> bool:
         """
         Send threat alert email.
-        
+
         Args:
             reports: List of threat reports.
             is_final: Whether this is the final mitigation report.
-            
+
         Returns:
             True if email sent successfully.
-            
+
         Raises:
             EmailError: If sending fails.
         """
         if not self.recipients:
             self.logger.warning("No email recipients configured")
             return False
-        
+
         if not self.smtp_config.host or not self.smtp_config.username:
             self.logger.warning("SMTP not configured")
             return False
-        
+
         # Determine subject
         hostname = self._get_hostname()
         if is_final:
@@ -525,24 +530,24 @@ class EmailNotifier:
                 subject = f"[WASM] 🚨 CRITICAL: Malicious Process Detected - {hostname}"
             else:
                 subject = f"[WASM] ⚠️ Warning: Suspicious Activity - {hostname}"
-        
+
         # Create message
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"] = self.smtp_config.from_address
         msg["To"] = ", ".join(self.recipients)
-        
+
         # Attach both plain text and HTML versions
         text_content = self._generate_threat_text(reports, is_final)
         html_content = self._generate_threat_html(reports, is_final)
-        
+
         msg.attach(MIMEText(text_content, "plain"))
         msg.attach(MIMEText(html_content, "html"))
-        
+
         try:
             self.logger.debug(f"Connecting to SMTP server: {self.smtp_config.host}")
             server = self._create_connection()
-            
+
             self.logger.debug(f"Sending email to: {', '.join(self.recipients)}")
             server.sendmail(
                 self.smtp_config.from_address,
@@ -550,10 +555,10 @@ class EmailNotifier:
                 msg.as_string(),
             )
             server.quit()
-            
+
             self.logger.success("Alert email sent successfully")
             return True
-            
+
         except EmailError:
             raise
         except Exception as e:
@@ -561,22 +566,22 @@ class EmailNotifier:
                 "Failed to send email",
                 details=str(e),
             )
-    
+
     def send_test_email(self) -> bool:
         """
         Send a test email to verify configuration.
-        
+
         Returns:
             True if test email sent successfully.
         """
         hostname = self._get_hostname()
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
+
         msg = MIMEMultipart("alternative")
         msg["Subject"] = f"[WASM] Test Email - {hostname}"
         msg["From"] = self.smtp_config.from_address
         msg["To"] = ", ".join(self.recipients)
-        
+
         text = f"""
 WASM Security Monitor - Test Email
 ===================================
@@ -588,7 +593,7 @@ Time: {timestamp}
 
 If you received this email, your notification system is configured correctly.
 """
-        
+
         html = f"""
 <!DOCTYPE html>
 <html>
@@ -609,10 +614,10 @@ If you received this email, your notification system is configured correctly.
 </body>
 </html>
 """
-        
+
         msg.attach(MIMEText(text, "plain"))
         msg.attach(MIMEText(html, "html"))
-        
+
         try:
             server = self._create_connection()
             server.sendmail(

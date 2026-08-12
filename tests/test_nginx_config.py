@@ -4,15 +4,13 @@
 
 """Tests for the NginxConfigBuilder helper."""
 
-import tempfile
-from pathlib import Path
 
 import pytest
 
 from wasm.deployers.helpers.nginx_config import (
+    NginxAdvancedConfig,
     NginxConfigBuilder,
     NginxRoute,
-    NginxAdvancedConfig,
 )
 
 
@@ -103,23 +101,14 @@ class TestParsing:
 
     def test_parse_websocket(self, builder, tmp_path):
         config_file = tmp_path / "wasm.nginx.yaml"
-        config_file.write_text(
-            "routes:\n"
-            "  - path: /ws\n"
-            "    port: 3001\n"
-            "    websocket: true\n"
-        )
+        config_file.write_text("routes:\n  - path: /ws\n    port: 3001\n    websocket: true\n")
         config = builder.parse(config_file)
         assert config.routes[0].websocket is True
 
     def test_parse_rate_limit(self, builder, tmp_path):
         config_file = tmp_path / "wasm.nginx.yaml"
         config_file.write_text(
-            "rate_limit: '50r/s'\n"
-            "routes:\n"
-            "  - path: /\n"
-            "    port: 3000\n"
-            "    rate_limit: '10r/s'\n"
+            "rate_limit: '50r/s'\nroutes:\n  - path: /\n    port: 3000\n    rate_limit: '10r/s'\n"
         )
         config = builder.parse(config_file)
         assert config.global_rate_limit == "50r/s"
@@ -139,12 +128,7 @@ class TestParsing:
 
     def test_parse_strip_prefix(self, builder, tmp_path):
         config_file = tmp_path / "wasm.nginx.yaml"
-        config_file.write_text(
-            "routes:\n"
-            "  - path: /api\n"
-            "    port: 3001\n"
-            "    strip_prefix: true\n"
-        )
+        config_file.write_text("routes:\n  - path: /api\n    port: 3001\n    strip_prefix: true\n")
         config = builder.parse(config_file)
         assert config.routes[0].strip_prefix is True
 
@@ -162,11 +146,7 @@ class TestParsing:
 
     def test_auto_name_generation(self, builder, tmp_path):
         config_file = tmp_path / "wasm.nginx.yaml"
-        config_file.write_text(
-            "routes:\n"
-            "  - path: /api/v1\n"
-            "    port: 3001\n"
-        )
+        config_file.write_text("routes:\n  - path: /api/v1\n    port: 3001\n")
         config = builder.parse(config_file)
         assert config.routes[0].upstream_name == "api-v1"
 
@@ -193,11 +173,7 @@ class TestDockerCompose:
     def test_single_service(self, builder, tmp_path):
         compose_file = tmp_path / "docker-compose.yml"
         compose_file.write_text(
-            "services:\n"
-            "  web:\n"
-            "    image: nginx\n"
-            "    ports:\n"
-            "      - '8080:80'\n"
+            "services:\n  web:\n    image: nginx\n    ports:\n      - '8080:80'\n"
         )
         config = builder.from_docker_compose(compose_file, "test.local")
         assert len(config.routes) == 1

@@ -13,7 +13,6 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import Optional
 
 from wasm import __version__
 
@@ -29,8 +28,8 @@ class UpdateChecker:
     GITHUB_API = "https://api.github.com/repos/Perkybeet/wasm/releases/latest"
 
     # Background check state
-    _check_thread: Optional[threading.Thread] = None
-    _update_version: Optional[str] = None
+    _check_thread: threading.Thread | None = None
+    _update_version: str | None = None
 
     @classmethod
     def start_background_check(cls):
@@ -53,10 +52,7 @@ class UpdateChecker:
 
             # Start background thread for network request
             cls._update_version = None
-            cls._check_thread = threading.Thread(
-                target=cls._background_check,
-                daemon=True
-            )
+            cls._check_thread = threading.Thread(target=cls._background_check, daemon=True)
             cls._check_thread.start()
         except Exception:
             pass
@@ -68,20 +64,20 @@ class UpdateChecker:
             latest_version = cls._fetch_latest_version()
 
             if not latest_version:
-                cls._write_cache({
-                    "latest_version": __version__,
-                    "has_update": False,
-                    "checked_at": time.time()
-                })
+                cls._write_cache(
+                    {"latest_version": __version__, "has_update": False, "checked_at": time.time()}
+                )
                 return
 
             has_update = cls._is_newer_version(latest_version, __version__)
 
-            cls._write_cache({
-                "latest_version": latest_version,
-                "has_update": has_update,
-                "checked_at": time.time()
-            })
+            cls._write_cache(
+                {
+                    "latest_version": latest_version,
+                    "has_update": has_update,
+                    "checked_at": time.time(),
+                }
+            )
 
             if has_update:
                 cls._update_version = latest_version
@@ -126,7 +122,7 @@ class UpdateChecker:
         cls.show_update_if_available(timeout=0)
 
     @classmethod
-    def _fetch_latest_version(cls) -> Optional[str]:
+    def _fetch_latest_version(cls) -> str | None:
         """
         Fetch the latest version from GitHub API.
 
@@ -134,12 +130,11 @@ class UpdateChecker:
             Latest version string or None if failed.
         """
         try:
-            import urllib.request
             import urllib.error
+            import urllib.request
 
             req = urllib.request.Request(
-                cls.GITHUB_API,
-                headers={"Accept": "application/vnd.github.v3+json"}
+                cls.GITHUB_API, headers={"Accept": "application/vnd.github.v3+json"}
             )
 
             with urllib.request.urlopen(req, timeout=cls.TIMEOUT) as response:
@@ -189,7 +184,7 @@ class UpdateChecker:
             return False
 
     @classmethod
-    def _read_cache(cls) -> Optional[dict]:
+    def _read_cache(cls) -> dict | None:
         """
         Read cached version check data.
 
@@ -200,7 +195,7 @@ class UpdateChecker:
             if cls.CACHE_FILE.exists():
                 content = cls.CACHE_FILE.read_text()
                 return json.loads(content)
-        except (json.JSONDecodeError, OSError, IOError):
+        except (json.JSONDecodeError, OSError):
             pass
         except Exception:
             pass
@@ -222,7 +217,7 @@ class UpdateChecker:
             # Write cache file
             cls.CACHE_FILE.write_text(json.dumps(data, indent=2))
 
-        except (OSError, IOError):
+        except OSError:
             # Permission errors, disk full, etc.
             pass
         except Exception:
@@ -278,11 +273,7 @@ class UpdateChecker:
 
             # APT (Ubuntu, Debian) - package is called "wasm" not "wasm-cli"
             if Path("/var/lib/dpkg/status").exists():
-                result = subprocess.run(
-                    ["dpkg", "-s", "wasm"],
-                    capture_output=True,
-                    timeout=2
-                )
+                result = subprocess.run(["dpkg", "-s", "wasm"], capture_output=True, timeout=2)
                 if result.returncode == 0:
                     return "apt"
 
@@ -292,7 +283,7 @@ class UpdateChecker:
                     result = subprocess.run(
                         [pkg_manager, "list", "installed", "wasm-cli"],
                         capture_output=True,
-                        timeout=2
+                        timeout=2,
                     )
                     if result.returncode == 0:
                         return pkg_manager
@@ -302,9 +293,7 @@ class UpdateChecker:
             # Zypper (openSUSE)
             try:
                 result = subprocess.run(
-                    ["zypper", "se", "-i", "wasm-cli"],
-                    capture_output=True,
-                    timeout=2
+                    ["zypper", "se", "-i", "wasm-cli"], capture_output=True, timeout=2
                 )
                 if result.returncode == 0 and b"wasm-cli" in result.stdout:
                     return "zypper"
@@ -316,7 +305,7 @@ class UpdateChecker:
                 [sys.executable, "-m", "pip", "show", "wasm-cli"],
                 capture_output=True,
                 text=True,
-                timeout=2
+                timeout=2,
             )
             if result.returncode == 0:
                 # Check if installed in editable mode (from source)
@@ -348,7 +337,7 @@ class UpdateChecker:
             "yum": "sudo yum update wasm-cli",
             "zypper": "sudo zypper update wasm-cli",
             "source": "cd <wasm-repo> && git pull && pip install -e .",
-            "unknown": "pip install --upgrade wasm-cli  # or use your system package manager"
+            "unknown": "pip install --upgrade wasm-cli  # or use your system package manager",
         }
         return commands.get(method, commands["unknown"])
 
@@ -364,9 +353,13 @@ class UpdateChecker:
             method = cls._detect_installation_method()
             update_command = cls._get_update_command(method)
 
-            print(f"\n\033[33m⚠  New version available: {latest_version} (current: {__version__})\033[0m")
+            print(
+                f"\n\033[33m⚠  New version available: {latest_version} (current: {__version__})\033[0m"
+            )
             print(f"\033[33m   Update with: {update_command}\033[0m")
-            print(f"\033[33m   Release notes: https://github.com/Perkybeet/wasm/releases/tag/v{latest_version}\033[0m\n")
+            print(
+                f"\033[33m   Release notes: https://github.com/Perkybeet/wasm/releases/tag/v{latest_version}\033[0m\n"
+            )
         except Exception:
             # Even printing can fail in some edge cases
             pass

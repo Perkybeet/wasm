@@ -12,9 +12,9 @@ secret auto-generation, and interactive configuration.
 
 import json
 import secrets
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Any
 
 from wasm.core.exceptions import WASMError
 from wasm.core.logger import Logger
@@ -22,12 +22,14 @@ from wasm.core.logger import Logger
 
 class EnvConfigError(WASMError):
     """Raised when environment configuration fails."""
+
     pass
 
 
 @dataclass
 class EnvVariable:
     """Represents a single environment variable."""
+
     name: str
     default: str = ""
     description: str = ""
@@ -35,16 +37,17 @@ class EnvVariable:
     required: bool = False
     secret: bool = False
     shared: bool = False
-    value: Optional[str] = None
+    value: str | None = None
 
 
 @dataclass
 class EnvConfig:
     """Environment configuration for an application."""
-    variables: List[EnvVariable] = field(default_factory=list)
-    files: Dict[str, List[str]] = field(default_factory=dict)  # filename -> variable names
 
-    def to_dict(self) -> Dict[str, Any]:
+    variables: list[EnvVariable] = field(default_factory=list)
+    files: dict[str, list[str]] = field(default_factory=dict)  # filename -> variable names
+
+    def to_dict(self) -> dict[str, Any]:
         """
         Serialize to dictionary.
 
@@ -57,7 +60,7 @@ class EnvConfig:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "EnvConfig":
+    def from_dict(cls, data: dict[str, Any]) -> "EnvConfig":
         """
         Deserialize from dictionary.
 
@@ -113,16 +116,25 @@ class EnvManager:
 
     # Secret detection patterns
     SECRET_PATTERNS = [
-        "PASSWORD", "_PASS", "SECRET", "TOKEN", "API_KEY", "PRIVATE_KEY",
-        "ENCRYPTION_KEY", "SIGNING_KEY", "ACCESS_KEY", "SECRET_KEY",
-        "CLIENT_SECRET", "WEBHOOK_SECRET",
+        "PASSWORD",
+        "_PASS",
+        "SECRET",
+        "TOKEN",
+        "API_KEY",
+        "PRIVATE_KEY",
+        "ENCRYPTION_KEY",
+        "SIGNING_KEY",
+        "ACCESS_KEY",
+        "SECRET_KEY",
+        "CLIENT_SECRET",
+        "WEBHOOK_SECRET",
     ]
 
     def __init__(self, verbose: bool = False):
         self.verbose = verbose
         self.logger = Logger(verbose=verbose)
 
-    def discover(self, app_path: Path) -> List[EnvVariable]:
+    def discover(self, app_path: Path) -> list[EnvVariable]:
         """
         Discover environment variables from .env.example files.
 
@@ -166,7 +178,7 @@ class EnvManager:
 
         return variables
 
-    def _parse_env_example(self, path: Path) -> List[EnvVariable]:
+    def _parse_env_example(self, path: Path) -> list[EnvVariable]:
         """
         Parse a .env.example file into EnvVariable objects.
 
@@ -219,8 +231,7 @@ class EnvManager:
 
             # Remove surrounding quotes from default value
             if len(value) >= 2:
-                if (value[0] == '"' and value[-1] == '"') or \
-                   (value[0] == "'" and value[-1] == "'"):
+                if (value[0] == '"' and value[-1] == '"') or (value[0] == "'" and value[-1] == "'"):
                     value = value[1:-1]
 
             var = EnvVariable(
@@ -281,9 +292,9 @@ class EnvManager:
 
     def prompt_variables(
         self,
-        variables: List[EnvVariable],
-        existing_values: Optional[Dict[str, str]] = None,
-    ) -> Dict[str, str]:
+        variables: list[EnvVariable],
+        existing_values: dict[str, str] | None = None,
+    ) -> dict[str, str]:
         """
         Interactively prompt for variable values grouped by category.
 
@@ -301,7 +312,7 @@ class EnvManager:
         result = {}
 
         # Group by category
-        categories: Dict[str, List[EnvVariable]] = {}
+        categories: dict[str, list[EnvVariable]] = {}
         for var in variables:
             cat = var.category
             if cat not in categories:
@@ -310,6 +321,7 @@ class EnvManager:
 
         try:
             import inquirer
+
             has_inquirer = True
         except ImportError:
             has_inquirer = False
@@ -362,8 +374,8 @@ class EnvManager:
 
     def prompt_non_interactive(
         self,
-        variables: List[EnvVariable],
-    ) -> Dict[str, str]:
+        variables: list[EnvVariable],
+    ) -> dict[str, str]:
         """
         Fill variable values non-interactively.
 
@@ -386,9 +398,9 @@ class EnvManager:
     def write_env_files(
         self,
         app_path: Path,
-        values: Dict[str, str],
-        file_mapping: Optional[Dict[str, List[str]]] = None,
-    ) -> List[Path]:
+        values: dict[str, str],
+        file_mapping: dict[str, list[str]] | None = None,
+    ) -> list[Path]:
         """
         Write environment variables to .env files.
 
@@ -416,7 +428,7 @@ class EnvManager:
 
         return written
 
-    def _write_single_env_file(self, path: Path, values: Dict[str, str]) -> None:
+    def _write_single_env_file(self, path: Path, values: dict[str, str]) -> None:
         """
         Write a single .env file.
 
@@ -450,7 +462,7 @@ class EnvManager:
             encoding="utf-8",
         )
 
-    def load_config(self, app_path: Path) -> Optional[EnvConfig]:
+    def load_config(self, app_path: Path) -> EnvConfig | None:
         """
         Load persisted environment configuration.
 
@@ -487,7 +499,7 @@ class EnvManager:
             return value[:4] + "****"
         return value
 
-    def get_current_values(self, app_path: Path) -> Dict[str, str]:
+    def get_current_values(self, app_path: Path) -> dict[str, str]:
         """
         Read current .env file values.
 
@@ -515,8 +527,7 @@ class EnvManager:
                 key = key.strip()
                 val = val.strip()
                 if len(val) >= 2:
-                    if (val[0] == '"' and val[-1] == '"') or \
-                       (val[0] == "'" and val[-1] == "'"):
+                    if (val[0] == '"' and val[-1] == '"') or (val[0] == "'" and val[-1] == "'"):
                         val = val[1:-1]
                 values[key] = val
         except OSError:

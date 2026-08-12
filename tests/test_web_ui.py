@@ -1,9 +1,8 @@
 """Tests for web UI components and structure."""
 
-import pytest
-import os
 from pathlib import Path
 
+import pytest
 
 # Get the project root
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -170,39 +169,39 @@ class TestIndexHtmlContent:
 
     def test_has_navigation(self, index_content):
         """Test that index.html has navigation items."""
-        assert 'nav-item' in index_content
+        assert "nav-item" in index_content
 
     def test_has_dashboard_page(self, index_content):
         """Test that index.html has dashboard page."""
-        assert 'page-dashboard' in index_content
+        assert "page-dashboard" in index_content
 
     def test_has_toast_container(self, index_content):
         """Test that index.html has toast container."""
-        assert 'toast-container' in index_content
+        assert "toast-container" in index_content
 
     def test_has_modals(self, index_content):
         """Test that index.html has modals."""
-        assert '-modal' in index_content
+        assert "-modal" in index_content
 
     def test_has_quick_actions(self, index_content):
         """Test that index.html has quick actions FAB."""
-        assert 'quick-actions' in index_content
+        assert "quick-actions" in index_content
 
     def test_has_mobile_menu(self, index_content):
         """Test that index.html has mobile menu button."""
-        assert 'mobile-menu' in index_content or 'toggleMobileSidebar' in index_content
+        assert "mobile-menu" in index_content or "toggleMobileSidebar" in index_content
 
     def test_has_breadcrumbs(self, index_content):
         """Test that index.html has breadcrumbs."""
-        assert 'breadcrumb' in index_content
+        assert "breadcrumb" in index_content
 
     def test_has_search_functionality(self, index_content):
         """Test that index.html references search functionality."""
-        assert 'globalSearch' in index_content or 'search' in index_content.lower()
+        assert "globalSearch" in index_content or "search" in index_content.lower()
 
     def test_has_keyboard_shortcuts_reference(self, index_content):
         """Test that index.html references keyboard shortcuts."""
-        assert 'keyboardShortcuts' in index_content or 'Keyboard Shortcuts' in index_content
+        assert "keyboardShortcuts" in index_content or "Keyboard Shortcuts" in index_content
 
 
 class TestMainCssContent:
@@ -215,37 +214,37 @@ class TestMainCssContent:
 
     def test_has_css_variables(self, css_content):
         """Test that CSS has custom properties."""
-        assert '--bg-primary' in css_content
-        assert '--text-primary' in css_content
+        assert "--bg-primary" in css_content
+        assert "--text-primary" in css_content
 
     def test_has_light_theme(self, css_content):
         """Test that CSS has light theme styles."""
-        assert 'light-theme' in css_content
+        assert "light-theme" in css_content
 
     def test_has_skeleton_loading(self, css_content):
         """Test that CSS has skeleton loading styles."""
-        assert 'skeleton' in css_content
+        assert "skeleton" in css_content
 
     def test_has_quick_actions_styles(self, css_content):
         """Test that CSS has quick actions styles."""
-        assert 'quick-actions' in css_content
+        assert "quick-actions" in css_content
 
     def test_has_fab_button_styles(self, css_content):
         """Test that CSS has FAB button styles."""
-        assert 'fab-button' in css_content
+        assert "fab-button" in css_content
 
     def test_has_mobile_responsive_styles(self, css_content):
         """Test that CSS has mobile responsive styles."""
-        assert '@media' in css_content
+        assert "@media" in css_content
 
     def test_has_breadcrumbs_styles(self, css_content):
         """Test that CSS has breadcrumbs styles."""
-        assert 'breadcrumbs' in css_content
+        assert "breadcrumbs" in css_content
 
     def test_has_animation_keyframes(self, css_content):
         """Test that CSS has animation keyframes."""
-        assert '@keyframes' in css_content
-        assert 'fadeIn' in css_content or 'slideUp' in css_content
+        assert "@keyframes" in css_content
+        assert "fadeIn" in css_content or "slideUp" in css_content
 
 
 class TestMainJsImports:
@@ -258,35 +257,35 @@ class TestMainJsImports:
 
     def test_imports_api(self, main_js_content):
         """Test that main.js imports api module."""
-        assert 'api.js' in main_js_content
+        assert "api.js" in main_js_content
 
     def test_imports_router(self, main_js_content):
         """Test that main.js imports router module."""
-        assert 'router.js' in main_js_content
+        assert "router.js" in main_js_content
 
     def test_imports_search(self, main_js_content):
         """Test that main.js imports search module."""
-        assert 'search.js' in main_js_content
+        assert "search.js" in main_js_content
 
     def test_imports_shortcuts(self, main_js_content):
         """Test that main.js imports shortcuts module."""
-        assert 'shortcuts.js' in main_js_content
+        assert "shortcuts.js" in main_js_content
 
     def test_imports_theme(self, main_js_content):
         """Test that main.js imports theme module."""
-        assert 'theme.js' in main_js_content
+        assert "theme.js" in main_js_content
 
     def test_imports_notifications(self, main_js_content):
         """Test that main.js imports notifications module."""
-        assert 'notifications.js' in main_js_content
+        assert "notifications.js" in main_js_content
 
     def test_imports_dialogs(self, main_js_content):
         """Test that main.js imports dialogs module."""
-        assert 'dialogs.js' in main_js_content
+        assert "dialogs.js" in main_js_content
 
     def test_exports_router_globally(self, main_js_content):
         """Test that main.js exports router to window."""
-        assert 'window.router' in main_js_content
+        assert "window.router" in main_js_content
 
 
 class TestSearchModuleContent:
@@ -299,27 +298,27 @@ class TestSearchModuleContent:
 
     def test_has_search_class(self, search_content):
         """Test that search.js has GlobalSearch class."""
-        assert 'class GlobalSearch' in search_content
+        assert "class GlobalSearch" in search_content
 
     def test_has_search_modal(self, search_content):
         """Test that search.js creates search modal."""
-        assert 'createSearchModal' in search_content
+        assert "createSearchModal" in search_content
 
     def test_has_keyboard_shortcut_setup(self, search_content):
         """Test that search.js sets up Ctrl+K shortcut."""
-        assert 'Ctrl' in search_content or 'ctrlKey' in search_content
+        assert "Ctrl" in search_content or "ctrlKey" in search_content
 
     def test_has_search_functionality(self, search_content):
         """Test that search.js has search method."""
-        assert 'search(' in search_content
+        assert "search(" in search_content
 
     def test_has_result_rendering(self, search_content):
         """Test that search.js renders results."""
-        assert 'renderResults' in search_content
+        assert "renderResults" in search_content
 
     def test_exports_global_search(self, search_content):
         """Test that search.js exports globalSearch."""
-        assert 'window.globalSearch' in search_content
+        assert "window.globalSearch" in search_content
 
 
 class TestShortcutsModuleContent:
@@ -332,23 +331,23 @@ class TestShortcutsModuleContent:
 
     def test_has_shortcuts_class(self, shortcuts_content):
         """Test that shortcuts.js has KeyboardShortcuts class."""
-        assert 'class KeyboardShortcuts' in shortcuts_content
+        assert "class KeyboardShortcuts" in shortcuts_content
 
     def test_has_shortcut_registration(self, shortcuts_content):
         """Test that shortcuts.js can register shortcuts."""
-        assert 'register(' in shortcuts_content
+        assert "register(" in shortcuts_content
 
     def test_has_navigation_shortcuts(self, shortcuts_content):
         """Test that shortcuts.js has navigation shortcuts."""
-        assert 'g d' in shortcuts_content or 'dashboard' in shortcuts_content.lower()
+        assert "g d" in shortcuts_content or "dashboard" in shortcuts_content.lower()
 
     def test_has_help_modal(self, shortcuts_content):
         """Test that shortcuts.js has help modal."""
-        assert 'showHelp' in shortcuts_content
+        assert "showHelp" in shortcuts_content
 
     def test_exports_globally(self, shortcuts_content):
         """Test that shortcuts.js exports keyboardShortcuts."""
-        assert 'window.keyboardShortcuts' in shortcuts_content
+        assert "window.keyboardShortcuts" in shortcuts_content
 
 
 class TestThemeModuleContent:
@@ -361,27 +360,27 @@ class TestThemeModuleContent:
 
     def test_has_theme_class(self, theme_content):
         """Test that theme.js has ThemeManager class."""
-        assert 'class ThemeManager' in theme_content
+        assert "class ThemeManager" in theme_content
 
     def test_has_toggle_function(self, theme_content):
         """Test that theme.js has toggle function."""
-        assert 'toggle(' in theme_content
+        assert "toggle(" in theme_content
 
     def test_has_dark_theme_support(self, theme_content):
         """Test that theme.js supports dark theme."""
-        assert 'dark' in theme_content
+        assert "dark" in theme_content
 
     def test_has_light_theme_support(self, theme_content):
         """Test that theme.js supports light theme."""
-        assert 'light' in theme_content
+        assert "light" in theme_content
 
     def test_uses_local_storage(self, theme_content):
         """Test that theme.js uses localStorage."""
-        assert 'localStorage' in theme_content
+        assert "localStorage" in theme_content
 
     def test_exports_globally(self, theme_content):
         """Test that theme.js exports themeManager."""
-        assert 'window.themeManager' in theme_content
+        assert "window.themeManager" in theme_content
 
 
 class TestNotificationsModuleContent:
@@ -394,27 +393,27 @@ class TestNotificationsModuleContent:
 
     def test_has_notification_class(self, notifications_content):
         """Test that notifications.js has NotificationCenter class."""
-        assert 'class NotificationCenter' in notifications_content
+        assert "class NotificationCenter" in notifications_content
 
     def test_has_add_function(self, notifications_content):
         """Test that notifications.js can add notifications."""
-        assert 'add(' in notifications_content
+        assert "add(" in notifications_content
 
     def test_has_mark_read_function(self, notifications_content):
         """Test that notifications.js can mark as read."""
-        assert 'markRead' in notifications_content
+        assert "markRead" in notifications_content
 
     def test_has_clear_all_function(self, notifications_content):
         """Test that notifications.js can clear all."""
-        assert 'clearAll' in notifications_content
+        assert "clearAll" in notifications_content
 
     def test_uses_local_storage(self, notifications_content):
         """Test that notifications.js uses localStorage."""
-        assert 'localStorage' in notifications_content
+        assert "localStorage" in notifications_content
 
     def test_exports_globally(self, notifications_content):
         """Test that notifications.js exports notificationCenter."""
-        assert 'window.notificationCenter' in notifications_content
+        assert "window.notificationCenter" in notifications_content
 
 
 class TestDialogsModuleContent:
@@ -427,21 +426,21 @@ class TestDialogsModuleContent:
 
     def test_has_confirm_dialog(self, dialogs_content):
         """Test that dialogs.js has showConfirmDialog function."""
-        assert 'showConfirmDialog' in dialogs_content
+        assert "showConfirmDialog" in dialogs_content
 
     def test_has_input_dialog(self, dialogs_content):
         """Test that dialogs.js has showInputDialog function."""
-        assert 'showInputDialog' in dialogs_content
+        assert "showInputDialog" in dialogs_content
 
     def test_returns_promise(self, dialogs_content):
         """Test that dialogs.js uses Promises."""
-        assert 'Promise' in dialogs_content
+        assert "Promise" in dialogs_content
 
     def test_has_different_types(self, dialogs_content):
         """Test that dialogs.js supports different types."""
-        assert 'danger' in dialogs_content
-        assert 'warning' in dialogs_content
+        assert "danger" in dialogs_content
+        assert "warning" in dialogs_content
 
     def test_exports_globally(self, dialogs_content):
         """Test that dialogs.js exports showConfirmDialog."""
-        assert 'window.showConfirmDialog' in dialogs_content
+        assert "window.showConfirmDialog" in dialogs_content

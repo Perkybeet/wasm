@@ -9,7 +9,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from wasm.core.config import Config
 from wasm.core.exceptions import AIAnalysisError
@@ -19,86 +19,86 @@ from wasm.core.logger import Logger
 @dataclass
 class ProcessInfo:
     """Information about a running process."""
-    
+
     pid: int
     name: str
     user: str
     cpu_percent: float
     memory_percent: float
     command: str
-    create_time: Optional[float] = None
-    parent_pid: Optional[int] = None
-    parent_name: Optional[str] = None
+    create_time: float | None = None
+    parent_pid: int | None = None
+    parent_name: str | None = None
     status: str = "running"
     num_threads: int = 1
-    connections: List[Dict] = field(default_factory=list)
-    open_files: List[str] = field(default_factory=list)
+    connections: list[dict] = field(default_factory=list)
+    open_files: list[str] = field(default_factory=list)
     cwd: str = ""
 
 
 @dataclass
 class AnalysisResult:
     """Result of AI process analysis."""
-    
+
     process: ProcessInfo
     is_threat: bool
     threat_level: str  # "safe", "suspicious", "malicious"
     confidence: float
     reason: str
     recommended_action: str  # "none", "monitor", "terminate", "terminate_tree"
-    related_processes: List[int] = field(default_factory=list)
+    related_processes: list[int] = field(default_factory=list)
 
 
 class AIProcessAnalyzer:
     """
     AI-powered process analyzer using OpenAI API.
-    
+
     Analyzes process information to detect cryptocurrency miners,
     backdoors, reverse shells, and other malicious activity.
     """
-    
+
     # Known malicious process patterns (pre-filter)
     KNOWN_MALICIOUS_PATTERNS = [
-        r"xmrig",           # Monero miner
-        r"minerd",          # Generic miner
-        r"cpuminer",        # CPU miner
-        r"cgminer",         # GPU miner
-        r"bfgminer",        # Mining software
-        r"ethminer",        # Ethereum miner
-        r"ccminer",         # Cryptocurrency miner
-        r"cryptonight",     # Mining algorithm
-        r"stratum",         # Mining pool protocol
-        r"kworker.*mining", # Hidden miner
-        r"\.hidden",        # Hidden processes
-        r"kdevtmpfsi",      # Known crypto miner
-        r"kinsing",         # Crypto-jacking malware
-        r"kerberods",       # Linux backdoor
-        r"watchdogs",       # Malware dropper
-        r"b64_hidden",      # Base64 obfuscation
+        r"xmrig",  # Monero miner
+        r"minerd",  # Generic miner
+        r"cpuminer",  # CPU miner
+        r"cgminer",  # GPU miner
+        r"bfgminer",  # Mining software
+        r"ethminer",  # Ethereum miner
+        r"ccminer",  # Cryptocurrency miner
+        r"cryptonight",  # Mining algorithm
+        r"stratum",  # Mining pool protocol
+        r"kworker.*mining",  # Hidden miner
+        r"\.hidden",  # Hidden processes
+        r"kdevtmpfsi",  # Known crypto miner
+        r"kinsing",  # Crypto-jacking malware
+        r"kerberods",  # Linux backdoor
+        r"watchdogs",  # Malware dropper
+        r"b64_hidden",  # Base64 obfuscation
     ]
-    
+
     # Suspicious command patterns
     SUSPICIOUS_PATTERNS = [
-        r"curl.*\|.*sh",            # Pipe curl to shell
-        r"wget.*\|.*sh",            # Pipe wget to shell
-        r"bash.*-c.*base64",        # Base64 encoded commands
-        r"nc\s+-.*-e",              # Netcat with execution
-        r"ncat.*-e",                # Ncat with execution
-        r"/dev/tcp/",               # Bash TCP connection
-        r"python.*-c.*socket",      # Python reverse shell
-        r"perl.*socket",            # Perl reverse shell
-        r"ruby.*socket",            # Ruby reverse shell
-        r"php.*fsockopen",          # PHP reverse shell
-        r"socat.*exec",             # Socat execution
-        r"mkfifo.*nc",              # Named pipe with netcat
-        r"rm\s+-rf\s+/",            # Dangerous rm command
-        r"chmod\s+777",             # Overly permissive chmod
-        r"iptables.*DROP",          # Firewall manipulation
-        r"crontab.*http",           # Cron download
-        r"/tmp/\.",                 # Hidden files in /tmp
-        r"\.\/\.",                  # Hidden executable
+        r"curl.*\|.*sh",  # Pipe curl to shell
+        r"wget.*\|.*sh",  # Pipe wget to shell
+        r"bash.*-c.*base64",  # Base64 encoded commands
+        r"nc\s+-.*-e",  # Netcat with execution
+        r"ncat.*-e",  # Ncat with execution
+        r"/dev/tcp/",  # Bash TCP connection
+        r"python.*-c.*socket",  # Python reverse shell
+        r"perl.*socket",  # Perl reverse shell
+        r"ruby.*socket",  # Ruby reverse shell
+        r"php.*fsockopen",  # PHP reverse shell
+        r"socat.*exec",  # Socat execution
+        r"mkfifo.*nc",  # Named pipe with netcat
+        r"rm\s+-rf\s+/",  # Dangerous rm command
+        r"chmod\s+777",  # Overly permissive chmod
+        r"iptables.*DROP",  # Firewall manipulation
+        r"crontab.*http",  # Cron download
+        r"/tmp/\.",  # Hidden files in /tmp
+        r"\.\/\.",  # Hidden executable
     ]
-    
+
     # Known safe process patterns (whitelist)
     SAFE_PATTERNS = [
         r"^systemd",
@@ -117,16 +117,16 @@ class AIProcessAnalyzer:
         r"^cron$",
         r"^rsyslogd",
         r"^snapd",
-        r"^wasm",           # Our own tool
-        r"^wasm-",          # Our own services
-        r"^next-server",    # Next.js server
+        r"^wasm",  # Our own tool
+        r"^wasm-",  # Our own services
+        r"^next-server",  # Next.js server
         r"^npm$",
         r"^npx$",
         r"^pnpm$",
         r"^yarn$",
         r"^bun$",
         r"^deno$",
-        r"^code$",          # VS Code
+        r"^code$",  # VS Code
         r"^code-server",
         r"^cursor",
         r"^electron",
@@ -149,7 +149,7 @@ class AIProcessAnalyzer:
         r"^evolution",
         r"^gnome-shell",
         r"^plasmashell",
-        r"^sh$",            # Normal shell
+        r"^sh$",  # Normal shell
         r"^bash$",
         r"^zsh$",
         r"^fish$",
@@ -165,19 +165,19 @@ class AIProcessAnalyzer:
         r"^celery",
         r"^jupyter",
     ]
-    
+
     # Default OpenAI model
     DEFAULT_MODEL = "gpt-4o-mini"
-    
+
     def __init__(
         self,
-        api_key: Optional[str] = None,
-        model: Optional[str] = None,
+        api_key: str | None = None,
+        model: str | None = None,
         verbose: bool = False,
     ):
         """
         Initialize AI process analyzer.
-        
+
         Args:
             api_key: OpenAI API key. If None, loads from config.
             model: OpenAI model to use. If None, uses default.
@@ -185,26 +185,26 @@ class AIProcessAnalyzer:
         """
         self.logger = Logger(verbose=verbose)
         self.config = Config()
-        
+
         self.api_key = api_key or self.config.get("monitor.openai.api_key", "")
         self.model = model or self.config.get("monitor.openai.model", self.DEFAULT_MODEL)
-        
+
         if not self.api_key:
             self.logger.warning("OpenAI API key not configured - will use pattern matching only")
-    
-    def _quick_check(self, process: ProcessInfo) -> Optional[AnalysisResult]:
+
+    def _quick_check(self, process: ProcessInfo) -> AnalysisResult | None:
         """
         Perform quick pattern-based check before AI analysis.
-        
+
         Args:
             process: Process to check.
-            
+
         Returns:
             AnalysisResult if threat detected, None otherwise.
         """
         command_lower = process.command.lower()
         name_lower = process.name.lower()
-        
+
         # Check against known malicious patterns
         for pattern in self.KNOWN_MALICIOUS_PATTERNS:
             if re.search(pattern, command_lower) or re.search(pattern, name_lower):
@@ -216,7 +216,7 @@ class AIProcessAnalyzer:
                     reason=f"Matches known malicious pattern: {pattern}",
                     recommended_action="terminate_tree",
                 )
-        
+
         # Check against suspicious patterns
         for pattern in self.SUSPICIOUS_PATTERNS:
             if re.search(pattern, command_lower):
@@ -228,13 +228,12 @@ class AIProcessAnalyzer:
                     reason=f"Matches suspicious pattern: {pattern}",
                     recommended_action="terminate",
                 )
-        
+
         # Check for high CPU usage with suspicious name
         if process.cpu_percent > 80:
             # Unknown process consuming lots of CPU
             is_safe = any(
-                re.search(pattern, process.name.lower())
-                for pattern in self.SAFE_PATTERNS
+                re.search(pattern, process.name.lower()) for pattern in self.SAFE_PATTERNS
             )
             if not is_safe:
                 return AnalysisResult(
@@ -245,25 +244,25 @@ class AIProcessAnalyzer:
                     reason=f"High CPU usage ({process.cpu_percent:.1f}%) from unknown process",
                     recommended_action="monitor",
                 )
-        
+
         return None
-    
-    def _analyze_with_ai(self, processes: List[ProcessInfo]) -> List[AnalysisResult]:
+
+    def _analyze_with_ai(self, processes: list[ProcessInfo]) -> list[AnalysisResult]:
         """
         Use OpenAI API to analyze processes.
-        
+
         Args:
             processes: List of processes to analyze.
-            
+
         Returns:
             List of analysis results.
-            
+
         Raises:
             AIAnalysisError: If API call fails.
         """
         if not self.api_key:
             return []
-        
+
         try:
             import httpx
         except ImportError:
@@ -272,28 +271,30 @@ class AIProcessAnalyzer:
             except ImportError:
                 self.logger.warning("HTTP library not available for AI analysis")
                 return []
-        
+
         # Prepare process data for analysis
         process_data = []
         for p in processes:
-            process_data.append({
-                "pid": p.pid,
-                "name": p.name,
-                "user": p.user,
-                "cpu_percent": p.cpu_percent,
-                "memory_percent": p.memory_percent,
-                "command": p.command[:500],  # Limit command length
-                "num_threads": p.num_threads,
-                "status": p.status,
-                "cwd": p.cwd,
-                "has_network_connections": len(p.connections) > 0,
-                "connection_count": len(p.connections),
-            })
-        
+            process_data.append(
+                {
+                    "pid": p.pid,
+                    "name": p.name,
+                    "user": p.user,
+                    "cpu_percent": p.cpu_percent,
+                    "memory_percent": p.memory_percent,
+                    "command": p.command[:500],  # Limit command length
+                    "num_threads": p.num_threads,
+                    "status": p.status,
+                    "cwd": p.cwd,
+                    "has_network_connections": len(p.connections) > 0,
+                    "connection_count": len(p.connections),
+                }
+            )
+
         prompt = self._build_analysis_prompt(process_data)
-        
+
         try:
-            if hasattr(httpx, 'Client'):
+            if hasattr(httpx, "Client"):
                 # Using httpx
                 with httpx.Client(timeout=60.0) as client:
                     response = client.post(
@@ -343,18 +344,18 @@ class AIProcessAnalyzer:
                     },
                     timeout=60,
                 )
-            
+
             if response.status_code != 200:
                 raise AIAnalysisError(
                     f"OpenAI API error: {response.status_code}",
                     details=response.text,
                 )
-            
+
             result = response.json()
             content = result["choices"][0]["message"]["content"]
-            
+
             return self._parse_ai_response(content, processes)
-            
+
         except AIAnalysisError:
             raise
         except Exception as e:
@@ -362,7 +363,7 @@ class AIProcessAnalyzer:
                 "Failed to analyze processes with AI",
                 details=str(e),
             )
-    
+
     def _get_system_prompt(self) -> str:
         """Get the system prompt for AI analysis."""
         return """You are a security expert analyzing Linux processes for REAL security threats.
@@ -404,8 +405,8 @@ Response format - JSON array ONLY:
 If NO clear threats found, return empty array: []
 
 Remember: False positives are WORSE than missing a threat. Only flag what you're CERTAIN about."""
-    
-    def _build_analysis_prompt(self, process_data: List[Dict]) -> str:
+
+    def _build_analysis_prompt(self, process_data: list[dict]) -> str:
         """Build the user prompt for process analysis."""
         return f"""Analyze these {len(process_data)} processes for REAL security threats.
 
@@ -428,28 +429,28 @@ DO NOT flag:
 - The wasm monitoring tool itself
 
 Return ONLY confirmed threats as JSON array. Empty array [] if nothing malicious found."""
-    
+
     def _parse_ai_response(
         self,
         content: str,
-        processes: List[ProcessInfo],
-    ) -> List[AnalysisResult]:
+        processes: list[ProcessInfo],
+    ) -> list[AnalysisResult]:
         """
         Parse AI response into AnalysisResult objects.
-        
+
         Args:
             content: AI response content.
             processes: Original process list.
-            
+
         Returns:
             List of analysis results.
         """
         results = []
-        
+
         # Extract JSON from response
         try:
             # Try to find JSON array in response
-            json_match = re.search(r'\[[\s\S]*\]', content)
+            json_match = re.search(r"\[[\s\S]*\]", content)
             if json_match:
                 data = json.loads(json_match.group())
             else:
@@ -457,51 +458,53 @@ Return ONLY confirmed threats as JSON array. Empty array [] if nothing malicious
         except json.JSONDecodeError:
             self.logger.warning("Failed to parse AI response as JSON")
             return results
-        
+
         # Create lookup for processes
         process_map = {p.pid: p for p in processes}
-        
+
         for item in data:
             pid = item.get("pid")
             if pid and pid in process_map:
                 threat_level = item.get("threat_level", "suspicious")
                 if threat_level in ["suspicious", "malicious"]:
-                    results.append(AnalysisResult(
-                        process=process_map[pid],
-                        is_threat=True,
-                        threat_level=threat_level,
-                        confidence=item.get("confidence", 0.7),
-                        reason=item.get("reason", "Flagged by AI analysis"),
-                        recommended_action=item.get("recommended_action", "monitor"),
-                    ))
-        
+                    results.append(
+                        AnalysisResult(
+                            process=process_map[pid],
+                            is_threat=True,
+                            threat_level=threat_level,
+                            confidence=item.get("confidence", 0.7),
+                            reason=item.get("reason", "Flagged by AI analysis"),
+                            recommended_action=item.get("recommended_action", "monitor"),
+                        )
+                    )
+
         return results
-    
+
     def analyze_processes(
         self,
-        processes: List[ProcessInfo],
+        processes: list[ProcessInfo],
         use_ai: bool = True,
         force_ai: bool = False,
         analyze_all: bool = False,
-    ) -> List[AnalysisResult]:
+    ) -> list[AnalysisResult]:
         """
         Analyze a list of processes for threats.
-        
+
         Performs quick pattern matching first, then uses AI for
         deeper analysis of remaining processes.
-        
+
         Args:
             processes: List of processes to analyze.
             use_ai: Whether to use AI analysis.
             force_ai: Force AI analysis even if no suspicious processes found.
             analyze_all: Analyze ALL processes with AI (expensive).
-            
+
         Returns:
             List of analysis results for detected threats.
         """
         results = []
         remaining_processes = []
-        
+
         # First pass: Quick pattern matching
         for process in processes:
             quick_result = self._quick_check(process)
@@ -513,11 +516,11 @@ Return ONLY confirmed threats as JSON array. Empty array [] if nothing malicious
                 )
             else:
                 remaining_processes.append(process)
-        
+
         # Second pass: AI analysis for remaining suspicious candidates
         if use_ai and self.api_key and remaining_processes:
             candidates = []
-            
+
             if analyze_all:
                 # Analyze ALL processes (expensive)
                 candidates = remaining_processes
@@ -527,71 +530,75 @@ Return ONLY confirmed threats as JSON array. Empty array [] if nothing malicious
                 for p in remaining_processes:
                     # Skip if matches any safe pattern (unless analyze_all)
                     is_safe = any(
-                        re.search(pattern, p.name.lower())
-                        for pattern in self.SAFE_PATTERNS
+                        re.search(pattern, p.name.lower()) for pattern in self.SAFE_PATTERNS
                     )
                     if is_safe:
                         continue
-                    
+
                     # Only analyze if there's a concrete reason to be suspicious:
                     # 1. Very high CPU (could be miner)
                     # 2. Running from suspicious locations (/tmp, /var/tmp, /dev/shm)
                     # 3. Has suspicious characters in name (hidden files)
                     # 4. Unknown process with network connections
                     suspicious_location = any(
-                        loc in (p.cwd or "")
-                        for loc in ["/tmp", "/var/tmp", "/dev/shm"]
+                        loc in (p.cwd or "") for loc in ["/tmp", "/var/tmp", "/dev/shm"]
                     )
                     suspicious_name = p.name.startswith(".") or "hidden" in p.name.lower()
                     high_cpu_unknown = p.cpu_percent > 50 and not is_safe
                     has_many_connections = len(p.connections) > 20
-                    
-                    if suspicious_location or suspicious_name or high_cpu_unknown or has_many_connections:
+
+                    if (
+                        suspicious_location
+                        or suspicious_name
+                        or high_cpu_unknown
+                        or has_many_connections
+                    ):
                         candidates.append(p)
-                
+
                 # If force_ai is set but no candidates yet, take top CPU/memory processes
                 if force_ai and not candidates:
                     # Get top 10 processes by CPU and memory
                     sorted_by_cpu = sorted(
-                        remaining_processes,
-                        key=lambda p: p.cpu_percent,
-                        reverse=True
+                        remaining_processes, key=lambda p: p.cpu_percent, reverse=True
                     )[:10]
                     sorted_by_mem = sorted(
-                        remaining_processes,
-                        key=lambda p: p.memory_percent,
-                        reverse=True
+                        remaining_processes, key=lambda p: p.memory_percent, reverse=True
                     )[:10]
-                    
+
                     # Combine and deduplicate
                     seen = set()
                     for p in sorted_by_cpu + sorted_by_mem:
                         if p.pid not in seen:
                             candidates.append(p)
                             seen.add(p.pid)
-                    
-                    self.logger.info(f"Force AI enabled: analyzing top {len(candidates)} resource consumers")
+
+                    self.logger.info(
+                        f"Force AI enabled: analyzing top {len(candidates)} resource consumers"
+                    )
             else:
                 # Normal mode: Only analyze if there's a concrete reason
                 for p in remaining_processes:
                     is_safe = any(
-                        re.search(pattern, p.name.lower())
-                        for pattern in self.SAFE_PATTERNS
+                        re.search(pattern, p.name.lower()) for pattern in self.SAFE_PATTERNS
                     )
                     if is_safe:
                         continue
-                    
+
                     suspicious_location = any(
-                        loc in (p.cwd or "")
-                        for loc in ["/tmp", "/var/tmp", "/dev/shm"]
+                        loc in (p.cwd or "") for loc in ["/tmp", "/var/tmp", "/dev/shm"]
                     )
                     suspicious_name = p.name.startswith(".") or "hidden" in p.name.lower()
                     high_cpu_unknown = p.cpu_percent > 50 and not is_safe
                     has_many_connections = len(p.connections) > 20
-                    
-                    if suspicious_location or suspicious_name or high_cpu_unknown or has_many_connections:
+
+                    if (
+                        suspicious_location
+                        or suspicious_name
+                        or high_cpu_unknown
+                        or has_many_connections
+                    ):
                         candidates.append(p)
-            
+
             if candidates:
                 self.logger.debug(f"Sending {len(candidates)} processes to AI for analysis")
                 try:
@@ -599,16 +606,16 @@ Return ONLY confirmed threats as JSON array. Empty array [] if nothing malicious
                     results.extend(ai_results)
                 except AIAnalysisError as e:
                     self.logger.warning(f"AI analysis failed: {e}")
-        
+
         return results
 
-    def get_analysis_summary(self, results: List[AnalysisResult]) -> Dict[str, Any]:
+    def get_analysis_summary(self, results: list[AnalysisResult]) -> dict[str, Any]:
         """
         Generate a summary of analysis results.
-        
+
         Args:
             results: List of analysis results.
-            
+
         Returns:
             Summary dictionary.
         """
@@ -616,13 +623,9 @@ Return ONLY confirmed threats as JSON array. Empty array [] if nothing malicious
             "total_threats": len(results),
             "malicious_count": sum(1 for r in results if r.threat_level == "malicious"),
             "suspicious_count": sum(1 for r in results if r.threat_level == "suspicious"),
-            "avg_confidence": (
-                sum(r.confidence for r in results) / len(results)
-                if results else 0
-            ),
+            "avg_confidence": (sum(r.confidence for r in results) / len(results) if results else 0),
             "recommended_terminations": sum(
-                1 for r in results
-                if r.recommended_action in ["terminate", "terminate_tree"]
+                1 for r in results if r.recommended_action in ["terminate", "terminate_tree"]
             ),
             "timestamp": datetime.now().isoformat(),
         }

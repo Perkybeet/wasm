@@ -49,12 +49,13 @@ interactive = [
     "inquirer>=3.1.0",
 ]
 dev = [
-    "pytest>=7.0",
-    "pytest-cov>=4.0",
-    "black>=23.0",
-    "isort>=5.12",
-    "mypy>=1.0",
-    "ruff>=0.1.0",
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "pytest-mock>=3.12",
+    "syrupy>=4.6",
+    "hypothesis>=6.100",
+    "mypy>=1.10",
+    "ruff>=0.6",
 ]
 rich = [
     "rich>=13.0",
@@ -104,42 +105,41 @@ wasm = [
     "py.typed",
 ]
 
-[tool.black]
-line-length = 100
-target-version = ['py310', 'py311', 'py312']
-include = '\.pyi?$'
-exclude = '''
-/(
-    \.git
-  | \.mypy_cache
-  | \.pytest_cache
-  | \.venv
-  | build
-  | dist
-)/
-'''
-
-[tool.isort]
-profile = "black"
-line_length = 100
-skip = [".git", ".mypy_cache", ".pytest_cache", ".venv", "build", "dist"]
-
 [tool.mypy]
 python_version = "3.10"
+files = ["src/wasm"]
 warn_return_any = true
 warn_unused_configs = true
-ignore_missing_imports = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true
+check_untyped_defs = true
 exclude = [
     "build",
     "dist",
     ".venv",
 ]
 
+# Third-party packages without type information. Listed one by one rather than
+# with a blanket ignore_missing_imports, so a new untyped dependency is a
+# deliberate decision instead of a silent one.
+[[tool.mypy.overrides]]
+module = [
+    "jose.*",
+    "inquirer.*",
+    "questionary.*",
+    "psutil.*",
+]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = "test_*.py"
 python_functions = "test_*"
-addopts = "-v --cov=wasm --cov-report=term-missing"
+addopts = "--strict-markers --strict-config"
+filterwarnings = [
+    "error::DeprecationWarning:wasm.*",
+]
 
 [tool.ruff]
 line-length = 100
@@ -153,15 +153,31 @@ exclude = [
     "dist",
 ]
 
+[tool.ruff.format]
+docstring-code-format = true
+
 [tool.ruff.lint]
 select = [
-    "E",   # pycodestyle errors
-    "W",   # pycodestyle warnings
-    "F",   # pyflakes
-    "I",   # isort
-    "B",   # flake8-bugbear
-    "C4",  # flake8-comprehensions
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "UP",   # pyupgrade
+    "S",    # flake8-bandit: this project runs as root
+    "BLE",  # flake8-blind-except: the defect class that hid five broken methods
+    "T20",  # flake8-print: output goes through the presenter, not print()
+    "RUF",  # ruff-specific rules
 ]
 ignore = [
-    "E501",  # line too long (handled by black)
+    "E501",  # line length is handled by the formatter
+    "S603",  # subprocess call: the runner is the audited seam for this
+    "S607",  # partial executable path: PATH lookup is intended for system tools
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert on things bandit dislikes and print freely.
+"tests/**" = ["S101", "S105", "S106", "S108", "T20", "BLE"]
+# The release script is a developer tool, not shipped code.
+"scripts/**" = ["T20"]

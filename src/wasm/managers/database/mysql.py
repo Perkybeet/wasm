@@ -9,25 +9,25 @@ MySQL/MariaDB database manager for WASM.
 import os
 import re
 import tempfile
+from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional
 
 from wasm.core.exceptions import (
-    DatabaseError,
-    DatabaseNotFoundError,
-    DatabaseExistsError,
-    DatabaseUserError,
-    DatabaseEngineError,
     DatabaseBackupError,
+    DatabaseEngineError,
+    DatabaseError,
+    DatabaseExistsError,
+    DatabaseNotFoundError,
     DatabaseQueryError,
+    DatabaseUserError,
 )
 from wasm.managers.database.base import (
+    BackupInfo,
     BaseDatabaseManager,
     DatabaseInfo,
     UserInfo,
-    BackupInfo,
 )
 from wasm.managers.database.registry import DatabaseRegistry
 
@@ -35,17 +35,17 @@ from wasm.managers.database.registry import DatabaseRegistry
 class MySQLManager(BaseDatabaseManager):
     """
     Manager for MySQL/MariaDB databases.
-    
+
     Supports both MySQL and MariaDB, automatically detecting which is installed.
     """
-    
+
     ENGINE_NAME = "mysql"
     DISPLAY_NAME = "MySQL/MariaDB"
     DEFAULT_PORT = 3306
     SERVICE_NAME = "mysql"  # Updated during init if MariaDB
     PACKAGE_NAMES = ["mysql-server"]
     MARIADB_PACKAGES = ["mariadb-server"]
-    
+
     # System databases to exclude from listings
     SYSTEM_DATABASES = {
         "information_schema",
@@ -53,12 +53,12 @@ class MySQLManager(BaseDatabaseManager):
         "performance_schema",
         "sys",
     }
-    
+
     def __init__(self, verbose: bool = False):
         """Initialize MySQL manager."""
         super().__init__(verbose=verbose)
         self._detect_variant()
-    
+
     # ==================== SQL Escaping (Security) ====================
 
     @staticmethod
@@ -82,7 +82,7 @@ class MySQLManager(BaseDatabaseManager):
         return "'" + value.replace("\\", "\\\\").replace("'", "''") + "'"
 
     @contextmanager
-    def _secure_credentials(self) -> Generator[List[str], None, None]:
+    def _secure_credentials(self) -> Generator[list[str], None, None]:
         """
         Context manager that provides MySQL credentials securely.
 
@@ -135,7 +135,7 @@ class MySQLManager(BaseDatabaseManager):
             self.SERVICE_NAME = "mariadb"
             self.DISPLAY_NAME = "MariaDB"
             return
-        
+
         # Check for MySQL
         result = self._run(["which", "mysql"])
         if result.success:
@@ -144,13 +144,13 @@ class MySQLManager(BaseDatabaseManager):
             if result.success and "mariadb" in result.stdout.lower():
                 self.SERVICE_NAME = "mariadb"
                 self.DISPLAY_NAME = "MariaDB"
-    
+
     def is_installed(self) -> bool:
         """Check if MySQL/MariaDB is installed."""
         result = self._run(["which", "mysql"])
         return result.success
-    
-    def get_version(self) -> Optional[str]:
+
+    def get_version(self) -> str | None:
         """Get MySQL/MariaDB version."""
         result = self._run(["mysql", "--version"])
         if result.success:
@@ -159,96 +159,96 @@ class MySQLManager(BaseDatabaseManager):
             if match:
                 return match.group(1)
         return None
-    
+
     def install(self) -> bool:
         """Install MySQL/MariaDB."""
         self.logger.info(f"Installing {self.DISPLAY_NAME}...")
-        
+
         # Update package list
         result = self._run_sudo(["apt-get", "update"])
         if not result.success:
             raise DatabaseEngineError("Failed to update package list", result.stderr)
-        
+
         # Try MariaDB first (more common on modern systems)
-        result = self._run_sudo([
-            "apt-get", "install", "-y",
-            *self.MARIADB_PACKAGES,
-        ])
-        
+        result = self._run_sudo(
+            [
+                "apt-get",
+                "install",
+                "-y",
+                *self.MARIADB_PACKAGES,
+            ]
+        )
+
         if result.success:
             self.SERVICE_NAME = "mariadb"
             self.DISPLAY_NAME = "MariaDB"
         else:
             # Fall back to MySQL
-            result = self._run_sudo([
-                "apt-get", "install", "-y",
-                *self.PACKAGE_NAMES,
-            ])
+            result = self._run_sudo(
+                [
+                    "apt-get",
+                    "install",
+                    "-y",
+                    *self.PACKAGE_NAMES,
+                ]
+            )
             if not result.success:
-                raise DatabaseEngineError(
-                    f"Failed to install {self.DISPLAY_NAME}",
-                    result.stderr
-                )
-        
+                raise DatabaseEngineError(f"Failed to install {self.DISPLAY_NAME}", result.stderr)
+
         # Enable and start service
         self.enable()
         self.start()
-        
+
         # Secure installation (set root password, remove test db, etc.)
         self._secure_installation()
-        
+
         return True
-    
+
     def _secure_installation(self) -> None:
         """Run basic security hardening."""
         # Remove anonymous users
-        self._run_sudo([
-            "mysql", "-e",
-            "DELETE FROM mysql.user WHERE User='';"
-        ])
-        
+        self._run_sudo(["mysql", "-e", "DELETE FROM mysql.user WHERE User='';"])
+
         # Remove test database
-        self._run_sudo([
-            "mysql", "-e",
-            "DROP DATABASE IF EXISTS test;"
-        ])
-        
+        self._run_sudo(["mysql", "-e", "DROP DATABASE IF EXISTS test;"])
+
         # Flush privileges
-        self._run_sudo([
-            "mysql", "-e",
-            "FLUSH PRIVILEGES;"
-        ])
-    
+        self._run_sudo(["mysql", "-e", "FLUSH PRIVILEGES;"])
+
     def uninstall(self, purge: bool = False) -> bool:
         """Uninstall MySQL/MariaDB."""
         self.logger.info(f"Uninstalling {self.DISPLAY_NAME}...")
-        
+
         # Stop service
         try:
             self.stop()
         except Exception as e:
             self.logger.warning(f"Could not stop service during uninstall: {e}")
-        
+
         action = "purge" if purge else "remove"
-        
+
         # Try removing both variants
         for packages in [self.MARIADB_PACKAGES, self.PACKAGE_NAMES]:
-            result = self._run_sudo([
-                "apt-get", action, "-y",
-                *packages,
-            ])
-        
+            result = self._run_sudo(
+                [
+                    "apt-get",
+                    action,
+                    "-y",
+                    *packages,
+                ]
+            )
+
         if purge:
             # Remove data directory
             self._run_sudo(["rm", "-rf", "/var/lib/mysql"])
             self._run_sudo(["rm", "-rf", "/etc/mysql"])
-        
+
         return True
-    
+
     def _execute_sql(
         self,
         sql: str,
-        database: Optional[str] = None,
+        database: str | None = None,
         return_output: bool = True,
     ) -> tuple[bool, str]:
         """
@@ -272,20 +272,20 @@ class MySQLManager(BaseDatabaseManager):
 
             result = self._run_sudo(cmd)
             return result.success, result.stdout if result.success else result.stderr
-    
+
     # ==================== Database Management ====================
-    
+
     def create_database(
         self,
         name: str,
-        owner: Optional[str] = None,
-        encoding: Optional[str] = None,
+        owner: str | None = None,
+        encoding: str | None = None,
         **kwargs,
     ) -> DatabaseInfo:
         """Create a new MySQL database."""
         if self.database_exists(name):
             raise DatabaseExistsError(f"Database '{name}' already exists")
-        
+
         charset = encoding or "utf8mb4"
         collation = kwargs.get("collation", "utf8mb4_unicode_ci")
 
@@ -293,17 +293,17 @@ class MySQLManager(BaseDatabaseManager):
         safe_name = self._escape_identifier(name)
         sql = f"CREATE DATABASE {safe_name} CHARACTER SET {charset} COLLATE {collation};"
         success, output = self._execute_sql(sql)
-        
+
         if not success:
             raise DatabaseError(f"Failed to create database '{name}'", output)
-        
+
         # Grant privileges to owner if specified
         if owner:
             self.grant_privileges(owner, name)
-        
+
         self.logger.info(f"Created database: {name}")
         return self.get_database_info(name)
-    
+
     def drop_database(self, name: str, force: bool = False) -> bool:
         """Drop a MySQL database."""
         if not self.database_exists(name):
@@ -315,22 +315,24 @@ class MySQLManager(BaseDatabaseManager):
         safe_name = self._escape_identifier(name)
         sql = f"DROP DATABASE {safe_name};"
         success, output = self._execute_sql(sql)
-        
+
         if not success:
             raise DatabaseError(f"Failed to drop database '{name}'", output)
-        
+
         self.logger.info(f"Dropped database: {name}")
         return True
-    
+
     def database_exists(self, name: str) -> bool:
         """Check if a database exists."""
         # Use escaped literal to prevent SQL injection
         safe_name = self._escape_literal(name)
-        sql = f"SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = {safe_name};"
+        sql = (
+            f"SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = {safe_name};"
+        )
         success, output = self._execute_sql(sql)
         return success and name in output
-    
-    def list_databases(self) -> List[DatabaseInfo]:
+
+    def list_databases(self) -> list[DatabaseInfo]:
         """List all databases."""
         sql = """
             SELECT 
@@ -340,10 +342,10 @@ class MySQLManager(BaseDatabaseManager):
             FROM INFORMATION_SCHEMA.SCHEMATA;
         """
         success, output = self._execute_sql(sql)
-        
+
         if not success:
             return []
-        
+
         databases = []
         for line in output.strip().split("\n"):
             if not line:
@@ -353,19 +355,21 @@ class MySQLManager(BaseDatabaseManager):
                 name = parts[0]
                 if name in self.SYSTEM_DATABASES:
                     continue
-                
+
                 try:
                     info = self.get_database_info(name)
                     databases.append(info)
                 except Exception:
-                    databases.append(DatabaseInfo(
-                        name=name,
-                        engine=self.ENGINE_NAME,
-                        encoding=parts[1] if len(parts) > 1 else None,
-                    ))
-        
+                    databases.append(
+                        DatabaseInfo(
+                            name=name,
+                            engine=self.ENGINE_NAME,
+                            encoding=parts[1] if len(parts) > 1 else None,
+                        )
+                    )
+
         return databases
-    
+
     def get_database_info(self, name: str) -> DatabaseInfo:
         """Get detailed database information."""
         if not self.database_exists(name):
@@ -400,7 +404,7 @@ class MySQLManager(BaseDatabaseManager):
         sql = f"SELECT DEFAULT_CHARACTER_SET_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = {safe_name};"
         success, output = self._execute_sql(sql)
         encoding = output.strip() if success else None
-        
+
         return DatabaseInfo(
             name=name,
             engine=self.ENGINE_NAME,
@@ -408,7 +412,7 @@ class MySQLManager(BaseDatabaseManager):
             tables=tables,
             encoding=encoding,
         )
-    
+
     @staticmethod
     def _format_size(size: int) -> str:
         """Format size in human readable format."""
@@ -417,13 +421,13 @@ class MySQLManager(BaseDatabaseManager):
                 return f"{size:.1f} {unit}"
             size /= 1024
         return f"{size:.1f} PB"
-    
+
     # ==================== User Management ====================
-    
+
     def create_user(
         self,
         username: str,
-        password: Optional[str] = None,
+        password: str | None = None,
         host: str = "localhost",
         **kwargs,
     ) -> tuple[UserInfo, str]:
@@ -439,23 +443,23 @@ class MySQLManager(BaseDatabaseManager):
         safe_password = self._escape_literal(password)
         sql = f"CREATE USER {safe_username}@{safe_host} IDENTIFIED BY {safe_password};"
         success, output = self._execute_sql(sql)
-        
+
         if not success:
             raise DatabaseUserError(f"Failed to create user '{username}'", output)
-        
+
         # Flush privileges
         self._execute_sql("FLUSH PRIVILEGES;")
-        
+
         self.logger.info(f"Created user: {username}@{host}")
-        
+
         user_info = UserInfo(
             username=username,
             engine=self.ENGINE_NAME,
             host=host,
         )
-        
+
         return user_info, password
-    
+
     def drop_user(self, username: str, host: str = "localhost") -> bool:
         """Drop a MySQL user."""
         if not self.user_exists(username, host):
@@ -466,15 +470,15 @@ class MySQLManager(BaseDatabaseManager):
         safe_host = self._escape_literal(host)
         sql = f"DROP USER {safe_username}@{safe_host};"
         success, output = self._execute_sql(sql)
-        
+
         if not success:
             raise DatabaseUserError(f"Failed to drop user '{username}'", output)
-        
+
         self._execute_sql("FLUSH PRIVILEGES;")
-        
+
         self.logger.info(f"Dropped user: {username}@{host}")
         return True
-    
+
     def user_exists(self, username: str, host: str = "localhost") -> bool:
         """Check if a user exists."""
         # Use escaped literals to prevent SQL injection
@@ -483,34 +487,36 @@ class MySQLManager(BaseDatabaseManager):
         sql = f"SELECT User FROM mysql.user WHERE User = {safe_username} AND Host = {safe_host};"
         success, output = self._execute_sql(sql)
         return success and username in output
-    
-    def list_users(self) -> List[UserInfo]:
+
+    def list_users(self) -> list[UserInfo]:
         """List all MySQL users."""
         sql = "SELECT User, Host FROM mysql.user WHERE User != '' ORDER BY User;"
         success, output = self._execute_sql(sql)
-        
+
         if not success:
             return []
-        
+
         users = []
         for line in output.strip().split("\n"):
             if not line:
                 continue
             parts = line.split("\t")
             if len(parts) >= 2:
-                users.append(UserInfo(
-                    username=parts[0],
-                    engine=self.ENGINE_NAME,
-                    host=parts[1],
-                ))
-        
+                users.append(
+                    UserInfo(
+                        username=parts[0],
+                        engine=self.ENGINE_NAME,
+                        host=parts[1],
+                    )
+                )
+
         return users
-    
+
     def grant_privileges(
         self,
         username: str,
         database: str,
-        privileges: List[str] = None,
+        privileges: list[str] = None,
         host: str = "localhost",
     ) -> bool:
         """Grant privileges to a user on a database."""
@@ -522,20 +528,20 @@ class MySQLManager(BaseDatabaseManager):
         safe_host = self._escape_literal(host)
         sql = f"GRANT {privs} ON {safe_database}.* TO {safe_username}@{safe_host};"
         success, output = self._execute_sql(sql)
-        
+
         if not success:
-            raise DatabaseUserError(f"Failed to grant privileges", output)
-        
+            raise DatabaseUserError("Failed to grant privileges", output)
+
         self._execute_sql("FLUSH PRIVILEGES;")
-        
+
         self.logger.info(f"Granted {privs} on {database} to {username}@{host}")
         return True
-    
+
     def revoke_privileges(
         self,
         username: str,
         database: str,
-        privileges: List[str] = None,
+        privileges: list[str] = None,
         host: str = "localhost",
     ) -> bool:
         """Revoke privileges from a user on a database."""
@@ -547,40 +553,40 @@ class MySQLManager(BaseDatabaseManager):
         safe_host = self._escape_literal(host)
         sql = f"REVOKE {privs} ON {safe_database}.* FROM {safe_username}@{safe_host};"
         success, output = self._execute_sql(sql)
-        
+
         if not success:
-            raise DatabaseUserError(f"Failed to revoke privileges", output)
-        
+            raise DatabaseUserError("Failed to revoke privileges", output)
+
         self._execute_sql("FLUSH PRIVILEGES;")
-        
+
         self.logger.info(f"Revoked {privs} on {database} from {username}@{host}")
         return True
-    
+
     # ==================== Backup & Restore ====================
-    
+
     def backup(
         self,
         database: str,
-        output_path: Optional[Path] = None,
+        output_path: Path | None = None,
         compress: bool = True,
         **kwargs,
     ) -> BackupInfo:
         """Create a MySQL database backup using mysqldump."""
         if not self.database_exists(database):
             raise DatabaseNotFoundError(f"Database '{database}' does not exist")
-        
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{self.ENGINE_NAME}-{database}-{timestamp}.sql"
         if compress:
             filename += ".gz"
-        
+
         backup_path = output_path or (self.BACKUP_DIR / filename)
-        
+
         # Create backup directory if needed
         backup_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         cmd = ["mysqldump", "--single-transaction", "--routines", "--triggers", database]
-        
+
         if compress:
             # Pipe through gzip
             full_cmd = " ".join(cmd) + f" | gzip > {backup_path}"
@@ -589,14 +595,14 @@ class MySQLManager(BaseDatabaseManager):
             result = self._run_sudo(cmd)
             if result.success:
                 backup_path.write_text(result.stdout)
-        
+
         if not result.success:
             raise DatabaseBackupError(f"Failed to backup database '{database}'", result.stderr)
-        
+
         stat = backup_path.stat()
-        
+
         self.logger.info(f"Created backup: {backup_path}")
-        
+
         return BackupInfo(
             path=backup_path,
             database=database,
@@ -605,7 +611,7 @@ class MySQLManager(BaseDatabaseManager):
             created=datetime.now(),
             compressed=compress,
         )
-    
+
     def restore(
         self,
         database: str,
@@ -615,32 +621,32 @@ class MySQLManager(BaseDatabaseManager):
     ) -> bool:
         """Restore a MySQL database from backup."""
         backup_path = Path(backup_path)
-        
+
         if not backup_path.exists():
             raise DatabaseBackupError(f"Backup file not found: {backup_path}")
-        
+
         if drop_existing and self.database_exists(database):
             self.drop_database(database, force=True)
-        
+
         # Create database if it doesn't exist
         if not self.database_exists(database):
             self.create_database(database)
-        
+
         # Restore based on compression
         if backup_path.suffix == ".gz":
             full_cmd = f"gunzip < {backup_path} | mysql {database}"
             result = self._run_sudo(["bash", "-c", full_cmd])
         else:
             result = self._run_sudo(["bash", "-c", f"mysql {database} < {backup_path}"])
-        
+
         if not result.success:
             raise DatabaseBackupError(f"Failed to restore database '{database}'", result.stderr)
-        
+
         self.logger.info(f"Restored database: {database} from {backup_path}")
         return True
-    
+
     # ==================== Query Execution ====================
-    
+
     def execute_query(
         self,
         database: str,
@@ -650,14 +656,14 @@ class MySQLManager(BaseDatabaseManager):
         """Execute a SQL query."""
         if not self.database_exists(database):
             raise DatabaseNotFoundError(f"Database '{database}' does not exist")
-        
+
         success, output = self._execute_sql(query, database=database)
-        
+
         if not success:
-            raise DatabaseQueryError(f"Query failed", output)
-        
+            raise DatabaseQueryError("Query failed", output)
+
         return success, output
-    
+
     def get_connection_string(
         self,
         database: str,
@@ -667,12 +673,12 @@ class MySQLManager(BaseDatabaseManager):
     ) -> str:
         """Get a MySQL connection string."""
         return f"mysql://{username}:{password}@{host}:{self.DEFAULT_PORT}/{database}"
-    
+
     def get_interactive_command(
         self,
-        database: Optional[str] = None,
-        username: Optional[str] = None,
-    ) -> List[str]:
+        database: str | None = None,
+        username: str | None = None,
+    ) -> list[str]:
         """Get the command to connect interactively."""
         cmd = ["mysql"]
         if username:

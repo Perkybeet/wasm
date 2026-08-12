@@ -6,7 +6,7 @@ Commands for managing WASM configuration files.
 
 from argparse import Namespace
 
-from wasm.core.config import Config, DEFAULT_CONFIG_PATH
+from wasm.core.config import DEFAULT_CONFIG_PATH, Config
 from wasm.core.logger import Logger
 
 
@@ -61,7 +61,9 @@ def _handle_upgrade(args: Namespace) -> int:
 
     if result["upgraded"]:
         if not quiet:
-            logger.success(f"Configuration upgraded! Added {len(result['added_keys'])} new option(s):")
+            logger.success(
+                f"Configuration upgraded! Added {len(result['added_keys'])} new option(s):"
+            )
             for key in result["added_keys"][:10]:  # Show first 10
                 logger.info(f"  + {key}")
             if len(result["added_keys"]) > 10:

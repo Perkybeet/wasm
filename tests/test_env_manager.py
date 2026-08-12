@@ -4,16 +4,13 @@
 
 """Tests for the EnvManager helper."""
 
-import json
-import tempfile
-from pathlib import Path
 
 import pytest
 
 from wasm.deployers.helpers.env_manager import (
+    EnvConfig,
     EnvManager,
     EnvVariable,
-    EnvConfig,
 )
 
 
@@ -82,9 +79,7 @@ class TestEnvManagerParsing:
         """Test parsing quoted default values."""
         env_file = tmp_path / ".env.example"
         env_file.write_text(
-            'QUOTED_DOUBLE="hello world"\n'
-            "QUOTED_SINGLE='hello world'\n"
-            "UNQUOTED=hello\n"
+            "QUOTED_DOUBLE=\"hello world\"\nQUOTED_SINGLE='hello world'\nUNQUOTED=hello\n"
         )
 
         variables = env_manager.discover(tmp_path)

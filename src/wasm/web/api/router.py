@@ -4,17 +4,17 @@ Main API router that combines all API endpoints.
 
 from fastapi import APIRouter
 
-from wasm.web.api.auth import router as auth_router
 from wasm.web.api.apps import router as apps_router
+from wasm.web.api.auth import router as auth_router
+from wasm.web.api.backups import router as backups_router
+from wasm.web.api.certs import router as certs_router
+from wasm.web.api.config import router as config_router
+from wasm.web.api.databases import router as databases_router
+from wasm.web.api.jobs import router as jobs_router
+from wasm.web.api.monitor import router as monitor_router
 from wasm.web.api.services import router as services_router
 from wasm.web.api.sites import router as sites_router
-from wasm.web.api.certs import router as certs_router
 from wasm.web.api.system import router as system_router
-from wasm.web.api.monitor import router as monitor_router
-from wasm.web.api.jobs import router as jobs_router
-from wasm.web.api.config import router as config_router
-from wasm.web.api.backups import router as backups_router
-from wasm.web.api.databases import router as databases_router
 
 router = APIRouter()
 

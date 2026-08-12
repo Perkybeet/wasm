@@ -8,10 +8,9 @@ Global configuration management for WASM.
 
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 import yaml
-
 
 # Default paths
 DEFAULT_CONFIG_PATH = Path("/etc/wasm/config.yaml")
@@ -30,7 +29,7 @@ APACHE_SITES_ENABLED = Path("/etc/apache2/sites-enabled")
 SYSTEMD_DIR = Path("/etc/systemd/system")
 
 # Default configuration values
-DEFAULT_CONFIG: Dict[str, Any] = {
+DEFAULT_CONFIG: dict[str, Any] = {
     "apps_directory": str(DEFAULT_APPS_DIR),
     "webserver": "nginx",
     "service_user": "www-data",
@@ -123,36 +122,36 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 class Config:
     """
     Configuration manager for WASM.
-    
+
     Handles loading, saving, and accessing configuration values from
     the global config file and environment variables.
     """
-    
+
     _instance: Optional["Config"] = None
-    _config: Dict[str, Any] = {}
-    
+    _config: dict[str, Any] = {}
+
     def __new__(cls) -> "Config":
         """Singleton pattern to ensure single config instance."""
         if cls._instance is None:
             cls._instance = super().__new__(cls)
             cls._instance._load_config()
         return cls._instance
-    
+
     def _load_config(self) -> None:
         """Load configuration from file and merge with defaults."""
         self._config = DEFAULT_CONFIG.copy()
-        
+
         if DEFAULT_CONFIG_PATH.exists():
             try:
-                with open(DEFAULT_CONFIG_PATH, "r") as f:
+                with open(DEFAULT_CONFIG_PATH) as f:
                     file_config = yaml.safe_load(f) or {}
                 self._config = self._deep_merge(self._config, file_config)
             except Exception:
                 pass  # Use defaults if config file is invalid
-        
+
         # Override with environment variables
         self._load_env_overrides()
-    
+
     def _load_env_overrides(self) -> None:
         """Load configuration overrides from environment variables."""
         env_mappings = {
@@ -161,7 +160,7 @@ class Config:
             "WASM_SERVICE_USER": "service_user",
             "WASM_SSL_EMAIL": ("ssl", "email"),
         }
-        
+
         for env_var, config_key in env_mappings.items():
             value = os.environ.get(env_var)
             if value:
@@ -169,8 +168,8 @@ class Config:
                     self._config[config_key[0]][config_key[1]] = value
                 else:
                     self._config[config_key] = value
-    
-    def _deep_merge(self, base: Dict, override: Dict) -> Dict:
+
+    def _deep_merge(self, base: dict, override: dict) -> dict:
         """Deep merge two dictionaries."""
         result = base.copy()
         for key, value in override.items():
@@ -179,108 +178,108 @@ class Config:
             else:
                 result[key] = value
         return result
-    
+
     def get(self, key: str, default: Any = None) -> Any:
         """
         Get a configuration value.
-        
+
         Args:
             key: Configuration key (supports dot notation for nested values).
             default: Default value if key is not found.
-            
+
         Returns:
             Configuration value or default.
         """
         keys = key.split(".")
         value = self._config
-        
+
         for k in keys:
             if isinstance(value, dict) and k in value:
                 value = value[k]
             else:
                 return default
-        
+
         return value
-    
+
     def set(self, key: str, value: Any) -> None:
         """
         Set a configuration value.
-        
+
         Args:
             key: Configuration key (supports dot notation).
             value: Value to set.
         """
         keys = key.split(".")
         config = self._config
-        
+
         for k in keys[:-1]:
             if k not in config:
                 config[k] = {}
             config = config[k]
-        
+
         config[keys[-1]] = value
-    
+
     @property
     def apps_directory(self) -> Path:
         """Get the applications directory path."""
         return Path(self.get("apps_directory", str(DEFAULT_APPS_DIR)))
-    
+
     @property
     def webserver(self) -> str:
         """Get the default web server."""
         return self.get("webserver", "nginx")
-    
+
     def reload(self) -> None:
         """
         Reload configuration from disk.
-        
+
         Use this after configuration changes to ensure
         the latest values are loaded.
         """
         self._load_config()
-    
+
     @classmethod
     def reset_instance(cls) -> None:
         """
         Reset the singleton instance.
-        
+
         Forces a fresh config load on next access.
         """
         cls._instance = None
         cls._config = {}
-    
+
     @property
     def service_user(self) -> str:
         """Get the default service user."""
         return self.get("service_user", "www-data")
-    
+
     @property
     def service_group(self) -> str:
         """Get the default service group."""
         return self.get("service_group", "www-data")
-    
+
     @property
     def ssl_enabled(self) -> bool:
         """Check if SSL is enabled by default."""
         return self.get("ssl.enabled", True)
-    
+
     @property
     def ssl_email(self) -> str:
         """Get the SSL certificate email."""
         return self.get("ssl.email", "")
-    
-    def save(self, path: Optional[Path] = None) -> bool:
+
+    def save(self, path: Path | None = None) -> bool:
         """
         Save current configuration to file.
-        
+
         Args:
             path: Optional path to save to. Defaults to global config path.
-            
+
         Returns:
             True if saved successfully, False otherwise.
         """
         save_path = path or DEFAULT_CONFIG_PATH
-        
+
         try:
             save_path.parent.mkdir(parents=True, exist_ok=True)
             with open(save_path, "w") as f:
@@ -288,16 +287,16 @@ class Config:
             return True
         except Exception:
             return False
-    
+
     def reload(self) -> None:
         """Reload configuration from file."""
         self._load_config()
-    
-    def to_dict(self) -> Dict[str, Any]:
+
+    def to_dict(self) -> dict[str, Any]:
         """Return configuration as dictionary."""
         return self._config.copy()
 
-    def upgrade(self, path: Optional[Path] = None) -> Dict[str, Any]:
+    def upgrade(self, path: Path | None = None) -> dict[str, Any]:
         """
         Upgrade configuration file with new defaults.
 
@@ -316,10 +315,10 @@ class Config:
         config_path = path or DEFAULT_CONFIG_PATH
 
         # Load user's current config (raw, without merging defaults)
-        user_config: Dict[str, Any] = {}
+        user_config: dict[str, Any] = {}
         if config_path.exists():
             try:
-                with open(config_path, "r") as f:
+                with open(config_path) as f:
                     user_config = yaml.safe_load(f) or {}
             except Exception:
                 user_config = {}
@@ -351,9 +350,7 @@ class Config:
             "upgraded": len(added_keys) > 0,
         }
 
-    def _find_missing_keys(
-        self, defaults: Dict, user: Dict, prefix: str = ""
-    ) -> list:
+    def _find_missing_keys(self, defaults: dict, user: dict, prefix: str = "") -> list:
         """
         Find keys in defaults that are missing from user config.
 
@@ -374,8 +371,6 @@ class Config:
                 missing.append(full_key)
             elif isinstance(value, dict) and isinstance(user.get(key), dict):
                 # Recurse into nested dicts
-                missing.extend(
-                    self._find_missing_keys(value, user[key], full_key)
-                )
+                missing.extend(self._find_missing_keys(value, user[key], full_key))
 
         return missing

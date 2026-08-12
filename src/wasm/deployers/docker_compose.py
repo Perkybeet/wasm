@@ -14,31 +14,27 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Any
 
 import yaml
 
-from wasm.core.config import Config, DEFAULT_APPS_DIR
+from wasm.core.config import Config
 from wasm.core.exceptions import (
     DeploymentError,
     DockerError,
-    NginxError,
-    ServiceError,
-    WASMError,
 )
 from wasm.core.logger import Logger
-from wasm.core.store import get_store, App, AppType, AppStatus, WebServer
+from wasm.core.store import App, AppStatus, AppType, get_store
 from wasm.core.utils import (
     domain_to_app_name,
+    remove_directory,
     run_command,
     run_command_sudo,
-    remove_directory,
 )
 from wasm.managers.cert_manager import CertManager
 from wasm.managers.nginx_manager import NginxManager
 from wasm.managers.service_manager import ServiceManager
 from wasm.managers.source_manager import SourceManager
-
 
 # Compose file priority order
 COMPOSE_FILE_PRIORITY = [
@@ -54,14 +50,15 @@ COMPOSE_FILE_PRIORITY = [
 @dataclass
 class DockerComposeService:
     """Represents a service from a Docker Compose file."""
+
     name: str = ""
-    image: Optional[str] = None
-    build: Optional[str] = None
-    ports: List[str] = field(default_factory=list)
-    volumes: List[str] = field(default_factory=list)
-    depends_on: List[str] = field(default_factory=list)
-    environment: Dict[str, str] = field(default_factory=dict)
-    healthcheck: Optional[Dict] = None
+    image: str | None = None
+    build: str | None = None
+    ports: list[str] = field(default_factory=list)
+    volumes: list[str] = field(default_factory=list)
+    depends_on: list[str] = field(default_factory=list)
+    environment: dict[str, str] = field(default_factory=dict)
+    healthcheck: dict | None = None
     is_web: bool = False
 
 
@@ -77,9 +74,12 @@ class DockerComposeDeployer:
     APP_TYPE = "docker-compose"
     DISPLAY_NAME = "Docker Compose"
     DETECTION_FILES = [
-        "docker-compose.prod.yml", "docker-compose.prod.yaml",
-        "docker-compose.yml", "docker-compose.yaml",
-        "compose.yml", "compose.yaml",
+        "docker-compose.prod.yml",
+        "docker-compose.prod.yaml",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "compose.yml",
+        "compose.yaml",
     ]
 
     def __init__(self, verbose: bool = False):
@@ -102,26 +102,33 @@ class DockerComposeDeployer:
         self.port = None
 
         # Parsed state
-        self.services: List[DockerComposeService] = []
+        self.services: list[DockerComposeService] = []
         self.compose_path = None
 
     # Framework config files that indicate docker-compose.yml is likely
     # just for local development (databases, caches, etc.)
     FRAMEWORK_CONFIG_FILES = [
         # Next.js
-        "next.config.js", "next.config.mjs", "next.config.ts",
+        "next.config.js",
+        "next.config.mjs",
+        "next.config.ts",
         # Vite
-        "vite.config.js", "vite.config.ts", "vite.config.mjs",
+        "vite.config.js",
+        "vite.config.ts",
+        "vite.config.mjs",
         # Angular
         "angular.json",
         # Nuxt
-        "nuxt.config.js", "nuxt.config.ts",
+        "nuxt.config.js",
+        "nuxt.config.ts",
         # Svelte
         "svelte.config.js",
         # Astro
-        "astro.config.mjs", "astro.config.ts",
+        "astro.config.mjs",
+        "astro.config.ts",
         # Remix
-        "remix.config.js", "remix.config.ts",
+        "remix.config.js",
+        "remix.config.ts",
         # Django
         "manage.py",
     ]
@@ -144,17 +151,13 @@ class DockerComposeDeployer:
             True if Docker Compose project detected.
         """
         has_prod_compose = any(
-            (path / f).exists()
-            for f in ["docker-compose.prod.yml", "docker-compose.prod.yaml"]
+            (path / f).exists() for f in ["docker-compose.prod.yml", "docker-compose.prod.yaml"]
         )
 
         if has_prod_compose:
             return True
 
-        has_compose = any(
-            (path / f).exists()
-            for f in COMPOSE_FILE_PRIORITY
-        )
+        has_compose = any((path / f).exists() for f in COMPOSE_FILE_PRIORITY)
 
         if not has_compose:
             return False
@@ -170,9 +173,7 @@ class DockerComposeDeployer:
 
         # Check for framework config files - if present, docker-compose.yml
         # is likely just for local development (databases, caches, etc.)
-        has_framework = any(
-            (path / f).exists() for f in cls.FRAMEWORK_CONFIG_FILES
-        )
+        has_framework = any((path / f).exists() for f in cls.FRAMEWORK_CONFIG_FILES)
         if has_framework:
             return False
 
@@ -184,11 +185,11 @@ class DockerComposeDeployer:
         source: str,
         webserver: str = "nginx",
         ssl: bool = True,
-        branch: Optional[str] = None,
-        env_vars: Optional[Dict[str, str]] = None,
-        compose_file: Optional[str] = None,
-        compose_profiles: Optional[List[str]] = None,
-        port: Optional[int] = None,
+        branch: str | None = None,
+        env_vars: dict[str, str] | None = None,
+        compose_file: str | None = None,
+        compose_profiles: list[str] | None = None,
+        port: int | None = None,
     ) -> None:
         """
         Configure the deployer.
@@ -319,9 +320,7 @@ class DockerComposeDeployer:
         if self.compose_file:
             path = self.app_path / self.compose_file
             if not path.exists():
-                raise DeploymentError(
-                    f"Specified compose file not found: {self.compose_file}"
-                )
+                raise DeploymentError(f"Specified compose file not found: {self.compose_file}")
             self.compose_path = path
             self.logger.substep(f"Using specified: {self.compose_file}")
             return
@@ -530,6 +529,7 @@ class DockerComposeDeployer:
             primary_port = self._get_primary_port()
 
             from wasm.deployers.helpers.nginx_config import NginxConfigBuilder
+
             builder = NginxConfigBuilder(verbose=self.verbose)
             config_path = builder.detect(self.app_path)
 
@@ -740,14 +740,12 @@ class DockerComposeDeployer:
         """Restart (rebuild and recreate) the Docker Compose application."""
         service_manager = ServiceManager(verbose=self.verbose)
         # reload triggers ExecReload which does `docker compose up -d --build`
-        result = run_command_sudo(
-            ["systemctl", "reload", f"{self.app_name}.service"]
-        )
+        result = run_command_sudo(["systemctl", "reload", f"{self.app_name}.service"])
         if not result.success:
             # Fallback to restart
             service_manager.restart(self.app_name)
 
-    def logs(self, service: Optional[str] = None, lines: int = 50) -> str:
+    def logs(self, service: str | None = None, lines: int = 50) -> str:
         """
         Get Docker Compose logs.
 
@@ -769,7 +767,7 @@ class DockerComposeDeployer:
         result = run_command(cmd, cwd=self.app_path)
         return result.stdout if result.success else result.stderr
 
-    def status(self) -> Dict[str, Any]:
+    def status(self) -> dict[str, Any]:
         """
         Get Docker Compose service status.
 

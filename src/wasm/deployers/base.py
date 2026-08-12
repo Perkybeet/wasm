@@ -10,34 +10,31 @@ Defines the interface and common functionality for all deployers.
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Dict, List, Optional, Literal
+from typing import Literal
 
 from wasm.core.config import Config
+from wasm.core.exceptions import BuildError, DeploymentError, OutOfMemoryError
 from wasm.core.logger import Logger
-from wasm.core.exceptions import DeploymentError, BuildError, OutOfMemoryError
-from wasm.core.utils import run_command, domain_to_app_name
 from wasm.core.store import (
-    get_store,
     App,
-    Site,
-    Service,
-    AppType,
     AppStatus,
-    WebServer,
+    Service,
+    Site,
+    get_store,
 )
-from wasm.managers.nginx_manager import NginxManager
-from wasm.managers.apache_manager import ApacheManager
-from wasm.managers.service_manager import ServiceManager
-from wasm.managers.cert_manager import CertManager
-from wasm.managers.source_manager import SourceManager
+from wasm.core.utils import domain_to_app_name, run_command
 from wasm.deployers.helpers import (
+    EnvManager,
+    NginxConfigBuilder,
     PackageManagerHelper,
     PathResolver,
     PrismaHelper,
-    EnvManager,
-    NginxConfigBuilder,
 )
-
+from wasm.managers.apache_manager import ApacheManager
+from wasm.managers.cert_manager import CertManager
+from wasm.managers.nginx_manager import NginxManager
+from wasm.managers.service_manager import ServiceManager
+from wasm.managers.source_manager import SourceManager
 
 # Type for package managers
 PackageManager = Literal["npm", "pnpm", "bun", "yarn", "auto"]
@@ -46,29 +43,29 @@ PackageManager = Literal["npm", "pnpm", "bun", "yarn", "auto"]
 class BaseDeployer(ABC):
     """
     Abstract base class for application deployers.
-    
+
     Each deployer handles the deployment workflow for a specific
     type of application (Next.js, Node.js, Python, etc.).
     """
-    
+
     # Deployer identification
     APP_TYPE: str = "base"
     DISPLAY_NAME: str = "Base Application"
-    
+
     # Files used to detect this app type
-    DETECTION_FILES: List[str] = []
-    DETECTION_PATTERNS: List[str] = []
-    
+    DETECTION_FILES: list[str] = []
+    DETECTION_PATTERNS: list[str] = []
+
     # Default port
     DEFAULT_PORT: int = 3000
-    
+
     # System dependencies
-    SYSTEM_DEPS: List[str] = []
-    
+    SYSTEM_DEPS: list[str] = []
+
     def __init__(self, verbose: bool = False):
         """
         Initialize the deployer.
-        
+
         Args:
             verbose: Enable verbose logging.
         """
@@ -85,24 +82,24 @@ class BaseDeployer(ABC):
         # Helpers
         self._pm_helper = PackageManagerHelper(logger=self.logger)
         self._path_resolver = PathResolver(logger=self.logger)
-        self._prisma_helper: Optional[PrismaHelper] = None  # Initialized after app_path is set
-        
+        self._prisma_helper: PrismaHelper | None = None  # Initialized after app_path is set
+
         # Deployment configuration
-        self.domain: Optional[str] = None
-        self.source: Optional[str] = None
+        self.domain: str | None = None
+        self.source: str | None = None
         self.port: int = self.DEFAULT_PORT
-        self.app_path: Optional[Path] = None
-        self.app_name: Optional[str] = None
+        self.app_path: Path | None = None
+        self.app_name: str | None = None
         self.webserver: str = "nginx"
         self.ssl: bool = True
         self.include_www: bool = False
-        self.branch: Optional[str] = None
-        self.env_vars: Dict[str, str] = {}
-        
+        self.branch: str | None = None
+        self.env_vars: dict[str, str] = {}
+
         # Package manager (auto = auto-detect)
         self._package_manager: PackageManager = "auto"
         self.package_manager: str = "npm"  # Resolved package manager
-        
+
         # Prisma support
         self.has_prisma: bool = False
 
@@ -112,17 +109,17 @@ class BaseDeployer(ABC):
 
         # Env manager
         self._env_manager = EnvManager(verbose=verbose)
-    
+
     def configure(
         self,
         domain: str,
         source: str,
-        port: Optional[int] = None,
+        port: int | None = None,
         webserver: str = "nginx",
         ssl: bool = True,
-        branch: Optional[str] = None,
-        env_vars: Optional[Dict[str, str]] = None,
-        app_path: Optional[Path] = None,
+        branch: str | None = None,
+        env_vars: dict[str, str] | None = None,
+        app_path: Path | None = None,
         package_manager: PackageManager = "auto",
         include_www: bool = False,
     ) -> None:
@@ -152,17 +149,17 @@ class BaseDeployer(ABC):
         self.branch = branch
         self.env_vars = env_vars or {}
         self._package_manager = package_manager
-        
+
         # Set app name and path
         self.app_name = domain_to_app_name(domain)
         self.app_path = app_path or (self.config.apps_directory / self.app_name)
-    
+
     def _run(
         self,
-        command: List[str],
-        cwd: Optional[Path] = None,
-        env: Optional[Dict] = None,
-        timeout: Optional[int] = None,
+        command: list[str],
+        cwd: Path | None = None,
+        env: dict | None = None,
+        timeout: int | None = None,
     ):
         """Run a command and return result."""
         self.logger.debug(f"Running: {' '.join(command)}")
@@ -180,7 +177,7 @@ class BaseDeployer(ABC):
         )
         self.logger.command_output(result.stdout, result.stderr)
         return result
-    
+
     def _detect_package_manager(self) -> str:
         """
         Detect the package manager used in the project.
@@ -189,7 +186,7 @@ class BaseDeployer(ABC):
             Detected package manager name.
         """
         return self._pm_helper.detect(self.app_path, self._package_manager)
-    
+
     def _verify_package_manager(self) -> None:
         """
         Verify the package manager is installed and available.
@@ -199,7 +196,7 @@ class BaseDeployer(ABC):
             DeploymentError: If no package manager is available at all.
         """
         self.package_manager = self._pm_helper.verify(self.package_manager)
-    
+
     def _detect_prisma(self) -> bool:
         """
         Detect if project uses Prisma ORM.
@@ -208,8 +205,8 @@ class BaseDeployer(ABC):
             True if Prisma is detected.
         """
         return self._ensure_prisma_helper().detect(self.app_path)
-    
-    def _get_pm_install_command(self) -> List[str]:
+
+    def _get_pm_install_command(self) -> list[str]:
         """
         Get the package manager install command.
 
@@ -217,8 +214,8 @@ class BaseDeployer(ABC):
             Install command as list.
         """
         return self._pm_helper.get_install_command(self.package_manager)
-    
-    def _get_pm_run_command(self, script: str) -> List[str]:
+
+    def _get_pm_run_command(self, script: str) -> list[str]:
         """
         Get the package manager run command.
 
@@ -229,8 +226,8 @@ class BaseDeployer(ABC):
             Run command as list.
         """
         return self._pm_helper.get_run_command(self.package_manager, script)
-    
-    def _get_pm_exec_command(self, command: str) -> List[str]:
+
+    def _get_pm_exec_command(self, command: str) -> list[str]:
         """
         Get the package manager exec/dlx command.
 
@@ -241,7 +238,7 @@ class BaseDeployer(ABC):
             Exec command as list.
         """
         return self._pm_helper.get_exec_command(self.package_manager, command)
-    
+
     def _is_private_path(self, path: str) -> bool:
         """
         Check if path is in a private/user-specific directory.
@@ -253,8 +250,8 @@ class BaseDeployer(ABC):
             True if path is in a private directory.
         """
         return self._path_resolver.is_private_path(path)
-    
-    def _find_global_executable(self, executable: str) -> Optional[str]:
+
+    def _find_global_executable(self, executable: str) -> str | None:
         """
         Find executable in global/system paths only.
 
@@ -265,7 +262,7 @@ class BaseDeployer(ABC):
             Absolute path if found in system paths, None otherwise.
         """
         return self._path_resolver.find_global_executable(executable)
-    
+
     def _resolve_absolute_path(self, command: str) -> str:
         """
         Resolve command to use absolute paths for executables.
@@ -282,7 +279,7 @@ class BaseDeployer(ABC):
             Command with absolute path (e.g., "/usr/bin/npm run start")
         """
         return self._path_resolver.resolve_command(command)
-    
+
     def _ensure_prisma_helper(self) -> PrismaHelper:
         """
         Ensure PrismaHelper is initialized and return it.
@@ -330,59 +327,59 @@ class BaseDeployer(ABC):
             return True
 
         return self._ensure_prisma_helper().migrate(self.app_path, deploy=deploy)
-    
+
     @abstractmethod
     def detect(self, path: Path) -> bool:
         """
         Detect if path contains this type of application.
-        
+
         Args:
             path: Path to check.
-            
+
         Returns:
             True if this deployer can handle the application.
         """
         pass
-    
+
     @abstractmethod
-    def get_install_command(self) -> List[str]:
+    def get_install_command(self) -> list[str]:
         """
         Get the command to install dependencies.
-        
+
         Returns:
             Command as list of arguments.
         """
         pass
-    
+
     @abstractmethod
-    def get_build_command(self) -> List[str]:
+    def get_build_command(self) -> list[str]:
         """
         Get the command to build the application.
-        
+
         Returns:
             Command as list of arguments.
         """
         pass
-    
+
     @abstractmethod
     def get_start_command(self) -> str:
         """
         Get the command to start the application.
-        
+
         Returns:
             Start command string.
         """
         pass
-    
+
     def get_health_check(self) -> str:
         """
         Get the health check endpoint.
-        
+
         Returns:
             Health check path (default: /).
         """
         return "/"
-    
+
     def get_nginx_template(self) -> str:
         """
         Get the Nginx template name for this app type.
@@ -396,17 +393,17 @@ class BaseDeployer(ABC):
         if self._nginx_advanced_config is not None:
             return "advanced"
         return "proxy"
-    
+
     def get_apache_template(self) -> str:
         """
         Get the Apache template name for this app type.
-        
+
         Returns:
             Template name.
         """
         return "proxy"
-    
-    def get_template_context(self) -> Dict:
+
+    def get_template_context(self) -> dict:
         """
         Get template context for configuration files.
 
@@ -439,7 +436,7 @@ class BaseDeployer(ABC):
             "ssl": self.ssl,
             "health_check": self.get_health_check(),
         }
-    
+
     def _detect_nginx_config(self) -> None:
         """
         Detect and parse wasm.nginx.yaml if present.
@@ -550,15 +547,12 @@ class BaseDeployer(ABC):
 
         # 2. Check repository accessibility (for git sources)
         if self.source and (
-            self.source.startswith("git@") or
-            self.source.startswith("https://") or
-            self.source.startswith("http://") or
-            self.source.startswith("git://")
+            self.source.startswith("git@")
+            or self.source.startswith("https://")
+            or self.source.startswith("http://")
+            or self.source.startswith("git://")
         ):
-            result = run_command(
-                ["git", "ls-remote", "--exit-code", self.source],
-                timeout=30
-            )
+            result = run_command(["git", "ls-remote", "--exit-code", self.source], timeout=30)
             if not result.success:
                 issues.append(f"Repository not accessible: {self.source}")
                 if "Permission denied" in str(result.stderr):
@@ -567,13 +561,16 @@ class BaseDeployer(ABC):
 
         # 3. Check disk space (require at least 1GB free)
         import shutil
+
         try:
             apps_dir = self.config.apps_directory
             if apps_dir.exists():
                 stat = shutil.disk_usage(str(apps_dir))
-                free_gb = stat.free / (1024 ** 3)
+                free_gb = stat.free / (1024**3)
                 if free_gb < 1.0:
-                    issues.append(f"Insufficient disk space: {free_gb:.1f}GB free (need 1GB minimum)")
+                    issues.append(
+                        f"Insufficient disk space: {free_gb:.1f}GB free (need 1GB minimum)"
+                    )
                     checks_passed = False
         except Exception as e:
             self.logger.debug(f"Could not check disk space: {e}")
@@ -581,9 +578,10 @@ class BaseDeployer(ABC):
         # 4. Check if port is available
         if self.port:
             import socket
+
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
-                result = sock.connect_ex(('127.0.0.1', self.port))
+                result = sock.connect_ex(("127.0.0.1", self.port))
                 if result == 0:
                     # Port is in use - check if it's our own service
                     existing_app = self.store.get_app(self.domain)
@@ -609,8 +607,7 @@ class BaseDeployer(ABC):
         if not checks_passed:
             details = "\n".join(f"  - {issue}" for issue in issues)
             raise DeploymentError(
-                "Pre-flight checks failed",
-                details=f"The following issues were found:\n{details}"
+                "Pre-flight checks failed", details=f"The following issues were found:\n{details}"
             )
 
         self.logger.debug("All pre-flight checks passed")
@@ -671,6 +668,7 @@ class BaseDeployer(ABC):
         if not keep_files and self.app_path and self.app_path.exists():
             try:
                 import shutil
+
                 self.logger.debug(f"Removing app files: {self.app_path}")
                 shutil.rmtree(self.app_path)
             except Exception as e:
@@ -709,116 +707,116 @@ class BaseDeployer(ABC):
     def pre_install(self) -> bool:
         """
         Pre-installation hook.
-        
+
         Override to perform actions before dependency installation.
         Detects package manager and Prisma by default.
-        
+
         Returns:
             True if successful.
         """
         # Detect package manager
         self.package_manager = self._detect_package_manager()
         self.logger.debug(f"Using package manager: {self.package_manager}")
-        
+
         # Verify the package manager is available
         self._verify_package_manager()
-        
+
         # Detect Prisma
         self.has_prisma = self._detect_prisma()
         if self.has_prisma:
             self.logger.debug("Prisma detected")
-        
+
         return True
-    
+
     def post_install(self) -> bool:
         """
         Post-installation hook.
-        
+
         Override to perform actions after dependency installation.
         Generates Prisma client by default if needed.
-        
+
         Returns:
             True if successful.
         """
         # Generate Prisma client if detected
         if self.has_prisma:
             self.generate_prisma()
-        
+
         return True
-    
+
     def pre_build(self) -> bool:
         """
         Pre-build hook.
-        
+
         Override to perform actions before building.
-        
+
         Returns:
             True if successful.
         """
         return True
-    
+
     def post_build(self) -> bool:
         """
         Post-build hook.
-        
+
         Override to perform actions after building.
-        
+
         Returns:
             True if successful.
         """
         return True
-    
+
     def fetch_source(self) -> bool:
         """
         Fetch the source code.
-        
+
         Returns:
             True if successful.
         """
         self.logger.substep(f"Source: {self.source}")
         self.logger.substep(f"Target: {self.app_path}")
-        
+
         return self.source_manager.fetch(
             self.source,
             self.app_path,
             branch=self.branch,
         )
-    
+
     def install_dependencies(self) -> bool:
         """
         Install application dependencies.
-        
+
         Returns:
             True if successful.
         """
         self.pre_install()
-        
+
         command = self.get_install_command()
         if not command:
             return True
-        
+
         self.logger.substep(f"Running: {' '.join(command)}")
-        
+
         result = self._run(command, timeout=600)
         if not result.success:
             # Try fallback install methods
             fallback_command = None
-            
+
             # Check if it's a frozen lockfile issue (pnpm/yarn/bun)
             if "--frozen-lockfile" in command:
                 self.logger.warning("Strict lockfile install failed, trying regular install...")
                 fallback_command = [c for c in command if c != "--frozen-lockfile"]
-            
+
             # Check if it's npm ci failing (no package-lock.json)
             elif command == ["npm", "ci"]:
                 if "package-lock.json" in str(result.stderr) or "EUSAGE" in str(result.stderr):
                     self.logger.warning("npm ci failed (no lockfile), using npm install...")
                     fallback_command = ["npm", "install"]
-            
+
             if fallback_command:
                 self.logger.substep(f"Running: {' '.join(fallback_command)}")
                 result = self._run(fallback_command, timeout=600)
-            
+
             if not result.success:
                 # Combine stdout and stderr for better error visibility
                 error_output = ""
@@ -829,34 +827,35 @@ class BaseDeployer(ABC):
                         error_output += "\n" + result.stdout
                     else:
                         error_output = result.stdout
-                
+
                 raise DeploymentError(
                     "Dependency installation failed",
-                    details=error_output or "No error output captured. Check if the package manager is properly installed.",
+                    details=error_output
+                    or "No error output captured. Check if the package manager is properly installed.",
                 )
-        
+
         self.post_install()
         return True
-    
+
     def build(self) -> bool:
         """
         Build the application.
-        
+
         Returns:
             True if successful.
-            
+
         Raises:
             OutOfMemoryError: If build is killed due to OOM (exit code 137).
             BuildError: If build fails for other reasons.
         """
         self.pre_build()
-        
+
         command = self.get_build_command()
         if not command:
             return True
-        
+
         self.logger.substep(f"Running: {' '.join(command)}")
-        
+
         result = self._run(command, timeout=900)
         if not result.success:
             # Combine stdout and stderr for better error visibility
@@ -868,49 +867,49 @@ class BaseDeployer(ABC):
                     error_output += "\n" + result.stdout
                 else:
                     error_output = result.stdout
-            
+
             # Check for OOM killer (exit code 137 = 128 + SIGKILL)
             if result.exit_code == 137:
                 raise OutOfMemoryError(
                     "Build killed due to insufficient memory (exit code 137)",
                     details=error_output or "Process was killed by the OOM killer.",
                 )
-            
+
             raise BuildError(
                 "Build failed",
                 details=error_output or "No error output captured.",
             )
-        
+
         self.post_build()
         return True
-    
+
     def create_site(self, with_ssl: bool = False) -> bool:
         """
         Create web server site configuration.
-        
+
         Args:
             with_ssl: If True, create config with SSL enabled.
                       If False, create config without SSL (for initial setup).
-        
+
         Returns:
             True if successful.
         """
         context = self.get_template_context()
         # Override SSL setting based on parameter
         context["ssl"] = with_ssl
-        
+
         if self.webserver == "nginx":
             manager = NginxManager(verbose=self.verbose)
             template = self.get_nginx_template()
         else:
             manager = ApacheManager(verbose=self.verbose)
             template = self.get_apache_template()
-        
+
         self.logger.substep(f"Web server: {self.webserver}")
         self.logger.substep(f"Template: {template}")
         if self.ssl:
             self.logger.substep(f"SSL: {'enabled' if with_ssl else 'pending certificate'}")
-        
+
         # Check if site already exists (update vs create)
         if manager.site_exists(self.domain):
             manager.update_site(self.domain, template=template, context=context)
@@ -919,32 +918,31 @@ class BaseDeployer(ABC):
             manager.create_site(self.domain, template=template, context=context)
             # Enable site
             manager.enable_site(self.domain)
-        
+
         # Reload web server
         manager.reload()
-        
+
         # Register site in store
         self._register_site_in_store(with_ssl, template)
-        
+
         return True
-    
+
     def _register_site_in_store(self, with_ssl: bool, template: str) -> None:
         """Register or update site in persistent store."""
-        from wasm.core.config import NGINX_SITES_AVAILABLE, APACHE_SITES_AVAILABLE
-        
+        from wasm.core.config import APACHE_SITES_AVAILABLE, NGINX_SITES_AVAILABLE
+
         config_path = (
-            NGINX_SITES_AVAILABLE if self.webserver == "nginx"
-            else APACHE_SITES_AVAILABLE
+            NGINX_SITES_AVAILABLE if self.webserver == "nginx" else APACHE_SITES_AVAILABLE
         ) / self.domain
-        
+
         is_static = template == "static"
-        
+
         # Get app_id if app exists
         app = self.store.get_app(self.domain)
         app_id = app.id if app else None
-        
+
         existing_site = self.store.get_site(self.domain)
-        
+
         site = Site(
             id=existing_site.id if existing_site else None,
             app_id=app_id,
@@ -956,35 +954,37 @@ class BaseDeployer(ABC):
             document_root=str(self.app_path) if is_static else None,
             proxy_port=self.port if not is_static else None,
             ssl_enabled=with_ssl,
-            ssl_certificate=f"/etc/letsencrypt/live/{self.domain}/fullchain.pem" if with_ssl else None,
+            ssl_certificate=f"/etc/letsencrypt/live/{self.domain}/fullchain.pem"
+            if with_ssl
+            else None,
             ssl_key=f"/etc/letsencrypt/live/{self.domain}/privkey.pem" if with_ssl else None,
         )
-        
+
         if existing_site:
             self.store.update_site(site)
         else:
             self.store.create_site(site)
-    
+
     def create_service(self) -> bool:
         """
         Create systemd service.
-        
+
         Returns:
             True if successful.
         """
         start_command = self.get_start_command()
-        
+
         # Resolve to absolute path for systemd compatibility
         start_command = self._resolve_absolute_path(start_command)
-        
+
         self.logger.substep(f"Service: {self.app_name}")
         self.logger.substep(f"Command: {start_command}")
-        
+
         # Build environment with PORT
         env = self.env_vars.copy()
         env["PORT"] = str(self.port)
         env["NODE_ENV"] = "production"
-        
+
         self.service_manager.create_service(
             name=self.app_name,
             command=start_command,
@@ -992,29 +992,29 @@ class BaseDeployer(ABC):
             environment=env,
             description=f"WASM: {self.domain} ({self.APP_TYPE})",
         )
-        
+
         # Enable service
         self.service_manager.enable(self.app_name)
-        
+
         # Register service in store
         self._register_service_in_store(start_command, env)
-        
+
         return True
-    
-    def _register_service_in_store(self, command: str, env: Dict[str, str]) -> None:
+
+    def _register_service_in_store(self, command: str, env: dict[str, str]) -> None:
         """Register service in persistent store."""
         from wasm.core.config import SYSTEMD_DIR
-        
+
         # Get app_id if app exists
         app = self.store.get_app(self.domain)
         app_id = app.id if app else None
-        
+
         # Service name (no prefix for new format)
         service_name = self.app_name
         service_file = SYSTEMD_DIR / f"{self.app_name}.service"
-        
+
         existing_service = self.store.get_service(service_name)
-        
+
         service = Service(
             id=existing_service.id if existing_service else None,
             app_id=app_id,
@@ -1029,12 +1029,12 @@ class BaseDeployer(ABC):
             port=self.port,
             environment=env,
         )
-        
+
         if existing_service:
             self.store.update_service(service)
         else:
             self.store.create_service(service)
-    
+
     def obtain_certificate(self) -> bool:
         """
         Obtain SSL certificate.
@@ -1065,57 +1065,57 @@ class BaseDeployer(ABC):
         )
 
         return True
-    
+
     def start(self) -> bool:
         """
         Start the application service.
-        
+
         Returns:
             True if successful.
         """
         self.service_manager.start(self.app_name)
         return True
-    
+
     def stop(self) -> bool:
         """
         Stop the application service.
-        
+
         Returns:
             True if successful.
         """
         self.service_manager.stop(self.app_name)
         return True
-    
+
     def restart(self) -> bool:
         """
         Restart the application service.
-        
+
         Returns:
             True if successful.
         """
         self.service_manager.restart(self.app_name)
         return True
-    
+
     def health_check(self, retries: int = 5, delay: float = 2.0) -> bool:
         """
         Check if the application is healthy.
-        
+
         Args:
             retries: Number of retries.
             delay: Delay between retries in seconds.
-            
+
         Returns:
             True if application is healthy.
         """
         import time
         import urllib.request
         from urllib.error import URLError
-        
+
         endpoint = self.get_health_check()
         url = f"http://127.0.0.1:{self.port}{endpoint}"
-        
+
         self.logger.substep(f"Checking: {url}")
-        
+
         for i in range(retries):
             try:
                 with urllib.request.urlopen(url, timeout=5) as response:
@@ -1129,9 +1129,9 @@ class BaseDeployer(ABC):
             if i < retries - 1:
                 self.logger.debug(f"Health check attempt {i + 1} failed, retrying...")
                 time.sleep(delay)
-        
+
         return False
-    
+
     def deploy(self, total_steps: int = 7) -> bool:
         """
         Run the full deployment workflow.
@@ -1142,9 +1142,10 @@ class BaseDeployer(ABC):
         Returns:
             True if deployment was successful.
         """
-        from wasm.core.logger import Icons
-        from wasm.core.exceptions import CertificateError
         from datetime import datetime
+
+        from wasm.core.exceptions import CertificateError
+        from wasm.core.logger import Icons
 
         # Track if SSL was successfully obtained
         ssl_obtained = False
@@ -1158,7 +1159,7 @@ class BaseDeployer(ABC):
 
         # Register app in store at the start
         app = self._register_app_in_store(AppStatus.DEPLOYING.value)
-        
+
         try:
             # Step 1: Fetch source
             self.logger.step(1, total_steps, "Fetching source code", Icons.DOWNLOAD)
@@ -1172,15 +1173,15 @@ class BaseDeployer(ABC):
             # Step 2: Install dependencies
             self.logger.step(2, total_steps, "Installing dependencies", Icons.PACKAGE)
             self.install_dependencies()
-            
+
             # Step 3: Build
             self.logger.step(3, total_steps, "Building application", Icons.BUILD)
             self.build()
-            
+
             # Step 4: Create site (initially WITHOUT SSL to allow certbot validation)
             self.logger.step(4, total_steps, "Creating site configuration", Icons.GLOBE)
             self.create_site(with_ssl=False)
-            
+
             # Step 5: SSL certificate (best effort - continue if it fails)
             if self.ssl:
                 self.logger.step(5, total_steps, "Obtaining SSL certificate", Icons.LOCK)
@@ -1200,24 +1201,24 @@ class BaseDeployer(ABC):
                     self.logger.substep("Application will be available via HTTP only")
             else:
                 self.logger.step(5, total_steps, "Skipping SSL certificate", Icons.LOCK)
-            
+
             # Step 6: Create service
             self.logger.step(6, total_steps, "Creating systemd service", Icons.GEAR)
             self.create_service()
-            
+
             # Step 7: Start and verify
             self.logger.step(7, total_steps, "Starting application", Icons.ROCKET)
             self.start()
-            
+
             # Update app status to running
             app.status = AppStatus.RUNNING.value
             app.ssl_enabled = ssl_obtained
             app.deployed_at = datetime.now().isoformat()
             self.store.update_app(app)
-            
+
             # Update service status
             self.store.update_service_status(self.app_name, active=True, enabled=True)
-            
+
             # Health check
             if self.health_check():
                 self._show_deployment_summary(ssl_obtained)
@@ -1230,7 +1231,7 @@ class BaseDeployer(ABC):
                 self.logger.info(f"  wasm logs {self.domain}        # View application logs")
                 self.logger.info(f"  wasm status {self.domain}      # Check service status")
                 return True  # Still consider it successful
-                
+
         except Exception as e:
             # Update app status to failed
             app.status = AppStatus.FAILED.value
@@ -1248,7 +1249,7 @@ class BaseDeployer(ABC):
                     self.logger.warning("Rollback had some errors. Manual cleanup may be needed.")
 
             raise
-    
+
     def _show_deployment_summary(self, ssl_obtained: bool) -> None:
         """
         Show deployment summary with useful information.
@@ -1306,18 +1307,18 @@ class BaseDeployer(ABC):
     def _register_app_in_store(self, status: str) -> App:
         """
         Register or update application in persistent store.
-        
+
         Args:
             status: Initial app status.
-            
+
         Returns:
             The created or updated App object.
         """
         existing_app = self.store.get_app(self.domain)
-        
+
         # Determine if this is a static app
         is_static = not bool(self.get_start_command())
-        
+
         app = App(
             id=existing_app.id if existing_app else None,
             domain=self.domain,
@@ -1332,7 +1333,7 @@ class BaseDeployer(ABC):
             is_static=is_static,
             env_vars=self.env_vars,
         )
-        
+
         if existing_app:
             # Preserve created_at and deployed_at if updating
             app.created_at = existing_app.created_at

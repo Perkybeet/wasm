@@ -1,6 +1,6 @@
 """CLI module for WASM."""
 
-from wasm.cli.parser import create_parser, parse_args
 from wasm.cli.interactive import InteractiveMode
+from wasm.cli.parser import create_parser, parse_args
 
-__all__ = ["create_parser", "parse_args", "InteractiveMode"]
+__all__ = ["InteractiveMode", "create_parser", "parse_args"]

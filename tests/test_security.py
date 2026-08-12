@@ -6,8 +6,8 @@ import pytest
 
 from wasm.core.exceptions import SecurityError
 from wasm.core.utils import (
-    run_trusted_installer,
     TRUSTED_INSTALLER_URLS,
+    run_trusted_installer,
 )
 
 

@@ -13,8 +13,8 @@ __author__ = "Yago López Prado"
 __license__ = "WASM-NCSAL"
 
 from wasm.core.config import Config
-from wasm.core.logger import Logger
 from wasm.core.exceptions import WASMError
+from wasm.core.logger import Logger
 
 __all__ = [
     "Config",

@@ -11,7 +11,6 @@ Provides system-wide health diagnostics.
 import shutil
 from argparse import Namespace
 from datetime import datetime
-from pathlib import Path
 
 from wasm.core.config import Config
 from wasm.core.logger import Logger
@@ -52,18 +51,33 @@ def handle_health(args: Namespace) -> int:
         apps_dir = config.apps_directory
         if apps_dir.exists():
             stat = shutil.disk_usage(str(apps_dir))
-            free_gb = stat.free / (1024 ** 3)
-            total_gb = stat.total / (1024 ** 3)
+            free_gb = stat.free / (1024**3)
+            total_gb = stat.total / (1024**3)
             used_percent = ((stat.total - stat.free) / stat.total) * 100
 
             if free_gb < 1.0:
                 issues.append(f"Low disk space: {free_gb:.1f}GB free")
-                _print_status(logger, "Disk Space", f"{free_gb:.1f}GB free / {total_gb:.1f}GB total ({used_percent:.0f}% used)", "error")
+                _print_status(
+                    logger,
+                    "Disk Space",
+                    f"{free_gb:.1f}GB free / {total_gb:.1f}GB total ({used_percent:.0f}% used)",
+                    "error",
+                )
             elif free_gb < 5.0:
                 warnings.append(f"Disk space is getting low: {free_gb:.1f}GB free")
-                _print_status(logger, "Disk Space", f"{free_gb:.1f}GB free / {total_gb:.1f}GB total ({used_percent:.0f}% used)", "warning")
+                _print_status(
+                    logger,
+                    "Disk Space",
+                    f"{free_gb:.1f}GB free / {total_gb:.1f}GB total ({used_percent:.0f}% used)",
+                    "warning",
+                )
             else:
-                _print_status(logger, "Disk Space", f"{free_gb:.1f}GB free / {total_gb:.1f}GB total ({used_percent:.0f}% used)", "ok")
+                _print_status(
+                    logger,
+                    "Disk Space",
+                    f"{free_gb:.1f}GB free / {total_gb:.1f}GB total ({used_percent:.0f}% used)",
+                    "ok",
+                )
         else:
             _print_status(logger, "Disk Space", "Apps directory not found", "warning")
     except Exception as e:
@@ -73,8 +87,8 @@ def handle_health(args: Namespace) -> int:
     logger.blank()
     logger.info("Checking web servers...")
 
-    from wasm.managers.nginx_manager import NginxManager
     from wasm.managers.apache_manager import ApacheManager
+    from wasm.managers.nginx_manager import NginxManager
 
     nginx = NginxManager(verbose=args.verbose)
     apache = ApacheManager(verbose=args.verbose)
@@ -134,7 +148,12 @@ def handle_health(args: Namespace) -> int:
     total_apps = len(apps)
     if total_apps > 0:
         if apps_stopped > 0 or apps_failed > 0:
-            _print_status(logger, "Applications", f"{apps_running}/{total_apps} running, {apps_stopped} stopped", "warning")
+            _print_status(
+                logger,
+                "Applications",
+                f"{apps_running}/{total_apps} running, {apps_stopped} stopped",
+                "warning",
+            )
         else:
             _print_status(logger, "Applications", f"{apps_running}/{total_apps} running", "ok")
     else:
@@ -145,6 +164,7 @@ def handle_health(args: Namespace) -> int:
     logger.info("Checking SSL certificates...")
 
     from wasm.managers.cert_manager import CertManager
+
     cert_manager = CertManager(verbose=args.verbose)
 
     try:
@@ -157,16 +177,25 @@ def handle_health(args: Namespace) -> int:
                     expires = datetime.fromisoformat(cert["expires"].replace("Z", "+00:00"))
                     days_left = (expires - datetime.now(expires.tzinfo)).days
                     if days_left < 7:
-                        issues.append(f"Certificate for {cert['domain']} expires in {days_left} days")
+                        issues.append(
+                            f"Certificate for {cert['domain']} expires in {days_left} days"
+                        )
                         expiring_soon.append(cert["domain"])
                     elif days_left < 30:
-                        warnings.append(f"Certificate for {cert['domain']} expires in {days_left} days")
+                        warnings.append(
+                            f"Certificate for {cert['domain']} expires in {days_left} days"
+                        )
                         expiring_soon.append(cert["domain"])
                 except Exception:
                     pass
 
         if expiring_soon:
-            _print_status(logger, "SSL Certificates", f"{len(certs)} total, {len(expiring_soon)} expiring soon", "warning")
+            _print_status(
+                logger,
+                "SSL Certificates",
+                f"{len(certs)} total, {len(expiring_soon)} expiring soon",
+                "warning",
+            )
         elif certs:
             _print_status(logger, "SSL Certificates", f"{len(certs)} total, all valid", "ok")
         else:
@@ -195,12 +224,27 @@ def handle_health(args: Namespace) -> int:
 
         if used_percent > 90:
             issues.append(f"High memory usage: {used_percent:.0f}%")
-            _print_status(logger, "Memory", f"{free_mem:.1f}GB free / {total_mem:.1f}GB total ({used_percent:.0f}% used)", "error")
+            _print_status(
+                logger,
+                "Memory",
+                f"{free_mem:.1f}GB free / {total_mem:.1f}GB total ({used_percent:.0f}% used)",
+                "error",
+            )
         elif used_percent > 75:
             warnings.append(f"Memory usage is high: {used_percent:.0f}%")
-            _print_status(logger, "Memory", f"{free_mem:.1f}GB free / {total_mem:.1f}GB total ({used_percent:.0f}% used)", "warning")
+            _print_status(
+                logger,
+                "Memory",
+                f"{free_mem:.1f}GB free / {total_mem:.1f}GB total ({used_percent:.0f}% used)",
+                "warning",
+            )
         else:
-            _print_status(logger, "Memory", f"{free_mem:.1f}GB free / {total_mem:.1f}GB total ({used_percent:.0f}% used)", "ok")
+            _print_status(
+                logger,
+                "Memory",
+                f"{free_mem:.1f}GB free / {total_mem:.1f}GB total ({used_percent:.0f}% used)",
+                "ok",
+            )
     except Exception as e:
         _print_status(logger, "Memory", f"Could not check: {e}", "warning")
 

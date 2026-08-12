@@ -12,7 +12,6 @@ handling for systemd services that require global system paths.
 import os
 import shlex
 import shutil
-from typing import Optional
 
 from wasm.core.logger import Logger
 
@@ -47,7 +46,7 @@ class PathResolver:
         "/.bun/",
     ]
 
-    def __init__(self, logger: Optional[Logger] = None):
+    def __init__(self, logger: Logger | None = None):
         """
         Initialize path resolver.
 
@@ -85,7 +84,7 @@ class PathResolver:
 
         return False
 
-    def find_global_executable(self, executable: str) -> Optional[str]:
+    def find_global_executable(self, executable: str) -> str | None:
         """
         Find executable in global/system paths only.
 
@@ -168,21 +167,20 @@ class PathResolver:
                     f"which is in a private directory (e.g., nvm installation)."
                 )
                 self.logger.warning(
-                    f"The systemd service runs as a non-root user and won't be able "
-                    f"to access this path."
+                    "The systemd service runs as a non-root user and won't be able "
+                    "to access this path."
                 )
                 self.logger.info(
-                    f"To fix this, install Node.js/npm globally:\n"
-                    f"  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -\n"
-                    f"  sudo apt install -y nodejs\n"
-                    f"Or for pnpm: sudo npm install -g pnpm"
+                    "To fix this, install Node.js/npm globally:\n"
+                    "  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -\n"
+                    "  sudo apt install -y nodejs\n"
+                    "Or for pnpm: sudo npm install -g pnpm"
                 )
             parts[0] = abs_path
             return " ".join(parts)
 
         # Fallback: return original (systemd will fail, but error will be clearer)
         self.logger.warning(
-            f"Could not find absolute path for '{executable}'. "
-            f"Service may fail to start."
+            f"Could not find absolute path for '{executable}'. Service may fail to start."
         )
         return command

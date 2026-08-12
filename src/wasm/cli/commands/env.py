@@ -16,10 +16,10 @@ from argparse import Namespace
 from pathlib import Path
 
 from wasm.core.config import Config
-from wasm.core.logger import Logger
 from wasm.core.exceptions import WASMError
+from wasm.core.logger import Logger
 from wasm.core.utils import domain_to_app_name
-from wasm.deployers.helpers.env_manager import EnvManager, EnvConfig
+from wasm.deployers.helpers.env_manager import EnvConfig, EnvManager
 
 
 def handle_env(args: Namespace) -> int:

@@ -5,14 +5,13 @@ Provides endpoints for viewing and modifying WASM configuration.
 """
 
 from pathlib import Path
-from typing import Optional, Any, Dict
-from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel, Field
+from typing import Any
+
 import yaml
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 
 from wasm.web.auth import require_auth
-from wasm.core.config import Config
-
 
 router = APIRouter()
 
@@ -24,7 +23,7 @@ CONFIG_PATHS = [
 ]
 
 
-def get_config_path() -> Optional[Path]:
+def get_config_path() -> Path | None:
     """Get the active configuration file path."""
     for path in CONFIG_PATHS:
         if path.exists():
@@ -35,7 +34,7 @@ def get_config_path() -> Optional[Path]:
 def load_config_file() -> tuple[dict, Path]:
     """Load configuration from file."""
     config_path = get_config_path()
-    
+
     if not config_path:
         # Return default config if no file exists
         return {
@@ -57,7 +56,7 @@ def load_config_file() -> tuple[dict, Path]:
                 "session_timeout": 3600,
             },
         }, CONFIG_PATHS[0]
-    
+
     with open(config_path) as f:
         return yaml.safe_load(f) or {}, config_path
 
@@ -65,14 +64,16 @@ def load_config_file() -> tuple[dict, Path]:
 def save_config_file(config: dict, path: Path):
     """Save configuration to file."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, 'w') as f:
+    with open(path, "w") as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
 
 # ============ Request/Response Models ============
 
+
 class ConfigResponse(BaseModel):
     """Response containing full configuration."""
+
     config: dict
     path: str
     writable: bool
@@ -80,33 +81,41 @@ class ConfigResponse(BaseModel):
 
 class ConfigUpdateRequest(BaseModel):
     """Request to update configuration."""
+
     config: dict = Field(..., description="Full configuration object")
 
 
 class ConfigPatchRequest(BaseModel):
     """Request to patch specific configuration values."""
-    path: str = Field(..., description="Dot-separated path to config key (e.g., 'backup.max_per_app')")
+
+    path: str = Field(
+        ..., description="Dot-separated path to config key (e.g., 'backup.max_per_app')"
+    )
     value: Any = Field(..., description="New value for the configuration key")
 
 
 class AppsDirConfig(BaseModel):
     """Applications directory configuration."""
+
     apps_directory: str = Field(..., description="Directory for deployed applications")
 
 
 class WebserverConfig(BaseModel):
     """Web server configuration."""
+
     webserver: str = Field(..., description="Web server to use (nginx or apache)")
 
 
 class BackupConfig(BaseModel):
     """Backup configuration."""
+
     directory: str = Field("/var/backups/wasm", description="Backup storage directory")
     max_per_app: int = Field(10, ge=1, le=100, description="Maximum backups per application")
 
 
 class SSLConfig(BaseModel):
     """SSL/TLS configuration."""
+
     enabled: bool = Field(True, description="Enable SSL certificates")
     provider: str = Field("certbot", description="SSL provider (certbot)")
     email: str = Field("", description="Email for certificate notifications")
@@ -114,6 +123,7 @@ class SSLConfig(BaseModel):
 
 class WebConfig(BaseModel):
     """Web interface configuration."""
+
     host: str = Field("127.0.0.1", description="Host to bind web interface")
     port: int = Field(8080, ge=1, le=65535, description="Port for web interface")
     session_timeout: int = Field(3600, ge=300, le=86400, description="Session timeout in seconds")
@@ -121,17 +131,18 @@ class WebConfig(BaseModel):
 
 # ============ Endpoints ============
 
+
 @router.get("", response_model=ConfigResponse)
 async def get_config(_: dict = Depends(require_auth)):
     """Get the current configuration."""
     config, path = load_config_file()
-    
+
     # Check if path is writable
     try:
         writable = path.parent.exists() and (not path.exists() or bool(path.stat().st_mode & 0o200))
     except OSError:
         writable = False
-    
+
     return {
         "config": config,
         "path": str(path),
@@ -143,39 +154,33 @@ async def get_config(_: dict = Depends(require_auth)):
 async def update_config(request: ConfigUpdateRequest, _: dict = Depends(require_auth)):
     """Update the full configuration."""
     _, path = load_config_file()
-    
+
     try:
         save_config_file(request.config, path)
         return {"message": "Configuration updated", "path": str(path)}
     except PermissionError:
-        raise HTTPException(
-            status_code=403,
-            detail=f"Permission denied writing to {path}"
-        )
+        raise HTTPException(status_code=403, detail=f"Permission denied writing to {path}")
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to save configuration: {e}"
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to save configuration: {e}")
 
 
 @router.patch("")
 async def patch_config(request: ConfigPatchRequest, _: dict = Depends(require_auth)):
     """Update a specific configuration value."""
     config, path = load_config_file()
-    
+
     # Navigate to the nested key
-    keys = request.path.split('.')
+    keys = request.path.split(".")
     current = config
-    
+
     for key in keys[:-1]:
         if key not in current:
             current[key] = {}
         current = current[key]
-    
+
     # Set the value
     current[keys[-1]] = request.value
-    
+
     try:
         save_config_file(config, path)
         return {
@@ -184,10 +189,7 @@ async def patch_config(request: ConfigPatchRequest, _: dict = Depends(require_au
             "value": request.value,
         }
     except PermissionError:
-        raise HTTPException(
-            status_code=403,
-            detail=f"Permission denied writing to {path}"
-        )
+        raise HTTPException(status_code=403, detail=f"Permission denied writing to {path}")
 
 
 @router.get("/apps-directory")
@@ -204,10 +206,13 @@ async def update_apps_directory(request: AppsDirConfig, _: dict = Depends(requir
     """Update the applications directory."""
     config, path = load_config_file()
     config["apps_directory"] = request.apps_directory
-    
+
     try:
         save_config_file(config, path)
-        return {"message": "Applications directory updated", "apps_directory": request.apps_directory}
+        return {
+            "message": "Applications directory updated",
+            "apps_directory": request.apps_directory,
+        }
     except PermissionError:
         raise HTTPException(status_code=403, detail="Permission denied")
 
@@ -226,10 +231,10 @@ async def update_webserver(request: WebserverConfig, _: dict = Depends(require_a
     """Update the web server setting."""
     if request.webserver not in ["nginx", "apache"]:
         raise HTTPException(status_code=400, detail="Webserver must be 'nginx' or 'apache'")
-    
+
     config, path = load_config_file()
     config["webserver"] = request.webserver
-    
+
     try:
         save_config_file(config, path)
         return {"message": "Web server updated", "webserver": request.webserver}
@@ -256,7 +261,7 @@ async def update_backup_config(request: BackupConfig, _: dict = Depends(require_
         "directory": request.directory,
         "max_per_app": request.max_per_app,
     }
-    
+
     try:
         save_config_file(config, path)
         return {"message": "Backup configuration updated"}
@@ -285,7 +290,7 @@ async def update_ssl_config(request: SSLConfig, _: dict = Depends(require_auth))
         "provider": request.provider,
         "email": request.email,
     }
-    
+
     try:
         save_config_file(config, path)
         return {"message": "SSL configuration updated"}
@@ -314,7 +319,7 @@ async def update_web_config(request: WebConfig, _: dict = Depends(require_auth))
         "port": request.port,
         "session_timeout": request.session_timeout,
     }
-    
+
     try:
         save_config_file(config, path)
         return {"message": "Web configuration updated (restart required)"}

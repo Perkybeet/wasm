@@ -8,12 +8,11 @@ Version and changelog display commands.
 
 import re
 from pathlib import Path
-from typing import Optional
 
 from wasm import __version__
 
 
-def get_current_version_changelog() -> Optional[str]:
+def get_current_version_changelog() -> str | None:
     """
     Extract changelog for the current version from debian.changelog.
 
@@ -38,6 +37,7 @@ def get_current_version_changelog() -> Optional[str]:
             if changelog_path.exists():
                 if changelog_path.suffix == ".gz":
                     import gzip
+
                     with gzip.open(changelog_path, "rt") as f:
                         changelog_content = f.read()
                 else:
@@ -67,7 +67,9 @@ def get_current_version_changelog() -> Optional[str]:
 
             if in_version:
                 # Stop at the author line or next version
-                if line.strip().startswith("--") or (line.strip() and re.match(r"wasm \(\d+\.\d+\.\d+-\d+\)", line)):
+                if line.strip().startswith("--") or (
+                    line.strip() and re.match(r"wasm \(\d+\.\d+\.\d+-\d+\)", line)
+                ):
                     changelog_lines.append(line)
                     break
                 changelog_lines.append(line)
@@ -107,5 +109,5 @@ def show_changelog() -> None:
     else:
         # Fallback: show release URL
         print("Changelog not available locally.")
-        print(f"View release notes at:")
+        print("View release notes at:")
         print(f"https://github.com/Perkybeet/wasm/releases/tag/v{__version__}\n")

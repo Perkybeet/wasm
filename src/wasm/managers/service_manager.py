@@ -4,13 +4,12 @@ Systemd service manager for WASM.
 
 import re
 from pathlib import Path
-from typing import Dict, List, Optional
 
 from jinja2 import Environment, PackageLoader, TemplateNotFound
 
 from wasm.core.config import SYSTEMD_DIR
 from wasm.core.exceptions import ServiceError, TemplateError
-from wasm.core.store import get_store, Service
+from wasm.core.store import Service, get_store
 from wasm.core.utils import read_file, remove_file, write_file
 from wasm.managers.base_manager import BaseManager
 
@@ -45,7 +44,7 @@ class ServiceManager(BaseManager):
         result = self._run(["which", "systemctl"])
         return result.success
 
-    def get_version(self) -> Optional[str]:
+    def get_version(self) -> str | None:
         """Get systemd version."""
         result = self._run(["systemctl", "--version"])
         if result.success:
@@ -66,7 +65,7 @@ class ServiceManager(BaseManager):
         """
         # Strip legacy prefix if present
         if name.startswith(self.LEGACY_PREFIX):
-            return name[len(self.LEGACY_PREFIX):]
+            return name[len(self.LEGACY_PREFIX) :]
         return name
 
     def _resolve_service_name(self, name: str) -> str:
@@ -127,17 +126,17 @@ class ServiceManager(BaseManager):
         if not service_name.endswith(".service"):
             service_name = f"{service_name}.service"
         return self.SYSTEMD_DIR / service_name
-    
+
     def daemon_reload(self) -> bool:
         """
         Reload systemd daemon.
-        
+
         Returns:
             True if successful.
         """
         result = self._run_sudo(["systemctl", "daemon-reload"])
         return result.success
-    
+
     def service_exists(self, name: str) -> bool:
         """
         Check if a service exists (new or legacy format).
@@ -150,53 +149,58 @@ class ServiceManager(BaseManager):
         """
         service_file = self._resolve_service_file(name)
         return service_file.exists()
-    
-    def list_services(self, all_services: bool = False) -> List[Dict]:
+
+    def list_services(self, all_services: bool = False) -> list[dict]:
         """
         List WASM-managed services.
-        
+
         Args:
             all_services: Include all system services.
-            
+
         Returns:
             List of service information dictionaries.
         """
         services = []
-        
+
         # List services starting with our prefix
         pattern = "*" if all_services else f"{self.SERVICE_PREFIX}*"
-        result = self._run([
-            "systemctl", "list-units",
-            "--type=service",
-            "--all",
-            "--no-pager",
-            "--plain",
-            pattern,
-        ])
-        
+        result = self._run(
+            [
+                "systemctl",
+                "list-units",
+                "--type=service",
+                "--all",
+                "--no-pager",
+                "--plain",
+                pattern,
+            ]
+        )
+
         if not result.success:
             return services
-        
+
         for line in result.stdout.strip().split("\n"):
             if not line or line.startswith("UNIT"):
                 continue
-            
+
             parts = line.split()
             if len(parts) >= 4:
                 unit_name = parts[0]
                 if unit_name.endswith(".service"):
                     name = unit_name.replace(".service", "")
                     if all_services or name.startswith(self.SERVICE_PREFIX):
-                        services.append({
-                            "name": name,
-                            "load": parts[1] if len(parts) > 1 else "unknown",
-                            "active": parts[2] if len(parts) > 2 else "unknown",
-                            "sub": parts[3] if len(parts) > 3 else "unknown",
-                        })
-        
+                        services.append(
+                            {
+                                "name": name,
+                                "load": parts[1] if len(parts) > 1 else "unknown",
+                                "active": parts[2] if len(parts) > 2 else "unknown",
+                                "sub": parts[3] if len(parts) > 3 else "unknown",
+                            }
+                        )
+
         return services
-    
-    def get_status(self, name: str) -> Dict:
+
+    def get_status(self, name: str) -> dict:
         """
         Get service status.
 
@@ -207,15 +211,15 @@ class ServiceManager(BaseManager):
             Dictionary with status information.
         """
         service_name = self._resolve_service_name(name)
-        
+
         # Check if active
         result = self._run(["systemctl", "is-active", service_name])
         is_active = result.stdout.strip() == "active"
-        
+
         # Check if enabled
         result = self._run(["systemctl", "is-enabled", service_name])
         is_enabled = result.stdout.strip() == "enabled"
-        
+
         # Get detailed status
         result = self._run(["systemctl", "show", service_name, "--no-pager"])
         details = {}
@@ -224,7 +228,7 @@ class ServiceManager(BaseManager):
                 if "=" in line:
                     key, value = line.split("=", 1)
                     details[key] = value
-        
+
         return {
             "name": service_name,
             "exists": self.service_exists(name),
@@ -234,16 +238,16 @@ class ServiceManager(BaseManager):
             "memory": details.get("MemoryCurrent", ""),
             "uptime": details.get("ActiveEnterTimestamp", ""),
         }
-    
+
     def create_service(
         self,
         name: str,
         command: str = "",
         working_directory: str = "",
-        user: Optional[str] = None,
-        group: Optional[str] = None,
-        environment: Optional[Dict[str, str]] = None,
-        description: Optional[str] = None,
+        user: str | None = None,
+        group: str | None = None,
+        environment: dict[str, str] | None = None,
+        description: str | None = None,
         template: str = "app",
         **kwargs,
     ) -> bool:
@@ -286,7 +290,7 @@ class ServiceManager(BaseManager):
             "environment": environment or {},
         }
         ctx.update(kwargs)
-        
+
         # Render template
         try:
             template_obj = self.jinja_env.get_template(f"{template}.service.j2")
@@ -295,15 +299,15 @@ class ServiceManager(BaseManager):
             raise TemplateError(f"Template not found: {template}.service.j2")
         except Exception as e:
             raise TemplateError(f"Template rendering failed: {e}")
-        
+
         # Write service file
         service_file = self._get_service_file(name)
         if not write_file(service_file, service_content, sudo=True):
             raise ServiceError(f"Failed to write service file: {service_file}")
-        
+
         # Reload daemon
         self.daemon_reload()
-        
+
         # Register in store
         try:
             svc = Service(
@@ -320,17 +324,17 @@ class ServiceManager(BaseManager):
             self.store.create_service(svc)
         except Exception as e:
             self.logger.debug(f"Could not register service in store: {e}")
-        
+
         self.logger.debug(f"Created service: {service_name}")
         return True
-    
+
     def delete_service(self, name: str) -> bool:
         """
         Delete a service.
-        
+
         Args:
             name: Service name.
-            
+
         Returns:
             True if service was deleted.
         """
@@ -347,19 +351,19 @@ class ServiceManager(BaseManager):
         if service_file.exists():
             if not remove_file(service_file, sudo=True):
                 raise ServiceError(f"Failed to delete service: {service_name}")
-        
+
         # Reload daemon
         self.daemon_reload()
-        
+
         # Remove from store
         try:
             self.store.delete_service(service_name)
         except Exception as e:
             self.logger.debug(f"Could not remove service from store: {e}")
-        
+
         self.logger.debug(f"Deleted service: {service_name}")
         return True
-    
+
     def start(self, name: str) -> bool:
         """
         Start a service.
@@ -372,21 +376,21 @@ class ServiceManager(BaseManager):
         """
         service_name = self._resolve_service_name(name)
         result = self._run_sudo(["systemctl", "start", service_name])
-        
+
         if not result.success:
             raise ServiceError(
                 f"Failed to start service: {service_name}",
                 details=result.stderr,
             )
-        
+
         # Update store status
         try:
             self.store.update_service_status(service_name, "active")
         except Exception as e:
             self.logger.debug(f"Could not update service status in store: {e}")
-        
+
         return True
-    
+
     def stop(self, name: str) -> bool:
         """
         Stop a service.
@@ -399,15 +403,15 @@ class ServiceManager(BaseManager):
         """
         service_name = self._resolve_service_name(name)
         result = self._run_sudo(["systemctl", "stop", service_name])
-        
+
         # Update store status
         try:
             self.store.update_service_status(service_name, "inactive")
         except Exception as e:
             self.logger.debug(f"Could not update service status in store: {e}")
-        
+
         return result.success
-    
+
     def restart(self, name: str) -> bool:
         """
         Restart a service.
@@ -420,21 +424,21 @@ class ServiceManager(BaseManager):
         """
         service_name = self._resolve_service_name(name)
         result = self._run_sudo(["systemctl", "restart", service_name])
-        
+
         if not result.success:
             raise ServiceError(
                 f"Failed to restart service: {service_name}",
                 details=result.stderr,
             )
-        
+
         # Update store status
         try:
             self.store.update_service_status(service_name, "active")
         except Exception as e:
             self.logger.debug(f"Could not update service status in store: {e}")
-        
+
         return True
-    
+
     def enable(self, name: str) -> bool:
         """
         Enable a service to start on boot.
@@ -447,7 +451,7 @@ class ServiceManager(BaseManager):
         """
         service_name = self._resolve_service_name(name)
         result = self._run_sudo(["systemctl", "enable", service_name])
-        
+
         # Update store
         try:
             svc = self.store.get_service(service_name)
@@ -456,9 +460,9 @@ class ServiceManager(BaseManager):
                 self.store.update_service(svc)
         except Exception as e:
             self.logger.debug(f"Could not update service in store: {e}")
-        
+
         return result.success
-    
+
     def disable(self, name: str) -> bool:
         """
         Disable a service from starting on boot.
@@ -471,7 +475,7 @@ class ServiceManager(BaseManager):
         """
         service_name = self._resolve_service_name(name)
         result = self._run_sudo(["systemctl", "disable", service_name])
-        
+
         # Update store
         try:
             svc = self.store.get_service(service_name)
@@ -480,9 +484,9 @@ class ServiceManager(BaseManager):
                 self.store.update_service(svc)
         except Exception as e:
             self.logger.debug(f"Could not update service in store: {e}")
-        
+
         return result.success
-    
+
     def logs(
         self,
         name: str,
@@ -501,13 +505,13 @@ class ServiceManager(BaseManager):
             Log output.
         """
         service_name = self._resolve_service_name(name)
-        
+
         cmd = ["journalctl", "-u", service_name, "-n", str(lines), "--no-pager"]
         result = self._run(cmd)
-        
+
         return result.stdout if result.success else result.stderr
-    
-    def get_service_config(self, name: str) -> Optional[str]:
+
+    def get_service_config(self, name: str) -> str | None:
         """
         Get service configuration content.
 

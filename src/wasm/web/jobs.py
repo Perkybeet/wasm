@@ -5,17 +5,15 @@ Provides async task execution with real-time progress updates
 to prevent blocking the web server during long operations.
 """
 
-import asyncio
-import uuid
-import time
+import queue
 import subprocess
 import threading
-import queue
-from datetime import datetime
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
-from typing import Dict, List, Optional, Callable, Any
-from pathlib import Path
+from typing import Any, Optional
 
 from wasm.core.exceptions import (
     BackupError,
@@ -27,6 +25,7 @@ from wasm.core.exceptions import (
 
 class JobStatus(str, Enum):
     """Job execution status."""
+
     PENDING = "pending"
     RUNNING = "running"
     COMPLETED = "completed"
@@ -36,6 +35,7 @@ class JobStatus(str, Enum):
 
 class JobType(str, Enum):
     """Types of background jobs."""
+
     DEPLOY = "deploy"
     UPDATE = "update"
     BACKUP = "backup"
@@ -51,11 +51,12 @@ class JobType(str, Enum):
 @dataclass
 class JobLogEntry:
     """A single log entry for a job."""
+
     timestamp: datetime
     level: str  # info, warning, error, success
     message: str
-    step: Optional[int] = None
-    
+    step: int | None = None
+
     def to_dict(self) -> dict:
         return {
             "timestamp": self.timestamp.isoformat(),
@@ -68,6 +69,7 @@ class JobLogEntry:
 @dataclass
 class Job:
     """Represents a background job."""
+
     id: str
     type: JobType
     name: str
@@ -77,13 +79,13 @@ class Job:
     total_steps: int = 100
     current_step: str = ""
     created_at: datetime = field(default_factory=datetime.now)
-    started_at: Optional[datetime] = None
-    completed_at: Optional[datetime] = None
-    result: Optional[Any] = None
-    error: Optional[str] = None
-    logs: List[JobLogEntry] = field(default_factory=list)
-    metadata: Dict[str, Any] = field(default_factory=dict)
-    
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    result: Any | None = None
+    error: str | None = None
+    logs: list[JobLogEntry] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
     def to_dict(self) -> dict:
         return {
             "id": self.id,
@@ -102,118 +104,120 @@ class Job:
             "logs": [log.to_dict() for log in self.logs[-100:]],  # Last 100 logs
             "metadata": self.metadata,
         }
-    
-    def add_log(self, message: str, level: str = "info", step: Optional[int] = None):
+
+    def add_log(self, message: str, level: str = "info", step: int | None = None):
         """Add a log entry to the job."""
-        self.logs.append(JobLogEntry(
-            timestamp=datetime.now(),
-            level=level,
-            message=message,
-            step=step or self.progress,
-        ))
+        self.logs.append(
+            JobLogEntry(
+                timestamp=datetime.now(),
+                level=level,
+                message=message,
+                step=step or self.progress,
+            )
+        )
 
 
 class JobManager:
     """
     Manages background jobs with async execution.
-    
+
     Features:
     - Non-blocking job execution in thread pool
     - Real-time progress updates via callbacks
     - Job persistence and history
     - Concurrent job limiting
     """
-    
-    _instance: Optional['JobManager'] = None
-    
+
+    _instance: Optional["JobManager"] = None
+
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
             cls._instance._initialized = False
         return cls._instance
-    
+
     def __init__(self):
         if self._initialized:
             return
-        
-        self._jobs: Dict[str, Job] = {}
+
+        self._jobs: dict[str, Job] = {}
         self._job_queue: queue.Queue = queue.Queue()
         self._max_concurrent = 3
         self._running_count = 0
         self._lock = threading.Lock()
-        self._subscribers: Dict[str, List[Callable]] = {}  # job_id -> callbacks
-        self._global_subscribers: List[Callable] = []  # For all job updates
-        self._worker_thread: Optional[threading.Thread] = None
+        self._subscribers: dict[str, list[Callable]] = {}  # job_id -> callbacks
+        self._global_subscribers: list[Callable] = []  # For all job updates
+        self._worker_thread: threading.Thread | None = None
         self._shutdown = False
         self._initialized = True
-        
+
         # Start worker thread
         self._start_worker()
-    
+
     def _start_worker(self):
         """Start the background worker thread."""
         if self._worker_thread is None or not self._worker_thread.is_alive():
             self._shutdown = False
             self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
             self._worker_thread.start()
-    
+
     def _worker_loop(self):
         """Main worker loop that processes jobs from the queue."""
         while not self._shutdown:
             try:
                 # Get job from queue with timeout
                 job_id, func, args, kwargs = self._job_queue.get(timeout=1.0)
-                
+
                 with self._lock:
                     if self._running_count >= self._max_concurrent:
                         # Re-queue if at capacity
                         self._job_queue.put((job_id, func, args, kwargs))
                         continue
                     self._running_count += 1
-                
+
                 try:
                     self._execute_job(job_id, func, args, kwargs)
                 finally:
                     with self._lock:
                         self._running_count -= 1
-                        
+
             except queue.Empty:
                 continue
             except Exception as e:
                 print(f"Worker error: {e}")
-    
+
     def _execute_job(self, job_id: str, func: Callable, args: tuple, kwargs: dict):
         """Execute a job and handle its lifecycle."""
         job = self._jobs.get(job_id)
         if not job:
             return
-        
+
         job.status = JobStatus.RUNNING
         job.started_at = datetime.now()
         job.add_log("Job started", "info")
         self._notify_subscribers(job)
-        
+
         try:
             # Create a job context for the function
             context = JobContext(job, self._notify_subscribers)
-            kwargs['job_context'] = context
-            
+            kwargs["job_context"] = context
+
             result = func(*args, **kwargs)
-            
+
             job.status = JobStatus.COMPLETED
             job.result = result
             job.progress = job.total_steps
             job.add_log("Job completed successfully", "success")
-            
+
         except Exception as e:
             job.status = JobStatus.FAILED
             job.error = str(e)
             job.add_log(f"Job failed: {e}", "error")
-        
+
         finally:
             job.completed_at = datetime.now()
             self._notify_subscribers(job)
-    
+
     def create_job(
         self,
         job_type: JobType,
@@ -227,7 +231,7 @@ class JobManager:
     ) -> Job:
         """
         Create and queue a new background job.
-        
+
         Args:
             job_type: Type of job
             name: Short name for the job
@@ -237,12 +241,12 @@ class JobManager:
             kwargs: Keyword arguments for func
             metadata: Additional job metadata
             total_steps: Total steps for progress calculation
-            
+
         Returns:
             The created Job object
         """
         job_id = str(uuid.uuid4())[:8]
-        
+
         job = Job(
             id=job_id,
             type=job_type,
@@ -251,60 +255,57 @@ class JobManager:
             total_steps=total_steps,
             metadata=metadata or {},
         )
-        
+
         self._jobs[job_id] = job
         self._job_queue.put((job_id, func, args, kwargs or {}))
-        
+
         self._notify_subscribers(job)
-        
+
         return job
-    
-    def get_job(self, job_id: str) -> Optional[Job]:
+
+    def get_job(self, job_id: str) -> Job | None:
         """Get a job by ID."""
         return self._jobs.get(job_id)
-    
-    def get_all_jobs(self, limit: int = 50) -> List[Job]:
+
+    def get_all_jobs(self, limit: int = 50) -> list[Job]:
         """Get all jobs, most recent first."""
-        jobs = sorted(
-            self._jobs.values(),
-            key=lambda j: j.created_at,
-            reverse=True
-        )
+        jobs = sorted(self._jobs.values(), key=lambda j: j.created_at, reverse=True)
         return jobs[:limit]
-    
-    def get_active_jobs(self) -> List[Job]:
+
+    def get_active_jobs(self) -> list[Job]:
         """Get all running or pending jobs."""
         return [
-            job for job in self._jobs.values()
+            job
+            for job in self._jobs.values()
             if job.status in [JobStatus.PENDING, JobStatus.RUNNING]
         ]
-    
+
     def cancel_job(self, job_id: str) -> bool:
         """Cancel a pending or running job."""
         job = self._jobs.get(job_id)
         if not job:
             return False
-        
+
         if job.status == JobStatus.PENDING:
             job.status = JobStatus.CANCELLED
             job.completed_at = datetime.now()
             job.add_log("Job cancelled", "warning")
             self._notify_subscribers(job)
             return True
-        
+
         # Can't cancel running jobs easily without process management
         return False
-    
+
     def subscribe(self, job_id: str, callback: Callable[[Job], None]):
         """Subscribe to updates for a specific job."""
         if job_id not in self._subscribers:
             self._subscribers[job_id] = []
         self._subscribers[job_id].append(callback)
-    
+
     def subscribe_all(self, callback: Callable[[Job], None]):
         """Subscribe to updates for all jobs."""
         self._global_subscribers.append(callback)
-    
+
     def unsubscribe(self, job_id: str, callback: Callable):
         """Unsubscribe from job updates."""
         if job_id in self._subscribers:
@@ -312,7 +313,7 @@ class JobManager:
                 self._subscribers[job_id].remove(callback)
             except ValueError:
                 pass  # Callback was not subscribed, ignore
-    
+
     def _notify_subscribers(self, job: Job):
         """Notify all subscribers of a job update."""
         # Job-specific subscribers
@@ -321,25 +322,26 @@ class JobManager:
                 callback(job)
             except Exception as e:
                 print(f"Subscriber error: {e}")
-        
+
         # Global subscribers
         for callback in self._global_subscribers:
             try:
                 callback(job)
             except Exception as e:
                 print(f"Global subscriber error: {e}")
-    
+
     def cleanup_old_jobs(self, max_age_hours: int = 24):
         """Remove completed jobs older than max_age_hours."""
         cutoff = datetime.now().timestamp() - (max_age_hours * 3600)
-        
+
         to_remove = [
-            job_id for job_id, job in self._jobs.items()
+            job_id
+            for job_id, job in self._jobs.items()
             if job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]
             and job.completed_at
             and job.completed_at.timestamp() < cutoff
         ]
-        
+
         for job_id in to_remove:
             del self._jobs[job_id]
             if job_id in self._subscribers:
@@ -349,7 +351,7 @@ class JobManager:
 class JobContext:
     """
     Context object passed to job functions for progress reporting.
-    
+
     Usage in job function:
         def my_job(arg1, arg2, job_context: JobContext):
             job_context.update("Starting...", 10)
@@ -359,38 +361,38 @@ class JobContext:
             # more work
             job_context.update("Finishing...", 90)
     """
-    
+
     def __init__(self, job: Job, notify_callback: Callable):
         self._job = job
         self._notify = notify_callback
-    
+
     @property
     def job_id(self) -> str:
         return self._job.id
-    
+
     @property
     def is_cancelled(self) -> bool:
         return self._job.status == JobStatus.CANCELLED
-    
+
     def update(self, step_name: str, progress: int):
         """Update job progress and current step."""
         self._job.current_step = step_name
         self._job.progress = min(progress, self._job.total_steps)
         self._job.add_log(step_name, "info", progress)
         self._notify(self._job)
-    
+
     def log(self, message: str, level: str = "info"):
         """Add a log message without changing progress."""
         self._job.add_log(message, level)
         self._notify(self._job)
-    
+
     def set_metadata(self, key: str, value: Any):
         """Set metadata on the job."""
         self._job.metadata[key] = value
 
 
 # Global job manager instance
-_job_manager: Optional[JobManager] = None
+_job_manager: JobManager | None = None
 
 
 def get_job_manager() -> JobManager:
@@ -403,41 +405,41 @@ def get_job_manager() -> JobManager:
 
 # ============ Job Functions ============
 
+
 def deploy_app_job(
     domain: str,
     source: str,
     app_type: str,
-    port: Optional[int] = None,
+    port: int | None = None,
     branch: str = "main",
-    env_vars: Optional[Dict[str, str]] = None,
-    job_context: Optional[JobContext] = None,
+    env_vars: dict[str, str] | None = None,
+    job_context: JobContext | None = None,
 ) -> dict:
     """
     Deploy an application as a background job.
-    
+
     This is the job function that wraps the actual deployment logic.
     """
     import subprocess
-    import shlex
-    
+
     if job_context is None:
         raise ValueError("job_context is required")
-    
+
     job_context.set_metadata("domain", domain)
     job_context.set_metadata("source", source)
     job_context.set_metadata("app_type", app_type)
-    
+
     # Build the wasm command (--verbose is a global flag, must come before the subcommand)
     cmd = ["wasm", "--verbose", "create", "-d", domain, "-s", source, "-t", app_type]
-    
+
     if port:
         cmd.extend(["-p", str(port)])
     if branch:
         cmd.extend(["-b", branch])
-    
+
     job_context.update("Starting deployment...", 5)
     job_context.log(f"Command: {' '.join(cmd)}")
-    
+
     # Execute with real-time output
     process = subprocess.Popen(
         cmd,
@@ -446,7 +448,7 @@ def deploy_app_job(
         text=True,
         bufsize=1,
     )
-    
+
     step_patterns = {
         "Fetching source": 10,
         "Installing dependencies": 30,
@@ -456,14 +458,14 @@ def deploy_app_job(
         "SSL": 90,
         "Deployment complete": 100,
     }
-    
+
     current_progress = 5
-    
+
     for line in process.stdout:
         line = line.strip()
         if not line:
             continue
-        
+
         # Determine log level
         level = "info"
         if "error" in line.lower() or "failed" in line.lower():
@@ -472,16 +474,16 @@ def deploy_app_job(
             level = "warning"
         elif "✓" in line or "success" in line.lower():
             level = "success"
-        
+
         job_context.log(line, level)
-        
+
         # Update progress based on patterns
         for pattern, progress in step_patterns.items():
             if pattern.lower() in line.lower():
                 current_progress = progress
                 job_context.update(pattern, progress)
                 break
-        
+
         if job_context.is_cancelled:
             process.terminate()
             raise DeploymentError("Job cancelled by user")
@@ -490,9 +492,9 @@ def deploy_app_job(
 
     if process.returncode != 0:
         raise DeploymentError(f"Deployment failed with exit code {process.returncode}")
-    
+
     job_context.update("Deployment complete", 100)
-    
+
     return {
         "domain": domain,
         "app_type": app_type,
@@ -502,17 +504,17 @@ def deploy_app_job(
 
 def update_app_job(
     domain: str,
-    job_context: Optional[JobContext] = None,
+    job_context: JobContext | None = None,
 ) -> dict:
     """Update an application as a background job."""
     if job_context is None:
         raise ValueError("job_context is required")
-    
+
     job_context.set_metadata("domain", domain)
     job_context.update("Starting update...", 5)
-    
+
     cmd = ["wasm", "--verbose", "update", domain]
-    
+
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -520,15 +522,15 @@ def update_app_job(
         text=True,
         bufsize=1,
     )
-    
+
     for line in process.stdout:
         line = line.strip()
         if line:
             level = "error" if "error" in line.lower() else "info"
             job_context.log(line, level)
-    
+
     process.wait()
-    
+
     if process.returncode != 0:
         raise DeploymentError(f"Update failed with exit code {process.returncode}")
 
@@ -541,22 +543,22 @@ def delete_app_job(
     domain: str,
     remove_files: bool = True,
     remove_ssl: bool = True,
-    job_context: Optional[JobContext] = None,
+    job_context: JobContext | None = None,
 ) -> dict:
     """Delete an application as a background job."""
     if job_context is None:
         raise ValueError("job_context is required")
-    
+
     job_context.set_metadata("domain", domain)
     job_context.update("Starting deletion...", 10)
-    
+
     cmd = ["wasm", "--verbose", "delete", domain, "-y"]
-    
+
     if not remove_files:
         cmd.append("--keep-files")
     if not remove_ssl:
         cmd.append("--keep-ssl")
-    
+
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -564,14 +566,14 @@ def delete_app_job(
         text=True,
         bufsize=1,
     )
-    
+
     for line in process.stdout:
         line = line.strip()
         if line:
             job_context.log(line, "info")
-    
+
     process.wait()
-    
+
     if process.returncode != 0:
         raise DeploymentError(f"Deletion failed with exit code {process.returncode}")
 
@@ -582,17 +584,17 @@ def delete_app_job(
 
 def backup_app_job(
     domain: str,
-    job_context: Optional[JobContext] = None,
+    job_context: JobContext | None = None,
 ) -> dict:
     """Create a backup as a background job."""
     if job_context is None:
         raise ValueError("job_context is required")
-    
+
     job_context.set_metadata("domain", domain)
     job_context.update("Creating backup...", 20)
-    
+
     cmd = ["wasm", "--verbose", "backup", "create", domain]
-    
+
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -600,7 +602,7 @@ def backup_app_job(
         text=True,
         bufsize=1,
     )
-    
+
     backup_path = None
     for line in process.stdout:
         line = line.strip()
@@ -608,9 +610,9 @@ def backup_app_job(
             job_context.log(line, "info")
             if "backup" in line.lower() and "/" in line:
                 backup_path = line
-    
+
     process.wait()
-    
+
     if process.returncode != 0:
         raise BackupError(f"Backup failed with exit code {process.returncode}")
 
@@ -621,20 +623,20 @@ def backup_app_job(
 
 def rollback_app_job(
     domain: str,
-    backup_id: Optional[str] = None,
-    job_context: Optional[JobContext] = None,
+    backup_id: str | None = None,
+    job_context: JobContext | None = None,
 ) -> dict:
     """Rollback an application as a background job."""
     if job_context is None:
         raise ValueError("job_context is required")
-    
+
     job_context.set_metadata("domain", domain)
     job_context.update("Starting rollback...", 10)
-    
+
     cmd = ["wasm", "--verbose", "rollback", domain]
     if backup_id:
         cmd.extend(["--backup", backup_id])
-    
+
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -642,14 +644,14 @@ def rollback_app_job(
         text=True,
         bufsize=1,
     )
-    
+
     for line in process.stdout:
         line = line.strip()
         if line:
             job_context.log(line, "info")
-    
+
     process.wait()
-    
+
     if process.returncode != 0:
         raise RollbackError(f"Rollback failed with exit code {process.returncode}")
 
@@ -660,20 +662,20 @@ def rollback_app_job(
 
 def cert_create_job(
     domain: str,
-    email: Optional[str] = None,
-    job_context: Optional[JobContext] = None,
+    email: str | None = None,
+    job_context: JobContext | None = None,
 ) -> dict:
     """Create SSL certificate as a background job."""
     if job_context is None:
         raise ValueError("job_context is required")
-    
+
     job_context.set_metadata("domain", domain)
     job_context.update("Requesting certificate...", 20)
-    
+
     cmd = ["wasm", "--verbose", "cert", "create", "-d", domain]
     if email:
         cmd.extend(["-e", email])
-    
+
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -681,14 +683,14 @@ def cert_create_job(
         text=True,
         bufsize=1,
     )
-    
+
     for line in process.stdout:
         line = line.strip()
         if line:
             job_context.log(line, "info")
-    
+
     process.wait()
-    
+
     if process.returncode != 0:
         raise CertificateError(f"Certificate creation failed with exit code {process.returncode}")
 

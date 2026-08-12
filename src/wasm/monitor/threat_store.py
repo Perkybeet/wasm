@@ -8,11 +8,9 @@ import sqlite3
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
 
 from wasm.core.logger import Logger
 from wasm.monitor.email_notifier import ThreatReport
-
 
 # Storage paths (same pattern as core store)
 DEFAULT_DB_PATH = Path("/var/lib/wasm/threats.db")
@@ -24,7 +22,7 @@ class ThreatStore:
 
     SCHEMA_VERSION = 1
 
-    def __init__(self, db_path: Optional[Path] = None, verbose: bool = False):
+    def __init__(self, db_path: Path | None = None, verbose: bool = False):
         """
         Initialize threat store.
 
@@ -129,11 +127,7 @@ class ThreatStore:
         conn = self._get_connection()
         cursor = conn.cursor()
 
-        timestamp = (
-            report.timestamp.isoformat()
-            if report.timestamp
-            else datetime.now().isoformat()
-        )
+        timestamp = report.timestamp.isoformat() if report.timestamp else datetime.now().isoformat()
 
         cursor.execute(
             """
@@ -164,13 +158,12 @@ class ThreatStore:
         threat_id = cursor.lastrowid
 
         self.logger.debug(
-            f"Saved threat #{threat_id}: {report.process_name} "
-            f"({report.threat_level})"
+            f"Saved threat #{threat_id}: {report.process_name} ({report.threat_level})"
         )
 
         return threat_id
 
-    def save_threats(self, reports: List[ThreatReport]) -> List[int]:
+    def save_threats(self, reports: list[ThreatReport]) -> list[int]:
         """
         Save multiple threat reports.
 
@@ -186,8 +179,8 @@ class ThreatStore:
         self,
         limit: int = 50,
         include_resolved: bool = False,
-        threat_level: Optional[str] = None,
-    ) -> List[dict]:
+        threat_level: str | None = None,
+    ) -> list[dict]:
         """
         Get recent threats from history.
 
@@ -220,7 +213,7 @@ class ThreatStore:
 
         return [dict(row) for row in rows]
 
-    def get_threat_by_id(self, threat_id: int) -> Optional[dict]:
+    def get_threat_by_id(self, threat_id: int) -> dict | None:
         """
         Get a specific threat by ID.
 
@@ -284,14 +277,10 @@ class ThreatStore:
         cursor.execute("SELECT COUNT(*) FROM threats")
         stats["total"] = cursor.fetchone()[0]
 
-        cursor.execute(
-            "SELECT COUNT(*) FROM threats WHERE threat_level = 'malicious'"
-        )
+        cursor.execute("SELECT COUNT(*) FROM threats WHERE threat_level = 'malicious'")
         stats["malicious"] = cursor.fetchone()[0]
 
-        cursor.execute(
-            "SELECT COUNT(*) FROM threats WHERE threat_level = 'suspicious'"
-        )
+        cursor.execute("SELECT COUNT(*) FROM threats WHERE threat_level = 'suspicious'")
         stats["suspicious"] = cursor.fetchone()[0]
 
         cursor.execute("SELECT COUNT(*) FROM threats WHERE resolved = 1")
