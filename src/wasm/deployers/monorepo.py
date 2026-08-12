@@ -138,7 +138,7 @@ class MonorepoDeployer(AppDeployer):
         self._cert_manager: CertManager | None = None
 
         # Helpers
-        self._pm_helper = PackageManagerHelper(logger=self.logger)
+        self._pm_helper = PackageManagerHelper(logger=self.logger, runner=self.runner)
         self._path_resolver = PathResolver(logger=self.logger)
         self._workspace_helper = WorkspaceHelper(logger=self.logger)
         self._turbo_helper = TurboHelper(logger=self.logger)
@@ -848,7 +848,10 @@ class MonorepoDeployer(AppDeployer):
     def _install_dependencies(self) -> None:
         """Install dependencies using pnpm."""
         # Verify pnpm
-        self.package_manager = self._pm_helper.verify("pnpm")
+        # Not negotiable: a turbo/pnpm workspace declares its internal
+        # dependencies with pnpm's workspace protocol, which npm cannot
+        # resolve at all.
+        self.package_manager = self._pm_helper.verify("pnpm", negotiable=False)
 
         result = self._run(
             ["pnpm", "install", "--frozen-lockfile"],

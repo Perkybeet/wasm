@@ -120,7 +120,7 @@ class BaseDeployer(AppDeployer):
         self._registrar: StoreRegistrar | None = None
 
         # Helpers
-        self._pm_helper = PackageManagerHelper(logger=self.logger)
+        self._pm_helper = PackageManagerHelper(logger=self.logger, runner=self.runner)
         self._path_resolver = PathResolver(logger=self.logger)
         self._prisma_helper: PrismaHelper | None = None  # Initialized after app_path is set
 

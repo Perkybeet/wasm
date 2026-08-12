@@ -1372,3 +1372,73 @@ def test_monorepo_permissions_pass_changes_nothing_in_a_rehearsal(
 
     assert stat.S_IMODE(env_file.stat().st_mode) == 0o644
     assert any("would set" in change for change in dry.skipped)
+
+
+class TestPackageManagerAvailability:
+    """
+    Availability is asked of the runner, never of the process PATH.
+
+    Reading the PATH made the answer depend on the machine: the monorepo update
+    test passed on a laptop with pnpm installed and failed in CI without it,
+    and the same difference in production silently installed a pnpm workspace
+    with npm.
+    """
+
+    def test_a_project_that_needs_pnpm_says_so_when_pnpm_is_missing(
+        self, tmp_path: Path, store: WASMStore, runner: FakeRunner
+    ) -> None:
+        runner.only_knows("npm")
+        app_path = tmp_path / "app"
+        write_tree(app_path, TREES["monorepo"])
+        deployer = MonorepoDeployer(runner=runner)
+        deployer.configure("example.com", str(app_path), app_path=app_path)
+
+        with pytest.raises(DeploymentError) as exc:
+            deployer.update()
+
+        assert "pnpm" in str(exc.value)
+        assert exc.value.details and "npm install -g pnpm" in exc.value.details
+        assert not runner.ran("npm", "install"), (
+            "a pnpm workspace was installed with npm, which resolves a different tree"
+        )
+
+    def test_a_workspace_offers_no_substitute_because_there_is_none(
+        self, tmp_path: Path, store: WASMStore, runner: FakeRunner
+    ) -> None:
+        """
+        A message must not promise an escape hatch that does not exist.
+
+        A turbo/pnpm workspace declares its internal dependencies with pnpm's
+        workspace protocol; npm cannot resolve those at all, so offering
+        "--pm npm" would send the operator down a road that ends in a broken
+        install.
+        """
+        runner.only_knows("npm")
+        app_path = tmp_path / "app"
+        write_tree(app_path, TREES["monorepo"])
+        deployer = MonorepoDeployer(runner=runner)
+        deployer.configure("example.com", str(app_path), app_path=app_path, package_manager="npm")
+
+        with pytest.raises(DeploymentError) as exc:
+            deployer.update()
+
+        assert "--pm" not in (exc.value.details or "")
+        assert "npm install -g pnpm" in (exc.value.details or "")
+
+    def test_availability_never_reads_the_real_path(
+        self, tmp_path: Path, store: WASMStore, runner: FakeRunner, monkeypatch
+    ) -> None:
+        """The guard: shutil.which must not be consulted at all."""
+        import shutil
+
+        def forbidden(*_args, **_kwargs):
+            raise AssertionError("package manager availability read the process PATH")
+
+        monkeypatch.setattr(shutil, "which", forbidden)
+        runner.only_knows("pnpm", "npm")
+        app_path = tmp_path / "app"
+        write_tree(app_path, TREES["monorepo"])
+        deployer = MonorepoDeployer(runner=runner)
+        deployer.configure("example.com", str(app_path), app_path=app_path)
+
+        assert deployer.update().package_manager == "pnpm"

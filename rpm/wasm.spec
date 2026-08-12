@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        1.0.0
+Version:        1.0.1
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -157,6 +157,9 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
 fi
 
 %changelog
+* Wed Aug 12 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.0.1-1
+- Fix: package manager availability is asked of the command runner, not of the process PATH
+- Fix: a project whose lock file names a package manager refuses to install with a different one
 * Wed Aug 12 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.0.0-1
 - Security: closes six critical issues, including arbitrary code execution as root through systemd unit environment injection
 - Security: the process monitor no longer terminates processes or deletes directories; it reports instead of acting

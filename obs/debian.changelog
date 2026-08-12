@@ -1,3 +1,10 @@
+wasm (1.0.1-1) unstable; urgency=medium
+
+  * Fix: package manager availability is asked of the command runner, not of the process PATH
+  * Fix: a project whose lock file names a package manager refuses to install with a different one
+
+ -- Yago Lopez Prado <yago.lopez.adeje@gmail.com>  Wed, 12 Aug 2026 16:06:57 +0000
+
 wasm (1.0.0-1) unstable; urgency=medium
 
   * Security: closes six critical issues, including arbitrary code execution as root through systemd unit environment injection

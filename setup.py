@@ -9,7 +9,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="wasm-cli",
-    version="1.0.0",
+    version="1.0.1",
     description="Web App System Management - Deploy and manage web applications on Linux servers",
     author="Yago López Prado",
     author_email="yago.lopez.adeje@gmail.com",
