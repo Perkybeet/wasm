@@ -1,5 +1,9 @@
+# Copyright (c) 2024-2026 Yago Lopez Prado
+# Licensed under WASM-NCSAL 1.0 (Commercial use prohibited)
+# https://github.com/Perkybeet/wasm/blob/main/LICENSE
+
 """
-Web interface command handlers for WASM.
+The ``wasm web`` command group.
 
 This is the only way the panel is started in practice, so the security posture
 of a deployment is decided here. Two rules follow from the panel being a root
@@ -12,6 +16,19 @@ shell with a login form:
   warning scrolls past; the operator wanted the panel up, and it comes up. So
   ``--host 0.0.0.0`` is refused unless the panel terminates TLS itself or only
   answers a declared list of addresses.
+
+Two structural notes about the Click migration:
+
+- The command bodies hold no logic. Every command parses its options and hands
+  them to a private ``_start`` / ``_stop`` / ``_token`` helper, which is also
+  what the surviving ``handle_web`` argparse entry point calls. One
+  implementation, two front doors, until the argparse tree is deleted.
+- ``--verbose``, ``--dry-run`` and ``--no-color`` are accepted after the
+  subcommand, as they always were, but they do not become per-command
+  parameters: :func:`global_flags` declares them with ``expose_value=False`` and
+  folds them into the shared :class:`~wasm.cli.app.Context`. That is what
+  distinguishes re-exposing a global flag from redeclaring it, and redeclaring
+  it is the argparse bug this migration exists to remove.
 """
 
 from __future__ import annotations
@@ -20,13 +37,19 @@ import importlib.util
 import os
 import signal
 import sys
+import time
 from argparse import ArgumentParser, Namespace
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, NoReturn, TypeVar
 
+import click
+
+from wasm.cli.app import Context, pass_context
 from wasm.core.exceptions import SecurityError, WASMError
-from wasm.core.logger import Logger
-from wasm.core.runner import get_runner
+from wasm.core.logger import Logger, set_colors_disabled
+from wasm.core.runner import DryRunRunner, SubprocessRunner, get_runner, set_runner
 
 if TYPE_CHECKING:
     from wasm.web.auth import SecurityConfig
@@ -42,20 +65,169 @@ LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", ""})
 #: Package installation is slow on a cold cache but must not hang a session.
 INSTALL_TIMEOUT = 900
 
+#: Seconds between stopping and starting again, so the port is released.
+RESTART_PAUSE = 1
+
+F = TypeVar("F", bound=Callable[..., Any])
+
 
 def get_pid_file() -> Path:
-    """Get the appropriate PID file path."""
+    """
+    Return the PID file this process may write.
+
+    Returns:
+        ``/var/run/wasm-web.pid`` for root, a path under ``~/.wasm`` otherwise.
+    """
     if os.geteuid() == 0:
         return PID_FILE
     return PID_FILE_USER
+
+
+# ---------------------------------------------------------------------------
+# Global flags, re-exposed rather than redeclared
+# ---------------------------------------------------------------------------
+
+
+def _adopt_global_flag(attribute: str) -> Callable[[click.Context, click.Parameter, bool], None]:
+    """
+    Build the callback that folds a global flag into the shared context.
+
+    Args:
+        attribute: Name of the :class:`~wasm.cli.app.Context` field to set.
+
+    Returns:
+        A Click option callback.
+    """
+
+    def callback(ctx: click.Context, param: click.Parameter, value: bool) -> None:
+        if not value:
+            return
+        state = ctx.ensure_object(Context)
+        setattr(state, attribute, True)
+
+        # The root callback has already run by the time a subcommand's options
+        # are parsed, so a flag typed after the subcommand name has to apply
+        # its own side effects. Nothing here is a per-command decision: it is
+        # the same global effect, reached late.
+        if attribute == "verbose":
+            # The cached logger was built with the old verbosity.
+            state._logger = None
+        elif attribute == "no_color":
+            set_colors_disabled(True)
+        elif attribute == "dry_run":
+            logger = state.logger
+            logger.warning("Dry run: no changes will be made to this machine")
+            set_runner(
+                DryRunRunner(
+                    SubprocessRunner(),
+                    on_skip=lambda cmd: logger.info(f"would run: {' '.join(cmd)}"),
+                )
+            )
+
+    return callback
+
+
+#: Applied in declaration order, so verbosity is adopted before anything that
+#: logs during parsing.
+_GLOBAL_FLAGS = (
+    click.option(
+        "-v",
+        "--verbose",
+        is_flag=True,
+        expose_value=False,
+        is_eager=True,
+        callback=_adopt_global_flag("verbose"),
+        help="Show the detail of each step.",
+    ),
+    click.option(
+        "--dry-run",
+        is_flag=True,
+        expose_value=False,
+        is_eager=True,
+        callback=_adopt_global_flag("dry_run"),
+        help="Rehearse without changing anything. Read-only checks still run.",
+    ),
+    click.option(
+        "--no-color",
+        is_flag=True,
+        expose_value=False,
+        is_eager=True,
+        callback=_adopt_global_flag("no_color"),
+        help="Never emit colour.",
+    ),
+)
+
+
+def global_flags(command: F) -> F:
+    """
+    Accept the global flags after this command's name.
+
+    ``wasm web start --verbose`` has always worked and is in scripts, so the
+    flags stay spellable here. They carry ``expose_value=False``: the value goes
+    to the shared context and never reaches the command as a parameter, which is
+    what stops a subcommand from overwriting what the user typed before it.
+
+    Args:
+        command: The command function being decorated.
+
+    Returns:
+        The same function, with the global options attached.
+    """
+    for option in reversed(_GLOBAL_FLAGS):
+        command = option(command)
+    return command
+
+
+def _exit(code: int) -> NoReturn:
+    """
+    End the current command with an exit status.
+
+    Args:
+        code: Process exit status.
+
+    Raises:
+        click.exceptions.Exit: Always; this is how Click unwinds a command.
+    """
+    click.get_current_context().exit(code)
+
+
+# ---------------------------------------------------------------------------
+# How the panel is exposed
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StartOptions:
+    """
+    Everything that decides how reachable a panel is.
+
+    Attributes:
+        host: Interface to bind to.
+        port: TCP port to listen on.
+        daemon: Whether to detach into the background.
+        require_https: Whether the panel terminates TLS itself.
+        tls_cert: Path to the certificate chain.
+        tls_key: Path to the private key.
+        allow_ip: Addresses or CIDRs allowed to connect, empty for anyone.
+        trusted_proxy: Peers whose forwarding headers are believed.
+    """
+
+    host: str = "127.0.0.1"
+    port: int = 8080
+    daemon: bool = False
+    require_https: bool = False
+    tls_cert: str | None = None
+    tls_key: str | None = None
+    allow_ip: tuple[str, ...] = ()
+    trusted_proxy: tuple[str, ...] = ()
 
 
 def add_start_arguments(parser: ArgumentParser) -> None:
     """
     Register the options that decide how exposed a panel is.
 
-    The CLI parser calls this for ``web start`` and ``web restart`` so that both
-    accept exactly the same security flags.
+    The legacy argparse parser calls this for ``web start`` and ``web restart``
+    so that both accept exactly the same security flags.
 
     Args:
         parser: The subcommand parser to extend.
@@ -93,12 +265,34 @@ def add_start_arguments(parser: ArgumentParser) -> None:
     )
 
 
-def build_security_config(args: Namespace) -> SecurityConfig:
+def _start_options(args: Namespace) -> StartOptions:
     """
-    Turn parsed arguments into a security configuration.
+    Read start options off an argparse namespace.
 
     Args:
         args: Parsed command line arguments.
+
+    Returns:
+        The same options the Click command builds directly.
+    """
+    return StartOptions(
+        host=getattr(args, "host", None) or "127.0.0.1",
+        port=getattr(args, "port", None) or 8080,
+        daemon=bool(getattr(args, "daemon", False)),
+        require_https=bool(getattr(args, "require_https", False)),
+        tls_cert=getattr(args, "tls_cert", None),
+        tls_key=getattr(args, "tls_key", None),
+        allow_ip=tuple(getattr(args, "allow_ip", None) or ()),
+        trusted_proxy=tuple(getattr(args, "trusted_proxy", None) or ()),
+    )
+
+
+def _build_security_config(options: StartOptions) -> SecurityConfig:
+    """
+    Turn start options into a security configuration.
+
+    Args:
+        options: How the operator asked for the panel to be exposed.
 
     Returns:
         The configuration the server should run with.
@@ -109,15 +303,12 @@ def build_security_config(args: Namespace) -> SecurityConfig:
     """
     from wasm.web.auth import SecurityConfig
 
-    host = getattr(args, "host", "127.0.0.1") or "127.0.0.1"
-    port = getattr(args, "port", 8080) or 8080
-    whitelist = list(getattr(args, "allow_ip", None) or [])
-    proxies = list(getattr(args, "trusted_proxy", None) or [])
-    require_https = bool(getattr(args, "require_https", False))
-    cert = getattr(args, "tls_cert", None)
-    key = getattr(args, "tls_key", None)
+    host = options.host
+    port = options.port
+    whitelist = list(options.allow_ip)
+    proxies = list(options.trusted_proxy)
 
-    if require_https and not (cert and key):
+    if options.require_https and not (options.tls_cert and options.tls_key):
         raise SecurityError(
             "--require-https needs a certificate and a private key",
             details=(
@@ -128,7 +319,7 @@ def build_security_config(args: Namespace) -> SecurityConfig:
             ),
         )
 
-    if host not in LOOPBACK_HOSTS and not require_https and not whitelist:
+    if host not in LOOPBACK_HOSTS and not options.require_https and not whitelist:
         raise SecurityError(
             f"Refusing to expose the WASM panel on {host} without TLS or an IP whitelist",
             details=(
@@ -148,9 +339,9 @@ def build_security_config(args: Namespace) -> SecurityConfig:
         host=host,
         port=port,
         rate_limit_enabled=True,
-        require_https=require_https,
-        ssl_certfile=cert,
-        ssl_keyfile=key,
+        require_https=options.require_https,
+        ssl_certfile=options.tls_cert,
+        ssl_keyfile=options.tls_key,
         ip_whitelist=whitelist,
         trusted_proxies=proxies,
     )
@@ -163,58 +354,35 @@ def build_security_config(args: Namespace) -> SecurityConfig:
     return config
 
 
-def handle_web(args: Namespace) -> int:
+def build_security_config(args: Namespace) -> SecurityConfig:
     """
-    Handle web commands.
+    Turn parsed argparse arguments into a security configuration.
 
     Args:
-        args: Parsed arguments.
+        args: Parsed command line arguments.
 
     Returns:
-        Exit code.
+        The configuration the server should run with.
+
+    Raises:
+        SecurityError: When the requested combination would put a root panel on
+            a network unprotected.
     """
-    action = args.action
-
-    handlers = {
-        "start": _handle_start,
-        "stop": _handle_stop,
-        "status": _handle_status,
-        "restart": _handle_restart,
-        "token": _handle_token,
-        "install": _handle_install,
-    }
-
-    handler = handlers.get(action)
-    if not handler:
-        print(f"Unknown action: {action}", file=sys.stderr)
-        return 1
-
-    try:
-        return handler(args)
-    except WASMError as e:
-        logger = Logger(verbose=args.verbose)
-        logger.error(str(e))
-        return 1
-    except KeyboardInterrupt:
-        print("\nShutting down...")
-        return 0
-    except Exception as e:
-        logger = Logger(verbose=args.verbose)
-        logger.error(f"Unexpected error: {e}")
-        if args.verbose:
-            import traceback
-
-            traceback.print_exc()
-        return 1
+    return _build_security_config(_start_options(args))
 
 
-# Mapping from import name to package names (apt, pip)
+# ---------------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------------
+
+#: Import name to the packages that provide it, as (system, pip). Only what the
+#: panel actually imports belongs here: a dependency check that asks for
+#: packages nothing imports sends operators to install software they do not
+#: need, and makes a real missing dependency harder to see.
 WEB_DEPENDENCIES = {
     "fastapi": ("python3-fastapi", "fastapi>=0.109.0"),
     "uvicorn": ("python3-uvicorn", "uvicorn[standard]>=0.27.0"),
     "jose": ("python3-jose", "python-jose[cryptography]>=3.3.0"),
-    "passlib": ("python3-passlib", "passlib[bcrypt]>=1.7.4"),
-    "aiofiles": ("python3-aiofiles", "aiofiles>=23.0.0"),
     "psutil": ("python3-psutil", "psutil>=5.9.0"),
 }
 
@@ -241,7 +409,16 @@ def _check_dependencies() -> tuple[bool, list[str], list[str]]:
 
 
 def _get_install_instructions(missing_apt: list[str], missing_pip: list[str]) -> list[str]:
-    """Get installation instructions based on the system."""
+    """
+    Suggest how to install the missing packages on this distribution.
+
+    Args:
+        missing_apt: Missing system package names.
+        missing_pip: Missing pip requirements.
+
+    Returns:
+        Command lines to show the operator, pip last as the fallback.
+    """
     instructions = []
 
     # Check if running on a Debian-based system
@@ -267,8 +444,12 @@ def _get_install_instructions(missing_apt: list[str], missing_pip: list[str]) ->
 
 
 def _is_externally_managed() -> bool:
-    """Check if Python environment is externally managed (PEP 668)."""
-    # Check for EXTERNALLY-MANAGED marker file
+    """
+    Report whether this interpreter refuses unmanaged installs (PEP 668).
+
+    Returns:
+        True when the standard library carries an EXTERNALLY-MANAGED marker.
+    """
     import sysconfig
 
     stdlib_path = sysconfig.get_path("stdlib")
@@ -279,15 +460,16 @@ def _is_externally_managed() -> bool:
 
 
 def _install_with_pip(packages: list[str], verbose: bool = False, force: bool = False) -> bool:
-    """Install packages using pip.
+    """
+    Install packages with pip.
 
     Args:
-        packages: List of pip package specifications
-        verbose: Show verbose output
-        force: Use --break-system-packages for externally managed environments
+        packages: Pip requirement specifiers.
+        verbose: Show verbose output.
+        force: Pass --break-system-packages even if the marker is absent.
 
     Returns:
-        True if installation succeeded
+        True when the installation succeeded.
     """
     logger = Logger(verbose=verbose)
 
@@ -307,14 +489,15 @@ def _install_with_pip(packages: list[str], verbose: bool = False, force: bool = 
 
 
 def _install_with_apt(packages: list[str], verbose: bool = False) -> bool:
-    """Install packages using apt.
+    """
+    Install packages with apt.
 
     Args:
-        packages: List of apt package names
-        verbose: Show verbose output
+        packages: System package names.
+        verbose: Show verbose output.
 
     Returns:
-        True if installation succeeded
+        True when the installation succeeded.
     """
     logger = Logger(verbose=verbose)
 
@@ -334,15 +517,16 @@ def _install_with_apt(packages: list[str], verbose: bool = False) -> bool:
 
 
 def _prompt_install(missing_apt: list[str], missing_pip: list[str], verbose: bool = False) -> bool:
-    """Prompt user to install missing dependencies.
+    """
+    Offer to install the missing dependencies right now.
 
     Args:
-        missing_apt: List of missing apt packages
-        missing_pip: List of missing pip packages
-        verbose: Show verbose output
+        missing_apt: Missing system package names.
+        missing_pip: Missing pip requirements.
+        verbose: Show verbose output.
 
     Returns:
-        True if user chose to install and installation succeeded
+        True when the operator accepted and the installation succeeded.
     """
     logger = Logger(verbose=verbose)
 
@@ -392,9 +576,26 @@ def _prompt_install(missing_apt: list[str], missing_pip: list[str], verbose: boo
             return False
 
 
-def _handle_start(args: Namespace) -> int:
-    """Handle web start command."""
-    logger = Logger(verbose=args.verbose)
+# ---------------------------------------------------------------------------
+# What the commands actually do
+# ---------------------------------------------------------------------------
+
+
+def _start(options: StartOptions, verbose: bool) -> int:
+    """
+    Start the panel, refusing an unsafe exposure first.
+
+    Args:
+        options: How the operator asked for the panel to be exposed.
+        verbose: Whether to log verbosely.
+
+    Returns:
+        Exit code.
+
+    Raises:
+        SecurityError: When the requested exposure is not protected.
+    """
+    logger = Logger(verbose=verbose)
 
     # Check dependencies
     all_installed, missing_apt, missing_pip = _check_dependencies()
@@ -403,7 +604,7 @@ def _handle_start(args: Namespace) -> int:
         logger.info(f"Missing packages: {', '.join(missing_apt)}")
 
         # Offer to install automatically
-        if _prompt_install(missing_apt, missing_pip, args.verbose):
+        if _prompt_install(missing_apt, missing_pip, verbose):
             # Re-check after installation
             all_installed, _, _ = _check_dependencies()
             if all_installed:
@@ -436,7 +637,7 @@ def _handle_start(args: Namespace) -> int:
             pid_file.unlink(missing_ok=True)
 
     # Refuses an unsafe exposure before anything is bound or written.
-    config = build_security_config(args)
+    config = _build_security_config(options)
     host = config.host
 
     if config.ip_whitelist:
@@ -449,8 +650,8 @@ def _handle_start(args: Namespace) -> int:
             "so the session cookie is issued with the Secure flag."
         )
 
-    if getattr(args, "daemon", False):
-        return _start_daemon(config, args.verbose)
+    if options.daemon:
+        return _start_daemon(config, verbose)
     return _start_foreground(config)
 
 
@@ -543,9 +744,17 @@ def _start_daemon(config: SecurityConfig, verbose: bool) -> int:
     os._exit(0)
 
 
-def _handle_stop(args: Namespace) -> int:
-    """Handle web stop command."""
-    logger = Logger(verbose=args.verbose)
+def _stop(verbose: bool) -> int:
+    """
+    Stop the running panel.
+
+    Args:
+        verbose: Whether to log verbosely.
+
+    Returns:
+        Exit code.
+    """
+    logger = Logger(verbose=verbose)
 
     pid_file = get_pid_file()
 
@@ -578,9 +787,17 @@ def _handle_stop(args: Namespace) -> int:
         return 1
 
 
-def _handle_status(args: Namespace) -> int:
-    """Handle web status command."""
-    logger = Logger(verbose=args.verbose)
+def _status(verbose: bool) -> int:
+    """
+    Report whether the panel is running.
+
+    Args:
+        verbose: Whether to log verbosely.
+
+    Returns:
+        Exit code.
+    """
+    logger = Logger(verbose=verbose)
 
     pid_file = get_pid_file()
 
@@ -599,13 +816,14 @@ def _handle_status(args: Namespace) -> int:
         logger.key_value("Status", "running")
         logger.key_value("PID", str(pid))
 
-        # Try to get more info
+        # Extra detail is a nicety; psutil may be missing or the process may
+        # have exited between the signal and the query.
         try:
             import psutil
 
             proc = psutil.Process(pid)
             logger.key_value("Memory", f"{proc.memory_info().rss / 1024 / 1024:.1f} MB")
-            logger.key_value("Started", proc.create_time())
+            logger.key_value("Started", str(proc.create_time()))
         except Exception:
             pass
 
@@ -620,33 +838,89 @@ def _handle_status(args: Namespace) -> int:
         return 1
 
 
-def _handle_restart(args: Namespace) -> int:
-    """Handle web restart command."""
-    logger = Logger(verbose=args.verbose)
+def _restart(options: StartOptions, verbose: bool) -> int:
+    """
+    Stop the panel and start it again with new options.
+
+    Args:
+        options: How the operator asked for the panel to be exposed.
+        verbose: Whether to log verbosely.
+
+    Returns:
+        Exit code.
+
+    Raises:
+        SecurityError: When the requested exposure is not protected.
+    """
+    logger = Logger(verbose=verbose)
 
     logger.info("Restarting web server...")
 
-    # Stop first
-    _handle_stop(args)
+    _stop(verbose)
 
-    # Brief pause
-    import time
+    # The old process needs a moment to release the listening socket.
+    time.sleep(RESTART_PAUSE)
 
-    time.sleep(1)
-
-    # Start again
-    return _handle_start(args)
+    return _start(options, verbose)
 
 
-def _handle_token(args: Namespace) -> int:
-    """Handle token regeneration."""
-    logger = Logger(verbose=args.verbose)
+def _confirm_token_change(config: SecurityConfig, regenerate: bool) -> None:
+    """
+    Ask before invalidating credentials that are already in use.
+
+    Nothing is asked when there is no token yet: the first one costs nobody
+    anything.
+
+    Args:
+        config: Configuration naming the files that would be rewritten.
+        regenerate: Whether the signing key and sessions go too.
+
+    Raises:
+        click.Abort: When the operator declines.
+    """
+    if not config.token_file.exists():
+        return
+
+    if regenerate:
+        message = (
+            f"Rotate the signing key in {config.secret_file} and issue a new access token? "
+            "Every open panel session is logged out and the current token stops working"
+        )
+    else:
+        message = (
+            f"Replace the access token recorded in {config.token_file}? "
+            "The token currently in use stops working immediately"
+        )
+
+    click.confirm(message, abort=True)
+
+
+def _token(regenerate: bool, confirm: bool, verbose: bool) -> int:
+    """
+    Issue an access token and print it.
+
+    The stored token is a salted hash, so an existing token cannot be read back:
+    the only way to answer "what is my token" is to issue a new one, which is
+    what this does.
+
+    Args:
+        regenerate: Also rotate the signing key, revoking every session.
+        confirm: Ask before invalidating a token that is already in use.
+        verbose: Whether to log verbosely.
+
+    Returns:
+        Exit code.
+
+    Raises:
+        click.Abort: When confirmation is asked for and declined.
+    """
+    logger = Logger(verbose=verbose)
 
     all_installed, missing_apt, missing_pip = _check_dependencies()
     if not all_installed:
         logger.error("Web dependencies not installed")
         logger.info(f"Missing packages: {', '.join(missing_apt)}")
-        logger.info("")
+        logger.blank()
         logger.info("Install with one of the following:")
         for instruction in _get_install_instructions(missing_apt, missing_pip):
             logger.info(f"  {instruction}")
@@ -657,28 +931,46 @@ def _handle_token(args: Namespace) -> int:
     from wasm.web.auth import SecurityConfig, TokenManager
 
     config = SecurityConfig()
+
+    if confirm:
+        _confirm_token_change(config, regenerate)
+
     token_manager = TokenManager(config)
 
-    if getattr(args, "regenerate", False):
-        # Regenerate token
+    if regenerate:
         new_token = token_manager.rotate_secrets()
-        logger.success("New access token generated")
-        logger.blank()
-        print(f"Access Token: {new_token}")
-        logger.blank()
-        logger.warning("All existing sessions have been revoked")
-        logger.info("Restart the web server to apply the new token")
     else:
-        # Show current token info
-        logger.info("Use --regenerate to generate a new token")
-        logger.info("This will revoke all existing sessions")
+        new_token = token_manager.generate_master_token()
+
+    logger.success("New access token issued")
+    logger.blank()
+    print(f"Access Token: {new_token}")
+    logger.blank()
+    logger.info("Paste it into the login form. It is never accepted in a URL.")
+
+    if regenerate:
+        logger.warning("All existing sessions have been revoked")
+    else:
+        logger.warning("The token issued previously no longer works")
+
+    logger.info("Restart the web server to apply the new token")
 
     return 0
 
 
-def _handle_install(args: Namespace) -> int:
-    """Handle web install command - install web dependencies."""
-    logger = Logger(verbose=args.verbose)
+def _install(use_apt: bool, use_pip: bool, verbose: bool) -> int:
+    """
+    Install the packages the panel needs.
+
+    Args:
+        use_apt: Install system packages.
+        use_pip: Install pip requirements.
+        verbose: Whether to log verbosely.
+
+    Returns:
+        Exit code.
+    """
+    logger = Logger(verbose=verbose)
 
     logger.header("Installing WASM Web Dependencies")
 
@@ -693,8 +985,6 @@ def _handle_install(args: Namespace) -> int:
 
     # Determine installation method
     is_debian = Path("/etc/debian_version").exists()
-    use_apt = getattr(args, "apt", False)
-    use_pip = getattr(args, "pip", False)
 
     # If neither specified, prompt or use default
     if not use_apt and not use_pip:
@@ -721,7 +1011,7 @@ def _handle_install(args: Namespace) -> int:
 
     if use_apt:
         logger.info("Installing with apt...")
-        if _install_with_apt(missing_apt, args.verbose):
+        if _install_with_apt(missing_apt, verbose):
             # Verify installation
             all_installed, _, _ = _check_dependencies()
             if all_installed:
@@ -733,7 +1023,7 @@ def _handle_install(args: Namespace) -> int:
                 logger.warning("Some packages may not be available via apt")
                 logger.info("Falling back to pip for remaining packages...")
                 _, _, remaining_pip = _check_dependencies()
-                if _install_with_pip(remaining_pip, args.verbose):
+                if _install_with_pip(remaining_pip, verbose):
                     logger.success("Web dependencies installed successfully!")
                     return 0
         logger.error("Failed to install dependencies")
@@ -741,7 +1031,7 @@ def _handle_install(args: Namespace) -> int:
 
     if use_pip:
         logger.info("Installing with pip...")
-        if _install_with_pip(missing_pip, args.verbose):
+        if _install_with_pip(missing_pip, verbose):
             # Verify installation
             all_installed, _, _ = _check_dependencies()
             if all_installed:
@@ -753,3 +1043,338 @@ def _handle_install(args: Namespace) -> int:
         return 1
 
     return 1
+
+
+# ---------------------------------------------------------------------------
+# The Click command tree
+# ---------------------------------------------------------------------------
+
+
+def _exposure_options(command: F) -> F:
+    """
+    Attach the options shared by ``web start`` and ``web restart``.
+
+    Both commands bring the panel up, so both have to be able to say the same
+    things about how it is exposed. Declaring them once is what keeps the two
+    from drifting apart.
+
+    Args:
+        command: The command function being decorated.
+
+    Returns:
+        The same function, with the exposure options attached.
+    """
+    options = (
+        click.option(
+            "-H",
+            "--host",
+            default="127.0.0.1",
+            show_default=True,
+            metavar="ADDR",
+            help="Interface to bind to. Anything but loopback needs --require-https or --allow-ip.",
+        ),
+        click.option(
+            "-p",
+            "--port",
+            type=click.INT,
+            default=8080,
+            show_default=True,
+            help="Port to listen on.",
+        ),
+        click.option("-d", "--daemon", is_flag=True, help="Run in the background."),
+        click.option(
+            "--require-https",
+            is_flag=True,
+            help="Serve TLS from the panel and refuse cleartext. Needs --tls-cert and --tls-key.",
+        ),
+        click.option(
+            "--tls-cert",
+            type=click.Path(exists=True, dir_okay=False, readable=True),
+            metavar="PATH",
+            help="Certificate chain to serve.",
+        ),
+        click.option(
+            "--tls-key",
+            type=click.Path(exists=True, dir_okay=False, readable=True),
+            metavar="PATH",
+            help="Private key for the certificate.",
+        ),
+        click.option(
+            "--allow-ip",
+            multiple=True,
+            metavar="ADDR/CIDR",
+            help="Only answer this address or network. Repeat to allow several.",
+        ),
+        click.option(
+            "--trusted-proxy",
+            multiple=True,
+            metavar="ADDR/CIDR",
+            help="Believe forwarding headers from this peer. Declare the proxy that "
+            "terminates TLS so the session cookie is issued with Secure.",
+        ),
+    )
+    for option in reversed(options):
+        command = option(command)
+    return command
+
+
+@click.group(name="web")
+@global_flags
+def cli() -> None:
+    """
+    Run the browser panel for this server.
+
+    The panel acts as root, so it listens on 127.0.0.1 unless you give it TLS
+    or a list of addresses allowed to reach it.
+    """
+
+
+@cli.command("start")
+@_exposure_options
+@global_flags
+@pass_context
+def start_command(
+    ctx: Context,
+    host: str,
+    port: int,
+    daemon: bool,
+    require_https: bool,
+    tls_cert: str | None,
+    tls_key: str | None,
+    allow_ip: tuple[str, ...],
+    trusted_proxy: tuple[str, ...],
+) -> NoReturn:
+    """Start the panel and print an access token."""
+    options = StartOptions(
+        host=host,
+        port=port,
+        daemon=daemon,
+        require_https=require_https,
+        tls_cert=tls_cert,
+        tls_key=tls_key,
+        allow_ip=tuple(allow_ip),
+        trusted_proxy=tuple(trusted_proxy),
+    )
+    _exit(_start(options, ctx.verbose))
+
+
+@cli.command("stop")
+@global_flags
+@pass_context
+def stop_command(ctx: Context) -> NoReturn:
+    """Stop the running panel."""
+    _exit(_stop(ctx.verbose))
+
+
+@cli.command("status")
+@global_flags
+@pass_context
+def status_command(ctx: Context) -> NoReturn:
+    """Show whether the panel is running."""
+    _exit(_status(ctx.verbose))
+
+
+@cli.command("restart")
+@_exposure_options
+@global_flags
+@pass_context
+def restart_command(
+    ctx: Context,
+    host: str,
+    port: int,
+    daemon: bool,
+    require_https: bool,
+    tls_cert: str | None,
+    tls_key: str | None,
+    allow_ip: tuple[str, ...],
+    trusted_proxy: tuple[str, ...],
+) -> NoReturn:
+    """Stop the panel and start it again."""
+    options = StartOptions(
+        host=host,
+        port=port,
+        daemon=daemon,
+        require_https=require_https,
+        tls_cert=tls_cert,
+        tls_key=tls_key,
+        allow_ip=tuple(allow_ip),
+        trusted_proxy=tuple(trusted_proxy),
+    )
+    _exit(_restart(options, ctx.verbose))
+
+
+@cli.command("token")
+@click.option(
+    "-r",
+    "--regenerate",
+    is_flag=True,
+    help="Also rotate the signing key, which logs out every open session.",
+)
+@click.option("-y", "--yes", "assume_yes", is_flag=True, help="Do not ask for confirmation.")
+@global_flags
+@pass_context
+def token_command(ctx: Context, regenerate: bool, assume_yes: bool) -> NoReturn:
+    """Issue a new access token and print it."""
+    _exit(_token(regenerate=regenerate, confirm=not assume_yes, verbose=ctx.verbose))
+
+
+@cli.command("install")
+@click.option("--apt", "use_apt", is_flag=True, help="Install the distribution packages.")
+@click.option("--pip", "use_pip", is_flag=True, help="Install into this Python with pip.")
+@global_flags
+@pass_context
+def install_command(ctx: Context, use_apt: bool, use_pip: bool) -> NoReturn:
+    """Install the packages the panel needs."""
+    if use_apt and use_pip:
+        raise click.UsageError("Choose one of --apt or --pip, not both.")
+    _exit(_install(use_apt, use_pip, ctx.verbose))
+
+
+# ---------------------------------------------------------------------------
+# Legacy argparse entry point
+# ---------------------------------------------------------------------------
+
+
+def _handle_start(args: Namespace) -> int:
+    """
+    Handle ``web start`` from the argparse tree.
+
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        Exit code.
+    """
+    return _start(_start_options(args), args.verbose)
+
+
+def _handle_stop(args: Namespace) -> int:
+    """
+    Handle ``web stop`` from the argparse tree.
+
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        Exit code.
+    """
+    return _stop(args.verbose)
+
+
+def _handle_status(args: Namespace) -> int:
+    """
+    Handle ``web status`` from the argparse tree.
+
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        Exit code.
+    """
+    return _status(args.verbose)
+
+
+def _handle_restart(args: Namespace) -> int:
+    """
+    Handle ``web restart`` from the argparse tree.
+
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        Exit code.
+    """
+    return _restart(_start_options(args), args.verbose)
+
+
+def _handle_token(args: Namespace) -> int:
+    """
+    Handle ``web token`` from the argparse tree.
+
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        Exit code.
+    """
+    return _token(
+        regenerate=bool(getattr(args, "regenerate", False)),
+        confirm=False,
+        verbose=args.verbose,
+    )
+
+
+def _handle_install(args: Namespace) -> int:
+    """
+    Handle ``web install`` from the argparse tree.
+
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        Exit code.
+    """
+    return _install(
+        bool(getattr(args, "apt", False)),
+        bool(getattr(args, "pip", False)),
+        args.verbose,
+    )
+
+
+def handle_web(args: Namespace) -> int:
+    """
+    Route a ``web`` subcommand parsed by the legacy argparse tree.
+
+    Kept until ``wasm.cli.parser`` is deleted; it shares every implementation
+    with the Click commands above rather than duplicating them.
+
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        Exit code.
+    """
+    action = args.action
+
+    handlers: dict[str, Callable[[Namespace], int]] = {
+        "start": _handle_start,
+        "stop": _handle_stop,
+        "status": _handle_status,
+        "restart": _handle_restart,
+        "token": _handle_token,
+        "install": _handle_install,
+    }
+
+    handler = handlers.get(action)
+    if not handler:
+        print(f"Unknown action: {action}", file=sys.stderr)
+        return 1
+
+    try:
+        return handler(args)
+    except WASMError as e:
+        logger = Logger(verbose=args.verbose)
+        logger.error(str(e))
+        return 1
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+        return 0
+    except Exception as e:
+        logger = Logger(verbose=args.verbose)
+        logger.error(f"Unexpected error: {e}")
+        if args.verbose:
+            import traceback
+
+            traceback.print_exc()
+        return 1
+
+
+__all__ = [
+    "StartOptions",
+    "add_start_arguments",
+    "build_security_config",
+    "cli",
+    "get_pid_file",
+    "global_flags",
+    "handle_web",
+]

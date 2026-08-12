@@ -24,9 +24,40 @@ import click
 ROOT = Path(__file__).resolve().parent.parent
 CONTRACT = ROOT / "tests/contracts/cli_surface.json"
 
-#: Options the argparse tree declared and nothing ever read. They are not
-#: carried over, and their absence is not a regression.
-DROPPED_OPTIONS = frozenset()
+#: Global flags. argparse declared these on the root *and* on many subparsers
+#: with the same dest, which is precisely the bug the migration removes: the
+#: subparser's default overwrote the value the user had already given, so
+#: 'wasm --dry-run monitor scan' ran a real scan. Their absence from a
+#: subcommand is the fix, not a regression.
+#:
+#: They are still accepted after a subcommand name, so 'wasm backup list
+#: --json' keeps working; Click just routes them to the shared context instead
+#: of to a per-command variable that can shadow it.
+DROPPED_OPTIONS = frozenset({"--verbose", "-v", "--dry-run", "--json", "--no-color"})
+
+
+def resolve(root: click.Command, path: list[str]) -> click.Command | None:
+    """
+    Walk the tree to a command, following aliases.
+
+    Args:
+        root: Command to start from.
+        path: Command names.
+
+    Returns:
+        The command, or None when a segment does not resolve.
+    """
+    command: click.Command | None = root
+    for name in path:
+        if not isinstance(command, click.Group):
+            return None
+        try:
+            command = command.get_command(click.Context(command), name)
+        except click.ClickException:
+            return None
+        if command is None:
+            return None
+    return command
 
 
 def click_tree(command: click.Command, path: tuple[str, ...] = ()) -> dict[str, dict]:
@@ -65,7 +96,7 @@ def click_tree(command: click.Command, path: tuple[str, ...] = ()) -> dict[str, 
                 continue
             if sub is None:
                 continue
-            tree.update(click_tree(sub, path + (name,)))
+            tree.update(click_tree(sub, (*path, name)))
     return tree
 
 
@@ -79,7 +110,7 @@ def compare(subtree: str | None) -> int:
     Returns:
         Process exit code.
     """
-    from wasm.cli.app import ALIASES, cli
+    from wasm.cli.app import cli
 
     contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
     actual = click_tree(cli)
@@ -101,9 +132,13 @@ def compare(subtree: str | None) -> int:
         if missing_options:
             problems.append(f"wasm {key}: options gone: {sorted(missing_options)}")
         for alias in expected["aliases"]:
-            target = key.split(" ")[-1]
-            if ALIASES.get(alias) != target and alias not in actual:
-                problems.append(f"wasm {key}: alias '{alias}' no longer resolves")
+            # Resolve the alias through the tree rather than looking it up in
+            # the walked list: a group is free to accept an alias without
+            # listing it in --help, and several do.
+            parent = key.split(" ")[:-1]
+            alias_path = " ".join([*parent, alias])
+            if resolve(cli, [*parent, alias]) is None:
+                problems.append(f"wasm {key}: alias 'wasm {alias_path}' does not resolve")
 
     extra = {k for k in actual if k and in_scope(k)} - set(contract)
     if extra:

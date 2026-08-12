@@ -13,6 +13,10 @@ heartbeat that tells the operator the panel is alive.
 
 The routes read through the same managers the CLI uses. There is one
 implementation of the product; this is a view of it.
+
+Every entry in the navigation resolves to a route declared here. A dead link
+in a panel that holds root over the machine costs more trust than a screen
+that is missing, because the operator stops believing the rest of it.
 """
 
 from __future__ import annotations
@@ -21,9 +25,10 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 
 from wasm.web.auth import require_auth
+from wasm.web.views import resources
 from wasm.web.views.rendering import page
 
 log = logging.getLogger(__name__)
@@ -64,98 +69,6 @@ async def require_page_session(request: Request) -> dict[str, Any]:
 router = APIRouter(include_in_schema=False, dependencies=[Depends(require_page_session)])
 
 
-def _rows_from_store(kind: str) -> list[dict[str, Any]]:
-    """
-    Read a resource list from the store, shaped for the row component.
-
-    Args:
-        kind: Which resource to read: apps, sites, services or databases.
-
-    Returns:
-        Rows ready for the template. Empty when the store cannot be read.
-    """
-    from wasm.core.store import get_store
-
-    store = get_store()
-    readers = {
-        "apps": store.list_apps,
-        "sites": store.list_sites,
-        "services": store.list_services,
-        "databases": store.list_databases,
-    }
-    try:
-        records = readers[kind]()
-    except Exception as exc:
-        log.warning("Could not read %s from the store: %s", kind, exc)
-        return []
-
-    return [_shape(kind, record) for record in records]
-
-
-def _shape(kind: str, record: Any) -> dict[str, Any]:
-    """
-    Turn a store record into the fields the row component needs.
-
-    Args:
-        kind: Which resource this is.
-        record: The store dataclass.
-
-    Returns:
-        A row context.
-    """
-    if kind == "apps":
-        return {
-            "id": record.domain,
-            "domain": record.domain,
-            "state": record.status,
-            "meta": [
-                ("type", record.app_type),
-                ("port", record.port or "—"),
-                ("ssl", "yes" if record.ssl_enabled else "no"),
-            ],
-        }
-    if kind == "sites":
-        return {
-            "id": record.domain,
-            "domain": record.domain,
-            "state": "active" if record.enabled else "idle",
-            "meta": [
-                ("server", record.webserver),
-                ("ssl", "yes" if record.ssl_enabled else "no"),
-            ],
-        }
-    if kind == "services":
-        return {
-            "id": record.name,
-            "domain": record.name,
-            "state": record.status,
-            "meta": [("port", record.port or "—"), ("user", record.user)],
-        }
-    return {
-        "id": getattr(record, "name", "?"),
-        "domain": getattr(record, "name", "?"),
-        "state": "idle",
-        "meta": [("engine", getattr(record, "engine", "?"))],
-    }
-
-
-def _needs_attention(apps: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """
-    Pick out what an operator should look at first.
-
-    Args:
-        apps: Shaped application rows.
-
-    Returns:
-        The subset in a failed state, with a link to open each.
-    """
-    return [
-        {**app, "name": app["domain"], "href": f"/apps/{app['domain']}"}
-        for app in apps
-        if app["state"] in {"failed", "error"}
-    ]
-
-
 @router.get("/", response_class=HTMLResponse)
 def dashboard(request: Request) -> HTMLResponse:
     """
@@ -167,14 +80,16 @@ def dashboard(request: Request) -> HTMLResponse:
     Returns:
         The overview page.
     """
-    apps = _rows_from_store("apps")
+    apps = resources.resource_rows("apps")
+    running, recent = resources.job_rows()
     return page(
         request,
         "pages/dashboard.html",
         {
             "apps": apps,
-            "attention": _needs_attention(apps),
-            "activity": [],
+            "attention": resources.needs_attention(apps),
+            "running": running,
+            "activity": recent,
         },
     )
 
@@ -249,6 +164,148 @@ def databases(request: Request) -> HTMLResponse:
     return page(request, "pages/resources.html", _resource_page("databases"))
 
 
+@router.get("/apps/{domain}", response_class=HTMLResponse)
+def app_detail(request: Request, domain: str) -> HTMLResponse:
+    """
+    Render one application: what it is, what runs it and what it was told.
+
+    Args:
+        request: The incoming request.
+        domain: The application's domain.
+
+    Returns:
+        The application page, or a 404 page naming the domain that is not
+        deployed. The domain is echoed escaped, like every other value the
+        templates render.
+    """
+    detail = resources.application_detail(domain)
+    if detail is None:
+        return page(
+            request,
+            "pages/missing.html",
+            {
+                "section": "Applications",
+                "title": "No such application",
+                "body": f"Nothing is deployed at {domain} on this machine.",
+                "command": "wasm list",
+            },
+            status_code=404,
+        )
+    return page(request, "pages/app.html", detail)
+
+
+@router.get("/certificates", response_class=HTMLResponse)
+def certificates(request: Request) -> HTMLResponse:
+    """
+    Render the certificates: what covers what, and for how much longer.
+
+    Args:
+        request: The incoming request.
+
+    Returns:
+        The certificates page.
+    """
+    rows, problem = resources.certificate_rows()
+    uncovered = resources.domains_without_certificate(rows) if problem is None else []
+    expiring = [row for row in rows if row["state"] in ("busy", "failed")]
+    return page(
+        request,
+        "pages/certificates.html",
+        {
+            "rows": rows,
+            "uncovered": uncovered,
+            "expiring": len(expiring),
+            "problem": problem,
+        },
+    )
+
+
+@router.get("/backups", response_class=HTMLResponse)
+def backups(request: Request) -> HTMLResponse:
+    """
+    Render the backups: when each was taken, how big it is and what it holds.
+
+    Args:
+        request: The incoming request.
+
+    Returns:
+        The backups page.
+    """
+    rows, storage = resources.backup_rows()
+    return page(request, "pages/backups.html", {"rows": rows, "storage": storage})
+
+
+@router.get("/activity", response_class=HTMLResponse)
+def activity(request: Request) -> HTMLResponse:
+    """
+    Render what this machine is doing and what it just did.
+
+    Args:
+        request: The incoming request.
+
+    Returns:
+        The activity page.
+    """
+    running, recent = resources.job_rows()
+    return page(request, "pages/activity.html", {"running": running, "recent": recent})
+
+
+@router.get("/settings", response_class=HTMLResponse)
+def settings(request: Request) -> HTMLResponse:
+    """
+    Render the stored configuration, with every secret redacted.
+
+    Args:
+        request: The incoming request.
+
+    Returns:
+        The settings page.
+    """
+    sections, problem = resources.settings_sections()
+    return page(
+        request,
+        "pages/settings.html",
+        {"sections": sections, "problem": problem},
+    )
+
+
+@router.post("/logout")
+def sign_out(request: Request) -> Response:
+    """
+    End the session and send the browser back to the sign-in page.
+
+    The JSON endpoint at ``/api/auth/logout`` cannot finish this job: it
+    answers with a payload, and a person who clicked "Sign out" needs to end up
+    somewhere else. This does the same revocation and hands htmx the redirect
+    header, so the button in the shell leads somewhere instead of nowhere.
+
+    The CSRF header is required here exactly as it is on every other mutation,
+    because it goes through the same session dependency as the pages.
+
+    Args:
+        request: The incoming request.
+
+    Returns:
+        An empty response telling the browser to go to the sign-in page.
+    """
+    from wasm.web.auth import (
+        CSRF_COOKIE_NAME,
+        SESSION_COOKIE_NAME,
+        get_global_token_manager,
+    )
+
+    session = getattr(request.state, "session", None) or {}
+    manager = get_global_token_manager()
+    session_id = session.get("sid")
+    if manager is not None and session_id and session.get("type") == "session":
+        manager.revoke_session(session_id)
+
+    response = Response(status_code=200, headers={"HX-Redirect": "/login"})
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+    response.delete_cookie(CSRF_COOKIE_NAME, path="/")
+    return response
+
+
 #: Copy for each resource list. Empty states name the one thing to do next and
 #: give the equivalent command, because this audience often prefers the
 #: terminal and should not have to guess the incantation.
@@ -290,7 +347,7 @@ def _resource_page(kind: str) -> dict[str, Any]:
     Returns:
         The page context.
     """
-    rows = _rows_from_store(kind)
+    rows = resources.resource_rows(kind)
     copy = _RESOURCE_COPY[kind]
     return {
         "kind": kind,

@@ -10,13 +10,22 @@ These handlers used to build a ``MonitorConfig`` with ``auto_terminate``,
 stopped being an antivirus, so ``wasm monitor scan`` raised a TypeError on every
 run. Nothing here reads a configuration key that the monitor does not have; the
 handler map is exported so a test can exercise every action.
+
+Each action is a plain function taking the values it needs. The Click group and
+the argparse handler that :mod:`wasm.cli.parser` still calls both dispatch
+through :data:`ACTIONS`, so neither entry point can drift from the other while
+the migration finishes.
 """
 
 from __future__ import annotations
 
 from argparse import Namespace
 from collections.abc import Callable
+from typing import Any
 
+import click
+
+from wasm.cli.app import Context, pass_context
 from wasm.core.config import Config
 from wasm.core.exceptions import EmailError, MonitorError, WASMError
 from wasm.core.logger import Logger
@@ -38,10 +47,15 @@ from wasm.monitor import (
 
 #: Options the parser still accepts from the antivirus era. Accepting and
 #: explaining them beats an argparse error for a flag a user's script may pass.
+#: The key is the argparse destination the flag was parsed into.
 REMOVED_SCAN_FLAGS: tuple[tuple[str, str], ...] = (
     ("force_ai", "--force-ai"),
     ("all", "--all"),
 )
+
+#: Alternative spellings for the actions of this group. Local, because the root
+#: alias table only rewrites the first word of the command line.
+LOCAL_ALIASES: dict[str, str] = {"info": "status"}
 
 
 def _require_root(action: str) -> None:
@@ -61,20 +75,34 @@ def _require_root(action: str) -> None:
         )
 
 
-def _warn_about_removed_flags(args: Namespace, logger: Logger) -> None:
+def _ignored_flags(force_ai: bool = False, all_processes: bool = False) -> tuple[str, ...]:
+    """
+    Name the retired scan flags the caller passed.
+
+    Args:
+        force_ai: Whether ``--force-ai`` was given.
+        all_processes: Whether ``--all`` was given.
+
+    Returns:
+        The flags, spelled as the user typed them.
+    """
+    passed = {"force_ai": force_ai, "all": all_processes}
+    return tuple(flag for destination, flag in REMOVED_SCAN_FLAGS if passed[destination])
+
+
+def _warn_about_removed_flags(flags: tuple[str, ...], logger: Logger) -> None:
     """
     Tell the user that the AI scan options no longer do anything.
 
     Args:
-        args: Parsed arguments.
+        flags: Retired flags the caller passed.
         logger: Logger to report through.
     """
-    for attribute, flag in REMOVED_SCAN_FLAGS:
-        if getattr(args, attribute, False):
-            logger.warning(
-                f"{flag} is ignored: the monitor no longer sends process data to a "
-                "third-party model. It reports what it sees, locally."
-            )
+    for flag in flags:
+        logger.warning(
+            f"{flag} is ignored: the monitor no longer sends process data to a "
+            "third-party model. It reports what it sees, locally."
+        )
 
 
 def _print_observation(observation: ProcessObservation, logger: Logger) -> None:
@@ -102,54 +130,18 @@ def _print_observation(observation: ProcessObservation, logger: Logger) -> None:
     logger.key_value("Command", process.command or "-", indent=4)
 
 
-def handle_monitor(args: Namespace) -> int:
-    """
-    Route a ``wasm monitor`` invocation to its handler.
-
-    Only :class:`WASMError` is caught here. A TypeError or an AttributeError is
-    a defect in WASM, and the previous blanket ``except Exception`` is exactly
-    what let this command ship broken: it turned a call to a constructor that no
-    longer accepted its arguments into a one-line "unexpected error".
-
-    Args:
-        args: Parsed arguments.
-
-    Returns:
-        Exit code.
-    """
-    logger = Logger(verbose=args.verbose)
-
-    handler = ACTIONS.get(args.action)
-    if handler is None:
-        logger.error(
-            f"Unknown action: {args.action}",
-            f"Known actions: {', '.join(sorted(ACTIONS))}",
-        )
-        return 1
-
-    try:
-        return handler(args)
-    except WASMError as exc:
-        # WASMError.__str__ already appends the details; passing them twice prints twice.
-        logger.error(str(exc))
-        return 1
-    except KeyboardInterrupt:
-        logger.info("Interrupted")
-        return 130
-
-
-def _handle_status(args: Namespace) -> int:
+def _show_status(verbose: bool = False) -> int:
     """
     Show the state of the monitor service and what it is set to observe.
 
     Args:
-        args: Parsed arguments.
+        verbose: Print the detail of each step.
 
     Returns:
         Exit code.
     """
-    logger = Logger(verbose=args.verbose)
-    monitor = ProcessMonitor(verbose=args.verbose)
+    logger = Logger(verbose=verbose)
+    monitor = ProcessMonitor(verbose=verbose)
     status = monitor.get_service_status()
 
     logger.header("WASM monitor")
@@ -212,20 +204,22 @@ def _print_scope(logger: Logger) -> None:
         logger.list_item(guarantee.replace("Never ", "", 1).rstrip("."))
 
 
-def _handle_scan(args: Namespace) -> int:
+def _run_scan(verbose: bool = False, ignored_flags: tuple[str, ...] = ()) -> int:
     """
     Run a single scan and print what it noticed.
 
     Args:
-        args: Parsed arguments.
+        verbose: Print the detail of each step.
+        ignored_flags: Retired flags the caller passed, reported back so a
+            script that still sends one learns that it does nothing.
 
     Returns:
         Exit code.
     """
-    logger = Logger(verbose=args.verbose)
-    _warn_about_removed_flags(args, logger)
+    logger = Logger(verbose=verbose)
+    _warn_about_removed_flags(ignored_flags, logger)
 
-    monitor = ProcessMonitor(verbose=args.verbose)
+    monitor = ProcessMonitor(verbose=verbose)
     logger.info(
         f"Sampling processes for {DEFAULT_CPU_SAMPLE_INTERVAL:.1f}s "
         "(CPU usage is a delta, a single reading is always zero)"
@@ -245,18 +239,18 @@ def _handle_scan(args: Namespace) -> int:
     return 0
 
 
-def _handle_run(args: Namespace) -> int:
+def _run_foreground(verbose: bool = False) -> int:
     """
     Run the observation loop in the foreground.
 
     Args:
-        args: Parsed arguments.
+        verbose: Print the detail of each step.
 
     Returns:
         Exit code.
     """
-    logger = Logger(verbose=args.verbose)
-    monitor = ProcessMonitor(verbose=args.verbose)
+    logger = Logger(verbose=verbose)
+    monitor = ProcessMonitor(verbose=verbose)
 
     logger.info(f"Starting monitor, scanning every {monitor.config.scan_interval}s")
     logger.info("Press Ctrl+C to stop")
@@ -270,30 +264,30 @@ def _handle_run(args: Namespace) -> int:
     return 0
 
 
-def _handle_install(args: Namespace) -> int:
+def _install(verbose: bool = False) -> int:
     """
     Write the systemd unit without enabling it.
 
     Args:
-        args: Parsed arguments.
+        verbose: Print the detail of each step.
 
     Returns:
         Exit code.
     """
     _require_root("monitor install")
-    logger = Logger(verbose=args.verbose)
+    logger = Logger(verbose=verbose)
 
-    ProcessMonitor(verbose=args.verbose).install_service()
+    ProcessMonitor(verbose=verbose).install_service()
     logger.info("Enable it with: wasm monitor enable")
     return 0
 
 
-def _handle_enable(args: Namespace) -> int:
+def _enable(verbose: bool = False) -> int:
     """
     Install the unit if needed, then enable and start it.
 
     Args:
-        args: Parsed arguments.
+        verbose: Print the detail of each step.
 
     Returns:
         Exit code.
@@ -302,7 +296,7 @@ def _handle_enable(args: Namespace) -> int:
         MonitorError: When psutil is missing or systemd refuses.
     """
     _require_root("monitor enable")
-    logger = Logger(verbose=args.verbose)
+    logger = Logger(verbose=verbose)
 
     logger.step(1, 3, "Checking dependencies")
     try:
@@ -317,7 +311,7 @@ def _handle_enable(args: Namespace) -> int:
         ) from exc
     logger.success("psutil available")
 
-    monitor = ProcessMonitor(verbose=args.verbose)
+    monitor = ProcessMonitor(verbose=verbose)
 
     logger.step(2, 3, "Installing the service")
     if monitor.get_service_status()["installed"]:
@@ -333,19 +327,19 @@ def _handle_enable(args: Namespace) -> int:
     return 0
 
 
-def _handle_disable(args: Namespace) -> int:
+def _disable(verbose: bool = False) -> int:
     """
     Stop the service and take it out of the boot sequence.
 
     Args:
-        args: Parsed arguments.
+        verbose: Print the detail of each step.
 
     Returns:
         Exit code.
     """
     _require_root("monitor disable")
-    logger = Logger(verbose=args.verbose)
-    monitor = ProcessMonitor(verbose=args.verbose)
+    logger = Logger(verbose=verbose)
+    monitor = ProcessMonitor(verbose=verbose)
 
     if not monitor.get_service_status()["installed"]:
         logger.error("Monitor service is not installed")
@@ -355,19 +349,19 @@ def _handle_disable(args: Namespace) -> int:
     return 0
 
 
-def _handle_uninstall(args: Namespace) -> int:
+def _uninstall(verbose: bool = False) -> int:
     """
     Stop the service and remove the unit WASM wrote.
 
     Args:
-        args: Parsed arguments.
+        verbose: Print the detail of each step.
 
     Returns:
         Exit code.
     """
     _require_root("monitor uninstall")
-    logger = Logger(verbose=args.verbose)
-    monitor = ProcessMonitor(verbose=args.verbose)
+    logger = Logger(verbose=verbose)
+    monitor = ProcessMonitor(verbose=verbose)
 
     if not monitor.get_service_status()["installed"]:
         logger.warning("Monitor service is not installed")
@@ -377,18 +371,18 @@ def _handle_uninstall(args: Namespace) -> int:
     return 0
 
 
-def _handle_test_email(args: Namespace) -> int:
+def _test_email(verbose: bool = False) -> int:
     """
     Send a message to prove the notification settings work.
 
     Args:
-        args: Parsed arguments.
+        verbose: Print the detail of each step.
 
     Returns:
         Exit code.
     """
-    logger = Logger(verbose=args.verbose)
-    notifier = EmailNotifier(verbose=args.verbose)
+    logger = Logger(verbose=verbose)
+    notifier = EmailNotifier(verbose=verbose)
 
     if not notifier.recipients:
         logger.error(
@@ -409,17 +403,17 @@ def _handle_test_email(args: Namespace) -> int:
     return 0
 
 
-def _handle_config(args: Namespace) -> int:
+def _show_config(verbose: bool = False) -> int:
     """
     Print the monitor settings that exist.
 
     Args:
-        args: Parsed arguments.
+        verbose: Print the detail of each step.
 
     Returns:
         Exit code.
     """
-    logger = Logger(verbose=args.verbose)
+    logger = Logger(verbose=verbose)
     config = Config()
 
     logger.header("Monitor configuration")
@@ -456,17 +450,217 @@ def _handle_config(args: Namespace) -> int:
     return 0
 
 
-#: Every action ``wasm monitor`` accepts. Exported so the parser and the tests
-#: agree on one list instead of two that drift.
-ACTIONS: dict[str, Callable[[Namespace], int]] = {
-    "status": _handle_status,
-    "info": _handle_status,
-    "scan": _handle_scan,
-    "run": _handle_run,
-    "install": _handle_install,
-    "enable": _handle_enable,
-    "disable": _handle_disable,
-    "uninstall": _handle_uninstall,
-    "test-email": _handle_test_email,
-    "config": _handle_config,
+#: Every action ``wasm monitor`` accepts. Exported so the parser, the Click
+#: group and the tests agree on one list instead of three that drift. Every
+#: entry takes ``verbose``; ``scan`` also takes ``ignored_flags``.
+ACTIONS: dict[str, Callable[..., int]] = {
+    "status": _show_status,
+    "info": _show_status,
+    "scan": _run_scan,
+    "run": _run_foreground,
+    "install": _install,
+    "enable": _enable,
+    "disable": _disable,
+    "uninstall": _uninstall,
+    "test-email": _test_email,
+    "config": _show_config,
 }
+
+
+class MonitorGroup(click.Group):
+    """
+    A group that answers to the alternative spellings of its own actions.
+
+    The root group rewrites only the first word of the command line, so
+    ``wasm monitor info`` has to be resolved here or it stops working.
+    """
+
+    def get_command(self, ctx: click.Context, name: str) -> click.Command | None:
+        """
+        Look a subcommand up, resolving a local alias first.
+
+        Args:
+            ctx: Click context.
+            name: Name the user typed.
+
+        Returns:
+            The command, or None when there is no such action.
+        """
+        return super().get_command(ctx, LOCAL_ALIASES.get(name, name))
+
+    def resolve_command(
+        self, ctx: click.Context, args: list[str]
+    ) -> tuple[str | None, click.Command | None, list[str]]:
+        """
+        Resolve a command, reporting the name the user actually typed.
+
+        Args:
+            ctx: Click context.
+            args: Remaining command line arguments.
+
+        Returns:
+            The typed name, the command and the arguments left over.
+        """
+        _, command, remaining = super().resolve_command(ctx, args)
+        return (command.name if command else None), command, remaining
+
+
+@click.group("monitor", cls=MonitorGroup)
+def cli() -> None:
+    """
+    Watch this server and write down what stands out.
+
+    The monitor reads resource usage, the process table and the health of the
+    units you list, keeps what it noticed in a local database and can mail you
+    a report. It never stops a process and never deletes a file.
+    """
+
+
+@cli.command("status")
+@pass_context
+def status(ctx: Context) -> int:
+    """Show whether the monitor is running and what it is watching."""
+    return _show_status(verbose=ctx.verbose)
+
+
+@cli.command("scan")
+@click.option(
+    "--force-ai",
+    is_flag=True,
+    help="Retired. The monitor analyses nothing off this machine; it only reports.",
+)
+@click.option(
+    "--all",
+    "all_processes",
+    is_flag=True,
+    help="Retired. Every scan already walks the whole process table.",
+)
+@pass_context
+def scan(ctx: Context, force_ai: bool, all_processes: bool) -> int:
+    """
+    Look at the machine once and print what stands out.
+
+    Samples CPU over a short window, so it takes a moment to answer.
+    """
+    return _run_scan(
+        verbose=ctx.verbose,
+        ignored_flags=_ignored_flags(force_ai=force_ai, all_processes=all_processes),
+    )
+
+
+@cli.command("run")
+@pass_context
+def run(ctx: Context) -> int:
+    """Scan on a loop in this terminal, until you press Ctrl+C."""
+    return _run_foreground(verbose=ctx.verbose)
+
+
+@cli.command("install")
+@pass_context
+def install(ctx: Context) -> int:
+    """Write the monitor's systemd unit, without starting it."""
+    return _install(verbose=ctx.verbose)
+
+
+@cli.command("enable")
+@pass_context
+def enable(ctx: Context) -> int:
+    """Start the monitor now and on every boot, installing it if needed."""
+    return _enable(verbose=ctx.verbose)
+
+
+@cli.command("disable")
+@pass_context
+def disable(ctx: Context) -> int:
+    """Stop the monitor and keep it from starting at boot."""
+    return _disable(verbose=ctx.verbose)
+
+
+@cli.command("uninstall")
+@click.option("-y", "--yes", is_flag=True, help="Do not ask for confirmation.")
+@pass_context
+def uninstall(ctx: Context, yes: bool) -> int:
+    """
+    Remove the monitor's systemd unit from this server.
+
+    Observations already recorded stay in the database.
+    """
+    if not yes and not click.confirm(
+        "Remove the wasm-monitor systemd unit? Nothing will watch this server "
+        "until you run 'wasm monitor enable' again"
+    ):
+        click.echo("Cancelled")
+        return 0
+    return _uninstall(verbose=ctx.verbose)
+
+
+@cli.command("test-email")
+@pass_context
+def test_email(ctx: Context) -> int:
+    """Send one email to the configured recipients to prove the settings work."""
+    return _test_email(verbose=ctx.verbose)
+
+
+@cli.command("config")
+@pass_context
+def config(ctx: Context) -> int:
+    """Show the monitor's current settings and where its database lives."""
+    return _show_config(verbose=ctx.verbose)
+
+
+def _namespace_kwargs(args: Namespace) -> dict[str, Any]:
+    """
+    Pull the arguments an action needs off an argparse namespace.
+
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        Keyword arguments for the action.
+    """
+    kwargs: dict[str, Any] = {"verbose": getattr(args, "verbose", False)}
+    if args.action == "scan":
+        kwargs["ignored_flags"] = _ignored_flags(
+            force_ai=getattr(args, "force_ai", False),
+            all_processes=getattr(args, "all", False),
+        )
+    return kwargs
+
+
+def handle_monitor(args: Namespace) -> int:
+    """
+    Route a ``wasm monitor`` invocation to its handler.
+
+    Kept while :mod:`wasm.cli.parser` still routes through argparse; it shares
+    :data:`ACTIONS` with the Click group rather than repeating it.
+
+    Only :class:`WASMError` is caught here. A TypeError or an AttributeError is
+    a defect in WASM, and the previous blanket ``except Exception`` is exactly
+    what let this command ship broken: it turned a call to a constructor that no
+    longer accepted its arguments into a one-line "unexpected error".
+
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        Exit code.
+    """
+    logger = Logger(verbose=args.verbose)
+
+    handler = ACTIONS.get(args.action)
+    if handler is None:
+        logger.error(
+            f"Unknown action: {args.action}",
+            f"Known actions: {', '.join(sorted(ACTIONS))}",
+        )
+        return 1
+
+    try:
+        return handler(**_namespace_kwargs(args))
+    except WASMError as exc:
+        # WASMError.__str__ already appends the details; passing them twice prints twice.
+        logger.error(str(exc))
+        return 1
+    except KeyboardInterrupt:
+        logger.info("Interrupted")
+        return 130

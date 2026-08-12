@@ -50,7 +50,7 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "wasm=wasm.main:cli",
+            "wasm=wasm.cli.app:entrypoint",
         ],
     },
     data_files=[

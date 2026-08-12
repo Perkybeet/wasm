@@ -2,8 +2,8 @@
   Overview.
 
   What an operator wants on opening the panel, in order: is anything broken,
-  what changed recently, and what is about to need attention. Everything else
-  is one click away and does not belong here.
+  is anything happening right now, what is deployed, and what just finished.
+  Everything else is one click away and does not belong here.
 #}
 {% extends "base.html" %}
 {% import "_macros.html" as m %}
@@ -12,9 +12,7 @@
 
 {% block content %}
 
-{% call m.page_head("Overview", machine.hostname) %}
-  <a class="btn btn--primary" href="/apps/new">Deploy an application</a>
-{% endcall %}
+{{ m.page_head("Overview", machine.hostname) }}
 
 {#
   Attention first. When nothing is wrong this section is absent entirely,
@@ -26,8 +24,25 @@
     <h2 class="label" style="margin-bottom: var(--space-2)">Needs attention</h2>
     <div class="rows">
       {% for item in attention %}
-        {% call m.row(item.name, item.state, item.meta, item.href, "row-" ~ item.id) %}
+        {% call m.row(item.domain, item.state, item.meta, item.href, "row-" ~ item.id) %}
           <a class="btn btn--sm" href="{{ item.href }}">Open</a>
+        {% endcall %}
+      {% endfor %}
+    </div>
+  </section>
+{% endif %}
+
+{# In flight, and only when there is something in flight: an empty "running"
+   panel on every page load is furniture. #}
+{% if running %}
+  <section style="margin-bottom: var(--space-6)">
+    <h2 class="label" style="margin-bottom: var(--space-2)">Working now</h2>
+    <div class="rows">
+      {% for job in running %}
+        {% call m.row(job.name, job.state,
+                      [("step", job.current_step), ("progress", job.progress ~ "/" ~ job.total_steps),
+                       ("started", job.started)], "/activity", "row-" ~ job.id) %}
+          {{ m.follow_button("Logs", job.name, job.log_url) }}
         {% endcall %}
       {% endfor %}
     </div>
@@ -40,9 +55,9 @@
   {% if apps %}
     <div class="rows">
       {% for app in apps %}
-        {% call m.row(app.domain, app.state, app.meta, "/apps/" ~ app.domain, "row-" ~ app.id) %}
-          {{ m.follow_button("Logs", app.domain, "/ws/logs/" ~ app.domain) }}
-          {{ m.action_button("Restart", "/api/apps/" ~ app.domain ~ "/restart") }}
+        {% call m.row(app.domain, app.state, app.meta, app.href, "row-" ~ app.id) %}
+          {{ m.follow_button("Logs", app.domain, app.log_url) }}
+          {{ m.action_button("Restart", app.restart_endpoint) }}
         {% endcall %}
       {% endfor %}
     </div>
@@ -50,8 +65,7 @@
     {{ m.empty(
         "No applications yet",
         "Deploy one from a Git repository, an archive or a local directory.",
-        "Deploy an application", "/apps/new",
-        "wasm create -d example.com -s https://github.com/you/app") }}
+        command="wasm create -d example.com -s https://github.com/you/app") }}
   {% endif %}
 </section>
 
@@ -62,7 +76,7 @@
     <table class="table">
       <thead>
         <tr>
-          <th>When</th>
+          <th>Finished</th>
           <th>Action</th>
           <th>Resource</th>
           <th>Result</th>
@@ -71,10 +85,10 @@
       <tbody>
         {% for entry in activity %}
           <tr>
-            <td class="num">{{ entry.when }}</td>
-            <td>{{ entry.action }}</td>
+            <td class="mono">{{ entry.finished }}</td>
+            <td><a href="/activity">{{ entry.name }}</a></td>
             <td class="mono">{{ entry.resource }}</td>
-            <td>{{ m.badge(entry.state, entry.result) }}</td>
+            <td>{{ m.badge(entry.state, entry.status) }}</td>
           </tr>
         {% endfor %}
       </tbody>

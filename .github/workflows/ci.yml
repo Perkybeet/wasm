@@ -157,6 +157,19 @@ jobs:
       - name: Check vendored assets
         run: python scripts/vendor_assets.py --check
 
+      # Every command, alias and option the argparse tree exposed still exists.
+      # They are in scripts and in muscle memory, so losing one is a breaking
+      # change whether or not anyone meant it.
+      - name: Check the command surface
+        run: |
+          pip install -e ".[all]"
+          python scripts/cli_parity.py
+
+      # There used to be two man pages, diverged, fifteen releases stale, and
+      # the one shipped in the .deb declared the wrong licence.
+      - name: Check the man page is current
+        run: python scripts/generate_man.py --check
+
       - name: Build distributions
         run: |
           pip install build twine

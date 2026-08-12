@@ -82,12 +82,33 @@ def duration(seconds: float | int | None) -> str:
     return f"{days}d {hours}h"
 
 
+def _localised(moment: dt.datetime) -> dt.datetime:
+    """
+    Attach this machine's offset to a timestamp that was written without one.
+
+    Everything WASM records is stamped with ``datetime.now()``: the store, the
+    job manager and the backup manager all do it, and none of them attach an
+    offset. Reading those back as UTC is how a deploy that finished a minute
+    ago came out as "in 59m", an hour in the future, on any machine that is not
+    in London.
+
+    Args:
+        moment: The timestamp, aware or naive.
+
+    Returns:
+        An aware timestamp.
+    """
+    return moment.astimezone() if moment.tzinfo is None else moment
+
+
 def since(moment: dt.datetime | str | None) -> str:
     """
     Render how long ago something happened.
 
     Args:
-        moment: When it happened, as a datetime or an ISO 8601 string.
+        moment: When it happened, as a datetime or an ISO 8601 string. A
+            timestamp with no offset is read as local time, which is how every
+            part of WASM writes one.
 
     Returns:
         A relative description, or an em dash when unknown.
@@ -96,11 +117,13 @@ def since(moment: dt.datetime | str | None) -> str:
         return "—"
     if isinstance(moment, str):
         try:
-            moment = dt.datetime.fromisoformat(moment)
+            parsed = dt.datetime.fromisoformat(moment)
         except ValueError:
+            # An unparsable timestamp is shown as it was stored. Inventing a
+            # date for it would be worse than admitting the record is odd.
             return moment
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=dt.timezone.utc)
+        moment = parsed
+    moment = _localised(moment)
     delta = dt.datetime.now(dt.timezone.utc) - moment
     if delta.total_seconds() < 0:
         return f"in {duration(-delta.total_seconds())}"
@@ -112,7 +135,8 @@ def until(moment: dt.datetime | str | None) -> str:
     Render how long remains before a deadline, such as certificate expiry.
 
     Args:
-        moment: The deadline, as a datetime or an ISO 8601 string.
+        moment: The deadline, as a datetime or an ISO 8601 string. A timestamp
+            with no offset is read as local time.
 
     Returns:
         A relative description, or "expired" when it has passed.
@@ -121,11 +145,11 @@ def until(moment: dt.datetime | str | None) -> str:
         return "—"
     if isinstance(moment, str):
         try:
-            moment = dt.datetime.fromisoformat(moment)
+            parsed = dt.datetime.fromisoformat(moment)
         except ValueError:
             return moment
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=dt.timezone.utc)
+        moment = parsed
+    moment = _localised(moment)
     delta = moment - dt.datetime.now(dt.timezone.utc)
     if delta.total_seconds() <= 0:
         return "expired"
@@ -176,7 +200,9 @@ class _LoudUndefined(ChainableUndefined):
 templates = build_environment()
 
 
-def page(request: Request, name: str, context: dict[str, Any]) -> HTMLResponse:
+def page(
+    request: Request, name: str, context: dict[str, Any], status_code: int = 200
+) -> HTMLResponse:
     """
     Render a full page.
 
@@ -184,6 +210,9 @@ def page(request: Request, name: str, context: dict[str, Any]) -> HTMLResponse:
         request: The incoming request, used for the shared context.
         name: Template path relative to the templates directory.
         context: Values the template needs, merged over the shared context.
+        status_code: HTTP status to answer with. A page that reports something
+            missing says so in its status too, so a proxy, a log and a person
+            all agree on what happened.
 
     Returns:
         The rendered page.
@@ -192,7 +221,7 @@ def page(request: Request, name: str, context: dict[str, Any]) -> HTMLResponse:
 
     merged = shared_context(request)
     merged.update(context)
-    return HTMLResponse(templates.get_template(name).render(**merged))
+    return HTMLResponse(templates.get_template(name).render(**merged), status_code=status_code)
 
 
 def fragment(request: Request, name: str, context: dict[str, Any]) -> HTMLResponse:

@@ -260,62 +260,45 @@ class UpdateChecker:
         Returns:
             Installation method: 'pip', 'pipx', 'apt', 'dnf', 'yum', 'zypper', or 'unknown'.
         """
-        import subprocess
         import sys
 
-        try:
-            # Check pipx first (most specific)
-            pipx_path = Path.home() / ".local" / "pipx" / "venvs" / "wasm-cli"
-            if pipx_path.exists():
-                return "pipx"
+        from wasm.core.runner import get_runner
 
-            # Check system package managers BEFORE pip, since system packages
-            # install Python files that pip can also detect (false positive)
+        runner = get_runner()
 
-            # APT (Ubuntu, Debian) - package is called "wasm" not "wasm-cli"
-            if Path("/var/lib/dpkg/status").exists():
-                result = subprocess.run(["dpkg", "-s", "wasm"], capture_output=True, timeout=2)
-                if result.returncode == 0:
-                    return "apt"
+        # Every probe is short: a package manager that does not answer in two
+        # seconds is not going to, and this runs on the way to the command the
+        # user actually asked for.
+        probe = 2
 
-            # DNF/YUM (Fedora, RHEL, CentOS)
-            for pkg_manager in ["dnf", "yum"]:
-                try:
-                    result = subprocess.run(
-                        [pkg_manager, "list", "installed", "wasm-cli"],
-                        capture_output=True,
-                        timeout=2,
-                    )
-                    if result.returncode == 0:
-                        return pkg_manager
-                except FileNotFoundError:
-                    continue
+        pipx_path = Path.home() / ".local" / "pipx" / "venvs" / "wasm-cli"
+        if pipx_path.exists():
+            return "pipx"
 
-            # Zypper (openSUSE)
-            try:
-                result = subprocess.run(
-                    ["zypper", "se", "-i", "wasm-cli"], capture_output=True, timeout=2
-                )
-                if result.returncode == 0 and b"wasm-cli" in result.stdout:
-                    return "zypper"
-            except FileNotFoundError:
-                pass
+        # System package managers before pip. A distribution package installs
+        # Python files that pip can also see, so asking pip first reports the
+        # wrong answer and then offers the wrong upgrade command.
+        if Path("/var/lib/dpkg/status").exists() and runner.run(
+            ["dpkg", "-s", "wasm"], timeout=probe
+        ):
+            return "apt"
 
-            # Check pip (after system package managers)
-            result = subprocess.run(
-                [sys.executable, "-m", "pip", "show", "wasm-cli"],
-                capture_output=True,
-                text=True,
-                timeout=2,
-            )
-            if result.returncode == 0:
-                # Check if installed in editable mode (from source)
-                if "Editable project location:" in result.stdout or "-e " in result.stdout:
-                    return "source"
-                return "pip"
+        for package_manager in ("dnf", "yum"):
+            if runner.exists(package_manager) and runner.run(
+                [package_manager, "list", "installed", "wasm-cli"], timeout=probe
+            ):
+                return package_manager
 
-        except Exception as e:
-            logger.debug(f"Failed to detect installation method: {e}")
+        if runner.exists("zypper"):
+            result = runner.run(["zypper", "se", "-i", "wasm-cli"], timeout=probe)
+            if result.success and "wasm-cli" in result.stdout:
+                return "zypper"
+
+        result = runner.run([sys.executable, "-m", "pip", "show", "wasm-cli"], timeout=probe)
+        if result.success:
+            if "Editable project location:" in result.stdout or "-e " in result.stdout:
+                return "source"
+            return "pip"
 
         return "unknown"
 

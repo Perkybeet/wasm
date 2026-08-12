@@ -13,12 +13,21 @@ that: it asked ServiceManager for a ``status`` method that does not exist, so
 every application was counted as failed, and it looked for an ``expires`` key
 in certificate data that carries ``expiry``, so no certificate ever appeared to
 be close to renewal.
+
+The check itself lives in :func:`run_health_check`. The Click command and the
+argparse handler that :mod:`wasm.cli.parser` still calls are both two lines
+around it, so the two entry points cannot drift while the migration finishes.
 """
+
+from __future__ import annotations
 
 import shutil
 from argparse import Namespace
 from datetime import datetime
 
+import click
+
+from wasm.cli.app import Context, pass_context
 from wasm.core.config import Config
 from wasm.core.exceptions import ServiceError, WASMError
 from wasm.core.logger import Logger
@@ -92,19 +101,40 @@ def _certificate_label(cert: CertificateInfo) -> str:
     return domains[0] if domains else "unknown"
 
 
-def handle_health(args: Namespace) -> int:
+def _read_meminfo() -> dict[str, int]:
     """
-    Handle the health check command.
+    Read ``/proc/meminfo`` into its numeric fields.
 
-    Performs system diagnostics and shows overall health status.
+    Returns:
+        Field name to value in kilobytes, for every line that carries a number.
+
+    Raises:
+        OSError: When /proc/meminfo cannot be read.
+        ValueError: When a value is not a number.
+    """
+    meminfo: dict[str, int] = {}
+    with open("/proc/meminfo") as handle:
+        for line in handle:
+            key, separator, value = line.partition(":")
+            if separator and value.strip():
+                meminfo[key.strip()] = int(value.split()[0])
+    return meminfo
+
+
+def run_health_check(verbose: bool = False) -> int:
+    """
+    Inspect the server and report what is wrong with it.
+
+    Checks disk space, the web servers, every deployed application, the
+    certificates close to expiry and memory pressure.
 
     Args:
-        args: Parsed arguments; only ``verbose`` is read.
+        verbose: Print the detail of each step.
 
     Returns:
         1 when the check found issues, 0 otherwise.
     """
-    logger = Logger(verbose=args.verbose)
+    logger = Logger(verbose=verbose)
     config = Config()
 
     logger.header("System Health Check")
@@ -155,8 +185,8 @@ def handle_health(args: Namespace) -> int:
     logger.blank()
     logger.info("Checking web servers...")
 
-    nginx = NginxManager(verbose=args.verbose)
-    apache = ApacheManager(verbose=args.verbose)
+    nginx = NginxManager(verbose=verbose)
+    apache = ApacheManager(verbose=verbose)
 
     nginx_installed = nginx.is_installed()
     apache_installed = apache.is_installed()
@@ -189,7 +219,7 @@ def handle_health(args: Namespace) -> int:
     logger.info("Checking deployed applications...")
 
     store = get_store()
-    service_manager = ServiceManager(verbose=args.verbose)
+    service_manager = ServiceManager(verbose=verbose)
 
     apps = store.list_apps()
     apps_running = 0
@@ -230,7 +260,7 @@ def handle_health(args: Namespace) -> int:
     logger.blank()
     logger.info("Checking SSL certificates...")
 
-    cert_manager = CertManager(verbose=args.verbose)
+    cert_manager = CertManager(verbose=verbose)
 
     try:
         certs = cert_manager.list_certificates()
@@ -275,15 +305,7 @@ def handle_health(args: Namespace) -> int:
     logger.info("Checking system resources...")
 
     try:
-        # Memory check using /proc/meminfo
-        with open("/proc/meminfo") as f:
-            meminfo = {}
-            for line in f:
-                parts = line.split(":")
-                if len(parts) == 2:
-                    key = parts[0].strip()
-                    value = parts[1].strip().split()[0]
-                    meminfo[key] = int(value)
+        meminfo = _read_meminfo()
 
         total_mem = meminfo.get("MemTotal", 0) / 1024 / 1024  # GB
         free_mem = (meminfo.get("MemAvailable", 0) or meminfo.get("MemFree", 0)) / 1024 / 1024  # GB
@@ -340,3 +362,31 @@ def handle_health(args: Namespace) -> int:
     else:
         logger.warning("System is healthy with minor warnings.")
         return 0
+
+
+@click.command("health")
+@pass_context
+def cli(ctx: Context) -> int:
+    """
+    Check the server and report anything that needs attention.
+
+    Looks at free disk space, the web server, every deployed application,
+    certificates close to expiry and memory pressure. It only reads.
+    """
+    return run_health_check(verbose=ctx.verbose)
+
+
+def handle_health(args: Namespace) -> int:
+    """
+    Handle the health check command.
+
+    Kept while :mod:`wasm.cli.parser` still routes through argparse; it shares
+    :func:`run_health_check` with the Click command rather than repeating it.
+
+    Args:
+        args: Parsed arguments; only ``verbose`` is read.
+
+    Returns:
+        1 when the check found issues, 0 otherwise.
+    """
+    return run_health_check(verbose=getattr(args, "verbose", False))

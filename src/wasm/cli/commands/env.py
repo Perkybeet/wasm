@@ -3,104 +3,190 @@
 # https://github.com/Perkybeet/wasm/blob/main/LICENSE
 
 """
-Environment variable CLI commands for WASM.
+Environment variables of a deployed application.
 
-Provides CLI handlers for managing application environment variables:
-- Interactive configuration from .env.example templates
-- Viewing current values with secret masking
-- Exporting variables to files
+The three actions share one rule: a ``.env`` holds credentials, so nothing here
+prints a value in clear unless the operator asked for it with ``--unmask``, and
+every file written goes through
+:meth:`~wasm.deployers.helpers.env_manager.EnvManager._write_single_env_file`,
+which creates it 0600 rather than letting the process umask decide.
+
+Both entry points, the Click commands below and the legacy
+:func:`handle_env` that ``wasm.cli.parser`` still calls, run the same private
+functions, so the two paths cannot drift apart while the migration finishes.
 """
 
-import sys
-from argparse import Namespace
-from pathlib import Path
+from __future__ import annotations
 
-from wasm.core.config import Config
-from wasm.core.exceptions import WASMError
+import re
+from argparse import Namespace
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
+import click
+
+from wasm.cli.app import Context, pass_context
+from wasm.core.config import REDACTED, Config, redact_secrets
+from wasm.core.exceptions import EnvConfigError, WASMError
 from wasm.core.logger import Logger
 from wasm.core.utils import domain_to_app_name
 from wasm.deployers.helpers.env_manager import EnvConfig, EnvManager
 
+#: Historical spellings of the subcommand names. They are in scripts and in the
+#: published documentation, so dropping one is a breaking change.
+ENV_ALIASES: dict[str, str] = {
+    "config": "configure",
+    "setup": "configure",
+    "list": "show",
+    "ls": "show",
+}
 
-def handle_env(args: Namespace) -> int:
+# A credential embedded in a connection string. DATABASE_URL is the canonical
+# example: neither redact_secrets nor EnvManager.SECRET_PATTERNS flags the name,
+# yet the value carries the database password in clear.
+_URL_CREDENTIALS = re.compile(r"(?P<prefix>[A-Za-z][A-Za-z0-9+.\-]*://[^:/?#@\s]+:)[^@\s]*@")
+
+
+class AliasedGroup(click.Group):
     """
-    Handle wasm env <action> commands.
+    A group that also answers to the previous names of its commands.
 
-    Routes to the appropriate sub-handler based on the action.
+    Attributes:
+        aliases: Alternative spelling to the canonical command name.
+    """
+
+    def __init__(self, *args: Any, aliases: dict[str, str] | None = None, **kwargs: Any) -> None:
+        """
+        Args:
+            *args: Passed to click.Group.
+            aliases: Alternative spelling to the canonical command name.
+            **kwargs: Passed to click.Group.
+        """
+        super().__init__(*args, **kwargs)
+        self.aliases = aliases or {}
+
+    def get_command(self, ctx: click.Context, name: str) -> click.Command | None:
+        """
+        Look a command up, resolving an alias first.
+
+        Args:
+            ctx: Click context.
+            name: Name the user typed.
+
+        Returns:
+            The command, or None if there is no such name.
+        """
+        return super().get_command(ctx, self.aliases.get(name, name))
+
+    def resolve_command(
+        self, ctx: click.Context, args: list[str]
+    ) -> tuple[str | None, click.Command | None, list[str]]:
+        """
+        Resolve a command, reporting the name the user actually typed.
+
+        Args:
+            ctx: Click context.
+            args: Remaining arguments.
+
+        Returns:
+            The typed name, the command and the arguments left to parse.
+        """
+        _, command, remaining = super().resolve_command(ctx, args)
+        return (command.name if command else None), command, remaining
+
+
+def _looks_secret(name: str) -> bool:
+    """
+    Check a variable name against the deployer's secret patterns.
 
     Args:
-        args: Parsed command-line arguments.
+        name: Environment variable name.
 
     Returns:
-        Exit code (0 for success, non-zero for error).
+        True if the value behind this name must not be shown.
     """
-    action = getattr(args, "action", None)
-    verbose = getattr(args, "verbose", False)
-
-    if not action:
-        print("Error: env requires an action", file=sys.stderr)
-        print("Use: wasm env --help", file=sys.stderr)
-        return 1
-
-    handlers = {
-        "configure": _env_configure,
-        "config": _env_configure,
-        "setup": _env_configure,
-        "show": _env_show,
-        "list": _env_show,
-        "ls": _env_show,
-        "export": _env_export,
-    }
-
-    handler = handlers.get(action)
-    if not handler:
-        print(f"Unknown env action: {action}", file=sys.stderr)
-        return 1
-
-    try:
-        return handler(args, verbose)
-    except WASMError as e:
-        logger = Logger(verbose=verbose)
-        logger.error(e.message)
-        if e.details:
-            print(f"  {e.details}")
-        return 1
+    upper = name.upper()
+    return any(pattern in upper for pattern in EnvManager.SECRET_PATTERNS)
 
 
-def _env_configure(args: Namespace, verbose: bool) -> int:
+def _redact(values: Mapping[str, str]) -> dict[str, str]:
     """
-    Run interactive environment configuration.
+    Replace every secret value with a placeholder.
 
-    Discovers variables from .env.example files, prompts the user
-    for values, auto-generates secrets, and writes .env files.
+    Three classifiers are combined because each one misses what the others
+    catch: :func:`~wasm.core.config.redact_secrets` splits the name into words,
+    :data:`~wasm.deployers.helpers.env_manager.EnvManager.SECRET_PATTERNS`
+    matches substrings such as ``_PASS``, and the connection-string pattern
+    catches a password that only appears inside the value.
+
+    The placeholder is fixed width, so the output never reveals the length of a
+    secret nor whether one is set at all.
 
     Args:
-        args: Parsed arguments (requires domain).
-        verbose: Whether to enable verbose output.
+        values: Variable name to value.
+
+    Returns:
+        A new mapping safe to print.
+    """
+    by_word: Any = redact_secrets(dict(values))
+    safe: dict[str, str] = {}
+    for key, value in values.items():
+        if by_word.get(key) == REDACTED or _looks_secret(key):
+            safe[key] = REDACTED
+        else:
+            safe[key] = _URL_CREDENTIALS.sub(rf"\g<prefix>{REDACTED}@", value)
+    return safe
+
+
+def _app_path(domain: str) -> Path:
+    """
+    Locate the directory of a deployed application.
+
+    Args:
+        domain: Domain the application is served on.
+
+    Returns:
+        Path to the application root.
+
+    Raises:
+        EnvConfigError: If the domain is empty or nothing is deployed there.
+    """
+    if not domain:
+        raise EnvConfigError(
+            "No domain given",
+            details="Name the application, for example: wasm env show example.com",
+        )
+
+    path = Config().apps_directory / domain_to_app_name(domain)
+    if not path.exists():
+        raise EnvConfigError(
+            f"Application not found: {domain}",
+            details=f"Nothing is deployed at {path}. Run 'wasm list' to see what is.",
+        )
+    return path
+
+
+def _env_configure(domain: str, verbose: bool) -> int:
+    """
+    Ask for every variable the application declares and write its .env.
+
+    Args:
+        domain: Domain the application is served on.
+        verbose: Print the detail of each step.
 
     Returns:
         Exit code.
+
+    Raises:
+        EnvConfigError: If nothing is deployed at this domain.
     """
     logger = Logger(verbose=verbose)
-    config = Config()
-
-    domain = getattr(args, "domain", None)
-    if not domain:
-        logger.error("Domain is required")
-        return 1
-
-    app_name = domain_to_app_name(domain)
-    app_path = config.apps_directory / app_name
-
-    if not app_path.exists():
-        logger.error(f"Application not found: {domain}")
-        return 1
-
+    app_path = _app_path(domain)
     manager = EnvManager(verbose=verbose)
 
     logger.header(f"Environment Configuration: {domain}")
 
-    # Discover variables
     variables = manager.discover(app_path)
     if not variables:
         logger.info("No .env.example files found")
@@ -108,54 +194,35 @@ def _env_configure(args: Namespace, verbose: bool) -> int:
 
     logger.info(f"Found {len(variables)} variables")
 
-    # Load existing values
     existing = manager.get_current_values(app_path)
-
-    # Prompt for values
     values = manager.prompt_variables(variables, existing)
 
-    # Write .env file
-    written = manager.write_env_files(app_path, values)
-    for path in written:
+    # write_env_files goes through secure_write, so the .env lands 0600 and is
+    # never left readable by the web server user.
+    for path in manager.write_env_files(app_path, values):
         logger.success(f"Written: {path}")
 
-    # Save config
-    env_config = EnvConfig(variables=variables)
-    manager.save_config(app_path, env_config)
-
+    manager.save_config(app_path, EnvConfig(variables=variables))
     return 0
 
 
-def _env_show(args: Namespace, verbose: bool) -> int:
+def _env_show(domain: str, unmask: bool, verbose: bool) -> int:
     """
-    Display current environment variables.
-
-    Shows all variables from the application's .env file, with
-    secret values masked by default.
+    Print the variables currently set for an application.
 
     Args:
-        args: Parsed arguments (requires domain, optional --unmask).
-        verbose: Whether to enable verbose output.
+        domain: Domain the application is served on.
+        unmask: Print secret values in clear.
+        verbose: Print the detail of each step.
 
     Returns:
         Exit code.
+
+    Raises:
+        EnvConfigError: If nothing is deployed at this domain.
     """
     logger = Logger(verbose=verbose)
-    config = Config()
-
-    domain = getattr(args, "domain", None)
-    if not domain:
-        logger.error("Domain is required")
-        return 1
-
-    unmask = getattr(args, "unmask", False)
-
-    app_name = domain_to_app_name(domain)
-    app_path = config.apps_directory / app_name
-
-    if not app_path.exists():
-        logger.error(f"Application not found: {domain}")
-        return 1
+    app_path = _app_path(domain)
 
     manager = EnvManager(verbose=verbose)
     values = manager.get_current_values(app_path)
@@ -166,45 +233,40 @@ def _env_show(args: Namespace, verbose: bool) -> int:
 
     logger.header(f"Environment: {domain}")
 
-    for key in sorted(values.keys()):
-        value = values[key]
-        if not unmask:
-            value = manager.mask_value(key, value)
-        logger.key_value(f"  {key}", value)
+    if unmask:
+        logger.warning("Printing secrets in clear. Check who can see this terminal.")
+        shown = dict(values)
+    else:
+        shown = _redact(values)
+
+    for key in sorted(shown):
+        logger.key_value(f"  {key}", shown[key])
+
+    if not unmask:
+        logger.blank()
+        logger.info(f"Secrets are shown as {REDACTED}. Add --unmask to read them.")
 
     return 0
 
 
-def _env_export(args: Namespace, verbose: bool) -> int:
+def _env_export(domain: str, output: str, verbose: bool) -> int:
     """
-    Export environment variables to a file.
-
-    Reads the application's .env file and writes it to the
-    specified output path.
+    Copy an application's variables into a file.
 
     Args:
-        args: Parsed arguments (requires domain, optional --output).
-        verbose: Whether to enable verbose output.
+        domain: Domain the application is served on.
+        output: Destination path.
+        verbose: Print the detail of each step.
 
     Returns:
         Exit code.
+
+    Raises:
+        EnvConfigError: If nothing is deployed at this domain.
+        SecurityError: If the destination is a symlink.
     """
     logger = Logger(verbose=verbose)
-    config = Config()
-
-    domain = getattr(args, "domain", None)
-    output = getattr(args, "output", ".env")
-
-    if not domain:
-        logger.error("Domain is required")
-        return 1
-
-    app_name = domain_to_app_name(domain)
-    app_path = config.apps_directory / app_name
-
-    if not app_path.exists():
-        logger.error(f"Application not found: {domain}")
-        return 1
+    app_path = _app_path(domain)
 
     manager = EnvManager(verbose=verbose)
     values = manager.get_current_values(app_path)
@@ -214,7 +276,95 @@ def _env_export(args: Namespace, verbose: bool) -> int:
         return 0
 
     output_path = Path(output)
+    # The export carries the secrets in clear, so it is written through the
+    # same 0600 seam as the deployed .env rather than with a plain write.
     manager._write_single_env_file(output_path, values)
     logger.success(f"Exported {len(values)} variables to {output_path}")
-
+    logger.info("The file holds secrets in clear and is readable by its owner only.")
     return 0
+
+
+@click.group(
+    cls=AliasedGroup,
+    aliases=ENV_ALIASES,
+    name="env",
+    epilog="Also accepts: configure as 'config' or 'setup', show as 'list' or 'ls'.",
+)
+def cli() -> None:
+    """Read and set the environment variables of a deployed application."""
+
+
+@cli.command("configure")
+@click.argument("domain")
+@pass_context
+def configure(state: Context, domain: str) -> None:
+    """Ask for each variable the application declares and save its .env."""
+    _env_configure(domain, state.verbose)
+
+
+@cli.command("show")
+@click.argument("domain")
+@click.option(
+    "--unmask",
+    is_flag=True,
+    help="Print secret values in clear instead of hiding them.",
+)
+@pass_context
+def show(state: Context, domain: str, unmask: bool) -> None:
+    """List the variables an application runs with, secrets hidden."""
+    _env_show(domain, unmask, state.verbose)
+
+
+@cli.command("export")
+@click.argument("domain")
+@click.option(
+    "-o",
+    "--output",
+    default=".env",
+    show_default=True,
+    type=click.Path(dir_okay=False, writable=True, path_type=str),
+    help="Where to write the file.",
+)
+@pass_context
+def export(state: Context, domain: str, output: str) -> None:
+    """Write an application's variables to a file, owner-readable only."""
+    _env_export(domain, output, state.verbose)
+
+
+def handle_env(args: Namespace) -> int:
+    """
+    Run an env action from the argparse namespace.
+
+    Kept while ``wasm.cli.parser`` is still wired to argparse. It shares every
+    private function with the Click commands above.
+
+    Args:
+        args: Parsed command-line arguments.
+
+    Returns:
+        Exit code (0 for success, non-zero for error).
+    """
+    verbose = getattr(args, "verbose", False)
+    logger = Logger(verbose=verbose)
+
+    action = getattr(args, "action", None)
+    if not action:
+        logger.error("env requires an action", details="Use: wasm env --help")
+        return 1
+
+    canonical = ENV_ALIASES.get(action, action)
+    domain = getattr(args, "domain", "")
+
+    try:
+        if canonical == "configure":
+            return _env_configure(domain, verbose)
+        if canonical == "show":
+            return _env_show(domain, getattr(args, "unmask", False), verbose)
+        if canonical == "export":
+            return _env_export(domain, getattr(args, "output", ".env"), verbose)
+    except WASMError as exc:
+        logger.error(exc.message, details=exc.details)
+        return 1
+
+    logger.error(f"Unknown env action: {action}", details="Use: wasm env --help")
+    return 1

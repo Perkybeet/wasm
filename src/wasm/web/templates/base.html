@@ -65,10 +65,13 @@
       {{ nav_item("/settings", "Settings", "settings", none) }}
     </div>
 
-    <form method="post" action="/logout" style="margin-top: auto; padding: 0 1rem">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <button class="btn btn--quiet" type="submit">Sign out</button>
-    </form>
+    {# Posted by htmx rather than by the form, because the CSRF token travels
+       in a header: a plain form cannot set one, so the browser's own submit
+       was refused with a 403 every time. The route answers with HX-Redirect,
+       which is what actually takes the operator back to the sign-in page. #}
+    <div style="margin-top: auto; padding: 0 1rem">
+      <button class="btn btn--quiet" hx-post="/logout" hx-swap="none">Sign out</button>
+    </div>
   </nav>
 
   <main class="main" id="main">

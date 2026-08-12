@@ -1,0 +1,55 @@
+{#
+  Settings.
+
+  This screen is one request away from being a credential dump, so everything
+  on it has been through redact_secrets first. A hidden value keeps its
+  placeholder and is styled as hidden: a blank field would read as "nothing is
+  set here" and invite someone to overwrite a working credential with an empty
+  string.
+
+  It is read only. Writing configuration is done through the API and the CLI,
+  which validate a change before it reaches the file that every other part of
+  WASM depends on.
+#}
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+
+{% block title %}Settings{% endblock %}
+
+{% block content %}
+
+{{ m.page_head("Settings", "Read only. Secrets are redacted before they leave the server.") }}
+
+{% if problem %}
+  {{ m.problem(problem.fix, problem.output) }}
+{% endif %}
+
+{% if sections %}
+  {% for section in sections %}
+    <section style="margin-bottom: var(--space-5)">
+      <h2 class="label" style="margin-bottom: var(--space-2)">{{ section.name }}</h2>
+      <div class="rows">
+        <table class="table">
+          <tbody>
+            {% for entry in section.entries %}
+              <tr>
+                <th scope="row">{{ entry.key }}</th>
+                <td>
+                  {%- if entry.redacted %}{{ m.secret(entry.value) }}
+                  {%- else %}<span class="mono">{{ entry.value }}</span>{% endif -%}
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  {% endfor %}
+{% elif not problem %}
+  {{ m.empty(
+      "No configuration stored",
+      "This machine is running on the built-in defaults. Writing any setting creates the file.",
+      command="wasm config set apps.directory /var/www/apps") }}
+{% endif %}
+
+{% endblock %}

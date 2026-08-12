@@ -89,15 +89,9 @@ class TestExecutionSeam:
     the deployers and managers sat at zero coverage while shipping bugs.
     """
 
-    #: Only the seam itself may import subprocess. The rest of this list is
-    #: what remains of the sixteen files that used to bypass it, and it is
-    #: expected to reach one entry.
-    SUBPROCESS_ALLOWED = {
-        "src/wasm/core/runner.py",
-        "src/wasm/cli/commands/db.py",
-        "src/wasm/cli/commands/service.py",
-        "src/wasm/core/update_checker.py",
-    }
+    #: Only the seam itself. This started at sixteen files and is now closed:
+    #: adding a second entry is not paying down debt, it is reopening the hole.
+    SUBPROCESS_ALLOWED = {"src/wasm/core/runner.py"}
 
     def test_nothing_else_imports_subprocess(self):
         offenders = set()
@@ -148,7 +142,7 @@ class TestErrorHandling:
     """
 
     #: Current count. Lower it when you fix some; never raise it.
-    MAX_BLIND_EXCEPTS = 94
+    MAX_BLIND_EXCEPTS = 65
 
     def test_blind_excepts_do_not_grow(self):
         found: list[str] = []

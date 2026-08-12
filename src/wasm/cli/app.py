@@ -65,10 +65,10 @@ COMMAND_MODULES: dict[str, str] = {
 
 #: Commands that act on a deployed application. They are top level rather than
 #: under a ``webapp`` group because that is how they have always been typed.
-WEBAPP_COMMANDS: dict[str, str] = {
-    name: "wasm.cli.commands.webapp"
-    for name in ("create", "delete", "list", "logs", "restart", "start", "status", "stop", "update")
-}
+WEBAPP_COMMANDS: dict[str, str] = dict.fromkeys(
+    ("create", "delete", "list", "logs", "restart", "start", "status", "stop", "update"),
+    "wasm.cli.commands.webapp",
+)
 
 #: Alternative spellings, kept because they are in muscle memory, scripts and
 #: the published documentation. Removing one is a breaking change.

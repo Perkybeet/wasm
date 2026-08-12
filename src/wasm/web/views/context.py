@@ -35,11 +35,20 @@ def resource_counts() -> dict[str, int | None]:
         "apps": None,
         "services": None,
         "sites": None,
+        # Certificates and backups stay unknown here on purpose. Counting them
+        # means running "certbot certificates" and walking the backup
+        # directory, and this function runs on every page and on every refresh
+        # of the machine strip, which is every five seconds. A number in the
+        # navigation is not worth a privileged subprocess on a timer.
         "certificates": None,
         "databases": None,
         "backups": None,
         "running_jobs": None,
     }
+
+    from wasm.web.views.resources import running_job_count
+
+    counts["running_jobs"] = running_job_count()
 
     try:
         from wasm.core.store import get_store
@@ -77,10 +86,31 @@ def shared_context(request: Request) -> dict[str, Any]:
     return {
         "machine": machine_state(),
         "counts": resource_counts(),
-        "csrf_token": getattr(session, "csrf_token", "") if session else "",
+        "csrf_token": csrf_token(session),
         "page": request.url.path.strip("/").split("/")[0] or "dashboard",
         "theme": None,
     }
+
+
+def csrf_token(session: Any) -> str:
+    """
+    Read the CSRF token out of a verified session payload.
+
+    The payload is a mapping, and the shell reads the token out of it with an
+    attribute lookup, which always missed and always produced an empty string.
+    Every mutation the panel offered was therefore rejected with a 403 the
+    moment it left the browser: every restart button, every delete, sign-out
+    included. It is read as a key here, once, for the whole shell.
+
+    Args:
+        session: The session payload attached to the request, or None.
+
+    Returns:
+        The token, or an empty string when there is no session.
+    """
+    if not isinstance(session, dict):
+        return ""
+    return str(session.get("csrf", ""))
 
 
 def machine_state() -> MachineState:

@@ -1,0 +1,102 @@
+{#
+  One application.
+
+  This is the page the list links to, and it exists to answer the questions an
+  operator would otherwise open an SSH session for: what is it, what runs it,
+  what is in front of it, what was it told, and what has happened to it.
+
+  The environment is shown with its secrets hidden. An application's
+  environment is where the database password lives, and a control panel that
+  prints it to the browser has handed it to every extension the operator has
+  installed.
+#}
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+
+{% block title %}{{ domain }}{% endblock %}
+
+{% block content %}
+
+{% call m.page_head(domain, status) %}
+  {{ m.follow_button("Logs", domain, log_url) }}
+  {{ m.action_button("Restart", restart_endpoint) }}
+  {{ m.action_button("Stop", stop_endpoint,
+                     "Stop " ~ domain ~ "? The site stops answering until it is started again.") }}
+  {{ m.action_button("Start", start_endpoint) }}
+  {{ m.danger_button("Delete", delete_endpoint, domain, delete_consequence) }}
+{% endcall %}
+
+<section style="margin-bottom: var(--space-5)">
+  <h2 class="label" style="margin-bottom: var(--space-2)">Application</h2>
+  <p style="margin-bottom: var(--space-3)">{{ m.badge(state, status) }}</p>
+  {{ m.facts(facts) }}
+</section>
+
+<section style="margin-bottom: var(--space-5)">
+  <h2 class="label" style="margin-bottom: var(--space-2)">Certificate</h2>
+  {{ m.facts(certificate) }}
+  <p class="faint" style="margin-top: var(--space-2)">
+    Issuing and renewal live on the <a href="/certificates">certificates</a> screen.
+  </p>
+</section>
+
+<section style="margin-bottom: var(--space-5)">
+  <h2 class="label" style="margin-bottom: var(--space-2)">Service</h2>
+  {% if service %}
+    {{ m.facts(service) }}
+  {% else %}
+    <p class="muted">No systemd unit is recorded for this application.</p>
+  {% endif %}
+</section>
+
+<section style="margin-bottom: var(--space-5)">
+  <h2 class="label" style="margin-bottom: var(--space-2)">Site</h2>
+  {% if site %}
+    {{ m.facts(site) }}
+  {% else %}
+    <p class="muted">No web server configuration is recorded for this application.</p>
+  {% endif %}
+</section>
+
+<section style="margin-bottom: var(--space-5)">
+  <h2 class="label" style="margin-bottom: var(--space-2)">Environment</h2>
+  {% if env %}
+    <table class="table">
+      <thead>
+        <tr><th>Variable</th><th>Value</th></tr>
+      </thead>
+      <tbody>
+        {% for item in env %}
+          <tr>
+            <td class="mono">{{ item.name }}</td>
+            <td>
+              {%- if item.redacted %}{{ m.secret(item.value) }}
+              {%- else %}<span class="mono">{{ item.value }}</span>{% endif -%}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="muted">No environment variables are recorded for this application.</p>
+  {% endif %}
+</section>
+
+<section>
+  <h2 class="label" style="margin-bottom: var(--space-2)">Recent jobs</h2>
+  {% if jobs %}
+    <div class="rows">
+      {% for job in jobs %}
+        {% call m.row(job.name, job.state,
+                      [("result", job.status), ("finished", job.finished)],
+                      "/activity", "row-" ~ job.id) %}
+          <a class="btn btn--sm" href="/activity">Open</a>
+        {% endcall %}
+      {% endfor %}
+    </div>
+  {% else %}
+    <p class="muted">Nothing has run against this application since the panel started.</p>
+  {% endif %}
+</section>
+
+{% endblock %}

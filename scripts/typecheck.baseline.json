@@ -1,14 +1,12 @@
 {
-  "arg-type": 26,
-  "assignment": 10,
+  "arg-type": 8,
+  "assignment": 3,
   "call-overload": 1,
   "has-type": 2,
   "import-untyped": 5,
   "no-any-return": 6,
-  "operator": 2,
   "override": 1,
-  "return-value": 4,
-  "union-attr": 7,
+  "return-value": 2,
   "unused-ignore": 1,
-  "var-annotated": 5
+  "var-annotated": 3
 }

@@ -66,7 +66,7 @@ def render_command(command: click.Command, path: tuple[str, ...]) -> list[str]:
         lines.append(".TP")
         lines.append(".B Arguments")
         for arg in arguments:
-            lines.append(f".br")
+            lines.append(".br")
             lines.append(f"\\fI{escape(arg.name or '')}\\fR")
 
     for option in options:
@@ -87,7 +87,7 @@ def render_command(command: click.Command, path: tuple[str, ...]) -> list[str]:
         for child_name in command.list_commands(ctx):
             child = command.get_command(ctx, child_name)
             if child is not None:
-                lines += render_command(child, path + (child_name,))
+                lines += render_command(child, (*path, child_name))
 
     return lines
 

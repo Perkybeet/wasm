@@ -34,13 +34,17 @@
   meta is a list of (label, value) pairs rendered in mono. Keep it to the three
   or four facts an operator scans for, not everything the record holds.
 
+  note is one further line, for what a tool said about this record verbatim:
+  certbot's own validity line, or a backup's description. It is not a place for
+  commentary.
+
   Used with {% call %} so the caller supplies the action buttons:
 
       {% call m.row("example.com", "active", meta) %}
         {{ m.action_button("Restart", "/api/apps/example.com/restart") }}
       {% endcall %}
 #}
-{% macro row(name, state, meta=[], href=none, row_id=none) %}
+{% macro row(name, state, meta=[], href=none, row_id=none, note=none) %}
 <div class="row row--{{ state_class(state) }}"{% if row_id %} id="{{ row_id }}"{% endif %}>
   <div class="row__main">
     <span class="row__name">
@@ -51,6 +55,7 @@
         {% for label, value in meta %}<span>{{ label }} {{ value }}</span>{% endfor %}
       </span>
     {% endif %}
+    {% if note %}<span class="row__meta faint">{{ note }}</span>{% endif %}
   </div>
   <div class="row__actions">{{ caller() if caller else "" }}</div>
 </div>
@@ -133,22 +138,65 @@
 
 {#
   Destructive actions ask first, and the question names the exact resource and
-  the exact consequence. "Are you sure?" tells an operator nothing.
+  the exact consequence. "Are you sure?" tells an operator nothing. Pass
+  question when the caller has already composed the exact wording.
+
+  The swap is "delete", not "outerHTML": the endpoints answer in JSON, and
+  swapping a JSON body into the list is how a delete used to leave a blob of
+  braces where the row had been. htmx does not swap at all on a 4xx or 5xx, so
+  a row only disappears when the deletion actually happened.
 #}
-{% macro danger_button(label, endpoint, resource, consequence) %}
+{% macro danger_button(label, endpoint, resource, consequence, question=none) %}
 <button class="btn btn--sm btn--danger"
         hx-delete="{{ endpoint }}"
-        hx-confirm="{{ label }} {{ resource }}? {{ consequence }}"
+        hx-confirm="{{ question or (label ~ ' ' ~ resource ~ '? ' ~ consequence) }}"
         hx-target="closest .row"
-        hx-swap="outerHTML">{{ label }}</button>
+        hx-swap="delete">{{ label }}</button>
 {% endmacro %}
 
 
-{% macro action_button(label, endpoint, target="closest .row") %}
+{#
+  Fires an action and swaps nothing, for the same reason: the API answers with
+  JSON. What comes back is a job, and the job is reported by the machine strip,
+  the activity screen and the notices, not by rewriting the row from a payload
+  the template cannot read.
+#}
+{% macro action_button(label, endpoint, confirm=none) %}
 <button class="btn btn--sm"
         hx-post="{{ endpoint }}"
-        hx-target="{{ target }}"
-        hx-swap="outerHTML">{{ label }}</button>
+        {% if confirm %}hx-confirm="{{ confirm }}"
+        {% endif %}hx-swap="none">{{ label }}</button>
+{% endmacro %}
+
+
+{#
+  A two column sheet of facts: label on the left in the condensed label face,
+  the machine's own value on the right in mono with tabular figures. Used on
+  the detail screens, where the point is to be readable next to the output of
+  the command that produced it.
+#}
+{% macro facts(entries) %}
+<table class="table">
+  <tbody>
+    {% for label, value in entries %}
+      <tr>
+        <th scope="row">{{ label }}</th>
+        <td class="mono">{{ value }}</td>
+      </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endmacro %}
+
+
+{#
+  A value the server refused to send. It has to read as hidden, not as empty:
+  a blank field says "nothing is set here" and invites someone to overwrite a
+  working credential with an empty string.
+#}
+{% macro secret(value) %}
+<span class="mono faint"
+      title="Redacted. The panel never sends a stored secret to the browser.">{{ value }}</span>
 {% endmacro %}
 
 

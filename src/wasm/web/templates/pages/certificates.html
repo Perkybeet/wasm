@@ -1,0 +1,66 @@
+{#
+  Certificates.
+
+  The one fact that matters here is how long is left, so it is what the rail
+  encodes: green while there is time, amber inside certbot's own thirty day
+  renewal window, red once the browser has already started refusing the site.
+
+  Below the lineages sit the domains this machine serves without one. That is
+  the whole issuing interface: the panel knows every domain it answers for, so
+  the operator picks one instead of typing it and finding out afterwards that
+  certbot disagreed about the spelling.
+#}
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+
+{% block title %}Certificates{% endblock %}
+
+{% block content %}
+
+{% set subtitle = (rows | length) ~ " on this machine, " ~ expiring ~ " needing attention" %}
+
+{% call m.page_head("Certificates", subtitle if rows else none) %}
+  {% if rows %}
+    {{ m.action_button("Renew all due", "/api/certs/renew-all",
+                       "Renew every certificate that is due? certbot contacts the certificate authority for each one and reloads the web server.") }}
+  {% endif %}
+{% endcall %}
+
+{% if problem %}
+  {{ m.problem(problem.fix, problem.output) }}
+{% endif %}
+
+{% if rows %}
+  <div class="rows">
+    {% for cert in rows %}
+      {% call m.row(cert.name, cert.state, cert.meta, none, "row-" ~ cert.id, cert.note) %}
+        {{ m.action_button("Renew", cert.renew_endpoint,
+                           "Renew " ~ cert.name ~ "? certbot contacts the certificate authority and reloads the web server.") }}
+      {% endcall %}
+    {% endfor %}
+  </div>
+{% elif not problem %}
+  {{ m.empty(
+      "No certificates yet",
+      "Nothing on this machine is served over HTTPS. Issue a certificate for one of the domains below, or from the terminal.",
+      command="wasm ssl create -d example.com") }}
+{% endif %}
+
+<section style="margin-top: var(--space-6)">
+  <h2 class="label" style="margin-bottom: var(--space-2)">Domains without a certificate</h2>
+
+  {% if uncovered %}
+    <div class="rows">
+      {% for item in uncovered %}
+        {% call m.row(item.domain, item.state, item.meta, none, "row-" ~ item.id) %}
+          {{ m.action_button("Issue", item.issue_endpoint,
+                             "Issue a certificate for " ~ item.domain ~ "? The domain must already resolve to this machine so that certbot can answer the challenge.") }}
+        {% endcall %}
+      {% endfor %}
+    </div>
+  {% else %}
+    <p class="muted">Every domain this machine serves is covered.</p>
+  {% endif %}
+</section>
+
+{% endblock %}

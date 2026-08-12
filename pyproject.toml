@@ -92,7 +92,7 @@ all = [
 ]
 
 [project.scripts]
-wasm = "wasm.main:cli"
+wasm = "wasm.cli.app:entrypoint"
 
 [project.urls]
 Homepage = "https://github.com/Perkybeet/wasm"
@@ -107,7 +107,6 @@ include = ["wasm*"]
 [tool.setuptools.package-data]
 wasm = [
     "templates/**/*.j2",
-    "completions/*",
     "web/static/**/*",
     "py.typed",
 ]

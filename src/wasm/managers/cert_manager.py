@@ -18,6 +18,10 @@ limited network operation against Let's Encrypt, so "run it again" must be
 cheap and safe:
 
 - A certificate that already covers every requested domain is left alone.
+- A failure to *read* the current state is an error, never a licence to issue.
+  ``certbot certificates`` returning non-zero used to be parsed as "there is no
+  certificate", so every run of a broken-but-installed certbot placed a fresh
+  order for a domain that was already served.
 - One that covers some of them is expanded, never issued a second time under a
   new lineage name. That is why every command passes ``--cert-name``: without
   it certbot invents ``example.com-0001`` as soon as the domain set changes, and
@@ -274,16 +278,44 @@ class CertManager(BaseManager):
 
         Returns:
             One record per certificate, empty when certbot has none or cannot
-            be queried.
+            be queried. Callers that decide whether to issue must use
+            :meth:`_query_certificates` instead, which keeps those two answers
+            apart.
+        """
+        return self._query_certificates() or []
+
+    def _query_certificates(self) -> list[CertificateInfo] | None:
+        """
+        Ask certbot what it manages, keeping "nothing" apart from "no answer".
+
+        Returns:
+            One record per certificate, or None when certbot could not be
+            queried at all.
+        """
+        result = self._exec(["certbot", "certificates"])
+        if not result.success:
+            self.logger.debug(
+                f"Could not read certbot's certificate list: "
+                f"{(result.stderr or result.stdout).strip()}"
+            )
+            return None
+        return self._parse_certificates(result.stdout)
+
+    @staticmethod
+    def _parse_certificates(output: str) -> list[CertificateInfo]:
+        """
+        Parse the report ``certbot certificates`` prints.
+
+        Args:
+            output: Certbot's standard output.
+
+        Returns:
+            One record per certificate, in the order certbot listed them.
         """
         certificates: list[CertificateInfo] = []
 
-        result = self._exec(["certbot", "certificates"])
-        if not result.success:
-            return certificates
-
         current: CertificateInfo | None = None
-        for raw in result.stdout.split("\n"):
+        for raw in output.split("\n"):
             line = raw.strip()
 
             if line.startswith("Certificate Name:"):
@@ -340,6 +372,40 @@ class CertManager(BaseManager):
         if info is None:
             return False
         return all(d in info.domains for d in required_domains)
+
+    def _existing_coverage(self, primary: str) -> list[str]:
+        """
+        Read the domains the existing lineage already covers.
+
+        Args:
+            primary: Lineage name, which is the primary domain.
+
+        Returns:
+            The covered domains, empty when certbot manages no lineage for the
+            domain.
+
+        Raises:
+            CertificateError: When certbot's certificate list cannot be read.
+                A failure to read state is not evidence that there is no
+                certificate, and treating it as such re-orders from a rate
+                limited API against a domain that is already served.
+        """
+        certificates = self._query_certificates()
+        if certificates is None:
+            raise CertificateError(
+                f"Cannot read the certificates certbot manages, and {primary} already has one",
+                details=(
+                    "Issuing again without knowing what the existing certificate covers "
+                    "would spend a Let's Encrypt rate limit for nothing. Run "
+                    "'certbot certificates' as root to see what it reports, fix that, "
+                    "and run this command again."
+                ),
+            )
+
+        for cert in certificates:
+            if cert.name == primary or primary in cert.domains:
+                return list(cert.domains)
+        return []
 
     def _check_certbot_plugin(self, plugin: str) -> bool:
         """
@@ -512,15 +578,21 @@ class CertManager(BaseManager):
             True when the certificate covering every requested domain exists.
 
         Raises:
-            CertificateError: When a domain is invalid or issuance fails.
+            CertificateError: When a domain is invalid, when the state of the
+                existing certificate cannot be read, or when issuance fails.
         """
         requested = self.certificate_domains(domain, additional_domains, include_www)
         primary = requested[0]
 
         if self.cert_exists(primary) and not dry_run:
-            if self.cert_covers_domains(primary, requested) and not expand:
+            covered = self._existing_coverage(primary)
+            if all(name in covered for name in requested) and not expand:
                 self.logger.info(f"Certificate already covers all domains: {', '.join(requested)}")
                 return True
+            # certbot rewrites the SAN list to exactly what -d says, even with
+            # --expand, so expanding with the requested names alone would drop
+            # whatever else the certificate carries - usually the www alias.
+            requested = requested + [name for name in covered if name not in requested]
             self.logger.info(f"Expanding certificate to cover: {', '.join(requested)}")
             expand = True
 
@@ -543,14 +615,21 @@ class CertManager(BaseManager):
                 or "Check that the domain resolves to this host and port 80 is reachable.",
             )
 
-        if not dry_run:
-            paths = self.get_cert_path(primary)
+        paths = self.get_cert_path(primary)
+        # Record TLS on the site only once the files are actually there. A
+        # rehearsal reports success without issuing anything - --dry-run is
+        # enforced at the command runner, which the manager cannot see - and a
+        # store claiming a site serves TLS when it has no key makes every reader
+        # of that record lie, including the vhost writer.
+        if not dry_run and paths.fullchain.exists():
             self._store_ssl_state(
                 primary,
                 enabled=True,
                 certificate=str(paths.fullchain),
                 key=str(paths.privkey),
             )
+        elif not dry_run:
+            self.logger.debug(f"Certbot reported success but {paths.fullchain} is not there")
 
         self.logger.debug(f"Obtained certificate for: {primary}")
         return True
