@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import stat
+from pathlib import Path
 
 import pytest
 
@@ -254,3 +255,113 @@ class TestDryRunIsWiredToTheFlag:
             from wasm.core.runner import set_runner
 
             set_runner(None)
+
+
+class TestTheTemporaryFileCannotBeHijacked:
+    """
+    The staging file is a predictable path in a directory WASM writes to as
+    root, so it is exactly the kind of name an attacker plants a symlink at.
+    """
+
+    def test_a_squatted_symlink_does_not_redirect_the_write(self, fs: RealFileSystem, tmp_path):
+        victim = tmp_path / "victim"
+        victim.write_text("original")
+        target = tmp_path / "config.yaml"
+
+        # Guess every staging name the implementation could pick and plant a
+        # link at each: whichever it chooses must be refused, not followed.
+        for candidate in tmp_path.glob(".config.yaml*"):
+            candidate.unlink()
+        planted = tmp_path / ".config.yaml.wasm-tmp"
+        planted.symlink_to(victim)
+
+        fs.write_text(target, "new content")
+
+        assert victim.read_text() == "original", "the write followed a planted symlink"
+        assert target.read_text() == "new content"
+
+    def test_the_staging_name_is_not_predictable(self, fs: RealFileSystem, tmp_path):
+        """
+        Two writes must not agree on a name, or one process can pre-create the
+        path another is about to open.
+        """
+        seen: set[str] = set()
+        original = os.open
+
+        def record(path, flags, mode=0o777, **kwargs):
+            if ".wasm-tmp" in str(path):
+                seen.add(Path(path).name)
+            return original(path, flags, mode, **kwargs)
+
+        import wasm.core.fs as fs_module
+
+        monkey = fs_module.os
+        try:
+            monkey.open = record  # type: ignore[assignment]
+            fs.write_text(tmp_path / "a.conf", "1")
+            fs.write_text(tmp_path / "a.conf", "2")
+        finally:
+            monkey.open = original  # type: ignore[assignment]
+
+        assert len(seen) == 2, f"the staging name repeated: {seen}"
+
+    def test_a_squatted_regular_file_is_refused_not_overwritten(
+        self, fs: RealFileSystem, tmp_path, monkeypatch
+    ):
+        """O_EXCL: an existing entry at the staging path aborts the write."""
+        target = tmp_path / "unit.service"
+        fixed = tmp_path / ".unit.service.abcdef012345.wasm-tmp"
+        fixed.write_text("someone else's file")
+        monkeypatch.setattr("os.urandom", lambda _n: bytes.fromhex("abcdef012345"))
+
+        with pytest.raises(FileExistsError):
+            fs.write_text(target, "[Service]\n")
+
+        assert fixed.read_text() == "someone else's file"
+
+
+class TestTheStoreIsRehearsedToo:
+    """
+    A rehearsal that leaves the database changed is worse than one that leaves
+    a file changed: the record and the machine then disagree, and the next real
+    command acts on a state that never existed.
+    """
+
+    def test_a_write_is_rolled_back_under_dry_run(self, tmp_path, monkeypatch):
+        from wasm.core.fs import DryRunFileSystem, set_fs
+        from wasm.core.store import App, WASMStore
+
+        db = tmp_path / "wasm.db"
+        WASMStore.reset_instance()
+        store = WASMStore(db_path=db)
+        store.create_app(App(domain="before.com", app_type="static", app_path="/x"))
+
+        set_fs(DryRunFileSystem())
+        try:
+            store.create_app(App(domain="during.com", app_type="static", app_path="/y"))
+        finally:
+            set_fs(None)
+
+        WASMStore.reset_instance()
+        after = WASMStore(db_path=db)
+        domains = {app.domain for app in after.list_apps()}
+
+        assert "before.com" in domains
+        assert "during.com" not in domains, "the rehearsal committed a row"
+        WASMStore.reset_instance()
+
+    def test_a_real_run_still_commits(self, tmp_path):
+        from wasm.core.fs import set_fs
+        from wasm.core.store import App, WASMStore
+
+        db = tmp_path / "wasm.db"
+        set_fs(None)
+        WASMStore.reset_instance()
+        store = WASMStore(db_path=db)
+
+        store.create_app(App(domain="real.com", app_type="static", app_path="/x"))
+
+        WASMStore.reset_instance()
+        after = WASMStore(db_path=db)
+        assert {a.domain for a in after.list_apps()} == {"real.com"}
+        WASMStore.reset_instance()

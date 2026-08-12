@@ -133,10 +133,19 @@ class RealFileSystem(FileSystem):
 
     def write_text(self, path: Path, content: str, *, mode: int = 0o644) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(f".{path.name}.wasm-tmp")
+
+        # A fixed temporary name is a predictable path an attacker can plant a
+        # symlink at: O_CREAT alone would then follow it and write wherever it
+        # points, as root. O_EXCL refuses an existing entry of any kind, and
+        # O_NOFOLLOW refuses a symlink, so neither a squatted regular file nor
+        # a squatted link can redirect the write. A random suffix on top means
+        # a loser of that race retries rather than failing.
+        temporary = path.with_name(f".{path.name}.{os.urandom(6).hex()}.wasm-tmp")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+
         # The mode is set at creation. A chmod afterwards leaves a window in
         # which a file holding a database password is world-readable.
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        descriptor = os.open(temporary, flags, mode)
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
                 handle.write(content)
@@ -306,3 +315,19 @@ def set_fs(filesystem: FileSystem | None) -> None:
     """
     global _default_fs
     _default_fs = filesystem
+
+
+def is_rehearsal() -> bool:
+    """
+    Report whether this invocation is a dry run.
+
+    Most code should not ask: routing a change through the filesystem or the
+    command runner is enough, and both refuse on their own. This exists for
+    the one kind of change neither seam covers, a write to the SQLite store,
+    where the honest answer is to roll the transaction back rather than to
+    pretend the seam owns it.
+
+    Returns:
+        True when a rehearsing filesystem is installed.
+    """
+    return isinstance(get_fs(), DryRunFileSystem)

@@ -36,7 +36,7 @@ from typing import Any, Optional
 from urllib.parse import quote
 
 from wasm.core.exceptions import WASMError
-from wasm.core.fs import SECRET_DIR_MODE, SECRET_MODE, FileSystem, get_fs
+from wasm.core.fs import SECRET_DIR_MODE, SECRET_MODE, FileSystem, get_fs, is_rehearsal
 
 logger = logging.getLogger(__name__)
 
@@ -511,12 +511,28 @@ class WASMStore:
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Cursor]:
-        """Context manager for database transactions."""
+        """
+        Run a database transaction, or rehearse one.
+
+        Every write to the store passes through here, which is why the dry-run
+        check lives here rather than in each caller. It is needed because a
+        rehearsal that leaves the store changed is worse than one that leaves a
+        file changed: the record and the machine then disagree, and the next
+        real command acts on a state that never existed.
+
+        Yields:
+            A cursor. Under ``--dry-run`` the work is done and then rolled
+            back, so a caller that reads back what it just wrote still sees a
+            consistent picture inside the transaction.
+        """
         conn = self._get_connection()
         cursor = conn.cursor()
         try:
             yield cursor
-            conn.commit()
+            if is_rehearsal():
+                conn.rollback()
+            else:
+                conn.commit()
         except Exception:
             conn.rollback()
             raise

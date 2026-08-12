@@ -32,17 +32,14 @@ from typing import Any, TypeVar
 
 import click
 
-from wasm.cli.app import Context, pass_context
+from wasm.cli.app import Context, enable_dry_run, pass_context
 from wasm.core.config import Config
 from wasm.core.dependencies import check_deployment_ready
 from wasm.core.exceptions import DeploymentError, ServiceError, WASMError
 from wasm.core.logger import Logger, set_colors_disabled
 from wasm.core.runner import (
     CommandResult,
-    DryRunRunner,
-    SubprocessRunner,
     get_runner,
-    set_runner,
 )
 from wasm.core.store import AppStatus, get_store
 from wasm.core.utils import domain_to_app_name, remove_directory
@@ -1442,9 +1439,12 @@ def _fold_dry_run(ctx: click.Context, param: click.Parameter, value: bool | None
     """
     Record ``--dry-run`` typed after the command name.
 
-    The flag has to reach the same execution seam the root wires it into,
-    otherwise ``wasm delete example.com --dry-run`` would accept the flag and
-    then delete the application anyway.
+    Both seams have to be swapped, not just the command runner: a deletion is
+    a filesystem call and never reaches a subprocess, which is how a rehearsal
+    came to announce that nothing would change and then delete the archive.
+    :func:`~wasm.cli.app.enable_dry_run` is the one place that knows what
+    "rehearsal" means, so this defers to it rather than repeating the wiring
+    and drifting from it.
 
     Args:
         ctx: Click context.
@@ -1454,17 +1454,8 @@ def _fold_dry_run(ctx: click.Context, param: click.Parameter, value: bool | None
     if not value:
         return
     state = ctx.ensure_object(Context)
-    if state.dry_run:
-        return
     state.dry_run = True
-    logger = state.logger
-    logger.warning("Dry run: no changes will be made to this machine")
-    set_runner(
-        DryRunRunner(
-            SubprocessRunner(),
-            on_skip=lambda cmd: logger.info(f"would run: {' '.join(cmd)}"),
-        )
-    )
+    enable_dry_run(state)
 
 
 def _global_flags(command: _F) -> _F:

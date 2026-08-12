@@ -20,34 +20,12 @@ from typing import Any, NoReturn
 
 import click
 
-from wasm.cli.app import Context, pass_context
+from wasm.cli.app import Context, enable_dry_run, pass_context
 from wasm.core.config import DEFAULT_CONFIG_PATH, Config
 from wasm.core.logger import Logger, set_colors_disabled
-from wasm.core.runner import DryRunRunner, SubprocessRunner, set_runner
 
 #: How many added keys the upgrade lists before summarising the rest.
 MAX_LISTED_KEYS = 10
-
-
-def _enable_dry_run(state: Context) -> None:
-    """
-    Route every external command through the rehearsal runner.
-
-    The root group does this when ``--dry-run`` comes before the subcommand.
-    A subcommand has to do it itself when the flag comes after, because by then
-    the root callback has already run.
-
-    Args:
-        state: The shared context to mark as rehearsing.
-    """
-    logger = state.logger
-    logger.warning("Dry run: no changes will be made to this machine")
-    set_runner(
-        DryRunRunner(
-            SubprocessRunner(),
-            on_skip=lambda cmd: logger.info(f"would run: {' '.join(cmd)}"),
-        )
-    )
 
 
 def _fold_into_context(attribute: str) -> Callable[[click.Context, click.Parameter, bool], bool]:
@@ -69,7 +47,7 @@ def _fold_into_context(attribute: str) -> Callable[[click.Context, click.Paramet
         if attribute == "no_color":
             set_colors_disabled(True)
         elif attribute == "dry_run":
-            _enable_dry_run(state)
+            enable_dry_run(state)
         return value
 
     return fold
