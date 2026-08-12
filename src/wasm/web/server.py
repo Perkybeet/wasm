@@ -25,7 +25,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import parse_qs
 
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -254,34 +254,38 @@ def create_app(config: SecurityConfig | None = None) -> FastAPI:
     if STATIC_DIR.exists():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-    @app.get("/", response_class=HTMLResponse)
-    async def root() -> Response:
-        """
-        Serve the dashboard shell.
+    # Pages are rendered on the server and updated by htmx. The single-page
+    # application this replaces built its markup by interpolating server data
+    # into innerHTML in eighty-six places and loaded Tailwind and Font Awesome
+    # from public CDNs, so a control panel with root over the machine could not
+    # render without internet access.
+    from wasm.web.views import router as views_router
 
-        Returns:
-            The dashboard page.
-        """
-        index_path = STATIC_DIR / "index.html"
-        if index_path.exists():
-            return FileResponse(index_path)
-        return HTMLResponse(
-            content="<h1>WASM Web Interface</h1><p>Static files not found.</p>", status_code=200
-        )
+    app.include_router(views_router)
 
     @app.get("/login", response_class=HTMLResponse)
-    async def login_page() -> Response:
+    def login_page(request: Request) -> Response:
         """
-        Serve the login page.
+        Serve the sign-in page.
+
+        Args:
+            request: The incoming request.
 
         Returns:
-            The login page. Tokens are never accepted in the URL: query strings
-            are recorded by proxies, browsers and access logs.
+            The sign-in page. Tokens are never accepted in the URL: query
+            strings are recorded by proxies, browsers and access logs.
         """
-        login_path = STATIC_DIR / "login.html"
-        if login_path.exists():
-            return FileResponse(login_path)
-        return HTMLResponse(content=_login_fallback_html(), status_code=200)
+        from wasm.web.views.rendering import templates
+
+        return HTMLResponse(
+            templates.get_template("login.html").render(
+                hostname=socket.gethostname(),
+                csrf_token=getattr(getattr(request.state, "session", None), "csrf_token", ""),
+                error=None,
+                locked_for=None,
+                theme=None,
+            )
+        )
 
     @app.get("/health")
     async def health_check() -> dict[str, str]:

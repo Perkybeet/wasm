@@ -169,11 +169,10 @@ class TestTemplateSafety:
 class TestSelfContained:
     """The panel works on a machine with no route to the internet."""
 
-    #: The panel that is being replaced. Removed once the new one is wired in.
-    CDN_ALLOWED = {
-        "src/wasm/web/static/index.html",
-        "src/wasm/web/static/login.html",
-    }
+    #: Nothing. The single-page application that loaded Tailwind and Font
+    #: Awesome from public CDNs has been replaced by server-rendered pages, so
+    #: this list is empty and must stay that way.
+    CDN_ALLOWED: set[str] = set()
 
     def test_no_external_assets(self):
         """

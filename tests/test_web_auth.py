@@ -698,11 +698,36 @@ def test_no_route_escapes_authentication(sandbox: Path) -> None:
         for method in sorted(getattr(route, "methods", set()) or {"GET"}):
             if method in ("HEAD", "OPTIONS"):
                 continue
-            response = client.request(method, url, json={})
-            if response.status_code not in (401, 403):
+            # Redirects are not followed: a page route answers an anonymous
+            # browser with a redirect to the sign-in form rather than a JSON
+            # 401, and following it would land on the public login page and
+            # read as success.
+            response = client.request(method, url, json={}, follow_redirects=False)
+            refused = response.status_code in (401, 403) or (
+                response.status_code in (302, 303, 307)
+                and response.headers.get("location", "").startswith("/login")
+            )
+            if not refused:
                 reachable.append(f"{method} {path} -> {response.status_code}")
 
     assert not reachable, f"routes reachable without credentials: {reachable}"
+
+
+def test_pages_send_an_anonymous_browser_to_the_sign_in_form(sandbox: Path) -> None:
+    """
+    A person who typed a URL gets a form, not a JSON error.
+
+    The refusal is the same check the API uses; only its presentation differs,
+    so there is still one place where a credential is verified.
+    """
+    app = create_app(make_config(sandbox, max_failed_attempts=10_000))
+    client = TestClient(app, client=("testclient", 50000))
+
+    response = client.get("/apps", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/login"
+    assert "row" not in response.text, "no page content may leak with the redirect"
 
 
 def test_cors_preflight_is_subject_to_the_ip_whitelist(sandbox: Path) -> None:

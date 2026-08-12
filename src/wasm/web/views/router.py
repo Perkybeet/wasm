@@ -20,14 +20,48 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 
+from wasm.web.auth import require_auth
 from wasm.web.views.rendering import page
 
 log = logging.getLogger(__name__)
 
-router = APIRouter(include_in_schema=False)
+
+async def require_page_session(request: Request) -> dict[str, Any]:
+    """
+    Require a session, sending a browser to the sign-in page when there is none.
+
+    Pages get a redirect where the API gets a 401: a person who typed a URL
+    should land on a form, not on a JSON error. The check itself is the same
+    one the API uses, so there is one place where a credential is verified and
+    one counter recording failures.
+
+    Args:
+        request: The incoming request.
+
+    Returns:
+        The authenticated session payload.
+
+    Raises:
+        HTTPException: A 303 redirect to the sign-in page when unauthenticated.
+    """
+    try:
+        session = await require_auth(request)
+    except HTTPException as exc:
+        if exc.status_code in (401, 403):
+            raise HTTPException(
+                status_code=303,
+                headers={"Location": "/login"},
+                detail="Sign in to reach the panel",
+            ) from exc
+        raise
+    request.state.session = session
+    return session
+
+
+router = APIRouter(include_in_schema=False, dependencies=[Depends(require_page_session)])
 
 
 def _rows_from_store(kind: str) -> list[dict[str, Any]]:
