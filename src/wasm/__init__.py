@@ -8,7 +8,19 @@ WASM - Web App System Management
 A robust CLI tool for deploying and managing web applications on Linux servers.
 """
 
-__version__ = "0.15.8"
+from importlib.metadata import PackageNotFoundError, version as _installed_version
+
+#: Fallback used when running from a source tree that was never installed, such
+#: as an OBS build directory. The single source of truth is the ``version``
+#: field of pyproject.toml; ``scripts/release.py`` keeps this literal and the
+#: distribution packaging files in step with it.
+_FALLBACK_VERSION = "0.15.8"
+
+try:
+    __version__ = _installed_version("wasm-cli")
+except PackageNotFoundError:  # pragma: no cover - only hit in uninstalled trees
+    __version__ = _FALLBACK_VERSION
+
 __author__ = "Yago López Prado"
 __license__ = "WASM-NCSAL"
 
