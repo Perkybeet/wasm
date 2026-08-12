@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        0.15.8
+Version:        1.0.0
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -148,9 +148,25 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
     systemctl daemon-reload
     systemctl restart wasm-monitor.service 2>/dev/null || true
     echo "wasm-monitor service updated and restarted"
+    echo ""
+    echo "NOTE: the monitor no longer terminates processes or deletes files."
+    echo "It decided what was malicious by matching substrings against a"
+    echo "process command line, and acted on that as root. It now reports"
+    echo "resource use, service health and notable processes, and acts on"
+    echo "nothing. The auto_terminate and use_ai settings are ignored."
 fi
 
 %changelog
+* Wed Aug 12 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.0.0-1
+- Security: closes six critical issues, including arbitrary code execution as root through systemd unit environment injection
+- Security: the process monitor no longer terminates processes or deletes directories; it reports instead of acting
+- Security: the panel serves no third-party asset, uses HttpOnly session cookies with CSRF, and writes an audit log
+- Security: database dumps, archive extraction and SQL privileges are validated instead of interpolated
+- Feature: control panel rebuilt as server-rendered pages, with no build step and no CDN
+- Feature: --dry-run is enforced at the execution and filesystem seams, so it holds for every command
+- Change: command line migrated to Click; every command, alias and option is preserved
+- Change: backup archives are self-contained and verified; format version 2.0.0
+- Packaging: supports Ubuntu 26.04 and Python 3.14; drops python-jose and python3-inquirer
 * Fri Mar 20 2026 Perkybeet <yago.lopez.adeje@gmail.com> - 0.15.8-1
 - Feature: Auto-verify and expand SSL certificates for www subdomain coverage
 - Enhancement: cert_manager.obtain() checks domain coverage before skipping existing certs

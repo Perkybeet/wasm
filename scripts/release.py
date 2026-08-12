@@ -93,7 +93,7 @@ SITES: tuple[Site, ...] = (
     Site(
         path="setup.py",
         pattern=r'^(\s*)version="([^"]+)"',
-        template=r'\1version="{version}"',
+        template=r'\g<1>version="{version}"',
         label="setup.py",
     ),
     Site(
@@ -105,7 +105,7 @@ SITES: tuple[Site, ...] = (
     Site(
         path="rpm/wasm.spec",
         pattern=r"^Version:(\s+)(\S+)",
-        template=r"Version:\1{version}",
+        template=r"Version:\g<1>{version}",
         label="RPM spec",
     ),
     Site(
@@ -117,7 +117,7 @@ SITES: tuple[Site, ...] = (
     Site(
         path="obs/wasm.dsc",
         pattern=r"^ (\w{32}) (\d+) wasm-(\S+)\.tar\.gz",
-        template=r" \1 \2 wasm-{version}.tar.gz",
+        template=r" \g<1> \g<2> wasm-{version}.tar.gz",
         label="Debian source tarball name",
     ),
 )

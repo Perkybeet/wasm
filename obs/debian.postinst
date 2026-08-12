@@ -47,6 +47,12 @@ case "$1" in
             systemctl daemon-reload
             systemctl restart wasm-monitor.service || true
             echo "wasm-monitor service updated and restarted"
+            echo ""
+            echo "NOTE: the monitor no longer terminates processes or deletes files."
+            echo "It decided what was malicious by matching substrings against a"
+            echo "process command line, and acted on that as root. It now reports"
+            echo "resource use, service health and notable processes, and acts on"
+            echo "nothing. The auto_terminate and use_ai settings are ignored."
         fi
         ;;
     
