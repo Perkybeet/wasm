@@ -18,9 +18,11 @@ from wasm.core.runner import (
     EXIT_TIMEOUT,
     CommandError,
     CommandResult,
+    DryRunRunner,
     FakeRunner,
     SubprocessRunner,
     get_runner,
+    is_read_only,
     set_runner,
 )
 
@@ -329,6 +331,103 @@ class TestGlobalRunner:
             assert get_runner() is fake
         finally:
             set_runner(None)
+
+
+class TestDryRun:
+    """--dry-run is enforced at the seam, so it is true everywhere."""
+
+    def test_a_mutating_command_never_reaches_the_machine(self, tmp_path):
+        victim = tmp_path / "created"
+        dry = DryRunRunner(SubprocessRunner())
+
+        result = dry.run(["touch", str(victim)])
+
+        assert result.success, "callers must be able to proceed through a rehearsal"
+        assert not victim.exists()
+        assert dry.skipped == [("touch", str(victim))]
+
+    def test_a_read_only_command_still_runs(self):
+        dry = DryRunRunner(SubprocessRunner())
+
+        assert dry.run(["whoami"]).success
+        assert dry.skipped == []
+
+    def test_reports_what_would_have_happened(self):
+        seen: list[tuple[str, ...]] = []
+        dry = DryRunRunner(SubprocessRunner(), on_skip=seen.append)
+
+        dry.run(["systemctl", "restart", "wasm-example-com"])
+
+        assert seen == [("systemctl", "restart", "wasm-example-com")]
+
+    def test_never_writes_a_capture_file(self, tmp_path):
+        dest = tmp_path / "dump.sql"
+        dry = DryRunRunner(SubprocessRunner())
+
+        dry.capture_to_file(["pg_dump", "app"], dest)
+
+        assert not dest.exists()
+
+    def test_redacts_secrets_from_what_it_records(self):
+        dry = DryRunRunner(SubprocessRunner())
+
+        dry.run(["mysql", "-phunter2"], secrets=["hunter2"])
+
+        assert "hunter2" not in " ".join(dry.skipped[0])
+
+    def test_streaming_a_build_is_rehearsed(self):
+        dry = DryRunRunner(SubprocessRunner())
+        lines: list[str] = []
+
+        dry.stream(["npm", "install"], on_line=lines.append)
+
+        assert lines == []
+        assert dry.skipped == [("npm", "install")]
+
+
+class TestReadOnlyClassification:
+    """
+    Unknown commands count as mutating.
+
+    A dry run that guesses wrong in the permissive direction performs a real
+    destructive action, so the classification errs the other way.
+    """
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["systemctl", "status", "nginx"],
+            ["systemctl", "is-active", "wasm-example-com"],
+            ["nginx", "-t"],
+            ["certbot", "certificates"],
+            ["git", "rev-parse", "HEAD"],
+            ["docker", "ps"],
+            ["journalctl", "-u", "wasm-example-com"],
+            ["node", "--version"],
+            ["/usr/bin/whoami"],
+        ],
+    )
+    def test_recognised_as_read_only(self, argv):
+        assert is_read_only(argv)
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["systemctl", "restart", "nginx"],
+            ["systemctl", "daemon-reload"],
+            ["nginx", "-s", "reload"],
+            ["certbot", "certonly", "-d", "example.com"],
+            ["git", "clone", "https://example.com/x.git"],
+            ["docker", "compose", "up", "-d"],
+            ["rm", "-rf", "/var/www/apps/x"],
+            ["apt-get", "install", "-y", "nginx"],
+            ["npm", "install"],
+            ["some-unknown-tool", "--flag"],
+            [],
+        ],
+    )
+    def test_treated_as_mutating(self, argv):
+        assert not is_read_only(argv)
 
 
 class TestCommandResult:

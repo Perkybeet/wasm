@@ -515,6 +515,11 @@ class SubprocessRunner(CommandRunner):
                     producer.kill()
                     if gzip_proc is not None:
                         gzip_proc.kill()
+                    # A dump that ran out of time has written a prefix of the
+                    # data. Leaving it behind would put a truncated file with a
+                    # valid name in the backup directory, where it would be
+                    # listed as a backup and eventually fed to psql on restore.
+                    destination.unlink(missing_ok=True)
                     return CommandResult(
                         argv=redacted,
                         exit_code=EXIT_TIMEOUT,
@@ -546,6 +551,180 @@ class SubprocessRunner(CommandRunner):
             stderr=stderr,
             duration=time.monotonic() - started,
         )
+
+
+#: Programs that only ever report state. A dry run may execute these, because
+#: seeing what the machine currently looks like is the whole point of a
+#: rehearsal. Anything not listed here is assumed to change something.
+READ_ONLY_PROGRAMS: frozenset[str] = frozenset(
+    {
+        "cat",
+        "df",
+        "du",
+        "getent",
+        "grep",
+        "head",
+        "hostname",
+        "id",
+        "journalctl",
+        "ls",
+        "lsb_release",
+        "ps",
+        "readlink",
+        "stat",
+        "tail",
+        "uname",
+        "which",
+        "whoami",
+    }
+)
+
+#: Subcommands that are read-only for programs that both report and mutate.
+READ_ONLY_SUBCOMMANDS: dict[str, frozenset[str]] = {
+    "systemctl": frozenset(
+        {"status", "is-active", "is-enabled", "is-failed", "show", "cat", "list-units"}
+    ),
+    "nginx": frozenset({"-t", "-T", "-v", "-V"}),
+    "apache2ctl": frozenset({"configtest", "-t", "-v", "-V"}),
+    "apachectl": frozenset({"configtest", "-t", "-v", "-V"}),
+    "certbot": frozenset({"certificates", "plugins", "--version"}),
+    "git": frozenset({"status", "log", "show", "rev-parse", "ls-remote", "describe"}),
+    "docker": frozenset({"ps", "images", "info", "version", "inspect", "logs"}),
+    "apt-get": frozenset({"--version"}),
+}
+
+
+def is_read_only(argv: Sequence[str]) -> bool:
+    """
+    Report whether a command only observes the system.
+
+    The classification is deliberately conservative: anything not recognised
+    counts as mutating, because a dry run that quietly performs a real action
+    is worse than one that refuses to guess.
+
+    Args:
+        argv: The argument vector to classify.
+
+    Returns:
+        True when the command is known not to change anything.
+    """
+    if not argv:
+        return False
+    program = Path(argv[0]).name
+    if program.endswith("--version") or "--version" in argv:
+        return True
+    if program in READ_ONLY_PROGRAMS:
+        return True
+    allowed = READ_ONLY_SUBCOMMANDS.get(program)
+    if allowed is None:
+        return False
+    return any(arg in allowed for arg in argv[1:])
+
+
+class DryRunRunner(CommandRunner):
+    """
+    Rehearses instead of acting. This is what ``--dry-run`` actually means.
+
+    The flag used to be wired per command, which meant it was honoured in three
+    code paths and silently ignored in the ninety others, including every
+    destructive one. Enforcing it here makes it true for the whole program by
+    construction: a command that would change the machine cannot reach the
+    machine, whatever the calling code believes.
+
+    Read-only probes still run, because a rehearsal that cannot look at the
+    system reports fiction.
+    """
+
+    def __init__(
+        self, inner: CommandRunner, *, on_skip: Callable[[tuple[str, ...]], None] | None = None
+    ):
+        """
+        Args:
+            inner: Runner used for the commands that only observe.
+            on_skip: Called with each argv that was not executed, so the CLI
+                can show the user what a real run would have done.
+        """
+        self._inner = inner
+        self._on_skip = on_skip
+        self.skipped: list[tuple[str, ...]] = []
+
+    def _skip(self, argv: Sequence[str], secrets: Sequence[str]) -> CommandResult:
+        """
+        Record a command that a real run would have executed.
+
+        Args:
+            argv: The argument vector that was not run.
+            secrets: Values to keep out of the record.
+
+        Returns:
+            A successful result, so callers proceed through the rehearsal.
+        """
+        redacted = _redact(_validate(argv), secrets)
+        self.skipped.append(redacted)
+        if self._on_skip is not None:
+            self._on_skip(redacted)
+        return CommandResult(argv=redacted, exit_code=0, stdout="")
+
+    def exists(self, program: str) -> bool:
+        return self._inner.exists(program)
+
+    def run(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: Path | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout: int = DEFAULT_TIMEOUT,
+        input: str | None = None,
+        user: str | None = None,
+        check: bool = False,
+        secrets: Sequence[str] = (),
+    ) -> CommandResult:
+        if is_read_only(argv):
+            return self._inner.run(
+                argv,
+                cwd=cwd,
+                env=env,
+                timeout=timeout,
+                input=input,
+                user=user,
+                check=check,
+                secrets=secrets,
+            )
+        return self._skip(argv, secrets)
+
+    def stream(
+        self,
+        argv: Sequence[str],
+        *,
+        on_line: Callable[[str], None],
+        cwd: Path | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout: int = DEFAULT_TIMEOUT,
+        user: str | None = None,
+        secrets: Sequence[str] = (),
+    ) -> CommandResult:
+        if is_read_only(argv):
+            return self._inner.stream(
+                argv, on_line=on_line, cwd=cwd, env=env, timeout=timeout, user=user, secrets=secrets
+            )
+        return self._skip(argv, secrets)
+
+    def capture_to_file(
+        self,
+        argv: Sequence[str],
+        destination: Path,
+        *,
+        compress: bool = False,
+        cwd: Path | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout: int = DEFAULT_TIMEOUT,
+        user: str | None = None,
+        secrets: Sequence[str] = (),
+    ) -> CommandResult:
+        # Never write the destination: a rehearsal that leaves a file behind is
+        # not a rehearsal.
+        return self._skip(argv, secrets)
 
 
 @dataclass

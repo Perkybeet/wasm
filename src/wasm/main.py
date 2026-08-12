@@ -17,6 +17,7 @@ from wasm.cli.interactive import InteractiveMode
 from wasm.cli.parser import create_parser, parse_args
 from wasm.core.exceptions import WASMError
 from wasm.core.logger import Logger, set_colors_disabled
+from wasm.core.runner import DryRunRunner, SubprocessRunner, set_runner
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +37,21 @@ def main(argv: list[str] | None = None) -> int:
     # Handlers build their own loggers, so the flag has to be applied globally.
     if args.no_color:
         set_colors_disabled(True)
+
+    # --dry-run is enforced at the execution seam rather than in each handler.
+    # Wiring it per command is what left it honoured in three code paths and
+    # silently ignored in every destructive one; installing a runner that
+    # refuses to execute mutating commands makes the flag true by construction,
+    # whatever the calling code believes.
+    if getattr(args, "dry_run", False):
+        logger = Logger(verbose=args.verbose)
+        logger.warning("Dry run: no changes will be made to this machine")
+        set_runner(
+            DryRunRunner(
+                SubprocessRunner(),
+                on_skip=lambda cmd: logger.info(f"would run: {' '.join(cmd)}"),
+            )
+        )
 
     if args.changelog:
         from wasm.cli.commands.version import show_changelog
