@@ -2,7 +2,7 @@ Format: 1.0
 Source: wasm
 Binary: wasm
 Architecture: all
-Version: 1.2.0-1
+Version: 1.2.1-1
 Maintainer: Yago López Prado <yago.lopez.adeje@gmail.com>
 Homepage: https://github.com/Perkybeet/wasm
 Standards-Version: 4.6.0
@@ -10,4 +10,4 @@ Build-Depends: debhelper-compat (= 13), dh-python, pybuild-plugin-pyproject, pyt
 Package-List:
  wasm deb admin optional arch=all
 Files:
- 00000000000000000000000000000000 0 wasm-1.2.0.tar.gz
+ 00000000000000000000000000000000 0 wasm-1.2.1.tar.gz

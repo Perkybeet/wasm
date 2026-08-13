@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        1.2.0
+Version:        1.2.1
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -222,6 +222,8 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
 fi
 
 %changelog
+* Thu Aug 13 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.2.1-1
+- Fix: wasm reported no applications on a machine whose records existed, after the monitor service created /var/lib/wasm and the store moved to it; a database that already exists now outranks an empty location
 * Thu Aug 13 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.2.0-1
 - Fix: the monitor service never started, failing every 30 seconds since installation, because its unit named a state directory systemd was never asked to create
 - Fix: the panel's journal streams left a journalctl process running on every disconnection

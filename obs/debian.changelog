@@ -1,3 +1,9 @@
+wasm (1.2.1-1) unstable; urgency=medium
+
+  * Fix: wasm reported no applications on a machine whose records existed, after the monitor service created /var/lib/wasm and the store moved to it; a database that already exists now outranks an empty location
+
+ -- Yago Lopez Prado <yago.lopez.adeje@gmail.com>  Thu, 13 Aug 2026 15:30:55 +0000
+
 wasm (1.2.0-1) unstable; urgency=medium
 
   * Fix: the monitor service never started, failing every 30 seconds since installation, because its unit named a state directory systemd was never asked to create
