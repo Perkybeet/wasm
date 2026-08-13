@@ -433,13 +433,29 @@ class WASMStore:
 
         Priority:
         1. Explicit path provided
-        2. System path if writable (/var/lib/wasm/)
-        3. User path (~/.local/share/wasm/)
+        2. A database that already exists, system before user
+        3. System path if writable (/var/lib/wasm/)
+        4. User path (~/.local/share/wasm/)
 
         Nothing is created here. Deciding *where* the database lives is a
-        question, not a change, and the previous version answered it by trying
-        to create the directory, so merely resolving a path left a directory
+        question, not a change, and an early version answered it by trying to
+        create the directory, so merely resolving a path left a directory
         behind on a run that was supposed to change nothing.
+
+        **Why an existing database outranks the system location.** The choice
+        used to be made purely on whether ``/var/lib/wasm`` happened to exist
+        and be writable, so it changed the moment somebody created that
+        directory - a packaging change, an administrator, or WASM's own monitor
+        service, which needs it. On a server whose inventory had always lived
+        under ``~/.local/share``, ``wasm list`` then answered "No applications
+        deployed" about a machine serving seventeen sites. Nothing was lost and
+        nothing said so, which is the worst way for a tool to be wrong: the
+        records were one directory away and the operator was told they did not
+        exist.
+
+        Falling back to a database that is actually there removes the failure
+        entirely. A fresh machine still gets the system path, because neither
+        file exists and rule 3 decides it.
 
         Args:
             db_path: Explicit database path, if the caller has one.
@@ -450,7 +466,19 @@ class WASMStore:
         if db_path:
             return Path(db_path)
 
-        if DEFAULT_DB_PATH.parent.is_dir() and os.access(DEFAULT_DB_PATH.parent, os.W_OK):
+        system_writable = DEFAULT_DB_PATH.parent.is_dir() and os.access(
+            DEFAULT_DB_PATH.parent, os.W_OK
+        )
+
+        # An inventory that exists wins over one that would be created. Two
+        # empty files, or none at all, fall through to the usual preference.
+        for candidate in (DEFAULT_DB_PATH, USER_DB_PATH):
+            if candidate.is_file() and candidate.stat().st_size > 0:
+                if candidate == DEFAULT_DB_PATH and not system_writable:
+                    continue
+                return candidate
+
+        if system_writable:
             return DEFAULT_DB_PATH
 
         return USER_DB_PATH

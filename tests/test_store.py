@@ -732,9 +732,101 @@ class TestResolvingThePathChangesNothing:
         system_db = tmp_path / "var" / "lib" / "wasm" / "wasm.db"
         system_db.parent.mkdir(parents=True)
         monkeypatch.setattr(store_module, "DEFAULT_DB_PATH", system_db)
+        # Pinned too, or the resolver sees whatever database the developer
+        # running the suite happens to have in their own home directory.
+        monkeypatch.setattr(store_module, "USER_DB_PATH", tmp_path / "home" / "wasm.db")
         store = WASMStore(tmp_path / "explicit.db", fs=RecordingFileSystem())
 
         assert store._resolve_db_path() == system_db
+
+    def test_an_inventory_that_exists_is_not_abandoned_for_an_empty_location(
+        self, fresh, tmp_path, monkeypatch
+    ):
+        """
+        The reported incident, and the reason this rule exists.
+
+        The choice used to be made purely on whether /var/lib/wasm existed and
+        was writable, so it changed the moment somebody created that directory
+        - a packaging change, an administrator, or WASM's own monitor service,
+        which needs it. On a server whose records had always lived under
+        ~/.local/share, `wasm list` then answered "No applications deployed"
+        about a machine serving seventeen sites. Nothing had been lost, and
+        nothing said so.
+        """
+        user_db = tmp_path / "home" / ".local" / "share" / "wasm" / "wasm.db"
+        user_db.parent.mkdir(parents=True)
+        user_db.write_bytes(b"an inventory that took a year to build")
+
+        system_db = tmp_path / "var" / "lib" / "wasm" / "wasm.db"
+        system_db.parent.mkdir(parents=True)  # exists and is writable, as after a mkdir
+
+        monkeypatch.setattr(store_module, "USER_DB_PATH", user_db)
+        monkeypatch.setattr(store_module, "DEFAULT_DB_PATH", system_db)
+        store = WASMStore(tmp_path / "explicit.db", fs=RecordingFileSystem())
+
+        assert store._resolve_db_path() == user_db
+
+    def test_the_system_database_is_preferred_once_it_holds_something(
+        self, fresh, tmp_path, monkeypatch
+    ):
+        """
+        A machine that has been migrated keeps using the system location.
+
+        Otherwise the rule above would pin every host to ~/.local/share for
+        ever, which is the wrong home for the records of a machine-wide tool.
+        """
+        user_db = tmp_path / "home" / ".local" / "share" / "wasm" / "wasm.db"
+        user_db.parent.mkdir(parents=True)
+        user_db.write_bytes(b"the copy left behind by the migration")
+
+        system_db = tmp_path / "var" / "lib" / "wasm" / "wasm.db"
+        system_db.parent.mkdir(parents=True)
+        system_db.write_bytes(b"the inventory, where it belongs")
+
+        monkeypatch.setattr(store_module, "USER_DB_PATH", user_db)
+        monkeypatch.setattr(store_module, "DEFAULT_DB_PATH", system_db)
+        store = WASMStore(tmp_path / "explicit.db", fs=RecordingFileSystem())
+
+        assert store._resolve_db_path() == system_db
+
+    def test_a_fresh_machine_still_starts_in_the_system_location(
+        self, fresh, tmp_path, monkeypatch
+    ):
+        """With neither file present the usual preference decides, unchanged."""
+        user_db = tmp_path / "home" / ".local" / "share" / "wasm" / "wasm.db"
+        system_db = tmp_path / "var" / "lib" / "wasm" / "wasm.db"
+        system_db.parent.mkdir(parents=True)
+
+        monkeypatch.setattr(store_module, "USER_DB_PATH", user_db)
+        monkeypatch.setattr(store_module, "DEFAULT_DB_PATH", system_db)
+        store = WASMStore(tmp_path / "explicit.db", fs=RecordingFileSystem())
+
+        assert store._resolve_db_path() == system_db
+
+    def test_an_unwritable_system_location_never_wins_even_holding_a_database(
+        self, fresh, tmp_path, monkeypatch
+    ):
+        """
+        A root-owned database is not usable by a user who cannot write it, and
+        choosing it would fail later instead of here.
+        """
+        user_db = tmp_path / "home" / ".local" / "share" / "wasm" / "wasm.db"
+        user_db.parent.mkdir(parents=True)
+        user_db.write_bytes(b"the records this user can actually read")
+
+        system_db = tmp_path / "var" / "lib" / "wasm" / "wasm.db"
+        system_db.parent.mkdir(parents=True)
+        system_db.write_bytes(b"root's copy")
+        system_db.parent.chmod(0o500)
+
+        monkeypatch.setattr(store_module, "USER_DB_PATH", user_db)
+        monkeypatch.setattr(store_module, "DEFAULT_DB_PATH", system_db)
+        store = WASMStore(tmp_path / "explicit.db", fs=RecordingFileSystem())
+
+        try:
+            assert store._resolve_db_path() == user_db
+        finally:
+            system_db.parent.chmod(0o700)
 
 
 class TestNoMutationEscapesTheSeam:
