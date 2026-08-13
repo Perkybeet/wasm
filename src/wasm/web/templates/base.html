@@ -28,9 +28,22 @@
   <link rel="stylesheet" href="/static/vendor/uplot.min.css">
   <link rel="icon" href="/static/logo.webp" type="image/webp">
 
+  {# Two scripts, and no Alpine.
+
+     The panel serves itself under script-src 'self' with no unsafe-eval,
+     because it runs systemd as root and an injected script here is a root
+     shell. Alpine turns every x-data, @click and x-text into a function built
+     from a string, which that policy forbids outright: the browser refused all
+     of them, the log drawer never initialised, and the mobile navigation could
+     not be opened. It was not a subtle failure - it was the whole framework
+     never running - and no test could see it, because the markup was correct
+     and the server was correct.
+
+     The two islands it was there for are a hundred lines of panel.js now.
+     Loosening the policy for a dependency that costs 47 KB and does not work
+     is not a trade this product makes. #}
   <script src="/static/vendor/htmx.min.js" defer></script>
-  <script src="/static/vendor/alpine.min.js" defer></script>
-  <script src="/static/panel.js" type="module"></script>
+  <script src="/static/panel.js" defer></script>
 </head>
 
 {#
@@ -41,16 +54,32 @@
   back 403 from a browser. Two spellings of one name in two files cannot be
   kept in agreement by care alone.
 #}
-<body hx-headers='{"{{ csrf_header }}": "{{ csrf_token }}"}'>
+{# The navigation's open state lives on the body, not on .shell, because the
+   control that opens it has to sit outside the sidebar: a toggle inside the
+   panel it reveals goes off-canvas with it, which is why the panel shipped
+   with a sidebar that could be styled open and reached by nothing. #}
+<body hx-headers='{"{{ csrf_header }}": "{{ csrf_token }}"}'
+      data-csrf-header="{{ csrf_header }}" data-csrf-cookie="{{ csrf_cookie }}">
 
-<a class="visually-hidden" href="#main">Skip to content</a>
+<a class="skip-link" href="#main">Skip to content</a>
+
+{# Outside the machine strip on purpose: that fragment replaces itself every
+   five seconds, and a control that is destroyed under the operator's finger
+   takes their keyboard focus with it. #}
+<button type="button" class="nav-toggle" data-nav-toggle
+        aria-controls="sidebar" aria-expanded="false">
+  <span class="visually-hidden">Sections</span>
+  <span aria-hidden="true">☰</span>
+</button>
 
 {# The signature element: one dense instrument line for this machine. The
    fragment carries its own element so htmx can swap it whole. #}
 {% include "fragments/machine.html" %}
 
-<div class="shell" x-data="{ nav: false }">
-  <nav class="sidebar" :data-open="nav" aria-label="Sections">
+<div class="scrim" data-nav-close hidden aria-hidden="true"></div>
+
+<div class="shell">
+  <nav class="sidebar" id="sidebar" data-open="false" aria-label="Sections">
     <div class="brand">
       <img src="/static/logo.webp" alt="" width="20" height="20">
       WASM
@@ -73,16 +102,34 @@
       {{ nav_item("/settings", "Settings", "settings", none) }}
     </div>
 
-    {# Posted by htmx rather than by the form, because the CSRF token travels
-       in a header: a plain form cannot set one, so the browser's own submit
-       was refused with a 403 every time. The route answers with HX-Redirect,
-       which is what actually takes the operator back to the sign-in page. #}
-    <div style="margin-top: auto; padding: 0 1rem">
-      <button type="button" class="btn btn--quiet" hx-post="/logout" hx-swap="none">Sign out</button>
+    {#
+      The footer, which used to be a bare div with two inline styles holding a
+      quiet button the same weight as the log drawer's "Clear". It read as
+      something dropped in place rather than the end of the navigation, and on
+      a long list it sat a page and a half below the fold, because the sidebar
+      stretched with the document.
+
+      It names the machine as well: signing out of the wrong server is a thing
+      that happens to an operator with four tabs open, and the strip at the top
+      is the only other place that says which one this is.
+
+      Sign-out is posted by htmx rather than by a form, because the CSRF token
+      travels in a header: a plain form cannot set one, so the browser's own
+      submit was refused with a 403 every time. The route answers with
+      HX-Redirect, which is what takes the operator back to the sign-in page.
+    #}
+    <div class="sidebar__footer">
+      <span class="sidebar__host mono" title="{{ machine.os }}">{{ machine.hostname }}</span>
+      <div class="sidebar__actions">
+        <button type="button" class="btn btn--sm btn--quiet" data-theme-toggle>Theme</button>
+        <button type="button" class="btn btn--sm" hx-post="/logout" hx-swap="none">Sign out</button>
+      </div>
     </div>
   </nav>
 
-  <main class="main" id="main">
+  {# tabindex makes the skip link's destination focusable; without it the link
+     moves the viewport and leaves the keyboard where it was. #}
+  <main class="main" id="main" tabindex="-1">
     <div class="page">
       {% block content %}{% endblock %}
     </div>
@@ -92,28 +139,26 @@
       moment logs matter most is mid-deploy, and hiding them behind a click per
       resource is what makes a web panel feel worse than an SSH session.
     #}
-    <section class="drawer" id="log-drawer" x-data="logDrawer()" :data-open="open"
-             aria-label="Live log">
+    <section class="drawer" id="log-drawer" data-open="false" aria-label="Live log">
       {# The bar is a plain element that happens to be clickable, and the
          toggle is a real button. It used to be the other way round: the bar
          carried role="button" and wrapped two more buttons, which is invalid
          nesting, and its keyboard handling was hand-rolled. A native button
          is focusable, operable with Enter and Space, and announced correctly
          without any of that. #}
-      <div class="drawer__bar" @click="toggle()">
+      <div class="drawer__bar" data-drawer-toggle>
         <span class="label">Log</span>
-        {# The fallback text matters: x-text replaces the content, so before
-           Alpine runs an empty element would leave the bar looking broken. #}
-        <span class="drawer__source" x-text="source || 'nothing attached'">nothing attached</span>
-        <span class="drawer__tools" @click.stop>
-          <button type="button" class="btn btn--sm btn--quiet" @click="clear()">Clear</button>
-          <button type="button" class="btn btn--sm btn--quiet"
-                  aria-controls="log-drawer-body" aria-expanded="false"
-                  :aria-expanded="open" @click="toggle()"
-                  x-text="open ? 'Hide' : 'Show'">Show</button>
+        {# The text is server-rendered and then kept in step by panel.js, so
+           the bar reads correctly even in the instant before the script runs
+           and on a machine where it never does. #}
+        <span class="drawer__source" data-drawer-source>nothing attached</span>
+        <span class="drawer__tools">
+          <button type="button" class="btn btn--sm btn--quiet" data-drawer-clear>Clear</button>
+          <button type="button" class="btn btn--sm btn--quiet" data-drawer-toggle
+                  aria-controls="log-drawer-body" aria-expanded="false">Show</button>
         </span>
       </div>
-      <div class="drawer__body" id="log-drawer-body" x-ref="terminal"></div>
+      <div class="drawer__body" id="log-drawer-body"></div>
     </section>
   </main>
 </div>

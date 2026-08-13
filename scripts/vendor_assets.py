@@ -38,7 +38,6 @@ JSDELIVR = "https://cdn.jsdelivr.net/npm"
 # Pinned versions. htmx stays on 2.x deliberately: 4.0 has been in beta since
 # July 2026 with no stable date and no published migration guide.
 HTMX = "2.0.10"
-ALPINE = "3.16.1"
 XTERM = "6.0.0"
 UPLOT = "1.6.32"
 PLEX = "5.3.0"
@@ -81,7 +80,6 @@ def _font(family: str, weight: int) -> Asset:
 
 ASSETS: tuple[Asset, ...] = (
     Asset(f"{JSDELIVR}/htmx.org@{HTMX}/dist/htmx.min.js", "htmx.min.js", "BSD-2-Clause"),
-    Asset(f"{JSDELIVR}/alpinejs@{ALPINE}/dist/cdn.min.js", "alpine.min.js", "MIT"),
     Asset(f"{JSDELIVR}/@xterm/xterm@{XTERM}/lib/xterm.js", "xterm.js", "MIT"),
     Asset(f"{JSDELIVR}/@xterm/xterm@{XTERM}/css/xterm.css", "xterm.css", "MIT"),
     Asset(f"{JSDELIVR}/uplot@{UPLOT}/dist/uPlot.iife.min.js", "uplot.min.js", "MIT"),

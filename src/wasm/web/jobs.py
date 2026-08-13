@@ -512,6 +512,26 @@ class JobManager:
             except ValueError:
                 pass
 
+    def unsubscribe_all(self, callback: Callable[[Job], None]) -> None:
+        """
+        Stop receiving updates for every job.
+
+        The counterpart to :meth:`subscribe_all`, and not optional: the panel's
+        event stream subscribes once per open browser tab and an operator
+        leaves the panel open for days across reconnections. Without a way to
+        withdraw, every one of those leaves a callback holding a queue that
+        nothing will ever read again.
+
+        Args:
+            callback: The callback to remove. Removing one that was never
+                registered is not an error, so a stream can unsubscribe on the
+                way out without tracking whether it got that far.
+        """
+        try:
+            self._global_subscribers.remove(callback)
+        except ValueError:
+            pass
+
     def _notify_subscribers(self, job: Job) -> None:
         """
         Push a job snapshot to everyone watching it.

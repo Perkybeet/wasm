@@ -415,7 +415,20 @@ def test_security_headers_are_present(sandbox: Path) -> None:
     csp = headers["Content-Security-Policy"]
     assert "default-src 'self'" in csp
     assert "frame-ancestors 'none'" in csp
-    assert "'unsafe-inline'" not in csp
+
+    # The directive that decides whether an injected script gets root. It
+    # allows neither inline scripts nor eval, and Alpine was removed rather
+    # than this loosened to accommodate it.
+    assert "script-src 'self';" in csp
+    assert "unsafe-eval" not in csp
+
+    # style-src does allow inline, because xterm builds the log terminal out of
+    # inline styles and htmx sets them for its request indicators; strict here
+    # did not harden the panel, it switched those features off in silence.
+    # Server-rendered markup still carries no style attributes - see
+    # tests/test_web_style_contract.py.
+    assert "style-src 'self' 'unsafe-inline'" in csp
+
     assert headers["X-Content-Type-Options"] == "nosniff"
     assert headers["X-Frame-Options"] == "DENY"
     assert headers["Referrer-Policy"] == "no-referrer"

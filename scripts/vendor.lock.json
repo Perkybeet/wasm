@@ -1,9 +1,4 @@
 {
-  "alpine.min.js": {
-    "licence": "MIT",
-    "sha256": "04656d770039b55ac7a37aeecb92191de2c7775f61f2d0183331cc16c13f3f1e",
-    "url": "https://cdn.jsdelivr.net/npm/alpinejs@3.16.1/dist/cdn.min.js"
-  },
   "fonts/ibm-plex-mono-latin-400-normal.woff2": {
     "licence": "OFL-1.1",
     "sha256": "08949f728dc52d528e69b1667d15c89a5686a4ee9a296ff90983985f99c380f7",
