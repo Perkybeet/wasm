@@ -24,7 +24,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
-from wasm.core.config import SYSTEMD_DIR
+from wasm.core.config import SYSTEMD_DIR, Config
 from wasm.core.exceptions import SecurityError, ServiceError, ValidationError, WASMError
 from wasm.core.store import get_store
 from wasm.managers.service_manager import ServiceManager
@@ -91,11 +91,17 @@ class ServiceActionResponse(BaseModel):
 
 
 class CreateServiceRequest(BaseModel):
-    """Request to create a new service."""
+    """
+    Request to create a new service.
+
+    ``user`` left unset resolves to the configured ``service_user`` (the same
+    source the CLI uses), never to root. An operator who explicitly asks for
+    "root" still gets root.
+    """
 
     name: str
     command: str | None = None
-    user: str = "root"
+    user: str | None = None
     working_directory: str = "/var/www"
     restart: str = "always"
     environment: dict | None = None
@@ -227,9 +233,12 @@ def _render_unit(data: CreateServiceRequest, service_name: str) -> str:
             details="systemd rejects relative WorkingDirectory values.",
         )
 
-    if not USER_NAME_PATTERN.match(data.user):
+    # An unset field means "use what the CLI uses", not root: the same
+    # resolution the manager itself applies in create_service().
+    user = data.user or Config().service_user
+    if not USER_NAME_PATTERN.match(user):
         raise ValidationError(
-            f"Invalid user: {data.user!r}",
+            f"Invalid user: {user!r}",
             details="Use an existing account name made of letters, digits, '_' and '-'.",
         )
 
@@ -266,7 +275,7 @@ After=network.target
 
 [Service]
 Type=simple
-User={data.user}
+User={user}
 WorkingDirectory={working_directory}
 ExecStart={command}
 Restart={data.restart}

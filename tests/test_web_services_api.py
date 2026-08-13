@@ -22,6 +22,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from wasm.core.config import Config
 from wasm.core.exceptions import SecurityError, ValidationError
 from wasm.managers.service_manager import WASM_UNIT_MARKER, ServiceManager
 from wasm.validators.names import (
@@ -397,6 +398,47 @@ class TestHappyPath:
 
         assert 400 <= response.status_code < 500, response.text
         assert not (unit_dir / "my-app.service").exists()
+
+    def test_create_without_user_runs_as_the_configured_service_user(
+        self, client: TestClient, unit_dir: Path, sandboxed_manager
+    ) -> None:
+        """
+        Omitting 'user' must not default to root.
+
+        The CLI runs new services as the configured service_user (www-data by
+        default), never root. The API used to default the field to "root" in
+        the request model, so an operator who forgot the field silently got a
+        service running as root. The unit must come out owned by the same
+        account the CLI would have used: whatever core.config.Config.service_user
+        resolves to, not a value hardcoded in the web layer.
+        """
+        response = client.post(
+            "/api/services",
+            json={"name": "my-app", "command": "/usr/bin/node /var/www/apps/my-app/server.js"},
+        )
+
+        assert response.status_code == 200, response.text
+        unit = unit_dir / "my-app.service"
+        content = unit.read_text()
+        assert "User=root" not in content
+        assert f"User={Config().service_user}" in content
+
+    def test_create_with_explicit_root_user_is_still_honoured(
+        self, client: TestClient, unit_dir: Path, sandboxed_manager
+    ) -> None:
+        """An operator who explicitly asks for root must still get root."""
+        response = client.post(
+            "/api/services",
+            json={
+                "name": "my-app",
+                "command": "/usr/bin/node /var/www/apps/my-app/server.js",
+                "user": "root",
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        unit = unit_dir / "my-app.service"
+        assert "User=root" in unit.read_text()
 
 
 class TestEventLoopSafety:
