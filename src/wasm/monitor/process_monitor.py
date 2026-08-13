@@ -423,7 +423,16 @@ RestartSec=30
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/var/lib/wasm /var/log/wasm
+# StateDirectory and LogsDirectory rather than ReadWritePaths: systemd creates
+# these before the unit starts and adds them to the writable set itself.
+# ReadWritePaths does neither, so on a machine where /var/lib/wasm did not
+# exist yet - which is every machine that installed the monitor before it had
+# ever written a database - mounting the namespace failed outright. The unit
+# exited 226/NAMESPACE and systemd restarted it every 30 seconds forever: one
+# production server was found at 2379 consecutive failures, with the monitor
+# never having run once.
+StateDirectory=wasm
+LogsDirectory=wasm
 PrivateDevices=true
 RestrictSUIDSGID=true
 

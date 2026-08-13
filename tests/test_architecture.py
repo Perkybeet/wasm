@@ -93,6 +93,19 @@ class TestExecutionSeam:
     #: adding a second entry is not paying down debt, it is reopening the hole.
     SUBPROCESS_ALLOWED = {"src/wasm/core/runner.py"}
 
+    #: The same rule for asyncio's process API, which spells the escape hatch
+    #: differently and therefore walked straight past the import check above:
+    #: ``asyncio.create_subprocess_exec`` imports asyncio, not subprocess.
+    #:
+    #: The panel's journal streams are here because the runner is synchronous
+    #: and a WebSocket cannot block on it. That is a real constraint and a real
+    #: piece of debt: these two call sites are outside the seam, so nothing can
+    #: intercept them in a test, and the guarantees the runner gives - argv
+    #: only, mandatory timeouts, one place that knows how to clean a process up
+    #: - are hand-rolled there instead. Closing it means an async streaming
+    #: method on CommandRunner. Until then, this list must not grow.
+    ASYNC_SUBPROCESS_ALLOWED = {"src/wasm/web/websockets/router.py"}
+
     def test_nothing_else_imports_subprocess(self):
         offenders = set()
         for path in python_files():
@@ -108,6 +121,33 @@ class TestExecutionSeam:
                     offenders.add(relative(path))
 
         check_ratchet(offenders, self.SUBPROCESS_ALLOWED, "only the runner imports subprocess")
+
+    def test_nothing_spawns_a_process_through_asyncio(self):
+        """
+        The import check has a blind spot, and something was already in it.
+
+        ``asyncio.create_subprocess_exec`` runs a process without importing
+        subprocess, so the panel's two journal streams spawned journalctl
+        outside the seam and the guard said nothing. One of them then leaked a
+        process per connection for want of the cleanup the runner does once,
+        which is exactly the class of bug the seam exists to make impossible.
+        """
+        offenders = set()
+        for path in python_files():
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                function = node.func
+                name = getattr(function, "attr", None) or getattr(function, "id", None)
+                if name in {"create_subprocess_exec", "create_subprocess_shell"}:
+                    offenders.add(relative(path))
+
+        check_ratchet(
+            offenders,
+            self.ASYNC_SUBPROCESS_ALLOWED,
+            "only the runner spawns processes, asyncio included",
+        )
 
     def test_no_shell_execution_anywhere(self):
         """

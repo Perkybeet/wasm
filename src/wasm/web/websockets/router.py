@@ -55,6 +55,37 @@ LOG_STREAM_MAX_SECONDS = 12 * 3600
 _log_connections: dict[str, set[WebSocket]] = {}
 _system_connections: set[WebSocket] = set()
 
+#: How long a journal follow is given to exit after being asked politely.
+TERMINATE_GRACE_SECONDS = 2.0
+
+
+async def _terminate(process: asyncio.subprocess.Process | None) -> None:
+    """
+    Stop a journal follow, and make sure it is really gone.
+
+    Every stream in this module spawns a ``journalctl -f``, which by definition
+    never ends on its own. Whether it is cleaned up therefore decides whether a
+    long-lived panel accumulates one orphaned process per connection, and a
+    browser reconnects on its own: this is the difference between a server that
+    is stable for months and one that runs out of processes.
+
+    Args:
+        process: The process to stop, if one was started at all.
+    """
+    if process is None or process.returncode is not None:
+        return
+
+    try:
+        process.terminate()
+        await asyncio.wait_for(process.wait(), timeout=TERMINATE_GRACE_SECONDS)
+    except (ProcessLookupError, asyncio.TimeoutError):
+        # It ignored SIGTERM, or it was reaped between the check and the
+        # signal. Either way, do not leave it behind.
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+
 
 async def authenticate_websocket(
     websocket: WebSocket, ticket: str | None = None
@@ -278,16 +309,7 @@ async def websocket_logs(
         except Exception:
             pass
     finally:
-        # Kill process if running
-        if process and process.returncode is None:
-            try:
-                process.terminate()
-                await asyncio.wait_for(process.wait(), timeout=2.0)
-            except Exception:
-                try:
-                    process.kill()
-                except Exception:
-                    pass  # Process already terminated
+        await _terminate(process)
 
         # Remove from connections
         if domain in _log_connections:
@@ -410,6 +432,13 @@ async def websocket_events(websocket: WebSocket, ticket: str | None = Query(defa
 
     await _accept(websocket, session, "/ws/events")
 
+    # Bound before the try, so the cleanup below can always see it. It used to
+    # be assigned inside, and the terminate() was on the happy path: closing
+    # the browser tab raises WebSocketDisconnect long before that line, so
+    # every connection left a journalctl -f running forever. A panel that
+    # reconnects on its own accumulates one per reconnection.
+    process: asyncio.subprocess.Process | None = None
+
     try:
         await websocket.send_json({"type": "connected", "message": "Listening for system events"})
 
@@ -480,8 +509,6 @@ async def websocket_events(websocket: WebSocket, ticket: str | None = Query(defa
         for task in pending:
             task.cancel()
 
-        process.terminate()
-
     except WebSocketDisconnect:
         pass
     except Exception as e:
@@ -490,6 +517,10 @@ async def websocket_events(websocket: WebSocket, ticket: str | None = Query(defa
         except Exception:
             pass
     finally:
+        await _terminate(process)
+
+        _system_connections.discard(websocket)
+
         try:
             await websocket.close()
         except Exception:
