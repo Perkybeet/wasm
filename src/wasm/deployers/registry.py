@@ -159,6 +159,30 @@ def detect_app_type(path: Path, verbose: bool = False) -> str | None:
     return DeployerRegistry.detect(path, verbose=verbose)
 
 
+def available_types() -> list[dict[str, str]]:
+    """
+    List the application types anything in the product may offer.
+
+    The registry is the only place that knows what can be deployed, so it is
+    the only place that should answer this. The CLI used to carry a
+    hand-written list of eight strings and the panel had no list at all, which
+    is how a deployer could be added and reach neither front door.
+
+    Returns:
+        One mapping per type, with ``type`` and ``name``, ordered with the
+        detectors first and ``auto`` last: picking a specific type is the
+        deliberate choice, and offering "let WASM decide" at the top invites
+        the operator to skip a decision they usually know the answer to.
+    """
+    _import_deployers()
+
+    types = [
+        {"type": str(entry["type"]), "name": str(entry["name"])}
+        for entry in DeployerRegistry.list_deployers()
+    ]
+    return sorted(types, key=lambda entry: (entry["type"] == "auto", entry["name"].lower()))
+
+
 def _import_deployers() -> None:
     """
     Import every deployer module so that registration has happened.

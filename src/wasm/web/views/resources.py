@@ -94,6 +94,118 @@ def resource_rows(kind: str) -> list[dict[str, Any]]:
     return [_shape(kind, record) for record in records]
 
 
+def _service_actions(record: Any) -> list[dict[str, Any]]:
+    """
+    Build the buttons a systemd unit should offer, given what it is doing.
+
+    Offering every verb at all times is how an operator ends up clicking "Start"
+    on a running unit and reading a failure that is really a no-op. The row
+    offers what would change something: a running unit can be restarted or
+    stopped, a stopped one can be started, and either can be enabled or
+    disabled for the next boot.
+
+    The API has had all five of these since the beginning. The panel only ever
+    called restart, so a service the operator wanted stopped could not be
+    stopped from the screen that showed it was running.
+
+    Args:
+        record: A :class:`~wasm.core.store.Service`.
+
+    Returns:
+        Action descriptions for the row's buttons.
+    """
+    name = record.name
+    running = str(record.status).lower() in {"active", "running"}
+
+    actions: list[dict[str, Any]] = []
+    if running:
+        actions.append(
+            {
+                "label": "Restart",
+                "endpoint": f"/api/services/{name}/restart",
+                "done": f"Restarted {name}",
+                "confirm": None,
+            }
+        )
+        actions.append(
+            {
+                "label": "Stop",
+                "endpoint": f"/api/services/{name}/stop",
+                "done": f"Stopped {name}",
+                "confirm": f"Stop {name}? Whatever it serves stops answering.",
+            }
+        )
+    else:
+        actions.append(
+            {
+                "label": "Start",
+                "endpoint": f"/api/services/{name}/start",
+                "done": f"Started {name}",
+                "confirm": None,
+            }
+        )
+
+    if record.enabled:
+        actions.append(
+            {
+                "label": "Disable",
+                "endpoint": f"/api/services/{name}/disable",
+                "done": f"Disabled {name}",
+                "confirm": f"Disable {name}? It will not start on the next boot.",
+            }
+        )
+    else:
+        actions.append(
+            {
+                "label": "Enable",
+                "endpoint": f"/api/services/{name}/enable",
+                "done": f"Enabled {name}",
+                "confirm": None,
+            }
+        )
+
+    return actions
+
+
+def _site_actions(record: Any) -> list[dict[str, Any]]:
+    """
+    Build the buttons a web server site should offer.
+
+    The row displayed "enabled" or "disabled" and gave no way to change it,
+    which is the most conspicuous kind of dead screen: it states a fact the
+    operator is obviously there to act on.
+
+    Args:
+        record: A :class:`~wasm.core.store.Site`.
+
+    Returns:
+        Action descriptions for the row's buttons.
+    """
+    domain = record.domain
+
+    if record.enabled:
+        return [
+            {
+                "label": "Disable",
+                "endpoint": f"/api/sites/{domain}/disable",
+                "done": f"Disabled {domain}",
+                "confirm": (
+                    f"Disable {domain}? The web server stops answering for it "
+                    "until it is enabled again."
+                ),
+            }
+        ]
+
+    return [
+        {
+            "label": "Enable",
+            "endpoint": f"/api/sites/{domain}/enable",
+            "done": f"Enabled {domain}",
+            "confirm": None,
+        }
+    ]
+
+
 def _shape(kind: str, record: Any) -> dict[str, Any]:
     """
     Turn a store record into the fields the row component needs.
@@ -127,6 +239,17 @@ def _shape(kind: str, record: Any) -> dict[str, Any]:
             "href": f"/apps/{record.domain}",
             "log_url": f"/ws/logs/{record.domain}",
             "restart_endpoint": f"/api/apps/{record.domain}/restart",
+            # Taking a backup is the one thing an operator wants to do
+            # immediately before anything risky, so it belongs on the row
+            # rather than three screens away.
+            "actions": [
+                {
+                    "label": "Back up",
+                    "endpoint": f"/apps/{record.domain}/backup",
+                    "done": f"Backup started for {record.domain}",
+                    "confirm": None,
+                }
+            ],
             "delete_endpoint": f"/api/apps/{record.domain}",
             "delete_consequence": (
                 "The service, the web server configuration and the deployed "
@@ -147,6 +270,7 @@ def _shape(kind: str, record: Any) -> dict[str, Any]:
             "href": None,
             "log_url": None,
             "restart_endpoint": None,
+            "actions": _site_actions(record),
             "delete_endpoint": f"/api/sites/{record.domain}",
             "delete_consequence": (
                 "The web server stops answering for this domain. The "
@@ -162,7 +286,8 @@ def _shape(kind: str, record: Any) -> dict[str, Any]:
             "meta": [("port", record.port or "—"), ("user", record.user)],
             "href": None,
             "log_url": f"/ws/logs/{record.name}",
-            "restart_endpoint": f"/api/services/{record.name}/restart",
+            "restart_endpoint": None,
+            "actions": _service_actions(record),
             "delete_endpoint": f"/api/services/{record.name}",
             "delete_consequence": "The systemd unit is stopped and removed.",
         }
@@ -266,6 +391,22 @@ def _shape_certificate(entry: Any) -> dict[str, Any]:
         "cert_path": entry.cert_path or "—",
         "key_path": entry.key_path or "—",
         "renew_endpoint": f"/api/certs/{name}/renew",
+        # Certificates were the only resource in the panel with no way to get
+        # rid of one. Revoking and deleting are different acts and both are
+        # offered: revoking tells the authority the key is no longer trusted,
+        # deleting only stops this machine from serving it.
+        "revoke_endpoint": f"/api/certs/{name}/revoke",
+        "delete_endpoint": f"/api/certs/{name}",
+        "delete_consequence": (
+            "The certificate and its private key are removed from this "
+            "machine. Any site still configured for HTTPS with it stops "
+            "answering until another one is issued."
+        ),
+        "revoke_question": (
+            f"Revoke the certificate for {name}? The certificate authority is "
+            "told the key is no longer trusted, and it cannot be un-revoked. "
+            "The files stay on disk."
+        ),
     }
 
 
@@ -423,6 +564,10 @@ def _shape_backup(record: Any) -> dict[str, Any]:
         "note": record.description or record.id,
         "created_at": record.created_at,
         "contents": backup_contents(record),
+        # Checking an archive is sound is the one thing that can be done to a
+        # backup safely, and the only way to learn it is restorable before the
+        # day it has to be.
+        "verify_endpoint": f"/backups/{record.id}/verify",
         "restore_endpoint": f"/api/backups/{record.id}/restore",
         "restore_question": (
             f"Restore {record.id} into {record.domain}? "

@@ -47,6 +47,7 @@ from wasm.core.utils import domain_to_app_name, remove_directory
 from wasm.deployers import detect_app_type, get_deployer
 from wasm.deployers.docker_compose import DockerComposeDeployer
 from wasm.deployers.monorepo import MonorepoDeployer
+from wasm.deployers.registry import available_types
 from wasm.managers.apache_manager import ApacheManager
 from wasm.managers.backup_manager import RollbackManager
 from wasm.managers.cert_manager import CertManager
@@ -68,17 +69,10 @@ _FOLLOW_TIMEOUT = 86400
 #: Docker Compose pulls images and rebuilds; it needs room.
 _COMPOSE_TIMEOUT = 1800
 
-#: Application types ``create`` accepts, in the order they are offered.
-APP_TYPES = [
-    "nextjs",
-    "nodejs",
-    "vite",
-    "python",
-    "static",
-    "monorepo",
-    "docker-compose",
-    "auto",
-]
+#: Application types ``create`` accepts, in the order they are offered. Read
+#: from the registry rather than typed out here: a hand-written copy is a copy
+#: that goes stale the first time a deployer is added, and it did.
+APP_TYPES = [entry["type"] for entry in available_types()]
 
 #: Node package managers ``create`` and ``update`` accept.
 PACKAGE_MANAGERS = ["npm", "pnpm", "bun", "auto"]

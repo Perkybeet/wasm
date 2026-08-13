@@ -22,11 +22,17 @@ that is missing, because the operator stops believing the rest of it.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable, Coroutine
 from typing import Any
+from urllib.parse import parse_qs
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.routing import APIRoute
+from pydantic import ValidationError
+from starlette.concurrency import run_in_threadpool
 
+from wasm.core.exceptions import WASMError
 from wasm.web.auth import require_auth
 from wasm.web.views import resources
 from wasm.web.views.rendering import page
@@ -64,6 +70,16 @@ async def require_page_session(request: Request) -> dict[str, Any]:
         session = await require_auth(request)
     except HTTPException as exc:
         if exc.status_code == 401:
+            # htmx follows a 303 itself and swaps the body it gets back, so a
+            # plain redirect dropped the sign-in page's <main> inside the live
+            # shell: a login form nested in a panel that was still showing the
+            # machine's data. HX-Redirect makes the browser navigate instead.
+            if request.headers.get("HX-Request"):
+                raise HTTPException(
+                    status_code=401,
+                    headers={"HX-Redirect": "/login"},
+                    detail="Sign in to reach the panel",
+                ) from exc
             raise HTTPException(
                 status_code=303,
                 headers={"Location": "/login"},
@@ -74,7 +90,78 @@ async def require_page_session(request: Request) -> dict[str, Any]:
     return session
 
 
-router = APIRouter(include_in_schema=False, dependencies=[Depends(require_page_session)])
+class PageErrorRoute(APIRoute):
+    """
+    Route that renders a failure instead of dropping the panel.
+
+    The API has had this since the beginning, as
+    :class:`~wasm.web.api.deps.WASMErrorRoute`; the pages never did. A manager
+    raising anywhere in a handler here reached Starlette's default and the
+    operator got the words "Internal Server Error" as plain text on a white
+    page: no navigation, no machine strip, and above all none of what nginx or
+    systemd actually said, which is the one thing they needed.
+
+    Attaching it to the router rather than to each handler is the point. A
+    boundary enforced per caller has as many holes as there are callers, and
+    there are eleven of them here.
+    """
+
+    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        """
+        Wrap the generated handler in the panel's error boundary.
+
+        Returns:
+            The wrapped handler.
+        """
+        handler = super().get_route_handler()
+
+        async def wrapped(request: Request) -> Response:
+            try:
+                return await handler(request)
+            except WASMError as exc:
+                # Only WASMError. An AttributeError from this layer is a bug in
+                # the panel, and the project's whole position on error handling
+                # is that those stay loud: catching them here to render a
+                # polite screen is how five calls to methods that did not exist
+                # shipped for entire releases. HTTPException is not caught
+                # either - a redirect to the sign-in page and a 404 for an
+                # undeployed domain are answers, not failures.
+                log.warning("%s failed: %s", request.url.path, exc)
+                return failure(request, str(exc), getattr(exc, "details", "") or "")
+
+        return wrapped
+
+
+def failure(request: Request, fix: str, output: str) -> Response:
+    """
+    Render the failure screen.
+
+    Args:
+        request: The incoming request.
+        fix: What to do about it, in plain words.
+        output: The tool's own output, verbatim.
+
+    Returns:
+        The rendered page, at 500.
+    """
+    return page(
+        request,
+        "pages/failure.html",
+        {
+            "title": "This screen could not be rendered",
+            "section": None,
+            "fix": fix,
+            "output": output,
+        },
+        status_code=500,
+    )
+
+
+router = APIRouter(
+    include_in_schema=False,
+    dependencies=[Depends(require_page_session)],
+    route_class=PageErrorRoute,
+)
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -128,6 +215,211 @@ def apps(request: Request) -> HTMLResponse:
         The applications page.
     """
     return page(request, "pages/resources.html", _resource_page("apps"))
+
+
+#: Web servers a site can be fronted by. The same two the CLI offers.
+WEBSERVERS = ("nginx", "apache")
+
+
+def _deploy_form(request: Request, submitted: dict[str, Any], problem: Any = None) -> HTMLResponse:
+    """
+    Render the deployment form.
+
+    Args:
+        request: The incoming request.
+        submitted: What the operator typed, so a refusal does not empty the
+            form they have to correct.
+        problem: A ``fix``/``output`` mapping when a submission was refused.
+
+    Returns:
+        The deployment page.
+    """
+    from wasm.deployers.registry import available_types
+
+    return page(
+        request,
+        "pages/deploy.html",
+        {
+            "app_types": available_types(),
+            "webservers": WEBSERVERS,
+            "submitted": submitted,
+            "problem": problem,
+        },
+        status_code=400 if problem else 200,
+    )
+
+
+# Declared before /apps/{domain}, or the parametrised route would answer for
+# it and the panel would look for an application called "new".
+@router.get("/apps/new", response_class=HTMLResponse)
+def deploy_form(request: Request) -> HTMLResponse:
+    """
+    Render the form that deploys an application.
+
+    Args:
+        request: The incoming request.
+
+    Returns:
+        The deployment page.
+    """
+    return _deploy_form(request, {"ssl": True, "app_type": "auto", "webserver": "nginx"})
+
+
+@router.post("/apps/new")
+async def deploy_submit(request: Request) -> Response:
+    """
+    Queue a deployment from the form.
+
+    The work is done by :func:`wasm.web.api.apps.create_app`, which is the same
+    function the JSON API calls. This route only translates a form submission
+    into the request model and a refusal into a screen: a second implementation
+    of "deploy an application" is exactly what the panel must never grow.
+
+    Async, unlike every other handler here, because reading a request body
+    requires awaiting it - the same reason ``login_submit`` is. Everything that
+    blocks is handed to a worker thread rather than run on the event loop,
+    which is what the rule about synchronous handlers actually protects: one
+    deployment must not freeze every other request, every WebSocket and the
+    heartbeat that says the panel is alive.
+
+    The body is parsed with ``parse_qs`` rather than ``request.form()`` so the
+    panel does not acquire python-multipart, which would have to be declared in
+    four packaging files and exist on every target distribution.
+
+    Args:
+        request: The incoming request.
+
+    Returns:
+        A redirect to the activity screen, or the form again with the reason it
+        was refused.
+    """
+    from wasm.web.api.apps import CreateAppRequest, create_app
+
+    fields = parse_qs((await request.body()).decode("utf-8", errors="replace"))
+
+    def field(name: str, default: str = "") -> str:
+        """
+        Args:
+            name: Field name.
+            default: Value to use when the field was not submitted.
+
+        Returns:
+            The submitted value, stripped.
+        """
+        return fields.get(name, [default])[0].strip()
+
+    submitted: dict[str, Any] = {
+        "domain": field("domain"),
+        "source": field("source"),
+        "app_type": field("app_type", "auto"),
+        "branch": field("branch"),
+        "port": field("port"),
+        "webserver": field("webserver", "nginx"),
+        "ssl": "ssl" in fields,
+    }
+
+    try:
+        body = CreateAppRequest(
+            domain=submitted["domain"],
+            source=submitted["source"],
+            app_type=submitted["app_type"],
+            port=int(submitted["port"]) if submitted["port"] else None,
+            webserver=submitted["webserver"],
+            branch=submitted["branch"] or None,
+            ssl=submitted["ssl"],
+        )
+    except (ValueError, ValidationError) as exc:
+        return await run_in_threadpool(
+            _deploy_form, request, submitted, {"fix": "Check the form.", "output": str(exc)}
+        )
+
+    session = getattr(request.state, "session", {})
+
+    try:
+        await run_in_threadpool(create_app, body, session)
+    except HTTPException as exc:
+        # 409 for a domain already deployed, 503 when no port is free. Both are
+        # answers to what was typed, so the form comes back with them.
+        return await run_in_threadpool(
+            _deploy_form, request, submitted, {"fix": str(exc.detail), "output": ""}
+        )
+    except WASMError as exc:
+        return await run_in_threadpool(
+            _deploy_form,
+            request,
+            submitted,
+            {"fix": str(exc), "output": getattr(exc, "details", "") or ""},
+        )
+
+    # A deployment takes minutes, so the operator is sent where they can watch
+    # it rather than left on a form that looks like it did nothing.
+    return RedirectResponse("/activity", status_code=303)
+
+
+@router.post("/apps/{domain}/backup")
+def back_up_now(domain: str, request: Request) -> Response:
+    """
+    Queue a backup of one application.
+
+    An adapter, like the deployment form: the work is
+    :func:`wasm.web.api.backups.create_backup`, which takes its request as a
+    JSON body. A button in a row cannot send one without an htmx extension the
+    panel does not vendor, so the domain travels in the path here and the
+    request model is built on this side. Nothing about what a backup *is* lives
+    here.
+
+    Args:
+        domain: The application to back up.
+        request: The incoming request.
+
+    Returns:
+        An empty response; the job is reported by the feed and the activity
+        screen, like every other queued job.
+    """
+    from wasm.web.api.backups import CreateBackupRequest, create_backup
+
+    session = getattr(request.state, "session", {})
+    create_backup(CreateBackupRequest(domain=domain), session)
+    return Response(status_code=204)
+
+
+@router.post("/backups/{backup_id}/verify")
+def verify_now(backup_id: str, request: Request) -> Response:
+    """
+    Verify one archive, and say plainly when it is not sound.
+
+    The API answers 200 with ``valid: false`` for a corrupt archive, which is
+    correct for a JSON client and wrong for a button: the panel would report
+    "Verified" in the same green it uses for success, about a backup that
+    cannot be restored. A backup nobody can restore is worse than no backup,
+    because it is the one people are counting on.
+
+    So a failed verification is answered as a failure here, with what the
+    checker actually found.
+
+    Args:
+        backup_id: The archive to check.
+        request: The incoming request.
+
+    Returns:
+        An empty response when the archive is sound.
+
+    Raises:
+        HTTPException: 422 with the checker's findings when it is not.
+    """
+    from wasm.web.api.backups import verify_backup
+
+    session = getattr(request.state, "session", {})
+    result = verify_backup(backup_id, session)
+
+    if result.valid:
+        return Response(status_code=204)
+
+    findings = result.errors or result.warnings or ["The archive did not pass verification."]
+    raise HTTPException(
+        status_code=422,
+        detail=f"{backup_id} failed verification. " + " ".join(findings),
+    )
 
 
 @router.get("/services", response_class=HTMLResponse)
@@ -327,6 +619,8 @@ _RESOURCE_COPY: dict[str, dict[str, str]] = {
         "empty_title": "No applications yet",
         "empty_body": "Deploy one from a Git repository, an archive or a local directory.",
         "command": "wasm create -d example.com -s https://github.com/you/app",
+        "action_label": "Deploy",
+        "action_href": "/apps/new",
     },
     "services": {
         "title": "Services",
@@ -369,4 +663,9 @@ def _resource_page(kind: str) -> dict[str, Any]:
         "empty_title": copy["empty_title"],
         "empty_body": copy["empty_body"],
         "command": copy["command"],
+        # Only applications can be created from the panel. The others are made
+        # by deploying one, and offering a button that leads nowhere is worse
+        # than offering none: the empty state's own copy says so.
+        "action_label": copy.get("action_label"),
+        "action_href": copy.get("action_href"),
     }
