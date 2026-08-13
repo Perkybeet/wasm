@@ -25,7 +25,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import parse_qs
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -34,10 +34,9 @@ from starlette.requests import HTTPConnection
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from wasm.core.exceptions import SecurityError
+from wasm.core.net import host_addresses, local_address, loopback_access_lines
 from wasm.web.auth import (
-    CSRF_COOKIE_NAME,
     SAFE_METHODS,
-    SESSION_COOKIE_NAME,
     WS_CLOSE_FORBIDDEN,
     WS_CLOSE_RATE_LIMITED,
     WS_CLOSE_UNAUTHORIZED,
@@ -66,10 +65,29 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 #: No inline scripts, no third party origins, no framing. The panel executes
 #: systemd as root, so an injected script is a root shell.
+#:
+#: ``style-src`` allows inline styles and ``script-src`` does not, and the
+#: asymmetry is deliberate. The strict form of both was tried and shipped, and
+#: what it actually did was switch features off in silence: xterm builds the
+#: whole log terminal out of inline styles and htmx sets them for its request
+#: indicators, so the drawer rendered blank and every pending state was
+#: invisible. Nothing reported it, because a Content Security Policy is only
+#: enforced in a browser and the suite has none.
+#:
+#: The exposure the two directives control is not comparable. An injected
+#: script here runs systemd as root; an injected style can deface the page and,
+#: with attribute selectors and a background image, leak what is already on
+#: screen to a third party - which ``default-src 'self'`` also has to allow
+#: before it works at all. Against that, the templates are autoescaped and
+#: tested against injection on every screen.
+#:
+#: Server-rendered markup still carries no style attributes: that rule is
+#: enforced in tests/test_web_style_contract.py and is about the stylesheet
+#: being the one place styling lives, not about this header.
 CONTENT_SECURITY_POLICY = (
     "default-src 'self'; "
     "script-src 'self'; "
-    "style-src 'self'; "
+    "style-src 'self' 'unsafe-inline'; "
     "img-src 'self' data:; "
     "font-src 'self'; "
     "connect-src 'self' ws: wss:; "
@@ -255,6 +273,14 @@ def create_app(config: SecurityConfig | None = None) -> FastAPI:
 
     app.include_router(ws_router, prefix="/ws")
 
+    # The live feed the shell listens to, at the root rather than under /api,
+    # because that is the address the client opens and an EventSource is not
+    # an API call. Mounted before the pages so the routing table reads in the
+    # order a browser meets it: data, then documents.
+    from wasm.web.events import router as events_router
+
+    app.include_router(events_router)
+
     if STATIC_DIR.exists():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -382,28 +408,61 @@ def create_app(config: SecurityConfig | None = None) -> FastAPI:
             )
         return response
 
-    @app.post("/logout")
-    def logout_submit(request: Request) -> Response:
+    # Sign-out lives in wasm.web.views.router, which is included above and
+    # therefore answers POST /logout. A second one used to be declared here and
+    # was unreachable for that reason alone - which was fortunate, because it
+    # read session_id off request.state.session, and that is a dict: the
+    # attribute was always None, so it cleared the browser's cookies and left
+    # the root session live on the server for the rest of its 24 hours. One
+    # implementation of each thing, and this was not it.
+
+    @app.exception_handler(404)
+    async def not_found(request: Request, exc: Exception) -> Response:
         """
-        End the session and send the browser back to the form.
+        Answer a mistyped panel address with the panel's own missing screen.
+
+        The template has existed all along and exactly one route rendered it,
+        for a domain that is not deployed. Every other unknown address - a
+        stale bookmark, a truncated paste, a link from an older version -
+        produced Starlette's plain-text 404, which reads like the server is
+        broken rather than like the page is gone.
 
         Args:
-            request: The incoming request.
+            request: The request that matched no route.
+            exc: The 404 Starlette raised. Unused; the signature requires it.
 
         Returns:
-            A response that clears the session and redirects.
+            The missing screen for a browser with a session, and the plain
+            answer for everything else. A 404 is not a place to start rendering
+            a root panel's navigation to someone who has not signed in.
         """
-        manager = get_token_manager()
-        session_id = getattr(getattr(request.state, "session", None), "session_id", None)
-        if session_id:
-            manager.revoke_session(session_id)
+        path = request.url.path
+        machine_paths = ("/api", "/ws", "/static", "/events", "/health")
+        wants_html = "text/html" in request.headers.get("accept", "")
 
-        # htmx issued the request, so the redirect has to be a header it
-        # understands; a 303 body would simply be swapped into the page.
-        response = Response(status_code=204, headers={"HX-Redirect": "/login"})
-        response.delete_cookie(SESSION_COOKIE_NAME, path="/")
-        response.delete_cookie(CSRF_COOKIE_NAME, path="/")
-        return response
+        if path.startswith(machine_paths) or not wants_html:
+            return JSONResponse({"detail": "Not found"}, status_code=404)
+
+        from wasm.web.auth import require_auth
+
+        try:
+            await require_auth(request)
+        except HTTPException:
+            return RedirectResponse("/login", status_code=303)
+
+        from wasm.web.views.rendering import page as render_page
+
+        return render_page(
+            request,
+            "pages/missing.html",
+            {
+                "section": "Not found",
+                "title": "No such screen",
+                "body": f"The panel has nothing at {path}.",
+                "command": "wasm --help",
+            },
+            status_code=404,
+        )
 
     @app.get("/health")
     async def health_check() -> dict[str, str]:
@@ -817,19 +876,55 @@ def _login_fallback_html() -> str:
 """
 
 
-def get_local_ip() -> str:
+def banner_address(host: str) -> str:
     """
-    Best-effort local address of this machine, for the startup banner.
+    Turn a bound address into one an operator can type.
+
+    Args:
+        host: The address the panel was bound to.
 
     Returns:
-        The outbound interface address, or 127.0.0.1 when it cannot be found.
+        The same address, unless it is "every interface", which no browser can
+        open: that becomes an address this machine actually answers on.
     """
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.connect(("8.8.8.8", 80))
-            return str(sock.getsockname()[0])
-    except OSError:
-        return "127.0.0.1"
+    addresses = host_addresses(host)
+    if addresses and all(address.is_unspecified for address in addresses):
+        return local_address()
+    return host
+
+
+def startup_banner(token: str, host: str, port: int, scheme: str) -> tuple[str, ...]:
+    """
+    Build what the panel prints when it comes up.
+
+    This is the entire handover between the CLI and the operator: it carries the
+    only readable copy of the access token, and the address it names is all
+    there is to go on. On a server with no desktop that address is loopback, so
+    a banner that prints it and stops hands somebody a root credential for a
+    page they have no way to open. See :func:`wasm.core.net.loopback_access_lines`.
+
+    Args:
+        token: The freshly issued access token.
+        host: Address the panel is bound to.
+        port: Port it listens on.
+        scheme: ``http`` or ``https``, matching what it serves.
+
+    Returns:
+        The lines to print, in order.
+    """
+    rule = "=" * 60
+    return (
+        "",
+        rule,
+        "WASM Web Interface",
+        rule,
+        f"Access Token: {token}",
+        f"Server: {scheme}://{host}:{port}",
+        *loopback_access_lines(host, port, scheme=scheme),
+        "Paste the token into the login form. It is never accepted in a URL.",
+        "Keep this token secure! It grants full root access to this machine.",
+        rule,
+    )
 
 
 def run_server(
@@ -871,16 +966,7 @@ def run_server(
 
     if show_token:
         scheme = "https" if ssl_certfile else "http"
-        local_ip = get_local_ip() if host == "0.0.0.0" else host
-        print()
-        print("=" * 60)
-        print("WASM Web Interface")
-        print("=" * 60)
-        print(f"Access Token: {master_token}")
-        print(f"Server: {scheme}://{local_ip}:{port}")
-        print("Paste the token into the login form. It is never accepted in a URL.")
-        print("Keep this token secure! It grants full root access to this machine.")
-        print("=" * 60)
+        print("\n".join(startup_banner(master_token, banner_address(host), port, scheme)))
         print(flush=True)
 
     uvicorn.run(

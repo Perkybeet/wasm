@@ -285,6 +285,124 @@ def test_a_taken_port_is_refused_before_a_token_is_printed(
     assert "Access Token" not in result.output
 
 
+def test_a_taken_port_says_why_the_panel_does_not_move_itself(
+    cli_runner: CliRunner,
+    deps_present: None,
+    pid_file: Path,
+    started: dict[str, Any],
+    ports: Any,
+) -> None:
+    """
+    The operator's question was "why do I have to pick the port?".
+
+    Refusing is right - the port is what tunnels, proxies and bookmarks point
+    at, and a panel that moved on its own would hide the one already running -
+    but a refusal that does not say so reads as the tool being unhelpful.
+    """
+    ports.taken.add(8080)
+
+    result = cli_runner.invoke(web.cli, ["start"])
+
+    assert result.exit_code == 1, result.output
+    assert "does not move the panel" in result.output
+
+
+def test_the_suggested_port_is_one_that_is_actually_free(
+    cli_runner: CliRunner,
+    deps_present: None,
+    pid_file: Path,
+    started: dict[str, Any],
+    ports: Any,
+) -> None:
+    """
+    The old suggestion was the requested port plus one, named without asking
+    whether anything held it. On the machine this was reported from that is the
+    port the operator tries next, so it has to be a port that will work.
+    """
+    ports.taken.update({8080, 8081, 8082})
+
+    result = cli_runner.invoke(web.cli, ["start"])
+
+    assert result.exit_code == 1, result.output
+    assert "wasm web start --port 8083" in result.output
+    assert "--port 8081" not in result.output
+
+
+def test_a_range_with_nothing_free_says_so_instead_of_suggesting_a_port(
+    cli_runner: CliRunner,
+    deps_present: None,
+    pid_file: Path,
+    started: dict[str, Any],
+    ports: Any,
+) -> None:
+    """Naming a port that is also taken would send the operator round again."""
+    ports.taken.update(range(8080, 8080 + web.PORT_SUGGESTION_SPAN + 1))
+
+    result = cli_runner.invoke(web.cli, ["start"])
+
+    assert result.exit_code == 1, result.output
+    assert "wasm web start --port" not in result.output
+    assert "is free" in result.output
+
+
+def test_a_loopback_panel_started_as_a_daemon_explains_how_to_reach_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A backgrounded panel prints its address and returns the shell, so the
+    forwarding instructions are the only thing the operator has left to go on.
+
+    Args:
+        monkeypatch: Patching helper, scoped to the test.
+    """
+    monkeypatch.setattr("wasm.core.net.server_address", lambda: "198.51.100.7")
+    monkeypatch.setattr("wasm.core.net._current_user", lambda: "root")
+
+    lines: list[str] = []
+    logger = web.Logger(verbose=False)
+    monkeypatch.setattr(logger, "info", lines.append)
+    monkeypatch.setattr(logger, "success", lines.append)
+
+    web._report_daemon_started(_loopback_config(8081), pid=4321, logger=logger)
+
+    assert "ssh -L 8081:127.0.0.1:8081 root@198.51.100.7" in "\n".join(lines)
+
+
+def test_a_reachable_daemon_panel_is_not_given_tunnel_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Args:
+        monkeypatch: Patching helper, scoped to the test.
+    """
+    lines: list[str] = []
+    logger = web.Logger(verbose=False)
+    monkeypatch.setattr(logger, "info", lines.append)
+    monkeypatch.setattr(logger, "success", lines.append)
+
+    config = _loopback_config(8081)
+    config.host = "198.51.100.7"
+
+    web._report_daemon_started(config, pid=4321, logger=logger)
+
+    assert "ssh -L" not in "\n".join(lines)
+
+
+def _loopback_config(port: int) -> Any:
+    """
+    Build a security configuration bound to loopback.
+
+    Args:
+        port: Port the panel would listen on.
+
+    Returns:
+        The configuration.
+    """
+    from wasm.web.auth import SecurityConfig
+
+    return SecurityConfig(host="127.0.0.1", port=port)
+
+
 def test_a_free_port_starts_normally(
     cli_runner: CliRunner,
     deps_present: None,

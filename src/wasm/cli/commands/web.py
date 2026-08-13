@@ -40,7 +40,6 @@ Two structural notes about the Click migration:
 from __future__ import annotations
 
 import importlib.util
-import ipaddress
 import os
 import signal
 import socket
@@ -59,6 +58,13 @@ from wasm.cli.app import Context, enable_dry_run, pass_context
 from wasm.core.exceptions import SecurityError, WASMError
 from wasm.core.fs import get_fs
 from wasm.core.logger import Logger, set_colors_disabled
+from wasm.core.net import (
+    host_addresses,
+    is_loopback_host,
+    loopback_access_lines,
+    normalize_host,
+    strip_brackets,
+)
 from wasm.core.runner import get_runner
 
 if TYPE_CHECKING:
@@ -68,22 +74,17 @@ if TYPE_CHECKING:
 PID_FILE = Path("/var/run/wasm-web.pid")
 PID_FILE_USER = Path.home() / ".wasm" / "web.pid"
 
-#: The address a socket is given when it should answer on every interface. It
-#: is named here to be recognised and refused, never bound by default.
-ALL_INTERFACES = "0.0.0.0"  # noqa: S104
-
-#: Spellings of "every interface" that no resolver accepts, so they cannot be
-#: classified by looking them up. The empty string is the one that mattered: a
-#: version of this module kept a set of loopback *strings* with "" in it, and
-#: ``wasm web start --host ""`` walked past the refusal below and bound the
-#: root panel to every interface in cleartext.
-WILDCARD_SPELLINGS = frozenset({"", "*"})
-
 #: Package installation is slow on a cold cache but must not hang a session.
 INSTALL_TIMEOUT = 900
 
 #: Seconds between stopping and starting again, so the port is released.
 RESTART_PAUSE = 1
+
+#: How far past a taken port to look for a free one to name. The panel is not
+#: moved automatically - see :func:`_start` - but the port offered instead has
+#: to be one that will actually work, and the search has to finish while the
+#: operator is still reading the error.
+PORT_SUGGESTION_SPAN = 20
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -208,110 +209,6 @@ def _exit(code: int) -> NoReturn:
 # How the panel is exposed
 # ---------------------------------------------------------------------------
 
-#: Address family alias, for the helpers below.
-IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
-
-
-def _strip_brackets(host: str) -> str:
-    """
-    Remove the brackets an IPv6 literal is often written with.
-
-    Args:
-        host: The spelling the operator typed.
-
-    Returns:
-        The spelling without a surrounding ``[]`` pair.
-    """
-    candidate = host.strip()
-    if len(candidate) > 1 and candidate.startswith("[") and candidate.endswith("]"):
-        return candidate[1:-1]
-    return candidate
-
-
-def _host_addresses(host: str) -> tuple[IPAddress, ...]:
-    """
-    Return every address a host spelling would end up bound to.
-
-    Comparing host strings is what made this decision wrong: "" , "*", "0",
-    "0.0.0.0", "::" and a name in ``/etc/hosts`` pointing at 0.0.0.0 are six
-    spellings of the same socket, and a set of known-good strings misses five
-    of them. The resolver is asked instead, and its answer is classified with
-    :mod:`ipaddress`.
-
-    Args:
-        host: The spelling the operator typed.
-
-    Returns:
-        The addresses, empty when the spelling cannot be resolved. Empty means
-        "unknown", and every caller treats unknown as exposed.
-    """
-    candidate = _strip_brackets(host)
-    if candidate in WILDCARD_SPELLINGS:
-        return (ipaddress.ip_address(ALL_INTERFACES),)
-
-    try:
-        return (ipaddress.ip_address(candidate),)
-    except ValueError:
-        pass
-
-    try:
-        # A resolution covers names and also the inet_aton spellings ipaddress
-        # refuses but a socket accepts, such as "0" (INADDR_ANY) and "127.1".
-        infos = socket.getaddrinfo(candidate, None, type=socket.SOCK_STREAM)
-    except (OSError, UnicodeError, ValueError):
-        return ()
-
-    addresses = []
-    for info in infos:
-        # A link-local sockaddr carries a %scope suffix that ipaddress refuses.
-        text = str(info[4][0]).split("%", 1)[0]
-        try:
-            addresses.append(ipaddress.ip_address(text))
-        except ValueError:
-            return ()
-    return tuple(addresses)
-
-
-def _is_loopback_host(host: str) -> bool:
-    """
-    Report whether only this machine could reach a panel bound to a host.
-
-    Args:
-        host: The spelling the operator typed.
-
-    Returns:
-        True only when the spelling is known to resolve to loopback addresses
-        and nothing else. A spelling that cannot be resolved is not loopback,
-        because guessing in the other direction publishes a root shell.
-    """
-    addresses = _host_addresses(host)
-    return bool(addresses) and all(address.is_loopback for address in addresses)
-
-
-def _normalize_host(host: str) -> str:
-    """
-    Canonicalise a host spelling so what is checked is what is reported.
-
-    Args:
-        host: The spelling the operator typed.
-
-    Returns:
-        The canonical spelling. Every way of writing "every interface" becomes
-        the address it binds, so the refusal below names a real address instead
-        of quoting an empty string back at the operator.
-    """
-    candidate = _strip_brackets(host)
-    addresses = _host_addresses(candidate)
-    if not addresses:
-        return candidate
-    if candidate in WILDCARD_SPELLINGS or all(address.is_unspecified for address in addresses):
-        return str(addresses[0])
-    try:
-        return str(ipaddress.ip_address(candidate))
-    except ValueError:
-        # A name: binding it is the resolver's business, not this module's.
-        return candidate
-
 
 @dataclass(frozen=True)
 class StartOptions:
@@ -422,11 +319,11 @@ def _build_security_config(options: StartOptions) -> SecurityConfig:
 
     # Normalised first, so the exposure decision, the message and the address
     # that is finally bound all talk about the same thing.
-    host = _normalize_host(options.host)
+    host = normalize_host(options.host)
     port = options.port
     whitelist = list(options.allow_ip)
     proxies = list(options.trusted_proxy)
-    local_only = _is_loopback_host(host)
+    local_only = is_loopback_host(host)
 
     if options.require_https and not (options.tls_cert and options.tls_key):
         raise SecurityError(
@@ -443,7 +340,7 @@ def _build_security_config(options: StartOptions) -> SecurityConfig:
         unresolved = (
             f"WASM could not resolve {host!r}, so it cannot show that only this machine "
             "would reach the panel, and treats it as exposed.\n"
-            if not _host_addresses(host)
+            if not host_addresses(host)
             else ""
         )
         raise SecurityError(
@@ -723,12 +620,12 @@ def _port_in_use(host: str, port: int) -> bool:
     Returns:
         True when binding would fail because something holds the address.
     """
-    family = socket.AF_INET6 if ":" in _strip_brackets(host) else socket.AF_INET
+    family = socket.AF_INET6 if ":" in strip_brackets(host) else socket.AF_INET
     probe = socket.socket(family, socket.SOCK_STREAM)
     try:
         # Deliberately not SO_REUSEADDR: with it the bind succeeds against a
         # socket in TIME_WAIT, which is the case this is meant to catch.
-        probe.bind((_strip_brackets(host), port))
+        probe.bind((strip_brackets(host), port))
     except OSError:
         return True
     except (ValueError, socket.gaierror):
@@ -738,6 +635,84 @@ def _port_in_use(host: str, port: int) -> bool:
     finally:
         probe.close()
     return False
+
+
+def _first_free_port(host: str, port: int) -> int | None:
+    """
+    Find a port to offer in place of one that is taken.
+
+    Args:
+        host: Address the panel would bind.
+        port: The port that turned out to be taken.
+
+    Returns:
+        The first free port above it, or None when the whole search span is
+        held. Naming a port without checking it is what made the old suggestion
+        useless: it was the requested port plus one, and on a machine busy
+        enough to hit this at all that is frequently taken too.
+    """
+    for candidate in range(port + 1, min(port + 1 + PORT_SUGGESTION_SPAN, 65536)):
+        if not _port_in_use(host, candidate):
+            return candidate
+    return None
+
+
+def _report_taken_port(host: str, port: int, logger: Logger) -> None:
+    """
+    Explain a taken port, including why the panel does not move itself.
+
+    Moving to the next free port would be the obliging thing to do and it is
+    the wrong thing to do. The port is an address other things point at - an
+    SSH tunnel, a reverse proxy, a bookmark, a script - so a panel that lands
+    somewhere new whenever the old place is busy cannot be automated. It would
+    also paper over the case this check exists to catch: a second panel, still
+    running, still holding a root session.
+
+    None of that is obvious from the outside, so it is said rather than
+    implied.
+
+    Args:
+        host: Address the panel would have bound.
+        port: The port something else holds.
+        logger: Logger for the report.
+    """
+    logger.error(f"Something is already listening on {host}:{port}")
+    logger.info("WASM does not move the panel to another port on its own:")
+    logger.info("  the port is what your SSH tunnel, proxy and bookmarks point at,")
+    logger.info("  and moving it would hide a panel that is still running here.")
+    logger.info("If it is a panel this machine has forgotten about:")
+    logger.info("  wasm web stop")
+    logger.info("To see what holds the port:")
+    logger.info(f"  ss -ltnp 'sport = :{port}'")
+
+    free = _first_free_port(host, port)
+    if free is None:
+        logger.info(
+            f"Nothing up to {port + PORT_SUGGESTION_SPAN} is free either. "
+            "Choose a port with --port."
+        )
+        return
+    logger.info(f"Or serve on {free}, which is free right now:")
+    logger.info(f"  wasm web start --port {free}")
+
+
+def _report_daemon_started(config: SecurityConfig, pid: int, logger: Logger) -> None:
+    """
+    Report a backgrounded panel, and how to reach it.
+
+    Args:
+        config: The configuration it was started with.
+        pid: Process id of the panel.
+        logger: Logger for the report.
+    """
+    scheme = "https" if config.require_https else "http"
+
+    logger.success(f"Web server started in background (PID: {pid})")
+    logger.info(f"Server running at {scheme}://{config.host}:{config.port}")
+    for line in loopback_access_lines(config.host, config.port, scheme=scheme):
+        logger.info(line)
+    logger.info("Use 'wasm web status' to check status")
+    logger.info("Use 'wasm web stop' to stop the server")
 
 
 def _start(options: StartOptions, verbose: bool, *, dry_run: bool = False) -> int:
@@ -811,20 +786,14 @@ def _start(options: StartOptions, verbose: bool, *, dry_run: bool = False) -> in
     # bare OSError, leaving an operator holding a credential for a server that
     # never started.
     if not dry_run and _port_in_use(host, config.port):
-        logger.error(f"Something is already listening on {host}:{config.port}")
-        logger.info("If it is a panel this machine has forgotten about:")
-        logger.info("  wasm web stop")
-        logger.info("To see what holds the port:")
-        logger.info(f"  ss -ltnp 'sport = :{config.port}'")
-        logger.info("Or serve somewhere else:")
-        logger.info(f"  wasm web start --port {config.port + 1}")
+        _report_taken_port(host, config.port, logger)
         return 1
 
     if config.ip_whitelist:
         logger.info(f"Only these clients may connect: {', '.join(config.ip_whitelist)}")
     if config.trusted_proxies:
         logger.info(f"Forwarding headers believed from: {', '.join(config.trusted_proxies)}")
-    elif _is_loopback_host(host) and not config.require_https:
+    elif is_loopback_host(host) and not config.require_https:
         logger.warning(
             "Serving plain HTTP on loopback. Behind a TLS proxy, pass --trusted-proxy "
             "so the session cookie is issued with the Secure flag."
@@ -882,17 +851,13 @@ def _start_daemon(config: SecurityConfig, verbose: bool) -> int:
         Exit code.
     """
     logger = Logger(verbose=verbose)
-    scheme = "https" if config.require_https else "http"
 
     # Fork process
     pid = os.fork()
 
     if pid > 0:
         # Parent process
-        logger.success(f"Web server started in background (PID: {pid})")
-        logger.info(f"Server running at {scheme}://{config.host}:{config.port}")
-        logger.info("Use 'wasm web status' to check status")
-        logger.info("Use 'wasm web stop' to stop the server")
+        _report_daemon_started(config, pid, logger)
         return 0
 
     # Child process
