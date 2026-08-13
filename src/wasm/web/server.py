@@ -23,6 +23,7 @@ import logging
 import socket
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -781,6 +782,7 @@ class SecurityMiddleware:
         headers["X-Frame-Options"] = "DENY"
         headers["Referrer-Policy"] = "no-referrer"
         headers["Cross-Origin-Opener-Policy"] = "same-origin"
+        headers["Cross-Origin-Resource-Policy"] = "same-origin"
         headers["Cache-Control"] = "no-store"
         headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
 
@@ -927,6 +929,50 @@ def startup_banner(token: str, host: str, port: int, scheme: str) -> tuple[str, 
     )
 
 
+def _uvicorn_kwargs(
+    app: FastAPI,
+    host: str,
+    port: int,
+    ssl_certfile: str | None,
+    ssl_keyfile: str | None,
+) -> dict[str, Any]:
+    """
+    Build the keyword arguments ``run_server`` hands to ``uvicorn.run``.
+
+    Pulled out as its own pure function so the composition is testable
+    without binding a real socket: ``uvicorn.run`` blocks for the life of the
+    process and tests/conftest.py makes real network access fail, so nothing
+    that actually starts the server can run in the suite.
+
+    Args:
+        app: The application to serve.
+        host: Address to bind to.
+        port: Port to bind to.
+        ssl_certfile: Path to a TLS certificate, or None for plain HTTP.
+        ssl_keyfile: Path to the certificate's private key, or None for plain
+            HTTP.
+
+    Returns:
+        Keyword arguments for ``uvicorn.run``.
+    """
+    return {
+        "app": app,
+        "host": host,
+        "port": port,
+        "log_level": "warning",
+        # The panel runs privileged operations; requests must leave a trace.
+        "access_log": True,
+        "ssl_certfile": ssl_certfile,
+        "ssl_keyfile": ssl_keyfile,
+        # uvicorn's default "Server: uvicorn" response header announces the
+        # exact software running behind the panel to anyone, unauthenticated.
+        # That is a fingerprint an attacker probes for before picking an
+        # exploit, and the panel's own hardening headers do not touch it: it
+        # is uvicorn, not the application, that writes it.
+        "server_header": False,
+    }
+
+
 def run_server(
     host: str = "127.0.0.1",
     port: int = 8080,
@@ -969,13 +1015,4 @@ def run_server(
         print("\n".join(startup_banner(master_token, banner_address(host), port, scheme)))
         print(flush=True)
 
-    uvicorn.run(
-        app,
-        host=host,
-        port=port,
-        log_level="warning",
-        # The panel runs privileged operations; requests must leave a trace.
-        access_log=True,
-        ssl_certfile=ssl_certfile,
-        ssl_keyfile=ssl_keyfile,
-    )
+    uvicorn.run(**_uvicorn_kwargs(app, host, port, ssl_certfile, ssl_keyfile))

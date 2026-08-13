@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any, Literal, overload
 
 from wasm.core.exceptions import CertificateError, WASMError
-from wasm.core.fs import FileSystem
+from wasm.core.fs import SECRET_DIR_MODE, SECRET_MODE, FileSystem
 from wasm.core.runner import DEFAULT_TIMEOUT, CommandResult, CommandRunner
 from wasm.core.store import WASMStore, get_store
 from wasm.managers.base_manager import BaseManager, MappingRecord
@@ -64,6 +64,45 @@ _CRON_MODE = 0o644
 #: Fields of :class:`CertificateInfo` that hold text, used to type the mapping
 #: accessor the CLI and the health check still read certificates through.
 _TextField = Literal["name", "expiry", "expiry_full", "cert_path", "key_path"]
+
+#: Validity of a certificate WASM mints for itself. Long on purpose: it is
+#: self-signed, so an early expiry adds no security and only breaks a restart
+#: years later, when nobody remembers where the pair came from.
+_SELF_SIGNED_DAYS = 3650
+
+#: Seconds of remaining validity below which a minted pair is replaced rather
+#: than reused.
+_SELF_SIGNED_MIN_VALIDITY = 86400
+
+#: What may go into the subject of a minted certificate. The name lands in
+#: ``-subj /CN=...``, where ``/`` separates fields and ``=`` separates keys
+#: from values, so anything that could restructure the subject is refused
+#: rather than escaped.
+_SUBJECT_NAME = re.compile(r"^[A-Za-z0-9._:-]+$")
+
+
+def _pem_block(text: str, label: str) -> str | None:
+    """
+    Extract the first PEM block whose label ends with the given words.
+
+    openssl varies the exact label with the key algorithm (``PRIVATE KEY``,
+    ``RSA PRIVATE KEY``, ``EC PRIVATE KEY``), so the match is by suffix.
+
+    Args:
+        text: Text that may contain PEM blocks.
+        label: Final words of the block label, such as ``PRIVATE KEY``.
+
+    Returns:
+        The block including its markers, ending in one newline, or None when
+        no such block is present.
+    """
+    escaped = re.escape(label)
+    pattern = re.compile(
+        rf"-----BEGIN (?:[A-Z0-9]+ )*{escaped}-----\n.*?\n-----END (?:[A-Z0-9]+ )*{escaped}-----",
+        re.DOTALL,
+    )
+    match = pattern.search(text)
+    return f"{match.group(0)}\n" if match else None
 
 
 @dataclass
@@ -779,6 +818,128 @@ class CertManager(BaseManager):
                 self.store.update_app(app)
         except (WASMError, sqlite3.Error) as exc:
             self.logger.debug(f"Could not update SSL in store: {exc}")
+
+    # -- Self-signed material ------------------------------------------------
+
+    def generate_self_signed(self, hostname: str, cert_path: Path, key_path: Path) -> bool:
+        """
+        Mint a self-signed certificate for a host, or keep a valid one.
+
+        This exists for the panel: TLS is mandatory beyond loopback, and a
+        machine without a public domain still needs something to serve. The
+        pair is written owner-only through the filesystem seam, and a pair
+        already on disk and still valid is left alone, because reminting on
+        every start would churn the fingerprint the operator's browser has
+        already stored an exception for.
+
+        Args:
+            hostname: Name or address the certificate is issued to.
+            cert_path: Destination for the certificate, created 0600.
+            key_path: Destination for the private key, created 0600.
+
+        Returns:
+            True when a new pair was written, False when the existing pair was
+            reused.
+
+        Raises:
+            CertificateError: When the hostname cannot go into a certificate
+                subject, or when openssl fails or prints no usable pair.
+        """
+        name = hostname.strip()
+        if not name or not _SUBJECT_NAME.match(name):
+            raise CertificateError(
+                f"Invalid hostname for a self-signed certificate: {hostname!r}",
+                details=(
+                    "The name goes into the certificate subject. Use a bare host "
+                    "name or address such as panel.internal or 192.0.2.10."
+                ),
+            )
+
+        if self._reusable_pair(cert_path, key_path):
+            self.logger.debug(f"Reusing the self-signed certificate at {cert_path}")
+            return False
+
+        # The key is asked for on stdout instead of letting openssl write the
+        # files itself: that is what lets both files be created 0600 through
+        # the filesystem seam, with no window at another mode and no stray
+        # privkey.pem in the working directory. The runner is called directly
+        # because _run logs command output at debug level, and this output is
+        # a private key.
+        result = self.runner.run(
+            [
+                "openssl",
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-sha256",
+                "-days",
+                str(_SELF_SIGNED_DAYS),
+                "-nodes",
+                "-subj",
+                f"/CN={name}",
+                "-keyout",
+                "/dev/stdout",
+            ],
+            timeout=60,
+        )
+        if not result.success:
+            raise CertificateError(
+                f"openssl could not create a self-signed certificate for {name}",
+                details=(result.stderr or result.stdout).strip()
+                or f"openssl req exited with {result.exit_code} and no output.",
+            )
+
+        key_pem = _pem_block(result.stdout, "PRIVATE KEY")
+        cert_pem = _pem_block(result.stdout, "CERTIFICATE")
+        if key_pem is None or cert_pem is None:
+            raise CertificateError(
+                f"openssl reported success but printed no usable key pair for {name}",
+                details=(
+                    "Expected a PRIVATE KEY and a CERTIFICATE block on stdout. "
+                    "Check the installation with 'openssl version'."
+                ),
+            )
+
+        self.fs.make_dir(cert_path.parent, mode=SECRET_DIR_MODE)
+        self.fs.write_text(key_path, key_pem, mode=SECRET_MODE)
+        self.fs.write_text(cert_path, cert_pem, mode=SECRET_MODE)
+        self.logger.debug(f"Minted a self-signed certificate for {name} at {cert_path}")
+        return True
+
+    def _reusable_pair(self, cert_path: Path, key_path: Path) -> bool:
+        """
+        Report whether an existing minted pair can keep serving.
+
+        Only expiry is checked, not the subject: a self-signed certificate is
+        trusted by its fingerprint, so replacing it whenever the panel is
+        started with a different ``--host`` would invalidate that trust for no
+        gain in return.
+
+        Args:
+            cert_path: Certificate the pair would serve.
+            key_path: Private key belonging to it.
+
+        Returns:
+            True when both files exist and the certificate is not about to
+            expire. A certificate openssl cannot read answers False, so a
+            corrupt pair is reminted instead of served.
+        """
+        if not cert_path.exists() or not key_path.exists():
+            return False
+        result = self._exec(
+            [
+                "openssl",
+                "x509",
+                "-in",
+                str(cert_path),
+                "-noout",
+                "-checkend",
+                str(_SELF_SIGNED_MIN_VALIDITY),
+            ],
+            sudo=False,
+        )
+        return result.success
 
     # -- Renewal and removal -----------------------------------------------
 

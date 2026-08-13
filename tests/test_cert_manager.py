@@ -262,6 +262,171 @@ def test_a_hostile_domain_never_reaches_certbot(
     assert runner.calls == []
 
 
+# ---------------------------------------------------------------------------
+# Self-signed material for the panel
+# ---------------------------------------------------------------------------
+
+#: What openssl prints when the key is requested on stdout: the key first,
+#: then the certificate, nothing else on that stream.
+SELF_SIGNED_STDOUT = (
+    "-----BEGIN PRIVATE KEY-----\nMIIEvQfake\n-----END PRIVATE KEY-----\n"
+    "-----BEGIN CERTIFICATE-----\nMIIDfake\n-----END CERTIFICATE-----\n"
+)
+
+
+def _tls_paths(tmp_path: Path) -> tuple[Path, Path]:
+    """
+    Build the destination paths a panel certificate would be written to.
+
+    Args:
+        tmp_path: Per-test temporary directory.
+
+    Returns:
+        The certificate path and the key path, in a directory that does not
+        exist yet.
+    """
+    base = tmp_path / "panel-tls"
+    return base / "panel.crt", base / "panel.key"
+
+
+def test_minting_builds_the_exact_openssl_argv(
+    certs: CertManager, runner: FakeRunner, tmp_path: Path
+) -> None:
+    """The command that ends up running is the one under test."""
+    runner.script(["openssl", "req"], stdout=SELF_SIGNED_STDOUT)
+    cert_path, key_path = _tls_paths(tmp_path)
+
+    assert certs.generate_self_signed("panel.internal", cert_path, key_path) is True
+    assert runner.calls == [
+        (
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-sha256",
+            "-days",
+            "3650",
+            "-nodes",
+            "-subj",
+            "/CN=panel.internal",
+            "-keyout",
+            "/dev/stdout",
+        )
+    ]
+
+
+def test_the_minted_pair_is_owner_only_and_split_correctly(
+    certs: CertManager, runner: FakeRunner, tmp_path: Path
+) -> None:
+    """
+    The key is asked for on stdout so the files are created by the fs seam.
+
+    Letting openssl write them itself would leave the certificate at the umask
+    and put the writes outside the seam that makes --dry-run honest.
+    """
+    runner.script(["openssl", "req"], stdout=SELF_SIGNED_STDOUT)
+    cert_path, key_path = _tls_paths(tmp_path)
+
+    certs.generate_self_signed("panel.internal", cert_path, key_path)
+
+    assert key_path.read_text() == (
+        "-----BEGIN PRIVATE KEY-----\nMIIEvQfake\n-----END PRIVATE KEY-----\n"
+    )
+    assert cert_path.read_text() == (
+        "-----BEGIN CERTIFICATE-----\nMIIDfake\n-----END CERTIFICATE-----\n"
+    )
+    assert (key_path.stat().st_mode & 0o777) == 0o600
+    assert (cert_path.stat().st_mode & 0o777) == 0o600
+    assert (cert_path.parent.stat().st_mode & 0o777) == 0o700
+    # And nothing else - a temporary, a stray privkey.pem - was left behind.
+    assert sorted(p.name for p in cert_path.parent.iterdir()) == ["panel.crt", "panel.key"]
+
+
+def test_a_pair_still_valid_is_reused_not_reminted(
+    certs: CertManager, runner: FakeRunner, tmp_path: Path
+) -> None:
+    """
+    Restarting the panel must not churn the certificate fingerprint.
+
+    The operator's browser stores an exception for the fingerprint it saw; a
+    pair reminted on every start invalidates that exception on every start.
+    """
+    cert_path, key_path = _tls_paths(tmp_path)
+    cert_path.parent.mkdir(parents=True)
+    cert_path.write_text("cert")
+    key_path.write_text("key")
+
+    assert certs.generate_self_signed("panel.internal", cert_path, key_path) is False
+    assert runner.calls == [
+        ("openssl", "x509", "-in", str(cert_path), "-noout", "-checkend", "86400")
+    ]
+    assert cert_path.read_text() == "cert"
+
+
+def test_an_expiring_pair_is_reminted(
+    certs: CertManager, runner: FakeRunner, tmp_path: Path
+) -> None:
+    """A pair about to expire is replaced instead of served until it breaks."""
+    cert_path, key_path = _tls_paths(tmp_path)
+    cert_path.parent.mkdir(parents=True)
+    cert_path.write_text("stale cert")
+    key_path.write_text("stale key")
+    runner.script(["openssl", "x509"], exit_code=1)
+    runner.script(["openssl", "req"], stdout=SELF_SIGNED_STDOUT)
+
+    assert certs.generate_self_signed("panel.internal", cert_path, key_path) is True
+    assert cert_path.read_text().startswith("-----BEGIN CERTIFICATE-----")
+    assert key_path.read_text().startswith("-----BEGIN PRIVATE KEY-----")
+
+
+def test_a_failed_openssl_is_reported_verbatim(
+    certs: CertManager, runner: FakeRunner, tmp_path: Path
+) -> None:
+    """The operator gets openssl's own words, not a paraphrase."""
+    runner.script(["openssl", "req"], stderr="unable to load provider", exit_code=1)
+    cert_path, key_path = _tls_paths(tmp_path)
+
+    with pytest.raises(CertificateError) as raised:
+        certs.generate_self_signed("panel.internal", cert_path, key_path)
+
+    assert "unable to load provider" in str(raised.value.details)
+    assert not cert_path.exists()
+    assert not key_path.exists()
+
+
+def test_success_without_pem_output_is_an_error(
+    certs: CertManager, runner: FakeRunner, tmp_path: Path
+) -> None:
+    """An exit code of 0 with no key on stdout must not write empty files."""
+    runner.script(["openssl", "req"], stdout="")
+    cert_path, key_path = _tls_paths(tmp_path)
+
+    with pytest.raises(CertificateError):
+        certs.generate_self_signed("panel.internal", cert_path, key_path)
+
+    assert not cert_path.exists()
+    assert not key_path.exists()
+
+
+@pytest.mark.parametrize("hostname", ["", "  ", "a/b", "host name", "x;y", "/CN=evil"])
+def test_a_hostile_subject_never_reaches_openssl(
+    certs: CertManager, runner: FakeRunner, tmp_path: Path, hostname: str
+) -> None:
+    """
+    The name lands in ``-subj``, where ``/`` separates fields.
+
+    Args:
+        hostname: A spelling that must be refused before openssl runs.
+    """
+    cert_path, key_path = _tls_paths(tmp_path)
+
+    with pytest.raises(CertificateError):
+        certs.generate_self_signed(hostname, cert_path, key_path)
+
+    assert runner.calls == []
+
+
 def test_tls_is_recorded_only_once_the_certificate_files_exist(
     certs: CertManager, runner: FakeRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:

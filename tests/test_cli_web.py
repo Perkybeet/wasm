@@ -27,6 +27,7 @@ from typing import Any
 
 import click
 import pytest
+import yaml
 from click.testing import CliRunner
 
 from wasm.cli.commands import web
@@ -82,6 +83,46 @@ def logger_follows_the_current_stdout(monkeypatch: pytest.MonkeyPatch) -> None:
             super().__init__(*args, **kwargs)
 
     monkeypatch.setattr(web, "Logger", StdoutLogger)
+
+
+@pytest.fixture(autouse=True)
+def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """
+    Point the layered configuration at a per-test file.
+
+    ``_build_security_config`` reads the ``web.*`` keys through the Config
+    singleton, which would otherwise read the developer's real
+    ``/etc/wasm/config.yaml`` and make these tests depend on the machine they
+    run on.
+
+    Args:
+        tmp_path: Per-test temporary directory.
+        monkeypatch: Patching helper, scoped to the test.
+
+    Yields:
+        The configuration file the test may write.
+    """
+    from wasm.core import config as config_module
+
+    path = tmp_path / "config.yaml"
+    monkeypatch.setattr(config_module, "DEFAULT_CONFIG_PATH", path)
+    config_module.Config.reset_instance()
+    yield path
+    config_module.Config.reset_instance()
+
+
+def _write_web_config(path: Path, **settings: Any) -> None:
+    """
+    Declare ``web.*`` keys in the isolated config file and reload the singleton.
+
+    Args:
+        path: The isolated configuration file.
+        **settings: Keys of the ``web`` section, as an operator would write them.
+    """
+    from wasm.core.config import Config
+
+    path.write_text(yaml.safe_dump({"web": settings}), encoding="utf-8")
+    Config.reset_instance()
 
 
 @pytest.fixture
@@ -453,8 +494,9 @@ def test_binding_to_every_interface_without_protection_is_refused(
 
     assert result.exit_code != 0
     assert isinstance(result.exception, SecurityError)
-    assert "--allow-ip" in result.exception.details
-    assert "--require-https" in result.exception.details
+    assert "--tls-cert" in result.exception.details
+    assert "--self-signed" in result.exception.details
+    assert "--insecure-http" in result.exception.details
     assert "config" not in started
 
 
@@ -481,7 +523,7 @@ def test_no_spelling_of_every_interface_escapes_the_refusal(
     result = cli_runner.invoke(web.cli, ["start", "--host", spelling])
 
     assert isinstance(result.exception, SecurityError), result.output
-    assert "--allow-ip" in result.exception.details
+    assert "--self-signed" in result.exception.details
     assert "config" not in started
 
 
@@ -560,7 +602,7 @@ def test_a_wildcard_host_is_normalised_before_it_is_bound(
     cli_runner: CliRunner, deps_present: None, pid_file: Path, started: dict[str, Any]
 ) -> None:
     """What was checked and what is served have to be the same address."""
-    result = cli_runner.invoke(web.cli, ["start", "--host", "", "--allow-ip", "10.0.0.0/24"])
+    result = cli_runner.invoke(web.cli, ["start", "--host", "", "--insecure-http"])
 
     assert result.exit_code == 0, result.output
     assert started["config"].host == ALL_INTERFACES
@@ -619,21 +661,60 @@ def test_require_https_without_material_is_refused(
 
     assert isinstance(result.exception, SecurityError)
     assert "--tls-cert" in result.exception.details
+    assert "--self-signed" in result.exception.details
     assert "config" not in started
 
 
-def test_a_whitelist_justifies_the_exposure(
+def test_a_whitelist_alone_no_longer_justifies_the_exposure(
     cli_runner: CliRunner, deps_present: None, pid_file: Path, started: dict[str, Any]
 ) -> None:
-    """Declaring who may connect is one of the ways to open the panel up."""
+    """
+    The finding this closes: --allow-ip restricts who connects, it encrypts
+    nothing, so the token and the session cookie still crossed the network in
+    cleartext for every allowed client.
+    """
     result = cli_runner.invoke(
         web.cli,
-        ["start", "--host", ALL_INTERFACES, "--allow-ip", "10.0.0.0/24", "--allow-ip", "10.1.0.1"],
+        ["start", "--host", ALL_INTERFACES, "--allow-ip", "10.0.0.0/24"],
+    )
+
+    assert isinstance(result.exception, SecurityError), result.output
+    assert "--self-signed" in result.exception.details
+    assert "config" not in started
+
+
+def test_the_insecure_opt_out_opens_the_panel_and_keeps_the_whitelist(
+    cli_runner: CliRunner, deps_present: None, pid_file: Path, started: dict[str, Any]
+) -> None:
+    """Cleartext is available, but only asked for in so many words."""
+    result = cli_runner.invoke(
+        web.cli,
+        [
+            "start",
+            "--host",
+            ALL_INTERFACES,
+            "--insecure-http",
+            "--allow-ip",
+            "10.0.0.0/24",
+            "--allow-ip",
+            "10.1.0.1",
+        ],
     )
 
     assert result.exit_code == 0, result.output
+    assert started["config"].require_https is False
     assert started["config"].ip_whitelist == ["10.0.0.0/24", "10.1.0.1"]
     assert started["config"].allowed_hosts == []
+
+
+def test_the_insecure_opt_out_names_what_travels_in_cleartext(
+    cli_runner: CliRunner, deps_present: None, pid_file: Path, started: dict[str, Any]
+) -> None:
+    """The operator who opted out is still told what the opt-out costs."""
+    result = cli_runner.invoke(web.cli, ["start", "--host", ALL_INTERFACES, "--insecure-http"])
+
+    assert result.exit_code == 0, result.output
+    assert "unencrypted" in result.output
 
 
 def test_tls_material_opens_the_panel_up(
@@ -667,6 +748,292 @@ def test_tls_material_opens_the_panel_up(
     assert started["config"].require_https is True
     assert started["config"].ssl_certfile == str(cert)
     assert started["config"].ssl_keyfile == str(key)
+
+
+def test_tls_material_serves_tls_without_a_separate_switch(
+    cli_runner: CliRunner,
+    deps_present: None,
+    pid_file: Path,
+    started: dict[str, Any],
+    tmp_path: Path,
+) -> None:
+    """
+    A certificate handed over and then not served is the require_https trap:
+    the material was carried into the configuration and ignored unless a
+    second flag was remembered. Material present means TLS served.
+    """
+    cert = tmp_path / "fullchain.pem"
+    key = tmp_path / "privkey.pem"
+    cert.write_text("cert")
+    key.write_text("key")
+
+    result = cli_runner.invoke(
+        web.cli,
+        ["start", "--host", ALL_INTERFACES, "--tls-cert", str(cert), "--tls-key", str(key)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert started["config"].require_https is True
+    assert started["config"].ssl_certfile == str(cert)
+
+
+def test_a_certificate_without_its_key_is_refused(
+    cli_runner: CliRunner,
+    deps_present: None,
+    pid_file: Path,
+    started: dict[str, Any],
+    tmp_path: Path,
+) -> None:
+    """Half a pair cannot serve; the message names the missing half."""
+    cert = tmp_path / "fullchain.pem"
+    cert.write_text("cert")
+
+    result = cli_runner.invoke(web.cli, ["start", "--tls-cert", str(cert)])
+
+    assert isinstance(result.exception, SecurityError), result.output
+    assert "--tls-key" in result.exception.details
+    assert "config" not in started
+
+
+# ---------------------------------------------------------------------------
+# Minting a self-signed certificate
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def minted(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, Path, Path]]:
+    """
+    Capture what the certificate manager would be asked to mint.
+
+    Args:
+        monkeypatch: Patching helper, scoped to the test.
+
+    Returns:
+        A list filled in with (hostname, cert_path, key_path) per request.
+    """
+    requests: list[tuple[str, Path, Path]] = []
+
+    def record(self: Any, hostname: str, cert_path: Path, key_path: Path) -> bool:
+        requests.append((hostname, cert_path, key_path))
+        return True
+
+    monkeypatch.setattr("wasm.managers.cert_manager.CertManager.generate_self_signed", record)
+    return requests
+
+
+def test_self_signed_mints_a_pair_and_serves_tls(
+    cli_runner: CliRunner,
+    deps_present: None,
+    pid_file: Path,
+    started: dict[str, Any],
+    minted: list[tuple[str, Path, Path]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--self-signed is the whole third way out of the TLS requirement."""
+    monkeypatch.setattr(web.socket, "gethostname", lambda: "panel-host")
+
+    result = cli_runner.invoke(web.cli, ["start", "--host", ALL_INTERFACES, "--self-signed"])
+
+    assert result.exit_code == 0, result.output
+    assert minted == [("panel-host", web.PANEL_TLS_CERT, web.PANEL_TLS_KEY)]
+    assert started["config"].require_https is True
+    assert started["config"].ssl_certfile == str(web.PANEL_TLS_CERT)
+    assert started["config"].ssl_keyfile == str(web.PANEL_TLS_KEY)
+
+
+def test_self_signed_is_issued_to_the_bound_address(
+    cli_runner: CliRunner,
+    deps_present: None,
+    pid_file: Path,
+    started: dict[str, Any],
+    minted: list[tuple[str, Path, Path]],
+) -> None:
+    """A panel bound to one address gets a certificate naming that address."""
+    result = cli_runner.invoke(web.cli, ["start", "--host", "192.0.2.10", "--self-signed"])
+
+    assert result.exit_code == 0, result.output
+    assert minted[0][0] == "192.0.2.10"
+
+
+def test_self_signed_contradicts_bringing_your_own_pair(
+    cli_runner: CliRunner,
+    deps_present: None,
+    pid_file: Path,
+    started: dict[str, Any],
+    minted: list[tuple[str, Path, Path]],
+    tmp_path: Path,
+) -> None:
+    """Two sources for the served certificate cannot both win silently."""
+    cert = tmp_path / "fullchain.pem"
+    key = tmp_path / "privkey.pem"
+    cert.write_text("cert")
+    key.write_text("key")
+
+    result = cli_runner.invoke(
+        web.cli,
+        ["start", "--self-signed", "--tls-cert", str(cert), "--tls-key", str(key)],
+    )
+
+    assert isinstance(result.exception, SecurityError), result.output
+    assert minted == []
+    assert "config" not in started
+
+
+def test_insecure_http_contradicts_tls_material(
+    cli_runner: CliRunner,
+    deps_present: None,
+    pid_file: Path,
+    started: dict[str, Any],
+    tmp_path: Path,
+) -> None:
+    """A flag that would be silently ignored is refused instead."""
+    cert = tmp_path / "fullchain.pem"
+    key = tmp_path / "privkey.pem"
+    cert.write_text("cert")
+    key.write_text("key")
+
+    result = cli_runner.invoke(
+        web.cli,
+        [
+            "start",
+            "--host",
+            ALL_INTERFACES,
+            "--insecure-http",
+            "--tls-cert",
+            str(cert),
+            "--tls-key",
+            str(key),
+        ],
+    )
+
+    assert isinstance(result.exception, SecurityError), result.output
+    assert "config" not in started
+
+
+def test_a_rehearsed_self_signed_start_mints_nothing(
+    cli_runner: CliRunner,
+    deps_present: None,
+    pid_file: Path,
+    started: dict[str, Any],
+    minted: list[tuple[str, Path, Path]],
+    seams: None,
+) -> None:
+    """
+    The reuse probe is not read-only to the dry-run runner, so acting the
+    minting out would report fiction; the rehearsal says what it would do.
+    """
+    result = cli_runner.invoke(
+        web.cli, ["--dry-run", "start", "--host", ALL_INTERFACES, "--self-signed"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert minted == []
+    assert "would mint" in result.output
+    assert "https://" in result.output
+
+
+# ---------------------------------------------------------------------------
+# config.yaml web.* keys reach the security configuration
+# ---------------------------------------------------------------------------
+
+
+def test_config_yaml_security_keys_apply_without_flags(
+    cli_runner: CliRunner,
+    deps_present: None,
+    pid_file: Path,
+    started: dict[str, Any],
+    isolated_config: Path,
+) -> None:
+    """
+    The finding this closes: every one of these keys was accepted by
+    config.yaml, shown by ``wasm config show``, and silently ignored.
+    """
+    _write_web_config(
+        isolated_config,
+        max_failed_attempts=3,
+        lockout_duration=120,
+        rate_limit_enabled=False,
+        rate_limit_requests=42,
+        rate_limit_window=30,
+        token_expiration_hours=2,
+        ip_whitelist=["10.0.0.8"],
+    )
+
+    result = cli_runner.invoke(web.cli, ["start"])
+
+    assert result.exit_code == 0, result.output
+    config = started["config"]
+    assert config.max_failed_attempts == 3
+    assert config.lockout_duration == 120
+    assert config.rate_limit_enabled is False
+    assert config.rate_limit_requests == 42
+    assert config.rate_limit_window == 30
+    assert config.token_expiration_hours == 2
+    assert config.ip_whitelist == ["10.0.0.8"]
+
+
+def test_an_explicit_flag_beats_the_config_file(
+    cli_runner: CliRunner,
+    deps_present: None,
+    pid_file: Path,
+    started: dict[str, Any],
+    isolated_config: Path,
+) -> None:
+    """Per key, the command line wins over the file, never the reverse."""
+    _write_web_config(isolated_config, ip_whitelist=["10.0.0.8"])
+
+    result = cli_runner.invoke(web.cli, ["start", "--allow-ip", "192.0.2.1"])
+
+    assert result.exit_code == 0, result.output
+    assert started["config"].ip_whitelist == ["192.0.2.1"]
+
+
+def test_shipped_defaults_apply_when_nothing_is_declared(
+    cli_runner: CliRunner,
+    deps_present: None,
+    pid_file: Path,
+    started: dict[str, Any],
+) -> None:
+    """With no file and no flags, the panel runs with the shipped defaults."""
+    from wasm.web.auth import SecurityConfig
+
+    result = cli_runner.invoke(web.cli, ["start"])
+
+    assert result.exit_code == 0, result.output
+    defaults = SecurityConfig()
+    config = started["config"]
+    for name in (
+        "max_failed_attempts",
+        "lockout_duration",
+        "rate_limit_enabled",
+        "rate_limit_requests",
+        "rate_limit_window",
+        "token_expiration_hours",
+    ):
+        assert getattr(config, name) == getattr(defaults, name), name
+    assert config.ip_whitelist == []
+
+
+def test_the_config_defaults_agree_with_the_enforcement_defaults() -> None:
+    """
+    One truth for each default.
+
+    ``DEFAULT_CONFIG`` cannot import the web layer to share the constants, so
+    this test is what pins the two sets of numbers together.
+    """
+    from wasm.core.config import DEFAULT_CONFIG
+    from wasm.web.auth import SecurityConfig
+
+    defaults = SecurityConfig()
+    shipped = DEFAULT_CONFIG["web"]
+
+    assert shipped["rate_limit_enabled"] == defaults.rate_limit_enabled
+    assert shipped["rate_limit_requests"] == defaults.rate_limit_requests
+    assert shipped["rate_limit_window"] == defaults.rate_limit_window
+    assert shipped["max_failed_attempts"] == defaults.max_failed_attempts
+    assert shipped["lockout_duration"] == defaults.lockout_duration
+    assert shipped["token_expiration_hours"] == defaults.token_expiration_hours
+    assert shipped["ip_whitelist"] == defaults.ip_whitelist
 
 
 def test_a_trusted_proxy_is_carried_into_the_configuration(

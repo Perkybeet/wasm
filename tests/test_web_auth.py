@@ -31,7 +31,7 @@ from wasm.web.auth import (
     TokenManager,
     require_auth,
 )
-from wasm.web.server import create_app, get_token_manager
+from wasm.web.server import _uvicorn_kwargs, create_app, get_token_manager
 
 #: Endpoints that answer without credentials, on purpose.
 PUBLIC_API_PATHS = frozenset({"/api/auth/login"})
@@ -432,6 +432,11 @@ def test_security_headers_are_present(sandbox: Path) -> None:
     assert headers["X-Content-Type-Options"] == "nosniff"
     assert headers["X-Frame-Options"] == "DENY"
     assert headers["Referrer-Policy"] == "no-referrer"
+    # Without it, a same-site page that embeds the panel's static assets or
+    # API responses via <img>/<script src> can be read cross-origin by any
+    # page that links to it - the class of leak Spectre made exploitable
+    # even for resources a browser would previously have blocked reading.
+    assert headers["Cross-Origin-Resource-Policy"] == "same-origin"
     assert "Strict-Transport-Security" not in headers
 
 
@@ -456,6 +461,30 @@ def test_https_required_without_certificate_refuses_to_start(sandbox: Path) -> N
         create_app(make_config(sandbox, require_https=True))
 
     assert "certbot" in excinfo.value.details or "openssl" in excinfo.value.details
+
+
+def test_uvicorn_is_configured_to_hide_its_server_banner() -> None:
+    """
+    ``run_server`` must ask uvicorn not to send ``Server: uvicorn``.
+
+    An unauthenticated response header naming the server software is exactly
+    the fingerprint an attacker probes for before picking an exploit. There is
+    no socket-free way to inspect the header uvicorn itself would send -
+    ``uvicorn.run`` blocks until the process is killed, and
+    tests/conftest.py makes real sockets fail in every test - so this checks
+    the keyword arguments ``run_server`` builds for it instead, the same way
+    ``--dry-run`` elsewhere in the project makes an otherwise-opaque call
+    testable by extracting the part that decides what would happen.
+    """
+    kwargs = _uvicorn_kwargs(
+        app=object(),
+        host="127.0.0.1",
+        port=8080,
+        ssl_certfile=None,
+        ssl_keyfile=None,
+    )
+
+    assert kwargs["server_header"] is False
 
 
 def test_plain_http_is_refused_when_https_is_required(sandbox: Path, tmp_path: Path) -> None:
@@ -801,19 +830,37 @@ def test_binding_to_every_interface_without_protection_is_an_error() -> None:
     with pytest.raises(SecurityError) as excinfo:
         build_security_config(parse_start_args(["--host", ALL_INTERFACES]))
 
-    assert "--allow-ip" in excinfo.value.details
-    assert "--require-https" in excinfo.value.details
+    assert "--tls-cert" in excinfo.value.details
+    assert "--self-signed" in excinfo.value.details
+    assert "--insecure-http" in excinfo.value.details
 
 
-def test_binding_to_every_interface_is_allowed_with_a_whitelist() -> None:
-    """Restricting who may connect is one of the ways to justify the exposure."""
+def test_a_whitelist_alone_no_longer_justifies_the_exposure() -> None:
+    """A whitelist restricts who connects; it encrypts nothing."""
+    with pytest.raises(SecurityError):
+        build_security_config(
+            parse_start_args(["--host", ALL_INTERFACES, "--allow-ip", "10.0.0.0/24"])
+        )
+
+
+def test_the_insecure_opt_out_carries_the_whitelist() -> None:
+    """Cleartext must be asked for in so many words, and keeps its whitelist."""
     config = build_security_config(
         parse_start_args(
-            ["--host", ALL_INTERFACES, "--allow-ip", "10.0.0.0/24", "--allow-ip", "10.1.0.1"]
+            [
+                "--host",
+                ALL_INTERFACES,
+                "--insecure-http",
+                "--allow-ip",
+                "10.0.0.0/24",
+                "--allow-ip",
+                "10.1.0.1",
+            ]
         )
     )
 
     assert config.ip_whitelist == ["10.0.0.0/24", "10.1.0.1"]
+    assert config.require_https is False
 
 
 def test_require_https_without_material_is_an_error() -> None:

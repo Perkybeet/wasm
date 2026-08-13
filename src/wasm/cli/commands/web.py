@@ -12,13 +12,16 @@ shell with a login form:
 - **Everything ``SecurityConfig`` can enforce is reachable from the command
   line.** A flag that only exists in Python is a flag nobody sets, which is how
   a panel ends up running with ``require_https=False`` and an empty whitelist.
-- **Binding beyond loopback without protection is an error, not a warning.** A
+- **Binding beyond loopback without TLS is an error, not a warning.** A
   warning scrolls past; the operator wanted the panel up, and it comes up. So
-  ``--host 0.0.0.0`` is refused unless the panel terminates TLS itself or only
-  answers a declared list of addresses. The decision is made about the address
-  that would be bound, not about the string typed: "", ``*``, ``0``, ``::`` and
-  a name that resolves to 0.0.0.0 are all the same socket, and a set of
-  known-good host strings recognised one of them.
+  ``--host 0.0.0.0`` is refused unless the panel terminates TLS itself - with
+  a pair the operator brings, or a self-signed one WASM mints - or cleartext
+  is accepted in so many words with ``--insecure-http``. A whitelist restricts
+  who may connect but encrypts nothing, so it does not lift the requirement.
+  The decision is made about the address that would be bound, not about the
+  string typed: "", ``*``, ``0``, ``::`` and a name that resolves to 0.0.0.0
+  are all the same socket, and a set of known-good host strings recognised one
+  of them.
 - **``wasm web token`` reports; it does not rotate.** The command people run to
   look the root credential up cannot be the command that revokes it. Issuing
   takes ``--new`` and a confirmation that names what stops working.
@@ -55,10 +58,12 @@ from typing import TYPE_CHECKING, Any, NoReturn, TypeVar
 import click
 
 from wasm.cli.app import Context, enable_dry_run, pass_context
+from wasm.core.config import Config
 from wasm.core.exceptions import SecurityError, WASMError
 from wasm.core.fs import get_fs
 from wasm.core.logger import Logger, set_colors_disabled
 from wasm.core.net import (
+    ALL_INTERFACES,
     host_addresses,
     is_loopback_host,
     loopback_access_lines,
@@ -73,6 +78,13 @@ if TYPE_CHECKING:
 # PID file location
 PID_FILE = Path("/var/run/wasm-web.pid")
 PID_FILE_USER = Path.home() / ".wasm" / "web.pid"
+
+#: Where the pair minted by ``--self-signed`` lives. A fixed place, so the
+#: pair is reused across restarts and an operator can point a monitoring
+#: check, or a replacement certificate, at it.
+PANEL_TLS_DIR = Path("/etc/wasm/panel-tls")
+PANEL_TLS_CERT = PANEL_TLS_DIR / "panel.crt"
+PANEL_TLS_KEY = PANEL_TLS_DIR / "panel.key"
 
 #: Package installation is slow on a cold cache but must not hang a session.
 INSTALL_TIMEOUT = 900
@@ -219,9 +231,14 @@ class StartOptions:
         host: Interface to bind to.
         port: TCP port to listen on.
         daemon: Whether to detach into the background.
-        require_https: Whether the panel terminates TLS itself.
+        require_https: Whether the operator demanded TLS in so many words.
+            TLS material present implies it; this flag only exists so the
+            demand can be spelled out and refused loudly when the material
+            is missing.
         tls_cert: Path to the certificate chain.
         tls_key: Path to the private key.
+        self_signed: Serve TLS with a pair minted under ``/etc/wasm/panel-tls``.
+        insecure_http: Serve cleartext beyond loopback, in so many words.
         allow_ip: Addresses or CIDRs allowed to connect, empty for anyone.
         trusted_proxy: Peers whose forwarding headers are believed.
     """
@@ -232,6 +249,8 @@ class StartOptions:
     require_https: bool = False
     tls_cert: str | None = None
     tls_key: str | None = None
+    self_signed: bool = False
+    insecure_http: bool = False
     allow_ip: tuple[str, ...] = ()
     trusted_proxy: tuple[str, ...] = ()
 
@@ -250,18 +269,31 @@ def add_start_arguments(parser: ArgumentParser) -> None:
         "--host",
         "-H",
         default="127.0.0.1",
-        help="Host to bind to (default: 127.0.0.1). Anything else requires --require-https "
-        "or --allow-ip",
+        help="Host to bind to (default: 127.0.0.1). Anything else requires TLS "
+        "(--tls-cert/--tls-key or --self-signed) or --insecure-http",
     )
     parser.add_argument("--port", "-p", type=int, default=8080, help="Port to listen on")
     parser.add_argument("--daemon", "-d", action="store_true", help="Run in background as daemon")
     parser.add_argument(
         "--require-https",
         action="store_true",
-        help="Serve TLS directly and refuse cleartext requests. Needs --tls-cert and --tls-key",
+        help="Serve TLS directly and refuse cleartext requests. Needs --tls-cert and --tls-key, "
+        "or --self-signed",
     )
     parser.add_argument("--tls-cert", default=None, help="Path to the TLS certificate chain")
     parser.add_argument("--tls-key", default=None, help="Path to the TLS private key")
+    parser.add_argument(
+        "--self-signed",
+        action="store_true",
+        help="Serve TLS with a self-signed certificate, minted under /etc/wasm/panel-tls "
+        "and reused while it is valid",
+    )
+    parser.add_argument(
+        "--insecure-http",
+        action="store_true",
+        help="Serve cleartext HTTP beyond loopback. The access token and the session "
+        "cookie cross the network unencrypted",
+    )
     parser.add_argument(
         "--allow-ip",
         action="append",
@@ -296,14 +328,68 @@ def _start_options(args: Namespace) -> StartOptions:
         require_https=bool(getattr(args, "require_https", False)),
         tls_cert=getattr(args, "tls_cert", None),
         tls_key=getattr(args, "tls_key", None),
+        self_signed=bool(getattr(args, "self_signed", False)),
+        insecure_http=bool(getattr(args, "insecure_http", False)),
         allow_ip=tuple(getattr(args, "allow_ip", None) or ()),
         trusted_proxy=tuple(getattr(args, "trusted_proxy", None) or ()),
     )
 
 
+def _web_config_overrides() -> dict[str, Any]:
+    """
+    Read the ``web.*`` security keys the layered configuration declares.
+
+    These keys have no command line flag of their own, so config.yaml is the
+    only place an operator can set them - which is exactly why ignoring them
+    silently was a defect: the file accepted the value, ``wasm config show``
+    displayed it, and the panel ran with something else.
+
+    Returns:
+        :class:`~wasm.web.auth.SecurityConfig` field overrides for every key
+        the configuration answers.
+    """
+    overrides: dict[str, Any] = {}
+    config = Config()
+    for key, cast in (
+        ("rate_limit_enabled", bool),
+        ("rate_limit_requests", int),
+        ("rate_limit_window", int),
+        ("max_failed_attempts", int),
+        ("lockout_duration", int),
+        ("token_expiration_hours", int),
+    ):
+        value = config.get(f"web.{key}")
+        if value is not None:
+            overrides[key] = cast(value)
+    return overrides
+
+
+def _config_ip_whitelist() -> list[str]:
+    """
+    Read the client whitelist config.yaml declares.
+
+    Returns:
+        The ``web.ip_whitelist`` entries, empty when none are declared.
+    """
+    return [str(entry) for entry in Config().get("web.ip_whitelist") or []]
+
+
 def _build_security_config(options: StartOptions) -> SecurityConfig:
     """
     Turn start options into a security configuration.
+
+    Keys that exist both as a flag and in config.yaml follow one precedence,
+    decided per key: an explicit command line flag wins, then the ``web.*``
+    section of ``/etc/wasm/config.yaml``, then the shipped default.
+    ``web.host`` and ``web.port`` are deliberately not read from the file: how
+    far the panel reaches is decided by the operator, in the same command that
+    refuses an unsafe exposure.
+
+    Serving beyond loopback requires the panel to terminate TLS - with a pair
+    the operator brings (``--tls-cert``/``--tls-key``) or one WASM mints
+    (``--self-signed``) - unless cleartext is accepted in so many words with
+    ``--insecure-http``. A whitelist restricts who may connect but encrypts
+    nothing, so it does not lift the requirement.
 
     Args:
         options: How the operator asked for the panel to be exposed.
@@ -313,7 +399,8 @@ def _build_security_config(options: StartOptions) -> SecurityConfig:
 
     Raises:
         SecurityError: When the requested combination would put a root panel on
-            a network unprotected.
+            a network unprotected, or when the TLS options contradict each
+            other.
     """
     from wasm.web.auth import SecurityConfig
 
@@ -321,22 +408,55 @@ def _build_security_config(options: StartOptions) -> SecurityConfig:
     # that is finally bound all talk about the same thing.
     host = normalize_host(options.host)
     port = options.port
-    whitelist = list(options.allow_ip)
+    whitelist = list(options.allow_ip) or _config_ip_whitelist()
     proxies = list(options.trusted_proxy)
     local_only = is_loopback_host(host)
 
-    if options.require_https and not (options.tls_cert and options.tls_key):
+    tls_cert = options.tls_cert
+    tls_key = options.tls_key
+    if options.self_signed:
+        if tls_cert or tls_key:
+            raise SecurityError(
+                "--self-signed and --tls-cert/--tls-key contradict each other",
+                details=(
+                    "Bring your own pair with --tls-cert and --tls-key, or let WASM "
+                    "mint one with --self-signed. Not both."
+                ),
+            )
+        tls_cert = str(PANEL_TLS_CERT)
+        tls_key = str(PANEL_TLS_KEY)
+
+    if bool(tls_cert) != bool(tls_key):
+        missing = "--tls-key" if tls_cert else "--tls-cert"
+        raise SecurityError(
+            "A TLS certificate and its private key travel together",
+            details=f"Pass {missing} as well, or drop both to serve without TLS.",
+        )
+
+    serves_tls = bool(tls_cert and tls_key)
+
+    if options.require_https and not serves_tls:
         raise SecurityError(
             "--require-https needs a certificate and a private key",
             details=(
                 "Pass --tls-cert and --tls-key. For a public domain: "
                 "'certbot certonly --standalone -d panel.example.com' then "
                 "--tls-cert /etc/letsencrypt/live/panel.example.com/fullchain.pem "
-                "--tls-key /etc/letsencrypt/live/panel.example.com/privkey.pem."
+                "--tls-key /etc/letsencrypt/live/panel.example.com/privkey.pem. "
+                f"Without a domain, --self-signed mints a pair under {PANEL_TLS_DIR}."
             ),
         )
 
-    if not local_only and not options.require_https and not whitelist:
+    if options.insecure_http and serves_tls:
+        raise SecurityError(
+            "--insecure-http contradicts serving TLS",
+            details=(
+                "Drop --insecure-http to serve the certificate you configured, or "
+                "drop the TLS options to serve cleartext on loopback."
+            ),
+        )
+
+    if not local_only and not serves_tls and not options.insecure_http:
         unresolved = (
             f"WASM could not resolve {host!r}, so it cannot show that only this machine "
             "would reach the panel, and treats it as exposed.\n"
@@ -344,31 +464,40 @@ def _build_security_config(options: StartOptions) -> SecurityConfig:
             else ""
         )
         raise SecurityError(
-            f"Refusing to expose the WASM panel on {host} without TLS or an IP whitelist",
+            f"Refusing to expose the WASM panel on {host} without TLS",
             details=(
-                "The panel drives systemd, nginx and certbot as root, so this would put a "
-                "root shell on the network in cleartext.\n"
+                "The panel drives systemd, nginx and certbot as root, and over plain "
+                "HTTP its access token and session cookie cross the network readable "
+                "by anyone on the path.\n"
                 f"{unresolved}"
                 "Pick one:\n"
                 "  - keep it local and reach it over SSH: "
                 f"wasm web start --host 127.0.0.1 --port {port} "
                 f"(then 'ssh -L {port}:127.0.0.1:{port} user@server')\n"
-                "  - terminate TLS in the panel: --require-https --tls-cert CERT --tls-key KEY\n"
-                "  - restrict who may connect: --allow-ip 10.0.0.0/24 (repeatable)\n"
-                "If a reverse proxy already terminates TLS, bind to 127.0.0.1 and declare it "
-                "with --trusted-proxy so the session cookie is issued with the Secure flag."
+                "  - bring a certificate: --tls-cert CERT --tls-key KEY\n"
+                f"  - let WASM mint one: --self-signed (kept under {PANEL_TLS_DIR}; "
+                "browsers warn until you trust it)\n"
+                "  - accept cleartext in so many words: --insecure-http\n"
+                "--allow-ip restricts who may connect but encrypts nothing, so it does "
+                "not lift this requirement. If a reverse proxy already terminates TLS, "
+                "bind to 127.0.0.1 and declare it with --trusted-proxy so the session "
+                "cookie is issued with the Secure flag."
             ),
         )
 
     config = SecurityConfig(
         host=host,
         port=port,
-        rate_limit_enabled=True,
-        require_https=options.require_https,
-        ssl_certfile=options.tls_cert,
-        ssl_keyfile=options.tls_key,
+        # TLS material present means the panel terminates TLS and refuses
+        # cleartext. There is no separate switch to forget: material that was
+        # handed over and then served as plain HTTP is how the old
+        # require_https flag became a trap.
+        require_https=serves_tls,
+        ssl_certfile=tls_cert,
+        ssl_keyfile=tls_key,
         ip_whitelist=whitelist,
         trusted_proxies=proxies,
+        **_web_config_overrides(),
     )
 
     if not local_only:
@@ -696,6 +825,51 @@ def _report_taken_port(host: str, port: int, logger: Logger) -> None:
     logger.info(f"  wasm web start --port {free}")
 
 
+def _self_signed_subject(host: str) -> str:
+    """
+    Choose the name a minted panel certificate is issued to.
+
+    Args:
+        host: The normalised bind address.
+
+    Returns:
+        The bind address when it names one interface, this machine's hostname
+        when the panel answers on all of them.
+    """
+    bare = strip_brackets(host)
+    if bare in (ALL_INTERFACES, "::"):
+        return socket.gethostname() or "wasm-panel"
+    return bare
+
+
+def _ensure_self_signed(host: str, logger: Logger, verbose: bool) -> None:
+    """
+    Put a self-signed pair at the panel's TLS paths, minting it if needed.
+
+    Args:
+        host: The normalised bind address, which names the certificate subject.
+        logger: Logger for the report.
+        verbose: Whether the certificate manager should log verbosely.
+
+    Raises:
+        WASMError: When the pair cannot be created.
+    """
+    from wasm.managers.cert_manager import CertManager
+
+    subject = _self_signed_subject(host)
+    minted = CertManager(verbose=verbose).generate_self_signed(
+        subject, PANEL_TLS_CERT, PANEL_TLS_KEY
+    )
+    if minted:
+        logger.info(f"Minted a self-signed certificate for {subject} under {PANEL_TLS_DIR}")
+    else:
+        logger.info(f"Reusing the self-signed certificate under {PANEL_TLS_DIR}")
+    logger.warning(
+        "Browsers warn about a self-signed certificate until you trust it. "
+        "For a clean padlock, bring a CA-issued pair with --tls-cert/--tls-key."
+    )
+
+
 def _report_daemon_started(config: SecurityConfig, pid: int, logger: Logger) -> None:
     """
     Report a backgrounded panel, and how to reach it.
@@ -798,6 +972,22 @@ def _start(options: StartOptions, verbose: bool, *, dry_run: bool = False) -> in
             "Serving plain HTTP on loopback. Behind a TLS proxy, pass --trusted-proxy "
             "so the session cookie is issued with the Secure flag."
         )
+
+    if options.insecure_http and not is_loopback_host(host):
+        logger.warning(
+            "Serving plain HTTP beyond loopback: the access token and the session "
+            "cookie cross the network unencrypted."
+        )
+
+    if options.self_signed:
+        if dry_run:
+            # Minting is an openssl run and two writes, and both seams would
+            # skip them - but the skipped reuse probe would read as "still
+            # valid" and the rehearsal would report a pair it never checked.
+            # Saying what would happen is more honest than acting it out.
+            logger.info(f"would mint or reuse a self-signed certificate under {PANEL_TLS_DIR}")
+        else:
+            _ensure_self_signed(host, logger, verbose)
 
     if dry_run:
         # Serving is neither a subprocess nor a file write, so neither seam
@@ -1297,7 +1487,8 @@ def _exposure_options(command: F) -> F:
             default="127.0.0.1",
             show_default=True,
             metavar="ADDR",
-            help="Interface to bind to. Anything but loopback needs --require-https or --allow-ip.",
+            help="Interface to bind to. Anything but loopback needs TLS "
+            "(--tls-cert/--tls-key or --self-signed) or --insecure-http.",
         ),
         click.option(
             "-p",
@@ -1311,7 +1502,8 @@ def _exposure_options(command: F) -> F:
         click.option(
             "--require-https",
             is_flag=True,
-            help="Serve TLS from the panel and refuse cleartext. Needs --tls-cert and --tls-key.",
+            help="Serve TLS from the panel and refuse cleartext. Needs --tls-cert and "
+            "--tls-key, or --self-signed.",
         ),
         click.option(
             "--tls-cert",
@@ -1326,10 +1518,23 @@ def _exposure_options(command: F) -> F:
             help="Private key for the certificate.",
         ),
         click.option(
+            "--self-signed",
+            is_flag=True,
+            help="Serve TLS with a self-signed certificate, minted under "
+            "/etc/wasm/panel-tls and reused while it is valid.",
+        ),
+        click.option(
+            "--insecure-http",
+            is_flag=True,
+            help="Serve cleartext HTTP beyond loopback. The access token and the "
+            "session cookie cross the network unencrypted.",
+        ),
+        click.option(
             "--allow-ip",
             multiple=True,
             metavar="ADDR/CIDR",
-            help="Only answer this address or network. Repeat to allow several.",
+            help="Only answer this address or network. Repeat to allow several. "
+            "Restricts who connects; encrypts nothing.",
         ),
         click.option(
             "--trusted-proxy",
@@ -1367,6 +1572,8 @@ def start_command(
     require_https: bool,
     tls_cert: str | None,
     tls_key: str | None,
+    self_signed: bool,
+    insecure_http: bool,
     allow_ip: tuple[str, ...],
     trusted_proxy: tuple[str, ...],
 ) -> NoReturn:
@@ -1378,6 +1585,8 @@ def start_command(
         require_https=require_https,
         tls_cert=tls_cert,
         tls_key=tls_key,
+        self_signed=self_signed,
+        insecure_http=insecure_http,
         allow_ip=tuple(allow_ip),
         trusted_proxy=tuple(trusted_proxy),
     )
@@ -1412,6 +1621,8 @@ def restart_command(
     require_https: bool,
     tls_cert: str | None,
     tls_key: str | None,
+    self_signed: bool,
+    insecure_http: bool,
     allow_ip: tuple[str, ...],
     trusted_proxy: tuple[str, ...],
 ) -> NoReturn:
@@ -1423,6 +1634,8 @@ def restart_command(
         require_https=require_https,
         tls_cert=tls_cert,
         tls_key=tls_key,
+        self_signed=self_signed,
+        insecure_http=insecure_http,
         allow_ip=tuple(allow_ip),
         trusted_proxy=tuple(trusted_proxy),
     )

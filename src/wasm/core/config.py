@@ -120,12 +120,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": False,
         "host": "127.0.0.1",
         "port": 8080,
+        # These values are enforced by wasm.web.auth.SecurityConfig, whose
+        # dataclass defaults must say the same numbers - core cannot import
+        # the web layer to share one constant, so the agreement is pinned by
+        # a test in tests/test_cli_web.py. They used to disagree, which went
+        # unnoticed exactly as long as this section was ignored.
         "rate_limit_enabled": True,
-        "rate_limit_requests": 100,
+        "rate_limit_requests": 120,
         "rate_limit_window": 60,
         "max_failed_attempts": 5,
-        "lockout_duration": 300,
-        "token_expiration_hours": 24,
+        "lockout_duration": 900,
+        "token_expiration_hours": 12,
         "ip_whitelist": [],
     },
     "databases": {
