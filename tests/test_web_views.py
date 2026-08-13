@@ -48,6 +48,7 @@ from fastapi.testclient import TestClient
 from starlette.routing import Match
 
 from wasm.core.config import Config
+from wasm.core.runner import FakeRunner
 from wasm.core.store import App, Database, Service, Site, WASMStore
 from wasm.web.auth import CSRF_HEADER_NAME, SESSION_COOKIE_NAME, SecurityConfig
 from wasm.web.jobs import Job, JobLogEntry, JobStatus, JobType
@@ -884,6 +885,137 @@ def test_days_remaining_decide_the_rail_colour() -> None:
     assert resources.certificate_state(0) == "failed"
     assert resources.certificate_state(-3) == "failed"
     assert resources.certificate_state(None) == "idle"
+
+
+# --------------------------------------------------------------- machine strip
+
+#: The one systemctl call the machine strip's unit tally is allowed to make.
+#: Scripting only this prefix, with no patterns after it, proves the refresh
+#: never launches a process per unit.
+LIST_UNITS = ["systemctl", "list-units", "--type=service", "--all", "--no-pager", "--plain"]
+
+
+def test_read_machine_counts_active_and_failed_units(store: WASMStore, runner: FakeRunner) -> None:
+    """
+    The header used to always read "0 running / 0 failed": the counters on
+    :class:`~wasm.web.views.machine.MachineState` were declared and never
+    filled in. They have to come from the same live systemd source the
+    services screen and the CLI read, not from the store's status column,
+    which nothing updates after a deploy.
+    """
+    deploy(store, domain="one.example.com")
+    deploy(store, domain="two.example.com")
+    deploy(store, domain="broken.example.com")
+    runner.script(
+        LIST_UNITS,
+        stdout=(
+            "UNIT LOAD ACTIVE SUB DESCRIPTION\n"
+            "wasm-one-example-com.service loaded active running App\n"
+            "wasm-two-example-com.service loaded active running App\n"
+            "wasm-broken-example-com.service loaded failed failed App\n"
+        ),
+    )
+
+    from wasm.web.views.machine import read_machine
+
+    machine = read_machine()
+
+    assert machine.units_active == 2
+    assert machine.units_failed == 1
+    assert machine.units_busy == 0
+
+
+def test_read_machine_counts_a_crash_looping_unit_as_busy(
+    store: WASMStore, runner: FakeRunner
+) -> None:
+    """
+    A unit systemd is restarting every few seconds reads as active in between
+    restarts. It belongs in "working", the same bucket a queued job occupies,
+    not silently inside "running" where an operator would never notice it.
+    """
+    deploy(store, domain="looping.example.com")
+    runner.script(
+        LIST_UNITS,
+        stdout=(
+            "UNIT LOAD ACTIVE SUB DESCRIPTION\n"
+            "wasm-looping-example-com.service loaded activating auto-restart App\n"
+        ),
+    )
+
+    from wasm.web.views.machine import read_machine
+
+    machine = read_machine()
+
+    assert machine.units_busy == 1
+    assert machine.units_active == 0
+    assert machine.units_failed == 0
+
+
+def test_read_machine_only_counts_units_wasm_manages(store: WASMStore, runner: FakeRunner) -> None:
+    """
+    "Cuenta solo units gestionadas por WASM": a unit systemd happens to report
+    alongside them, such as ssh, must never inflate the tally.
+    """
+    deploy(store, domain="one.example.com")
+    runner.script(
+        LIST_UNITS,
+        stdout=(
+            "UNIT LOAD ACTIVE SUB DESCRIPTION\n"
+            "wasm-one-example-com.service loaded active running App\n"
+            "ssh.service loaded active running OpenBSD Secure Shell server\n"
+        ),
+    )
+
+    from wasm.web.views.machine import read_machine
+
+    machine = read_machine()
+
+    assert machine.units_active == 1
+
+
+def test_read_machine_survives_a_service_manager_that_cannot_answer(
+    store: WASMStore, runner: FakeRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The strip refreshes on a timer; a systemd that cannot be reached must
+    render zero counts rather than take the header down with it.
+    """
+    from wasm.core.exceptions import ServiceError
+    from wasm.managers.service_manager import ServiceManager
+
+    def _broken(self: ServiceManager, all_services: bool = False) -> list[dict]:
+        raise ServiceError("systemd is not reachable")
+
+    monkeypatch.setattr(ServiceManager, "list_services", _broken)
+
+    from wasm.web.views.machine import read_machine
+
+    machine = read_machine()
+
+    assert machine.units_active == 0
+    assert machine.units_failed == 0
+    assert machine.units_busy == 0
+
+
+def test_the_machine_fragment_shows_the_live_unit_tally(
+    client: TestClient, store: WASMStore, runner: FakeRunner
+) -> None:
+    """The strip a browser polls every five seconds carries the same counts."""
+    deploy(store, domain="ok.example.com")
+    deploy(store, domain="broken.example.com")
+    runner.script(
+        LIST_UNITS,
+        stdout=(
+            "UNIT LOAD ACTIVE SUB DESCRIPTION\n"
+            "wasm-ok-example-com.service loaded active running App\n"
+            "wasm-broken-example-com.service loaded failed failed App\n"
+        ),
+    )
+
+    page = body_of(client, "/fragments/machine")
+
+    assert "1 running" in page
+    assert "1 failed" in page
 
 
 # ------------------------------------------------------------------- session
