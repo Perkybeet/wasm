@@ -31,6 +31,7 @@ every manager in this area including these ones.
 
 from __future__ import annotations
 
+import tempfile
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -583,6 +584,223 @@ def test_apache_syntax_warning_is_not_a_syntax_error(
     )
 
     assert apache.test_config() is True
+
+
+# ---------------------------------------------------------------------------
+# A configuration is validated without touching the live one
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def validation_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """
+    Point the validation staging area into the test's temporary directory.
+
+    Args:
+        tmp_path: Per-test temporary directory.
+        monkeypatch: Patching helper, scoped to the test.
+
+    Returns:
+        The directory validation stages its files in.
+    """
+    staging_root = tmp_path / "validation-tmp"
+    staging_root.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(staging_root))
+    return staging_root
+
+
+class ValidationSnoop(FakeRunner):
+    """
+    A fake runner that reads the staged files before validation deletes them.
+
+    The wrapper and the snippet only exist for the duration of the syntax
+    check, so their content can only be asserted on from inside the call.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.wrappers: list[str] = []
+        self.snippets: dict[str, str] = {}
+
+    def run(self, argv: Any, **kwargs: Any) -> Any:
+        """
+        Capture the staging directory, then behave like a FakeRunner.
+
+        Args:
+            argv: Program and arguments; the wrapper path comes last.
+            kwargs: The rest of the runner protocol.
+
+        Returns:
+            The scripted result.
+        """
+        wrapper = Path(str(argv[-1]))
+        if wrapper.is_file():
+            self.wrappers.append(wrapper.read_text())
+            for staged in wrapper.parent.iterdir():
+                if staged != wrapper:
+                    self.snippets[staged.name] = staged.read_text()
+        return super().run(argv, **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("backend", "expected_prefix"),
+    [("nginx", ("nginx", "-t", "-c")), ("apache", ("apache2ctl", "-t", "-f"))],
+)
+def test_validation_runs_the_syntax_check_against_a_staged_wrapper(
+    managers: dict[str, WebServerManager],
+    runner: FakeRunner,
+    validation_tmp: Path,
+    backend: str,
+    expected_prefix: tuple[str, ...],
+) -> None:
+    """The check runs on a throwaway file, never on the live configuration."""
+    manager = managers[backend]
+
+    manager.validate_config_text("# fine\n", domain="example.com")
+
+    (call,) = runner.calls
+    assert call[: len(expected_prefix)] == expected_prefix
+    wrapper = Path(call[-1])
+    assert validation_tmp in wrapper.parents
+    assert wrapper != manager.config_path("example.com")
+    # Once the answer is known the staging files are gone.
+    assert list(validation_tmp.iterdir()) == []
+
+
+def test_nginx_validation_wraps_the_snippet_in_a_minimal_main_context(
+    tmp_path: Path, store: FakeStore, validation_tmp: Path
+) -> None:
+    """nginx refuses a bare server block, so the wrapper supplies events and http."""
+    snoop = ValidationSnoop()
+    manager = NginxManager(
+        runner=snoop,
+        backend=replace(
+            NGINX_BACKEND,
+            sites_available=tmp_path / "nginx/sites-available",
+            sites_enabled=tmp_path / "nginx/sites-enabled",
+        ),
+    )
+    config = "server {\n    listen 8080;\n}\n"
+
+    manager.validate_config_text(config, domain="example.com")
+
+    (wrapper,) = snoop.wrappers
+    assert "events {" in wrapper
+    assert "http {" in wrapper
+    include_line = next(
+        line for line in wrapper.splitlines() if line.strip().startswith("include ")
+    )
+    assert include_line.strip().endswith("/example.com;")
+    # The snippet reaches the syntax check verbatim.
+    assert snoop.snippets["example.com"] == config
+
+
+def test_apache_validation_wrapper_loads_the_live_modules(
+    tmp_path: Path, store: FakeStore, validation_tmp: Path
+) -> None:
+    """A vhost using ProxyPass is only valid with the live module set loaded."""
+    snoop = ValidationSnoop()
+    manager = ApacheManager(
+        runner=snoop,
+        backend=replace(
+            APACHE_BACKEND,
+            sites_available=tmp_path / "apache/sites-available",
+            sites_enabled=tmp_path / "apache/sites-enabled",
+        ),
+    )
+    config = "<VirtualHost *:80>\n    ServerName example.com\n</VirtualHost>\n"
+
+    manager.validate_config_text(config, domain="example.com")
+
+    (wrapper,) = snoop.wrappers
+    assert f'ServerRoot "{tmp_path / "apache"}"' in wrapper
+    assert "mods-enabled/*.load" in wrapper
+    include_line = next(
+        line for line in wrapper.splitlines() if line.strip().startswith("Include ")
+    )
+    assert include_line.strip().endswith("/example.com.conf")
+    assert snoop.snippets["example.com.conf"] == config
+
+
+@pytest.mark.parametrize("backend", ["nginx", "apache"])
+def test_validation_failure_carries_the_servers_output_verbatim(
+    managers: dict[str, WebServerManager],
+    runner: FakeRunner,
+    validation_tmp: Path,
+    backend: str,
+) -> None:
+    """The operator fixes what the server said, not a paraphrase of it."""
+    manager = managers[backend]
+    stderr = 'nginx: [emerg] unexpected end of file, expecting "}" in /tmp/x.conf:3\n'
+    runner.script(list(manager.backend.validation_argv), stderr=stderr, exit_code=1)
+
+    with pytest.raises(ValidationError) as raised:
+        manager.validate_config_text("server {", domain="example.com")
+
+    assert raised.value.details == stderr
+    assert list(validation_tmp.iterdir()) == []
+
+
+def test_apache_validation_warning_that_says_syntax_ok_passes(
+    apache: ApacheManager, runner: FakeRunner, validation_tmp: Path
+) -> None:
+    """The same tolerance test_config has: a warning is not a syntax error."""
+    runner.script(
+        ["apache2ctl", "-t"],
+        stderr="Could not reliably determine the server's FQDN\nSyntax OK\n",
+        exit_code=1,
+    )
+
+    apache.validate_config_text("<VirtualHost *:80>\n</VirtualHost>\n", domain="example.com")
+
+
+@pytest.mark.parametrize("backend", ["nginx", "apache"])
+def test_replace_refuses_an_invalid_config_and_keeps_the_file(
+    managers: dict[str, WebServerManager],
+    runner: FakeRunner,
+    validation_tmp: Path,
+    backend: str,
+) -> None:
+    """A config the server rejects must never reach disk (finding M-4)."""
+    manager = managers[backend]
+    manager.create_site("example.com", context={"port": 3000})
+    before = manager.get_site_config("example.com")
+    runner.script(
+        list(manager.backend.validation_argv),
+        stderr="nginx: [emerg] unexpected end of file",
+        exit_code=1,
+    )
+
+    with pytest.raises(ValidationError):
+        manager.replace_site_config("example.com", "server {")
+
+    assert manager.get_site_config("example.com") == before
+
+
+@pytest.mark.parametrize("backend", ["nginx", "apache"])
+def test_replace_persists_a_valid_config(
+    managers: dict[str, WebServerManager],
+    runner: FakeRunner,
+    validation_tmp: Path,
+    backend: str,
+) -> None:
+    """A config the server accepts replaces the file, verbatim."""
+    manager = managers[backend]
+    manager.create_site("example.com")
+    new_config = "# hand edited\nserver {\n    listen 8081;\n}\n"
+
+    manager.replace_site_config("example.com", new_config)
+
+    assert manager.get_site_config("example.com") == new_config
+
+
+@pytest.mark.parametrize("backend", ["nginx", "apache"])
+def test_replace_on_a_missing_site_is_refused(
+    managers: dict[str, WebServerManager], runner: FakeRunner, backend: str
+) -> None:
+    """Replacing a config that does not exist would hide a typo in a domain."""
+    with pytest.raises((NginxError, ApacheError)):
+        managers[backend].replace_site_config("example.com", "server {\n}\n")
 
 
 # ---------------------------------------------------------------------------

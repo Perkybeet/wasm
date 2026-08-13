@@ -34,12 +34,15 @@ Four rules the old code broke and this one keeps:
 
 from __future__ import annotations
 
+import os
 import re
 import sqlite3
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
+from string import Template
 from typing import Any
 
 from jinja2 import Environment, PackageLoader, TemplateNotFound
@@ -57,6 +60,7 @@ from wasm.core.exceptions import (
     NginxError,
     SiteError,
     TemplateError,
+    ValidationError,
     WASMError,
 )
 from wasm.core.fs import FileSystem
@@ -148,6 +152,13 @@ class WebServerBackend:
         version_argv: Command that prints the version.
         version_pattern: Pattern whose first group is the version.
         config_test_argv: Command that checks the configuration syntax.
+        validation_argv: Command that checks the syntax of an arbitrary main
+            configuration file; the path of that file is appended.
+        validation_wrapper: :class:`string.Template` body of the throwaway
+            main configuration that wraps a single virtual host so
+            ``validation_argv`` can check it. ``$snippet`` is the staged
+            virtual host file and ``$server_root`` the directory holding the
+            backend's own configuration.
         sites_available: Directory holding every virtual host file.
         sites_enabled: Directory holding the enabled ones.
         config_suffix: Suffix appended to the domain to name the file.
@@ -170,6 +181,8 @@ class WebServerBackend:
     version_argv: tuple[str, ...]
     version_pattern: re.Pattern[str]
     config_test_argv: tuple[str, ...]
+    validation_argv: tuple[str, ...]
+    validation_wrapper: str
     sites_available: Path
     sites_enabled: Path
     config_suffix: str
@@ -184,6 +197,33 @@ class WebServerBackend:
     webserver_record: str = WebServer.NGINX.value
 
 
+#: Main configuration wrapping one staged virtual host for ``nginx -t -c``.
+#: A server block is only valid inside http{}, and a main configuration is
+#: only valid with an events{} block, so the wrapper supplies the minimal
+#: skeleton and nothing else: including the live nginx.conf instead would make
+#: the new snippet collide with the site it is about to replace.
+_NGINX_VALIDATION_WRAPPER = """\
+# Written by WASM to check one virtual host without touching the live
+# configuration. Deleted as soon as nginx -t has answered.
+events {
+}
+http {
+    include $snippet;
+}
+"""
+
+#: Main configuration wrapping one staged virtual host for apache. The live
+#: module set is loaded first: a vhost using ProxyPass is only valid with
+#: mod_proxy present, exactly as it will be at the next reload.
+_APACHE_VALIDATION_WRAPPER = """\
+# Written by WASM to check one virtual host without touching the live
+# configuration. Deleted as soon as the syntax check has answered.
+ServerRoot "$server_root"
+IncludeOptional $server_root/mods-enabled/*.load
+IncludeOptional $server_root/mods-enabled/*.conf
+Include $snippet
+"""
+
 NGINX_BACKEND = WebServerBackend(
     name="nginx",
     binary="nginx",
@@ -191,6 +231,8 @@ NGINX_BACKEND = WebServerBackend(
     version_argv=("nginx", "-v"),
     version_pattern=re.compile(r"nginx/(\S+)"),
     config_test_argv=("nginx", "-t"),
+    validation_argv=("nginx", "-t", "-c"),
+    validation_wrapper=_NGINX_VALIDATION_WRAPPER,
     sites_available=NGINX_SITES_AVAILABLE,
     sites_enabled=NGINX_SITES_ENABLED,
     config_suffix="",
@@ -207,6 +249,12 @@ APACHE_BACKEND = WebServerBackend(
     version_argv=("apache2", "-v"),
     version_pattern=re.compile(r"Apache/(\S+)"),
     config_test_argv=("apache2ctl", "configtest"),
+    # Not ``configtest``: apache2ctl hard-codes that word to ``-t`` on the live
+    # configuration and drops any further arguments. Bare flags fall through to
+    # the passthrough branch, which still sources /etc/apache2/envvars, so the
+    # ${APACHE_*} variables the module files reference keep resolving.
+    validation_argv=("apache2ctl", "-t", "-f"),
+    validation_wrapper=_APACHE_VALIDATION_WRAPPER,
     sites_available=APACHE_SITES_AVAILABLE,
     sites_enabled=APACHE_SITES_ENABLED,
     config_suffix=".conf",
@@ -980,3 +1028,111 @@ class WebServerManager(BaseManager):
         except OSError as exc:
             self.logger.debug(f"Could not read {config_path}: {exc}")
             return None
+
+    # -- Validating a configuration without installing it --------------------
+
+    def validate_config_text(self, config_text: str, *, domain: str) -> None:
+        """
+        Ask the web server whether it would accept a configuration snippet.
+
+        The snippet is staged into a throwaway directory together with a
+        minimal main configuration that includes it, and the backend's own
+        syntax checker runs against that wrapper. The live configuration is
+        never touched: a broken snippet used to be written first and checked
+        never, which took the site down at the next reload.
+
+        Args:
+            config_text: The virtual host configuration to check.
+            domain: Domain the configuration is meant for. Validated the same
+                way as everywhere else before it names a staged file.
+
+        Returns:
+            None. Returning at all means the server accepted the snippet.
+
+        Raises:
+            ValidationError: When the server rejects the snippet. ``details``
+                carries the server's own output verbatim.
+            NginxError: When the nginx snippet cannot be staged.
+            ApacheError: When the apache snippet cannot be staged.
+            DomainError: When the domain is not a valid domain name.
+        """
+        snippet_name = self.config_path(domain).name
+        # A random directory name for the same reason the filesystem seam uses
+        # a random sibling: a predictable path in a world-writable directory is
+        # a symlink an attacker can plant, and this code runs as root.
+        staging = Path(tempfile.gettempdir()) / f"wasm-validate-{os.urandom(6).hex()}"
+        snippet = staging / snippet_name
+        wrapper = staging / "wasm-validate.conf"
+        wrapper_text = Template(self.backend.validation_wrapper).substitute(
+            snippet=str(snippet),
+            server_root=str(self.backend.sites_available.parent),
+        )
+
+        try:
+            try:
+                self.fs.write_text(snippet, config_text, mode=_CONFIG_MODE)
+                self.fs.write_text(wrapper, wrapper_text, mode=_CONFIG_MODE)
+            except OSError as exc:
+                raise self.backend.error(
+                    f"Could not stage the configuration of {domain} for validation",
+                    details=str(exc),
+                ) from exc
+            result = self._run(
+                [*self.backend.validation_argv, str(wrapper)], timeout=_CONTROL_TIMEOUT
+            )
+        finally:
+            if staging.exists():
+                self.fs.remove_tree(staging)
+
+        # The same tolerance test_config() needs: apache2ctl exits non-zero on
+        # warnings it then describes as "Syntax OK".
+        if result.success or "Syntax OK" in f"{result.stdout}\n{result.stderr}":
+            return
+
+        output = "\n".join(stream for stream in (result.stderr, result.stdout) if stream.strip())
+        raise ValidationError(
+            f"{self.backend.name} rejected the configuration for {domain}",
+            details=output,
+        )
+
+    def replace_site_config(self, domain: str, config_text: str) -> Path:
+        """
+        Validate a hand-edited configuration and install it atomically.
+
+        Args:
+            domain: Domain of the site.
+            config_text: The new configuration, written verbatim.
+
+        Returns:
+            The path of the configuration file that was replaced.
+
+        Raises:
+            NginxError: When the nginx site does not exist or cannot be
+                written.
+            ApacheError: When the apache site does not exist or cannot be
+                written.
+            ValidationError: When the server rejects the configuration. The
+                file on disk is left exactly as it was.
+            DomainError: When the domain is not a valid domain name.
+        """
+        if not self.site_exists(domain):
+            raise self.backend.error(
+                f"Site does not exist: {domain}",
+                details="Create it first with create_site().",
+            )
+
+        self.validate_config_text(config_text, domain=domain)
+
+        config_path = self.config_path(domain)
+        try:
+            # The seam writes through a sibling and renames, so a reload racing
+            # this call sees either the old configuration or the new one.
+            self.fs.write_text(config_path, config_text, mode=_CONFIG_MODE)
+        except OSError as exc:
+            raise self.backend.error(
+                f"Failed to write configuration: {config_path}",
+                details=str(exc),
+            ) from exc
+
+        self.logger.debug(f"Replaced site configuration: {config_path}")
+        return config_path

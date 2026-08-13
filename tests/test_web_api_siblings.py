@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import tempfile
 from importlib import import_module
 from pathlib import Path
 from typing import Any
@@ -403,6 +404,78 @@ class TestSiteNamingMatchesTheManager:
         manager = sandbox_nginx()
         assert manager.site_exists("panel.example.com")
         assert manager.site_enabled("panel.example.com")
+
+
+class TestSiteConfigValidation:
+    """
+    PUT /{domain}/config must not persist a configuration the server rejects.
+
+    It used to write whatever arrived, so a typo in a hand-edited config sat
+    on disk until the next reload took the site down (finding M-4).
+    """
+
+    @pytest.fixture(autouse=True)
+    def staging_tmp(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """
+        Keep validation's staging files inside the test's temporary directory.
+
+        Args:
+            tmp_path: Per-test temporary directory.
+            monkeypatch: Patching helper, scoped to the test.
+
+        Returns:
+            The staging directory.
+        """
+        staging = tmp_path / "validation-tmp"
+        staging.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(staging))
+        return staging
+
+    def _created(self, sites_client: TestClient) -> str:
+        """
+        Create a site to edit.
+
+        Args:
+            sites_client: The authenticated client.
+
+        Returns:
+            The domain of the created site.
+        """
+        response = sites_client.post(
+            "/api/sites", json={"domain": "panel.example.com", "enable": False}
+        )
+        assert response.status_code == 200, response.text
+        return "panel.example.com"
+
+    def test_an_invalid_config_is_refused_with_the_servers_own_words(
+        self, sites_client: TestClient, sandbox_nginx: Any, runner: Any
+    ) -> None:
+        """The client gets nginx's output verbatim and the file is untouched."""
+        domain = self._created(sites_client)
+        before = sandbox_nginx().get_site_config(domain)
+        stderr = 'nginx: [emerg] unexpected end of file, expecting "}"\n'
+        runner.script(["nginx", "-t", "-c"], stderr=stderr, exit_code=1)
+
+        response = sites_client.put(f"/api/sites/{domain}/config", json={"config": "server {"})
+
+        assert response.status_code == 400, response.text
+        body = response.json()
+        assert body["error"] == "ValidationError"
+        assert stderr.strip() in (body["hint"] or ""), body
+        assert sandbox_nginx().get_site_config(domain) == before
+
+    def test_a_valid_config_is_validated_and_then_persisted(
+        self, sites_client: TestClient, sandbox_nginx: Any, runner: Any
+    ) -> None:
+        """The happy path still writes, and only after the syntax check ran."""
+        domain = self._created(sites_client)
+        new_config = "# hand edited\nserver {\n    listen 8081;\n}\n"
+
+        response = sites_client.put(f"/api/sites/{domain}/config", json={"config": new_config})
+
+        assert response.status_code == 200, response.text
+        assert sandbox_nginx().get_site_config(domain) == new_config
+        assert any(call[:3] == ("nginx", "-t", "-c") for call in runner.calls), runner.calls
 
 
 class TestTraversal:

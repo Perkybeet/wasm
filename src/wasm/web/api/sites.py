@@ -31,7 +31,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from wasm.core.exceptions import SiteError, ValidationError
+from wasm.core.exceptions import ValidationError
 from wasm.core.store import get_store
 from wasm.managers.apache_manager import ApacheManager
 from wasm.managers.nginx_manager import NginxManager
@@ -395,7 +395,10 @@ def update_site_config(
     Replace the raw configuration of a site.
 
     The path comes from the manager, so a hand-edited configuration can only
-    ever overwrite the file that domain already owns.
+    ever overwrite the file that domain already owns. The manager validates
+    the text against the web server itself before persisting it: a broken
+    configuration used to be written unchecked and took the site down at the
+    next reload.
 
     Args:
         domain: Domain of the site.
@@ -407,7 +410,10 @@ def update_site_config(
 
     Raises:
         HTTPException: 404 when no such site exists.
-        SiteError: When the file cannot be written.
+        ValidationError: When the web server rejects the configuration; the
+            error carries the server's own output verbatim and the file on
+            disk is left as it was.
+        SiteError: When the file cannot be staged or written.
         DomainError: When the domain is not acceptable.
     """
     validated = strict_domain(domain)
@@ -416,14 +422,7 @@ def update_site_config(
     if not manager.site_exists(validated):
         raise HTTPException(status_code=404, detail=f"Site not found: {validated}")
 
-    config_path = manager.config_path(validated)
-    try:
-        config_path.write_text(data.config)
-    except OSError as exc:
-        raise SiteError(
-            f"Could not write the configuration for {validated}",
-            details=str(exc),
-        ) from exc
+    manager.replace_site_config(validated, data.config)
 
     return SiteActionResponse(
         success=True,
