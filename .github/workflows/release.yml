@@ -235,18 +235,18 @@ jobs:
           # questionary reached Fedora in 42, so 41 is the one that proves the
           # requirement filter works.
           - image: "fedora:41"
-            install: "dnf install -y rpm-build python3-devel python3-setuptools python3-pip python3-wheel"
+            install: "dnf install -y rpm-build python3-devel python3-setuptools python3-pip python3-wheel git tar gzip"
           - image: "fedora:43"
-            install: "dnf install -y rpm-build python3-devel python3-setuptools python3-pip python3-wheel"
+            install: "dnf install -y rpm-build python3-devel python3-setuptools python3-pip python3-wheel git tar gzip"
           - image: "opensuse/tumbleweed"
-            install: "zypper --non-interactive --gpg-auto-import-keys refresh && zypper --non-interactive install -y rpm-build python3-devel python3-setuptools python3-pip python3-wheel python-rpm-macros tar gzip"
+            install: "zypper --non-interactive --gpg-auto-import-keys refresh && zypper --non-interactive install -y rpm-build python3-devel python3-setuptools python3-pip python3-wheel python-rpm-macros git tar gzip"
           # Leap 15.6's python3 is 3.6, which cannot parse this code. It builds
           # against the packaged 3.11 flavor instead, and this is what proves
           # the resulting package targets that interpreter.
           - image: "opensuse/leap:15.6"
-            install: "zypper --non-interactive --gpg-auto-import-keys refresh && zypper --non-interactive install -y rpm-build python311-devel python311-setuptools python311-pip python311-wheel python-rpm-macros tar gzip"
+            install: "zypper --non-interactive --gpg-auto-import-keys refresh && zypper --non-interactive install -y rpm-build python311-devel python311-setuptools python311-pip python311-wheel python-rpm-macros git tar gzip"
           - image: "opensuse/leap:16.0"
-            install: "zypper --non-interactive --gpg-auto-import-keys refresh && zypper --non-interactive install -y rpm-build python3-devel python3-setuptools python3-pip python3-wheel python-rpm-macros tar gzip"
+            install: "zypper --non-interactive --gpg-auto-import-keys refresh && zypper --non-interactive install -y rpm-build python3-devel python3-setuptools python3-pip python3-wheel python-rpm-macros git tar gzip"
     steps:
       - name: Install only what a build host has
         run: ${{ matrix.install }}
@@ -260,6 +260,18 @@ jobs:
       # committed files are in it and the build needs no network.
       - name: Lay out the rpmbuild tree
         run: |
+          # actions/checkout falls back to downloading a tarball when the
+          # container has no git, and then reports success. The result is a
+          # working tree with no history, so the git archive below fails with
+          # nothing to say about why. git is in the install line above; this
+          # says so out loud if it ever stops being.
+          if [ ! -d .git ]; then
+            echo "No .git here: checkout fell back to a tarball because the"
+            echo "container has no git, so the source tarball cannot be built"
+            echo "from the commit. Add git to this image's install line."
+            exit 1
+          fi
+
           version=$(awk '/^Version:/ {print $2; exit}' rpm/wasm.spec)
           mkdir -p /rpmbuild/SOURCES /rpmbuild/SPECS
           git config --global --add safe.directory "$PWD"
