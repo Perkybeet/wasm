@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        1.1.0
+Version:        1.2.0
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -222,6 +222,21 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
 fi
 
 %changelog
+* Thu Aug 13 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.2.0-1
+- Fix: the monitor service never started, failing every 30 seconds since installation, because its unit named a state directory systemd was never asked to create
+- Fix: the panel's journal streams left a journalctl process running on every disconnection
+- Fix: the panel's live event feed did not exist; /events now streams state changes and notices as server-sent events
+- Fix: the log drawer and the mobile navigation never ran at all, blocked by the panel's own script-src policy
+- Fix: the machine strip and the navigation scrolled off the top of every page
+- Fix: an action that succeeded reported nothing, and a failure was shown as truncated JSON instead of the tool's own output
+- Fix: page routes answered a manager failure with a plain-text Internal Server Error
+- Fix: a session renewing itself silently invalidated the CSRF token every control was using
+- Fix: text colours and badge backgrounds now meet WCAG AA on every surface they are placed on
+- Feature: deploy an application from the panel
+- Feature: start, stop, enable and disable services, enable and disable sites, revoke and delete certificates
+- Feature: take a backup from an application's row, and verify that an archive is sound
+- Enhancement: wasm web start explains how to reach a loopback panel over an SSH tunnel, and offers a port it has checked is free
+- Refactor: remove Alpine, which the panel's content security policy had always refused to execute
 * Wed Aug 12 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.1.0-1
 - Fix: wasm list reports the state systemd and the port actually report, not the value written at deploy time; it and wasm health no longer contradict each other
 - Fix: a service systemd is restarting every few seconds, or one that accepts no connections, is no longer reported as running

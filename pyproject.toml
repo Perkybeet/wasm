@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wasm-cli"
-version = "1.1.0"
+version = "1.2.0"
 description = "Web App System Management - Deploy and manage web applications on Linux servers"
 readme = "README.md"
 license = { text = "WASM-NCSAL" }
