@@ -238,15 +238,23 @@ jobs:
             install: "dnf install -y rpm-build python3-devel python3-setuptools python3-pip python3-wheel git tar gzip"
           - image: "fedora:43"
             install: "dnf install -y rpm-build python3-devel python3-setuptools python3-pip python3-wheel git tar gzip"
+          # zypper refresh exits 4 when any repository fails, including the
+          # optional third-party ones an image ships with: openh264, backports
+          # and update. A timed-out mirror at download.opensuse.org therefore
+          # failed all three SUSE builds at once and, because publishing is
+          # gated on them, refused to release a version whose packages were
+          # fine. The refresh is best-effort now; the install that follows is
+          # not, so a package that genuinely cannot be found still stops the
+          # release.
           - image: "opensuse/tumbleweed"
-            install: "zypper --non-interactive --gpg-auto-import-keys refresh && zypper --non-interactive install -y rpm-build python3-devel python3-setuptools python3-pip python3-wheel python-rpm-macros git tar gzip"
+            install: "zypper --non-interactive --gpg-auto-import-keys refresh || true; zypper --non-interactive install -y rpm-build python3-devel python3-setuptools python3-pip python3-wheel python-rpm-macros git tar gzip"
           # Leap 15.6's python3 is 3.6, which cannot parse this code. It builds
           # against the packaged 3.11 flavor instead, and this is what proves
           # the resulting package targets that interpreter.
           - image: "opensuse/leap:15.6"
-            install: "zypper --non-interactive --gpg-auto-import-keys refresh && zypper --non-interactive install -y rpm-build python311-devel python311-setuptools python311-pip python311-wheel python-rpm-macros git tar gzip"
+            install: "zypper --non-interactive --gpg-auto-import-keys refresh || true; zypper --non-interactive install -y rpm-build python311-devel python311-setuptools python311-pip python311-wheel python-rpm-macros git tar gzip"
           - image: "opensuse/leap:16.0"
-            install: "zypper --non-interactive --gpg-auto-import-keys refresh && zypper --non-interactive install -y rpm-build python3-devel python3-setuptools python3-pip python3-wheel python-rpm-macros git tar gzip"
+            install: "zypper --non-interactive --gpg-auto-import-keys refresh || true; zypper --non-interactive install -y rpm-build python3-devel python3-setuptools python3-pip python3-wheel python-rpm-macros git tar gzip"
     steps:
       - name: Install only what a build host has
         run: ${{ matrix.install }}
