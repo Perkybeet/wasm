@@ -126,13 +126,27 @@
   fastest. Thresholds live here so every meter in the panel agrees on what
   "nearly full" means.
 #}
+{#
+  The fill is a class, not an inline width.
+
+  The panel sets style-src 'self' with no unsafe-inline, because it runs as
+  root and a style attribute is a place markup can be injected. The browser
+  refused every style="width: N%" here, so the capacity bars rendered empty on
+  every page: the one element on the machine strip whose whole job is to be
+  read at a glance showed nothing at all.
+
+  Rounding to the nearest five is what makes a class per value practical. It
+  costs no accuracy that matters at 3.5rem wide, and the exact figure is in the
+  number beside it either way.
+#}
 {% macro capacity(label, used, total, human_used="", human_total="") %}
 {%- set pct = (used / total * 100) if total else 0 -%}
 {%- set level = "critical" if pct >= 90 else ("warn" if pct >= 75 else "ok") -%}
+{%- set step = ((pct / 5) | round | int) * 5 -%}
 <span class="machine__metric" title="{{ label }}: {{ human_used }} of {{ human_total }}">
   <span class="label">{{ label }}</span>
   <span class="capacity capacity--{{ level }}">
-    <span class="capacity__fill" style="width: {{ pct | round | int }}%"></span>
+    <span class="capacity__fill capacity__fill--{{ step }}"></span>
   </span>
   <span class="num">{{ pct | round | int }}%</span>
 </span>
@@ -157,12 +171,19 @@
   braces where the row had been. htmx does not swap at all on a 4xx or 5xx, so
   a row only disappears when the deletion actually happened.
 #}
-{% macro danger_button(label, endpoint, resource, consequence, question=none) %}
+{% macro danger_button(label, endpoint, resource, consequence, question=none, target=none) %}
+{#
+  target defaults to the row this button sits in, which is where it sits
+  everywhere except an application's own page: there is no .row there, so
+  "closest .row" matched nothing, htmx raised targetError and never sent the
+  request at all. The delete control on the detail screen was completely inert
+  and said nothing about it. A caller outside a list passes its own target.
+#}
 <button type="button" class="btn btn--sm btn--danger"
         hx-delete="{{ endpoint }}"
         hx-confirm="{{ question or (label ~ ' ' ~ resource ~ '? ' ~ consequence) }}"
-        hx-target="closest .row"
-        hx-swap="delete">{{ label }}</button>
+        hx-target="{{ target or 'closest .row' }}"
+        hx-swap="{{ 'delete' if target is none else 'none' }}">{{ label }}</button>
 {% endmacro %}
 
 
@@ -171,11 +192,18 @@
   JSON. What comes back is a job, and the job is reported by the machine strip,
   the activity screen and the notices, not by rewriting the row from a payload
   the template cannot read.
+
+  done is what the operator is told once it worked, and it is written in the
+  past tense of the button's own label, because the design direction commits to
+  an action keeping its name through the whole flow: "Restart" produces
+  "Restarted". Without it the panel ran the action and said nothing at all,
+  which is how an operator ends up clicking Restart four times.
 #}
-{% macro action_button(label, endpoint, confirm=none) %}
+{% macro action_button(label, endpoint, confirm=none, done=none) %}
 <button type="button" class="btn btn--sm"
         hx-post="{{ endpoint }}"
-        {% if confirm %}hx-confirm="{{ confirm }}"
+        {% if done %}data-success="{{ done }}"
+        {% endif %}{% if confirm %}hx-confirm="{{ confirm }}"
         {% endif %}hx-swap="none">{{ label }}</button>
 {% endmacro %}
 

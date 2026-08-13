@@ -1,0 +1,123 @@
+{#
+  Deploy an application.
+
+  The panel exists to deploy web applications and, until this screen, could not
+  deploy one: POST /api/apps had no caller anywhere in the interface. An
+  operator could look at everything and create nothing.
+
+  It is a plain form posting to a page route, not htmx. A deployment is the one
+  action here that is worth a whole screen and a full navigation: it takes
+  minutes, it is the thing most likely to fail with something worth reading,
+  and the result is a job to follow rather than a row to swap. Submitting it
+  lands on the activity screen with the log drawer attached.
+
+  Only what a deployment cannot proceed without is on the form. Everything else
+  the CLI accepts - package manager, workspaces, subdomains, compose profiles -
+  has a sensible default, and a screen that asks fourteen questions to do the
+  common thing is a screen people avoid.
+#}
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+
+{% block title %}Deploy{% endblock %}
+
+{% block content %}
+
+{{ m.page_head("Deploy an application", "From a Git repository, an archive or a directory on this machine") }}
+
+{% if problem %}
+  {{ m.problem(problem.fix, problem.output) }}
+{% endif %}
+
+<form method="post" action="/apps/new" class="form">
+  <div class="field">
+    <label class="label" for="domain">Domain</label>
+    <input class="mono" type="text" id="domain" name="domain" required autofocus
+           value="{{ submitted.domain or '' }}"
+           placeholder="app.example.com" aria-describedby="domain-hint">
+    <span class="field__hint" id="domain-hint">
+      The web server answers for this name, and the certificate is issued for it.
+      It has to resolve to this machine already.
+    </span>
+  </div>
+
+  <div class="field">
+    <label class="label" for="source">Source</label>
+    <input class="mono" type="text" id="source" name="source" required
+           value="{{ submitted.source or '' }}"
+           placeholder="https://github.com/you/app" aria-describedby="source-hint">
+    <span class="field__hint" id="source-hint">
+      A Git URL, or a path on this machine.
+    </span>
+  </div>
+
+  <div class="form__row">
+    <div class="field">
+      <label class="label" for="app_type">Type</label>
+      <select id="app_type" name="app_type" aria-describedby="type-hint">
+        {% for entry in app_types %}
+          <option value="{{ entry.type }}"
+                  {% if entry.type == (submitted.app_type or 'auto') %}selected{% endif %}>
+            {{ entry.name }}
+          </option>
+        {% endfor %}
+      </select>
+      <span class="field__hint" id="type-hint">
+        Auto-detect reads the repository and picks one.
+      </span>
+    </div>
+
+    <div class="field">
+      <label class="label" for="branch">Branch</label>
+      <input class="mono" type="text" id="branch" name="branch"
+             value="{{ submitted.branch or '' }}" placeholder="default">
+      <span class="field__hint">Leave empty for the repository's default.</span>
+    </div>
+
+    <div class="field">
+      <label class="label" for="port">Port</label>
+      <input class="mono" type="number" id="port" name="port" min="1" max="65535"
+             value="{{ submitted.port or '' }}" placeholder="auto">
+      <span class="field__hint">Leave empty to be assigned a free one.</span>
+    </div>
+  </div>
+
+  <div class="form__row">
+    <div class="field">
+      <label class="label" for="webserver">Web server</label>
+      <select id="webserver" name="webserver">
+        {% for option in webservers %}
+          <option value="{{ option }}"
+                  {% if option == (submitted.webserver or 'nginx') %}selected{% endif %}>
+            {{ option }}
+          </option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div class="field">
+      <label class="label" for="ssl">Certificate</label>
+      <label class="choice">
+        <input type="checkbox" id="ssl" name="ssl" value="yes"
+               {% if submitted.ssl %}checked{% endif %}>
+        Obtain one from Let's Encrypt
+      </label>
+      <span class="field__hint">
+        certbot answers a challenge on this machine, so the domain must resolve
+        here first.
+      </span>
+    </div>
+  </div>
+
+  <div class="toolbar">
+    <button class="btn btn--primary" type="submit">Deploy</button>
+    <a class="btn" href="/apps">Cancel</a>
+  </div>
+</form>
+
+<p class="muted form__aside">
+  The same deployment from a terminal:
+  <code>wasm create -d example.com -s https://github.com/you/app</code>
+</p>
+
+{% endblock %}

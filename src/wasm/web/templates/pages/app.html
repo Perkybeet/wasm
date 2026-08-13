@@ -19,29 +19,33 @@
 
 {% call m.page_head(domain, status) %}
   {{ m.follow_button("Logs", domain, log_url) }}
-  {{ m.action_button("Restart", restart_endpoint) }}
+  {{ m.action_button("Restart", restart_endpoint, none, "Restarted " ~ domain) }}
   {{ m.action_button("Stop", stop_endpoint,
-                     "Stop " ~ domain ~ "? The site stops answering until it is started again.") }}
-  {{ m.action_button("Start", start_endpoint) }}
-  {{ m.danger_button("Delete", delete_endpoint, domain, delete_consequence) }}
+                     "Stop " ~ domain ~ "? The site stops answering until it is started again.",
+                     "Stopped " ~ domain) }}
+  {{ m.action_button("Start", start_endpoint, none, "Started " ~ domain) }}
+  {# No rows on this screen: the button targets itself and swaps nothing. The
+     deletion is a job, and the job is reported by the feed and the activity
+     screen. #}
+  {{ m.danger_button("Delete", delete_endpoint, domain, delete_consequence, none, "this") }}
 {% endcall %}
 
-<section style="margin-bottom: var(--space-5)">
-  <h2 class="label" style="margin-bottom: var(--space-2)">Application</h2>
-  <p style="margin-bottom: var(--space-3)">{{ m.badge(state, status) }}</p>
+<section class="stack--tight">
+  <h2 class="label stack__title">Application</h2>
+  <p class="stack__lead">{{ m.badge(state, status) }}</p>
   {{ m.facts(facts) }}
 </section>
 
-<section style="margin-bottom: var(--space-5)">
-  <h2 class="label" style="margin-bottom: var(--space-2)">Certificate</h2>
+<section class="stack--tight">
+  <h2 class="label stack__title">Certificate</h2>
   {{ m.facts(certificate) }}
-  <p class="faint" style="margin-top: var(--space-2)">
+  <p class="faint stack__note">
     Issuing and renewal live on the <a href="/certificates">certificates</a> screen.
   </p>
 </section>
 
-<section style="margin-bottom: var(--space-5)">
-  <h2 class="label" style="margin-bottom: var(--space-2)">Service</h2>
+<section class="stack--tight">
+  <h2 class="label stack__title">Service</h2>
   {% if service %}
     {{ m.facts(service) }}
   {% else %}
@@ -49,8 +53,8 @@
   {% endif %}
 </section>
 
-<section style="margin-bottom: var(--space-5)">
-  <h2 class="label" style="margin-bottom: var(--space-2)">Site</h2>
+<section class="stack--tight">
+  <h2 class="label stack__title">Site</h2>
   {% if site %}
     {{ m.facts(site) }}
   {% else %}
@@ -58,8 +62,8 @@
   {% endif %}
 </section>
 
-<section style="margin-bottom: var(--space-5)">
-  <h2 class="label" style="margin-bottom: var(--space-2)">Environment</h2>
+<section class="stack--tight">
+  <h2 class="label stack__title">Environment</h2>
   {% if env %}
     <table class="table">
       <thead>
@@ -83,7 +87,7 @@
 </section>
 
 <section>
-  <h2 class="label" style="margin-bottom: var(--space-2)">Recent jobs</h2>
+  <h2 class="label stack__title">Recent jobs</h2>
   {% if jobs %}
     <div class="rows">
       {% for job in jobs %}

@@ -102,8 +102,8 @@
   --border: #e4e1dc;
   --border-strong: #cfcbc4;
   --text: #1a1d21;
-  --text-muted: #6b7178;
-  --text-faint: #969ba1;
+  --text-muted: #50565d;
+  --text-faint: #696e74;
 
   --state-active: #1f7a4d;
   --state-active-bg: #e8f4ed;
@@ -112,7 +112,7 @@
   --state-failed: #b3261e;
   --state-failed-bg: #fbeae9;
   --state-busy: #9a6700;
-  --state-busy-bg: #fdf3e0;
+  --state-busy-bg: #fff9e6;
 
   --focus: #1e5fb3;
   --shadow-drawer: 0 -8px 24px rgb(0 0 0 / 8%);
@@ -126,15 +126,15 @@
   --border: #262d35;
   --border-strong: #38414b;
   --text: #e8eaed;
-  --text-muted: #8a929b;
-  --text-faint: #656d76;
+  --text-muted: #a2aab3;
+  --text-faint: #848c95;
 
   --state-active: #3fa96e;
   --state-active-bg: #14301f;
   --state-idle: #8a929b;
   --state-idle-bg: #21262c;
   --state-failed: #e5534b;
-  --state-failed-bg: #351a19;
+  --state-failed-bg: #2f1413;
   --state-busy: #d4a017;
   --state-busy-bg: #32270c;
 
@@ -151,15 +151,15 @@
     --border: #262d35;
     --border-strong: #38414b;
     --text: #e8eaed;
-    --text-muted: #8a929b;
-    --text-faint: #656d76;
+    --text-muted: #a2aab3;
+    --text-faint: #848c95;
 
     --state-active: #3fa96e;
     --state-active-bg: #14301f;
     --state-idle: #8a929b;
     --state-idle-bg: #21262c;
     --state-failed: #e5534b;
-    --state-failed-bg: #351a19;
+    --state-failed-bg: #2f1413;
     --state-busy: #d4a017;
     --state-busy-bg: #32270c;
 
@@ -254,6 +254,61 @@ pre,
   white-space: nowrap;
 }
 
+/*
+ * Vertical rhythm as classes, because the panel forbids style attributes.
+ *
+ * style-src 'self' with no unsafe-inline is the right policy for a root shell,
+ * and it means every style="margin-bottom: ..." in a template is a declaration
+ * the browser throws away. They were spacing the sections of half the screens
+ * in the panel.
+ */
+.stack {
+  margin-bottom: var(--space-6);
+}
+
+.stack--tight {
+  margin-bottom: var(--space-5);
+}
+
+.stack__title {
+  margin-bottom: var(--space-2);
+}
+
+.stack__lead {
+  margin-bottom: var(--space-3);
+}
+
+.stack--above {
+  margin-top: var(--space-6);
+}
+
+.stack__note {
+  margin-top: var(--space-2);
+}
+
+/*
+ * The skip link. It has to be hidden until it is focused and visible the
+ * instant it is: as plain .visually-hidden it stayed clipped even while
+ * focused, so the first Tab on every page went to a control the operator
+ * could not see, which is worse than not having one.
+ */
+.skip-link {
+  position: absolute;
+  left: var(--space-3);
+  top: -3rem;
+  z-index: 100;
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  transition: top var(--duration) var(--ease);
+}
+
+.skip-link:focus {
+  top: var(--space-3);
+}
+
 /* ------------------------------------------------------------- typography */
 
 .label {
@@ -281,6 +336,19 @@ pre,
  * mono with tabular figures, so you always know which box you are about to
  * change.
  */
+/*
+ * The strip is pinned, and so is the sidebar below it.
+ *
+ * Nothing used to own scrolling: .shell was min-height: 100dvh with no
+ * overflow anywhere, so the document was the only scroll container and it took
+ * the chrome with it. Reading the second half of a list of applications meant
+ * losing both the machine you were about to change and the navigation.
+ *
+ * The document stays the scroll container on purpose. Moving the scroll into
+ * .main would work too, and would also change drawer sticky semantics, scroll
+ * restoration across hx-boost swaps, and mobile URL-bar behaviour. Two sticky
+ * rules beat six.
+ */
 .machine {
   display: flex;
   align-items: center;
@@ -289,6 +357,9 @@ pre,
   padding: 0 var(--space-4);
   background: var(--surface);
   border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 20;
   font-family: var(--font-mono);
   font-size: var(--text-sm);
   font-variant-numeric: tabular-nums;
@@ -339,6 +410,73 @@ pre,
   transition: width var(--duration) var(--ease);
 }
 
+/* One class per five per cent. A style attribute would be blocked by the
+   panel's own style-src policy, which is why these bars used to render empty
+   on every page. */
+.capacity__fill--0 {
+  width: 0%;
+}
+.capacity__fill--5 {
+  width: 5%;
+}
+.capacity__fill--10 {
+  width: 10%;
+}
+.capacity__fill--15 {
+  width: 15%;
+}
+.capacity__fill--20 {
+  width: 20%;
+}
+.capacity__fill--25 {
+  width: 25%;
+}
+.capacity__fill--30 {
+  width: 30%;
+}
+.capacity__fill--35 {
+  width: 35%;
+}
+.capacity__fill--40 {
+  width: 40%;
+}
+.capacity__fill--45 {
+  width: 45%;
+}
+.capacity__fill--50 {
+  width: 50%;
+}
+.capacity__fill--55 {
+  width: 55%;
+}
+.capacity__fill--60 {
+  width: 60%;
+}
+.capacity__fill--65 {
+  width: 65%;
+}
+.capacity__fill--70 {
+  width: 70%;
+}
+.capacity__fill--75 {
+  width: 75%;
+}
+.capacity__fill--80 {
+  width: 80%;
+}
+.capacity__fill--85 {
+  width: 85%;
+}
+.capacity__fill--90 {
+  width: 90%;
+}
+.capacity__fill--95 {
+  width: 95%;
+}
+.capacity__fill--100 {
+  width: 100%;
+}
+
 .capacity--warn .capacity__fill {
   background: var(--state-busy);
 }
@@ -372,6 +510,16 @@ pre,
   display: flex;
   flex-direction: column;
   gap: var(--space-5);
+  position: sticky;
+  top: var(--machine-strip-height);
+  /* Load-bearing: a grid item stretches to the row by default, and an element
+     with no room to move inside its containing block cannot stick to
+     anything. This is also what stops the sign-out footer being pushed a page
+     and a half below the fold on a long list. */
+  align-self: start;
+  height: calc(100dvh - var(--machine-strip-height));
+  /* A machine with enough sections to overflow still reaches all of them. */
+  overflow-y: auto;
 }
 
 .brand {
@@ -419,7 +567,50 @@ pre,
 .nav__count {
   font-family: var(--font-mono);
   font-size: var(--text-xs);
-  color: var(--text-faint);
+  color: var(--text-muted);
+}
+
+/*
+ * The end of the navigation, not an afterthought stuck to the bottom of it.
+ * margin-top: auto still does the placing; the border and the hostname are
+ * what make it read as a footer rather than as a button somebody dropped.
+ */
+.sidebar__footer {
+  margin-top: auto;
+  padding: var(--space-3) var(--space-4) 0;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.sidebar__host {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar__actions {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+}
+
+/*
+ * The control that reveals the sidebar on a narrow screen. It is hidden on a
+ * wide one, where the sidebar is always there. Before this existed, the
+ * stylesheet had a fully written off-canvas panel and nothing anywhere set the
+ * state that reveals it, so on a phone the navigation and the sign-out button
+ * were unreachable.
+ */
+.nav-toggle {
+  display: none;
+}
+
+.scrim {
+  display: none;
 }
 
 .main {
@@ -506,6 +697,19 @@ pre,
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
+}
+
+/*
+ * A badge is a label, not a banner.
+ *
+ * A flex column stretches its children across the full width by default, so
+ * the state badge rendered as a coloured bar the width of the row: a green
+ * slab on every running application, shouting far louder than the 3px rail and
+ * turning "colour only ever encodes state" into a wall of colour that encodes
+ * nothing. It is only visible in a browser, which is why it survived.
+ */
+.row__main > .badge {
+  align-self: flex-start;
 }
 
 .row__name {
@@ -874,6 +1078,118 @@ textarea.mono {
   border-top: none;
 }
 
+/* ------------------------------------------------------------------ forms */
+
+/*
+ * A screen whose whole job is to be filled in. There is exactly one - deploying
+ * an application - and it is a full page rather than a dialog because it takes
+ * minutes, it fails with things worth reading, and it produces a job to follow
+ * rather than a row to swap.
+ */
+.form {
+  max-width: 44rem;
+}
+
+/* Fields that belong together on one line, and stack when there is no room. */
+.form__row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+}
+
+.form__row > .field {
+  flex: 1 1 12rem;
+}
+
+.form__aside {
+  margin-top: var(--space-5);
+}
+
+.choice {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+}
+
+select {
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-sm);
+}
+
+/* ------------------------------------------------------------------ auth */
+
+/*
+ * Sign-in.
+ *
+ * It used to be the only screen in the panel whose content sat on the bare
+ * background with no surface under it, laid out by six inline style
+ * attributes. It read as a form somebody had not finished placing, which is a
+ * poor first impression from the thing that is about to hand out root.
+ *
+ * The panel is the same surface treatment as .rows, .empty and .problem: one
+ * border, one radius, one background. Nothing here is new; it is the shell's
+ * own vocabulary applied to the screen that was skipped.
+ */
+.auth {
+  display: grid;
+  place-items: center;
+  min-height: 100dvh;
+  padding: var(--space-5);
+}
+
+.auth__panel {
+  width: min(23rem, 100%);
+  padding: var(--space-6);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.auth__brand {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  margin-bottom: var(--space-5);
+}
+
+/* The machine is what this screen exists to say: an operator with four
+   servers open in four tabs should never have to guess which one is about to
+   give them root. It was styled as a field hint, one step above invisible. */
+.auth__host {
+  font-family: var(--font-mono);
+  font-size: var(--text-base);
+  color: var(--text);
+  margin: 0 0 var(--space-5);
+}
+
+.auth__status {
+  display: block;
+  margin-top: var(--space-4);
+  padding: var(--space-2) var(--space-3);
+  border-left: var(--rail-width) solid var(--state-busy);
+  background: var(--state-busy-bg);
+  color: var(--text);
+  font-size: var(--text-sm);
+}
+
+.auth__note {
+  margin: var(--space-5) 0 0;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.btn--block {
+  width: 100%;
+}
+
 /* ----------------------------------------------------------- skeletons */
 
 @keyframes shimmer {
@@ -917,6 +1233,9 @@ textarea.mono {
     position: fixed;
     inset: 0 auto 0 0;
     width: var(--sidebar-width);
+    /* inset pins both edges; the desktop height would fight it. */
+    height: auto;
+    top: 0;
     z-index: 50;
     transform: translateX(-100%);
     transition: transform var(--duration) var(--ease);
@@ -924,6 +1243,34 @@ textarea.mono {
 
   .sidebar[data-open="true"] {
     transform: none;
+  }
+
+  .nav-toggle {
+    display: inline-flex;
+    position: fixed;
+    top: 0;
+    left: 0;
+    height: var(--machine-strip-height);
+    width: var(--machine-strip-height);
+    z-index: 60;
+    border: none;
+    border-right: 1px solid var(--border);
+    border-radius: 0;
+    background: var(--surface);
+  }
+
+  /* Room for the toggle, so it does not sit on top of the hostname. */
+  .machine {
+    padding-left: calc(var(--machine-strip-height) + var(--space-3));
+  }
+
+  /* Tapping away closes the panel, which is what every operator tries first. */
+  .scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+    background: rgb(0 0 0 / 40%);
   }
 
   .row {

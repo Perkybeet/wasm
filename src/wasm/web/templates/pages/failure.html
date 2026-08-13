@@ -1,0 +1,31 @@
+{#
+  A screen that could not be rendered.
+
+  The rule this page exists to keep: a system error is never paraphrased. What
+  nginx, systemd or certbot actually said goes below, verbatim and in mono,
+  because that is the string the operator will search for; the plain-words fix
+  goes above it.
+
+  It renders inside the shell on purpose. The navigation still works, the
+  machine strip still says what the machine is doing, and the failure is one
+  screen rather than the whole panel. Before this existed, a manager raising
+  anywhere in a page handler produced Starlette's stock "Internal Server
+  Error" as plain text on a white page, with no navigation and nothing said.
+#}
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+
+{% block title %}{{ title }}{% endblock %}
+
+{% block content %}
+
+{{ m.page_head(title, section) }}
+
+{{ m.problem(fix, output) }}
+
+<p class="muted">
+  The rest of the panel still works. If this screen keeps failing, the same
+  work can be done from a terminal with <code>wasm</code>.
+</p>
+
+{% endblock %}

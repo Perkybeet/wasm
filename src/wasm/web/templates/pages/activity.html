@@ -18,8 +18,8 @@
 
 {{ m.page_head("Activity", (running | length) ~ " in flight" if running else none) }}
 
-<section style="margin-bottom: var(--space-6)">
-  <h2 class="label" style="margin-bottom: var(--space-2)">Working now</h2>
+<section class="stack">
+  <h2 class="label stack__title">Working now</h2>
 
   {% if running %}
     <div class="rows">
@@ -32,7 +32,8 @@
                       none, "row-" ~ job.id, job.description, job.status) %}
           {{ m.follow_button("Logs", job.name, job.log_url) }}
           {{ m.action_button("Cancel", job.cancel_endpoint,
-                             "Cancel " ~ job.name ~ "? The step already running is left to finish, and the machine is left half changed.") }}
+                             "Cancel " ~ job.name ~ "? The step already running is left to finish, and the machine is left half changed.",
+                             "Cancelled " ~ job.name) }}
         {% endcall %}
       {% endfor %}
     </div>
@@ -42,11 +43,11 @@
 </section>
 
 <section>
-  <h2 class="label" style="margin-bottom: var(--space-2)">Recently finished</h2>
+  <h2 class="label stack__title">Recently finished</h2>
 
   {% if recent %}
     {% for job in recent %}
-      <div class="rows" style="margin-bottom: var(--space-3)">
+      <div class="rows stack__lead">
         {% call m.row(job.name, job.state,
                       [("on", job.resource),
                        ("result", job.status),
@@ -61,7 +62,7 @@
       {% endif %}
 
       {% if job.output %}
-        <details style="margin-bottom: var(--space-5)">
+        <details class="stack--tight">
           <summary class="label">Output of {{ job.name }}</summary>
           <pre class="problem__output">{{ job.output }}</pre>
         </details>

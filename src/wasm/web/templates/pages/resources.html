@@ -17,7 +17,11 @@
 
 {% block content %}
 
-{{ m.page_head(title, subtitle) }}
+{% call m.page_head(title, subtitle) %}
+  {% if action_label %}
+    <a class="btn btn--primary" href="{{ action_href }}">{{ action_label }}</a>
+  {% endif %}
+{% endcall %}
 
 {% if rows %}
   <div class="rows">
@@ -28,15 +32,21 @@
           {{ m.follow_button("Logs", item.domain, item.log_url) }}
         {% endif %}
         {% if item.restart_endpoint %}
-          {{ m.action_button("Restart", item.restart_endpoint) }}
+          {{ m.action_button("Restart", item.restart_endpoint, none, "Restarted " ~ item.domain) }}
         {% endif %}
+        {# What this record can actually be told to do right now. The shaper
+           decides: a running unit offers Stop, a stopped one offers Start, and
+           a row never offers a verb that would be a no-op. #}
+        {% for action in item.actions or [] %}
+          {{ m.action_button(action.label, action.endpoint, action.confirm, action.done) }}
+        {% endfor %}
         {{ m.danger_button("Delete", item.delete_endpoint, item.domain,
                            item.delete_consequence) }}
       {% endcall %}
     {% endfor %}
   </div>
 {% else %}
-  {{ m.empty(empty_title, empty_body, command=command) }}
+  {{ m.empty(empty_title, empty_body, action_label, action_href, command) }}
 {% endif %}
 
 {% endblock %}

@@ -82,7 +82,7 @@ def shared_context(request: Request) -> dict[str, Any]:
     Returns:
         Values every template can rely on being present.
     """
-    from wasm.web.auth import CSRF_HEADER_NAME
+    from wasm.web.auth import CSRF_COOKIE_NAME, CSRF_HEADER_NAME
 
     session = getattr(request.state, "session", None)
     return {
@@ -94,6 +94,13 @@ def shared_context(request: Request) -> dict[str, Any]:
         # mutation a browser sent was refused; a constant cannot drift from
         # itself.
         "csrf_header": CSRF_HEADER_NAME,
+        # And the cookie the current value can be read back from. The token
+        # baked into the markup is only correct until the session renews
+        # itself, which it does silently at half its lifetime and which
+        # rotates the CSRF token with it: from that moment every button in a
+        # tab left open answered 403, with no way back except a reload nobody
+        # knew to perform. The client re-reads this cookie per request.
+        "csrf_cookie": CSRF_COOKIE_NAME,
         "page": request.url.path.strip("/").split("/")[0] or "dashboard",
         "theme": None,
     }

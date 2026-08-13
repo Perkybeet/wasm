@@ -1,9 +1,16 @@
 {#
   Sign-in.
 
-  Deliberately spare. The one thing worth saying here is which machine you are
-  about to get root on, because an operator with several servers open in
-  several tabs should not have to guess.
+  Spare, not unfinished. The distinction is the surface: this screen carries
+  the same bordered panel as every list, empty state and error in the product,
+  so it reads as the same piece of software rather than as a form somebody
+  forgot to place. Nothing here is styled inline; what the stylesheet says is
+  what the server sends.
+
+  The one thing worth saying is which machine you are about to get root on,
+  because an operator with several servers open in several tabs should not have
+  to guess. So the hostname is mono at full contrast under an eyebrow, not a
+  caption under the logo.
 #}
 <!doctype html>
 <html lang="en"{% if theme %} data-theme="{{ theme }}"{% endif %}>
@@ -15,18 +22,22 @@
   <link rel="icon" href="/static/logo.webp" type="image/webp">
 </head>
 
-<body style="display: grid; place-items: center; min-height: 100dvh">
+<body class="auth">
 
-<main style="width: min(22rem, 100%); padding: 1.5rem">
-  <div class="brand" style="padding: 0; margin-bottom: 0.25rem">
+<main class="auth__panel">
+  <h1 class="visually-hidden">Sign in to the WASM panel</h1>
+
+  <div class="auth__brand">
     <img src="/static/logo.webp" alt="" width="20" height="20">
     WASM
   </div>
-  <p class="mono muted" style="font-size: var(--text-sm); margin-bottom: 1.5rem">{{ hostname }}</p>
+
+  <p class="label">Signing in to</p>
+  <p class="auth__host">{{ hostname }}</p>
 
   {% if error %}
     <div class="problem" role="alert">
-      <p class="problem__fix" style="margin: 0">{{ error }}</p>
+      <p class="problem__fix">{{ error }}</p>
     </div>
   {% endif %}
 
@@ -53,16 +64,20 @@
       </span>
     </div>
 
-    <button class="btn btn--primary" type="submit" style="width: 100%">Sign in</button>
+    <button class="btn btn--primary btn--block" type="submit">Sign in</button>
   </form>
 
   {# Only when the lockout has not already been said above: a refusal repeated
-     twice on one screen reads as two different problems. #}
+     twice on one screen reads as two different problems. It carries the busy
+     rail and full-contrast text, because "wait, then try again" is the state
+     of the machine and not a footnote. #}
   {% if locked_for and not error %}
-    <p class="faint" style="margin-top: 1rem; font-size: var(--text-xs)">
+    <p class="auth__status" role="status">
       Too many attempts. Try again in {{ locked_for }} seconds.
     </p>
   {% endif %}
+
+  <p class="auth__note">This panel acts as root on this machine.</p>
 </main>
 
 </body>

@@ -20,8 +20,8 @@
   people to ignore the top of the page.
 #}
 {% if attention %}
-  <section style="margin-bottom: var(--space-6)">
-    <h2 class="label" style="margin-bottom: var(--space-2)">Needs attention</h2>
+  <section class="stack">
+    <h2 class="label stack__title">Needs attention</h2>
     <div class="rows">
       {% for item in attention %}
         {% call m.row(item.domain, item.state, item.meta, item.href, "row-" ~ item.id,
@@ -36,8 +36,8 @@
 {# In flight, and only when there is something in flight: an empty "running"
    panel on every page load is furniture. #}
 {% if running %}
-  <section style="margin-bottom: var(--space-6)">
-    <h2 class="label" style="margin-bottom: var(--space-2)">Working now</h2>
+  <section class="stack">
+    <h2 class="label stack__title">Working now</h2>
     <div class="rows">
       {% for job in running %}
         {% call m.row(job.name, job.state,
@@ -51,8 +51,8 @@
   </section>
 {% endif %}
 
-<section style="margin-bottom: var(--space-6)">
-  <h2 class="label" style="margin-bottom: var(--space-2)">Applications</h2>
+<section class="stack">
+  <h2 class="label stack__title">Applications</h2>
 
   {% if apps %}
     <div class="rows">
@@ -60,7 +60,7 @@
         {% call m.row(app.domain, app.state, app.meta, app.href, "row-" ~ app.id,
                       none, app.state_text) %}
           {{ m.follow_button("Logs", app.domain, app.log_url) }}
-          {{ m.action_button("Restart", app.restart_endpoint) }}
+          {{ m.action_button("Restart", app.restart_endpoint, none, "Restarted " ~ app.domain) }}
         {% endcall %}
       {% endfor %}
     </div>
@@ -73,7 +73,7 @@
 </section>
 
 <section>
-  <h2 class="label" style="margin-bottom: var(--space-2)">Recent activity</h2>
+  <h2 class="label stack__title">Recent activity</h2>
 
   {% if activity %}
     <table class="table">

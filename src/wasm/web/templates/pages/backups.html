@@ -24,7 +24,10 @@
     {% for backup in rows %}
       {% call m.row(backup.domain, backup.state, backup.meta, none,
                     "row-" ~ backup.id, backup.note) %}
-        {{ m.action_button("Restore", backup.restore_endpoint, backup.restore_question) }}
+        {{ m.action_button("Verify", backup.verify_endpoint, none,
+                           backup.id ~ " is sound") }}
+        {{ m.action_button("Restore", backup.restore_endpoint, backup.restore_question,
+                           "Restore started for " ~ backup.domain) }}
         {{ m.danger_button("Delete", backup.delete_endpoint, backup.id,
                            "The archive is removed from disk and cannot be recovered.",
                            backup.delete_question) }}

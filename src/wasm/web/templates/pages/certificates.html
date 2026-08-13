@@ -22,7 +22,8 @@
 {% call m.page_head("Certificates", subtitle if rows else none) %}
   {% if rows %}
     {{ m.action_button("Renew all due", "/api/certs/renew-all",
-                       "Renew every certificate that is due? certbot contacts the certificate authority for each one and reloads the web server.") }}
+                       "Renew every certificate that is due? certbot contacts the certificate authority for each one and reloads the web server.",
+                       "Renewal started for every certificate that is due") }}
   {% endif %}
 {% endcall %}
 
@@ -35,7 +36,12 @@
     {% for cert in rows %}
       {% call m.row(cert.name, cert.state, cert.meta, none, "row-" ~ cert.id, cert.note) %}
         {{ m.action_button("Renew", cert.renew_endpoint,
-                           "Renew " ~ cert.name ~ "? certbot contacts the certificate authority and reloads the web server.") }}
+                           "Renew " ~ cert.name ~ "? certbot contacts the certificate authority and reloads the web server.",
+                           "Renewal started for " ~ cert.name) }}
+        {{ m.action_button("Revoke", cert.revoke_endpoint, cert.revoke_question,
+                           "Revoked " ~ cert.name) }}
+        {{ m.danger_button("Delete", cert.delete_endpoint, cert.name,
+                           cert.delete_consequence) }}
       {% endcall %}
     {% endfor %}
   </div>
@@ -46,15 +52,16 @@
       command="wasm ssl create -d example.com") }}
 {% endif %}
 
-<section style="margin-top: var(--space-6)">
-  <h2 class="label" style="margin-bottom: var(--space-2)">Domains without a certificate</h2>
+<section class="stack--above">
+  <h2 class="label stack__title">Domains without a certificate</h2>
 
   {% if uncovered %}
     <div class="rows">
       {% for item in uncovered %}
         {% call m.row(item.domain, item.state, item.meta, none, "row-" ~ item.id) %}
           {{ m.action_button("Issue", item.issue_endpoint,
-                             "Issue a certificate for " ~ item.domain ~ "? The domain must already resolve to this machine so that certbot can answer the challenge.") }}
+                             "Issue a certificate for " ~ item.domain ~ "? The domain must already resolve to this machine so that certbot can answer the challenge.",
+                             "Issue started for " ~ item.domain) }}
         {% endcall %}
       {% endfor %}
     </div>
