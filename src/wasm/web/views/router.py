@@ -1149,3 +1149,6 @@ from wasm.web.views import settings_editor as _settings_editor_pages  # noqa: E4
 router.include_router(_infrastructure_pages.router)
 router.include_router(_settings_editor_pages.router)
 router.include_router(_backup_schedule_pages.router)
+from wasm.web.views import cron as _cron_pages  # noqa: E402
+
+router.include_router(_cron_pages.router)
