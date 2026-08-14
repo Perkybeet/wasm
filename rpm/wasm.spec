@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        1.4.0
+Version:        1.5.0
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -222,6 +222,8 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
 fi
 
 %changelog
+* Fri Aug 14 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.5.0-1
+- Observability and product polish: per-app charts with deploy markers, user cron jobs, CLI deep links, command palette, log search
 * Fri Aug 14 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.4.0-1
 - The panel manages the whole product: databases, services, sites, env vars, settings, scheduled backups, deployment history with rollback, live charts, git webhooks, notifications
 * Fri Aug 14 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.3.0-1
