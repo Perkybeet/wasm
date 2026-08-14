@@ -12,7 +12,9 @@
 
 {% block content %}
 
-{{ m.page_head("Overview", machine.hostname) }}
+{% call m.page_head("Overview", machine.hostname) %}
+  <a class="btn btn--primary" href="/apps/new">Deploy</a>
+{% endcall %}
 
 {#
   Attention first. When nothing is wrong this section is absent entirely,
@@ -21,7 +23,7 @@
 #}
 {% if attention %}
   <section class="stack">
-    <h2 class="label stack__title">Needs attention</h2>
+    <h2 class="stack__title">Needs attention</h2>
     <div class="rows">
       {% for item in attention %}
         {% call m.row(item.domain, item.state, item.meta, item.href, "row-" ~ item.id,
@@ -37,7 +39,7 @@
    panel on every page load is furniture. #}
 {% if running %}
   <section class="stack">
-    <h2 class="label stack__title">Working now</h2>
+    <h2 class="stack__title">Working now</h2>
     <div class="rows">
       {% for job in running %}
         {% call m.row(job.name, job.state,
@@ -61,7 +63,7 @@
 #}
 <section class="stack">
   <div class="charts__head">
-    <h2 class="label stack__title">Machine</h2>
+    <h2 class="stack__title">Machine</h2>
     <div class="charts__windows" role="group" aria-label="History window">
       <button type="button" class="btn btn--sm btn--quiet"
               data-chart-window="1h" aria-pressed="true">1h</button>
@@ -96,7 +98,7 @@
 </section>
 
 <section class="stack">
-  <h2 class="label stack__title">Applications</h2>
+  <h2 class="stack__title">Applications</h2>
 
   {% if apps %}
     <div class="rows">
@@ -117,7 +119,7 @@
 </section>
 
 <section>
-  <h2 class="label stack__title">Recent activity</h2>
+  <h2 class="stack__title">Recent activity</h2>
 
   {% if activity %}
     <table class="table">

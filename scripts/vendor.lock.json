@@ -1,38 +1,28 @@
 {
-  "fonts/ibm-plex-mono-latin-400-normal.woff2": {
+  "fonts/geist-mono-latin-400-normal.woff2": {
     "licence": "OFL-1.1",
-    "sha256": "08949f728dc52d528e69b1667d15c89a5686a4ee9a296ff90983985f99c380f7",
-    "url": "https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-mono@5.3.0/files/ibm-plex-mono-latin-400-normal.woff2"
+    "sha256": "3f98383b122fe015a48536cd4a1cda855a201718923ffe74931a01597107b9b5",
+    "url": "https://cdn.jsdelivr.net/npm/@fontsource/geist-mono@5.3.0/files/geist-mono-latin-400-normal.woff2"
   },
-  "fonts/ibm-plex-mono-latin-500-normal.woff2": {
+  "fonts/geist-mono-latin-500-normal.woff2": {
     "licence": "OFL-1.1",
-    "sha256": "01d285447409c8a588692162439a038b8cbd7871309ee20267b0d2d91c6e8e22",
-    "url": "https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-mono@5.3.0/files/ibm-plex-mono-latin-500-normal.woff2"
+    "sha256": "72971bd4908d3984fa1b1426bb363730e4957e16a0f58bfbca76993095715488",
+    "url": "https://cdn.jsdelivr.net/npm/@fontsource/geist-mono@5.3.0/files/geist-mono-latin-500-normal.woff2"
   },
-  "fonts/ibm-plex-sans-condensed-latin-500-normal.woff2": {
+  "fonts/geist-sans-latin-400-normal.woff2": {
     "licence": "OFL-1.1",
-    "sha256": "e3b4fd97fd20bc70fda66d8d5f0745d8d6958068a024cb4724bbc1ffb6cbc183",
-    "url": "https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-sans-condensed@5.3.0/files/ibm-plex-sans-condensed-latin-500-normal.woff2"
+    "sha256": "e6ef6abb39c762ed2259cc814e6f16888c540cd84835962227b56ab2354f27f1",
+    "url": "https://cdn.jsdelivr.net/npm/@fontsource/geist-sans@5.3.0/files/geist-sans-latin-400-normal.woff2"
   },
-  "fonts/ibm-plex-sans-condensed-latin-600-normal.woff2": {
+  "fonts/geist-sans-latin-500-normal.woff2": {
     "licence": "OFL-1.1",
-    "sha256": "3d72a0923c5830358b0a8e25b258aecadbecbf542b6ee9a25f387803e37d56b9",
-    "url": "https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-sans-condensed@5.3.0/files/ibm-plex-sans-condensed-latin-600-normal.woff2"
+    "sha256": "40073e90816315c92e4f4381bd50b6fdc950b22b0dd010a4179046cf588d4f12",
+    "url": "https://cdn.jsdelivr.net/npm/@fontsource/geist-sans@5.3.0/files/geist-sans-latin-500-normal.woff2"
   },
-  "fonts/ibm-plex-sans-latin-400-normal.woff2": {
+  "fonts/geist-sans-latin-600-normal.woff2": {
     "licence": "OFL-1.1",
-    "sha256": "3b646991d30055a93a4ecc499713d4347953a74a947ecab435ab72070cbdab0e",
-    "url": "https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-sans@5.3.0/files/ibm-plex-sans-latin-400-normal.woff2"
-  },
-  "fonts/ibm-plex-sans-latin-500-normal.woff2": {
-    "licence": "OFL-1.1",
-    "sha256": "0717336fb31fcdcde4b8deb3675bb4a0f7f6d484864afcd6751ac29975962203",
-    "url": "https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-sans@5.3.0/files/ibm-plex-sans-latin-500-normal.woff2"
-  },
-  "fonts/ibm-plex-sans-latin-600-normal.woff2": {
-    "licence": "OFL-1.1",
-    "sha256": "8960851d691c054ed38e259bdcf1a6190d157b4203ed5bb32c632a863fb8ec2f",
-    "url": "https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-sans@5.3.0/files/ibm-plex-sans-latin-600-normal.woff2"
+    "sha256": "9d99fbd791968493fa507ac846de561cee47b00f8100c23cad333b3cb78392d6",
+    "url": "https://cdn.jsdelivr.net/npm/@fontsource/geist-sans@5.3.0/files/geist-sans-latin-600-normal.woff2"
   },
   "htmx.min.js": {
     "licence": "BSD-2-Clause",

@@ -23,18 +23,18 @@
 
 {% for eng in engines %}
   <section class="stack--tight">
-    <h2 class="label stack__title">{{ eng.display_name }}</h2>
+    <h2 class="stack__title">{{ eng.display_name }}</h2>
     {% include "fragments/db_engine.html" %}
   </section>
 {% endfor %}
 
 <section class="stack--tight">
-  <h2 class="label stack__title">SQL console</h2>
+  <h2 class="stack__title">SQL console</h2>
   {% include "fragments/db_console.html" %}
 </section>
 
 <section class="stack--tight">
-  <h2 class="label stack__title">Recorded for applications</h2>
+  <h2 class="stack__title">Recorded for applications</h2>
   {% if rows %}
     <div class="rows">
       {% for item in rows %}

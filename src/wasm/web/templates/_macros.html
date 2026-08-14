@@ -27,9 +27,9 @@
 
 
 {#
-  A resource row. The coloured rail on the leading edge is the whole point:
-  running your eye down the left border of a list tells you the health of
-  everything on it without reading a word.
+  A resource row. Its state travels as a pill with a coloured dot - the v2
+  direction retired the 3px rail - so running your eye down a list still tells
+  you the health of everything on it, in words as well as colour.
 
   meta is a list of (label, value) pairs rendered in mono. Keep it to the three
   or four facts an operator scans for, not everything the record holds.
@@ -38,11 +38,9 @@
   certbot's own validity line, or a backup's description. It is not a place for
   commentary.
 
-  state_text is the state in words. The rail is a colour, and a colour on its
-  own is unreadable to anyone who cannot see this particular pair of hues and
-  invisible to a screen reader. Pass it wherever the record actually has a
-  state worth naming; where it does not, the state is still announced, just not
-  taken up screen space with.
+  state_text is the state in words; when the caller has none, the pill carries
+  the state's own name, because a dot on its own is unreadable to anyone who
+  cannot see this particular pair of hues and invisible to a screen reader.
 
   Used with {% call %} so the caller supplies the action buttons:
 
@@ -56,11 +54,7 @@
     <span class="row__name">
       {%- if href %}<a href="{{ href }}">{{ name }}</a>{% else %}{{ name }}{% endif -%}
     </span>
-    {% if state_text %}
-      {{ badge(state, state_text) }}
-    {% else %}
-      <span class="visually-hidden">Status: {{ state }}</span>
-    {% endif %}
+    {{ badge(state, state_text or state) }}
     {% if meta %}
       <span class="row__meta">
         {% for label, value in meta %}<span>{{ label }} {{ value }}</span>{% endfor %}

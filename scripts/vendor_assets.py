@@ -43,7 +43,7 @@ HTMX = "2.0.10"
 HTMX_SSE = "2.2.3"
 XTERM = "6.0.0"
 UPLOT = "1.6.32"
-PLEX = "5.3.0"
+GEIST = "5.3.0"
 # Nayuki's QR generator, for drawing the 2FA enrolment QR in the browser so
 # the otpauth secret never leaves the host. The npm package's index.js is the
 # compiled typescript-javascript file from the upstream repository, published
@@ -69,10 +69,10 @@ class Asset:
 
 def _font(family: str, weight: int) -> Asset:
     """
-    Build the asset entry for one IBM Plex weight.
+    Build the asset entry for one Geist weight.
 
     Args:
-        family: Fontsource package name, such as ``ibm-plex-sans``.
+        family: Fontsource package name, such as ``geist-sans``.
         weight: Numeric font weight.
 
     Returns:
@@ -80,7 +80,7 @@ def _font(family: str, weight: int) -> Asset:
     """
     name = f"{family}-latin-{weight}-normal.woff2"
     return Asset(
-        url=f"{JSDELIVR}/@fontsource/{family}@{PLEX}/files/{name}",
+        url=f"{JSDELIVR}/@fontsource/{family}@{GEIST}/files/{name}",
         dest=f"fonts/{name}",
         licence="OFL-1.1",
     )
@@ -94,17 +94,15 @@ ASSETS: tuple[Asset, ...] = (
     Asset(f"{JSDELIVR}/uplot@{UPLOT}/dist/uPlot.iife.min.js", "uplot.min.js", "MIT"),
     Asset(f"{JSDELIVR}/uplot@{UPLOT}/dist/uPlot.min.css", "uplot.min.css", "MIT"),
     Asset(f"{JSDELIVR}/nayuki-qr-code-generator@{QRCODEGEN}/index.js", "qrcodegen.js", "MIT"),
-    # Interface and prose.
-    _font("ibm-plex-sans", 400),
-    _font("ibm-plex-sans", 500),
-    _font("ibm-plex-sans", 600),
-    # Table headers, labels and axes. The condensed cut is what gives the panel
-    # its density.
-    _font("ibm-plex-sans-condensed", 500),
-    _font("ibm-plex-sans-condensed", 600),
+    # Interface and prose: titles at 600, labels and buttons at 500, body at
+    # 400. The design direction v2 retired IBM Plex entirely, condensed cut
+    # included.
+    _font("geist-sans", 400),
+    _font("geist-sans", 500),
+    _font("geist-sans", 600),
     # Everything that comes from the system: paths, unit names, ports, logs.
-    _font("ibm-plex-mono", 400),
-    _font("ibm-plex-mono", 500),
+    _font("geist-mono", 400),
+    _font("geist-mono", 500),
 )
 
 

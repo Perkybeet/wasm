@@ -63,6 +63,11 @@ class SeededState:
             written to disk here. Kept so a caller that wants to know which
             domains were meant to have one does not have to invent its own
             numbering.
+        deployment_domains: Domains that also got a small deployment
+            history: an older successful deploy and a newer attempt whose
+            outcome matches the application's own state, so the deployments
+            screen and an application's history read like a machine that has
+            been worked on.
     """
 
     domains: list[str] = field(default_factory=list)
@@ -72,6 +77,7 @@ class SeededState:
     failed_domains: list[str] = field(default_factory=list)
     cert_domains: list[str] = field(default_factory=list)
     backup_domains: list[str] = field(default_factory=list)
+    deployment_domains: list[str] = field(default_factory=list)
 
 
 def _domain_pool(count: int) -> list[str]:
@@ -101,6 +107,7 @@ def seed_panel_state(
     certs: int = 2,
     backups: int = 1,
     failed: int = 1,
+    deployments: int = 0,
 ) -> SeededState:
     """
     Populate a store with a machine's worth of realistic data.
@@ -126,13 +133,19 @@ def seed_panel_state(
         failed: How many of them (the last ``failed``, in creation order)
             have their application status forced to ``"failed"`` instead of
             the running/stopped pattern every other seeded app follows.
+        deployments: How many of them (the first ``deployments``, in
+            creation order) also get a two-entry deployment history. The
+            newer attempt fails exactly when the application itself is
+            seeded failed, so the history never contradicts the state pill
+            beside it.
 
     Returns:
         What was created.
 
     Raises:
-        ValueError: When ``services``, ``sites``, ``certs``, ``backups`` or
-            ``failed`` asks for more applications than ``apps`` creates.
+        ValueError: When ``services``, ``sites``, ``certs``, ``backups``,
+            ``failed`` or ``deployments`` asks for more applications than
+            ``apps`` creates.
     """
     for name, value in (
         ("services", services),
@@ -140,6 +153,7 @@ def seed_panel_state(
         ("certs", certs),
         ("backups", backups),
         ("failed", failed),
+        ("deployments", deployments),
     ):
         if value > apps:
             raise ValueError(f"{name}={value} cannot exceed apps={apps}")
@@ -205,5 +219,25 @@ def seed_panel_state(
             state.site_domains.append(domain)
             if wants_cert:
                 state.cert_domains.append(domain)
+
+        if index < deployments:
+            first = store.record_deployment_start(
+                domain, "cli", git_commit="9f2c41a", git_branch="main"
+            )
+            store.finish_deployment(first, "success")
+            second = store.record_deployment_start(
+                domain, "panel", git_commit="c07d5e3", git_branch="main"
+            )
+            if is_failing:
+                store.finish_deployment(
+                    second,
+                    "failed",
+                    error="npm ERR! code ELIFECYCLE\nnpm ERR! errno 1\n"
+                    "npm ERR! app@1.4.2 build: `next build`\n"
+                    "npm ERR! Exit status 1",
+                )
+            else:
+                store.finish_deployment(second, "success")
+            state.deployment_domains.append(domain)
 
     return state

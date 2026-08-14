@@ -19,7 +19,7 @@
 {% endcall %}
 
 <section class="stack--tight">
-  <h2 class="label stack__title">Outcome</h2>
+  <h2 class="stack__title">Outcome</h2>
   <p class="stack__lead">{{ m.badge(deployment.state, deployment.status) }}</p>
   {% if error %}
     {{ m.problem("The deployment failed. What the pipeline reported is below; the captured build log holds the full context.", error) }}
@@ -28,7 +28,7 @@
 </section>
 
 <section>
-  <h2 class="label stack__title">Build log</h2>
+  <h2 class="stack__title">Build log</h2>
   {% if log_text is not none %}
     {% if log_truncated %}
       <p class="faint">

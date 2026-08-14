@@ -19,7 +19,7 @@
 {{ m.page_head("Activity", (running | length) ~ " in flight" if running else none) }}
 
 <section class="stack">
-  <h2 class="label stack__title">Working now</h2>
+  <h2 class="stack__title">Working now</h2>
 
   {% if running %}
     <div class="rows">
@@ -43,7 +43,7 @@
 </section>
 
 <section>
-  <h2 class="label stack__title">Recently finished</h2>
+  <h2 class="stack__title">Recently finished</h2>
 
   {% if recent %}
     {% for job in recent %}

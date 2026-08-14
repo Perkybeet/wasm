@@ -11,11 +11,14 @@
 {% import "_macros.html" as m %}
 <div class="rows">
   {% for row in deploy_rows %}
-    {% call m.row(row.domain, row.state,
-                  [("trigger", row.trigger),
-                   ("commit", row.commit),
-                   ("took", row.duration),
-                   ("started", row.started)],
+    {# Inside one domain's own page the domain as a title says nothing; the
+       commit is what distinguishes one attempt from the next there. #}
+    {% set title = row.domain if not history_domain else row.commit %}
+    {% set facts = [("commit", row.commit), ("trigger", row.trigger),
+                    ("took", row.duration), ("started", row.started)]
+       if not history_domain else
+       [("trigger", row.trigger), ("took", row.duration), ("started", row.started)] %}
+    {% call m.row(title, row.state, facts,
                   row.href, "deployment-" ~ row.id, row.note, row.status) %}
       <a class="btn btn--sm" href="{{ row.href }}">Open</a>
     {% endcall %}

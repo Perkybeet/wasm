@@ -27,17 +27,17 @@
 {{ m.page_head("Settings", "Configuration is edited by section. Secrets are redacted before they leave the server and are changed from the CLI.") }}
 
 <section class="stack--tight">
-  <h2 class="label stack__title">Two-factor authentication</h2>
+  <h2 class="stack__title">Two-factor authentication</h2>
   {% include "fragments/totp.html" %}
 </section>
 
 <section class="stack--tight">
-  <h2 class="label stack__title">API tokens</h2>
+  <h2 class="stack__title">API tokens</h2>
   {% include "fragments/api_tokens.html" %}
 </section>
 
 <section class="stack--tight">
-  <h2 class="label stack__title">Sessions</h2>
+  <h2 class="stack__title">Sessions</h2>
   {% include "fragments/sessions.html" %}
 </section>
 
@@ -69,7 +69,7 @@
 {% if remaining %}
   {% for section in remaining %}
     <section class="stack--tight">
-      <h2 class="label stack__title">{{ section.name }}</h2>
+      <h2 class="stack__title">{{ section.name }}</h2>
       <div class="rows">
         <table class="table">
           <tbody>

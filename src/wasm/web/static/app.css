@@ -6,52 +6,44 @@
  * where a generated stylesheet would either have to be committed alongside its
  * source and drift, or require a toolchain the build environment does not have.
  *
- * The rule that holds the whole thing together: colour only ever encodes state.
- * Navigation, surfaces, borders and text are achromatic. If you see colour on
- * the screen, it is telling you something about the machine.
+ * The rule that holds the whole thing together: colour encodes state, plus one
+ * accent with a job. Navigation, surfaces, borders and text are cool neutrals;
+ * the indigo accent marks the primary action, the active place and the live
+ * trace; green, amber, red and grey say what the machine is doing. Anything
+ * else coloured on screen is a bug.
+ *
+ * Direction: docs/superpowers/specs/2026-08-14-wasm-panel-design-v2.md.
  */
 
 /* ------------------------------------------------------------------ fonts */
 
 @font-face {
-  font-family: "IBM Plex Sans";
-  src: url("/static/vendor/fonts/ibm-plex-sans-latin-400-normal.woff2") format("woff2");
+  font-family: "Geist Sans";
+  src: url("/static/vendor/fonts/geist-sans-latin-400-normal.woff2") format("woff2");
   font-weight: 400;
   font-display: swap;
 }
 @font-face {
-  font-family: "IBM Plex Sans";
-  src: url("/static/vendor/fonts/ibm-plex-sans-latin-500-normal.woff2") format("woff2");
+  font-family: "Geist Sans";
+  src: url("/static/vendor/fonts/geist-sans-latin-500-normal.woff2") format("woff2");
   font-weight: 500;
   font-display: swap;
 }
 @font-face {
-  font-family: "IBM Plex Sans";
-  src: url("/static/vendor/fonts/ibm-plex-sans-latin-600-normal.woff2") format("woff2");
+  font-family: "Geist Sans";
+  src: url("/static/vendor/fonts/geist-sans-latin-600-normal.woff2") format("woff2");
   font-weight: 600;
   font-display: swap;
 }
 @font-face {
-  font-family: "IBM Plex Sans Condensed";
-  src: url("/static/vendor/fonts/ibm-plex-sans-condensed-latin-500-normal.woff2") format("woff2");
-  font-weight: 500;
-  font-display: swap;
-}
-@font-face {
-  font-family: "IBM Plex Sans Condensed";
-  src: url("/static/vendor/fonts/ibm-plex-sans-condensed-latin-600-normal.woff2") format("woff2");
-  font-weight: 600;
-  font-display: swap;
-}
-@font-face {
-  font-family: "IBM Plex Mono";
-  src: url("/static/vendor/fonts/ibm-plex-mono-latin-400-normal.woff2") format("woff2");
+  font-family: "Geist Mono";
+  src: url("/static/vendor/fonts/geist-mono-latin-400-normal.woff2") format("woff2");
   font-weight: 400;
   font-display: swap;
 }
 @font-face {
-  font-family: "IBM Plex Mono";
-  src: url("/static/vendor/fonts/ibm-plex-mono-latin-500-normal.woff2") format("woff2");
+  font-family: "Geist Mono";
+  src: url("/static/vendor/fonts/geist-mono-latin-500-normal.woff2") format("woff2");
   font-weight: 500;
   font-display: swap;
 }
@@ -61,11 +53,13 @@
 :root {
   color-scheme: light dark;
 
-  --font-ui: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
-  --font-label: "IBM Plex Sans Condensed", "IBM Plex Sans", ui-sans-serif, sans-serif;
-  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --font-ui: "Geist Sans", ui-sans-serif, system-ui, sans-serif;
+  /* One family, two voices: the label voice is Geist Sans at 500. The
+     condensed cut it used to name is retired. */
+  --font-label: "Geist Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, monospace;
 
-  /* A fourth-based scale. Dense on purpose: this is an instrument panel. */
+  /* 4 / 8 / 12 / 16 / 24 / 32 / 48 / 64. */
   --space-1: 0.25rem;
   --space-2: 0.5rem;
   --space-3: 0.75rem;
@@ -73,97 +67,143 @@
   --space-5: 1.5rem;
   --space-6: 2rem;
   --space-7: 3rem;
+  --space-8: 4rem;
 
   --text-xs: 0.6875rem;
   --text-sm: 0.8125rem;
   --text-base: 0.875rem;
-  --text-lg: 1.0625rem;
+  --text-lg: 1rem;
   --text-xl: 1.375rem;
   --text-2xl: 1.875rem;
 
-  --radius-sm: 3px;
-  --radius: 5px;
-  --radius-lg: 8px;
+  /* 6 for controls, 10 for cards, a pill for state. */
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --radius-pill: 999px;
 
+  /* No longer the row rail (that is a pill now); still the leading edge of a
+     problem block, a notice and the lockout line. */
   --rail-width: 3px;
-  --machine-strip-height: 2.75rem;
-  --sidebar-width: 13.5rem;
+  --machine-strip-height: 3rem;
+  --sidebar-width: 15rem;
+  --page-width: 78rem;
 
-  --duration: 120ms;
-  --ease: cubic-bezier(0.2, 0, 0.15, 1);
+  --duration: 140ms;
+  --ease: cubic-bezier(0, 0, 0.2, 1);
 
-  /* Light is the mode that sets the identity: a dense technical datasheet,
-     which is rare in this category and reads as instrument rather than
-     hacker terminal. */
-  --bg: #fbfaf8;
-  --bg-sunken: #f3f1ed;
+  /* Cool clean neutrals; dark is where the identity lives, light is equally
+     finished. Values from the v2 direction, adjusted only where the computed
+     AA contract required it (each adjustment is annotated). */
+  --bg: #fafafa;
+  --bg-sunken: #f4f4f5;
   --surface: #ffffff;
-  --surface-hover: #f7f5f2;
-  --border: #e4e1dc;
-  --border-strong: #cfcbc4;
-  --text: #1a1d21;
-  --text-muted: #50565d;
-  --text-faint: #696e74;
+  --surface-hover: #f4f4f5;
+  --surface-translucent: rgb(255 255 255 / 80%);
+  --hover-overlay: rgb(9 9 11 / 5%);
+  --border: #e4e4e7;
+  --border-strong: #d4d4d8;
+  --text: #18181b;
+  --text-muted: #52525b;
+  /* Spec said #71717A; 4.40:1 on --bg-sunken. Darkened to keep AA. */
+  --text-faint: #6b6b74;
 
-  --state-active: #1f7a4d;
-  --state-active-bg: #e8f4ed;
-  --state-idle: #6b7178;
-  --state-idle-bg: #eeecea;
-  --state-failed: #b3261e;
-  --state-failed-bg: #fbeae9;
-  --state-busy: #9a6700;
-  --state-busy-bg: #fff9e6;
+  --accent: #5b5bd6;
+  --accent-hover: #4f4fc4;
+  --accent-muted: #eeeefb;
+  /* The fill behind white primary-button text. Same as the accent in light;
+     dark needs a deeper fill for the white to hold AA. */
+  --accent-solid: #5b5bd6;
+  --accent-solid-hover: #4f4fc4;
 
-  --focus: #1e5fb3;
+  /* Spec tones #16A34A / #DC2626 / #D97706 / #71717A all fell short of AA on
+     their own tinted backgrounds (2.90-4.28); each is darkened to the nearest
+     passing tone. The backgrounds are the spec's. */
+  --state-active: #15803d;
+  --state-active-bg: #eaf7ef;
+  --state-idle: #696971;
+  --state-idle-bg: #f1f1f2;
+  --state-failed: #c21e1e;
+  --state-failed-bg: #fdecec;
+  --state-busy: #92640a;
+  --state-busy-bg: #fdf3e4;
+
+  --focus: #5b5bd6;
+  --shadow-xs: 0 1px 2px rgb(0 0 0 / 5%);
+  --shadow-sm: 0 1px 3px rgb(0 0 0 / 7%), 0 1px 2px rgb(0 0 0 / 5%);
   --shadow-drawer: 0 -8px 24px rgb(0 0 0 / 8%);
 }
 
 :root[data-theme="dark"] {
-  --bg: #12161a;
-  --bg-sunken: #0d1114;
-  --surface: #191e24;
-  --surface-hover: #1f252c;
-  --border: #262d35;
-  --border-strong: #38414b;
-  --text: #e8eaed;
-  --text-muted: #a2aab3;
-  --text-faint: #848c95;
+  --bg: #0b0c0e;
+  --bg-sunken: #08090a;
+  --surface: #141519;
+  --surface-hover: #1a1c21;
+  --surface-translucent: rgb(20 21 25 / 78%);
+  --hover-overlay: rgb(237 238 240 / 6%);
+  --border: #26282e;
+  --border-strong: #363940;
+  --text: #edeef0;
+  --text-muted: #a1a5ad;
+  /* Spec said #7D828B; 4.41:1 on the elevated surface. Lifted to keep AA. */
+  --text-faint: #858a94;
 
-  --state-active: #3fa96e;
-  --state-active-bg: #14301f;
-  --state-idle: #8a929b;
-  --state-idle-bg: #21262c;
-  --state-failed: #e5534b;
-  --state-failed-bg: #2f1413;
-  --state-busy: #d4a017;
-  --state-busy-bg: #32270c;
+  --accent: #7c7cf0;
+  --accent-hover: #8f8ff5;
+  /* Spec said #232345; deepened so accent text on it holds AA. */
+  --accent-muted: #1f1f3d;
+  /* White on the spec accent is 3.50:1, so the solid fill is deeper. */
+  --accent-solid: #6060dc;
+  --accent-solid-hover: #6565e2;
 
-  --focus: #58a6ff;
+  --state-active: #4ade80;
+  --state-active-bg: #132e1d;
+  --state-idle: #8b8f98;
+  --state-idle-bg: #222329;
+  --state-failed: #f87171;
+  --state-failed-bg: #341518;
+  --state-busy: #fbbf24;
+  --state-busy-bg: #33270f;
+
+  --focus: #7c7cf0;
+  /* Dark elevates by surface colour, not by shadow. */
+  --shadow-xs: none;
+  --shadow-sm: none;
   --shadow-drawer: 0 -8px 24px rgb(0 0 0 / 40%);
 }
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --bg: #12161a;
-    --bg-sunken: #0d1114;
-    --surface: #191e24;
-    --surface-hover: #1f252c;
-    --border: #262d35;
-    --border-strong: #38414b;
-    --text: #e8eaed;
-    --text-muted: #a2aab3;
-    --text-faint: #848c95;
+    --bg: #0b0c0e;
+    --bg-sunken: #08090a;
+    --surface: #141519;
+    --surface-hover: #1a1c21;
+    --surface-translucent: rgb(20 21 25 / 78%);
+    --hover-overlay: rgb(237 238 240 / 6%);
+    --border: #26282e;
+    --border-strong: #363940;
+    --text: #edeef0;
+    --text-muted: #a1a5ad;
+    --text-faint: #858a94;
 
-    --state-active: #3fa96e;
-    --state-active-bg: #14301f;
-    --state-idle: #8a929b;
-    --state-idle-bg: #21262c;
-    --state-failed: #e5534b;
-    --state-failed-bg: #2f1413;
-    --state-busy: #d4a017;
-    --state-busy-bg: #32270c;
+    --accent: #7c7cf0;
+    --accent-hover: #8f8ff5;
+    --accent-muted: #1f1f3d;
+    --accent-solid: #6060dc;
+    --accent-solid-hover: #6565e2;
 
-    --focus: #58a6ff;
+    --state-active: #4ade80;
+    --state-active-bg: #132e1d;
+    --state-idle: #8b8f98;
+    --state-idle-bg: #222329;
+    --state-failed: #f87171;
+    --state-failed-bg: #341518;
+    --state-busy: #fbbf24;
+    --state-busy-bg: #33270f;
+
+    --focus: #7c7cf0;
+    --shadow-xs: none;
+    --shadow-sm: none;
     --shadow-drawer: 0 -8px 24px rgb(0 0 0 / 40%);
   }
 }
@@ -200,6 +240,7 @@ h3 {
 
 h1 {
   font-size: var(--text-xl);
+  letter-spacing: -0.02em;
 }
 h2 {
   font-size: var(--text-lg);
@@ -239,7 +280,7 @@ pre,
 }
 
 ::selection {
-  background: var(--focus);
+  background: var(--accent-solid);
   color: #fff;
 }
 
@@ -261,17 +302,26 @@ pre,
  * and it means every style="margin-bottom: ..." in a template is a declaration
  * the browser throws away. They were spacing the sections of half the screens
  * in the panel.
+ *
+ * The rhythm is uniform on purpose: 32px between sections, 16px from a
+ * section's title to its content, on every page. Ad-hoc spacing per template
+ * is what the v2 direction calls asymmetry.
  */
 .stack {
   margin-bottom: var(--space-6);
 }
 
 .stack--tight {
-  margin-bottom: var(--space-5);
+  margin-bottom: var(--space-6);
 }
 
+/* The section title: base size, 600, the same on every screen. */
 .stack__title {
-  margin-bottom: var(--space-2);
+  font-size: var(--text-base);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--text);
+  margin: 0 0 var(--space-4);
 }
 
 .stack__lead {
@@ -311,11 +361,13 @@ pre,
 
 /* ------------------------------------------------------------- typography */
 
+/* The eyebrow voice: small, 500, tracked out, muted. The one place uppercase
+   is allowed. */
 .label {
   font-family: var(--font-label);
-  font-weight: 600;
+  font-weight: 500;
   font-size: var(--text-xs);
-  letter-spacing: 0.06em;
+  letter-spacing: 0.05em;
   text-transform: uppercase;
   color: var(--text-muted);
 }
@@ -331,10 +383,11 @@ pre,
 /* ------------------------------------------------------- machine strip */
 
 /*
- * The signature element. A persistent instrument status line for this one
- * machine, present on every page. Not stat tiles: a single dense strip, in
- * mono with tabular figures, so you always know which box you are about to
- * change.
+ * The cockpit bar: the signature element. A persistent instrument line for
+ * this one machine, present on every page - hostname in mono, load with its
+ * sparkline, memory and disk as micro-meters, the unit tally as state pills.
+ * Sticky over the content with a translucent blur, so the page slides under
+ * an instrument panel rather than pushing it away.
  */
 /*
  * The strip is pinned, and so is the sidebar below it.
@@ -354,8 +407,10 @@ pre,
   align-items: center;
   gap: var(--space-5);
   height: var(--machine-strip-height);
-  padding: 0 var(--space-4);
-  background: var(--surface);
+  padding: 0 var(--space-5);
+  background: var(--surface-translucent);
+  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(12px);
   border-bottom: 1px solid var(--border);
   position: sticky;
   top: 0;
@@ -392,6 +447,8 @@ pre,
   width: 5rem;
   height: 1.125rem;
   display: block;
+  align-self: center;
+  color: var(--accent);
 }
 
 /* A capacity bar reads faster than a percentage, and both together read
@@ -399,13 +456,15 @@ pre,
 .capacity {
   width: 3.5rem;
   height: 4px;
-  border-radius: 2px;
+  border-radius: var(--radius-pill);
   background: var(--border);
   overflow: hidden;
+  align-self: center;
 }
 
 .capacity__fill {
   height: 100%;
+  border-radius: var(--radius-pill);
   background: var(--state-idle);
   transition: width var(--duration) var(--ease);
 }
@@ -486,9 +545,10 @@ pre,
 
 .machine__tally {
   display: flex;
-  gap: var(--space-3);
+  gap: var(--space-2);
   margin-left: auto;
   white-space: nowrap;
+  align-items: center;
 }
 
 .machine__tally b {
@@ -502,11 +562,15 @@ pre,
  * because the panel's own style-src policy throws away style attributes, and
  * because uPlot is sized from the box the stylesheet gives it, not the other
  * way round.
+ *
+ * The traces are the accent: CPU, memory and disk are neutral metrics, not
+ * states. The state tones only appear on a chart when they mean state - the
+ * deploy marks.
  */
 .charts {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
-  gap: var(--space-3);
+  gap: var(--space-4);
 }
 
 .charts__head {
@@ -514,6 +578,11 @@ pre,
   align-items: baseline;
   justify-content: space-between;
   gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+
+.charts__head .stack__title {
+  margin-bottom: 0;
 }
 
 .charts__windows {
@@ -522,17 +591,18 @@ pre,
 }
 
 .charts__windows .btn[aria-pressed="true"] {
-  background: var(--surface-hover);
-  border-color: var(--border-strong);
-  color: var(--text);
+  background: var(--accent-muted);
+  border-color: transparent;
+  color: var(--accent);
 }
 
 .chart {
   margin: 0;
-  padding: var(--space-2) var(--space-3) var(--space-3);
+  padding: var(--space-3) var(--space-4) var(--space-4);
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
+  box-shadow: var(--shadow-xs);
   min-width: 0;
 }
 
@@ -541,7 +611,7 @@ pre,
   align-items: baseline;
   justify-content: space-between;
   gap: var(--space-2);
-  margin-bottom: var(--space-2);
+  margin-bottom: var(--space-3);
 }
 
 /* Values on the axes must not jitter as the live edge advances. */
@@ -564,15 +634,15 @@ pre,
 .chart__swatch {
   width: 0.5rem;
   height: 2px;
-  background: var(--state-idle);
+  background: var(--text-faint);
 }
 
 .chart__swatch--rx {
-  background: var(--state-active);
+  background: var(--accent);
 }
 
 .chart__swatch--tx {
-  background: var(--state-busy);
+  background: var(--text-muted);
 }
 
 /* --------------------------------------------------------------- layout */
@@ -620,34 +690,49 @@ pre,
   padding: var(--space-3) var(--space-4) var(--space-1);
 }
 
+/* The active place is the accent's job: a quiet accent wash, accent text.
+   The old 3px rail is gone here as everywhere. */
 .nav__item {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: var(--space-2);
-  padding: var(--space-2) var(--space-4);
+  margin: 1px var(--space-2);
+  padding: 0.375rem var(--space-2);
+  border-radius: var(--radius-sm);
   color: var(--text-muted);
+  font-size: var(--text-sm);
   text-decoration: none;
-  border-left: var(--rail-width) solid transparent;
-  transition: background var(--duration) var(--ease);
+  transition:
+    background var(--duration) var(--ease),
+    color var(--duration) var(--ease);
 }
 
 .nav__item:hover {
-  background: var(--surface-hover);
+  background: var(--hover-overlay);
   color: var(--text);
 }
 
 .nav__item[aria-current="page"] {
-  background: var(--surface);
-  color: var(--text);
+  background: var(--accent-muted);
+  color: var(--accent);
   font-weight: 500;
-  border-left-color: var(--text);
 }
 
+/* Counts as minimal pills. */
 .nav__count {
   font-family: var(--font-mono);
   font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
   color: var(--text-muted);
+  background: var(--hover-overlay);
+  padding: 0 0.4375rem;
+  border-radius: var(--radius-pill);
+}
+
+.nav__item[aria-current="page"] .nav__count {
+  color: var(--accent);
+  background: transparent;
 }
 
 /*
@@ -699,24 +784,34 @@ pre,
   min-width: 0;
 }
 
+/* The page column: centred, capped, the same gutters everywhere. */
 .page {
-  padding: var(--space-5);
+  width: 100%;
+  max-width: var(--page-width);
+  margin: 0 auto;
+  padding: var(--space-6) var(--space-5);
   flex: 1;
   min-width: 0;
 }
 
+/* The one page header: title and description on the left, the page's primary
+   action on the right. Every screen, no exceptions. */
 .page__head {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: var(--space-4);
-  margin-bottom: var(--space-5);
+  margin-bottom: var(--space-6);
 }
 
 .page__title {
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
+}
+
+.page__title p {
+  margin: 0;
 }
 
 .toolbar {
@@ -726,13 +821,13 @@ pre,
   flex-wrap: wrap;
 }
 
-/* ------------------------------------------------------------ state rail */
+/* ------------------------------------------------------------ state rows */
 
 /*
- * Resources are rows, not floating cards, and each row carries a coloured rail
- * on its leading edge. Running your eye down the left border tells you the
- * health of everything without reading a word, and the same language is used
- * for applications, services, sites, certificates and backups.
+ * Resources are rows on one card: surface, border, radius 10, a whisper of
+ * shadow in light. State is a pill with a dot, not a rail: the v2 direction
+ * retired the 3px leading edge, and the pill carries the same four-word
+ * vocabulary everywhere.
  */
 .rows {
   display: flex;
@@ -741,6 +836,40 @@ pre,
   border-radius: var(--radius);
   overflow: hidden;
   background: var(--surface);
+  box-shadow: var(--shadow-xs);
+}
+
+/*
+ * Sections rendered as one swappable fragment (two-factor, sessions, an
+ * application's environment) use .rows as their surface and put prose, forms
+ * and a button straight inside it. A flex column stretches those children to
+ * the card's full width - which is how the Enable button once rendered as an
+ * edge-to-edge accent bar - and bare children have no gutter of their own.
+ */
+.rows > p {
+  margin: var(--space-3) var(--space-4);
+}
+
+.rows > p + p {
+  margin-top: calc(-1 * var(--space-2));
+}
+
+.rows > form,
+.rows > details {
+  padding: var(--space-3) var(--space-4);
+}
+
+.rows > .btn {
+  align-self: flex-start;
+  margin: 0 var(--space-4) var(--space-3);
+}
+
+.rows > .problem {
+  margin: var(--space-3) var(--space-4);
+}
+
+.rows > [data-totp-qr] {
+  padding: 0 var(--space-4);
 }
 
 .row {
@@ -749,7 +878,6 @@ pre,
   gap: var(--space-4);
   align-items: center;
   padding: var(--space-3) var(--space-4);
-  border-left: var(--rail-width) solid var(--state-idle);
   border-bottom: 1px solid var(--border);
   transition: background var(--duration) var(--ease);
 }
@@ -760,16 +888,6 @@ pre,
 
 .row:hover {
   background: var(--surface-hover);
-}
-
-.row--active {
-  border-left-color: var(--state-active);
-}
-.row--failed {
-  border-left-color: var(--state-failed);
-}
-.row--busy {
-  border-left-color: var(--state-busy);
 }
 
 .row__main {
@@ -784,7 +902,7 @@ pre,
  *
  * A flex column stretches its children across the full width by default, so
  * the state badge rendered as a coloured bar the width of the row: a green
- * slab on every running application, shouting far louder than the 3px rail and
+ * slab on every running application, shouting far louder than the pill and
  * turning "colour only ever encodes state" into a wall of colour that encodes
  * nothing. It is only visible in a browser, which is why it survived.
  */
@@ -797,6 +915,16 @@ pre,
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* A resource's name is a link, but a list of underlines reads as a document,
+   not a control surface; the underline waits for the pointer. */
+.row__name a {
+  text-decoration: none;
+}
+
+.row__name a:hover {
+  text-decoration: underline;
 }
 
 .row__meta {
@@ -815,36 +943,33 @@ pre,
 }
 
 /* A state change is the most important event this panel can show, so it is
-   the one thing that moves. */
+   the one thing that moves: a brief accent wash over the whole row. */
 @keyframes rail-pulse {
-  0% {
-    box-shadow: inset var(--rail-width) 0 0 0 currentColor;
+  from {
+    background-color: var(--accent-muted);
   }
-  50% {
-    box-shadow: inset calc(var(--rail-width) * 3) 0 0 0 currentColor;
-  }
-  100% {
-    box-shadow: inset var(--rail-width) 0 0 0 currentColor;
+  to {
+    background-color: transparent;
   }
 }
 
 .row--changed {
-  animation: rail-pulse 600ms var(--ease);
+  animation: rail-pulse 700ms var(--ease);
 }
 
 /* ------------------------------------------------------------- badges */
 
+/* The state pill: a dot and a word on the state's tinted ground. */
 .badge {
   display: inline-flex;
   align-items: center;
-  gap: var(--space-1);
-  padding: 1px var(--space-2);
-  border-radius: var(--radius-sm);
-  font-family: var(--font-label);
+  gap: 0.375rem;
+  padding: 0.125rem 0.625rem;
+  border-radius: var(--radius-pill);
+  font-family: var(--font-ui);
   font-size: var(--text-xs);
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
+  font-weight: 500;
+  letter-spacing: 0.01em;
   background: var(--state-idle-bg);
   color: var(--state-idle);
   white-space: nowrap;
@@ -865,21 +990,28 @@ pre,
 
 .badge::before {
   content: "";
-  width: 5px;
-  height: 5px;
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
   background: currentColor;
+  flex: none;
 }
 
 /* -------------------------------------------------------------- controls */
 
+/*
+ * The button hierarchy: primary carries the accent and there is one per
+ * screen; secondary is surface and border; quiet is bare until hovered;
+ * danger is red reserved for the destructive confirmation.
+ */
 .btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: var(--space-2);
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border-strong);
+  min-height: 2.25rem;
+  padding: var(--space-1) var(--space-4);
+  border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--surface);
   color: var(--text);
@@ -888,14 +1020,16 @@ pre,
   font-weight: 500;
   cursor: pointer;
   white-space: nowrap;
+  text-decoration: none;
   transition:
     background var(--duration) var(--ease),
-    border-color var(--duration) var(--ease);
+    border-color var(--duration) var(--ease),
+    color var(--duration) var(--ease);
 }
 
 .btn:hover:not(:disabled) {
   background: var(--surface-hover);
-  border-color: var(--text-faint);
+  border-color: var(--border-strong);
 }
 
 .btn:disabled {
@@ -904,25 +1038,28 @@ pre,
 }
 
 .btn--primary {
-  background: var(--text);
-  border-color: var(--text);
-  color: var(--bg);
+  background: var(--accent-solid);
+  border-color: var(--accent-solid);
+  color: #ffffff;
+  box-shadow: var(--shadow-xs);
 }
 
 .btn--primary:hover:not(:disabled) {
-  background: var(--text-muted);
-  border-color: var(--text-muted);
+  background: var(--accent-solid-hover);
+  border-color: var(--accent-solid-hover);
 }
 
-/* Destructive actions are the one place chrome earns colour, because the
-   consequence is irreversible. */
+/* Destructive actions are the one place chrome earns red, and even they stay
+   quiet until hovered: the confirmation is where the red is primary. */
 .btn--danger {
   color: var(--state-failed);
-  border-color: var(--state-failed);
+  border-color: transparent;
+  background: transparent;
 }
 
 .btn--danger:hover:not(:disabled) {
   background: var(--state-failed-bg);
+  border-color: transparent;
 }
 
 .btn--quiet {
@@ -932,13 +1069,15 @@ pre,
 }
 
 .btn--quiet:hover:not(:disabled) {
-  background: var(--surface-hover);
+  background: var(--hover-overlay);
+  border-color: transparent;
   color: var(--text);
 }
 
 .btn--sm {
-  padding: var(--space-1) var(--space-2);
-  font-size: var(--text-xs);
+  min-height: 2rem;
+  padding: var(--space-1) var(--space-3);
+  font-size: 0.75rem;
 }
 
 .field {
@@ -967,13 +1106,21 @@ textarea {
   font: inherit;
   font-size: var(--text-sm);
   width: 100%;
+  transition:
+    border-color var(--duration) var(--ease),
+    box-shadow var(--duration) var(--ease);
 }
 
+/* The focus ring: accent border, 3px accent wash. */
 input[type="text"]:focus,
 input[type="password"]:focus,
+input[type="number"]:focus,
+input[type="email"]:focus,
 select:focus,
 textarea:focus {
-  border-color: var(--focus);
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-muted);
 }
 
 /* Anything the machine produced or consumes is set in mono, so the boundary
@@ -991,31 +1138,62 @@ textarea.mono {
   font-size: var(--text-sm);
 }
 
+/* Headers: 12px, 500, muted, the UI voice. No condensed cut, no forced
+   uppercase - eyebrows are the only place caps live now. */
 .table th {
-  font-family: var(--font-label);
-  font-size: var(--text-xs);
-  font-weight: 600;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  font-family: var(--font-ui);
+  font-size: 0.75rem;
+  font-weight: 500;
+  letter-spacing: 0.01em;
   color: var(--text-muted);
   text-align: left;
+  height: 2.75rem;
   padding: var(--space-2) var(--space-3);
-  border-bottom: 1px solid var(--border-strong);
+  border-bottom: 1px solid var(--border);
   white-space: nowrap;
 }
 
 .table td {
+  height: 2.75rem;
   padding: var(--space-2) var(--space-3);
   border-bottom: 1px solid var(--border);
-  vertical-align: baseline;
+  vertical-align: middle;
 }
 
+.table tbody tr {
+  transition: background var(--duration) var(--ease);
+}
+
+.table tbody tr:hover {
+  background: var(--surface-hover);
+}
+
+/* th as well as td: the fact sheets label their rows with th[scope="row"],
+   and clearing only the value cell left a border stub under every sheet's
+   last label. */
+.table tr:last-child th,
 .table tr:last-child td {
   border-bottom: none;
 }
 
 .table td.num {
   text-align: right;
+}
+
+/* The fact sheets: every label column the same width, so the value column of
+   the Application, Certificate, Service and Site sections all start on one
+   vertical line instead of each table choosing its own. */
+.table th[scope="row"] {
+  width: 40%;
+}
+
+/* Links in tables follow the same rule as row names. */
+.table a {
+  text-decoration: none;
+}
+
+.table a:hover {
+  text-decoration: underline;
 }
 
 /* ----------------------------------------------------------- empty state */
@@ -1044,10 +1222,11 @@ textarea.mono {
  * wants the real error.
  */
 .problem {
-  border: 1px solid var(--state-failed);
-  border-left-width: var(--rail-width);
+  border: 1px solid var(--border);
+  border-left: var(--rail-width) solid var(--state-failed);
   border-radius: var(--radius);
   background: var(--surface);
+  box-shadow: var(--shadow-xs);
   padding: var(--space-3) var(--space-4);
   margin-bottom: var(--space-4);
 }
@@ -1091,12 +1270,12 @@ textarea.mono {
   gap: var(--space-2);
   min-width: 16rem;
   max-width: 24rem;
-  padding: var(--space-3);
+  padding: var(--space-3) var(--space-4);
   border: 1px solid var(--border);
   border-left: var(--rail-width) solid var(--state-idle);
   border-radius: var(--radius);
   background: var(--surface);
-  box-shadow: 0 4px 12px rgb(0 0 0 / 10%);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 14%);
   font-size: var(--text-sm);
 }
 
@@ -1121,7 +1300,7 @@ textarea.mono {
   display: flex;
   flex-direction: column;
   background: var(--surface);
-  border-top: 1px solid var(--border-strong);
+  border-top: 1px solid var(--border);
   box-shadow: var(--shadow-drawer);
   z-index: 30;
 }
@@ -1196,15 +1375,19 @@ textarea.mono {
   display: none;
 }
 
+/* The terminal sits on the sunken ground, one step below the bar. */
 .drawer__body {
   height: 18rem;
   border-top: 1px solid var(--border);
   overflow: hidden;
+  background: var(--bg-sunken);
+  padding: var(--space-2) var(--space-4);
   transition: height var(--duration) var(--ease);
 }
 
 .drawer[data-open="false"] .drawer__body {
   height: 0;
+  padding: 0 var(--space-4);
   border-top: none;
 }
 
@@ -1255,16 +1438,9 @@ select {
 /* ------------------------------------------------------------------ auth */
 
 /*
- * Sign-in.
- *
- * It used to be the only screen in the panel whose content sat on the bare
- * background with no surface under it, laid out by six inline style
- * attributes. It read as a form somebody had not finished placing, which is a
- * poor first impression from the thing that is about to hand out root.
- *
- * The panel is the same surface treatment as .rows, .empty and .problem: one
- * border, one radius, one background. Nothing here is new; it is the shell's
- * own vocabulary applied to the screen that was skipped.
+ * Sign-in: the first impression of the product, treated as such. One centred
+ * card on the plain ground - logo, the machine's name, one field, the accent
+ * button. The same surface vocabulary as every card in the shell.
  */
 .auth {
   display: grid;
@@ -1274,11 +1450,12 @@ select {
 }
 
 .auth__panel {
-  width: min(23rem, 100%);
+  width: min(24rem, 100%);
   padding: var(--space-6);
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
 }
 
 .auth__brand {
@@ -1305,6 +1482,7 @@ select {
   margin-top: var(--space-4);
   padding: var(--space-2) var(--space-3);
   border-left: var(--rail-width) solid var(--state-busy);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
   background: var(--state-busy-bg);
   color: var(--text);
   font-size: var(--text-sm);
@@ -1326,7 +1504,7 @@ select {
  * Ctrl+K. An instrument, not a spotlight: one bordered surface near the top
  * of the screen, destinations as rows with their routes in mono, and no
  * dramatic shadow - the dimmed backdrop already separates it from the page.
- * Colour rules hold here too; the only emphasis is the selection.
+ * The selection is the accent wash, the same mark the sidebar uses.
  */
 .palette {
   width: min(34rem, calc(100vw - 2 * var(--space-5)));
@@ -1347,7 +1525,7 @@ select {
   padding: var(--space-3) var(--space-4);
   border: none;
   border-bottom: 1px solid var(--border);
-  border-radius: 0;
+  border-radius: var(--radius) var(--radius) 0 0;
   background: transparent;
   color: var(--text);
   font-size: var(--text-base);
@@ -1355,7 +1533,8 @@ select {
 
 .palette__input:focus {
   outline: none;
-  border-bottom-color: var(--focus);
+  box-shadow: none;
+  border-bottom-color: var(--accent);
 }
 
 .palette__list {
@@ -1366,21 +1545,22 @@ select {
   overflow-y: auto;
 }
 
-/* The same anatomy as a navigation entry: rail on the left, quiet until
-   chosen. The rail is what marks the selection, not a colour wash. */
 .palette__item {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
   gap: var(--space-4);
   padding: var(--space-2) var(--space-4);
-  border-left: var(--rail-width) solid transparent;
   cursor: pointer;
 }
 
 .palette__item[aria-selected="true"] {
-  background: var(--surface-hover);
-  border-left-color: var(--text);
+  background: var(--accent-muted);
+}
+
+.palette__item[aria-selected="true"] .palette__label {
+  color: var(--accent);
+  font-weight: 500;
 }
 
 .palette__label {
@@ -1472,6 +1652,10 @@ select {
     grid-template-columns: 1fr;
   }
 
+  .page {
+    padding: var(--space-5) var(--space-4);
+  }
+
   .sidebar {
     position: fixed;
     inset: 0 auto 0 0;
@@ -1495,6 +1679,7 @@ select {
     left: 0;
     height: var(--machine-strip-height);
     width: var(--machine-strip-height);
+    min-height: 0;
     z-index: 60;
     border: none;
     border-right: 1px solid var(--border);
@@ -1523,6 +1708,13 @@ select {
 
   .row__actions {
     justify-content: flex-end;
+  }
+
+  /* At phone width the find field would squeeze the source name to nothing;
+     the drawer's job on a phone is reading the tail, not searching it. */
+  .drawer__search,
+  .drawer__count {
+    display: none;
   }
 }
 

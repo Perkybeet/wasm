@@ -63,13 +63,30 @@ def free_port() -> int:
 
 
 class Panel:
-    """The panel, running in this process, with a machine's worth of data."""
+    """The panel, running in this process, with a machine's worth of data.
 
-    def __init__(self) -> None:
+    The seed counts default to what this script has always built: every
+    domain gets a service and a site, none failed, no explicit certificate
+    paths and no deployment history. ``scripts/panel_screenshots.py`` reuses
+    this harness with livelier counts, so the review captures show state.
+    """
+
+    def __init__(
+        self,
+        *,
+        certs: int = 0,
+        backups: int = 0,
+        failed: int = 0,
+        deployments: int = 0,
+    ) -> None:
         self.root = Path(tempfile.mkdtemp(prefix="wasm-browser-check-"))
         self.port = free_port()
         self.token = ""
         self._server: Any = None
+        self._certs = certs
+        self._backups = backups
+        self._failed = failed
+        self._deployments = deployments
 
     @property
     def url(self) -> str:
@@ -98,9 +115,10 @@ class Panel:
             apps=domain_count,
             services=domain_count,
             sites=domain_count,
-            certs=0,
-            backups=0,
-            failed=0,
+            certs=self._certs,
+            backups=self._backups,
+            failed=self._failed,
+            deployments=self._deployments,
         )
 
         import uvicorn

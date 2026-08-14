@@ -276,7 +276,9 @@ const drawer = {
       convertEol: true,
       scrollback: 5000,
       theme: {
-        background: styles.getPropertyValue("--surface").trim(),
+        // The terminal sits on the drawer's sunken ground, one step below
+        // the bar, so the log reads as a well set into the page.
+        background: styles.getPropertyValue("--bg-sunken").trim(),
         foreground: styles.getPropertyValue("--text").trim(),
       },
     });
@@ -632,26 +634,27 @@ const CHART_POINTS = 120;
  * Keyed by the container's data-chart value. A series names the collector
  * metrics it reads and, when it is not a plain copy, how to combine them;
  * `ceiling` names a metric whose latest value caps the y axis, which is how
- * the memory chart keeps the machine's total in frame. Hues come only from
- * the state tones, because colour on this screen is never decoration: amber
- * (busy) for work happening now, green (active) for healthy occupancy, grey
- * (idle) for slow-moving capacity.
+ * the memory chart keeps the machine's total in frame. The traces are the
+ * accent: CPU, memory, disk and traffic are neutral metrics, not states, so
+ * the state tones stay off these lines and appear only where they mean state
+ * (the deploy marks). The network chart's second direction is the muted text
+ * tone, so the pair stays readable without inventing a new hue.
  */
 const CHART_SPECS = {
   "cpu.percent": {
     kind: "percent",
-    series: [{ label: "cpu", tone: "--state-busy", metrics: ["cpu.percent"] }],
+    series: [{ label: "cpu", tone: "--accent", metrics: ["cpu.percent"] }],
   },
   "mem.used_bytes": {
     kind: "bytes",
     ceiling: "mem.total_bytes",
-    series: [{ label: "used", tone: "--state-active", metrics: ["mem.used_bytes"] }],
+    series: [{ label: "used", tone: "--accent", metrics: ["mem.used_bytes"] }],
   },
   "net.bytes_s": {
     kind: "rate",
     series: [
-      { label: "rx", tone: "--state-active", metrics: ["net.rx_bytes_s"] },
-      { label: "tx", tone: "--state-busy", metrics: ["net.tx_bytes_s"] },
+      { label: "rx", tone: "--accent", metrics: ["net.rx_bytes_s"] },
+      { label: "tx", tone: "--text-muted", metrics: ["net.tx_bytes_s"] },
     ],
   },
   "disk.percent": {
@@ -659,7 +662,7 @@ const CHART_SPECS = {
     series: [
       {
         label: "disk",
-        tone: "--state-idle",
+        tone: "--accent",
         metrics: ["disk.used_bytes", "disk.total_bytes"],
         combine: (used, total) => (total > 0 ? (used / total) * 100 : null),
       },
@@ -675,21 +678,21 @@ const CHART_SPECS = {
  * metrics - app.{domain}.cpu.percent and app.{domain}.mem.bytes - and the
  * domain cannot be known here. Each shape recognises one family and builds
  * the same spec object the static table holds. The tones repeat the
- * dashboard's vocabulary: amber for work happening now, green for occupancy.
+ * dashboard's vocabulary: the accent for neutral metrics.
  */
 const APP_CHART_SHAPES = [
   {
     pattern: /^app\..+\.cpu\.percent$/,
     build: (metric) => ({
       kind: "percent",
-      series: [{ label: "cpu", tone: "--state-busy", metrics: [metric] }],
+      series: [{ label: "cpu", tone: "--accent", metrics: [metric] }],
     }),
   },
   {
     pattern: /^app\..+\.mem\.bytes$/,
     build: (metric) => ({
       kind: "bytes",
-      series: [{ label: "mem", tone: "--state-active", metrics: [metric] }],
+      series: [{ label: "mem", tone: "--accent", metrics: [metric] }],
     }),
   },
 ];
@@ -854,8 +857,8 @@ function chartStyles() {
   return {
     axis: read("--text-muted"),
     grid: read("--border"),
-    // The axes speak the same condensed voice as every other label.
-    font: `500 10px ${read("--font-label") || "sans-serif"}`,
+    // Axis figures are system values, so they speak mono like every other one.
+    font: `400 10px ${read("--font-mono") || "monospace"}`,
     tone: read,
   };
 }
