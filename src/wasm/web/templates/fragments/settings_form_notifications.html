@@ -1,0 +1,91 @@
+{#
+  The notifications form. Included by settings_section.html in its editing
+  state.
+
+  The URL and token fields never carry a stored value: a configured channel
+  renders the redaction placeholder, and the server treats that placeholder
+  as "keep what is stored". Pasting a whole new value replaces it; clearing
+  the field removes the channel. This form is also the one whose submissions
+  are never echoed back on a refusal, so a pasted secret travels exactly
+  once.
+#}
+<form class="form" hx-post="/settings/config/notifications"
+      hx-target="#settings-notifications" hx-swap="outerHTML">
+
+  <div class="field">
+    <label class="choice">
+      <input type="checkbox" name="enabled" value="yes"
+             {% if section.enabled %}checked{% endif %}>
+      Send notifications
+    </label>
+    <span class="field__hint">
+      The master switch. Channels can be configured and tested while it is off.
+    </span>
+  </div>
+
+  <div class="field">
+    <span class="label">Events</span>
+    {% for event in section.events %}
+      <label class="choice">
+        <input type="checkbox" name="event_{{ event.kind }}" value="yes"
+               {% if event.enabled %}checked{% endif %}>
+        <span class="mono">{{ event.kind }}</span>
+      </label>
+    {% endfor %}
+  </div>
+
+  {% for name, label in [("webhook", "Webhook URL"), ("slack", "Slack webhook URL"),
+                         ("discord", "Discord webhook URL")] %}
+    <div class="field">
+      <label class="label" for="set-notif-{{ name }}">{{ label }}</label>
+      <input class="mono" type="text" id="set-notif-{{ name }}" name="{{ name }}_url"
+             value="{{ '***' if section.url_set[name] else '' }}"
+             placeholder="https://…" aria-describedby="set-notif-{{ name }}-hint">
+      <span class="field__hint" id="set-notif-{{ name }}-hint">
+        {% if section.url_set[name] %}
+          Configured; the stored URL is never shown. Leave *** to keep it, paste a
+          whole new URL to replace it, or clear the field to remove the channel.
+        {% else %}
+          Not configured. Paste the full URL to enable this channel.
+        {% endif %}
+      </span>
+    </div>
+  {% endfor %}
+
+  <div class="form__row">
+    <div class="field">
+      <label class="label" for="set-notif-telegram-token">Telegram bot token</label>
+      <input class="mono" type="text" id="set-notif-telegram-token" name="telegram_bot_token"
+             value="{{ '***' if section.token_set else '' }}"
+             placeholder="123456:…" aria-describedby="set-notif-telegram-token-hint">
+      <span class="field__hint" id="set-notif-telegram-token-hint">
+        Never shown once stored. Leave *** to keep it, paste a new token to
+        replace it, or clear the field to remove it.
+      </span>
+    </div>
+    <div class="field">
+      <label class="label" for="set-notif-telegram-chat">Telegram chat id</label>
+      <input class="mono" type="text" id="set-notif-telegram-chat" name="telegram_chat_id"
+             value="{{ section.chat_id }}" placeholder="-1001234567890">
+      <span class="field__hint">The chat the bot posts to.</span>
+    </div>
+  </div>
+
+  <div class="field">
+    <label class="choice">
+      <input type="checkbox" name="email_enabled" value="yes"
+             {% if section.email_enabled %}checked{% endif %}>
+      Email
+    </label>
+    <span class="field__hint">
+      Uses the monitor's SMTP account (monitor.smtp.*), which is configured from
+      the CLI: <code>wasm config set monitor.smtp.host smtp.example.com</code>
+    </span>
+  </div>
+
+  <div class="toolbar">
+    <button class="btn btn--primary btn--sm" type="submit">Save</button>
+    <button type="button" class="btn btn--sm" hx-get="/settings/config/notifications"
+            hx-target="#settings-notifications" hx-swap="outerHTML">Cancel</button>
+  </div>
+</form>

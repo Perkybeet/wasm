@@ -1,0 +1,29 @@
+{#
+  The SSL form. Included by settings_section.html in its editing state.
+  The provider is not on the form: the panel offers no alternative to
+  certbot, so a form must not be able to blank it.
+#}
+<form class="form" hx-post="/settings/config/ssl"
+      hx-target="#settings-ssl" hx-swap="outerHTML">
+  <div class="field">
+    <label class="choice">
+      <input type="checkbox" name="enabled" value="yes"
+             {% if section.submitted %}{% if section.submitted.enabled %}checked{% endif %}{% elif section.enabled %}checked{% endif %}>
+      Obtain certificates for new deployments
+    </label>
+  </div>
+  <div class="field">
+    <label class="label" for="set-ssl-email">Certificate email</label>
+    <input class="mono" type="email" id="set-ssl-email" name="email"
+           value="{{ section.submitted.email if section.submitted else section.email }}"
+           placeholder="ops@example.com" aria-describedby="set-ssl-email-hint">
+    <span class="field__hint" id="set-ssl-email-hint">
+      Registered with Let's Encrypt; expiry warnings for issued certificates go here.
+    </span>
+  </div>
+  <div class="toolbar">
+    <button class="btn btn--primary btn--sm" type="submit">Save</button>
+    <button type="button" class="btn btn--sm" hx-get="/settings/config/ssl"
+            hx-target="#settings-ssl" hx-swap="outerHTML">Cancel</button>
+  </div>
+</form>

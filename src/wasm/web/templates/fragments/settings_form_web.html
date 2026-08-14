@@ -1,0 +1,42 @@
+{#
+  The panel form. Included by settings_section.html in its editing state.
+  The bind address and port are deliberately absent: where the panel listens
+  is decided by whoever starts it (wasm web start), not from inside a session
+  that only exists because of the current bind.
+#}
+<form class="form" hx-post="/settings/config/web"
+      hx-target="#settings-web" hx-swap="outerHTML">
+  <div class="form__row">
+    <div class="field">
+      <label class="label" for="set-web-token-hours">Token expiration (hours)</label>
+      <input class="mono" type="number" id="set-web-token-hours" name="token_expiration_hours"
+             required min="1"
+             value="{{ section.submitted.token_expiration_hours or section.token_expiration_hours }}">
+      <span class="field__hint">How long an issued access token stays valid.</span>
+    </div>
+    <div class="field">
+      <label class="label" for="set-web-rate-requests">Rate limit (requests)</label>
+      <input class="mono" type="number" id="set-web-rate-requests" name="rate_limit_requests"
+             required min="1"
+             value="{{ section.submitted.rate_limit_requests or section.rate_limit_requests }}">
+      <span class="field__hint">Requests allowed per client within the window.</span>
+    </div>
+    <div class="field">
+      <label class="label" for="set-web-rate-window">Rate limit window (seconds)</label>
+      <input class="mono" type="number" id="set-web-rate-window" name="rate_limit_window"
+             required min="1"
+             value="{{ section.submitted.rate_limit_window or section.rate_limit_window }}">
+      <span class="field__hint">The window the request count is measured over.</span>
+    </div>
+  </div>
+  <p class="faint">
+    The bind address and port are start-up decisions made from the CLI
+    (<code>wasm web start</code>) and are not edited here. Saved values apply
+    on the panel's next restart.
+  </p>
+  <div class="toolbar">
+    <button class="btn btn--primary btn--sm" type="submit">Save</button>
+    <button type="button" class="btn btn--sm" hx-get="/settings/config/web"
+            hx-target="#settings-web" hx-swap="outerHTML">Cancel</button>
+  </div>
+</form>

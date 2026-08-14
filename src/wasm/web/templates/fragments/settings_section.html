@@ -1,0 +1,51 @@
+{#
+  One editable configuration section, as one swappable unit.
+
+  Every state renders through this fragment - facts, editing, freshly saved,
+  refused - so the settings page and the htmx swaps can never disagree about
+  what a section looks like. The form itself is picked by section name, and
+  the notifications section additionally lists its channels with a test
+  button each.
+
+  A refused save renders at 200 with the refusal inline and verbatim: htmx
+  does not swap an error status, so answering 4xx would freeze the screen and
+  report nothing.
+#}
+{% import "_macros.html" as m %}
+<section class="stack--tight" id="settings-{{ section.name }}">
+  <h2 class="label stack__title">{{ section.title }}</h2>
+  <div class="rows">
+
+    {% if section.problem %}
+      {{ m.problem(section.problem.fix, section.problem.output) }}
+    {% endif %}
+
+    {% if section.notice %}
+      <p class="stack__lead">{{ section.notice }}</p>
+    {% endif %}
+
+    {% if section.test %}
+      {% if section.test.error %}
+        {{ m.problem("The " ~ section.test.channel ~ " test did not go out.", section.test.error) }}
+      {% else %}
+        <p class="stack__lead">Test message sent through {{ section.test.channel }}.</p>
+      {% endif %}
+    {% endif %}
+
+    {% if section.editing %}
+      {% include "fragments/settings_form_" ~ section.name ~ ".html" %}
+    {% else %}
+      {{ m.facts(section.entries) }}
+      {% if section.name == "notifications" %}
+        {% include "fragments/notif_channels.html" %}
+      {% endif %}
+      <div class="toolbar">
+        <button type="button" class="btn btn--sm"
+                hx-get="/settings/config/{{ section.name }}/edit"
+                hx-target="#settings-{{ section.name }}"
+                hx-swap="outerHTML">Edit</button>
+      </div>
+    {% endif %}
+
+  </div>
+</section>

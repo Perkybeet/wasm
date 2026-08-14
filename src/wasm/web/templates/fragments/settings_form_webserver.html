@@ -1,0 +1,23 @@
+{# The web server form. Included by settings_section.html in its editing state. #}
+<form class="form" hx-post="/settings/config/webserver"
+      hx-target="#settings-webserver" hx-swap="outerHTML">
+  <div class="field">
+    <label class="label" for="set-webserver">Default web server</label>
+    <select id="set-webserver" name="webserver" aria-describedby="set-webserver-hint">
+      {% for option in section.webservers %}
+        <option value="{{ option }}"
+                {% if option == (section.submitted.webserver or section.webserver) %}selected{% endif %}>
+          {{ option }}
+        </option>
+      {% endfor %}
+    </select>
+    <span class="field__hint" id="set-webserver-hint">
+      Used for new sites. Existing sites keep the server they were created with.
+    </span>
+  </div>
+  <div class="toolbar">
+    <button class="btn btn--primary btn--sm" type="submit">Save</button>
+    <button type="button" class="btn btn--sm" hx-get="/settings/config/webserver"
+            hx-target="#settings-webserver" hx-swap="outerHTML">Cancel</button>
+  </div>
+</form>

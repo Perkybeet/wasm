@@ -7,11 +7,15 @@
   set here" and invite someone to overwrite a working credential with an empty
   string.
 
-  The configuration below is read only. Writing configuration is done through
-  the API and the CLI, which validate a change before it reaches the file that
-  every other part of WASM depends on. The controls this screen does carry -
-  two-factor authentication, API tokens and session management - belong to the
-  panel itself and nowhere else.
+  Configuration is edited in sections, each an htmx swap over the config API's
+  own endpoints, loaded below from /settings/config so the page handler in the
+  aggregate router stays untouched by editor work. Stored credentials remain
+  CLI-only; the editor says so on itself. The stored-file dump at the bottom
+  excludes the keys the editable sections own, so a value never appears twice
+  on this screen with one copy stale after a swap.
+
+  The controls this screen also carries - two-factor authentication, API
+  tokens and session management - belong to the panel itself and nowhere else.
 #}
 {% extends "base.html" %}
 {% import "_macros.html" as m %}
@@ -20,7 +24,7 @@
 
 {% block content %}
 
-{{ m.page_head("Settings", "Configuration is read only here. Secrets are redacted before they leave the server.") }}
+{{ m.page_head("Settings", "Configuration is edited by section. Secrets are redacted before they leave the server and are changed from the CLI.") }}
 
 <section class="stack--tight">
   <h2 class="label stack__title">Two-factor authentication</h2>
@@ -37,12 +41,31 @@
   {% include "fragments/sessions.html" %}
 </section>
 
+<div hx-get="/settings/config" hx-trigger="load" hx-swap="outerHTML">
+  <p class="faint">Loading configuration sections…</p>
+</div>
+
 {% if problem %}
   {{ m.problem(problem.fix, problem.output) }}
 {% endif %}
 
-{% if sections %}
-  {% for section in sections %}
+{#
+  Keys owned by the editable sections above are excluded from the stored-file
+  dump: they already render there, and an htmx save would leave this copy
+  stale until the next full navigation.
+#}
+{% set covered_sections = ["ssl", "backup", "web", "notifications"] %}
+{% set covered_keys = ["apps_directory", "webserver"] %}
+{% set remaining = [] %}
+{% for section in sections if section.name not in covered_sections %}
+  {% set entries = section.entries | rejectattr("key", "in", covered_keys) | list %}
+  {% if entries %}
+    {% set _ = remaining.append({"name": section.name, "entries": entries}) %}
+  {% endif %}
+{% endfor %}
+
+{% if remaining %}
+  {% for section in remaining %}
     <section class="stack--tight">
       <h2 class="label stack__title">{{ section.name }}</h2>
       <div class="rows">
@@ -64,8 +87,8 @@
   {% endfor %}
 {% elif not problem %}
   {{ m.empty(
-      "No configuration stored",
-      "This machine is running on the built-in defaults. Writing any setting creates the file.",
+      "Nothing else stored",
+      "Beyond the sections above, this machine runs on the built-in defaults. Writing any setting creates the file.",
       command="wasm config set apps.directory /var/www/apps") }}
 {% endif %}
 

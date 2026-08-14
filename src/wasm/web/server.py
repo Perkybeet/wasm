@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import logging
 import socket
+import threading
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -34,8 +36,9 @@ from starlette.datastructures import MutableHeaders
 from starlette.requests import HTTPConnection
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from wasm.core.exceptions import SecurityError
+from wasm.core.exceptions import SecurityError, WASMError
 from wasm.core.net import host_addresses, local_address, loopback_access_lines
+from wasm.core.notifier import NotificationEvent
 from wasm.web.auth import (
     SAFE_METHODS,
     WS_CLOSE_FORBIDDEN,
@@ -175,6 +178,139 @@ def get_audit() -> AuditLogger | None:
     return _audit_logger
 
 
+#: Job types whose terminal state is a deployment outcome the operator asked
+#: to hear about: deploys, updates (the webhook auto-deploy queues these too)
+#: and rollbacks/restores. Everything else the job manager runs - certificate
+#: renewals, service actions, engine installs - has its own reporting surface.
+DEPLOY_JOB_TYPES = frozenset({"deploy", "update", "restore"})
+
+#: Terminal job status to the notification kind it publishes as.
+_TERMINAL_KINDS = {"completed": "deploy_success", "failed": "deploy_failed"}
+
+#: Most recently announced job ids remembered by a subscriber. Jobs reach a
+#: terminal state exactly once today; the memory is insurance against a
+#: subscriber being notified twice for the same finished job ever becoming a
+#: duplicate message on someone's phone.
+_SEEN_JOBS_LIMIT = 512
+
+
+def deployment_notification(job: Any) -> NotificationEvent | None:
+    """
+    Translate a job transition into the event the notifier carries, or None.
+
+    Args:
+        job: The job that changed, as the job manager reports it.
+
+    Returns:
+        The event for a finished deploy, update or rollback - and for a
+        failed backup, which has a kind of its own - or None for everything
+        else: non-terminal transitions, cancellations, and job types with
+        their own reporting surface.
+    """
+    status = str(getattr(job.status, "value", job.status))
+    job_type = str(getattr(job.type, "value", job.type))
+    domain = job.metadata.get("domain")
+
+    if job_type in DEPLOY_JOB_TYPES and status in _TERMINAL_KINDS:
+        kind = _TERMINAL_KINDS[status]
+    elif job_type == "backup" and status == "failed":
+        kind = "backup_failed"
+    else:
+        return None
+
+    if status == "failed":
+        title = f"{job.name} failed"
+        # The tool's own words, never paraphrased: this is what the operator
+        # will search for.
+        body = job.error or ""
+    else:
+        title = f"{job.name} completed"
+        body = job.description or ""
+
+    return NotificationEvent(
+        kind=kind, title=title, body=body, domain=str(domain) if domain else None
+    )
+
+
+def _deliver_notification(event: NotificationEvent) -> None:
+    """
+    Hand one event to the notifier without blocking the caller.
+
+    The job manager notifies subscribers from its worker thread, and the
+    notifier makes HTTP requests with a ten second deadline each: delivered
+    inline, one slow endpoint would stall every queued job behind the one
+    that finished. A daemon thread per event is cheap at the rate deploys
+    finish, and it does not hold the process open at shutdown.
+
+    Args:
+        event: The event to publish.
+    """
+    threading.Thread(target=_notify_now, args=(event,), name="wasm-notify", daemon=True).start()
+
+
+def _notify_now(event: NotificationEvent) -> None:
+    """
+    Publish one event over the configuration as it stands on disk.
+
+    The configuration is re-read per notification - one small file per
+    finished deploy - so a notifications change saved in the panel or made
+    with the CLI applies to the next event without a restart.
+
+    Args:
+        event: The event to publish.
+    """
+    from wasm.core.config import Config
+    from wasm.core.notifier import Notifier
+
+    config = Config()
+    try:
+        config.reload()
+    except (OSError, WASMError) as exc:
+        # Error boundary for the notification thread: an unreadable config
+        # file must cost this announcement its freshness, not the thread.
+        logger.warning("Configuration reload before notification failed: %s", exc)
+    Notifier(config).notify(event)
+
+
+class JobNotificationSubscriber:
+    """
+    Publishes finished jobs to the notifier, once each.
+
+    Registered with the job manager's ``subscribe_all`` for the life of the
+    server, next to the metrics collector in :func:`lifespan`: a process-wide
+    side effect belongs to the process's own lifetime, and the test suite
+    builds the application without running it.
+    """
+
+    def __init__(self, deliver: Any = None) -> None:
+        """
+        Args:
+            deliver: Replacement for :func:`_deliver_notification`. Tests
+                inject a capture so nothing spawns a thread or reads config.
+        """
+        self._deliver = deliver or _deliver_notification
+        self._seen: OrderedDict[str, None] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def __call__(self, job: Any) -> None:
+        """
+        Receive one job transition from the job manager.
+
+        Args:
+            job: The job that changed.
+        """
+        event = deployment_notification(job)
+        if event is None:
+            return
+        with self._lock:
+            if job.id in self._seen:
+                return
+            self._seen[job.id] = None
+            while len(self._seen) > _SEEN_JOBS_LIMIT:
+                self._seen.popitem(last=False)
+        self._deliver(event)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
@@ -186,16 +322,26 @@ async def lifespan(app: FastAPI):
     running this, which is what keeps the sampling thread out of every test
     that is not about it.
 
+    The deploy notification subscriber is attached here for the same reason:
+    subscribing is a process-wide side effect on the job manager singleton,
+    and doing it in ``create_app`` would stack one subscriber per application
+    a test builds.
+
     Args:
         app: The application being started.
     """
+    from wasm.web.jobs import get_job_manager
     from wasm.web.metrics_collector import start_metrics_collector, stop_metrics_collector
 
     manager = get_token_manager()
     manager.purge_expired_sessions()
+    jobs = get_job_manager()
+    notify_jobs = JobNotificationSubscriber()
+    jobs.subscribe_all(notify_jobs)
     start_metrics_collector()
     yield
     stop_metrics_collector()
+    jobs.unsubscribe_all(notify_jobs)
     manager.purge_expired_sessions()
 
 

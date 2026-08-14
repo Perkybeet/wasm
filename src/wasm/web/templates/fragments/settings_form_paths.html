@@ -1,0 +1,18 @@
+{# The paths form. Included by settings_section.html in its editing state. #}
+<form class="form" hx-post="/settings/config/paths"
+      hx-target="#settings-paths" hx-swap="outerHTML">
+  <div class="field">
+    <label class="label" for="set-paths-apps-directory">Applications directory</label>
+    <input class="mono" type="text" id="set-paths-apps-directory" name="apps_directory" required
+           value="{{ section.submitted.apps_directory or section.apps_directory }}"
+           aria-describedby="set-paths-apps-directory-hint">
+    <span class="field__hint" id="set-paths-apps-directory-hint">
+      Where new deployments land. Applications already deployed stay where they are.
+    </span>
+  </div>
+  <div class="toolbar">
+    <button class="btn btn--primary btn--sm" type="submit">Save</button>
+    <button type="button" class="btn btn--sm" hx-get="/settings/config/paths"
+            hx-target="#settings-paths" hx-swap="outerHTML">Cancel</button>
+  </div>
+</form>

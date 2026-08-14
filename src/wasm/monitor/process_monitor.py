@@ -23,6 +23,7 @@ from typing import Any
 from wasm.core.config import SYSTEMD_DIR, Config
 from wasm.core.exceptions import MonitorError, WASMError
 from wasm.core.logger import Logger
+from wasm.core.notifier import NotificationEvent, Notifier
 from wasm.core.runner import CommandRunner, get_runner
 from wasm.core.utils import remove_file, write_file
 from wasm.monitor.email_notifier import EmailNotifier
@@ -128,6 +129,7 @@ class ProcessMonitor:
         store: Any | None = None,
         notifier: Any | None = None,
         runner: CommandRunner | None = None,
+        event_notifier: Any | None = None,
     ) -> None:
         """
         Args:
@@ -136,6 +138,8 @@ class ProcessMonitor:
             store: Observation store. Created on first use if None.
             notifier: Email notifier. Created on first use if None.
             runner: Command runner. Defaults to the process-wide one.
+            event_notifier: Multi-channel notifier for unit and disk events.
+                Created on first use if None; tests inject a capture.
         """
         self.verbose = verbose
         self.logger = Logger(verbose=verbose)
@@ -145,9 +149,15 @@ class ProcessMonitor:
 
         self._store = store
         self._notifier = notifier
+        self._event_notifier = event_notifier
         self._running = False
         # Far enough in the past that the first loop iteration purges once.
         self._last_purge = float("-inf")
+        # Transition memory for the notifier: a disk over the threshold or a
+        # unit down is one event when it crosses, not one per scan, or a
+        # sixty second interval becomes a message a minute to every channel.
+        self._alerted_disks: set[str] = set()
+        self._failed_units: set[str] = set()
 
     def _load_config(self) -> MonitorConfig:
         """
@@ -185,6 +195,33 @@ class ProcessMonitor:
         if self._notifier is None:
             self._notifier = EmailNotifier(verbose=self.verbose)
         return self._notifier
+
+    @property
+    def event_notifier(self) -> Any:
+        """The multi-channel notifier, built on first use."""
+        if self._event_notifier is None:
+            self._event_notifier = Notifier(self.global_config)
+        return self._event_notifier
+
+    def _publish_event(self, kind: str, title: str, body: str) -> None:
+        """
+        Hand one observation to the multi-channel notifier.
+
+        The daemon runs for months, so the configuration is re-read from disk
+        first: an operator enabling notifications in the panel reaches the
+        next scan without a restart. Delivery problems are the notifier's to
+        log and skip; a scan must never fail because an endpoint is down.
+
+        Args:
+            kind: One of the notifier's event kinds.
+            title: One-line summary.
+            body: The detail the operator acts on.
+        """
+        try:
+            self.global_config.reload()
+        except (WASMError, OSError) as exc:
+            self.logger.debug(f"Configuration reload before notification failed: {exc}")
+        self.event_notifier.notify(NotificationEvent(kind=kind, title=title, body=body))
 
     def collect_metrics(self) -> ResourceMetrics:
         """
@@ -301,11 +338,58 @@ class ProcessMonitor:
         else:
             self.logger.debug(summary)
 
+        self._notify_full_disks(full_disks)
+
+    def _notify_full_disks(self, full_disks: list[Any]) -> None:
+        """
+        Publish ``disk_threshold`` for disks newly over the line.
+
+        Transition-based: a filesystem already announced stays silent until
+        it drops under the threshold and crosses it again, so a full disk is
+        one message, not one per scan interval.
+
+        Args:
+            full_disks: The disks at or over :data:`DISK_ALERT_PERCENT`.
+        """
+        for disk in full_disks:
+            if disk.mountpoint in self._alerted_disks:
+                continue
+            self._publish_event(
+                "disk_threshold",
+                f"Disk usage at {disk.percent:.0f}% on {disk.mountpoint}",
+                (
+                    f"{disk.mountpoint} is {disk.percent:.1f}% full, past the "
+                    f"{DISK_ALERT_PERCENT:.0f}% alert threshold. A full disk stops "
+                    "deployments, logs and databases on this machine."
+                ),
+            )
+        self._alerted_disks = {disk.mountpoint for disk in full_disks}
+
     def _report_services(self) -> None:
-        """Log any watched unit that is not active."""
+        """
+        Log any watched unit that is not active, and announce the transition.
+
+        The ``unit_failed`` event goes out once per outage, when a unit goes
+        from active to anything else; a unit that stays down is not repeated
+        every scan, and one that recovers re-arms.
+        """
+        down: set[str] = set()
         for health in self.check_services():
-            if not health.active:
-                self.logger.warning(f"Service {health.unit} is {health.active_state or 'unknown'}")
+            if health.active:
+                continue
+            state = health.active_state or "unknown"
+            down.add(health.unit)
+            self.logger.warning(f"Service {health.unit} is {state}")
+            if health.unit not in self._failed_units:
+                self._publish_event(
+                    "unit_failed",
+                    f"Unit {health.unit} is {state}",
+                    (
+                        f"The watched systemd unit {health.unit} reports {state}. "
+                        f"Inspect it with: systemctl status {health.unit}"
+                    ),
+                )
+        self._failed_units = down
 
     def run(self) -> None:
         """

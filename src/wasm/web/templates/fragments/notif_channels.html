@@ -1,0 +1,24 @@
+{#
+  The notification channels, one row each, with a test button per channel.
+
+  Only "configured or not" ever reaches this markup for the URL and token
+  channels: a webhook URL is a capability, and there is nothing useful a
+  masked copy of it would tell an operator that the badge does not. The test
+  button works whether or not notifications are enabled, because it exists to
+  try a channel before switching the feature on; its outcome renders above,
+  verbatim, through the section fragment.
+#}
+{% import "_macros.html" as m %}
+<div class="rows">
+  {% for channel in section.channels %}
+    {% call m.row(channel.label,
+                  "active" if channel.configured else "idle",
+                  channel.meta, none, none, none,
+                  "configured" if channel.configured else "not configured") %}
+      <button type="button" class="btn btn--sm"
+              hx-post="/settings/notifications/test/{{ channel.name }}"
+              hx-target="#settings-notifications"
+              hx-swap="outerHTML">Send test</button>
+    {% endcall %}
+  {% endfor %}
+</div>

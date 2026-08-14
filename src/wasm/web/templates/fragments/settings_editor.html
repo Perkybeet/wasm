@@ -1,0 +1,21 @@
+{#
+  The editable configuration sections, loaded into the settings page.
+
+  The settings page fetches this fragment on load rather than rendering it
+  inline, because the page handler lives in the aggregate router and this
+  editor lives in its own module: the page stays out of concurrent panel
+  work's way, and each section swaps independently from here on.
+#}
+{% import "_macros.html" as m %}
+<div id="settings-editor">
+  <p class="faint">
+    Stored credentials - database passwords, the SMTP account, API keys - are
+    not editable from this panel: a panel session must not be able to raise the
+    panel's own security configuration. Change them from a root shell with
+    <code>wasm config set</code>. Notification endpoints are the one exception:
+    the stored value is never shown, and pasting a whole new value replaces it.
+  </p>
+  {% for section in editable_sections %}
+    {% include "fragments/settings_section.html" %}
+  {% endfor %}
+</div>

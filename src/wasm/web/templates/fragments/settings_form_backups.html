@@ -1,0 +1,30 @@
+{# The backups form. Included by settings_section.html in its editing state. #}
+<form class="form" hx-post="/settings/config/backups"
+      hx-target="#settings-backups" hx-swap="outerHTML">
+  <div class="form__row">
+    <div class="field">
+      <label class="label" for="set-backup-directory">Backup directory</label>
+      <input class="mono" type="text" id="set-backup-directory" name="directory" required
+             value="{{ section.submitted.directory or section.directory }}"
+             aria-describedby="set-backup-directory-hint">
+      <span class="field__hint" id="set-backup-directory-hint">
+        Where application backups are written. Existing backups are not moved.
+      </span>
+    </div>
+    <div class="field">
+      <label class="label" for="set-backup-max">Backups kept per application</label>
+      <input class="mono" type="number" id="set-backup-max" name="max_per_app" required
+             min="1" max="100"
+             value="{{ section.submitted.max_per_app or section.max_per_app }}"
+             aria-describedby="set-backup-max-hint">
+      <span class="field__hint" id="set-backup-max-hint">
+        The oldest backup past this count is dropped when a new one is written.
+      </span>
+    </div>
+  </div>
+  <div class="toolbar">
+    <button class="btn btn--primary btn--sm" type="submit">Save</button>
+    <button type="button" class="btn btn--sm" hx-get="/settings/config/backups"
+            hx-target="#settings-backups" hx-swap="outerHTML">Cancel</button>
+  </div>
+</form>
