@@ -294,6 +294,22 @@ class TestRedactSecrets:
 
         assert result["password"] == "***"
 
+    def test_webhook_urls_are_redacted_wholesale(self) -> None:
+        """
+        A Slack or Discord webhook URL embeds the secret in its path, so the
+        whole value disappears; "url" alone is not a marker because values
+        like a DATABASE_URL keep their host and lose only the password.
+        """
+        data = {
+            "webhook": {"webhook_url": "https://hooks.slack.com/services/T0/B0/s3cret"},
+            "site_url": "https://example.com",
+        }
+
+        result = redact_secrets(data)
+
+        assert result["webhook"]["webhook_url"] == "***"
+        assert result["site_url"] == "https://example.com"
+
 
 class TestMonitorDefaults:
     """The monitor is observability, not an antivirus."""
@@ -421,6 +437,10 @@ class TestSecretInventory:
             "databases.credentials.postgresql.password",
             "databases.credentials.redis.password",
             "databases.credentials.mongodb.password",
+            "notifications.channels.webhook.webhook_url",
+            "notifications.channels.slack.webhook_url",
+            "notifications.channels.discord.webhook_url",
+            "notifications.channels.telegram.bot_token",
         }
 
     def test_redaction_touches_the_credentials_and_nothing_else(self) -> None:
@@ -439,6 +459,10 @@ class TestSecretInventory:
             "databases.credentials.postgresql.password",
             "databases.credentials.redis.password",
             "databases.credentials.mongodb.password",
+            "notifications.channels.webhook.webhook_url",
+            "notifications.channels.slack.webhook_url",
+            "notifications.channels.discord.webhook_url",
+            "notifications.channels.telegram.bot_token",
         }
 
     def test_no_secret_survives_a_full_tree_redaction(self, config_path: Path) -> None:

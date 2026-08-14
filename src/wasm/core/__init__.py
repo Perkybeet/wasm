@@ -3,6 +3,7 @@
 from wasm.core.config import Config
 from wasm.core.exceptions import WASMError
 from wasm.core.logger import Logger
+from wasm.core.notifier import NotificationEvent, Notifier
 from wasm.core.store import (
     App,
     AppStatus,
@@ -28,6 +29,8 @@ __all__ = [
     "DatabaseUser",
     "Logger",
     "MonorepoWorkspace",
+    "NotificationEvent",
+    "Notifier",
     "Service",
     "Site",
     "WASMError",

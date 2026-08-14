@@ -116,6 +116,35 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
         "email_recipients": [],
     },
+    "notifications": {
+        # Multi-channel event notifications, delivered by wasm.core.notifier.
+        # Off until the operator turns them on; every event kind defaults to
+        # on so enabling the feature is one switch, not seven. The kind names
+        # are pinned against notifier.EVENT_KINDS by a test in
+        # tests/test_notifier.py, because this module cannot import the
+        # notifier (the notifier reads its settings from here).
+        "enabled": False,
+        "events": {
+            "deploy_success": True,
+            "deploy_failed": True,
+            "cert_expiring": True,
+            "unit_failed": True,
+            "disk_threshold": True,
+            "backup_failed": True,
+        },
+        "channels": {
+            # A webhook URL is a capability: Slack and Discord embed the
+            # secret in the path. Every one of them is named "webhook_url",
+            # the generic endpoint included, so the "webhook" redaction
+            # marker covers them all by name.
+            "webhook": {"webhook_url": ""},
+            "slack": {"webhook_url": ""},
+            "discord": {"webhook_url": ""},
+            "telegram": {"bot_token": "", "chat_id": ""},
+            # Email reuses the monitor's SMTP account (monitor.smtp.*).
+            "email": {"enabled": False},
+        },
+    },
     "web": {
         "enabled": False,
         "host": "127.0.0.1",
@@ -186,6 +215,12 @@ SECRET_KEY_MARKERS: frozenset[str] = frozenset(
         "credential",
         "credentials",
         "auth",
+        # A webhook URL is a capability URL: whoever holds it can post as this
+        # server, and Slack and Discord embed the secret in the path. "url" on
+        # its own is deliberately not a marker, because values like a
+        # DATABASE_URL are shown with only their embedded password redacted
+        # (see cli/commands/env.py) and would disappear wholesale otherwise.
+        "webhook",
     }
 )
 
