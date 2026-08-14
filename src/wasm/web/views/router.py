@@ -21,6 +21,7 @@ that is missing, because the operator stops believing the rest of it.
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 from collections.abc import Callable, Coroutine
 from typing import Any
@@ -568,6 +569,8 @@ def settings(request: Request) -> HTMLResponse:
     sections, problem = resources.settings_sections()
     context: dict[str, Any] = {"sections": sections, "problem": problem}
     context.update(_totp_context())
+    context.update(_api_tokens_context())
+    context.update(_sessions_context(request))
     return page(request, "pages/settings.html", context)
 
 
@@ -722,6 +725,249 @@ def totp_disable(request: Request, body: bytes = Body(default=b"")) -> HTMLRespo
     except HTTPException as exc:
         return _totp_fragment(request, problem={"fix": str(exc.detail), "output": ""})
     return _totp_fragment(request)
+
+
+def _moment(value: float | None) -> dt.datetime | None:
+    """
+    Turn a stored UNIX timestamp into what the template filters read.
+
+    Args:
+        value: Seconds since the epoch, or None.
+
+    Returns:
+        An aware datetime, or None when there is nothing to show.
+    """
+    return dt.datetime.fromtimestamp(value, tz=dt.timezone.utc) if value else None
+
+
+def _form_fields(body: bytes) -> dict[str, str]:
+    """
+    Read the fields out of an urlencoded fragment form.
+
+    Args:
+        body: The raw request body.
+
+    Returns:
+        First value per field, stripped.
+    """
+    parsed = parse_qs(body.decode("utf-8", errors="replace"))
+    return {name: values[0].strip() for name, values in parsed.items() if values}
+
+
+def _api_tokens_context(
+    created: Any = None, problem: dict[str, str] | None = None
+) -> dict[str, Any]:
+    """
+    Build the context the API tokens fragment renders from.
+
+    Args:
+        created: A freshly issued token, shown exactly once.
+        problem: A ``fix``/``output`` mapping when a submission was refused.
+
+    Returns:
+        The fragment context. No stored token is ever in it: the list carries
+        names and metadata, and only an issuance just performed carries the
+        credential.
+    """
+    from wasm.web.server import get_token_manager
+
+    tokens = [
+        {
+            "id": record["id"],
+            "name": record["name"],
+            "scope": record["scope"],
+            "created": _moment(record["created_at"]),
+            "expires": _moment(record["expires_at"]),
+            "last_used": _moment(record["last_used_at"]),
+            "revoked": record["revoked_at"] is not None,
+        }
+        for record in get_token_manager().list_api_tokens()
+    ]
+    return {"api_tokens": tokens, "api_token_created": created, "api_token_problem": problem}
+
+
+def _api_tokens_fragment(
+    request: Request,
+    *,
+    created: Any = None,
+    problem: dict[str, str] | None = None,
+) -> HTMLResponse:
+    """
+    Render the API tokens section for an htmx swap.
+
+    Refusals render at 200 on purpose: htmx does not swap an error status, so
+    a 400 here would leave the screen frozen and report the refusal nowhere.
+
+    Args:
+        request: The incoming request.
+        created: A freshly issued token to show once.
+        problem: A ``fix``/``output`` mapping when a submission was refused.
+
+    Returns:
+        The rendered fragment.
+    """
+    return page(
+        request, "fragments/api_tokens.html", _api_tokens_context(created=created, problem=problem)
+    )
+
+
+def _sessions_context(request: Request, problem: dict[str, str] | None = None) -> dict[str, Any]:
+    """
+    Build the context the sessions fragment renders from.
+
+    Args:
+        request: The incoming request, carrying the caller's own session so
+            its row can be marked and its Revoke disabled.
+        problem: A ``fix``/``output`` mapping when a revocation was refused.
+
+    Returns:
+        The fragment context. Only truncated session id prefixes are in it.
+    """
+    from wasm.web.server import get_token_manager
+
+    session = getattr(request.state, "session", None) or {}
+    current_sid = session.get("sid") if session.get("type") == "session" else None
+    rows = [
+        {
+            "sid_prefix": entry["sid_prefix"],
+            "client_ip": entry["client_ip"],
+            "created": _moment(entry["created_at"]),
+            "last_seen": _moment(entry["last_seen"]),
+            "expires": _moment(entry["expires_at"]),
+            "is_current": entry["is_current"],
+        }
+        for entry in get_token_manager().list_sessions(current_sid)
+    ]
+    return {"panel_sessions": rows, "sessions_problem": problem}
+
+
+def _sessions_fragment(request: Request, problem: dict[str, str] | None = None) -> HTMLResponse:
+    """
+    Render the sessions section for an htmx swap.
+
+    Args:
+        request: The incoming request.
+        problem: A ``fix``/``output`` mapping when a revocation was refused.
+
+    Returns:
+        The rendered fragment.
+    """
+    return page(request, "fragments/sessions.html", _sessions_context(request, problem=problem))
+
+
+# Adapters over the JSON API, exactly like the two-factor handlers above: the
+# work, the auditing and the scope rules live in wasm.web.api.auth, and a
+# second implementation of "issue a token" is what the panel must never grow.
+
+
+@router.post("/settings/tokens", response_class=HTMLResponse)
+def api_token_create(request: Request, body: bytes = Body(default=b"")) -> HTMLResponse:
+    """
+    Issue an API token from the form and show it exactly once.
+
+    Args:
+        request: The incoming request.
+        body: The urlencoded form: name, scope and an expiry preset in hours,
+            empty for a token that only dies by revocation.
+
+    Returns:
+        The fragment with the fresh token, or with the refusal inline.
+    """
+    from wasm.web.api.auth import ApiTokenRequest
+    from wasm.web.api.auth import create_api_token as api_create_token
+
+    fields = _form_fields(body)
+    session = getattr(request.state, "session", {})
+
+    try:
+        model = ApiTokenRequest(
+            name=fields.get("name", ""),
+            scope=fields.get("scope", ""),
+            expires_hours=int(fields["expires_hours"]) if fields.get("expires_hours") else None,
+        )
+    except (ValueError, ValidationError) as exc:
+        return _api_tokens_fragment(request, problem={"fix": "Check the form.", "output": str(exc)})
+
+    try:
+        created = api_create_token(request, model, session)
+    except WASMError as exc:
+        return _api_tokens_fragment(
+            request, problem={"fix": str(exc), "output": getattr(exc, "details", "") or ""}
+        )
+    return _api_tokens_fragment(request, created=created)
+
+
+@router.post("/settings/tokens/{token_id}/revoke", response_class=HTMLResponse)
+def api_token_revoke(token_id: int, request: Request) -> HTMLResponse:
+    """
+    Revoke one API token from its row.
+
+    Args:
+        token_id: The record to revoke.
+        request: The incoming request.
+
+    Returns:
+        The fragment in its new state, or with the refusal inline.
+    """
+    from wasm.web.api.auth import revoke_api_token as api_revoke_token
+
+    session = getattr(request.state, "session", {})
+    try:
+        api_revoke_token(token_id, request, session)
+    except HTTPException as exc:
+        return _api_tokens_fragment(request, problem={"fix": str(exc.detail), "output": ""})
+    return _api_tokens_fragment(request)
+
+
+@router.post("/settings/sessions/{sid_prefix}/revoke", response_class=HTMLResponse)
+def session_revoke(sid_prefix: str, request: Request) -> HTMLResponse:
+    """
+    Revoke one session from its row.
+
+    Args:
+        sid_prefix: Truncated id of the session to revoke.
+        request: The incoming request.
+
+    Returns:
+        The fragment in its new state, or with the refusal inline - including
+        the refusal to revoke the session this very click arrived on.
+    """
+    from wasm.web.api.auth import revoke_one_session
+
+    session = getattr(request.state, "session", {})
+    try:
+        revoke_one_session(sid_prefix, request, session)
+    except HTTPException as exc:
+        return _sessions_fragment(request, problem={"fix": str(exc.detail), "output": ""})
+    except WASMError as exc:
+        return _sessions_fragment(
+            request, problem={"fix": str(exc), "output": getattr(exc, "details", "") or ""}
+        )
+    return _sessions_fragment(request)
+
+
+@router.post("/settings/sessions/revoke-all")
+def sessions_revoke_all(request: Request) -> Response:
+    """
+    Sign out every session, including this one, and leave for the sign-in page.
+
+    The revocation and its audit line are
+    :func:`wasm.web.api.auth.revoke_all_sessions`, called directly; this route
+    only adds what a browser needs on top of the JSON answer - the cookie
+    clearing it already does, plus the redirect htmx follows.
+
+    Args:
+        request: The incoming request.
+
+    Returns:
+        An empty response telling the browser to go to the sign-in page.
+    """
+    from wasm.web.api.auth import revoke_all_sessions
+
+    session = getattr(request.state, "session", {})
+    response = Response(status_code=200, headers={"HX-Redirect": "/login"})
+    revoke_all_sessions(request, response, session)
+    return response
 
 
 @router.post("/logout")

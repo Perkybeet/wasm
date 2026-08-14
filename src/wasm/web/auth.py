@@ -41,6 +41,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import secrets
 import sqlite3
 import threading
@@ -115,6 +116,30 @@ WS_CLOSE_RATE_LIMITED = 4429
 #: cookie: ``Sec-WebSocket-Protocol: wasm.auth, wasm.token.<token>``.
 WS_SUBPROTOCOL = "wasm.auth"
 WS_TOKEN_PREFIX = "wasm.token."  # noqa: S105 - subprotocol prefix, not a credential
+
+#: Prefix that routes a Bearer credential to the API token table instead of
+#: the session store or the master token. The master token's own prefix is
+#: ``wasm_``, so the two are distinguishable at a glance in a config file.
+API_TOKEN_PREFIX = "wasm_tok_"  # noqa: S105 - a prefix, not a credential
+
+#: API token scopes, weakest first. The order is the hierarchy: a scope
+#: satisfies every requirement at or below its own rank.
+API_TOKEN_SCOPES = ("read", "deploy", "admin")
+SCOPE_RANK = {scope: rank for rank, scope in enumerate(API_TOKEN_SCOPES)}
+
+#: How often a token's last_used_at is written, at most. Recording every
+#: request would turn a polling dashboard into a constant stream of writes to
+#: a database whose value here is "when was this credential last alive".
+API_TOKEN_LAST_USED_THROTTLE = 60
+
+#: The mutations a ``deploy`` scope is for: queueing a deployment, an update
+#: or a rollback. Every other mutation - deleting applications, editing
+#: configuration, managing credentials - stays ``admin``. This is the whole
+#: scope policy, stated once and enforced at the same chokepoint that
+#: resolves the credential; see :func:`required_scope`.
+DEPLOY_SCOPE_PATHS = frozenset(
+    {"/api/apps", "/api/jobs/deploy", "/api/jobs/update", "/api/jobs/rollback"}
+)
 
 #: Recorded in the payload the auth dependency hands to endpoints. Kept as
 #: names rather than a JWT: see SessionStore._encode for why the JWT went.
@@ -715,6 +740,23 @@ class SessionStore:
                 )
                 """
             )
+            # The token itself is never stored: only its salted hash, exactly
+            # like the master token. Names stay unique across revocations so
+            # an audit line naming a token always names one thing.
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS api_tokens (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    scope TEXT NOT NULL CHECK (scope IN ('read', 'deploy', 'admin')),
+                    created_at REAL NOT NULL,
+                    expires_at REAL,
+                    last_used_at REAL,
+                    revoked_at REAL
+                )
+                """
+            )
 
     def create(
         self,
@@ -864,6 +906,144 @@ class SessionStore:
             )
             self._conn.execute("DELETE FROM ws_tickets WHERE expires_at <= ?", (now,))
         return cursor.rowcount
+
+    def list_active(self) -> list[dict[str, Any]]:
+        """
+        List every session that is still usable, newest activity first.
+
+        Returns:
+            The live session rows as dicts.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT sid, client_ip, issued_at, created_at, expires_at FROM sessions "
+                "WHERE revoked = 0 AND expires_at > ? ORDER BY issued_at DESC",
+                (time.time(),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def sids_with_prefix(self, prefix: str) -> list[str]:
+        """
+        Find the live sessions whose identifier starts with a prefix.
+
+        Args:
+            prefix: Leading characters of a session id. The caller has already
+                validated it as hexadecimal, so it cannot carry LIKE wildcards.
+
+        Returns:
+            The matching session identifiers.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT sid FROM sessions WHERE revoked = 0 AND expires_at > ? "
+                "AND sid LIKE ? ORDER BY sid",
+                (time.time(), prefix + "%"),
+            ).fetchall()
+        return [str(row["sid"]) for row in rows]
+
+    def create_api_token(
+        self,
+        name: str,
+        token_hash: str,
+        scope: str,
+        created_at: float,
+        expires_at: float | None,
+    ) -> int:
+        """
+        Persist a new API token record.
+
+        Args:
+            name: Unique human-chosen name.
+            token_hash: Salted hash of the token; the token itself never lands.
+            scope: One of :data:`API_TOKEN_SCOPES`.
+            created_at: Creation time as a UNIX timestamp.
+            expires_at: Expiry as a UNIX timestamp, or None for no expiry.
+
+        Returns:
+            The new record's id.
+
+        Raises:
+            sqlite3.IntegrityError: When the name is already taken.
+        """
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "INSERT INTO api_tokens (name, token_hash, scope, created_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (name, token_hash, scope, created_at, expires_at),
+            )
+        return int(cursor.lastrowid or 0)
+
+    def get_api_token(self, token_hash: str) -> dict[str, Any] | None:
+        """
+        Fetch an unrevoked API token by its hash.
+
+        Expiry is deliberately left to the caller: "expired" and "unknown" are
+        the same refusal on the wire, but the caller decides both from one row.
+
+        Args:
+            token_hash: Salted hash of the presented token.
+
+        Returns:
+            The token row as a dict, or None when unknown or revoked.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM api_tokens WHERE token_hash = ? AND revoked_at IS NULL",
+                (token_hash,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def touch_api_token(self, token_id: int, used_at: float) -> None:
+        """
+        Record when a token last authenticated a request.
+
+        Args:
+            token_id: The token record's id.
+            used_at: The moment of use, as a UNIX timestamp.
+        """
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE api_tokens SET last_used_at = ? WHERE id = ?", (used_at, token_id)
+            )
+
+    def list_api_tokens(self) -> list[dict[str, Any]]:
+        """
+        List every API token record, newest first, without the hashes.
+
+        Returns:
+            The token rows as dicts.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, name, scope, created_at, expires_at, last_used_at, revoked_at "
+                "FROM api_tokens ORDER BY created_at DESC, id DESC"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def revoke_api_token(self, token_id: int) -> str | None:
+        """
+        Revoke one API token.
+
+        Args:
+            token_id: The token record's id.
+
+        Returns:
+            The token's name, for the audit record, or None when no such
+            record exists. Revoking an already revoked token is a no-op that
+            still reports the name: the outcome the caller asked for holds.
+        """
+        now = time.time()
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT name FROM api_tokens WHERE id = ?", (token_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            self._conn.execute(
+                "UPDATE api_tokens SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ?",
+                (now, token_id),
+            )
+        return str(row["name"])
 
     def store_ticket(self, ticket_hash: str, sid: str, client_ip: str, expires_at: float) -> None:
         """
@@ -1424,6 +1604,141 @@ class TokenManager:
             )
         return True
 
+    # ------------------------------------------------------------- API tokens
+
+    def create_api_token(
+        self, name: str, scope: str, expires_hours: float | None = None
+    ) -> dict[str, Any]:
+        """
+        Issue a named, scoped API token.
+
+        The token is returned in clear exactly once; only its salted hash is
+        stored, the same way the master token is stored.
+
+        Args:
+            name: Human-chosen name, unique across all tokens ever issued.
+            scope: One of :data:`API_TOKEN_SCOPES`.
+            expires_hours: Lifetime in hours, or None for a token that only
+                dies by revocation.
+
+        Returns:
+            The record, including the one and only clear copy of the token
+            under ``"token"``.
+
+        Raises:
+            SecurityError: When the name is empty or taken, the scope is not
+                a scope, or the expiry is not positive.
+        """
+        cleaned = name.strip()
+        if not cleaned or len(cleaned) > 64:
+            raise SecurityError(
+                "API token names are 1 to 64 characters",
+                details="Name the token after what will hold it, such as 'ci-deploy'.",
+            )
+        if scope not in API_TOKEN_SCOPES:
+            raise SecurityError(
+                f"Unknown API token scope: {scope!r}",
+                details=f"Use one of: {', '.join(API_TOKEN_SCOPES)}.",
+            )
+        if expires_hours is not None and expires_hours <= 0:
+            raise SecurityError(
+                "The token expiry must be a positive number of hours",
+                details="Omit it entirely for a token that only dies by revocation.",
+            )
+
+        token = f"{API_TOKEN_PREFIX}{secrets.token_urlsafe(TOKEN_LENGTH)}"
+        now = time.time()
+        expires_at = now + float(expires_hours) * 3600 if expires_hours is not None else None
+        try:
+            token_id = self.sessions.create_api_token(
+                cleaned, self._hash_token(token), scope, now, expires_at
+            )
+        except sqlite3.IntegrityError as exc:
+            raise SecurityError(
+                f"An API token named {cleaned!r} already exists",
+                details=(
+                    "Names are unique, including revoked tokens, so an audit line "
+                    "naming one always names one thing. Pick a new name."
+                ),
+            ) from exc
+
+        return {
+            "id": token_id,
+            "name": cleaned,
+            "scope": scope,
+            "token": token,
+            "created_at": now,
+            "expires_at": expires_at,
+        }
+
+    def list_api_tokens(self) -> list[dict[str, Any]]:
+        """
+        List every API token record. No hash and no token is in the result.
+
+        Returns:
+            The records, newest first.
+        """
+        return self.sessions.list_api_tokens()
+
+    def revoke_api_token(self, token_id: int) -> str | None:
+        """
+        Revoke one API token by id.
+
+        Args:
+            token_id: The record's id, as listed.
+
+        Returns:
+            The token's name, or None when no such record exists.
+        """
+        return self.sessions.revoke_api_token(token_id)
+
+    def verify_api_token(self, token: str, client_ip: str | None = None) -> dict[str, Any] | None:
+        """
+        Verify an API token and return the payload it authenticates.
+
+        The lookup is by the salted hash of the presented value, so timing
+        reveals nothing about any stored token, and the fetched row's hash is
+        still compared in constant time. Success records ``last_used_at``, at
+        most once per :data:`API_TOKEN_LAST_USED_THROTTLE` seconds.
+
+        Args:
+            token: The presented credential.
+            client_ip: Address presenting it, recorded in the payload.
+
+        Returns:
+            The payload, carrying the token's scope, or None when the token is
+            unknown, revoked or expired.
+        """
+        if not token.startswith(API_TOKEN_PREFIX):
+            return None
+
+        presented = self._hash_token(token)
+        record = self.sessions.get_api_token(presented)
+        if record is None:
+            return None
+        if not hmac.compare_digest(str(record["token_hash"]), presented):
+            return None
+
+        now = time.time()
+        expires_at = record["expires_at"]
+        if expires_at is not None and float(expires_at) <= now:
+            return None
+
+        last_used = record["last_used_at"]
+        if last_used is None or now - float(last_used) >= API_TOKEN_LAST_USED_THROTTLE:
+            self.sessions.touch_api_token(int(record["id"]), now)
+
+        return {
+            "type": "api_token",
+            "sid": f"token:{record['name']}",
+            "scope": str(record["scope"]),
+            "ip": client_ip,
+            "token_id": int(record["id"]),
+            "token_name": str(record["name"]),
+        }
+
+    # ---------------------------------------------------------------- sessions
+
     def create_session(self, client_ip: str) -> IssuedSession:
         """
         Create and persist a session.
@@ -1548,6 +1863,9 @@ class TokenManager:
         payload["csrf"] = record["csrf_token"]
         payload["expires_at"] = record["expires_at"]
         payload["type"] = "session"
+        # A session is an operator in a browser; scopes exist to narrow
+        # automation, not to narrow the person holding the panel.
+        payload["scope"] = "admin"
         return payload
 
     def _absolute_seconds(self) -> float:
@@ -1677,6 +1995,7 @@ class TokenManager:
             "sid": record["sid"],
             "ip": record["client_ip"],
             "csrf": session["csrf_token"],
+            "scope": "admin",
         }
 
     def revoke_session(self, session_id: str) -> None:
@@ -1687,6 +2006,80 @@ class TokenManager:
             session_id: The session identifier.
         """
         self.sessions.revoke(session_id)
+
+    def list_sessions(self, current_sid: str | None = None) -> list[dict[str, Any]]:
+        """
+        Describe every live session without exposing a usable identifier.
+
+        Only a truncated prefix of each session id leaves the server: enough
+        to name a row for revocation, useless for forging the cookie it
+        belongs to.
+
+        Args:
+            current_sid: The caller's own session id, so its row is marked.
+
+        Returns:
+            One dict per live session, newest activity first.
+        """
+        return [
+            {
+                "sid_prefix": str(row["sid"])[:8],
+                "client_ip": str(row["client_ip"]),
+                "created_at": float(row["created_at"] or row["issued_at"]),
+                "last_seen": float(row["issued_at"]),
+                "expires_at": float(row["expires_at"]),
+                "is_current": bool(current_sid and row["sid"] == current_sid),
+            }
+            for row in self.sessions.list_active()
+        ]
+
+    def revoke_session_by_prefix(self, prefix: str, protect_sid: str | None = None) -> str | None:
+        """
+        Revoke exactly one session, named by a unique prefix of its id.
+
+        Args:
+            prefix: Leading hexadecimal characters of the session id, as
+                listed by :meth:`list_sessions`. At least six of them.
+            protect_sid: The caller's own session id. Revoking it here is
+                refused: ending the session you are inside is sign-out, and it
+                has its own button that also clears the browser's cookies.
+
+        Returns:
+            The revoked session's prefix, or None when nothing matches.
+
+        Raises:
+            SecurityError: When the prefix is not hexadecimal, matches more
+                than one session, or names the protected session.
+        """
+        candidate = prefix.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{6,32}", candidate):
+            raise SecurityError(
+                f"Not a session id prefix: {prefix!r}",
+                details=(
+                    "Prefixes are the leading characters of a session id as listed by "
+                    "GET /api/auth/sessions: hexadecimal, at least six characters."
+                ),
+            )
+
+        matches = self.sessions.sids_with_prefix(candidate)
+        if not matches:
+            return None
+        if len(matches) > 1:
+            raise SecurityError(
+                f"The prefix {candidate!r} matches {len(matches)} sessions",
+                details="Send more characters of the session id so exactly one matches.",
+            )
+        if protect_sid and matches[0] == protect_sid:
+            raise SecurityError(
+                "That is the session you are using",
+                details=(
+                    "Revoking the current session from here would leave the browser "
+                    "holding dead cookies. Use Sign out, or POST /api/auth/logout."
+                ),
+            )
+
+        self.sessions.revoke(matches[0])
+        return matches[0][:8]
 
     def revoke_all_sessions(self) -> None:
         """Revoke every session."""
@@ -2027,12 +2420,98 @@ def record_auth_failure(client_ip: str, resource: str, source: str) -> None:
         )
 
 
+def scope_satisfies(granted: str, required: str) -> bool:
+    """
+    Report whether a granted scope covers a required one.
+
+    Args:
+        granted: Scope carried by the credential.
+        required: Scope the operation demands.
+
+    Returns:
+        True when the grant is at or above the requirement. An unknown scope
+        on either side fails closed.
+    """
+    wanted = SCOPE_RANK.get(required)
+    if wanted is None:
+        return False
+    return SCOPE_RANK.get(granted, -1) >= wanted
+
+
+def required_scope(method: str, path: str) -> str:
+    """
+    The scope policy, stated once: what a request needs to be allowed to run.
+
+    Reads need ``read``. The mutations that queue a deployment, an update or a
+    rollback need ``deploy``. Every other mutation needs ``admin``. Endpoints
+    with a stricter need than this table gives them - listing the API tokens
+    is a GET that must not be readable by a ``read`` token - declare it with
+    :func:`wasm.web.api.deps.require_scope`; nothing may declare a looser one.
+
+    Args:
+        method: The HTTP method.
+        path: The request path.
+
+    Returns:
+        The minimum scope.
+    """
+    verb = method.upper()
+    if verb in SAFE_METHODS:
+        return "read"
+    if verb == "POST" and path in DEPLOY_SCOPE_PATHS:
+        return "deploy"
+    return "admin"
+
+
+def ensure_scope(request: Request, payload: dict[str, Any], required: str) -> None:
+    """
+    Refuse a request whose credential does not carry the scope it needs.
+
+    This runs at the same chokepoint that resolves the credential, so a new
+    endpoint is covered the moment it exists rather than when somebody
+    remembers to guard it.
+
+    Args:
+        request: The incoming request.
+        payload: The verified session payload; its ``scope`` was set where the
+            credential was resolved. A payload without one fails closed as
+            ``read``.
+        required: The scope the operation demands.
+
+    Raises:
+        HTTPException: 403 when the scope is insufficient. The refusal is
+            audited with the token's name, never the token.
+    """
+    granted = str(payload.get("scope") or "read")
+    if scope_satisfies(granted, required):
+        return
+
+    audit = get_audit_logger()
+    if audit:
+        audit.record(
+            action="auth.scope",
+            result="denied",
+            client_ip=get_client_ip(request),
+            actor=str(payload.get("sid", "unknown")),
+            resource=request.url.path,
+            detail=f"scope '{granted}' below required '{required}'",
+        )
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=(
+            f"This credential's scope is '{granted}', and {request.method} "
+            f"{request.url.path} requires '{required}'. Issue a token with the "
+            "right scope from Settings, or POST /api/auth/tokens."
+        ),
+    )
+
+
 def check_credential(credential: str, client_ip: str) -> dict[str, Any] | None:
     """
     Verify one credential without recording anything.
 
     Args:
-        credential: A session token or the master token.
+        credential: A session token, an API token or the master token.
         client_ip: Address presenting it.
 
     Returns:
@@ -2042,12 +2521,17 @@ def check_credential(credential: str, client_ip: str) -> dict[str, Any] | None:
     if manager is None or not credential:
         return None
 
+    # The prefix routes to the token table and nowhere else, so an expired or
+    # revoked API token cannot fall through to a slower master-token check.
+    if credential.startswith(API_TOKEN_PREFIX):
+        return manager.verify_api_token(credential, client_ip)
+
     payload = manager.verify_session_token(credential, client_ip)
     if payload is not None:
         return payload
 
     if manager.verify_master_token(credential):
-        return {"type": "master", "sid": "master", "ip": client_ip}
+        return {"type": "master", "sid": "master", "ip": client_ip, "scope": "admin"}
 
     return None
 
@@ -2163,13 +2647,17 @@ async def require_auth(request: Request) -> dict[str, Any]:
     """
     FastAPI dependency enforcing authentication on an endpoint.
 
-    Accepts, in order, an ``Authorization: Bearer`` session token, a Bearer
-    master token (for the CLI), or the session cookie. Cookie authentication
-    additionally requires the CSRF header on every unsafe method.
+    Accepts, in order, an ``Authorization: Bearer`` session token, API token
+    or master token (for the CLI), or the session cookie. Cookie
+    authentication additionally requires the CSRF header on every unsafe
+    method.
 
     Whichever channel is used, a credential that does not match is counted by
     :func:`record_auth_failure`, so the lockout applies to master token guessing
-    on any endpoint and not only to ``/api/auth/login``.
+    on any endpoint and not only to ``/api/auth/login``. The credential's scope
+    is then held against :func:`required_scope` here, at the same chokepoint,
+    so a scoped API token is narrowed on every endpoint including the ones
+    written after it was issued.
 
     Args:
         request: The incoming request.
@@ -2178,8 +2666,8 @@ async def require_auth(request: Request) -> dict[str, Any]:
         The session payload, also stored on ``request.state.session``.
 
     Raises:
-        HTTPException: 401 when unauthenticated, 403 on a CSRF failure, 500
-            when the server was never initialised.
+        HTTPException: 401 when unauthenticated, 403 on a CSRF failure or an
+            insufficient scope, 500 when the server was never initialised.
     """
     manager = get_global_token_manager()
     if manager is None:
@@ -2198,6 +2686,7 @@ async def require_auth(request: Request) -> dict[str, Any]:
         if payload is None:
             raise _unauthorized("Invalid or expired authentication token")
         request.state.session = payload
+        ensure_scope(request, payload, required_scope(request.method, resource))
         return payload
 
     cookie = request.cookies.get(SESSION_COOKIE_NAME)
@@ -2207,6 +2696,7 @@ async def require_auth(request: Request) -> dict[str, Any]:
             raise _unauthorized("Session expired or revoked. Please log in again.")
         _check_csrf(request, payload, client_ip)
         request.state.session = payload
+        ensure_scope(request, payload, required_scope(request.method, resource))
         renewed = manager.renew_session(payload)
         if renewed is not None:
             request.state.renewed_session = renewed

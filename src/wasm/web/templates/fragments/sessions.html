@@ -1,0 +1,67 @@
+{#
+  Active sessions, as one swappable section.
+
+  Each row is a signed-in browser somewhere. Only a truncated prefix of the
+  session id reaches this page: enough to name a row for revocation, useless
+  for forging the cookie it belongs to.
+
+  The current session's Revoke is disabled rather than hidden - the operator
+  should see that the rule exists. Ending the session you are inside is
+  sign-out, which also clears the browser's cookies; the server refuses it
+  here for the same reason.
+
+  A refusal renders at 200 with the problem inline: htmx does not swap an
+  error status, so answering 400 would freeze the screen and report nothing.
+#}
+{% import "_macros.html" as m %}
+<div class="rows" id="sessions-section">
+
+  {% if sessions_problem %}
+    {{ m.problem(sessions_problem.fix, sessions_problem.output) }}
+  {% endif %}
+
+  {% if panel_sessions %}
+    <table class="table">
+      <thead>
+        <tr>
+          <th scope="col">Address</th>
+          <th scope="col">Signed in</th>
+          <th scope="col">Last seen</th>
+          <th scope="col">Expires</th>
+          <th scope="col"><span class="visually-hidden">Actions</span></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in panel_sessions %}
+          <tr>
+            <th scope="row">
+              <span class="mono">{{ s.client_ip }}</span>
+              {% if s.is_current %} {{ m.badge("active", "this session") }}{% endif %}
+            </th>
+            <td>{{ s.created | since }}</td>
+            <td>{{ s.last_seen | since }}</td>
+            <td>{{ s.expires | until }}</td>
+            <td>
+              {% if s.is_current %}
+                <button type="button" class="btn btn--sm btn--danger" disabled
+                        title="This is the session you are using. Sign out ends it.">Revoke</button>
+              {% else %}
+                <button type="button" class="btn btn--sm btn--danger"
+                        hx-post="/settings/sessions/{{ s.sid_prefix }}/revoke"
+                        hx-target="#sessions-section" hx-swap="outerHTML"
+                        hx-confirm="Revoke the session from {{ s.client_ip }}? That browser is signed out immediately.">Revoke</button>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="faint">No sessions. Yours would be here; it may authenticate as a Bearer token.</p>
+  {% endif %}
+
+  <button type="button" class="btn btn--danger"
+          hx-post="/settings/sessions/revoke-all"
+          hx-confirm="Sign out every session, including this one? Every signed-in browser lands back on the sign-in form.">Sign out everywhere</button>
+
+</div>

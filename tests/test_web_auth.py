@@ -1224,6 +1224,461 @@ def test_the_settings_fragment_flow_enrolls_confirms_and_disables(
     assert 'hx-post="/settings/2fa/enroll"' in disabled.text
 
 
+# --------------------------------------------------------------- API tokens
+
+
+def bearer(token: str) -> dict[str, str]:
+    """
+    Args:
+        token: The credential to present.
+
+    Returns:
+        An Authorization header carrying it.
+    """
+    return {"Authorization": f"Bearer {token}"}
+
+
+def issue_token(
+    client: TestClient,
+    csrf: str,
+    name: str = "ci",
+    scope: str = "read",
+    expires_hours: int | None = None,
+) -> dict:
+    """
+    Issue an API token through the API.
+
+    Args:
+        client: A signed-in client.
+        csrf: The session's CSRF token.
+        name: Token name.
+        scope: Token scope.
+        expires_hours: Optional lifetime in hours.
+
+    Returns:
+        The creation response body, the only place the token is ever clear.
+    """
+    body: dict[str, object] = {"name": name, "scope": scope}
+    if expires_hours is not None:
+        body["expires_hours"] = expires_hours
+    response = client.post("/api/auth/tokens", json=body, headers={CSRF_HEADER_NAME: csrf})
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def test_a_read_token_reads_but_cannot_mutate_and_the_refusal_is_audited(
+    sandbox: Path, runner: object
+) -> None:
+    """
+    A ``read`` token lists applications and is refused the deployment POST,
+    with the refusal audited under the token's name.
+
+    Args:
+        sandbox: Per-test temporary directory.
+        runner: The fake command runner, so listing apps reaches no process.
+    """
+    from wasm.core.store import WASMStore
+
+    client = build_client(sandbox)
+    master = get_token_manager().generate_master_token()
+    csrf = login(client, master)["csrf_token"]
+    issued = issue_token(client, csrf, name="reader", scope="read")
+    assert issued["token"].startswith("wasm_tok_")
+    assert issued["scope"] == "read"
+
+    WASMStore.reset_instance()
+    store = WASMStore(sandbox / "wasm.db")
+    try:
+        allowed = client.get("/api/apps", headers=bearer(issued["token"]))
+        assert allowed.status_code == 200, allowed.text
+    finally:
+        store.close()
+        WASMStore.reset_instance()
+
+    refused = client.post("/api/apps", headers=bearer(issued["token"]), json={})
+    assert refused.status_code == 403
+    assert "read" in refused.json()["detail"]
+    assert "deploy" in refused.json()["detail"]
+
+    denied = [e for e in read_audit(sandbox) if e["action"] == "auth.scope"]
+    assert denied, "an insufficient scope must be audited"
+    assert denied[-1]["result"] == "denied"
+    assert denied[-1]["actor"] == "token:reader"
+    assert issued["token"] not in (sandbox / "state" / "web-audit.log").read_text()
+
+
+def test_a_deploy_token_queues_deployments_but_cannot_delete(
+    sandbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    ``deploy`` covers deploy, update and rollback jobs; deletion stays admin.
+
+    Args:
+        sandbox: Per-test temporary directory.
+        monkeypatch: Patching helper, so the accepted job is never executed.
+    """
+    client = build_client(sandbox)
+    master = get_token_manager().generate_master_token()
+    csrf = login(client, master)["csrf_token"]
+    issued = issue_token(client, csrf, name="deployer", scope="deploy")
+
+    captured: list[dict] = []
+
+    class Queued:
+        """A job that was accepted but never run."""
+
+        id = "job-1"
+        status = type("Status", (), {"value": "pending"})()
+
+        def to_dict(self) -> dict:
+            """
+            Returns:
+                The job as the API's response model expects it.
+            """
+            return {
+                "id": self.id,
+                "type": "deploy",
+                "name": "Deploy app.example.com",
+                "description": "",
+                "status": "pending",
+                "progress": 0,
+                "total_steps": 100,
+                "current_step": "",
+                "created_at": "2026-01-01T00:00:00",
+            }
+
+    def create_job(**kwargs: object) -> Queued:
+        """
+        Args:
+            **kwargs: The job description.
+
+        Returns:
+            An accepted job.
+        """
+        captured.append(dict(kwargs))
+        return Queued()
+
+    fake = type("FakeJobs", (), {"create_job": staticmethod(create_job)})()
+    monkeypatch.setattr("wasm.web.api.jobs.get_job_manager", lambda: fake)
+
+    accepted = client.post(
+        "/api/jobs/deploy",
+        headers=bearer(issued["token"]),
+        json={"domain": "app.example.com", "source": "https://github.com/you/app"},
+    )
+    assert accepted.status_code == 202, accepted.text
+    assert captured, "the deployment never reached the job manager"
+
+    delete_app = client.delete("/api/apps/app.example.com", headers=bearer(issued["token"]))
+    assert delete_app.status_code == 403
+
+    delete_job = client.post(
+        "/api/jobs/delete", headers=bearer(issued["token"]), json={"domain": "app.example.com"}
+    )
+    assert delete_job.status_code == 403
+
+
+def test_an_expired_api_token_is_refused(sandbox: Path) -> None:
+    """A token past its expiry authenticates nothing, whatever its scope."""
+    client = build_client(sandbox)
+    master = get_token_manager().generate_master_token()
+    csrf = login(client, master)["csrf_token"]
+    issued = issue_token(client, csrf, name="short-lived", scope="admin", expires_hours=1)
+
+    before = client.get("/api/auth/verify", headers=bearer(issued["token"]))
+    assert before.status_code == 200
+
+    db = sqlite3.connect(sandbox / "state" / "web-sessions.db")
+    with db:
+        db.execute("UPDATE api_tokens SET expires_at = ?", (time.time() - 1,))
+    db.close()
+
+    after = client.get("/api/auth/verify", headers=bearer(issued["token"]))
+    assert after.status_code == 401
+
+
+def test_a_revoked_api_token_is_refused(sandbox: Path) -> None:
+    """Revocation takes effect on the very next request."""
+    client = build_client(sandbox)
+    master = get_token_manager().generate_master_token()
+    csrf = login(client, master)["csrf_token"]
+    issued = issue_token(client, csrf, name="doomed", scope="read")
+
+    assert client.get("/api/auth/verify", headers=bearer(issued["token"])).status_code == 200
+
+    revoked = client.delete(f"/api/auth/tokens/{issued['id']}", headers={CSRF_HEADER_NAME: csrf})
+    assert revoked.status_code == 200, revoked.text
+    assert revoked.json()["revoked"] == "doomed"
+
+    assert client.get("/api/auth/verify", headers=bearer(issued["token"])).status_code == 401
+
+    entries = read_audit(sandbox)
+    assert any(e["action"] == "auth.token.revoke" and e["result"] == "success" for e in entries)
+    raw = (sandbox / "state" / "web-audit.log").read_text()
+    assert issued["token"] not in raw, "the clear token reached the audit log"
+
+
+def test_last_used_is_recorded_with_a_throttle(sandbox: Path) -> None:
+    """
+    Use writes ``last_used_at``, but a polling client does not write on every
+    request: inside the throttle window the recorded time stands still.
+    """
+    manager = TokenManager(make_config(sandbox))
+    issued = manager.create_api_token("ci", "read")
+
+    payload = manager.verify_api_token(issued["token"])
+    assert payload is not None
+    assert payload["scope"] == "read"
+    assert payload["sid"] == "token:ci"
+
+    first = manager.list_api_tokens()[0]["last_used_at"]
+    assert first is not None, "use must record last_used_at"
+
+    assert manager.verify_api_token(issued["token"]) is not None
+    assert manager.list_api_tokens()[0]["last_used_at"] == first, (
+        "a second use inside the throttle window must not write"
+    )
+
+    db = sqlite3.connect(sandbox / "state" / "web-sessions.db")
+    with db:
+        db.execute("UPDATE api_tokens SET last_used_at = last_used_at - 120")
+    db.close()
+
+    assert manager.verify_api_token(issued["token"]) is not None
+    assert manager.list_api_tokens()[0]["last_used_at"] > first - 120, (
+        "past the throttle window the time must move"
+    )
+    manager.sessions.close()
+
+
+def test_the_clear_token_appears_only_in_the_creation_response(
+    sandbox: Path, runner: object
+) -> None:
+    """
+    One response carries the token once; no listing, screen or audit line
+    repeats it.
+
+    Args:
+        sandbox: Per-test temporary directory.
+        runner: The fake command runner, so rendering /settings reaches no
+            real process.
+    """
+    client = build_client(sandbox)
+    master = get_token_manager().generate_master_token()
+    csrf = login(client, master)["csrf_token"]
+    issued = issue_token(client, csrf, name="once-only", scope="deploy")
+
+    listing = client.get("/api/auth/tokens")
+    assert listing.status_code == 200
+    assert issued["token"] not in listing.text
+    assert "once-only" in listing.text
+
+    settings_screen = client.get("/settings")
+    assert issued["token"] not in settings_screen.text
+
+    assert issued["token"] not in (sandbox / "state" / "web-audit.log").read_text()
+    entries = read_audit(sandbox)
+    created = [e for e in entries if e["action"] == "auth.token.create"]
+    assert created and "once-only" in created[-1]["detail"]
+
+
+def test_token_management_needs_admin_even_for_the_listing(sandbox: Path) -> None:
+    """
+    Listing the tokens is a GET, and a ``read`` token must still not see it:
+    the endpoint declares a stricter scope than its method implies.
+    """
+    client = build_client(sandbox)
+    master = get_token_manager().generate_master_token()
+    csrf = login(client, master)["csrf_token"]
+    issued = issue_token(client, csrf, name="curious", scope="read")
+
+    assert client.get("/api/auth/tokens", headers=bearer(issued["token"])).status_code == 403
+    assert (
+        client.post(
+            "/api/auth/tokens",
+            headers=bearer(issued["token"]),
+            json={"name": "sneaky", "scope": "admin"},
+        ).status_code
+        == 403
+    )
+
+    # An admin-scoped token manages tokens the way the master token does.
+    admin = issue_token(client, csrf, name="steward", scope="admin")
+    assert client.get("/api/auth/tokens", headers=bearer(admin["token"])).status_code == 200
+
+
+def test_a_duplicate_token_name_is_refused_with_the_reason(sandbox: Path) -> None:
+    """Names are unique so an audit line naming a token names one thing."""
+    client = build_client(sandbox)
+    master = get_token_manager().generate_master_token()
+    csrf = login(client, master)["csrf_token"]
+    issue_token(client, csrf, name="ci", scope="read")
+
+    duplicate = client.post(
+        "/api/auth/tokens",
+        json={"name": "ci", "scope": "read"},
+        headers={CSRF_HEADER_NAME: csrf},
+    )
+
+    assert duplicate.status_code == 400
+    assert "already exists" in duplicate.json()["detail"]
+    assert duplicate.json()["hint"]
+
+
+def test_the_settings_screen_issues_lists_and_revokes_tokens(sandbox: Path, runner: object) -> None:
+    """
+    The htmx adapters drive the same implementation the JSON API does.
+
+    Args:
+        sandbox: Per-test temporary directory.
+        runner: The fake command runner, so rendering /settings reaches no
+            real process.
+    """
+    client = build_client(sandbox)
+    master = get_token_manager().generate_master_token()
+    csrf = login(client, master)["csrf_token"]
+    headers = {CSRF_HEADER_NAME: csrf}
+
+    screen = client.get("/settings").text
+    assert "API tokens" in screen
+    assert 'hx-post="/settings/tokens"' in screen
+
+    created = client.post(
+        "/settings/tokens",
+        data={"name": "panel-ci", "scope": "deploy", "expires_hours": "720"},
+        headers=headers,
+    )
+    assert created.status_code == 200
+    assert "wasm_tok_" in created.text, "the fresh token is not on the screen it was issued from"
+    assert "panel-ci" in created.text
+
+    again = client.get("/settings").text
+    assert "wasm_tok_" not in again, "the token survived past its one showing"
+    assert "panel-ci" in again
+
+    refused = client.post(
+        "/settings/tokens", data={"name": "panel-ci", "scope": "read"}, headers=headers
+    )
+    assert refused.status_code == 200
+    assert "already exists" in refused.text
+
+    token_id = get_token_manager().list_api_tokens()[0]["id"]
+    revoked = client.post(f"/settings/tokens/{token_id}/revoke", headers=headers)
+    assert revoked.status_code == 200
+    assert "revoked" in revoked.text
+
+
+# ----------------------------------------------------------------- sessions
+
+
+def test_revoking_another_session_leaves_the_current_one_alive(sandbox: Path) -> None:
+    """The whole point of per-session revocation, end to end."""
+    app = create_app(make_config(sandbox))
+    first = TestClient(app, client=("10.0.0.1", 50000))
+    second = TestClient(app, client=("10.0.0.2", 50000))
+    master = get_token_manager().generate_master_token()
+    csrf = login(first, master)["csrf_token"]
+    login(second, master)
+
+    listing = first.get("/api/auth/sessions").json()
+    assert listing["active_sessions"] == 2
+    rows = listing["sessions"]
+    assert len(rows) == 2
+    assert sum(1 for row in rows if row["is_current"]) == 1
+    assert all(len(row["sid_prefix"]) == 8 for row in rows)
+
+    other = next(row for row in rows if not row["is_current"])
+    response = first.delete(
+        f"/api/auth/sessions/{other['sid_prefix']}", headers={CSRF_HEADER_NAME: csrf}
+    )
+    assert response.status_code == 200, response.text
+
+    assert second.get("/api/auth/verify").status_code == 401
+    assert first.get("/api/auth/verify").status_code == 200
+
+    entries = read_audit(sandbox)
+    assert any(e["action"] == "auth.session.revoke" and e["result"] == "success" for e in entries)
+
+
+def test_revoking_the_current_session_is_refused_with_the_reason(sandbox: Path) -> None:
+    """Ending the session you are inside is sign-out, and the refusal says so."""
+    client = build_client(sandbox)
+    master = get_token_manager().generate_master_token()
+    csrf = login(client, master)["csrf_token"]
+
+    mine = next(
+        row for row in client.get("/api/auth/sessions").json()["sessions"] if row["is_current"]
+    )
+    refusal = client.delete(
+        f"/api/auth/sessions/{mine['sid_prefix']}", headers={CSRF_HEADER_NAME: csrf}
+    )
+
+    assert refusal.status_code == 400
+    assert "session you are using" in refusal.json()["detail"]
+    assert "Sign out" in refusal.json()["hint"]
+    assert client.get("/api/auth/verify").status_code == 200
+
+
+def test_an_ambiguous_or_malformed_prefix_is_refused(sandbox: Path) -> None:
+    """A prefix names exactly one session or it names nothing."""
+    manager = TokenManager(make_config(sandbox))
+    expires = time.time() + 3600
+    manager.sessions.create("abcdef" + "1" * 26, "csrf-1", "10.0.0.1", expires)
+    manager.sessions.create("abcdef" + "2" * 26, "csrf-2", "10.0.0.2", expires)
+
+    with pytest.raises(SecurityError) as ambiguous:
+        manager.revoke_session_by_prefix("abcdef")
+    assert "matches 2 sessions" in str(ambiguous.value)
+
+    with pytest.raises(SecurityError):
+        manager.revoke_session_by_prefix("nothex%")
+    with pytest.raises(SecurityError):
+        manager.revoke_session_by_prefix("abc")
+
+    assert manager.revoke_session_by_prefix("badbad") is None, "no match must not revoke"
+    assert manager.revoke_session_by_prefix("abcdef1") == "abcdef11"
+    assert manager.sessions.get("abcdef" + "1" * 26) is None
+    assert manager.sessions.get("abcdef" + "2" * 26) is not None
+    manager.sessions.close()
+
+
+def test_the_settings_screen_lists_and_revokes_sessions(sandbox: Path, runner: object) -> None:
+    """
+    The sessions fragment shows every session, marks the current one, revokes
+    the others and offers the sign-out-everywhere door.
+
+    Args:
+        sandbox: Per-test temporary directory.
+        runner: The fake command runner, so rendering /settings reaches no
+            real process.
+    """
+    app = create_app(make_config(sandbox))
+    first = TestClient(app, client=("10.0.0.1", 50000))
+    second = TestClient(app, client=("10.0.0.2", 50000))
+    master = get_token_manager().generate_master_token()
+    csrf = login(first, master)["csrf_token"]
+    login(second, master)
+    headers = {CSRF_HEADER_NAME: csrf}
+
+    screen = first.get("/settings").text
+    assert "Sign out everywhere" in screen
+    assert "this session" in screen
+    assert "10.0.0.2" in screen
+
+    other = next(
+        row for row in first.get("/api/auth/sessions").json()["sessions"] if not row["is_current"]
+    )
+    swapped = first.post(f"/settings/sessions/{other['sid_prefix']}/revoke", headers=headers)
+    assert swapped.status_code == 200
+    assert "10.0.0.2" not in swapped.text, "the revoked session is still on the screen"
+    assert second.get("/api/auth/verify").status_code == 401
+
+    everywhere = first.post("/settings/sessions/revoke-all", headers=headers)
+    assert everywhere.status_code == 200
+    assert everywhere.headers["HX-Redirect"] == "/login"
+    assert first.get("/api/auth/verify").status_code == 401
+
+
 def test_rate_limiter_does_not_grow_without_bound() -> None:
     """Old client entries are dropped instead of accumulating forever."""
     limiter = auth_module.RateLimiter(max_requests=2, window=60, max_tracked=10)

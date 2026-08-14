@@ -27,7 +27,7 @@ from __future__ import annotations
 from collections.abc import Callable, Coroutine
 from typing import Any
 
-from fastapi import FastAPI, Request, Response
+from fastapi import Depends, FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
@@ -45,6 +45,7 @@ from wasm.core.exceptions import (
     PermissionError as WASMPermissionError,
 )
 from wasm.validators.domain import validate_domain
+from wasm.web.auth import SCOPE_RANK, ensure_scope, require_auth
 
 #: Status used for a WASMError with no more specific mapping. A manager that
 #: raises anything else is reporting that the operation failed on the server,
@@ -194,6 +195,51 @@ def install_error_handlers(app: FastAPI) -> None:
         return error_response(exc)
 
     app.add_exception_handler(WASMError, handle)
+
+
+def require_scope(scope: str) -> Callable[..., Coroutine[Any, Any, dict[str, Any]]]:
+    """
+    Build a dependency that demands a minimum credential scope.
+
+    The blanket policy already runs where the credential is resolved -
+    :func:`wasm.web.auth.required_scope` at the ``require_auth`` chokepoint -
+    so most endpoints declare nothing. This is for the ones whose need is
+    stricter than the method implies: listing the API tokens is a GET, and a
+    ``read`` token must still not see it. It can only tighten; the chokepoint
+    has already enforced the floor by the time this runs.
+
+    Args:
+        scope: The minimum scope, one of ``read``, ``deploy`` or ``admin``.
+
+    Returns:
+        A dependency that yields the session payload, exactly as
+        ``require_auth`` does, so it can replace it in an endpoint signature.
+
+    Raises:
+        ValueError: When the scope is not a scope. At import time, on purpose:
+            a typo here must fail the module, not silently guard nothing.
+    """
+    if scope not in SCOPE_RANK:
+        raise ValueError(f"Unknown scope {scope!r}; use one of {sorted(SCOPE_RANK)}")
+
+    async def dependency(
+        request: Request, session: dict[str, Any] = Depends(require_auth)
+    ) -> dict[str, Any]:
+        """
+        Args:
+            request: The incoming request.
+            session: The authenticated session payload.
+
+        Returns:
+            The session payload.
+
+        Raises:
+            HTTPException: 403 when the credential's scope is below ``scope``.
+        """
+        ensure_scope(request, session, scope)
+        return session
+
+    return dependency
 
 
 def strict_domain(value: str) -> str:

@@ -1,0 +1,104 @@
+{#
+  API tokens, as one swappable section.
+
+  Every state renders through this fragment - empty, listed, freshly issued,
+  refused - so the settings page and the htmx swaps can never disagree about
+  what the section looks like.
+
+  A freshly issued token is shown exactly once, in selectable mono. Only its
+  salted hash is stored, so no later render of this fragment can repeat it;
+  the warning above the value says so in as many words.
+
+  A refused submission renders at 200 with the refusal inline: htmx does not
+  swap an error status, so answering 400 would freeze the screen and report
+  nothing.
+#}
+{% import "_macros.html" as m %}
+<div class="rows" id="api-tokens-section">
+
+  {% if api_token_problem %}
+    {{ m.problem(api_token_problem.fix, api_token_problem.output) }}
+  {% endif %}
+
+  {% if api_token_created %}
+    <p>
+      The token <strong>{{ api_token_created.name }}</strong> is shown once and
+      stored hashed, so copy it now. It authenticates as
+      <code>Authorization: Bearer &lt;token&gt;</code> with the
+      <strong>{{ api_token_created.scope }}</strong> scope.
+    </p>
+    <p class="mono">{{ api_token_created.token }}</p>
+  {% endif %}
+
+  {% if api_tokens %}
+    <table class="table">
+      <thead>
+        <tr>
+          <th scope="col">Name</th>
+          <th scope="col">Scope</th>
+          <th scope="col">Created</th>
+          <th scope="col">Expires</th>
+          <th scope="col">Last used</th>
+          <th scope="col"><span class="visually-hidden">Actions</span></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for token in api_tokens %}
+          <tr>
+            <th scope="row">{{ token.name }}</th>
+            <td><span class="mono">{{ token.scope }}</span></td>
+            <td>{{ token.created | since }}</td>
+            <td>{% if token.expires %}{{ token.expires | until }}{% else %}Never{% endif %}</td>
+            <td>{% if token.last_used %}{{ token.last_used | since }}{% else %}Never{% endif %}</td>
+            <td>
+              {% if token.revoked %}
+                {{ m.badge("failed", "revoked") }}
+              {% else %}
+                <button type="button" class="btn btn--sm btn--danger"
+                        hx-post="/settings/tokens/{{ token.id }}/revoke"
+                        hx-target="#api-tokens-section" hx-swap="outerHTML"
+                        hx-confirm="Revoke {{ token.name }}? Requests presenting it stop authenticating immediately.">Revoke</button>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="faint">
+      No tokens issued. A token lets a script reach the API without the master
+      token, narrowed to a scope and revocable on its own.
+    </p>
+  {% endif %}
+
+  <form hx-post="/settings/tokens" hx-target="#api-tokens-section" hx-swap="outerHTML">
+    <div class="field">
+      <label class="label" for="api-token-name">Name</label>
+      <input class="mono" type="text" id="api-token-name" name="name"
+             required maxlength="64" autocomplete="off"
+             aria-describedby="api-token-name-hint">
+      <span class="field__hint" id="api-token-name-hint">
+        Name it after what will hold it, such as ci-deploy.
+      </span>
+    </div>
+    <div class="field">
+      <label class="label" for="api-token-scope">Scope</label>
+      <select id="api-token-scope" name="scope">
+        <option value="read">read: list and inspect</option>
+        <option value="deploy" selected>deploy: read, plus deploy, update and rollback</option>
+        <option value="admin">admin: everything</option>
+      </select>
+    </div>
+    <div class="field">
+      <label class="label" for="api-token-expires">Expires</label>
+      <select id="api-token-expires" name="expires_hours">
+        <option value="24">24 hours</option>
+        <option value="720" selected>30 days</option>
+        <option value="2160">90 days</option>
+        <option value="">Never</option>
+      </select>
+    </div>
+    <button class="btn btn--primary" type="submit">Create token</button>
+  </form>
+
+</div>
