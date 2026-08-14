@@ -1,0 +1,91 @@
+{#
+  An application's environment, as one swappable section.
+
+  Three states render through this fragment - the masked table (view), the
+  same table with its values in clear (revealed), and the KEY=VALUE editor
+  (edit) - so the application page and the htmx swaps can never disagree
+  about what this section looks like.
+
+  Revealing a value, whether through Reveal or by opening the editor, is
+  audited on the server: this panel prints a credential to the browser only
+  when the operator explicitly asked, and the ask is on the record.
+
+  Saving rewrites the .env file the application will read on its next start.
+  The process already running keeps whatever it started with, which is why a
+  save leaves a "restart required" notice with the button that already
+  restarts this application from the rest of the page.
+
+  A refused save renders at 200 with the refusal inline: htmx does not swap
+  an error status, so answering 422 would freeze the screen and report
+  nothing.
+#}
+{% import "_macros.html" as m %}
+<div class="rows" id="app-env-section">
+
+  {% if app_env_problem %}
+    {{ m.problem(app_env_problem.fix, app_env_problem.output) }}
+  {% endif %}
+
+  {% if app_env_restart_required %}
+    <p class="stack__lead">
+      {{ m.badge("busy", "restart required") }}
+      Environment saved. Restart the application to apply the change.
+      {{ m.action_button("Restart", restart_endpoint, none, "Restarted " ~ app_env_domain) }}
+    </p>
+  {% endif %}
+
+  {% if app_env_mode == "edit" %}
+    <form hx-post="/apps/{{ app_env_domain }}/env/save" hx-target="#app-env-section" hx-swap="outerHTML">
+      <div class="field">
+        <label class="label" for="app-env-textarea">Variables, one KEY=VALUE per line</label>
+        <textarea class="mono" id="app-env-textarea" name="env" rows="12"
+                  spellcheck="false" autocomplete="off"
+                  aria-describedby="app-env-hint">{{ app_env_text }}</textarea>
+        <span class="field__hint" id="app-env-hint">
+          Replaces the whole file. Remove a line to remove that variable.
+        </span>
+      </div>
+      <button class="btn btn--primary" type="submit">Save</button>
+      <button class="btn btn--sm" type="button"
+              hx-get="/apps/{{ app_env_domain }}/env/view" hx-target="#app-env-section"
+              hx-swap="outerHTML">Cancel</button>
+    </form>
+
+  {% elif app_env_variables %}
+    <table class="table">
+      <thead>
+        <tr><th scope="col">Variable</th><th scope="col">Value</th></tr>
+      </thead>
+      <tbody>
+        {% for key, value in app_env_variables %}
+          <tr>
+            <td class="mono">{{ key }}</td>
+            <td>
+              {%- if app_env_mode == "revealed" %}<span class="mono">{{ value }}</span>
+              {%- else %}{{ m.secret(value) }}{% endif -%}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% if app_env_mode == "revealed" %}
+      <button type="button" class="btn btn--sm"
+              hx-get="/apps/{{ app_env_domain }}/env/view" hx-target="#app-env-section"
+              hx-swap="outerHTML">Hide</button>
+    {% else %}
+      <button type="button" class="btn btn--sm"
+              hx-get="/apps/{{ app_env_domain }}/env/reveal" hx-target="#app-env-section"
+              hx-swap="outerHTML">Reveal</button>
+    {% endif %}
+    <button type="button" class="btn btn--sm"
+            hx-get="/apps/{{ app_env_domain }}/env/edit" hx-target="#app-env-section"
+            hx-swap="outerHTML">Edit</button>
+
+  {% else %}
+    <p class="muted">No environment variables are recorded for this application.</p>
+    <button type="button" class="btn btn--sm"
+            hx-get="/apps/{{ app_env_domain }}/env/edit" hx-target="#app-env-section"
+            hx-swap="outerHTML">Edit</button>
+  {% endif %}
+
+</div>

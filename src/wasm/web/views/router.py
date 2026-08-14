@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Mapping
 from typing import Any
 from urllib.parse import parse_qs
 
@@ -492,7 +492,213 @@ def app_detail(request: Request, domain: str) -> HTMLResponse:
             },
             status_code=404,
         )
+    detail.update(_app_env_context(request, domain))
     return page(request, "pages/app.html", detail)
+
+
+def _parse_env_text(text: str) -> dict[str, str]:
+    """
+    Parse a "KEY=VALUE per line" textarea into a mapping.
+
+    A blank line or one starting with ``#`` is skipped, and a line with no
+    ``=`` is ignored rather than guessed at. Whatever survives is handed to
+    the same validator the API uses, so a malformed name or value is reported
+    there, once.
+
+    Args:
+        text: Raw textarea content.
+
+    Returns:
+        Name to value mapping, in the order the operator typed it.
+    """
+    values: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        values[key.strip()] = value.strip()
+    return values
+
+
+def _format_env_text(values: Mapping[str, str]) -> str:
+    """
+    Render a mapping as the "KEY=VALUE per line" text the editor shows.
+
+    Args:
+        values: Name to value mapping, in clear.
+
+    Returns:
+        One ``KEY=VALUE`` line per variable, sorted by name.
+    """
+    return "\n".join(f"{key}={value}" for key, value in sorted(values.items()))
+
+
+def _app_env_context(
+    request: Request,
+    domain: str,
+    *,
+    mode: str = "view",
+    edit_text: str | None = None,
+    problem: dict[str, str] | None = None,
+    restart_required: bool = False,
+) -> dict[str, Any]:
+    """
+    Build the context the environment fragment renders from.
+
+    Reads through :func:`wasm.web.api.apps.get_app_env`, exactly like the
+    JSON API: a second implementation of "read an application's .env" is
+    what this panel must never grow. Revealing the values in clear - for the
+    "revealed" table, or for the editor, which cannot usefully mask what it
+    hands the operator to edit - goes through the same call with
+    ``unmask=True`` and is audited there, under the action a Bearer client
+    gets for ``?unmask=true``.
+
+    Args:
+        request: The incoming request, carrying the session the API call
+            needs.
+        domain: The application's domain.
+        mode: ``"view"`` for the masked table, ``"revealed"`` for the table
+            in clear, or ``"edit"`` for the KEY=VALUE textarea.
+        edit_text: Textarea content to show verbatim, when the operator's own
+            submission is being redisplayed after a refusal, rather than what
+            is currently on disk.
+        problem: A ``fix``/``output`` mapping when a save was refused.
+        restart_required: Whether to show the "restart required" notice, set
+            after a successful save.
+
+    Returns:
+        The fragment context.
+    """
+    from wasm.web.api.apps import get_app_env
+
+    session = getattr(request.state, "session", {})
+    unmask = mode in ("revealed", "edit")
+    result = get_app_env(domain, request, session, unmask=unmask)
+
+    return {
+        "app_env_domain": domain,
+        "app_env_mode": mode,
+        "app_env_variables": sorted(result.variables.items()),
+        "app_env_text": (
+            edit_text if edit_text is not None else _format_env_text(result.variables)
+        ),
+        "app_env_problem": problem,
+        "app_env_restart_required": restart_required,
+        "restart_endpoint": f"/api/apps/{domain}/restart",
+    }
+
+
+def _app_env_fragment(request: Request, domain: str, **kwargs: Any) -> HTMLResponse:
+    """
+    Render the environment section for an htmx swap.
+
+    Args:
+        request: The incoming request.
+        domain: The application's domain.
+        **kwargs: Forwarded to :func:`_app_env_context`.
+
+    Returns:
+        The rendered fragment.
+    """
+    return page(request, "fragments/app_env.html", _app_env_context(request, domain, **kwargs))
+
+
+# Adapters over the JSON API, exactly like the two-factor and token handlers
+# above: the read, the write, the validation and the audit trail all live in
+# wasm.web.api.apps, and a second implementation of "edit an application's
+# environment" is what this panel must never grow.
+
+
+@router.get("/apps/{domain}/env/view", response_class=HTMLResponse)
+def app_env_view(domain: str, request: Request) -> HTMLResponse:
+    """
+    Show the environment table with its values masked.
+
+    Args:
+        domain: The application's domain.
+        request: The incoming request.
+
+    Returns:
+        The fragment, in its default state.
+    """
+    return _app_env_fragment(request, domain, mode="view")
+
+
+@router.get("/apps/{domain}/env/reveal", response_class=HTMLResponse)
+def app_env_reveal(domain: str, request: Request) -> HTMLResponse:
+    """
+    Show the environment table with its values in clear.
+
+    Every call is audited: this is the panel's equivalent of
+    ``wasm env show --unmask``, and the same rule applies - the operator
+    asked, so the read is on the record.
+
+    Args:
+        domain: The application's domain.
+        request: The incoming request.
+
+    Returns:
+        The fragment, with values unmasked.
+    """
+    return _app_env_fragment(request, domain, mode="revealed")
+
+
+@router.get("/apps/{domain}/env/edit", response_class=HTMLResponse)
+def app_env_edit(domain: str, request: Request) -> HTMLResponse:
+    """
+    Show the KEY=VALUE editor, prefilled with the current values in clear.
+
+    An operator editing a value has to see it, so opening the editor reveals
+    the environment exactly like Reveal does, and is audited the same way.
+
+    Args:
+        domain: The application's domain.
+        request: The incoming request.
+
+    Returns:
+        The fragment, showing the textarea.
+    """
+    return _app_env_fragment(request, domain, mode="edit")
+
+
+@router.post("/apps/{domain}/env/save", response_class=HTMLResponse)
+def app_env_save(domain: str, request: Request, body: bytes = Body(default=b"")) -> HTMLResponse:
+    """
+    Parse the KEY=VALUE textarea and rewrite the application's .env file.
+
+    An adapter over the JSON API, like the deploy form and the two-factor
+    handlers: the validation, the write and the audit trail live in
+    :func:`wasm.web.api.apps.update_app_env`.
+
+    Args:
+        domain: The application's domain.
+        request: The incoming request.
+        body: The urlencoded form carrying the textarea content.
+
+    Returns:
+        The fragment with a "restart required" notice, or the editor again
+        with the refusal inline and what the operator typed preserved.
+    """
+    from wasm.web.api.apps import UpdateAppEnvRequest
+    from wasm.web.api.apps import update_app_env as api_update_app_env
+
+    text = _form_fields(body).get("env", "")
+    variables = _parse_env_text(text)
+    session = getattr(request.state, "session", {})
+
+    try:
+        api_update_app_env(domain, UpdateAppEnvRequest(variables=variables), request, session)
+    except HTTPException as exc:
+        return _app_env_fragment(
+            request,
+            domain,
+            mode="edit",
+            edit_text=text,
+            problem={"fix": str(exc.detail), "output": ""},
+        )
+
+    return _app_env_fragment(request, domain, mode="view", restart_required=True)
 
 
 @router.get("/certificates", response_class=HTMLResponse)

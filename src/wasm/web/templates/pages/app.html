@@ -5,10 +5,11 @@
   operator would otherwise open an SSH session for: what is it, what runs it,
   what is in front of it, what was it told, and what has happened to it.
 
-  The environment is shown with its secrets hidden. An application's
-  environment is where the database password lives, and a control panel that
-  prints it to the browser has handed it to every extension the operator has
-  installed.
+  The environment section reads and writes the application's own .env file
+  through the same helper the CLI's `wasm env` commands use. Its secrets are
+  masked by default, revealing one is audited, and editing it never restarts
+  the application on its own: a database password is not something this
+  screen changes as a side effect of the operator glancing at it.
 #}
 {% extends "base.html" %}
 {% import "_macros.html" as m %}
@@ -64,26 +65,7 @@
 
 <section class="stack--tight">
   <h2 class="label stack__title">Environment</h2>
-  {% if env %}
-    <table class="table">
-      <thead>
-        <tr><th scope="col">Variable</th><th scope="col">Value</th></tr>
-      </thead>
-      <tbody>
-        {% for item in env %}
-          <tr>
-            <td class="mono">{{ item.name }}</td>
-            <td>
-              {%- if item.redacted %}{{ m.secret(item.value) }}
-              {%- else %}<span class="mono">{{ item.value }}</span>{% endif -%}
-            </td>
-          </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  {% else %}
-    <p class="muted">No environment variables are recorded for this application.</p>
-  {% endif %}
+  {% include "fragments/app_env.html" %}
 </section>
 
 <section>

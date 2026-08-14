@@ -553,6 +553,8 @@ class TestTraversal:
             ("post", f"/api/apps/{segment}/start"),
             ("post", f"/api/apps/{segment}/stop"),
             ("post", f"/api/apps/{segment}/restart"),
+            ("get", f"/api/apps/{segment}/env"),
+            ("put", f"/api/apps/{segment}/env"),
             ("delete", f"/api/apps/{segment}"),
         ):
             response = getattr(client, method)(path)

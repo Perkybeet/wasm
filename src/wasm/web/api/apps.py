@@ -17,17 +17,23 @@ here for that to be true.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
+from wasm.core.config import REDACTED, redact_secrets
 from wasm.core.store import App, Service, get_store
 from wasm.core.utils import domain_to_app_name
+from wasm.deployers.helpers.env_manager import EnvManager, redact_url_credentials
 from wasm.managers.service_manager import ServiceManager
+from wasm.validators.environment import EnvironmentValidationError, validate_environment
 from wasm.validators.port import find_available_port, validate_port
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import JobAcceptedResponse, WASMErrorRoute, strict_domain
+from wasm.web.auth import get_audit_logger, get_client_ip
 from wasm.web.jobs import JobType, delete_app_job, deploy_app_job, get_job_manager
 
 router = APIRouter(route_class=WASMErrorRoute)
@@ -101,6 +107,48 @@ class AppLogsResponse(BaseModel):
     lines: int
 
 
+class AppEnvResponse(BaseModel):
+    """
+    An application's environment, as recorded in its ``.env`` file.
+
+    Attributes:
+        domain: Domain of the application.
+        variables: Name to value mapping. Unless ``unmasked`` is true, a
+            secret-looking name and a URL credential embedded in a value are
+            both replaced by the fixed :data:`~wasm.core.config.REDACTED`
+            placeholder, exactly as ``wasm env show`` does on the terminal.
+        unmasked: Whether this response carries values in clear.
+    """
+
+    domain: str
+    variables: dict[str, str]
+    unmasked: bool
+
+
+class UpdateAppEnvRequest(BaseModel):
+    """Request to replace an application's ``.env`` file wholesale."""
+
+    variables: dict[str, str] = Field(
+        default_factory=dict,
+        description="The complete name to value mapping the .env file should hold",
+    )
+
+
+class AppEnvUpdateResponse(BaseModel):
+    """
+    Confirmation that an application's environment was rewritten.
+
+    Attributes:
+        domain: Domain of the application.
+        restart_required: Always true. The running process, if any, keeps the
+            environment it started with; the caller must restart it to pick
+            up the change.
+    """
+
+    domain: str
+    restart_required: bool = True
+
+
 def _service_status(store_service: Service | None, manager: ServiceManager) -> dict[str, Any]:
     """
     Read the live systemd state of an application's unit.
@@ -143,6 +191,68 @@ def _to_app_info(app: App, status: dict[str, Any], has_service: bool) -> AppInfo
         app_type=app.app_type,
         path=app.app_path,
     )
+
+
+def _looks_secret(name: str) -> bool:
+    """
+    Check a variable name against the deployer's secret patterns.
+
+    Args:
+        name: Environment variable name.
+
+    Returns:
+        True if the value behind this name must not be shown in clear.
+    """
+    upper = name.upper()
+    return any(pattern in upper for pattern in EnvManager.SECRET_PATTERNS)
+
+
+def _redact_env(values: Mapping[str, str]) -> dict[str, str]:
+    """
+    Replace every secret-looking value with the fixed REDACTED placeholder.
+
+    The same three-classifier approach ``wasm env show`` uses on the
+    terminal: a key-based pass (:func:`~wasm.core.config.redact_secrets`), a
+    substring match against :data:`EnvManager.SECRET_PATTERNS` for the names
+    it misses, and a value-based pass for a password embedded inside a
+    connection string such as ``DATABASE_URL``. The placeholder is fixed
+    width, so a response never reveals the length of a secret or whether one
+    is set at all.
+
+    Args:
+        values: The environment as read from the .env file.
+
+    Returns:
+        A new mapping safe to send to a browser.
+    """
+    by_word: Mapping[str, Any] = redact_secrets(dict(values))
+    redacted: dict[str, str] = {}
+    for key, value in values.items():
+        if by_word.get(key) == REDACTED or _looks_secret(key):
+            redacted[key] = REDACTED
+        else:
+            redacted[key] = redact_url_credentials(str(value))
+    return redacted
+
+
+def _env_app(domain: str) -> App:
+    """
+    Look up the application whose ``.env`` file a request is about.
+
+    Args:
+        domain: Domain from the request.
+
+    Returns:
+        The stored application record.
+
+    Raises:
+        HTTPException: 404 when nothing is deployed at the domain.
+    """
+    validated = strict_domain(domain)
+    app = get_store().get_app(validated)
+    if app is None:
+        raise HTTPException(status_code=404, detail=f"Application not found: {validated}")
+    return app
 
 
 @router.get("", response_model=AppListResponse)
@@ -357,6 +467,116 @@ def get_app_logs(
     logs = ServiceManager(verbose=False).logs(app_name, lines=lines) or "No logs available"
 
     return AppLogsResponse(domain=validated, logs=logs, lines=lines)
+
+
+@router.get("/{domain}/env", response_model=AppEnvResponse)
+def get_app_env(
+    domain: str,
+    request: Request,
+    session: Annotated[dict, Depends(get_current_session)],
+    unmask: Annotated[bool, Query()] = False,
+) -> AppEnvResponse:
+    """
+    Read an application's environment from its ``.env`` file.
+
+    This reads the file :mod:`wasm.deployers.helpers.env_manager` writes, the
+    same one ``wasm env show`` reads on the terminal - not the snapshot the
+    store recorded at deploy time, which can drift the moment anyone edits
+    the file by hand.
+
+    Args:
+        domain: Domain of the application.
+        request: The incoming request, for the audit record.
+        session: The authenticated session.
+        unmask: When true, values are returned in clear instead of redacted.
+            Every such read is audited, naming the caller but never a value.
+
+    Returns:
+        The stored variables, redacted unless unmask was asked for.
+
+    Raises:
+        HTTPException: 404 when the application is unknown.
+    """
+    app = _env_app(domain)
+    values = (
+        EnvManager(verbose=False).get_current_values(Path(app.app_path)) if app.app_path else {}
+    )
+
+    if unmask:
+        audit = get_audit_logger()
+        if audit:
+            audit.record(
+                action="apps.env.reveal",
+                result="success",
+                client_ip=get_client_ip(request),
+                actor=str(session.get("sid")),
+                resource=f"/api/apps/{app.domain}/env",
+                detail=f"revealed {len(values)} variable(s) in clear",
+            )
+        return AppEnvResponse(domain=app.domain, variables=dict(values), unmasked=True)
+
+    return AppEnvResponse(domain=app.domain, variables=_redact_env(values), unmasked=False)
+
+
+@router.put("/{domain}/env", response_model=AppEnvUpdateResponse)
+def update_app_env(
+    domain: str,
+    body: UpdateAppEnvRequest,
+    request: Request,
+    session: Annotated[dict, Depends(get_current_session)],
+) -> AppEnvUpdateResponse:
+    """
+    Replace an application's ``.env`` file wholesale.
+
+    Every name and value is validated against what can safely reach a
+    systemd unit (:mod:`wasm.validators.environment`) before anything is
+    written, so a rejected variable leaves the file on disk untouched. The
+    write goes through :class:`~wasm.deployers.helpers.env_manager.EnvManager`,
+    the same seam ``wasm env configure`` uses, so the file lands 0600 either
+    way.
+
+    The application is not restarted: a process already running keeps the
+    environment it started with until it is, so the caller is told a restart
+    is required rather than one being queued silently underneath it.
+
+    Args:
+        domain: Domain of the application.
+        body: The complete name to value mapping to write.
+        request: The incoming request, for the audit record.
+        session: The authenticated session.
+
+    Returns:
+        Confirmation that a restart is required to pick up the change.
+
+    Raises:
+        HTTPException: 404 when the application is unknown, 422 when a name
+            or a value is not safe to write into a systemd unit.
+    """
+    app = _env_app(domain)
+
+    try:
+        clean = validate_environment(body.variables)
+    except EnvironmentValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    app_path = Path(app.app_path)
+    manager = EnvManager(verbose=False)
+    before = manager.get_current_values(app_path)
+    manager.write_env_files(app_path, clean)
+
+    changed = sorted(key for key in set(before) | set(clean) if before.get(key) != clean.get(key))
+    audit = get_audit_logger()
+    if audit:
+        audit.record(
+            action="apps.env.update",
+            result="success",
+            client_ip=get_client_ip(request),
+            actor=str(session.get("sid")),
+            resource=f"/api/apps/{app.domain}/env",
+            detail=f"changed keys: {', '.join(changed)}" if changed else "no keys changed",
+        )
+
+    return AppEnvUpdateResponse(domain=app.domain, restart_required=True)
 
 
 @router.delete("/{domain}", response_model=JobAcceptedResponse, status_code=202)

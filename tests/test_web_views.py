@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import re
+import stat
 from collections.abc import Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -506,6 +507,12 @@ def test_every_address_on_every_populated_screen_resolves(
     matches no route at all, and every test passed because no test had ever
     created a database.
     """
+    # The machine strip is the one screen that legitimately hands the browser
+    # no address: it stopped polling with hx-get and is now swapped in whole
+    # over the /events stream (sse-swap="machine"), which the client contract
+    # tests cover. Its markup carries state, not links.
+    addressless = {"/fragments/machine"}
+
     targets: set[tuple[str, str]] = set()
     per_screen: dict[str, int] = {}
     for path in (*SCREENS, "/apps/broken.example.com"):
@@ -513,7 +520,9 @@ def test_every_address_on_every_populated_screen_resolves(
         per_screen[path] = len(found)
         targets |= found
 
-    empty = sorted(path for path, count in per_screen.items() if count == 0)
+    empty = sorted(
+        path for path, count in per_screen.items() if count == 0 and path not in addressless
+    )
     assert not empty, f"these screens emitted no addresses, so they were not exercised: {empty}"
 
     # A net that catches nothing passes silently. These are the addresses that
@@ -680,17 +689,60 @@ def test_settings_never_shows_a_stored_secret(client: TestClient, config_file: P
     assert "Redacted" in page
 
 
+def read_audit(sandbox: Path) -> list[dict[str, Any]]:
+    """
+    Read the audit log written during a test.
+
+    Args:
+        sandbox: Isolated filesystem root, where the panel's audit log lives.
+
+    Returns:
+        One dict per audit line, oldest first. Empty when nothing was audited.
+    """
+    path = sandbox / "state" / "web-audit.log"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def deployed_env(
+    store: WASMStore, tmp_path: Path, domain: str = "example.com", env_text: str = ""
+) -> Path:
+    """
+    Deploy an application whose ``.env`` file lives inside the sandbox.
+
+    The environment editor reads and writes the real file through
+    :class:`~wasm.deployers.helpers.env_manager.EnvManager`, so exercising it
+    needs an application directory that actually exists on disk - unlike
+    :func:`deploy`'s default ``app_path``, which is never created.
+
+    Args:
+        store: The store to write the application record to.
+        tmp_path: Per-test temporary directory.
+        domain: The application's domain.
+        env_text: Content to write to its ``.env`` file, when not empty.
+
+    Returns:
+        The application's directory.
+    """
+    app_dir = tmp_path / "apps" / domain
+    app_dir.mkdir(parents=True, exist_ok=True)
+    if env_text:
+        (app_dir / ".env").write_text(env_text, encoding="utf-8")
+    deploy(store, domain=domain, app_path=str(app_dir))
+    return app_dir
+
+
 def test_an_application_environment_hides_its_credentials(
-    client: TestClient, store: WASMStore
+    client: TestClient, store: WASMStore, tmp_path: Path
 ) -> None:
     """Both the secret-looking key and the password inside a URL are masked."""
-    deploy(
+    deployed_env(
         store,
-        env_vars={
-            "OPENAI_API_KEY": ENV_SECRET,
-            "DATABASE_URL": ENV_URL_SECRET,
-            "NODE_ENV": "production",
-        },
+        tmp_path,
+        env_text=(
+            f"OPENAI_API_KEY={ENV_SECRET}\nDATABASE_URL={ENV_URL_SECRET}\nNODE_ENV=production\n"
+        ),
     )
 
     page = body_of(client, "/apps/example.com")
@@ -700,6 +752,195 @@ def test_an_application_environment_hides_its_credentials(
     assert "DATABASE_URL" in page
     # Non-secrets stay readable, or the screen is useless.
     assert "production" in page
+
+
+# ------------------------------------------------------- app environment editor
+
+
+def test_get_app_env_redacts_secret_looking_keys_by_default(
+    client: TestClient, store: WASMStore, tmp_path: Path
+) -> None:
+    """SECRET/TOKEN/PASSWORD/KEY-shaped names come back as the fixed placeholder."""
+    deployed_env(
+        store,
+        tmp_path,
+        env_text=(
+            f"API_KEY={ENV_SECRET}\n"
+            "AUTH_TOKEN=t0ken-value\n"
+            "ADMIN_PASSWORD=correcthorse\n"
+            "APP_SECRET=hunter2\n"
+            "PORT=3000\n"
+        ),
+    )
+
+    response = client.get("/api/apps/example.com/env")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["unmasked"] is False
+    variables = body["variables"]
+    assert variables["API_KEY"] == "***"
+    assert variables["AUTH_TOKEN"] == "***"
+    assert variables["ADMIN_PASSWORD"] == "***"
+    assert variables["APP_SECRET"] == "***"
+    # A harmless value stays readable, or the endpoint is useless.
+    assert variables["PORT"] == "3000"
+
+
+def test_get_app_env_unmask_returns_clear_values_and_is_audited(
+    client: TestClient, store: WASMStore, tmp_path: Path, sandbox: Path
+) -> None:
+    """``?unmask=true`` is the explicit request, and it leaves a trail."""
+    deployed_env(store, tmp_path, env_text=f"API_KEY={ENV_SECRET}\n")
+
+    response = client.get("/api/apps/example.com/env", params={"unmask": "true"})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["unmasked"] is True
+    assert body["variables"]["API_KEY"] == ENV_SECRET
+
+    reveals = [e for e in read_audit(sandbox) if e["action"] == "apps.env.reveal"]
+    assert reveals, "reading the environment in clear must be audited"
+    assert reveals[0]["result"] == "success"
+    assert ENV_SECRET not in (sandbox / "state" / "web-audit.log").read_text()
+
+
+def test_put_app_env_rewrites_the_file_and_reports_restart_required(
+    client: TestClient, store: WASMStore, tmp_path: Path
+) -> None:
+    """A full roundtrip: the file on disk becomes exactly what was sent."""
+    app_dir = deployed_env(store, tmp_path, env_text="API_KEY=old\n")
+
+    response = client.put(
+        "/api/apps/example.com/env",
+        json={"variables": {"API_KEY": "new", "PORT": "3000"}},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"domain": "example.com", "restart_required": True}
+    assert (app_dir / ".env").read_text(encoding="utf-8") == "API_KEY=new\nPORT=3000\n"
+    assert stat.S_IMODE((app_dir / ".env").stat().st_mode) == 0o600
+
+
+def test_put_app_env_rejects_an_invalid_name_with_422(
+    client: TestClient, store: WASMStore, tmp_path: Path
+) -> None:
+    """A name that could inject a systemd directive is refused before any write."""
+    app_dir = deployed_env(store, tmp_path, env_text="API_KEY=old\n")
+
+    response = client.put("/api/apps/example.com/env", json={"variables": {"BAD NAME": "x"}})
+
+    assert response.status_code == 422, response.text
+    assert "Invalid environment variable name" in response.text
+    assert (app_dir / ".env").read_text(encoding="utf-8") == "API_KEY=old\n"
+
+
+def test_put_app_env_never_writes_a_value_to_the_audit_log(
+    client: TestClient, store: WASMStore, tmp_path: Path, sandbox: Path
+) -> None:
+    """The audit line names the changed keys; the values never appear anywhere near it."""
+    deployed_env(store, tmp_path, env_text="API_KEY=old\n")
+
+    response = client.put(
+        "/api/apps/example.com/env",
+        json={"variables": {"API_KEY": ENV_SECRET, "NEW_ONE": "another-secret-value"}},
+    )
+    assert response.status_code == 200, response.text
+
+    raw_audit = (sandbox / "state" / "web-audit.log").read_text()
+    assert ENV_SECRET not in raw_audit
+    assert "another-secret-value" not in raw_audit
+
+    updates = [e for e in read_audit(sandbox) if e["action"] == "apps.env.update"]
+    assert updates, "saving the environment must be audited"
+    assert "API_KEY" in updates[0]["detail"]
+    assert "NEW_ONE" in updates[0]["detail"]
+
+
+def test_the_environment_section_offers_reveal_and_edit(
+    client: TestClient, store: WASMStore, tmp_path: Path
+) -> None:
+    """The masked table on the page links to the reveal and edit routes."""
+    deployed_env(store, tmp_path, env_text=f"API_KEY={ENV_SECRET}\nPORT=3000\n")
+
+    page = body_of(client, "/apps/example.com")
+
+    assert ENV_SECRET not in page
+    assert "PORT" in page
+    assert 'hx-get="/apps/example.com/env/reveal"' in page
+    assert 'hx-get="/apps/example.com/env/edit"' in page
+
+
+def test_reveal_shows_the_values_in_clear_and_is_audited(
+    client: TestClient, store: WASMStore, tmp_path: Path, sandbox: Path
+) -> None:
+    """The htmx Reveal control is the same audited read as ?unmask=true."""
+    deployed_env(store, tmp_path, env_text=f"API_KEY={ENV_SECRET}\n")
+
+    response = client.get("/apps/example.com/env/reveal")
+
+    assert response.status_code == 200, response.text
+    assert ENV_SECRET in response.text
+    assert 'hx-get="/apps/example.com/env/view"' in response.text, "no way back to masked"
+
+    reveals = [e for e in read_audit(sandbox) if e["action"] == "apps.env.reveal"]
+    assert reveals, "revealing the environment from the page must be audited"
+
+
+def test_edit_prefills_the_textarea_with_clear_values(
+    client: TestClient, store: WASMStore, tmp_path: Path
+) -> None:
+    """The operator has to see what they are editing."""
+    deployed_env(store, tmp_path, env_text=f"API_KEY={ENV_SECRET}\nPORT=3000\n")
+
+    response = client.get("/apps/example.com/env/edit")
+
+    assert response.status_code == 200, response.text
+    assert "<textarea" in response.text
+    assert f"API_KEY={ENV_SECRET}" in response.text
+    assert "PORT=3000" in response.text
+
+
+def test_saving_from_the_page_rewrites_the_file_and_shows_restart_required(
+    client: TestClient, store: WASMStore, tmp_path: Path
+) -> None:
+    """The htmx Save control is the same write PUT /api/apps/.../env does."""
+    app_dir = deployed_env(store, tmp_path, env_text="API_KEY=old\n")
+
+    response = client.post("/apps/example.com/env/save", data={"env": "API_KEY=new\nPORT=3000"})
+
+    assert response.status_code == 200, response.text
+    assert "restart required" in response.text.lower()
+    assert 'hx-post="/api/apps/example.com/restart"' in response.text
+    assert (app_dir / ".env").read_text(encoding="utf-8") == "API_KEY=new\nPORT=3000\n"
+
+
+def test_saving_an_invalid_line_is_refused_inline_and_keeps_the_edit_open(
+    client: TestClient, store: WASMStore, tmp_path: Path
+) -> None:
+    """A rejected save re-opens the editor with what was typed, not the old file."""
+    app_dir = deployed_env(store, tmp_path, env_text="API_KEY=old\n")
+
+    response = client.post("/apps/example.com/env/save", data={"env": "BAD NAME=x"})
+
+    assert response.status_code == 200, response.text
+    assert "Invalid environment variable name" in response.text
+    assert "<textarea" in response.text, "the refusal must leave the editor open"
+    assert "BAD NAME=x" in response.text
+    assert (app_dir / ".env").read_text(encoding="utf-8") == "API_KEY=old\n"
+
+
+def test_clearing_the_textarea_removes_every_variable(
+    client: TestClient, store: WASMStore, tmp_path: Path
+) -> None:
+    """An empty save is a legitimate way to clear the file, not a no-op."""
+    app_dir = deployed_env(store, tmp_path, env_text="API_KEY=old\n")
+
+    response = client.post("/apps/example.com/env/save", data={"env": ""})
+
+    assert response.status_code == 200, response.text
+    assert (app_dir / ".env").read_text(encoding="utf-8") == "\n"
 
 
 # ------------------------------------------------------------------ behaviour
