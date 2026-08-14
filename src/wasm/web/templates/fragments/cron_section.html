@@ -1,0 +1,143 @@
+{#
+  Cron jobs, as one swappable section.
+
+  Each job is a row whose rail carries the last run's verdict: green for exit
+  0, red for anything else, neutral while it has never run. The schedule is in
+  words with the exact OnCalendar expression beside it in mono, because
+  "daily" is what a person scans for and the expression is what they paste
+  into a terminal to check. The command is the unit's own ExecStart value,
+  verbatim in mono.
+
+  Deleting demands the job's exact name typed back, compared server-side. A
+  refused action renders at 200 with the refusal inline: htmx does not swap an
+  error status, so answering 4xx would freeze the screen and report nothing.
+#}
+{% import "_macros.html" as m %}
+<div id="cron-jobs">
+
+  {% if problem %}
+    {{ m.problem(problem.fix, problem.output) }}
+  {% endif %}
+
+  {% if notice %}
+    <p class="stack__lead">{{ notice }}</p>
+  {% endif %}
+
+  {% if jobs %}
+    <div class="rows">
+      {% for job in jobs %}
+        <div class="row row--{{ job.exit_state }}" id="cron-row-{{ job.dom_id }}">
+          <div class="row__main">
+            <span class="row__name">{{ job.name }}</span>
+            {{ m.badge(job.exit_state, job.exit_text) }}
+            {% if not job.enabled %}{{ m.badge("idle", "disabled") }}{% endif %}
+            <span class="row__meta">
+              <span>{{ job.schedule }} <span class="mono">{{ job.on_calendar }}</span></span>
+              <span>next {{ job.next_run }}</span>
+              <span>last {{ job.last_run }}</span>
+              {% if job.app_domain %}<span>app {{ job.app_domain }}</span>{% endif %}
+              <span>as {{ job.user }}</span>
+            </span>
+            <span class="row__meta faint mono">{{ job.command }}</span>
+          </div>
+          <div class="row__actions">
+            <button type="button" class="btn btn--sm"
+                    hx-post="{{ job.run_endpoint }}"
+                    hx-target="#cron-jobs" hx-swap="outerHTML">Run now</button>
+            <button type="button" class="btn btn--sm"
+                    hx-post="{{ job.toggle_endpoint }}"
+                    hx-target="#cron-jobs" hx-swap="outerHTML">{{ job.toggle_label }}</button>
+            <button type="button" class="btn btn--sm btn--quiet"
+                    hx-get="{{ job.runs_endpoint }}"
+                    hx-target="#cron-runs-{{ job.dom_id }}"
+                    hx-swap="outerHTML">History</button>
+            <form hx-post="{{ job.delete_endpoint }}"
+                  hx-target="#cron-jobs" hx-swap="outerHTML" autocomplete="off">
+              <input class="mono" type="text" name="confirm"
+                     placeholder="type {{ job.name }}"
+                     aria-label="Type {{ job.name }} to confirm deleting it">
+              <button class="btn btn--sm btn--danger" type="submit">Delete</button>
+            </form>
+          </div>
+        </div>
+        <div id="cron-runs-{{ job.dom_id }}"></div>
+      {% endfor %}
+    </div>
+  {% else %}
+    <p class="faint">
+      No cron jobs. A job here is a systemd timer running one command on a
+      schedule, with its output in the journal and its exit code recorded, so
+      "did last night's run work" has an answer.
+    </p>
+  {% endif %}
+
+  <form hx-post="/cron/jobs" hx-target="#cron-jobs"
+        hx-swap="outerHTML" autocomplete="off">
+    <div class="field">
+      <label class="label" for="cron-name">Name</label>
+      <input type="text" id="cron-name" name="name" value="{{ form.name }}"
+             placeholder="cleanup-caches" required>
+    </div>
+    <div class="field">
+      <label class="label" for="cron-command">Command</label>
+      <input class="mono" type="text" id="cron-command" name="command"
+             value="{{ form.command }}" placeholder="/usr/bin/php artisan schedule:run"
+             aria-describedby="cron-command-hint" required>
+      <span class="field__hint" id="cron-command-hint">
+        Runs without a shell: the line is split into arguments and executed
+        directly, so pipes, &amp;&amp; and globs are plain text here. For shell
+        features, write /bin/sh -c '…' as the command.
+      </span>
+    </div>
+    <div class="field">
+      <label class="label" for="cron-preset">Schedule</label>
+      <select id="cron-preset" name="schedule">
+        {% for alias, calendar in presets %}
+          <option value="{{ alias }}"
+                  {% if alias == form.schedule %}selected{% endif %}>{{ alias }} ({{ calendar }})</option>
+        {% endfor %}
+        <option value="custom" {% if form.schedule == "custom" %}selected{% endif %}>custom</option>
+      </select>
+    </div>
+    <div class="field">
+      <label class="label" for="cron-calendar">Custom OnCalendar</label>
+      <input class="mono" type="text" id="cron-calendar" name="on_calendar"
+             value="{{ form.on_calendar }}" placeholder="Mon *-*-* 02:00:00"
+             aria-describedby="cron-calendar-hint">
+      <span class="field__hint" id="cron-calendar-hint">
+        Used only when the schedule is custom. A systemd calendar expression,
+        as systemd-analyze calendar accepts it.
+      </span>
+    </div>
+    <div class="field">
+      <label class="label" for="cron-app">Application</label>
+      <select id="cron-app" name="app_domain">
+        <option value="">none</option>
+        {% for domain in apps %}
+          <option value="{{ domain }}"
+                  {% if domain == form.app_domain %}selected{% endif %}>{{ domain }}</option>
+        {% endfor %}
+      </select>
+      <span class="field__hint">
+        Optional. The job runs in the application's directory unless a working
+        directory is given below.
+      </span>
+    </div>
+    <div class="field">
+      <label class="label" for="cron-workdir">Working directory</label>
+      <input class="mono" type="text" id="cron-workdir" name="working_directory"
+             value="{{ form.working_directory }}" placeholder="/var/www/apps/example.com">
+    </div>
+    <div class="field">
+      <label class="label" for="cron-user">Run as</label>
+      <input class="mono" type="text" id="cron-user" name="user"
+             value="{{ form.user }}" placeholder="www-data"
+             aria-describedby="cron-user-hint">
+      <span class="field__hint" id="cron-user-hint">
+        Empty means the configured service user.
+      </span>
+    </div>
+    <button class="btn btn--primary" type="submit">Create cron job</button>
+  </form>
+
+</div>

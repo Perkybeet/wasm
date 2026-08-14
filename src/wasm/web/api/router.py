@@ -19,6 +19,7 @@ from wasm.web.api.backup_schedules import router as backup_schedules_router
 from wasm.web.api.backups import router as backups_router
 from wasm.web.api.certs import router as certs_router
 from wasm.web.api.config import router as config_router
+from wasm.web.api.cron import router as cron_router
 from wasm.web.api.databases import router as databases_router
 from wasm.web.api.deps import install_error_handlers
 from wasm.web.api.jobs import router as jobs_router
@@ -48,3 +49,4 @@ router.include_router(
     backup_schedules_router, prefix="/backup-schedules", tags=["Backup Schedules"]
 )
 router.include_router(databases_router, prefix="/databases", tags=["Databases"])
+router.include_router(cron_router, prefix="/cron", tags=["Cron Jobs"])

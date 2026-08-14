@@ -1,0 +1,27 @@
+{#
+  Cron jobs.
+
+  A cron job here is a systemd timer/service pair WASM owns, not a crontab
+  line: it gets journald logging, Persistent catch-up after downtime, and a
+  recorded exit code per run. The section loads over htmx so the first paint
+  does not wait on two systemctl calls per job.
+#}
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+
+{% block title %}Cron jobs{% endblock %}
+
+{% block content %}
+
+{{ m.page_head("Cron jobs",
+               "Scheduled commands, run by systemd timers with a recorded result") }}
+
+<section class="stack--tight">
+  <div id="cron-jobs"
+       hx-get="/cron/jobs"
+       hx-trigger="load" hx-swap="outerHTML">
+    <p class="muted">Reading timers…</p>
+  </div>
+</section>
+
+{% endblock %}

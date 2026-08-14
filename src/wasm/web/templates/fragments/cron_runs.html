@@ -1,0 +1,41 @@
+{#
+  One cron job's execution history, swapped in under its row.
+
+  Each run is the journal's own record: when it started, the exit code
+  systemd reported, and the job's own output verbatim in mono. Nothing is
+  paraphrased - the end of a cron job's output is where it says what went
+  wrong, and that text is what the operator will search for.
+#}
+{% import "_macros.html" as m %}
+<div id="cron-runs-{{ dom_id }}" class="stack--tight">
+
+  {% if problem %}
+    {{ m.problem(problem.fix, problem.output) }}
+  {% elif runs %}
+    {% for run in runs %}
+      <div class="row row--{{ 'active' if run.success else ('failed' if run.success == false else 'idle') }}">
+        <div class="row__main">
+          <span class="row__name mono">{{ run.started or "time unknown" }}</span>
+          {% if run.exit_code is none %}
+            {{ m.badge("idle", "no result yet") }}
+          {% elif run.exit_code == 0 %}
+            {{ m.badge("active", "exit 0") }}
+          {% else %}
+            {{ m.badge("failed", "exit " ~ run.exit_code) }}
+          {% endif %}
+          {% if run.output %}
+            <pre class="problem__output">{{ run.output }}</pre>
+          {% else %}
+            <span class="row__meta faint">No output recorded for this run.</span>
+          {% endif %}
+        </div>
+      </div>
+    {% endfor %}
+  {% else %}
+    <p class="faint">
+      No recorded runs for {{ name }} yet. The history is read from the
+      journal, so it fills in as the timer fires or after Run now.
+    </p>
+  {% endif %}
+
+</div>
