@@ -1268,3 +1268,12 @@ from wasm.web.views import deployments as _deployment_pages  # noqa: E402
 
 router.include_router(_database_pages.router)
 router.include_router(_deployment_pages.router)
+from wasm.web.views import backup_schedules as _backup_schedule_pages  # noqa: E402
+from wasm.web.views import deploy_form as _deploy_form_pages  # noqa: E402
+from wasm.web.views import infrastructure as _infrastructure_pages  # noqa: E402
+from wasm.web.views import settings_editor as _settings_editor_pages  # noqa: E402
+
+router.include_router(_infrastructure_pages.router)
+router.include_router(_settings_editor_pages.router)
+router.include_router(_backup_schedule_pages.router)
+router.include_router(_deploy_form_pages.router)
