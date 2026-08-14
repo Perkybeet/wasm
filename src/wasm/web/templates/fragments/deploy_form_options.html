@@ -1,0 +1,70 @@
+{#
+  The type-specific advanced options of the deployment form.
+
+  Swapped whole when the type select changes, so the form only asks the
+  questions the chosen deployer will actually read - and so a field for a type
+  the operator moved away from leaves the document instead of submitting a
+  value nothing would look at. Each field maps one-to-one onto an option the
+  deployer's configure() already accepts; nothing here invents one.
+#}
+<div id="type-options">
+  {% if submitted.app_type == 'monorepo' %}
+    <div class="field">
+      <label class="label" for="subdomains">Workspace subdomains</label>
+      <textarea class="mono" id="subdomains" name="subdomains" rows="3" spellcheck="false"
+                placeholder="web:app&#10;api:api" aria-describedby="subdomains-hint"
+                hx-post="/apps/new/validate/subdomains" hx-trigger="change"
+                hx-target="#check-subdomains" hx-swap="outerHTML"
+                hx-include="closest form">{{ submitted.subdomains or '' }}</textarea>
+      <span class="field__hint" id="subdomains-hint">
+        One workspace:subdomain per line. Left out, each workspace is served on
+        a subdomain named after it.
+      </span>
+      <div id="check-subdomains"></div>
+    </div>
+
+    <div class="form__row">
+      <div class="field">
+        <label class="label" for="workspaces">Workspaces</label>
+        <input class="mono" type="text" id="workspaces" name="workspaces"
+               value="{{ submitted.workspaces or '' }}" placeholder="web, api"
+               aria-describedby="workspaces-hint">
+        <span class="field__hint" id="workspaces-hint">
+          Only deploy these, comma separated. Empty deploys every deployable
+          workspace.
+        </span>
+      </div>
+
+      <div class="field">
+        <label class="label" for="no_database">Database</label>
+        <label class="choice">
+          <input type="checkbox" id="no_database" name="no_database" value="yes"
+                 {% if submitted.no_database %}checked{% endif %}>
+          Skip database provisioning
+        </label>
+      </div>
+    </div>
+  {% elif submitted.app_type == 'docker-compose' %}
+    <div class="form__row">
+      <div class="field">
+        <label class="label" for="compose_file">Compose file</label>
+        <input class="mono" type="text" id="compose_file" name="compose_file"
+               value="{{ submitted.compose_file or '' }}" placeholder="docker-compose.yml"
+               aria-describedby="compose-file-hint">
+        <span class="field__hint" id="compose-file-hint">
+          Relative to the project root. Left empty, the deployer discovers it.
+        </span>
+      </div>
+
+      <div class="field">
+        <label class="label" for="compose_profiles">Compose profiles</label>
+        <input class="mono" type="text" id="compose_profiles" name="compose_profiles"
+               value="{{ submitted.compose_profiles or '' }}" placeholder="web, worker"
+               aria-describedby="compose-profiles-hint">
+        <span class="field__hint" id="compose-profiles-hint">
+          Profiles to activate, comma separated.
+        </span>
+      </div>
+    </div>
+  {% endif %}
+</div>

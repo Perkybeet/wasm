@@ -580,21 +580,16 @@ def _resolves(app: FastAPI, method: str, path: str) -> bool:
     return any(route.matches(scope)[0] is Match.FULL for route in app.routes)
 
 
-#: Handlers that must be async, with the reason. Reading a request body is
-#: awaitable, so a route that parses a form cannot be synchronous. Each entry
-#: here is required to hand its blocking work to a worker thread, which the
-#: test below enforces: being on this list buys the ``async`` keyword, not the
-#: right to run a deployment on the event loop.
-ASYNC_PAGE_HANDLERS = {"deploy_submit"}
-
-
 def test_no_page_handler_is_a_coroutine() -> None:
     """
     A blocking handler declared async freezes the event loop.
 
     These handlers read the store and call managers. Run on the loop, one
     deploy takes every other request, every WebSocket and the heartbeat with
-    it.
+    it. No exemptions remain: the one handler that used to buy the ``async``
+    keyword by awaiting its body, ``deploy_submit``, reads it as a
+    ``Body(bytes)`` parameter now, which FastAPI collects off the loop before
+    the synchronous handler runs in the threadpool.
     """
     import inspect
 
@@ -602,45 +597,7 @@ def test_no_page_handler_is_a_coroutine() -> None:
     assert len(handlers) >= 12, "route discovery is broken, this net would pass blindly"
 
     coroutines = {handler.__name__ for handler in handlers if inspect.iscoroutinefunction(handler)}
-    unexpected = coroutines - ASYNC_PAGE_HANDLERS
-    assert not unexpected, f"page handlers must be synchronous: {sorted(unexpected)}"
-
-    stale = ASYNC_PAGE_HANDLERS - coroutines
-    assert not stale, f"these are no longer async; remove them from the list: {sorted(stale)}"
-
-
-@pytest.mark.parametrize("name", sorted(ASYNC_PAGE_HANDLERS))
-def test_an_async_page_handler_does_its_blocking_work_off_the_loop(name: str) -> None:
-    """
-    The exception is the keyword, not the rule behind it.
-
-    A handler that must await the request body still may not call into the
-    store or a manager directly: that is the freeze this whole convention
-    exists to prevent, and it would be invisible until a deployment made every
-    other screen hang.
-
-    Args:
-        name: Name of the async handler to inspect.
-    """
-    import ast
-    import importlib
-    import inspect
-    import textwrap
-
-    # The package exports the APIRouter under the name "router", so the module
-    # itself has to be imported by path.
-    module = importlib.import_module("wasm.web.views.router")
-
-    source = textwrap.dedent(inspect.getsource(getattr(module, name)))
-    tree = ast.parse(source)
-
-    offloaded = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "run_in_threadpool"
-    ]
-
-    assert offloaded, f"{name} is async and never uses run_in_threadpool"
+    assert not coroutines, f"page handlers must be synchronous: {sorted(coroutines)}"
 
 
 # --------------------------------------------------------------------- escaping

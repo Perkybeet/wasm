@@ -616,10 +616,20 @@ def deploy_app_job(
     env_vars: dict[str, str] | None = None,
     webserver: str = "nginx",
     ssl: bool = True,
+    subdomain_overrides: dict[str, str] | None = None,
+    workspace_filter: list[str] | None = None,
+    skip_database: bool = False,
+    compose_file: str | None = None,
+    compose_profiles: list[str] | None = None,
     job_context: JobContext | None = None,
 ) -> dict[str, Any]:
     """
     Deploy an application through the deployer registry.
+
+    The deployer-specific options are handed to ``configure`` for every type:
+    the deployer interface's contract is that a deployer ignores the options
+    that do not concern it, so the monorepo knobs reach the monorepo deployer
+    and cost a Next.js one nothing.
 
     Args:
         domain: Target domain.
@@ -630,6 +640,11 @@ def deploy_app_job(
         env_vars: Environment variables for the service.
         webserver: Web server to configure.
         ssl: Whether to obtain a certificate.
+        subdomain_overrides: Monorepo: workspace name to subdomain overrides.
+        workspace_filter: Monorepo: deploy only these workspaces.
+        skip_database: Monorepo: skip database provisioning.
+        compose_file: Docker Compose: compose file, relative to the project.
+        compose_profiles: Docker Compose: profiles to activate.
         job_context: Injected by the job manager.
 
     Returns:
@@ -654,6 +669,11 @@ def deploy_app_job(
         ssl=ssl,
         branch=branch,
         env_vars=env_vars or {},
+        subdomain_overrides=subdomain_overrides or {},
+        workspace_filter=workspace_filter,
+        skip_database=skip_database,
+        compose_file=compose_file,
+        compose_profiles=compose_profiles,
         trigger="panel",
     )
 

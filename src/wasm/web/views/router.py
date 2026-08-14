@@ -28,10 +28,9 @@ from typing import Any
 from urllib.parse import parse_qs
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, Response
 from fastapi.routing import APIRoute
 from pydantic import ValidationError
-from starlette.concurrency import run_in_threadpool
 
 from wasm.core.exceptions import WASMError
 from wasm.web.auth import require_auth
@@ -218,143 +217,18 @@ def apps(request: Request) -> HTMLResponse:
     return page(request, "pages/resources.html", _resource_page("apps"))
 
 
-#: Web servers a site can be fronted by. The same two the CLI offers.
+#: Web servers a site can be fronted by. The same two the CLI offers. Declared
+#: here rather than in a sub-view module because two of them read it.
 WEBSERVERS = ("nginx", "apache")
 
+# The deployment form and the webhook section live in views/deploy_form.py.
+# Included here rather than at the bottom with the other sub-view modules
+# because routes match in declaration order: its /apps/new routes must be
+# registered before /apps/{domain} below, or the parametrised route would
+# answer for them and the panel would look for an application called "new".
+from wasm.web.views import deploy_form as _deploy_form_pages  # noqa: E402
 
-def _deploy_form(request: Request, submitted: dict[str, Any], problem: Any = None) -> HTMLResponse:
-    """
-    Render the deployment form.
-
-    Args:
-        request: The incoming request.
-        submitted: What the operator typed, so a refusal does not empty the
-            form they have to correct.
-        problem: A ``fix``/``output`` mapping when a submission was refused.
-
-    Returns:
-        The deployment page.
-    """
-    from wasm.deployers.registry import available_types
-
-    return page(
-        request,
-        "pages/deploy.html",
-        {
-            "app_types": available_types(),
-            "webservers": WEBSERVERS,
-            "submitted": submitted,
-            "problem": problem,
-        },
-        status_code=400 if problem else 200,
-    )
-
-
-# Declared before /apps/{domain}, or the parametrised route would answer for
-# it and the panel would look for an application called "new".
-@router.get("/apps/new", response_class=HTMLResponse)
-def deploy_form(request: Request) -> HTMLResponse:
-    """
-    Render the form that deploys an application.
-
-    Args:
-        request: The incoming request.
-
-    Returns:
-        The deployment page.
-    """
-    return _deploy_form(request, {"ssl": True, "app_type": "auto", "webserver": "nginx"})
-
-
-@router.post("/apps/new")
-async def deploy_submit(request: Request) -> Response:
-    """
-    Queue a deployment from the form.
-
-    The work is done by :func:`wasm.web.api.apps.create_app`, which is the same
-    function the JSON API calls. This route only translates a form submission
-    into the request model and a refusal into a screen: a second implementation
-    of "deploy an application" is exactly what the panel must never grow.
-
-    Async, unlike every other handler here, because reading a request body
-    requires awaiting it - the same reason ``login_submit`` is. Everything that
-    blocks is handed to a worker thread rather than run on the event loop,
-    which is what the rule about synchronous handlers actually protects: one
-    deployment must not freeze every other request, every WebSocket and the
-    heartbeat that says the panel is alive.
-
-    The body is parsed with ``parse_qs`` rather than ``request.form()`` so the
-    panel does not acquire python-multipart, which would have to be declared in
-    four packaging files and exist on every target distribution.
-
-    Args:
-        request: The incoming request.
-
-    Returns:
-        A redirect to the activity screen, or the form again with the reason it
-        was refused.
-    """
-    from wasm.web.api.apps import CreateAppRequest, create_app
-
-    fields = parse_qs((await request.body()).decode("utf-8", errors="replace"))
-
-    def field(name: str, default: str = "") -> str:
-        """
-        Args:
-            name: Field name.
-            default: Value to use when the field was not submitted.
-
-        Returns:
-            The submitted value, stripped.
-        """
-        return fields.get(name, [default])[0].strip()
-
-    submitted: dict[str, Any] = {
-        "domain": field("domain"),
-        "source": field("source"),
-        "app_type": field("app_type", "auto"),
-        "branch": field("branch"),
-        "port": field("port"),
-        "webserver": field("webserver", "nginx"),
-        "ssl": "ssl" in fields,
-    }
-
-    try:
-        body = CreateAppRequest(
-            domain=submitted["domain"],
-            source=submitted["source"],
-            app_type=submitted["app_type"],
-            port=int(submitted["port"]) if submitted["port"] else None,
-            webserver=submitted["webserver"],
-            branch=submitted["branch"] or None,
-            ssl=submitted["ssl"],
-        )
-    except (ValueError, ValidationError) as exc:
-        return await run_in_threadpool(
-            _deploy_form, request, submitted, {"fix": "Check the form.", "output": str(exc)}
-        )
-
-    session = getattr(request.state, "session", {})
-
-    try:
-        await run_in_threadpool(create_app, body, session)
-    except HTTPException as exc:
-        # 409 for a domain already deployed, 503 when no port is free. Both are
-        # answers to what was typed, so the form comes back with them.
-        return await run_in_threadpool(
-            _deploy_form, request, submitted, {"fix": str(exc.detail), "output": ""}
-        )
-    except WASMError as exc:
-        return await run_in_threadpool(
-            _deploy_form,
-            request,
-            submitted,
-            {"fix": str(exc), "output": getattr(exc, "details", "") or ""},
-        )
-
-    # A deployment takes minutes, so the operator is sent where they can watch
-    # it rather than left on a form that looks like it did nothing.
-    return RedirectResponse("/activity", status_code=303)
+router.include_router(_deploy_form_pages.router)
 
 
 @router.post("/apps/{domain}/backup")
@@ -1269,11 +1143,9 @@ from wasm.web.views import deployments as _deployment_pages  # noqa: E402
 router.include_router(_database_pages.router)
 router.include_router(_deployment_pages.router)
 from wasm.web.views import backup_schedules as _backup_schedule_pages  # noqa: E402
-from wasm.web.views import deploy_form as _deploy_form_pages  # noqa: E402
 from wasm.web.views import infrastructure as _infrastructure_pages  # noqa: E402
 from wasm.web.views import settings_editor as _settings_editor_pages  # noqa: E402
 
 router.include_router(_infrastructure_pages.router)
 router.include_router(_settings_editor_pages.router)
 router.include_router(_backup_schedule_pages.router)
-router.include_router(_deploy_form_pages.router)

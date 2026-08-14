@@ -1,0 +1,11 @@
+{#
+  One field's inline verdict on the deployment form.
+
+  Swapped in under the field it checked, whole, so a verdict of "fine" clears
+  a stale refusal instead of leaving it on screen. The refusal itself renders
+  through the same problem block every other refusal in the panel uses.
+#}
+{% import "_macros.html" as m %}
+<div id="check-{{ check_field }}">
+  {% if check_error %}{{ m.problem(check_error) }}{% endif %}
+</div>

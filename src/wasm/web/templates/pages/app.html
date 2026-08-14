@@ -69,11 +69,22 @@
 </section>
 
 {#
-  These two sections load over htmx rather than rendering inline, so they
-  live entirely in views/deployments.py and this page's handler does not have
-  to know they exist. Listing rollback points also walks the backup directory,
-  which is work the first paint should not wait on.
+  The webhook, deployment history and rollback sections load over htmx rather
+  than rendering inline, so they live entirely in views/deploy_form.py and
+  views/deployments.py and this page's handler does not have to know they
+  exist. Listing rollback points also walks the backup directory, which is
+  work the first paint should not wait on.
 #}
+<section class="stack--tight">
+  <h2 class="label stack__title">Git webhook</h2>
+  <div id="webhook-section"
+       hx-get="/apps/{{ domain }}/webhook/section"
+       hx-trigger="load" hx-swap="outerHTML">
+    <p class="muted">Reading webhook state…</p>
+  </div>
+</section>
+
+
 <section class="stack--tight">
   <h2 class="label stack__title">Deployments</h2>
   <div id="deploy-history-section"

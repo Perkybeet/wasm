@@ -79,7 +79,16 @@ class AppListResponse(BaseModel):
 
 
 class CreateAppRequest(BaseModel):
-    """Request to deploy a new application."""
+    """
+    Request to deploy a new application.
+
+    The deployer-specific fields carry exactly what the deployers'
+    ``configure`` methods already accept, no more: ``subdomain_overrides``,
+    ``workspace_filter`` and ``skip_database`` are read by the monorepo
+    deployer, ``compose_file`` and ``compose_profiles`` by the docker-compose
+    one, and every deployer ignores the options that do not concern it, which
+    is the interface's own contract.
+    """
 
     domain: str = Field(..., description="Target domain name")
     source: str = Field(..., description="Git URL or local path")
@@ -89,6 +98,20 @@ class CreateAppRequest(BaseModel):
     branch: str | None = Field(default=None, description="Git branch to deploy")
     ssl: bool = Field(default=True, description="Obtain a certificate")
     env_vars: dict[str, str] = Field(default_factory=dict, description="Environment variables")
+    subdomain_overrides: dict[str, str] = Field(
+        default_factory=dict,
+        description="Monorepo: workspace name to subdomain overrides",
+    )
+    workspace_filter: list[str] | None = Field(
+        default=None, description="Monorepo: deploy only these workspaces"
+    )
+    skip_database: bool = Field(default=False, description="Monorepo: skip database provisioning")
+    compose_file: str | None = Field(
+        default=None, description="Docker Compose: compose file, relative to the project"
+    )
+    compose_profiles: list[str] | None = Field(
+        default=None, description="Docker Compose: profiles to activate"
+    )
 
 
 class AppActionResponse(BaseModel):
@@ -323,6 +346,11 @@ def create_app(
             "env_vars": body.env_vars,
             "webserver": body.webserver,
             "ssl": body.ssl,
+            "subdomain_overrides": body.subdomain_overrides,
+            "workspace_filter": body.workspace_filter,
+            "skip_database": body.skip_database,
+            "compose_file": body.compose_file,
+            "compose_profiles": body.compose_profiles,
         },
         metadata={"domain": domain, "app_type": body.app_type, "port": port},
     )

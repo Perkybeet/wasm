@@ -1,0 +1,88 @@
+{#
+  The application's git webhook, as one swappable section.
+
+  Every state renders through this fragment - not configured, enabled, freshly
+  minted, refused - so the application page and the htmx swaps can never
+  disagree about what the section looks like.
+
+  A freshly minted secret is shown exactly once, in selectable mono. No later
+  render of this fragment can repeat it: the store keeps it for signature
+  verification only, and no endpoint returns it again. The warning above the
+  value says so in as many words.
+#}
+{% import "_macros.html" as m %}
+<div id="webhook-section">
+
+  {% if webhook_problem %}
+    {{ m.problem(webhook_problem.fix, webhook_problem.output) }}
+  {% endif %}
+
+  {% if webhook_minted %}
+    <p>
+      The secret below is shown once and never again, so copy it now.
+      Deliveries signed with any previous secret stop verifying immediately.
+    </p>
+    <pre class="mono">Payload URL:  {{ webhook_minted.hook_url }}
+Secret:       {{ webhook_minted.secret }}</pre>
+    <p class="field__hint">
+      GitHub: repository Settings, Webhooks, Add webhook - payload URL and secret above, content type application/json.
+      GitLab: Settings, Webhooks - the URL above, with the secret as Secret token.
+      Gitea: Settings, Webhooks, Add webhook - target URL and secret above.
+    </p>
+  {% endif %}
+
+  {% if webhook_enabled %}
+    <p>
+      {{ m.badge("active", "enabled") }}
+      A signed push to the tracked branch redeploys this application through
+      <span class="mono">{{ webhook_url }}</span>.
+    </p>
+    <div class="toolbar">
+      <button type="button" class="btn btn--sm"
+              hx-post="/apps/{{ webhook_domain }}/webhook/enable"
+              hx-target="#webhook-section" hx-swap="outerHTML"
+              hx-confirm="Regenerate the webhook secret for {{ webhook_domain }}? The current secret stops verifying immediately, and the forge must be given the new one.">Regenerate</button>
+      <button type="button" class="btn btn--sm btn--danger"
+              hx-post="/apps/{{ webhook_domain }}/webhook/disable"
+              hx-target="#webhook-section" hx-swap="outerHTML"
+              hx-confirm="Disable auto-deploy for {{ webhook_domain }}? Deliveries are answered 404 until a new secret is minted.">Disable</button>
+    </div>
+  {% else %}
+    <p class="muted">
+      Pushes to the repository do not deploy. Enabling mints a signing secret,
+      shown once, and gives the forge a URL to deliver to; a verified push to
+      the tracked branch then redeploys this application.
+    </p>
+    <button type="button" class="btn btn--sm"
+            hx-post="/apps/{{ webhook_domain }}/webhook/enable"
+            hx-target="#webhook-section" hx-swap="outerHTML">Enable auto-deploy</button>
+  {% endif %}
+
+  {% if webhook_rows %}
+    <table class="table">
+      <thead>
+        <tr>
+          <th scope="col">Delivery</th>
+          <th scope="col">Commit</th>
+          <th scope="col">Took</th>
+          <th scope="col">Started</th>
+          <th scope="col"><span class="visually-hidden">Detail</span></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in webhook_rows %}
+          <tr>
+            <td>{{ m.badge(row.state, row.status) }}</td>
+            <td><span class="mono">{{ row.commit }}</span></td>
+            <td>{{ row.duration }}</td>
+            <td>{{ row.started }}</td>
+            <td><a class="btn btn--sm" href="{{ row.href }}">Open</a></td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% elif webhook_enabled %}
+    <p class="faint">No delivery has deployed this application yet.</p>
+  {% endif %}
+
+</div>

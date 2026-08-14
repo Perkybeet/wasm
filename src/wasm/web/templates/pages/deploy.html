@@ -5,16 +5,22 @@
   deploy one: POST /api/apps had no caller anywhere in the interface. An
   operator could look at everything and create nothing.
 
-  It is a plain form posting to a page route, not htmx. A deployment is the one
-  action here that is worth a whole screen and a full navigation: it takes
-  minutes, it is the thing most likely to fail with something worth reading,
-  and the result is a job to follow rather than a row to swap. Submitting it
-  lands on the activity screen with the log drawer attached.
+  The form is boosted: htmx sends the submission, which is what puts the CSRF
+  header on it - a plain form cannot set one, so the browser's own submit came
+  back 403 every time, exactly like the sign-out button once did. A deployment
+  is still worth a whole screen and a full navigation: submitting lands on the
+  activity screen with the log drawer attached, and a refusal brings this form
+  back with the reason and everything still typed in.
 
-  Only what a deployment cannot proceed without is on the form. Everything else
-  the CLI accepts - package manager, workspaces, subdomains, compose profiles -
-  has a sensible default, and a screen that asks fourteen questions to do the
-  common thing is a screen people avoid.
+  Each field that can be checked cheaply is checked as it is left, by posting
+  the form to /apps/new/validate/{field} and swapping the verdict in under the
+  field. The check is a courtesy; the guard stays at the chokepoint the JSON
+  API uses.
+
+  Only what a deployment cannot proceed without is asked up front. Everything
+  else lives under Advanced, collapsed, and the type-specific questions only
+  appear for the type that will read them: the fragment under the type select
+  swaps when the selection changes.
 #}
 {% extends "base.html" %}
 {% import "_macros.html" as m %}
@@ -29,32 +35,40 @@
   {{ m.problem(problem.fix, problem.output) }}
 {% endif %}
 
-<form method="post" action="/apps/new" class="form">
+<form method="post" action="/apps/new" class="form" hx-boost="true">
   <div class="field">
     <label class="label" for="domain">Domain</label>
     <input class="mono" type="text" id="domain" name="domain" required autofocus
            value="{{ submitted.domain or '' }}"
-           placeholder="app.example.com" aria-describedby="domain-hint">
+           placeholder="app.example.com" aria-describedby="domain-hint"
+           hx-post="/apps/new/validate/domain" hx-trigger="change"
+           hx-target="#check-domain" hx-swap="outerHTML" hx-include="closest form">
     <span class="field__hint" id="domain-hint">
       The web server answers for this name, and the certificate is issued for it.
       It has to resolve to this machine already.
     </span>
+    <div id="check-domain"></div>
   </div>
 
   <div class="field">
     <label class="label" for="source">Source</label>
     <input class="mono" type="text" id="source" name="source" required
            value="{{ submitted.source or '' }}"
-           placeholder="https://github.com/you/app" aria-describedby="source-hint">
+           placeholder="https://github.com/you/app" aria-describedby="source-hint"
+           hx-post="/apps/new/validate/source" hx-trigger="change"
+           hx-target="#check-source" hx-swap="outerHTML" hx-include="closest form">
     <span class="field__hint" id="source-hint">
       A Git URL, or a path on this machine.
     </span>
+    <div id="check-source"></div>
   </div>
 
   <div class="form__row">
     <div class="field">
       <label class="label" for="app_type">Type</label>
-      <select id="app_type" name="app_type" aria-describedby="type-hint">
+      <select id="app_type" name="app_type" aria-describedby="type-hint"
+              hx-get="/apps/new/options" hx-trigger="change"
+              hx-target="#type-options" hx-swap="outerHTML" hx-include="closest form">
         {% for entry in app_types %}
           <option value="{{ entry.type }}"
                   {% if entry.type == (submitted.app_type or 'auto') %}selected{% endif %}>
@@ -77,8 +91,11 @@
     <div class="field">
       <label class="label" for="port">Port</label>
       <input class="mono" type="number" id="port" name="port" min="1" max="65535"
-             value="{{ submitted.port or '' }}" placeholder="auto">
+             value="{{ submitted.port or '' }}" placeholder="auto"
+             hx-post="/apps/new/validate/port" hx-trigger="change"
+             hx-target="#check-port" hx-swap="outerHTML" hx-include="closest form">
       <span class="field__hint">Leave empty to be assigned a free one.</span>
+      <div id="check-port"></div>
     </div>
   </div>
 
@@ -108,6 +125,30 @@
       </span>
     </div>
   </div>
+
+  {# Open when a refusal brought back values typed inside it, so a mistake in
+     an advanced field is not hidden behind the fold it was made under. #}
+  <details {% if submitted.env or submitted.subdomains or submitted.workspaces
+              or submitted.no_database or submitted.compose_file
+              or submitted.compose_profiles %}open{% endif %}>
+    <summary class="label">Advanced</summary>
+
+    <div class="field">
+      <label class="label" for="env">Environment variables</label>
+      <textarea class="mono" id="env" name="env" rows="4" spellcheck="false"
+                placeholder="KEY=value" aria-describedby="env-hint"
+                hx-post="/apps/new/validate/env" hx-trigger="change"
+                hx-target="#check-env" hx-swap="outerHTML"
+                hx-include="closest form">{{ submitted.env or '' }}</textarea>
+      <span class="field__hint" id="env-hint">
+        One KEY=VALUE per line, written to the application's .env file at
+        deploy time. Blank lines and lines starting with # are skipped.
+      </span>
+      <div id="check-env"></div>
+    </div>
+
+    {% include "fragments/deploy_form_options.html" %}
+  </details>
 
   <div class="toolbar">
     <button class="btn btn--primary" type="submit">Deploy</button>
