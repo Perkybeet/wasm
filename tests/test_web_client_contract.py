@@ -162,9 +162,16 @@ def _resolves(app: FastAPI, path: str, *, websocket: bool) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def test_the_script_opens_at_least_one_address() -> None:
-    """A net that catches nothing passes silently."""
-    assert _event_source_urls(), "no EventSource found; this file is checking nothing"
+def test_the_shell_opens_at_least_one_event_stream() -> None:
+    """A net that catches nothing passes silently.
+
+    The stream used to be opened by panel.js with ``new EventSource``; it is
+    now opened by the htmx SSE extension from ``sse-connect`` in the markup.
+    Both sweeps stay, so whichever side owns the connection is checked.
+    """
+    assert _event_source_urls() or _sse_connect_urls(), (
+        "no EventSource and no sse-connect found; this file is checking nothing"
+    )
 
 
 def test_the_resolver_agrees_with_routes_that_are_known_to_exist(app: FastAPI) -> None:
@@ -199,6 +206,27 @@ def _event_source_urls() -> list[str]:
         Every absolute path the script opens as a server-sent event stream.
     """
     return re.findall(r"""new\s+EventSource\(\s*["'](/[^"']*)["']""", PANEL_JS)
+
+
+def _sse_connect_urls() -> list[str]:
+    """
+    Returns:
+        Every absolute path the markup hands to the htmx SSE extension. The
+        extension opens these with an EventSource, so they are held to the
+        same contract as one the script opens itself.
+    """
+    return re.findall(r"""sse-connect="(/[^"]*)\"""", ALL_MARKUP)
+
+
+def _sse_swap_names() -> list[str]:
+    """
+    Returns:
+        Every event name an ``sse-swap`` element in the markup listens for.
+    """
+    found: list[str] = []
+    for value in re.findall(r"""sse-swap="([^"]+)\"""", ALL_MARKUP):
+        found.extend(name.strip() for name in value.split(","))
+    return found
 
 
 def _websocket_urls() -> list[str]:
@@ -241,6 +269,48 @@ def test_every_event_stream_the_script_opens_is_an_http_route(app: FastAPI, url:
         f"WebSocket routes that look related: "
         f"{sorted(path for path in sockets if path.endswith(url))}"
     )
+
+
+@pytest.mark.parametrize("url", sorted(set(_sse_connect_urls())))
+def test_every_sse_connect_address_in_the_markup_is_an_http_route(app: FastAPI, url: str) -> None:
+    """
+    The same contract as the EventSource test, for the connection the htmx
+    SSE extension owns: it speaks plain HTTP and expects ``text/event-stream``.
+
+    Args:
+        app: The application.
+        url: A path the markup connects to as an event stream.
+    """
+    assert url not in _paths(app, "websocket"), (
+        f"{url!r} is a WebSocket route, and an EventSource cannot speak to one"
+    )
+    assert _resolves(app, url, websocket=False), (
+        f"the markup opens an event stream on {url!r}, which no HTTP route answers"
+    )
+
+
+@pytest.mark.parametrize("name", sorted(set(_sse_swap_names())))
+def test_every_sse_swap_event_in_the_markup_is_emitted_by_the_stream(name: str) -> None:
+    """
+    An sse-swap listening for an event the server never sends is the polling
+    bug's successor: a strip that renders once and silently never updates.
+
+    Args:
+        name: An event name an sse-swap element listens for.
+    """
+    events_source = (
+        Path(__file__).resolve().parents[1] / "src" / "wasm" / "web" / "events.py"
+    ).read_text(encoding="utf-8")
+
+    assert f'"{name}"' in events_source, (
+        f"the markup swaps on SSE event {name!r}, which wasm/web/events.py never emits"
+    )
+
+
+def test_the_sse_sweeps_cover_the_shared_connection() -> None:
+    """The regexes above are load-bearing; assert they found the known usage."""
+    assert "/events" in _sse_connect_urls(), "the shell no longer connects to /events"
+    assert "machine" in _sse_swap_names(), "the machine strip no longer swaps over SSE"
 
 
 @pytest.mark.parametrize("url", _websocket_urls())

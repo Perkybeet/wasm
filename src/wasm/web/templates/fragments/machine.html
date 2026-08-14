@@ -1,6 +1,8 @@
 {#
-  The machine strip. Rendered on its own so htmx can refresh just this element
-  without touching the rest of the page.
+  The machine strip. Rendered on its own so it can be replaced whole without
+  touching the rest of the page: the /events stream pushes this fragment as
+  its named "machine" event and the sse-swap below swaps it in, where an
+  hx-get timer used to poll for the same markup every five seconds.
 
   Everything here is set in mono with tabular figures, so a number changing
   does not make the row jump.
@@ -8,7 +10,7 @@
 {% import "_macros.html" as m %}
 
 <header class="machine" id="machine-strip"
-        hx-get="/fragments/machine" hx-trigger="every 5s" hx-swap="outerHTML"
+        sse-swap="machine" hx-swap="outerHTML"
         aria-label="Machine status">
 
   <span class="machine__host" title="{{ machine.os }}">{{ machine.hostname }}</span>
@@ -17,7 +19,9 @@
 
   <span class="machine__metric" title="Load average over 1, 5 and 15 minutes">
     <span class="label">load</span>
-    <span class="num">{{ "%.2f" | format(machine.load[0]) }}</span>
+    {# data-metric lets panel.js refresh this figure from the 2-second metrics
+       snapshot between the 5-second strip swaps. #}
+    <span class="num" data-metric="load.1m">{{ "%.2f" | format(machine.load[0]) }}</span>
     {# A sparkline shows the shape of the last few minutes, which a single
        number cannot. #}
     <svg class="machine__spark" viewBox="0 0 80 18" preserveAspectRatio="none"

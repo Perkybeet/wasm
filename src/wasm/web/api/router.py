@@ -21,6 +21,7 @@ from wasm.web.api.config import router as config_router
 from wasm.web.api.databases import router as databases_router
 from wasm.web.api.deps import install_error_handlers
 from wasm.web.api.jobs import router as jobs_router
+from wasm.web.api.metrics import router as metrics_router
 from wasm.web.api.monitor import router as monitor_router
 from wasm.web.api.services import router as services_router
 from wasm.web.api.sites import router as sites_router
@@ -37,6 +38,7 @@ router.include_router(sites_router, prefix="/sites", tags=["Sites"])
 router.include_router(certs_router, prefix="/certs", tags=["Certificates"])
 router.include_router(system_router, prefix="/system", tags=["System"])
 router.include_router(monitor_router, prefix="/monitor", tags=["Monitor"])
+router.include_router(metrics_router, prefix="/metrics", tags=["Metrics"])
 # The jobs router carries its own "/jobs" prefix.
 router.include_router(jobs_router, tags=["Jobs"])
 router.include_router(config_router, prefix="/config", tags=["Configuration"])

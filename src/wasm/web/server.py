@@ -180,12 +180,22 @@ async def lifespan(app: FastAPI):
     """
     Purge stale persistent state around the server's lifetime.
 
+    The metrics collector is started and stopped here too: it is a daemon
+    thread owned by the web process, so its lifetime is the server's and
+    nothing else's. Note that the test suite builds the application without
+    running this, which is what keeps the sampling thread out of every test
+    that is not about it.
+
     Args:
         app: The application being started.
     """
+    from wasm.web.metrics_collector import start_metrics_collector, stop_metrics_collector
+
     manager = get_token_manager()
     manager.purge_expired_sessions()
+    start_metrics_collector()
     yield
+    stop_metrics_collector()
     manager.purge_expired_sessions()
 
 

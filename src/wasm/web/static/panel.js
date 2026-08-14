@@ -376,16 +376,55 @@ function setNavOpen(open) {
 /* ------------------------------------------------------------ live events */
 
 /**
- * Subscribe to server-sent state changes.
+ * The newest metrics snapshot the stream delivered, for anything that draws:
+ * metric name to value, exactly as the collector published it. The charts
+ * read it from here rather than opening a stream of their own.
+ */
+window.__wasmMetrics = null;
+
+/**
+ * Refresh every [data-metric] figure on screen from a snapshot.
+ *
+ * Only elements that opted in are touched, so the machine strip's own swap -
+ * which replaces the whole fragment - stays the source of truth for
+ * everything else in it.
+ *
+ * @param {Object<string, number>} snapshot Metric name to value.
+ */
+function updateMetricNumbers(snapshot) {
+  for (const element of document.querySelectorAll("[data-metric]")) {
+    const value = snapshot[element.dataset.metric];
+    if (typeof value === "number") element.textContent = value.toFixed(2);
+  }
+}
+
+/**
+ * The EventSource whose listeners are already attached, so a reconnect wires
+ * the replacement exactly once.
+ */
+let wiredEventSource = null;
+
+/**
+ * Attach the panel's listeners to the shared /events stream.
+ *
+ * The connection itself belongs to the htmx SSE extension: sse-connect on the
+ * body opens one EventSource per tab, and the machine strip's sse-swap rides
+ * it. The extension keeps the object internal, but it announces every
+ * connection - including its own reconnects - by firing htmx:sseOpen with the
+ * source in the event detail, and that is how this script listens on the same
+ * connection instead of holding a second one open per tab.
  *
  * A state change is the most important thing this panel can show, so a row
  * whose state changed gets a brief pulse on its rail. Everything else on the
  * screen stays still.
+ *
+ * @param {EventSource} source The stream the extension just opened.
  */
-function connectEvents() {
-  const events = new EventSource("/events");
+function wireEventSource(source) {
+  if (!source || source === wiredEventSource) return;
+  wiredEventSource = source;
 
-  events.addEventListener("state", (message) => {
+  source.addEventListener("state", (message) => {
     const change = JSON.parse(message.data);
     const row = document.getElementById(`row-${CSS.escape(change.id)}`);
     if (!row) return;
@@ -395,13 +434,30 @@ function connectEvents() {
     window.setTimeout(() => row.classList.remove("row--changed"), 700);
   });
 
-  events.addEventListener("notice", (message) => {
+  source.addEventListener("notice", (message) => {
     const notice = JSON.parse(message.data);
     notify(notice.text, notice.state);
   });
 
-  events.addEventListener("error", () => {
-    // EventSource reconnects on its own; saying so beats a silent gap.
+  source.addEventListener("metrics", (message) => {
+    let snapshot;
+    try {
+      snapshot = JSON.parse(message.data);
+    } catch {
+      return;
+    }
+    window.__wasmMetrics = snapshot;
+    updateMetricNumbers(snapshot);
+  });
+}
+
+function connectEvents() {
+  document.body.addEventListener("htmx:sseOpen", (event) => {
+    wireEventSource(event.detail.source);
+  });
+
+  document.body.addEventListener("htmx:sseError", () => {
+    // The extension reconnects on its own; saying so beats a silent gap.
     notify("Lost the live connection. Reconnecting.", "busy", 3000);
   });
 }

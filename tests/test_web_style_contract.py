@@ -281,6 +281,7 @@ HOOKS = (
     "data-nav-close",
     "data-theme-toggle",
     "data-follow-log",
+    "data-metric",
 )
 
 

@@ -44,6 +44,11 @@
     "sha256": "daa3aa30adbaf99c4e415f33b9042767e74f053896e55ad06f898d344917d2a7",
     "url": "https://cdn.jsdelivr.net/npm/nayuki-qr-code-generator@1.8.0/index.js"
   },
+  "sse.js": {
+    "licence": "0BSD",
+    "sha256": "83eca6fa0611fe2b0bf1700b424b88b5eced38ef448ef9760a2ea08fbc875611",
+    "url": "https://cdn.jsdelivr.net/npm/htmx-ext-sse@2.2.3/dist/sse.js"
+  },
   "uplot.min.css": {
     "licence": "MIT",
     "sha256": "df630c6a8d6f8eeaff264b50f73ce5b114f646ffd9a0bb74f049b0a00135fa04",

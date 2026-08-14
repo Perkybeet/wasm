@@ -28,7 +28,7 @@
   <link rel="stylesheet" href="/static/vendor/uplot.min.css">
   <link rel="icon" href="/static/logo.webp" type="image/webp">
 
-  {# Two scripts, and no Alpine.
+  {# Three scripts, and no Alpine.
 
      The panel serves itself under script-src 'self' with no unsafe-eval,
      because it runs systemd as root and an injected script here is a root
@@ -42,7 +42,11 @@
      The two islands it was there for are a hundred lines of panel.js now.
      Loosening the policy for a dependency that costs 47 KB and does not work
      is not a trade this product makes. #}
+  {# The SSE extension must run after htmx and before the document is
+     processed; three deferred classic scripts execute in exactly this order.
+     It is a vendored file served from this host, so script-src 'self' holds. #}
   <script src="/static/vendor/htmx.min.js" defer></script>
+  <script src="/static/vendor/sse.js" defer></script>
   <script src="/static/panel.js" defer></script>
 </head>
 
@@ -58,8 +62,15 @@
    control that opens it has to sit outside the sidebar: a toggle inside the
    panel it reveals goes off-canvas with it, which is why the panel shipped
    with a sidebar that could be styled open and reached by nothing. #}
+{# The live feed is attached to the body: one EventSource per tab, opened by
+   the htmx SSE extension and shared by everything on the page. The body is the
+   one element htmx never swaps - hx-boost replaces its contents, not the
+   element - so the connection survives navigation, and any sse-swap element
+   that arrives in a swap re-binds to it as its closest connected ancestor.
+   panel.js listens on the same source for the events that are not swaps. #}
 <body hx-headers='{"{{ csrf_header }}": "{{ csrf_token }}"}'
-      data-csrf-header="{{ csrf_header }}" data-csrf-cookie="{{ csrf_cookie }}">
+      data-csrf-header="{{ csrf_header }}" data-csrf-cookie="{{ csrf_cookie }}"
+      hx-ext="sse" sse-connect="/events">
 
 <a class="skip-link" href="#main">Skip to content</a>
 

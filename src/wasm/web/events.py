@@ -30,6 +30,15 @@ notifies its subscribers on every job transition, so a deploy, a restart, a
 renewal and a restore all pass through here. Nothing is invented - a stream
 that emits events nothing produces would be worse than no stream, because it
 would look like the feature works.
+
+The stream is multiplexed - one connection per tab, several named events -
+because that is the shape both ends want. htmx's SSE extension subscribes any
+number of ``sse-swap`` elements to one ``sse-connect`` ancestor, and a browser
+caps concurrent connections per origin low enough that a stream per concern
+would starve the panel of request slots. Alongside the job events, ``metrics``
+carries the collector's newest snapshot every couple of seconds and ``machine``
+carries the rendered machine strip, which used to be polled with an ``hx-get``
+timer at exactly the cost of this push plus an HTTP request each time.
 """
 
 from __future__ import annotations
@@ -42,7 +51,11 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
+from jinja2 import TemplateError
+from starlette.concurrency import run_in_threadpool
 
+from wasm.core.exceptions import WASMError
+from wasm.web import metrics_collector
 from wasm.web.views.router import require_page_session
 
 log = logging.getLogger(__name__)
@@ -52,6 +65,13 @@ router = APIRouter(include_in_schema=False)
 #: Seconds between keepalive comments. Proxies and load balancers close an idle
 #: response, and a silent stream is indistinguishable from a broken one.
 HEARTBEAT_SECONDS = 25
+
+#: Seconds between ``metrics`` events, matching the collector's own tick.
+METRICS_INTERVAL_SECONDS = 2.0
+
+#: Seconds between ``machine`` events, matching the cadence the strip used to
+#: poll at.
+MACHINE_INTERVAL_SECONDS = 5.0
 
 #: Most events held for a slow client before the oldest are dropped. A browser
 #: that cannot keep up gets a gap, which it recovers from on the next change;
@@ -87,6 +107,85 @@ def format_event(name: str, payload: dict[str, Any]) -> str:
     # separators without spaces, and no newline can survive json.dumps, which
     # matters because a newline in the data field would end the event early.
     return f"event: {name}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n"
+
+
+def format_html_event(name: str, html: str) -> str:
+    """
+    Render one server-sent event whose body is markup rather than JSON.
+
+    A raw newline would end the data field early, and rendered templates are
+    full of them. The SSE format's own answer is used instead of mangling the
+    markup: each line becomes its own ``data:`` field, and the browser joins
+    consecutive fields with a newline, reproducing the text exactly.
+
+    Args:
+        name: Event name the client listens for.
+        html: The rendered markup, newlines and all.
+
+    Returns:
+        The wire format, terminated by the blank line that ends an event.
+    """
+    lines = html.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    data = "".join(f"data: {line}\n" for line in lines)
+    return f"event: {name}\n{data}\n"
+
+
+def render_machine_strip() -> str:
+    """
+    Render the machine strip fragment for the ``machine`` event.
+
+    The same template the shell includes and ``/fragments/machine`` serves, so
+    the pushed strip can never disagree with the rendered one. Only the
+    machine state goes into the context: the fragment reads nothing else, and
+    the full shared context would price every push at a store read for counts
+    the strip does not show.
+
+    Returns:
+        The rendered fragment.
+    """
+    from wasm.web.views.context import machine_state
+    from wasm.web.views.rendering import templates
+
+    return templates.get_template("fragments/machine.html").render(machine=machine_state())
+
+
+#: What rendering the strip can fail with in operation: the managers' own
+#: errors, the OS reads underneath psutil, and the template machinery. Named
+#: rather than Exception so a bug in the fragment stays loud instead of
+#: becoming a strip that silently stops updating.
+RENDER_ERRORS: tuple[type[Exception], ...] = (WASMError, OSError, TemplateError)
+
+
+def machine_frame() -> str | None:
+    """
+    Build the periodic ``machine`` event, or nothing.
+
+    This is an error boundary: the render reads systemd and psutil, and a
+    transient failure there must cost one frame, not the whole stream with the
+    job events on it.
+
+    Returns:
+        The wire frame, or None when the strip could not be rendered.
+    """
+    try:
+        return format_html_event("machine", render_machine_strip())
+    except RENDER_ERRORS:
+        log.exception("the machine strip could not be rendered for the stream")
+        return None
+
+
+def metrics_frame() -> str | None:
+    """
+    Build the periodic ``metrics`` event, or nothing.
+
+    Returns:
+        The wire frame with the collector's newest snapshot, or None when no
+        collector is running in this process.
+    """
+    collector = metrics_collector.get_metrics_collector()
+    if collector is None:
+        return None
+    return format_event("metrics", collector.latest())
 
 
 def job_events(job: Any) -> list[tuple[str, dict[str, Any]]]:
@@ -176,13 +275,42 @@ async def _stream(request: Request) -> AsyncIterator[str]:
         # the response has stalled, and tells the client the feed is live.
         yield ": connected\n\n"
 
+        now = loop.time()
+        # The first metrics event goes out at once, so a freshly opened page
+        # has numbers before the collector's next tick. The strip waits a full
+        # interval: the page just rendered its own copy.
+        metrics_at = now
+        machine_at = now + MACHINE_INTERVAL_SECONDS
+        heartbeat_at = now + HEARTBEAT_SECONDS
+
         while True:
             if await request.is_disconnected():
                 return
+
+            now = loop.time()
+            if now >= metrics_at:
+                frame = metrics_frame()
+                if frame is not None:
+                    yield frame
+                    heartbeat_at = now + HEARTBEAT_SECONDS
+                metrics_at = now + METRICS_INTERVAL_SECONDS
+            if now >= machine_at:
+                # In a worker thread: the render tallies systemd units, and a
+                # blocking call here stalls every stream on the event loop.
+                frame = await run_in_threadpool(machine_frame)
+                if frame is not None:
+                    yield frame
+                    heartbeat_at = loop.time() + HEARTBEAT_SECONDS
+                machine_at = now + MACHINE_INTERVAL_SECONDS
+
+            timeout = min(metrics_at, machine_at, heartbeat_at) - loop.time()
             try:
-                yield await asyncio.wait_for(queue.get(), timeout=HEARTBEAT_SECONDS)
+                yield await asyncio.wait_for(queue.get(), timeout=max(0.0, timeout))
+                heartbeat_at = loop.time() + HEARTBEAT_SECONDS
             except asyncio.TimeoutError:
-                yield ": keepalive\n\n"
+                if loop.time() >= heartbeat_at:
+                    yield ": keepalive\n\n"
+                    heartbeat_at = loop.time() + HEARTBEAT_SECONDS
     finally:
         manager.unsubscribe_all(publish)
 
