@@ -1,3 +1,9 @@
+wasm (1.5.1-1) unstable; urgency=medium
+
+  * Fix: panel failed to start on distro pydantic v1 (Ubuntu 24.04); pydantic v1/v2 bridge with architecture guards and distro-import CI gates
+
+ -- Yago Lopez Prado <yago.lopez.adeje@gmail.com>  Fri, 14 Aug 2026 13:38:42 +0000
+
 wasm (1.5.0-1) unstable; urgency=medium
 
   * Observability and product polish: per-app charts with deploy markers, user cron jobs, CLI deep links, command palette, log search

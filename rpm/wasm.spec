@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        1.5.0
+Version:        1.5.1
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -222,6 +222,8 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
 fi
 
 %changelog
+* Fri Aug 14 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.5.1-1
+- Fix: panel failed to start on distro pydantic v1 (Ubuntu 24.04); pydantic v1/v2 bridge with architecture guards and distro-import CI gates
 * Fri Aug 14 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.5.0-1
 - Observability and product polish: per-app charts with deploy markers, user cron jobs, CLI deep links, command palette, log search
 * Fri Aug 14 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.4.0-1
