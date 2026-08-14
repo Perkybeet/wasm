@@ -41,6 +41,11 @@ HTMX = "2.0.10"
 XTERM = "6.0.0"
 UPLOT = "1.6.32"
 PLEX = "5.3.0"
+# Nayuki's QR generator, for drawing the 2FA enrolment QR in the browser so
+# the otpauth secret never leaves the host. The npm package's index.js is the
+# compiled typescript-javascript file from the upstream repository, published
+# as an ES module.
+QRCODEGEN = "1.8.0"
 
 
 @dataclass(frozen=True)
@@ -84,6 +89,7 @@ ASSETS: tuple[Asset, ...] = (
     Asset(f"{JSDELIVR}/@xterm/xterm@{XTERM}/css/xterm.css", "xterm.css", "MIT"),
     Asset(f"{JSDELIVR}/uplot@{UPLOT}/dist/uPlot.iife.min.js", "uplot.min.js", "MIT"),
     Asset(f"{JSDELIVR}/uplot@{UPLOT}/dist/uPlot.min.css", "uplot.min.css", "MIT"),
+    Asset(f"{JSDELIVR}/nayuki-qr-code-generator@{QRCODEGEN}/index.js", "qrcodegen.js", "MIT"),
     # Interface and prose.
     _font("ibm-plex-sans", 400),
     _font("ibm-plex-sans", 500),

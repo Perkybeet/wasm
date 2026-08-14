@@ -64,6 +64,22 @@
       </span>
     </div>
 
+    {# Only rendered when the server will actually read it. Showing the field
+       to a machine that does not require a second factor would teach every
+       operator to ignore it, and showing it teaches an attacker nothing: the
+       first wrong token already reveals whether one is required. #}
+    {% if totp_required %}
+      <div class="field">
+        <label class="label" for="totp_code">Authenticator code</label>
+        <input class="mono" type="text" id="totp_code" name="totp_code"
+               required inputmode="numeric" autocomplete="one-time-code"
+               aria-describedby="totp-hint">
+        <span class="field__hint" id="totp-hint">
+          The 6-digit code from your authenticator app, or a backup code.
+        </span>
+      </div>
+    {% endif %}
+
     <button class="btn btn--primary btn--block" type="submit">Sign in</button>
   </form>
 

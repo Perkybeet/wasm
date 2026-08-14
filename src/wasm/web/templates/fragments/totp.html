@@ -1,0 +1,76 @@
+{#
+  Two-factor authentication, as one swappable section.
+
+  Every state of the flow renders through this fragment - off, enrolling,
+  freshly confirmed, on - so the settings page and the htmx swaps can never
+  disagree about what the section looks like.
+
+  The QR is drawn client-side by panel.js from data-totp-uri, so the secret
+  never leaves this host in any form but this page. The base32 key and the
+  otpauth URI are always shown as selectable text as well, for an operator
+  enrolling by hand or on a browser where the script never ran.
+
+  A refused code renders at 200 with the refusal inline: htmx does not swap an
+  error status, so answering 400 would freeze the screen and report nothing.
+#}
+{% import "_macros.html" as m %}
+<div class="rows" id="totp-section">
+
+  {% if totp_problem %}
+    {{ m.problem(totp_problem.fix, totp_problem.output) }}
+  {% endif %}
+
+  {% if totp_backup_codes %}
+    <p>
+      Two-factor authentication is on. Each of these backup codes opens one
+      sign-in if the authenticator is lost. They are shown once and stored
+      hashed, so copy them somewhere safe now.
+    </p>
+    <p class="mono">{{ totp_backup_codes | join("   ") }}</p>
+    <p class="faint">From the next sign-in on, the form asks for the access token and a code.</p>
+
+  {% elif totp_enroll %}
+    <p>Scan this with your authenticator app, then confirm with the code it shows.</p>
+    <div data-totp-qr data-totp-uri="{{ totp_enroll.uri }}"></div>
+    <p class="faint">No camera at hand? Enter the key manually instead:</p>
+    <p class="mono">{{ totp_enroll.secret }}</p>
+    <p class="mono faint">{{ totp_enroll.uri }}</p>
+    <form hx-post="/settings/2fa/confirm" hx-target="#totp-section" hx-swap="outerHTML">
+      <div class="field">
+        <label class="label" for="totp-confirm-code">Authenticator code</label>
+        <input class="mono" type="text" id="totp-confirm-code" name="code"
+               required inputmode="numeric" autocomplete="one-time-code">
+      </div>
+      <button class="btn btn--primary" type="submit">Confirm and enable</button>
+    </form>
+
+  {% elif totp.enabled %}
+    <p>
+      Enabled. Signing in asks for the access token and a code from the
+      authenticator app.
+      <span class="mono">{{ totp.backup_codes_remaining }}</span> backup codes left.
+    </p>
+    <form hx-post="/settings/2fa/disable" hx-target="#totp-section" hx-swap="outerHTML">
+      <div class="field">
+        <label class="label" for="totp-disable-code">Current code</label>
+        <input class="mono" type="text" id="totp-disable-code" name="code"
+               required inputmode="numeric" autocomplete="one-time-code"
+               aria-describedby="totp-disable-hint">
+        <span class="field__hint" id="totp-disable-hint">
+          A code from the app, or an unused backup code.
+        </span>
+      </div>
+      <button class="btn btn--danger" type="submit">Disable</button>
+    </form>
+
+  {% else %}
+    <p>
+      Off. Signing in asks only for the access token. With two-factor on, a
+      stolen token is not enough to reach this panel.
+    </p>
+    <button class="btn btn--primary" type="button"
+            hx-post="/settings/2fa/enroll" hx-target="#totp-section"
+            hx-swap="outerHTML">Enable</button>
+  {% endif %}
+
+</div>

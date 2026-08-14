@@ -7,9 +7,11 @@
   set here" and invite someone to overwrite a working credential with an empty
   string.
 
-  It is read only. Writing configuration is done through the API and the CLI,
-  which validate a change before it reaches the file that every other part of
-  WASM depends on.
+  The configuration below is read only. Writing configuration is done through
+  the API and the CLI, which validate a change before it reaches the file that
+  every other part of WASM depends on. The one control this screen does carry
+  is two-factor authentication, which belongs to the panel itself and nowhere
+  else.
 #}
 {% extends "base.html" %}
 {% import "_macros.html" as m %}
@@ -18,7 +20,12 @@
 
 {% block content %}
 
-{{ m.page_head("Settings", "Read only. Secrets are redacted before they leave the server.") }}
+{{ m.page_head("Settings", "Configuration is read only here. Secrets are redacted before they leave the server.") }}
+
+<section class="stack--tight">
+  <h2 class="label stack__title">Two-factor authentication</h2>
+  {% include "fragments/totp.html" %}
+</section>
 
 {% if problem %}
   {{ m.problem(problem.fix, problem.output) }}

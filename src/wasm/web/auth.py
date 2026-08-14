@@ -53,7 +53,9 @@ from typing import Any
 from fastapi import HTTPException, Request, status
 from starlette.requests import HTTPConnection
 
+from wasm.core import totp
 from wasm.core.exceptions import SecurityError
+from wasm.core.fs import SECRET_MODE, get_fs
 
 logger = logging.getLogger(__name__)
 
@@ -84,8 +86,14 @@ STATE_DIR_ENV = "WASM_WEB_STATE_DIR"
 
 SECRET_FILE_NAME = "web-secret"  # noqa: S105 - file name, not a credential
 TOKEN_FILE_NAME = "web-token"  # noqa: S105 - file name, not a credential
+TOTP_FILE_NAME = "web-totp"
 SESSION_DB_NAME = "web-sessions.db"
 AUDIT_LOG_NAME = "web-audit.log"
+
+#: Single-use recovery codes issued when TOTP is confirmed. Eight is what an
+#: operator can print on one line; each is 32 bits, which a five-attempt
+#: lockout makes unguessable in practice and single use makes worthless after.
+BACKUP_CODE_COUNT = 8
 
 SESSION_COOKIE_NAME = "wasm_session"
 CSRF_COOKIE_NAME = "wasm_csrf"
@@ -226,6 +234,11 @@ class SecurityConfig:
     def token_file(self) -> Path:
         """Path of the master token hash file."""
         return self.resolved_state_dir / TOKEN_FILE_NAME
+
+    @property
+    def totp_file(self) -> Path:
+        """Path of the two-factor state file."""
+        return self.resolved_state_dir / TOTP_FILE_NAME
 
     @property
     def session_db(self) -> Path:
@@ -1062,6 +1075,9 @@ class TokenManager:
         self._master_token: str | None = None
         self._secret_key: str = self._load_or_create_secret()
         self.sessions = SessionStore(self.config.session_db)
+        # Serialises read-modify-write cycles on the two-factor state file, so
+        # two logins racing to consume the same backup code cannot both win.
+        self._totp_lock = threading.Lock()
 
     def _load_or_create_secret(self) -> str:
         """
@@ -1170,6 +1186,243 @@ class TokenManager:
             return secrets.compare_digest(self._hash_token(token), stored_hash)
 
         return False
+
+    # ------------------------------------------------------------------ TOTP
+
+    def _read_totp_state(self) -> dict[str, Any]:
+        """
+        Read the two-factor state file.
+
+        Returns:
+            The stored state, or the disabled default when the file has never
+            been written.
+
+        Raises:
+            SecurityError: When the file exists but cannot be read or parsed.
+                Treating a corrupt file as "two-factor is off" would turn any
+                truncation into a silent bypass of the second factor.
+        """
+        default: dict[str, Any] = {
+            "enabled": False,
+            "secret": "",
+            "pending_secret": "",
+            "backup_codes": [],
+        }
+        path = self.config.totp_file
+        try:
+            raw = path.read_text()
+        except FileNotFoundError:
+            return default
+        except OSError as exc:
+            raise SecurityError(
+                f"Cannot read the two-factor state file {path}",
+                details=(
+                    "Run the web panel as the user that owns it, or delete the file to "
+                    "turn two-factor authentication off on purpose."
+                ),
+            ) from exc
+        try:
+            state = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise SecurityError(
+                f"The two-factor state file {path} is corrupt",
+                details=(
+                    "WASM refuses to guess whether two-factor authentication was on. "
+                    f"Restore the file from backup, or delete it with 'rm {path}' to "
+                    "disable the second factor on purpose."
+                ),
+            ) from exc
+        default.update(state if isinstance(state, dict) else {})
+        return default
+
+    def _write_totp_state(self, state: dict[str, Any]) -> None:
+        """
+        Persist the two-factor state with owner-only permissions.
+
+        Args:
+            state: The state to write.
+        """
+        fs = get_fs()
+        fs.write_text(self.config.totp_file, json.dumps(state), mode=SECRET_MODE)
+
+    def _hash_backup_code(self, code: str) -> str:
+        """
+        Hash a backup code for storage, the way the master token is hashed.
+
+        Args:
+            code: The code, in whatever spacing the operator typed it.
+
+        Returns:
+            Hex digest of the normalised code, salted with the signing key.
+        """
+        compact = code.strip().lower().replace("-", "").replace(" ", "")
+        return hashlib.sha256((compact + self._secret_key).encode()).hexdigest()
+
+    def totp_enabled(self) -> bool:
+        """
+        Report whether logins require a second factor.
+
+        Returns:
+            True when two-factor authentication is confirmed and active.
+        """
+        return bool(self._read_totp_state()["enabled"])
+
+    def totp_status(self) -> dict[str, Any]:
+        """
+        Describe the two-factor state without exposing any secret.
+
+        Returns:
+            Whether it is enabled, whether an enrolment is pending, and how
+            many backup codes remain unused.
+        """
+        state = self._read_totp_state()
+        return {
+            "enabled": bool(state["enabled"]),
+            "pending": bool(state["pending_secret"]),
+            "backup_codes_remaining": len(state["backup_codes"]),
+        }
+
+    def begin_totp_enrollment(self) -> str:
+        """
+        Generate a pending secret for enrolment. Nothing is enforced yet.
+
+        Returns:
+            The new secret, to be shown to the operator exactly once as a QR
+            code and as text.
+
+        Raises:
+            SecurityError: When two-factor authentication is already enabled.
+                Replacing an active secret without presenting a current code
+                would let a hijacked session swap the operator's authenticator
+                for its own.
+        """
+        with self._totp_lock:
+            state = self._read_totp_state()
+            if state["enabled"]:
+                raise SecurityError(
+                    "Two-factor authentication is already enabled",
+                    details="Disable it with a current code before enrolling a new authenticator.",
+                )
+            secret = totp.generate_secret()
+            state["pending_secret"] = secret
+            self._write_totp_state(state)
+        return secret
+
+    def pending_totp_secret(self) -> str | None:
+        """
+        Return the secret of an enrolment that has been begun but not confirmed.
+
+        Only the enrolment screen reads this, to re-show the QR when the first
+        code typed was wrong. It is meaningless to an attacker who is not
+        already inside an authenticated session, because nothing accepts codes
+        derived from it until it is confirmed.
+
+        Returns:
+            The pending secret, or None when no enrolment is in progress.
+        """
+        return self._read_totp_state()["pending_secret"] or None
+
+    def confirm_totp_enrollment(self, code: str) -> list[str] | None:
+        """
+        Verify a code against the pending secret and activate the second factor.
+
+        Args:
+            code: The six-digit code the authenticator app shows.
+
+        Returns:
+            The backup codes, in clear, to be shown exactly once - they are
+            stored only as salted hashes. None when the code did not verify.
+
+        Raises:
+            SecurityError: When no enrolment is in progress.
+        """
+        with self._totp_lock:
+            state = self._read_totp_state()
+            pending = state["pending_secret"]
+            if not pending:
+                raise SecurityError(
+                    "No two-factor enrolment is in progress",
+                    details="Begin one first: POST /api/auth/2fa/enroll, or Enable in Settings.",
+                )
+            if not totp.verify(pending, code):
+                return None
+            codes = [
+                f"{secrets.token_hex(2)}-{secrets.token_hex(2)}" for _ in range(BACKUP_CODE_COUNT)
+            ]
+            state.update(
+                {
+                    "enabled": True,
+                    "secret": pending,
+                    "pending_secret": "",
+                    "backup_codes": [self._hash_backup_code(c) for c in codes],
+                }
+            )
+            self._write_totp_state(state)
+        return codes
+
+    def verify_second_factor(self, code: str) -> bool:
+        """
+        Check a login's second factor: a TOTP code, or a single-use backup code.
+
+        A backup code that matches is consumed in the same locked cycle that
+        verified it, so it cannot be replayed by a second login racing the
+        first.
+
+        Args:
+            code: What the client typed.
+
+        Returns:
+            True when the code is a current TOTP value or an unused backup
+            code. False otherwise, including when two-factor is not enabled:
+            this method fails closed, and the caller decides whether a second
+            factor was required at all.
+        """
+        if not code or not code.strip():
+            return False
+        with self._totp_lock:
+            state = self._read_totp_state()
+            if not state["enabled"]:
+                return False
+            if totp.verify(state["secret"], code):
+                return True
+            presented = self._hash_backup_code(code)
+            remaining = [
+                stored
+                for stored in state["backup_codes"]
+                if not hmac.compare_digest(stored, presented)
+            ]
+            if len(remaining) != len(state["backup_codes"]):
+                state["backup_codes"] = remaining
+                self._write_totp_state(state)
+                return True
+            return False
+
+    def disable_totp(self, code: str) -> bool:
+        """
+        Turn the second factor off, on presentation of a current code.
+
+        Args:
+            code: A TOTP code or an unused backup code.
+
+        Returns:
+            True when it was disabled. False when the code did not verify, in
+            which case nothing changed.
+
+        Raises:
+            SecurityError: When two-factor authentication is not enabled.
+        """
+        if not self._read_totp_state()["enabled"]:
+            raise SecurityError(
+                "Two-factor authentication is not enabled",
+                details="There is nothing to disable. Enrol first from Settings.",
+            )
+        if not self.verify_second_factor(code):
+            return False
+        with self._totp_lock:
+            self._write_totp_state(
+                {"enabled": False, "secret": "", "pending_secret": "", "backup_codes": []}
+            )
+        return True
 
     def create_session(self, client_ip: str) -> IssuedSession:
         """

@@ -410,6 +410,62 @@ if (document.getElementById("machine-strip")) {
   connectEvents();
 }
 
+/* ------------------------------------------------------------ 2FA QR code */
+
+/**
+ * Draw the two-factor enrolment QR into every empty [data-totp-qr] host.
+ *
+ * The server sends the otpauth:// URI as a data attribute and the QR is
+ * encoded here, by the vendored qrcodegen (Nayuki, MIT), so the secret never
+ * travels to a third party the way a QR image service would require. The
+ * module is ~45 KB and enrolment is rare, so it is imported only when an
+ * enrolment is actually on screen.
+ *
+ * The code is black on white whatever the theme: this square is read by a
+ * phone camera, not by the operator, and scanners want maximum contrast. The
+ * base32 key next to it is the fallback for a browser where this never runs.
+ */
+async function renderTotpQrs() {
+  for (const host of document.querySelectorAll("[data-totp-qr]")) {
+    if (host.querySelector("canvas")) continue;
+    const uri = host.dataset.totpUri;
+    if (!uri) continue;
+
+    const { default: qrcodegen } = await import("/static/vendor/qrcodegen.js");
+    const qr = qrcodegen.QrCode.encodeText(uri, qrcodegen.QrCode.Ecc.MEDIUM);
+
+    const border = 2;
+    const scale = 4;
+    const size = (qr.size + border * 2) * scale;
+    const canvas = document.createElement("canvas");
+    canvas.width = size;
+    canvas.height = size;
+    canvas.setAttribute("role", "img");
+    canvas.setAttribute("aria-label", "Enrolment QR code. The key below encodes the same secret.");
+
+    const context = canvas.getContext("2d");
+    context.fillStyle = "#ffffff";
+    context.fillRect(0, 0, size, size);
+    context.fillStyle = "#000000";
+    for (let y = 0; y < qr.size; y += 1) {
+      for (let x = 0; x < qr.size; x += 1) {
+        if (qr.getModule(x, y)) {
+          context.fillRect((x + border) * scale, (y + border) * scale, scale, scale);
+        }
+      }
+    }
+    host.replaceChildren(canvas);
+  }
+}
+
+renderTotpQrs();
+// The enrolment fragment arrives by htmx swap; the whole document is swept
+// rather than the swap target, because outerHTML swaps replace the target and
+// which element the event lands on differs between swap styles.
+document.body.addEventListener("htmx:afterSwap", () => {
+  renderTotpQrs();
+});
+
 /* --------------------------------------------------------------- wiring */
 
 /*

@@ -54,6 +54,7 @@ from wasm.web.auth import (
     ip_matches,
     is_allowed_origin,
     is_secure_request,
+    record_auth_failure,
     set_audit_logger,
     set_brute_force_protection,
     set_security_config,
@@ -319,6 +320,9 @@ def create_app(config: SecurityConfig | None = None) -> FastAPI:
                 error=error,
                 locked_for=locked_for,
                 theme=None,
+                # The server knows whether a second factor is required, so the
+                # form only shows the code field when it will actually be read.
+                totp_required=get_token_manager().totp_enabled(),
             ),
             status_code=status,
         )
@@ -356,7 +360,9 @@ def create_app(config: SecurityConfig | None = None) -> FastAPI:
             A redirect to the panel, or the form again with the reason.
         """
         body = await request.body()
-        token = parse_qs(body.decode("utf-8", errors="replace")).get("token", [""])[0]
+        fields = parse_qs(body.decode("utf-8", errors="replace"))
+        token = fields.get("token", [""])[0]
+        totp_code = fields.get("totp_code", [""])[0].strip()
         manager = get_token_manager()
         brute_force = get_brute_force()
         audit = get_audit()
@@ -388,6 +394,29 @@ def create_app(config: SecurityConfig | None = None) -> FastAPI:
                 ),
                 status=401,
             )
+
+        if manager.totp_enabled():
+            if not totp_code:
+                # Not counted: an absent code is a form submitted before the
+                # operator saw the field, not a guess at the second factor.
+                return render_login(
+                    request,
+                    error="Enter the code from your authenticator app.",
+                    status=401,
+                )
+            if not manager.verify_second_factor(totp_code):
+                # The same chokepoint that counts a bad token, so the lockout
+                # cannot be escaped by bringing a stolen token to this form
+                # and guessing only the second factor.
+                record_auth_failure(client_ip, "/login", "totp")
+                return render_login(
+                    request,
+                    error=(
+                        "That code was not accepted. "
+                        f"{brute_force.get_attempts_remaining(client_ip)} attempts remaining."
+                    ),
+                    status=401,
+                )
 
         brute_force.record_success(client_ip)
         session = manager.create_session(client_ip)

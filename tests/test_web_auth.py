@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from wasm.cli.commands.web import add_start_arguments, build_security_config
+from wasm.core import totp
 from wasm.core.exceptions import SecurityError
 from wasm.web import auth as auth_module
 from wasm.web.auth import (
@@ -900,6 +901,327 @@ def test_declaring_a_tls_proxy_makes_the_cookie_secure(sandbox: Path) -> None:
         if key.lower() == "set-cookie" and value.startswith(f"{SESSION_COOKIE_NAME}=")
     )
     assert "Secure" in cookie_header
+
+
+# ------------------------------------------------------------- second factor
+
+
+def enable_totp(client: TestClient, csrf: str) -> tuple[str, list[str]]:
+    """
+    Enrol and confirm the second factor through the API.
+
+    Args:
+        client: A signed-in client.
+        csrf: The session's CSRF token.
+
+    Returns:
+        The shared secret and the backup codes shown at confirmation.
+    """
+    enroll = client.post("/api/auth/2fa/enroll", headers={CSRF_HEADER_NAME: csrf})
+    assert enroll.status_code == 200, enroll.text
+    secret = enroll.json()["secret"]
+
+    confirm = client.post(
+        "/api/auth/2fa/confirm",
+        json={"code": totp.totp_now(secret)},
+        headers={CSRF_HEADER_NAME: csrf},
+    )
+    assert confirm.status_code == 200, confirm.text
+    return secret, confirm.json()["backup_codes"]
+
+
+def test_with_two_factor_off_login_is_exactly_what_it_was(sandbox: Path) -> None:
+    """No code field on the form, no code required by the API."""
+    client = build_client(sandbox)
+    token = get_token_manager().generate_master_token()
+
+    assert 'name="totp_code"' not in client.get("/login").text
+    assert client.post("/api/auth/login", json={"token": token}).status_code == 200
+
+
+def test_enrollment_confirms_activates_and_issues_backup_codes_once(sandbox: Path) -> None:
+    """The full roundtrip: off, pending, on, with eight one-use codes."""
+    client = build_client(sandbox)
+    token = get_token_manager().generate_master_token()
+    csrf = login(client, token)["csrf_token"]
+
+    before = client.get("/api/auth/2fa").json()
+    assert before == {"enabled": False, "pending": False, "backup_codes_remaining": 0}
+
+    enroll = client.post("/api/auth/2fa/enroll", headers={CSRF_HEADER_NAME: csrf})
+    assert enroll.status_code == 200
+    secret = enroll.json()["secret"]
+    assert secret in enroll.json()["uri"]
+    assert enroll.json()["uri"].startswith("otpauth://totp/")
+    assert client.get("/api/auth/2fa").json()["pending"] is True
+
+    confirm = client.post(
+        "/api/auth/2fa/confirm",
+        json={"code": totp.totp_now(secret)},
+        headers={CSRF_HEADER_NAME: csrf},
+    )
+    assert confirm.status_code == 200
+    codes = confirm.json()["backup_codes"]
+    assert len(codes) == auth_module.BACKUP_CODE_COUNT
+    for code in codes:
+        assert len(code) == 9 and code[4] == "-", f"backup code format broke: {code}"
+
+    after = client.get("/api/auth/2fa").json()
+    assert after["enabled"] is True
+    assert after["pending"] is False
+    assert after["backup_codes_remaining"] == len(codes)
+
+
+def test_a_wrong_confirmation_code_does_not_activate_anything(sandbox: Path) -> None:
+    """A typo during enrolment leaves the second factor off."""
+    client = build_client(sandbox)
+    token = get_token_manager().generate_master_token()
+    csrf = login(client, token)["csrf_token"]
+
+    client.post("/api/auth/2fa/enroll", headers={CSRF_HEADER_NAME: csrf})
+    refused = client.post(
+        "/api/auth/2fa/confirm", json={"code": "000000"}, headers={CSRF_HEADER_NAME: csrf}
+    )
+
+    assert refused.status_code == 400
+    status = client.get("/api/auth/2fa").json()
+    assert status["enabled"] is False
+    assert status["pending"] is True
+    # And a login still needs no code, because nothing was activated.
+    assert client.post("/api/auth/login", json={"token": token}).status_code == 200
+
+
+def test_once_enabled_a_login_without_a_code_is_refused(sandbox: Path) -> None:
+    """The master token alone stops being enough."""
+    client = build_client(sandbox)
+    token = get_token_manager().generate_master_token()
+    csrf = login(client, token)["csrf_token"]
+    secret, _codes = enable_totp(client, csrf)
+
+    without = client.post("/api/auth/login", json={"token": token})
+    assert without.status_code == 401
+    assert "totp_code" in without.json()["detail"]
+
+    with_code = client.post(
+        "/api/auth/login", json={"token": token, "totp_code": totp.totp_now(secret)}
+    )
+    assert with_code.status_code == 200
+
+
+def test_a_wrong_second_factor_counts_toward_the_same_lockout(sandbox: Path) -> None:
+    """Bringing a stolen token and guessing only the code must still lock out."""
+    client = build_client(sandbox, max_failed_attempts=3, lockout_duration=60)
+    token = get_token_manager().generate_master_token()
+    csrf = login(client, token)["csrf_token"]
+    enable_totp(client, csrf)
+
+    statuses = [
+        client.post("/api/auth/login", json={"token": token, "totp_code": "000000"}).status_code
+        for _ in range(6)
+    ]
+
+    assert statuses[0] == 401, statuses
+    assert 429 in statuses, f"totp guessing was never locked out: {statuses}"
+    assert statuses[-1] == 429
+
+
+def test_a_backup_code_opens_one_login_and_only_one(sandbox: Path) -> None:
+    """Backup codes are consumed by use."""
+    client = build_client(sandbox)
+    token = get_token_manager().generate_master_token()
+    csrf = login(client, token)["csrf_token"]
+    _secret, codes = enable_totp(client, csrf)
+
+    first = client.post("/api/auth/login", json={"token": token, "totp_code": codes[0]})
+    assert first.status_code == 200
+
+    replay = client.post("/api/auth/login", json={"token": token, "totp_code": codes[0]})
+    assert replay.status_code == 401
+
+    remaining = client.get("/api/auth/2fa").json()["backup_codes_remaining"]
+    assert remaining == len(codes) - 1
+
+
+def test_disable_requires_a_current_code_and_restores_plain_login(sandbox: Path) -> None:
+    """The switch that turns the second factor off is itself guarded by it."""
+    client = build_client(sandbox)
+    token = get_token_manager().generate_master_token()
+    csrf = login(client, token)["csrf_token"]
+    secret, _codes = enable_totp(client, csrf)
+
+    refused = client.post(
+        "/api/auth/2fa/disable", json={"code": "000000"}, headers={CSRF_HEADER_NAME: csrf}
+    )
+    assert refused.status_code == 400
+    assert client.get("/api/auth/2fa").json()["enabled"] is True
+    # The wrong code was counted where every other credential guess is.
+    denied = [e for e in read_audit(sandbox) if e["action"] == "auth.credential"]
+    assert any(e["resource"] == "/api/auth/2fa/disable" for e in denied)
+
+    accepted = client.post(
+        "/api/auth/2fa/disable",
+        json={"code": totp.totp_now(secret)},
+        headers={CSRF_HEADER_NAME: csrf},
+    )
+    assert accepted.status_code == 200
+    assert client.get("/api/auth/2fa").json() == {
+        "enabled": False,
+        "pending": False,
+        "backup_codes_remaining": 0,
+    }
+    assert client.post("/api/auth/login", json={"token": token}).status_code == 200
+
+
+def test_a_backup_code_can_disable_when_the_authenticator_is_lost(sandbox: Path) -> None:
+    """Losing the phone must not mean losing the panel."""
+    client = build_client(sandbox)
+    token = get_token_manager().generate_master_token()
+    csrf = login(client, token)["csrf_token"]
+    _secret, codes = enable_totp(client, csrf)
+
+    response = client.post(
+        "/api/auth/2fa/disable", json={"code": codes[-1]}, headers={CSRF_HEADER_NAME: csrf}
+    )
+
+    assert response.status_code == 200
+    assert client.get("/api/auth/2fa").json()["enabled"] is False
+
+
+def test_the_secret_never_appears_again_after_confirmation(sandbox: Path, runner: object) -> None:
+    """
+    One screen sees the secret once; no response or audit line repeats it.
+
+    Args:
+        sandbox: Per-test temporary directory.
+        runner: The fake command runner, so rendering /settings reaches no
+            real process.
+    """
+    client = build_client(sandbox)
+    token = get_token_manager().generate_master_token()
+    csrf = login(client, token)["csrf_token"]
+    secret, codes = enable_totp(client, csrf)
+
+    responses = [
+        client.get("/api/auth/2fa"),
+        client.post("/api/auth/login", json={"token": token, "totp_code": totp.totp_now(secret)}),
+        client.get("/settings"),
+    ]
+    for response in responses:
+        assert secret not in response.text, response.request.url
+
+    raw_audit = (sandbox / "state" / "web-audit.log").read_text()
+    assert secret not in raw_audit
+    for code in codes:
+        assert code not in raw_audit, "a backup code reached the audit log"
+
+    entries = read_audit(sandbox)
+    for action in ("auth.2fa.enroll", "auth.2fa.confirm"):
+        assert any(e["action"] == action and e["result"] == "success" for e in entries), action
+
+
+def test_the_two_factor_state_file_is_owner_only(sandbox: Path) -> None:
+    """The secret at rest gets the same 0600 the signing key gets."""
+    client = build_client(sandbox)
+    token = get_token_manager().generate_master_token()
+    csrf = login(client, token)["csrf_token"]
+    enable_totp(client, csrf)
+
+    state_file = sandbox / "state" / "web-totp"
+    assert state_file.exists()
+    assert state_file.stat().st_mode & 0o777 == 0o600
+    stored = json.loads(state_file.read_text())
+    assert stored["enabled"] is True
+    # Backup codes at rest are hashes, never the codes themselves.
+    assert all(len(entry) == 64 for entry in stored["backup_codes"])
+
+
+def test_a_corrupt_state_file_refuses_rather_than_waves_through(sandbox: Path) -> None:
+    """Treating a truncated file as "off" would be a silent bypass."""
+    manager = TokenManager(make_config(sandbox))
+    manager.config.totp_file.write_text("{not json")
+
+    with pytest.raises(SecurityError) as excinfo:
+        manager.totp_enabled()
+
+    assert excinfo.value.details
+    manager.sessions.close()
+
+
+def test_the_browser_form_gains_the_code_field_only_when_it_is_read(sandbox: Path) -> None:
+    """The form flow: field appears, code is required, wrong code is counted."""
+    client = build_client(sandbox, max_failed_attempts=3, lockout_duration=60)
+    token = get_token_manager().generate_master_token()
+    csrf = login(client, token)["csrf_token"]
+    secret, _codes = enable_totp(client, csrf)
+    client.cookies.clear()
+
+    form = client.get("/login").text
+    assert 'name="totp_code"' in form
+    assert "Authenticator code" in form
+
+    missing = client.post("/login", data={"token": token}, follow_redirects=False)
+    assert missing.status_code == 401
+    assert "authenticator" in missing.text.lower()
+
+    wrong = client.post(
+        "/login", data={"token": token, "totp_code": "000000"}, follow_redirects=False
+    )
+    assert wrong.status_code == 401
+    assert "attempts remaining" in wrong.text
+
+    good = client.post(
+        "/login",
+        data={"token": token, "totp_code": totp.totp_now(secret)},
+        follow_redirects=False,
+    )
+    assert good.status_code == 303
+    assert good.headers["location"] == "/"
+
+
+def test_the_settings_fragment_flow_enrolls_confirms_and_disables(
+    sandbox: Path, runner: object
+) -> None:
+    """
+    The htmx adapters drive the same implementation the JSON API does.
+
+    Args:
+        sandbox: Per-test temporary directory.
+        runner: The fake command runner, so rendering /settings reaches no
+            real process.
+    """
+    client = build_client(sandbox)
+    token = get_token_manager().generate_master_token()
+    csrf = login(client, token)["csrf_token"]
+    headers = {CSRF_HEADER_NAME: csrf}
+
+    page = client.get("/settings").text
+    assert "Two-factor authentication" in page
+    assert 'hx-post="/settings/2fa/enroll"' in page
+
+    enroll = client.post("/settings/2fa/enroll", headers=headers)
+    assert enroll.status_code == 200
+    assert "data-totp-uri=" in enroll.text
+    secret = get_token_manager().pending_totp_secret()
+    assert secret is not None
+    assert secret in enroll.text, "the manual key is not on the enrolment screen"
+
+    wrong = client.post("/settings/2fa/confirm", data={"code": "000000"}, headers=headers)
+    assert wrong.status_code == 200
+    assert "was not accepted" in wrong.text
+    assert "data-totp-uri=" in wrong.text, "a refused code must re-show the QR"
+
+    confirmed = client.post(
+        "/settings/2fa/confirm", data={"code": totp.totp_now(secret)}, headers=headers
+    )
+    assert confirmed.status_code == 200
+    assert "backup" in confirmed.text.lower()
+    assert secret not in confirmed.text, "the secret survived past confirmation"
+
+    disabled = client.post(
+        "/settings/2fa/disable", data={"code": totp.totp_now(secret)}, headers=headers
+    )
+    assert disabled.status_code == 200
+    assert 'hx-post="/settings/2fa/enroll"' in disabled.text
 
 
 def test_rate_limiter_does_not_grow_without_bound() -> None:

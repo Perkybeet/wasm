@@ -39,6 +39,11 @@
     "sha256": "71ea67185bfa8c98c39d31717c6fce5d852370fcdfd129db4543774d3145c0de",
     "url": "https://cdn.jsdelivr.net/npm/htmx.org@2.0.10/dist/htmx.min.js"
   },
+  "qrcodegen.js": {
+    "licence": "MIT",
+    "sha256": "daa3aa30adbaf99c4e415f33b9042767e74f053896e55ad06f898d344917d2a7",
+    "url": "https://cdn.jsdelivr.net/npm/nayuki-qr-code-generator@1.8.0/index.js"
+  },
   "uplot.min.css": {
     "licence": "MIT",
     "sha256": "df630c6a8d6f8eeaff264b50f73ce5b114f646ffd9a0bb74f049b0a00135fa04",

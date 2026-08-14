@@ -26,7 +26,7 @@ from collections.abc import Callable, Coroutine
 from typing import Any
 from urllib.parse import parse_qs
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.routing import APIRoute
 from pydantic import ValidationError
@@ -563,14 +563,165 @@ def settings(request: Request) -> HTMLResponse:
         request: The incoming request.
 
     Returns:
-        The settings page.
+        The settings page, including the two-factor authentication section.
     """
     sections, problem = resources.settings_sections()
+    context: dict[str, Any] = {"sections": sections, "problem": problem}
+    context.update(_totp_context())
+    return page(request, "pages/settings.html", context)
+
+
+def _totp_context(
+    enroll: Any = None,
+    backup_codes: list[str] | None = None,
+    problem: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """
+    Build the context the two-factor fragment renders from.
+
+    Args:
+        enroll: A begun enrolment (secret and URI), when one is on screen.
+        backup_codes: Freshly issued backup codes, shown exactly once.
+        problem: A ``fix``/``output`` mapping when a code was refused.
+
+    Returns:
+        The fragment context. The active secret is never in it: only a pending,
+        unconfirmed enrolment ever renders one.
+    """
+    from wasm.web.server import get_token_manager
+
+    return {
+        "totp": get_token_manager().totp_status(),
+        "totp_enroll": enroll,
+        "totp_backup_codes": backup_codes,
+        "totp_problem": problem,
+    }
+
+
+def _totp_fragment(
+    request: Request,
+    *,
+    enroll: Any = None,
+    backup_codes: list[str] | None = None,
+    problem: dict[str, str] | None = None,
+) -> HTMLResponse:
+    """
+    Render the two-factor section for an htmx swap.
+
+    Refusals render at 200 on purpose: htmx does not swap an error status, so
+    a 400 here would leave the screen frozen and report the refusal nowhere.
+    The refusal is on the fragment itself, as a problem block, which is where
+    the operator is looking.
+
+    Args:
+        request: The incoming request.
+        enroll: A begun enrolment to show.
+        backup_codes: Freshly issued backup codes to show once.
+        problem: A ``fix``/``output`` mapping when a code was refused.
+
+    Returns:
+        The rendered fragment.
+    """
     return page(
         request,
-        "pages/settings.html",
-        {"sections": sections, "problem": problem},
+        "fragments/totp.html",
+        _totp_context(enroll=enroll, backup_codes=backup_codes, problem=problem),
     )
+
+
+def _form_code(body: bytes) -> str:
+    """
+    Read the ``code`` field out of an urlencoded fragment form.
+
+    Args:
+        body: The raw request body.
+
+    Returns:
+        The submitted code, stripped.
+    """
+    return parse_qs(body.decode("utf-8", errors="replace")).get("code", [""])[0].strip()
+
+
+# These three handlers are adapters over the JSON API, exactly like the deploy
+# form: the work, the auditing and the lockout accounting live in
+# wasm.web.api.auth, and a second implementation of "enable two-factor" is what
+# the panel must never grow. They stay synchronous - the contract for page
+# handlers - which is why the body arrives as a Body(bytes) parameter FastAPI
+# reads off the event loop, rather than through an await of our own.
+
+
+@router.post("/settings/2fa/enroll", response_class=HTMLResponse)
+def totp_enroll(request: Request) -> HTMLResponse:
+    """
+    Begin enrolment and show the QR, the manual key and the confirm field.
+
+    Args:
+        request: The incoming request.
+
+    Returns:
+        The enrolment fragment.
+    """
+    from wasm.web.api.auth import two_factor_enroll
+
+    session = getattr(request.state, "session", {})
+    enrollment = two_factor_enroll(request, session)
+    return _totp_fragment(request, enroll=enrollment)
+
+
+@router.post("/settings/2fa/confirm", response_class=HTMLResponse)
+def totp_confirm(request: Request, body: bytes = Body(default=b"")) -> HTMLResponse:
+    """
+    Confirm enrolment with a code and show the backup codes once.
+
+    Args:
+        request: The incoming request.
+        body: The urlencoded form carrying the code.
+
+    Returns:
+        The fragment with the backup codes, or the enrolment again with the
+        refusal when the code did not verify.
+    """
+    from wasm.web.api.auth import TwoFactorCode, two_factor_confirm
+
+    session = getattr(request.state, "session", {})
+    try:
+        confirmed = two_factor_confirm(request, TwoFactorCode(code=_form_code(body)), session)
+    except HTTPException as exc:
+        from wasm.web.api.auth import enrollment_uri
+        from wasm.web.server import get_token_manager
+
+        pending = get_token_manager().pending_totp_secret()
+        enroll = (
+            {"secret": pending, "uri": enrollment_uri(pending)} if pending is not None else None
+        )
+        return _totp_fragment(
+            request, enroll=enroll, problem={"fix": str(exc.detail), "output": ""}
+        )
+    return _totp_fragment(request, backup_codes=confirmed.backup_codes)
+
+
+@router.post("/settings/2fa/disable", response_class=HTMLResponse)
+def totp_disable(request: Request, body: bytes = Body(default=b"")) -> HTMLResponse:
+    """
+    Turn the second factor off, on presentation of a current code.
+
+    Args:
+        request: The incoming request.
+        body: The urlencoded form carrying the code.
+
+    Returns:
+        The fragment in its new state, or with the refusal when the code did
+        not verify. A wrong code here counts against the same lockout a failed
+        login does; that accounting lives in the API function this adapts.
+    """
+    from wasm.web.api.auth import TwoFactorCode, two_factor_disable
+
+    session = getattr(request.state, "session", {})
+    try:
+        two_factor_disable(request, TwoFactorCode(code=_form_code(body)), session)
+    except HTTPException as exc:
+        return _totp_fragment(request, problem={"fix": str(exc.detail), "output": ""})
+    return _totp_fragment(request)
 
 
 @router.post("/logout")
