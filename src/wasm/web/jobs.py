@@ -654,6 +654,7 @@ def deploy_app_job(
         ssl=ssl,
         branch=branch,
         env_vars=env_vars or {},
+        trigger="panel",
     )
 
     context.update("Deploying", 10)
@@ -714,6 +715,7 @@ def update_app_job(
         ssl=app.ssl_enabled,
         branch=app.branch,
         env_vars=app.env_vars,
+        trigger="panel",
     )
 
     context.update("Redeploying", 30)
@@ -930,7 +932,9 @@ def rollback_app_job(
     context.set_metadata("backup_id", backup_id)
     context.update("Rolling back", 20)
 
-    if not RollbackManager(verbose=False).rollback(domain=domain, backup_id=backup_id):
+    if not RollbackManager(verbose=False).rollback(
+        domain=domain, backup_id=backup_id, trigger="panel"
+    ):
         raise RollbackError(
             f"Rollback failed for {domain}",
             details="Check that a backup exists with 'wasm backup list'.",

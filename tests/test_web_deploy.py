@@ -382,3 +382,85 @@ def test_markup_typed_into_the_form_comes_back_escaped(client: TestClient) -> No
     body = client.post("/apps/new", data={**FORM, "domain": '"><script>alert(1)</script>'}).text
 
     assert "<script>alert(1)</script>" not in body
+
+
+# ---------------------------------------------------------------------------
+# The jobs say who triggered them
+# ---------------------------------------------------------------------------
+
+
+def _job_context() -> Any:
+    """
+    Build a job context outside the job manager, discarding notifications.
+
+    Returns:
+        A context the job functions accept.
+    """
+    from wasm.web.jobs import Job, JobContext, JobType
+
+    job = Job(id="job-test", type=JobType.DEPLOY, name="deploy", description="")
+    return JobContext(job, lambda _job: None)
+
+
+def test_deploy_job_hands_the_panel_trigger_to_the_deployer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The deployment history records who initiated each run, and the recording
+    lives in the deployer. The job's whole contribution is the word "panel";
+    losing it would file every panel deploy as a CLI one.
+
+    Args:
+        monkeypatch: Patching helper, scoped to the test.
+    """
+    from wasm.web.jobs import deploy_app_job
+
+    captured: dict[str, Any] = {}
+
+    class FakeDeployer:
+        """Records how it was configured and deploys nothing."""
+
+        def configure(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        def deploy(self) -> bool:
+            return True
+
+    monkeypatch.setattr("wasm.deployers.get_deployer", lambda *a, **k: FakeDeployer())
+
+    deploy_app_job(
+        "app.example.com",
+        "https://github.com/you/app",
+        "nodejs",
+        job_context=_job_context(),
+    )
+
+    assert captured["trigger"] == "panel"
+
+
+def test_rollback_job_hands_the_panel_trigger_to_the_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Args:
+        monkeypatch: Patching helper, scoped to the test.
+    """
+    from wasm.web.jobs import rollback_app_job
+
+    captured: dict[str, Any] = {}
+
+    class FakeRollbackManager:
+        """Records the rollback request instead of restoring anything."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def rollback(self, **kwargs: Any) -> bool:
+            captured.update(kwargs)
+            return True
+
+    monkeypatch.setattr("wasm.managers.backup_manager.RollbackManager", FakeRollbackManager)
+
+    rollback_app_job("app.example.com", backup_id="backup-1", job_context=_job_context())
+
+    assert captured["trigger"] == "panel"

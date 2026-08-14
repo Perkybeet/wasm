@@ -86,8 +86,9 @@ from wasm.core.fs import (
 )
 from wasm.core.logger import Logger
 from wasm.core.runner import DEFAULT_TIMEOUT, CommandResult, CommandRunner, get_runner
-from wasm.core.store import get_store
+from wasm.core.store import DeploymentTrigger, get_store
 from wasm.core.utils import domain_to_app_name
+from wasm.deployers.recorder import CapturingLogger, DeploymentRecorder
 from wasm.managers.service_manager import ServiceManager
 from wasm.managers.source_manager import SourceError, extract_archive
 from wasm.validators.names import resolve_within, validate_app_name, validate_filename
@@ -2360,7 +2361,9 @@ class RollbackManager:
             fs: Filesystem passed to the backup manager it drives.
         """
         self.verbose = verbose
-        self.logger = Logger(verbose=verbose)
+        # Capturable so the rollback recording can mirror what this manager
+        # reports into the captured log.
+        self.logger = CapturingLogger(verbose=verbose)
         self.backup_manager = BackupManager(verbose=verbose, runner=runner, fs=fs)
         self.service_manager = ServiceManager(verbose=verbose, runner=runner)
         self.config = Config()
@@ -2399,14 +2402,26 @@ class RollbackManager:
         domain: str,
         backup_id: str | None = None,
         rebuild: bool = True,
+        trigger: str = DeploymentTrigger.CLI.value,
     ) -> bool:
         """
         Roll an application back to a previous state.
+
+        The rollback is recorded in the deployment history as **its own row**,
+        with its outcome and its captured log, never by rewriting the history
+        of the deploy it reverts: an operator triggered an operation and the
+        history must say so. On success the domain's most recent ``success``
+        row - the build this rollback discards - is additionally flipped to
+        ``rolled_back`` when one exists, so the timeline shows which
+        deployment stopped serving. Refusals before anything is attempted (no
+        backup to roll back to) are not recorded: nothing ran.
 
         Args:
             domain: Domain name.
             backup_id: Specific backup (defaults to the latest manual one).
             rebuild: Rebuild the application after the restore.
+            trigger: What initiated the rollback, recorded in the history:
+                ``cli`` (the default), ``panel`` or ``webhook``.
 
         Returns:
             True if the rollback succeeded.
@@ -2435,53 +2450,74 @@ class RollbackManager:
                 else:
                     raise BackupError(f"No backups found for: {domain}")
 
-        self.logger.info(f"Rolling back to: {metadata.id}")
-        self.logger.info(f"  Created: {metadata.age}")
-        if metadata.git_commit:
-            self.logger.info(f"  Commit: {metadata.git_commit}")
-
-        self.backup_manager.restore(
-            backup_id=metadata.id,
-            restore_env=True,
-            stop_service=True,
-        )
-
-        app_name = domain_to_app_name(domain)
-
-        if rebuild:
-            app_path = self.config.apps_directory / app_name
-
-            self.logger.info("Rebuilding application...")
-
-            from wasm.deployers import detect_app_type, get_deployer
-
-            app_type = detect_app_type(app_path, verbose=self.verbose)
-            if app_type:
-                deployer = get_deployer(app_type, verbose=self.verbose)
-                # The source is already on disk: this is a rebuild in place, not
-                # a deployment, so the restored directory is its own source.
-                deployer.configure(domain, source=str(app_path), app_path=app_path)
-
-                if isinstance(deployer, _InPlaceRebuilder):
-                    try:
-                        deployer.install_dependencies()
-                        deployer.build()
-                    except WASMError as exc:
-                        self.logger.warning(f"Rebuild failed: {exc}")
-                        self.logger.info("Application restored but may need manual rebuild")
-                else:
-                    self.logger.warning(
-                        f"The {app_type} deployer cannot rebuild in place; "
-                        "the files are restored but not rebuilt"
-                    )
+        recorder = DeploymentRecorder(get_store(), domain, trigger, logger=self.logger)
+        recorder.start()
+        recorder.annotate(git_commit=metadata.git_commit, git_branch=metadata.git_branch)
 
         try:
-            status = self.service_manager.get_status(app_name)
-            if status.get("exists"):
-                self.service_manager.start(app_name)
-        except ServiceError as exc:
-            self.logger.debug(f"Could not start service: {exc}")
+            self.logger.info(f"Rolling back to: {metadata.id}")
+            self.logger.info(f"  Created: {metadata.age}")
+            if metadata.git_commit:
+                self.logger.info(f"  Commit: {metadata.git_commit}")
 
+            self.backup_manager.restore(
+                backup_id=metadata.id,
+                restore_env=True,
+                stop_service=True,
+            )
+
+            app_name = domain_to_app_name(domain)
+
+            if rebuild:
+                app_path = self.config.apps_directory / app_name
+
+                self.logger.info("Rebuilding application...")
+
+                from wasm.deployers import detect_app_type, get_deployer
+
+                app_type = detect_app_type(app_path, verbose=self.verbose)
+                if app_type:
+                    deployer = get_deployer(app_type, verbose=self.verbose)
+                    # The rebuild happens through the deployer's own logger;
+                    # capturing it puts the build output in this rollback's
+                    # log. The interface does not promise a logger, so one
+                    # that is missing or not capturable is simply not mirrored.
+                    delegate_logger = getattr(deployer, "logger", None)
+                    if isinstance(delegate_logger, Logger):
+                        recorder.also_capture(delegate_logger)
+                    # The source is already on disk: this is a rebuild in place,
+                    # not a deployment, so the restored directory is its own
+                    # source.
+                    deployer.configure(domain, source=str(app_path), app_path=app_path)
+
+                    if isinstance(deployer, _InPlaceRebuilder):
+                        try:
+                            deployer.install_dependencies()
+                            deployer.build()
+                        except WASMError as exc:
+                            self.logger.warning(f"Rebuild failed: {exc}")
+                            self.logger.info("Application restored but may need manual rebuild")
+                    else:
+                        self.logger.warning(
+                            f"The {app_type} deployer cannot rebuild in place; "
+                            "the files are restored but not rebuilt"
+                        )
+
+            try:
+                status = self.service_manager.get_status(app_name)
+                if status.get("exists"):
+                    self.service_manager.start(app_name)
+            except ServiceError as exc:
+                self.logger.debug(f"Could not start service: {exc}")
+        except Exception as exc:
+            # Not handling: the failure is recorded and re-raised unchanged.
+            recorder.finish_failure(exc)
+            raise
+
+        # The restore succeeded, so the newest successful deployment is the
+        # build that just stopped serving.
+        recorder.mark_previous_success_rolled_back()
+        recorder.finish_success()
         return True
 
     def list_rollback_points(self, domain: str) -> list[BackupMetadata]:

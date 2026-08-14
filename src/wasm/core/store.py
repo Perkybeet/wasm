@@ -1391,6 +1391,73 @@ class WASMStore:
             )
         return deployment_id
 
+    def annotate_deployment(
+        self,
+        deployment_id: int,
+        *,
+        log_path: str | None = None,
+        git_commit: str | None = None,
+        git_branch: str | None = None,
+    ) -> bool:
+        """
+        Record facts about a deployment that are only learned after it starts.
+
+        The captured log is named after the row id, so the row has to exist
+        before its path does; the commit being deployed is only known once the
+        fetch step has run. Both arrive here instead of widening
+        :meth:`record_deployment_start` with values nobody has yet.
+
+        Args:
+            deployment_id: Id returned by :meth:`record_deployment_start`.
+            log_path: Where the captured build log is written.
+            git_commit: Commit being deployed (short hash).
+            git_branch: Branch being deployed.
+
+        Returns:
+            True if the row exists and something was updated. None arguments
+            leave their columns as they are.
+        """
+        updates = []
+        params: list[Any] = []
+        for column, value in (
+            ("log_path", log_path),
+            ("git_commit", git_commit),
+            ("git_branch", git_branch),
+        ):
+            if value is not None:
+                updates.append(f"{column} = ?")
+                params.append(value)
+
+        if not updates:
+            return False
+
+        params.append(deployment_id)
+        with self._transaction() as cursor:
+            cursor.execute(f"UPDATE deployments SET {', '.join(updates)} WHERE id = ?", params)
+            return cursor.rowcount > 0
+
+    def mark_deployment_rolled_back(self, deployment_id: int) -> bool:
+        """
+        Reclassify a finished deployment as rolled back, keeping its timing.
+
+        Not :meth:`finish_deployment`: that recomputes ``finished_at`` and
+        ``duration_s``, which is right for a run that is ending and wrong for
+        a record being reclassified days later - the original duration is
+        history, not state. So this changes the status and nothing else.
+
+        Args:
+            deployment_id: Id of the deployment whose build was rolled back.
+
+        Returns:
+            True if the row exists and was updated.
+        """
+        with self._transaction() as cursor:
+            cursor.execute(
+                "UPDATE deployments SET status = ? WHERE id = ?",
+                (DeploymentStatus.ROLLED_BACK.value, deployment_id),
+            )
+            return cursor.rowcount > 0
+
     def finish_deployment(self, deployment_id: int, status: str, error: str | None = None) -> None:
         """
         Record the outcome of a deployment.

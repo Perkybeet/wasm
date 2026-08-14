@@ -23,11 +23,12 @@ from typing import Any, ClassVar, Literal
 from wasm.core.config import Config
 from wasm.core.exceptions import BuildError, DeploymentError, OutOfMemoryError, WASMError
 from wasm.core.fs import FileSystem
-from wasm.core.logger import Icons, Logger
+from wasm.core.logger import Icons
 from wasm.core.runner import CommandResult, CommandRunner, get_runner
 from wasm.core.store import (
     App,
     AppStatus,
+    DeploymentTrigger,
     get_store,
 )
 from wasm.core.utils import domain_to_app_name
@@ -45,6 +46,7 @@ from wasm.deployers.helpers.registration import StoreRegistrar
 from wasm.deployers.helpers.summary import print_deployment_summary
 from wasm.deployers.interface import AppDeployer, StepReporter, UpdateResult
 from wasm.deployers.pipeline import DeployStep, run_pipeline
+from wasm.deployers.recorder import CapturingLogger, DeploymentRecorder
 from wasm.managers.apache_manager import ApacheManager
 from wasm.managers.cert_manager import CertManager
 from wasm.managers.nginx_manager import NginxManager
@@ -105,7 +107,9 @@ class BaseDeployer(AppDeployer):
         """
         self.verbose = verbose
         self.config = Config()
-        self.logger = Logger(verbose=verbose)
+        # Capturable so a deployment recording can mirror the full build
+        # output, including the detail a non-verbose console suppresses.
+        self.logger = CapturingLogger(verbose=verbose)
         self.store = get_store()
         self._runner = runner
         self._fs = fs
@@ -138,6 +142,7 @@ class BaseDeployer(AppDeployer):
         self.include_www: bool = False
         self.branch: str | None = None
         self.env_vars: dict[str, str] = {}
+        self.trigger: str = DeploymentTrigger.CLI.value
 
         # Package manager (auto = auto-detect)
         self._package_manager: PackageManager = "auto"
@@ -233,6 +238,7 @@ class BaseDeployer(AppDeployer):
         app_path: Path | None = None,
         package_manager: str = "auto",
         include_www: bool = False,
+        trigger: str = DeploymentTrigger.CLI.value,
         **options: Any,
     ) -> None:
         """
@@ -249,6 +255,8 @@ class BaseDeployer(AppDeployer):
             app_path: Custom application path.
             package_manager: Package manager to use (npm/pnpm/bun/auto).
             include_www: Include www subdomain in certificate and web server config.
+            trigger: What initiated this deployment, recorded in the history:
+                ``cli`` (the default), ``panel`` or ``webhook``.
             **options: Accepted and ignored, so a caller can pass the union of
                 every deployer's settings without knowing which one it got.
         """
@@ -262,6 +270,7 @@ class BaseDeployer(AppDeployer):
         self.include_www = include_www and should_include_www(domain)
         self.branch = branch
         self.env_vars = env_vars or {}
+        self.trigger = trigger
         self._package_manager = package_manager  # type: ignore[assignment]
 
         # Set app name and path
@@ -1226,6 +1235,40 @@ class BaseDeployer(AppDeployer):
         if self.app_name:
             self.store.update_service_status(self.app_name, active=True, enabled=True)
 
+    def _recorder(self) -> DeploymentRecorder:
+        """
+        Build the recorder :meth:`deploy` and :meth:`update` write history with.
+
+        Returns:
+            A recorder for this deployment attempt, wired to this deployer's
+            store, logger and filesystem. One shared construction site, so the
+            deploy and update paths cannot record differently.
+        """
+        return DeploymentRecorder(
+            self.store,
+            self.domain,
+            self.trigger,
+            logger=self.logger,
+            fs=self.fs,
+            git_info=self._git_info,
+        )
+
+    def _git_info(self) -> tuple[str | None, str | None]:
+        """
+        Read the short commit and branch of the deployed tree, when it is one.
+
+        Returns:
+            ``(commit, branch)``, each None when the tree is not a git
+            checkout or the information is unavailable. Test doubles stand in
+            for the source manager without implementing all of it, so a
+            manager that cannot answer is treated as "unknown", not an error.
+        """
+        reader = getattr(self.source_manager, "get_repo_info", None)
+        if reader is None or not self.app_path:
+            return None, None
+        info = reader(self.app_path)
+        return info.get("commit"), info.get("branch")
+
     def update(self, on_step: StepReporter | None = None) -> UpdateResult:
         """
         Rebuild this application in place, without a full redeploy.
@@ -1234,6 +1277,10 @@ class BaseDeployer(AppDeployer):
         the deployer step by step and reached into ``_package_manager`` to do
         it. Keeping it here means the update path is the deployer's own, gets
         the same detection and error handling as a deploy, and can be tested.
+
+        Like a deploy, an update is recorded in the deployment history with
+        its build log captured; recording failures are reported and never
+        fail the update itself.
 
         Args:
             on_step: Called as each step begins.
@@ -1246,29 +1293,39 @@ class BaseDeployer(AppDeployer):
         """
         report = on_step or (lambda _message: None)
 
-        report("Inspecting the project")
-        self.pre_install()
+        recorder = self._recorder()
+        recorder.start(git_branch=self.branch)
+        try:
+            report("Inspecting the project")
+            self.pre_install()
 
-        report("Installing dependencies")
-        self.install_dependencies()
+            report("Installing dependencies")
+            self.install_dependencies()
 
-        prisma_updated = False
-        if self.has_prisma:
-            report("Updating Prisma")
-            self.generate_prisma()
-            self.run_prisma_migrate(deploy=True)
-            prisma_updated = True
+            prisma_updated = False
+            if self.has_prisma:
+                report("Updating Prisma")
+                self.generate_prisma()
+                self.run_prisma_migrate(deploy=True)
+                prisma_updated = True
 
-        report("Building")
-        self.build()
+            report("Building")
+            self.build()
 
-        start_command = self.get_start_command()
-        return UpdateResult(
-            package_manager=self.package_manager,
-            prisma_updated=prisma_updated,
-            is_static=not bool(start_command),
-            start_command=start_command,
-        )
+            start_command = self.get_start_command()
+            result = UpdateResult(
+                package_manager=self.package_manager,
+                prisma_updated=prisma_updated,
+                is_static=not bool(start_command),
+                start_command=start_command,
+            )
+        except Exception as exc:
+            # Not handling: the failure is recorded and re-raised unchanged.
+            recorder.finish_failure(exc)
+            raise
+
+        recorder.finish_success()
+        return result
 
     def deploy(self, total_steps: int = 7) -> bool:
         """
@@ -1278,6 +1335,10 @@ class BaseDeployer(AppDeployer):
         what surrounds it: validation, the store row that tracks progress, and
         reporting. A step that fails undoes every step that ran before it,
         including the app row, so a failed first deployment leaves nothing.
+
+        Every run is also recorded in the deployment history with its build
+        log captured to a file; recording failures are reported as warnings
+        and never fail the deployment itself.
 
         Args:
             total_steps: Ignored. The pipeline knows how many steps it has;
@@ -1317,6 +1378,8 @@ class BaseDeployer(AppDeployer):
                 ),
             )
 
+        recorder = self._recorder()
+        recorder.start(git_branch=self.branch)
         try:
             run_pipeline(steps, self.logger)
         except Exception as e:
@@ -1325,8 +1388,10 @@ class BaseDeployer(AppDeployer):
                 self._app_record.status = AppStatus.FAILED.value
                 self.store.update_app(self._app_record)
             self.logger.error(f"Deployment failed: {e}")
+            recorder.finish_failure(e)
             raise
 
+        recorder.finish_success()
         self._report_result()
         return True
 
