@@ -1,3 +1,9 @@
+wasm (1.6.0-1) unstable; urgency=medium
+
+  * Visual redesign: Geist typography, indigo accent, refined components and a common page skeleton across the panel
+
+ -- Yago Lopez Prado <yago.lopez.adeje@gmail.com>  Fri, 14 Aug 2026 15:31:17 +0000
+
 wasm (1.5.1-1) unstable; urgency=medium
 
   * Fix: panel failed to start on distro pydantic v1 (Ubuntu 24.04); pydantic v1/v2 bridge with architecture guards and distro-import CI gates
