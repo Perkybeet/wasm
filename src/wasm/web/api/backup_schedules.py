@@ -29,7 +29,7 @@ import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 from wasm.core.exceptions import BackupError
 from wasm.core.utils import domain_to_app_name
@@ -41,6 +41,7 @@ from wasm.managers.backup_scheduler import (
 )
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import WASMErrorRoute, strict_domain
+from wasm.web.pydantic_compat import field_validator
 
 router = APIRouter(route_class=WASMErrorRoute)
 

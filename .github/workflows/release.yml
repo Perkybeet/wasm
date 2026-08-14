@@ -216,6 +216,34 @@ jobs:
           wasm list --help > /dev/null
           echo "The package installs and the command runs"
 
+      # The panel must import against the pydantic this distribution actually
+      # packages, not the one pip installs. Ubuntu 24.04 ships pydantic 1.10
+      # while pip, and therefore every other job in CI, runs pydantic 2:
+      # v1.5.0 imported `field_validator`, a pydantic-2-only name, and
+      # `wasm web start` died with ImportError on every Ubuntu 24.04 install
+      # while the whole test suite stayed green. The web stack is a
+      # Recommends, so this installs it exactly as `apt install wasm` would
+      # and then imports the real web layer.
+      - name: Import the panel with the distribution's own web stack
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get install -y python3-fastapi python3-starlette python3-pydantic \
+            python3-uvicorn python3-psutil || true
+          if ! python3 -c "import fastapi" 2> /dev/null; then
+            echo "This distribution does not package the web stack; the panel needs pip here. Skipping."
+            exit 0
+          fi
+          # FastAPI grew pydantic 2 support (and the panel's minimum surface)
+          # in 0.100. Debian 12 packages 0.92 and Ubuntu 22.04 something older
+          # still, so on those the panel is pip-only and there is nothing to
+          # check against the archive.
+          if ! python3 -c "import fastapi, sys; sys.exit(0 if tuple(map(int, fastapi.__version__.split('.')[:2])) >= (0, 100) else 1)"; then
+            echo "fastapi $(python3 -c 'import fastapi; print(fastapi.__version__)') predates 0.100; the panel needs pip here. Skipping."
+            exit 0
+          fi
+          python3 -c "import fastapi, pydantic; print('fastapi', fastapi.__version__, '/ pydantic', pydantic.VERSION)"
+          python3 -c "import wasm.web.api.router, wasm.web.server; print('The panel imports against the distribution web stack')"
+
   # The same thing for the RPM distributions, which are thirteen of the
   # twenty-two OBS targets and were the thirteen that failed.
   #
@@ -319,6 +347,36 @@ jobs:
           wasm --help > /dev/null
           wasm list --help > /dev/null
           echo "The package installs and the command runs"
+
+      # The same claim the deb job makes: the panel imports against the
+      # pydantic this distribution packages, which on the RPM side is 2.x and
+      # is the other half of the bridge in wasm.web.pydantic_compat. The web
+      # stack is a Suggests in the spec, so it is installed here explicitly.
+      - name: Import the panel with the distribution's own web stack
+        run: |
+          if command -v dnf > /dev/null; then
+            dnf install -y python3-fastapi python3-starlette python3-pydantic \
+              python3-uvicorn python3-psutil || true
+          else
+            zypper --non-interactive install -y python3-fastapi python3-starlette \
+              python3-pydantic python3-uvicorn python3-psutil || true
+          fi
+          # Leap 15.6 builds the python 3.11 flavor while /usr/bin/python3 is
+          # 3.6, so the default interpreter cannot import wasm at all there.
+          if ! python3 -c "import wasm" 2> /dev/null; then
+            echo "wasm is packaged for a non-default interpreter here. Skipping."
+            exit 0
+          fi
+          if ! python3 -c "import fastapi" 2> /dev/null; then
+            echo "This distribution does not package the web stack; the panel needs pip here. Skipping."
+            exit 0
+          fi
+          if ! python3 -c "import fastapi, sys; sys.exit(0 if tuple(map(int, fastapi.__version__.split('.')[:2])) >= (0, 100) else 1)"; then
+            echo "fastapi $(python3 -c 'import fastapi; print(fastapi.__version__)') predates 0.100; the panel needs pip here. Skipping."
+            exit 0
+          fi
+          python3 -c "import fastapi, pydantic; print('fastapi', fastapi.__version__, '/ pydantic', pydantic.VERSION)"
+          python3 -c "import wasm.web.api.router, wasm.web.server; print('The panel imports against the distribution web stack')"
 
   release:
     name: Create Release

@@ -28,13 +28,14 @@ import logging
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 from wasm.core.exceptions import ServiceError
 from wasm.managers.backup_scheduler import SCHEDULE_ALIASES
 from wasm.managers.cron_manager import CronJob, CronManager, validate_cron_calendar
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import WASMErrorRoute
+from wasm.web.pydantic_compat import field_validator
 
 router = APIRouter(route_class=WASMErrorRoute)
 

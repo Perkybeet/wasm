@@ -98,6 +98,49 @@ jobs:
           fail_ci_if_error: false
         continue-on-error: true
 
+  # Every other job installs pydantic 2 from pip, so none of them can see a
+  # pydantic-1-only failure - and the .deb depends on the distribution
+  # package, which on Ubuntu 24.04 and Debian 12 is pydantic 1.10. That is
+  # how v1.5.0 imported `field_validator`, a pydantic-2-only name, and
+  # `wasm web start` died with ImportError on every Ubuntu 24.04 install
+  # while this whole workflow stayed green. This job pins pydantic to 1.10
+  # and imports and tests the real web layer against it, exercising the
+  # bridge in wasm.web.pydantic_compat from its v1 side.
+  #
+  # fastapi is pinned to 0.115, the last line that supports pydantic 1: noble
+  # itself ships 0.101, but the test fixtures need starlette's newer
+  # TestClient, and the release workflow's container jobs already import the
+  # panel against noble's exact versions. What this job guards is the
+  # pydantic major, which is where the names differ.
+  pydantic-v1:
+    name: Panel on pydantic 1
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install the panel with pydantic 1.10
+        run: |
+          pip install --no-deps -e .
+          pip install "pydantic==1.10.*" "fastapi>=0.115,<0.116" "httpx<0.28" \
+            jinja2 psutil pyyaml click rich pytest pytest-mock
+
+      - name: Import the real web layer
+        run: |
+          python - <<'PY'
+          import pydantic
+          assert pydantic.VERSION.startswith("1."), pydantic.VERSION
+          import wasm.web.api.router, wasm.web.server
+          print(f"The web layer imports under pydantic {pydantic.VERSION}")
+          PY
+
+      - name: Run the bridged endpoints' tests
+        run: pytest tests/test_web_backup_schedules.py tests/test_web_cron_pages.py -q
+
   smoke:
     name: Smoke
     runs-on: ubuntu-latest

@@ -46,6 +46,7 @@ from wasm.core.exceptions import (
 )
 from wasm.validators.domain import validate_domain
 from wasm.web.auth import SCOPE_RANK, ensure_scope, require_auth
+from wasm.web.pydantic_compat import dump_model
 
 #: Status used for a WASMError with no more specific mapping. A manager that
 #: raises anything else is reporting that the operation failed on the server,
@@ -130,11 +131,13 @@ def error_response(exc: WASMError) -> JSONResponse:
     # hint, and the client should not have to know the difference.
     return JSONResponse(
         status_code=status_for(exc),
-        content=ErrorResponse(
-            detail=str(exc),
-            hint=getattr(exc, "details", None) or None,
-            error=type(exc).__name__,
-        ).model_dump(),
+        content=dump_model(
+            ErrorResponse(
+                detail=str(exc),
+                hint=getattr(exc, "details", None) or None,
+                error=type(exc).__name__,
+            )
+        ),
     )
 
 

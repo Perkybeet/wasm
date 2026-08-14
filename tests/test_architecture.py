@@ -329,6 +329,133 @@ class TestTemplateSafety:
         )
 
 
+class TestPydanticBridge:
+    """
+    The web layer runs on pydantic 1 and pydantic 2 alike.
+
+    pip and Fedora install pydantic 2, but Ubuntu 24.04 and Debian 12 package
+    python3-pydantic 1.10 and the .deb depends on the distribution package.
+    CI tests against pip's pydantic 2, which is how v1.5.0 imported
+    ``field_validator`` - a name pydantic 1 does not have - and ``wasm web
+    start`` died with ImportError on every Ubuntu 24.04 install while every
+    test stayed green. The names the two majors spell differently are bridged
+    once, in ``wasm.web.pydantic_compat``, and nowhere else.
+    """
+
+    #: The bridge itself, the only module allowed to know which pydantic is
+    #: installed.
+    SHIM = "src/wasm/web/pydantic_compat.py"
+
+    #: Names only one major version has. The v2 spellings raise ImportError
+    #: under 1.10; the v1 spellings are deprecated shims under 2.x and their
+    #: semantics differ. Either way, importing them from pydantic ties the
+    #: module to one major version.
+    VERSION_SPECIFIC_IMPORTS = frozenset(
+        {
+            # pydantic 2 only.
+            "field_validator",
+            "model_validator",
+            "field_serializer",
+            "model_serializer",
+            "computed_field",
+            "ConfigDict",
+            "TypeAdapter",
+            "RootModel",
+            # pydantic 1 only; use the bridge's v2-spelled equivalents.
+            "validator",
+            "root_validator",
+        }
+    )
+
+    #: Methods that exist only on pydantic 2 models. ``.model_dump()`` is how
+    #: the ImportError of v1.5.0 had a sibling waiting in deps.py: it imports
+    #: fine everywhere and then dies with AttributeError on the first error
+    #: response a pydantic 1 machine renders.
+    V2_ONLY_METHODS = frozenset(
+        {
+            "model_dump",
+            "model_dump_json",
+            "model_validate",
+            "model_validate_json",
+            "model_construct",
+            "model_copy",
+            "model_json_schema",
+        }
+    )
+
+    def test_version_specific_names_are_imported_only_by_the_bridge(self):
+        offenders = set()
+        for path in python_files():
+            if relative(path) == self.SHIM:
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ImportFrom):
+                    continue
+                if (node.module or "").split(".")[0] != "pydantic":
+                    continue
+                for alias in node.names:
+                    if alias.name in self.VERSION_SPECIFIC_IMPORTS:
+                        offenders.add(f"{relative(path)}:{node.lineno}:{alias.name}")
+
+        assert not offenders, (
+            "These files import a name only one pydantic major version has:\n"
+            + "\n".join(f"  {name}" for name in sorted(offenders))
+            + "\n\nImport it from wasm.web.pydantic_compat instead, adding the "
+            "bridge there if it is missing. Ubuntu 24.04 ships pydantic 1.10."
+        )
+
+    def test_v2_only_model_methods_are_called_only_by_the_bridge(self):
+        offenders = set()
+        for path in python_files():
+            if relative(path) == self.SHIM:
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                    continue
+                if node.func.attr in self.V2_ONLY_METHODS:
+                    offenders.add(f"{relative(path)}:{node.lineno}:{node.func.attr}")
+
+        assert not offenders, (
+            "These calls exist only on pydantic 2 models and raise "
+            "AttributeError under the pydantic 1.10 that Ubuntu 24.04 ships:\n"
+            + "\n".join(f"  {name}" for name in sorted(offenders))
+            + "\n\nUse the helpers in wasm.web.pydantic_compat instead."
+        )
+
+    def test_field_constraints_spelled_only_one_major_understands(self):
+        """
+        ``Field(pattern=...)`` is pydantic 2's spelling and ``Field(regex=...)``
+        pydantic 1's; each raises under the other. Neither is bridged: a field
+        that needs a pattern uses an explicit validator through the bridge's
+        ``field_validator``, which also gives the refusal a message an operator
+        can read.
+        """
+        offenders = set()
+        for path in python_files():
+            if relative(path) == self.SHIM:
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+                if name != "Field":
+                    continue
+                for keyword in node.keywords:
+                    if keyword.arg in ("pattern", "regex"):
+                        offenders.add(f"{relative(path)}:{node.lineno}:{keyword.arg}")
+
+        assert not offenders, (
+            "These Field() constraints only exist in one pydantic major "
+            "version:\n"
+            + "\n".join(f"  {name}" for name in sorted(offenders))
+            + "\n\nValidate with an explicit field_validator from "
+            "wasm.web.pydantic_compat instead."
+        )
+
+
 class TestSelfContained:
     """The panel works on a machine with no route to the internet."""
 
