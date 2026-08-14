@@ -1,3 +1,9 @@
+wasm (1.3.0-1) unstable; urgency=medium
+
+  * Panel security: TLS by default, TOTP 2FA, scoped API tokens, session management, browser E2E in CI
+
+ -- Yago Lopez Prado <yago.lopez.adeje@gmail.com>  Fri, 14 Aug 2026 10:45:08 +0000
+
 wasm (1.2.1-1) unstable; urgency=medium
 
   * Fix: wasm reported no applications on a machine whose records existed, after the monitor service created /var/lib/wasm and the store moved to it; a database that already exists now outranks an empty location

@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        1.2.1
+Version:        1.3.0
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -222,6 +222,8 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
 fi
 
 %changelog
+* Fri Aug 14 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.3.0-1
+- Panel security: TLS by default, TOTP 2FA, scoped API tokens, session management, browser E2E in CI
 * Thu Aug 13 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.2.1-1
 - Fix: wasm reported no applications on a machine whose records existed, after the monitor service created /var/lib/wasm and the store moved to it; a database that already exists now outranks an empty location
 * Thu Aug 13 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.2.0-1
