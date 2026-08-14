@@ -140,6 +140,15 @@ class App:
     def from_row(cls, row: sqlite3.Row) -> "App":
         """Create from database row."""
         data = dict(row)
+        # The webhook secret is deliberately not a field of this dataclass.
+        # Every App that leaves the store gets serialised somewhere - API
+        # responses, templates, logs - and every redeploy rewrites the whole
+        # row from a freshly built App (AppRegistrationHelper.register_app),
+        # which would silently blank the column. Keeping the secret off the
+        # record makes both impossible at the chokepoint: it is readable only
+        # through get_webhook_secret and writable only through
+        # set_webhook_secret.
+        data.pop("webhook_secret", None)
         if data.get("env_vars"):
             try:
                 data["env_vars"] = json.loads(data["env_vars"])
@@ -315,7 +324,7 @@ class MonorepoWorkspace:
 
 
 # Schema version for migrations
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _DEPLOYMENT_STATUSES_SQL = ", ".join(f"'{status.value}'" for status in DeploymentStatus)
 _DEPLOYMENT_TRIGGERS_SQL = ", ".join(f"'{trigger.value}'" for trigger in DeploymentTrigger)
@@ -376,6 +385,10 @@ CREATE TABLE IF NOT EXISTS apps (
     status TEXT NOT NULL DEFAULT 'unknown',
     is_static INTEGER NOT NULL DEFAULT 0,
     env_vars TEXT DEFAULT '{}',
+    -- Schema v3: per-application webhook secret; NULL means webhooks are
+    -- disabled. Stored in clear on purpose: see set_webhook_secret. The
+    -- v2-to-v3 migration adds this same column with ALTER TABLE.
+    webhook_secret TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     deployed_at TEXT
@@ -756,6 +769,7 @@ class WASMStore:
         # Keyed by the version each migration produces, matching the loop.
         migrations = {
             2: self._migrate_v1_to_v2,
+            3: self._migrate_v2_to_v3,
         }
 
         for version in range(from_version + 1, SCHEMA_VERSION + 1):
@@ -771,6 +785,18 @@ class WASMStore:
             cursor: Cursor the migration runs on.
         """
         cursor.executescript(DEPLOYMENTS_SCHEMA_SQL)
+
+    def _migrate_v2_to_v3(self, cursor: sqlite3.Cursor) -> None:
+        """
+        Add the per-application webhook secret column (schema v3).
+
+        NULL, which every existing row gets, means webhooks are disabled: an
+        upgrade must never invent a credential.
+
+        Args:
+            cursor: Cursor the migration runs on.
+        """
+        cursor.execute("ALTER TABLE apps ADD COLUMN webhook_secret TEXT")
 
     # =========================================================================
     # Application CRUD
@@ -927,6 +953,52 @@ class WASMStore:
         with self._transaction() as cursor:
             cursor.execute("SELECT 1 FROM apps WHERE domain = ?", (domain,))
             return cursor.fetchone() is not None
+
+    def set_webhook_secret(self, domain: str, secret: str | None) -> bool:
+        """
+        Store or clear the webhook secret of an application.
+
+        The secret is stored in clear, deliberately. GitHub and Gitea sign
+        every delivery with ``HMAC-SHA256(secret, body)``, and verifying that
+        signature means recomputing it, which needs the original secret; a
+        stored hash could only ever support plain equality (GitLab's token
+        header) and would make signature verification impossible. The database
+        file already holds credentials of the same sensitivity in the same
+        table - ``apps.env_vars`` carries DATABASE_URL and API keys - and is
+        created 0600 inside a 0700 directory, exactly like config.yaml with
+        its database credentials.
+
+        Args:
+            domain: Application domain.
+            secret: The secret in clear, or None to disable webhooks.
+
+        Returns:
+            True if the application exists and the row was updated.
+        """
+        with self._transaction() as cursor:
+            cursor.execute(
+                "UPDATE apps SET webhook_secret = ?, updated_at = ? WHERE domain = ?",
+                (secret, datetime.now().isoformat(), domain),
+            )
+            return cursor.rowcount > 0
+
+    def get_webhook_secret(self, domain: str) -> str | None:
+        """
+        Read the webhook secret of an application.
+
+        Args:
+            domain: Application domain.
+
+        Returns:
+            The secret in clear, or None when the application does not exist
+            or has webhooks disabled. The two cases are indistinguishable on
+            purpose: the webhook endpoint must not reveal which domains are
+            deployed.
+        """
+        with self._transaction() as cursor:
+            cursor.execute("SELECT webhook_secret FROM apps WHERE domain = ?", (domain,))
+            row = cursor.fetchone()
+            return row["webhook_secret"] if row else None
 
     # =========================================================================
     # Site CRUD

@@ -43,7 +43,11 @@ ALL_INTERFACES = "0.0.0.0"  # noqa: S104 - the address under test, not a bind
 
 #: Every path of the panel that is public, including the pages a browser needs
 #: before it has a session. Anything not listed here has to demand credentials.
-PUBLIC_PATHS = frozenset({"/", "/login", "/health", "/api/auth/login"})
+#: The webhook endpoint is public by design: a git forge holds no session, and
+#: what authenticates a delivery is the per-app HMAC secret checked inside the
+#: route; an anonymous probe gets a generic 404. See tests/test_web_hooks.py
+#: for the refusals that route owes.
+PUBLIC_PATHS = frozenset({"/", "/login", "/health", "/api/auth/login", "/hooks/deploy/{domain}"})
 
 
 def make_config(sandbox: Path, **overrides) -> SecurityConfig:

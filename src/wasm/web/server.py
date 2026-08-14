@@ -281,6 +281,21 @@ def create_app(config: SecurityConfig | None = None) -> FastAPI:
 
     app.include_router(api_router, prefix="/api")
 
+    # Git forges call the webhook surface server-to-server, so it is mounted
+    # at the root rather than under /api: there is no session and no ambient
+    # cookie, hence no CSRF, and the per-app HMAC secret inside the router is
+    # the authentication. It is mounted here and not in wasm.web.api.router so
+    # it cannot inherit the /api prefix. SecurityMiddleware still stands in
+    # front of it - added last, outermost - so the IP whitelist, the HTTPS
+    # requirement and the rate limiter hold for a forge exactly as they do for
+    # a browser. The companion router manages the secrets and is an ordinary
+    # authenticated admin surface under /api/apps.
+    from wasm.web.api.hooks import admin_router as webhook_admin_router
+    from wasm.web.api.hooks import router as hooks_router
+
+    app.include_router(hooks_router, prefix="/hooks", tags=["Webhooks"])
+    app.include_router(webhook_admin_router, prefix="/api/apps", tags=["Webhooks"])
+
     from wasm.web.websockets import router as ws_router
 
     app.include_router(ws_router, prefix="/ws")
@@ -477,7 +492,7 @@ def create_app(config: SecurityConfig | None = None) -> FastAPI:
             a root panel's navigation to someone who has not signed in.
         """
         path = request.url.path
-        machine_paths = ("/api", "/ws", "/static", "/events", "/health")
+        machine_paths = ("/api", "/ws", "/static", "/events", "/health", "/hooks")
         wants_html = "text/html" in request.headers.get("accept", "")
 
         if path.startswith(machine_paths) or not wants_html:

@@ -317,8 +317,10 @@ class TestSchemaV2Migration:
         store = WASMStore(db_path, fs=RecordingFileSystem())
 
         with store._transaction() as cursor:
+            # The chain does not stop at v2: a v1 database walks every
+            # migration and lands on whatever the current version is.
             cursor.execute("SELECT MAX(version) FROM schema_version")
-            assert cursor.fetchone()[0] == 2
+            assert cursor.fetchone()[0] == SCHEMA_VERSION
         assert store.get_app("v1.example.com") is not None
         assert store.get_site("v1.example.com") is not None
         assert store.get_service("v1-example-com") is not None
@@ -352,15 +354,197 @@ class TestSchemaV2Migration:
 
         assert store.get_deployment(deployment_id) is not None
 
-    def test_a_fresh_database_is_created_directly_at_v2(self, temp_db):
-        """A new install does not take the migration path to reach v2."""
+    def test_a_fresh_database_is_created_directly_at_the_current_version(self, temp_db):
+        """A new install does not take the migration path to reach the schema."""
         with temp_db._transaction() as cursor:
             cursor.execute("SELECT MAX(version) FROM schema_version")
-            assert cursor.fetchone()[0] == 2
+            assert cursor.fetchone()[0] == SCHEMA_VERSION
             cursor.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name=?", ("deployments",)
             )
             assert cursor.fetchone() is not None
+
+
+#: The deployments table exactly as schema v2 shipped it, frozen for the same
+#: reason V1_SCHEMA_SQL is: the v2-to-v3 migration must run against what is
+#: deployed, not against whatever DEPLOYMENTS_SCHEMA_SQL becomes later.
+V2_DEPLOYMENTS_SQL = """
+CREATE TABLE IF NOT EXISTS deployments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain TEXT NOT NULL,
+    status TEXT NOT NULL
+        CHECK (status IN ('queued', 'running', 'success', 'failed', 'rolled_back')),
+    triggered_by TEXT NOT NULL CHECK (triggered_by IN ('panel', 'cli', 'webhook')),
+    git_commit TEXT,
+    git_branch TEXT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    duration_s REAL,
+    log_path TEXT,
+    error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_deployments_domain_started
+    ON deployments(domain, started_at DESC);
+"""
+
+
+class TestSchemaV3Migration:
+    """Schema v3 adds the per-app webhook secret column."""
+
+    def _create_v2_database(self, db_path: Path) -> None:
+        """
+        Create a real v2 database with rows, as a 1.3.x release left it.
+
+        Args:
+            db_path: Where the database file is created.
+        """
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.executescript(V1_SCHEMA_SQL)
+            conn.executescript(V2_DEPLOYMENTS_SQL)
+            conn.execute("INSERT INTO schema_version (version) VALUES (1)")
+            conn.execute("INSERT INTO schema_version (version) VALUES (2)")
+            conn.execute(
+                "INSERT INTO apps (domain, app_type, app_path) VALUES (?, ?, ?)",
+                ("v2.example.com", "nextjs", "/var/www/apps/v2-example-com"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _apps_columns(self, store: WASMStore) -> set[str]:
+        """
+        Args:
+            store: The store to inspect.
+
+        Returns:
+            The column names of the apps table.
+        """
+        with store._transaction() as cursor:
+            cursor.execute("PRAGMA table_info(apps)")
+            return {row["name"] for row in cursor.fetchall()}
+
+    def test_a_v2_database_migrates_to_v3_keeping_every_row(self, fresh, tmp_path):
+        """A server upgraded in place keeps its inventory and gains the column."""
+        db_path = tmp_path / "wasm.db"
+        self._create_v2_database(db_path)
+
+        store = WASMStore(db_path, fs=RecordingFileSystem())
+
+        with store._transaction() as cursor:
+            cursor.execute("SELECT MAX(version) FROM schema_version")
+            assert cursor.fetchone()[0] == SCHEMA_VERSION
+        assert store.get_app("v2.example.com") is not None
+        assert "webhook_secret" in self._apps_columns(store)
+
+    def test_migrated_apps_have_webhooks_disabled(self, fresh, tmp_path):
+        """An upgrade must never invent a secret; NULL means disabled."""
+        db_path = tmp_path / "wasm.db"
+        self._create_v2_database(db_path)
+
+        store = WASMStore(db_path, fs=RecordingFileSystem())
+
+        assert store.get_webhook_secret("v2.example.com") is None
+
+    def test_a_v1_database_walks_both_migrations(self, fresh, tmp_path):
+        """A 1.2.x database reaches v3 in one opening."""
+        db_path = tmp_path / "wasm.db"
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.executescript(V1_SCHEMA_SQL)
+            conn.execute("INSERT INTO schema_version (version) VALUES (1)")
+            conn.commit()
+        finally:
+            conn.close()
+
+        store = WASMStore(db_path, fs=RecordingFileSystem())
+
+        with store._transaction() as cursor:
+            cursor.execute("SELECT MAX(version) FROM schema_version")
+            assert cursor.fetchone()[0] == SCHEMA_VERSION
+        assert "webhook_secret" in self._apps_columns(store)
+
+    def test_a_fresh_database_has_the_webhook_secret_column(self, temp_db):
+        """The fresh-install path and the migration agree on the schema."""
+        assert "webhook_secret" in self._apps_columns(temp_db)
+
+
+class TestWebhookSecret:
+    """The webhook secret is written and read only through its own methods."""
+
+    def _seed(self, store: WASMStore) -> App:
+        """
+        Args:
+            store: The store to seed.
+
+        Returns:
+            A stored application.
+        """
+        return store.create_app(
+            App(
+                domain="hooked.example.com",
+                app_type=AppType.NODEJS.value,
+                source="https://github.com/you/app",
+                branch="main",
+                app_path="/var/www/apps/hooked-example-com",
+            )
+        )
+
+    def test_set_and_get_roundtrip(self, temp_db):
+        """A stored secret comes back verbatim: HMAC needs it in clear."""
+        self._seed(temp_db)
+
+        assert temp_db.set_webhook_secret("hooked.example.com", "s3cret-value") is True
+        assert temp_db.get_webhook_secret("hooked.example.com") == "s3cret-value"
+
+    def test_clearing_the_secret_disables_webhooks(self, temp_db):
+        """None is the disabled state, not an empty string."""
+        self._seed(temp_db)
+        temp_db.set_webhook_secret("hooked.example.com", "s3cret-value")
+
+        assert temp_db.set_webhook_secret("hooked.example.com", None) is True
+        assert temp_db.get_webhook_secret("hooked.example.com") is None
+
+    def test_an_unknown_domain_has_no_secret_and_takes_none(self, temp_db):
+        """Setting a secret on nothing reports failure instead of inventing a row."""
+        assert temp_db.set_webhook_secret("nothing.example.com", "s3cret-value") is False
+        assert temp_db.get_webhook_secret("nothing.example.com") is None
+
+    def test_the_secret_survives_a_full_app_rewrite(self, temp_db):
+        """
+        Every redeploy rewrites the whole apps row from a freshly built App
+        (see AppRegistrationHelper.register_app). If the secret travelled on
+        the dataclass, the first webhook-triggered deploy would erase the
+        secret that authenticated it.
+        """
+        seeded = self._seed(temp_db)
+        temp_db.set_webhook_secret("hooked.example.com", "s3cret-value")
+
+        rewritten = App(
+            id=seeded.id,
+            domain="hooked.example.com",
+            app_type=AppType.NODEJS.value,
+            source="https://github.com/you/app",
+            branch="main",
+            app_path="/var/www/apps/hooked-example-com",
+            created_at=seeded.created_at,
+        )
+        temp_db.update_app(rewritten)
+
+        assert temp_db.get_webhook_secret("hooked.example.com") == "s3cret-value"
+
+    def test_the_secret_never_rides_the_app_record(self, temp_db):
+        """App objects are serialised everywhere; the secret must not be aboard."""
+        self._seed(temp_db)
+        temp_db.set_webhook_secret("hooked.example.com", "s3cret-value")
+
+        app = temp_db.get_app("hooked.example.com")
+
+        assert app is not None
+        assert not hasattr(app, "webhook_secret")
+        assert "webhook_secret" not in app.to_dict()
+        assert "s3cret-value" not in str(app.to_dict())
 
 
 class TestAppCRUD:
