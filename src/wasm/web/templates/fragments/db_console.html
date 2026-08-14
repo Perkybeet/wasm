@@ -1,0 +1,74 @@
+{#
+  The SQL console, as one swappable section.
+
+  Read-only by default: the checkbox is the explicit mode="write" the API
+  demands, so nothing writes by accident. The keyword courtesy check, the
+  read-only transaction, the single-statement rule and the audit line all live
+  in the API and its managers; this fragment only carries the form and shows
+  the engine's own output, verbatim, in mono. A refused statement renders at
+  200 with the refusal inline and the statement preserved, so the operator
+  corrects it instead of retyping it.
+#}
+{% import "_macros.html" as m %}
+<div class="rows" id="db-console">
+
+  {% if console.problem %}
+    {{ m.problem(console.problem.fix, console.problem.output) }}
+  {% endif %}
+
+  {% if console.targets %}
+    <form hx-post="/databases/console" hx-target="#db-console" hx-swap="outerHTML"
+          autocomplete="off">
+      <div class="form__row">
+        <div class="field">
+          <label class="label" for="console-target">Database</label>
+          <select id="console-target" name="target">
+            {% for target in console.targets %}
+              <option value="{{ target.value }}"
+                      {% if target.value == console.selected %}selected{% endif %}>
+                {{ target.engine }} · {{ target.database }}
+              </option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="field">
+          <span class="label" id="console-mode-label">Mode</span>
+          <label class="choice">
+            <input type="checkbox" id="console-writes" name="allow_writes" value="yes"
+                   aria-describedby="console-mode-hint"
+                   {% if console.allow_writes %}checked{% endif %}>
+            Allow writes
+          </label>
+          <span class="field__hint" id="console-mode-hint">
+            Unchecked, only read statements run, inside a read-only transaction where the
+            engine enforces one. One statement at a time; every statement is audited.
+          </span>
+        </div>
+      </div>
+      <div class="field">
+        <label class="label" for="console-query">Statement</label>
+        <textarea class="mono" id="console-query" name="query" rows="6"
+                  spellcheck="false" autocomplete="off">{{ console.query }}</textarea>
+      </div>
+      <button type="submit" class="btn btn--primary">Run</button>
+    </form>
+
+    {% if console.result %}
+      {% if console.result.success %}
+        <p class="faint">
+          Ran in {{ console.result.mode }} mode -
+          {{ console.result.returned_rows }} line{{ "" if console.result.returned_rows == 1 else "s" }}{% if console.result.truncated %}, output truncated{% endif %}.
+        </p>
+        <pre class="mono">{{ console.result.output }}</pre>
+      {% else %}
+        {{ m.problem("The engine refused the statement. Its own words:",
+                     console.result.output) }}
+      {% endif %}
+    {% endif %}
+  {% else %}
+    {{ m.empty("The console needs a running engine",
+               "Install or start an engine and create a database, then run statements here.",
+               command="wasm db install postgresql") }}
+  {% endif %}
+
+</div>

@@ -1,0 +1,304 @@
+{#
+  One database engine, as one swappable section.
+
+  Every state renders through this fragment - not installed, stopped, running,
+  refused, freshly acted upon - so the databases page and the htmx swaps can
+  never disagree about what an engine's section looks like.
+
+  Two values on it are shown exactly once and never again. A new user's
+  password exists in clear only in the response to the creation that made it:
+  the engine stores a hash, so no later render can repeat it. And a connection
+  string always carries a masked password for the same reason - there is no
+  stored clear value for the server to reveal.
+
+  Destructive actions confirm by name, server-side: the form posts what the
+  operator typed and the handler compares it against the resource's exact
+  name. The required attribute on the input is a courtesy; the comparison in
+  the handler is the guard.
+
+  A refused action renders at 200 with the refusal inline: htmx does not swap
+  an error status, so answering 4xx would freeze the screen and report
+  nothing.
+#}
+{% import "_macros.html" as m %}
+<div class="rows" id="db-engine-{{ eng.name }}">
+
+  {% if eng.problem %}
+    {{ m.problem(eng.problem.fix, eng.problem.output) }}
+  {% endif %}
+
+  {% if eng.notice %}
+    <p class="stack__lead">{{ eng.notice }}</p>
+  {% endif %}
+
+  {% if eng.created_user %}
+    <p class="stack__lead">
+      User <strong>{{ eng.created_user.username }}</strong> created. The password below is
+      shown once and never stored in clear, so copy it now; no screen can repeat it.
+    </p>
+    <p class="mono">{{ eng.created_user.password }}</p>
+  {% endif %}
+
+  {% if eng.conn %}
+    <p class="stack__lead">
+      Connection string for <strong>{{ eng.conn.database }}</strong>. The password is
+      masked because WASM keeps only the hash the engine keeps: substitute the one
+      issued when the user was created.
+    </p>
+    <p class="mono">{{ eng.conn.value }}</p>
+  {% endif %}
+
+  {% call m.row(eng.display_name, eng.state,
+                [("version", eng.version or "—"), ("port", eng.port), ("service", eng.service)],
+                none, none, none, eng.state_text) %}
+    {% if not eng.installed %}
+      <button type="button" class="btn btn--sm btn--primary"
+              hx-post="/databases/engines/{{ eng.name }}/install"
+              hx-target="#db-engine-{{ eng.name }}" hx-swap="outerHTML">Install</button>
+    {% else %}
+      {% if eng.running %}
+        <button type="button" class="btn btn--sm"
+                hx-post="/databases/engines/{{ eng.name }}/stop"
+                hx-target="#db-engine-{{ eng.name }}" hx-swap="outerHTML">Stop</button>
+        <button type="button" class="btn btn--sm"
+                hx-post="/databases/engines/{{ eng.name }}/restart"
+                hx-target="#db-engine-{{ eng.name }}" hx-swap="outerHTML">Restart</button>
+      {% else %}
+        <button type="button" class="btn btn--sm"
+                hx-post="/databases/engines/{{ eng.name }}/start"
+                hx-target="#db-engine-{{ eng.name }}" hx-swap="outerHTML">Start</button>
+      {% endif %}
+      <button type="button" class="btn btn--sm btn--danger"
+              hx-post="/databases/engines/{{ eng.name }}/uninstall"
+              hx-target="#db-engine-{{ eng.name }}" hx-swap="outerHTML"
+              hx-confirm="Uninstall {{ eng.display_name }}? Its packages are removed; its data directories are kept. The removal runs in the background.">Uninstall</button>
+    {% endif %}
+  {% endcall %}
+
+  {% if eng.running %}
+    {% if eng.databases %}
+      {% for db in eng.databases %}
+        {% call m.row(db.name, "idle", [("size", db.size or "—"), ("owner", db.owner or "—")]) %}
+          <button type="button" class="btn btn--sm"
+                  hx-post="/databases/{{ eng.name }}/{{ db.name }}/backup"
+                  hx-target="#db-engine-{{ eng.name }}" hx-swap="outerHTML">Back up</button>
+          <details>
+            <summary class="btn btn--sm btn--quiet">Connection string</summary>
+            <form hx-get="/databases/{{ eng.name }}/{{ db.name }}/connection-string"
+                  hx-target="#db-engine-{{ eng.name }}" hx-swap="outerHTML" autocomplete="off">
+              <div class="field">
+                <label class="label" for="conn-user-{{ eng.name }}-{{ loop.index }}">User</label>
+                <input class="mono" type="text" id="conn-user-{{ eng.name }}-{{ loop.index }}"
+                       name="username" value="{{ db.owner or '' }}" required autocomplete="off">
+              </div>
+              <button type="submit" class="btn btn--sm">Show</button>
+            </form>
+          </details>
+          <details>
+            <summary class="btn btn--sm btn--danger">Drop</summary>
+            <form hx-post="/databases/{{ eng.name }}/{{ db.name }}/drop"
+                  hx-target="#db-engine-{{ eng.name }}" hx-swap="outerHTML" autocomplete="off">
+              <div class="field">
+                <label class="label" for="drop-confirm-{{ eng.name }}-{{ loop.index }}">
+                  Type {{ db.name }} to confirm. Every table in it goes with it.
+                </label>
+                <input class="mono" type="text" id="drop-confirm-{{ eng.name }}-{{ loop.index }}"
+                       name="confirm" required placeholder="{{ db.name }}" autocomplete="off">
+              </div>
+              <button type="submit" class="btn btn--sm btn--danger">Drop {{ db.name }}</button>
+            </form>
+          </details>
+        {% endcall %}
+      {% endfor %}
+    {% else %}
+      <p class="faint">
+        No databases in {{ eng.display_name }} yet. Create the first below, or run
+        <code>wasm db create -e {{ eng.name }} -n myapp</code>.
+      </p>
+    {% endif %}
+
+    <form class="form" hx-post="/databases/{{ eng.name }}/create"
+          hx-target="#db-engine-{{ eng.name }}" hx-swap="outerHTML" autocomplete="off">
+      <div class="form__row">
+        <div class="field">
+          <label class="label" for="db-name-{{ eng.name }}">Create database</label>
+          <input class="mono" type="text" id="db-name-{{ eng.name }}" name="name"
+                 required autocomplete="off" placeholder="myapp">
+        </div>
+        <div class="field">
+          <label class="label" for="db-owner-{{ eng.name }}">Owner</label>
+          <input class="mono" type="text" id="db-owner-{{ eng.name }}" name="owner"
+                 autocomplete="off" placeholder="optional">
+        </div>
+      </div>
+      <button type="submit" class="btn btn--primary">Create database</button>
+    </form>
+
+    <h3 class="label stack__title">Users</h3>
+    {% if eng.users %}
+      <table class="table">
+        <thead>
+          <tr>
+            <th scope="col">User</th>
+            <th scope="col">Host</th>
+            <th scope="col">Databases</th>
+            <th scope="col">Privileges</th>
+            <th scope="col"><span class="visually-hidden">Actions</span></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for user in eng.users %}
+            <tr>
+              <th scope="row"><span class="mono">{{ user.username }}</span></th>
+              <td class="mono">{{ user.host }}</td>
+              <td class="mono">{{ user.databases | join(", ") or "—" }}</td>
+              <td class="mono">{{ user.privileges | join(", ") or "—" }}</td>
+              <td>
+                {% if eng.databases and eng.privileges %}
+                  <details>
+                    <summary class="btn btn--sm btn--quiet">Privileges</summary>
+                    {# One form, two verbs: the Grant button is the submit, and
+                       Revoke posts the same fields to its own route - htmx
+                       includes the enclosing form's values on a non-GET. #}
+                    <form hx-post="/databases/{{ eng.name }}/users/{{ user.username }}/grant"
+                          hx-target="#db-engine-{{ eng.name }}" hx-swap="outerHTML">
+                      <div class="field">
+                        <label class="label"
+                               for="priv-db-{{ eng.name }}-{{ loop.index }}">Database</label>
+                        <select id="priv-db-{{ eng.name }}-{{ loop.index }}" name="database">
+                          {% for db in eng.databases %}
+                            <option value="{{ db.name }}">{{ db.name }}</option>
+                          {% endfor %}
+                        </select>
+                      </div>
+                      <div class="field">
+                        <label class="label"
+                               for="priv-name-{{ eng.name }}-{{ loop.index }}">Privilege</label>
+                        <select id="priv-name-{{ eng.name }}-{{ loop.index }}" name="privilege">
+                          <option value="">Engine default</option>
+                          {% for privilege in eng.privileges %}
+                            <option value="{{ privilege }}">{{ privilege }}</option>
+                          {% endfor %}
+                        </select>
+                      </div>
+                      <button type="submit" class="btn btn--sm">Grant</button>
+                      <button type="button" class="btn btn--sm"
+                              hx-post="/databases/{{ eng.name }}/users/{{ user.username }}/revoke"
+                              hx-target="#db-engine-{{ eng.name }}"
+                              hx-swap="outerHTML">Revoke</button>
+                    </form>
+                  </details>
+                {% endif %}
+                <button type="button" class="btn btn--sm btn--danger"
+                        hx-post="/databases/{{ eng.name }}/users/{{ user.username }}/delete"
+                        hx-target="#db-engine-{{ eng.name }}" hx-swap="outerHTML"
+                        hx-confirm="Delete {{ user.username }}? Applications connecting as it stop authenticating immediately.">Delete</button>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="faint">No users beyond the engine's own. Create one below.</p>
+    {% endif %}
+
+    <form class="form" hx-post="/databases/{{ eng.name }}/users/create"
+          hx-target="#db-engine-{{ eng.name }}" hx-swap="outerHTML" autocomplete="off">
+      <div class="form__row">
+        <div class="field">
+          <label class="label" for="user-name-{{ eng.name }}">Create user</label>
+          <input class="mono" type="text" id="user-name-{{ eng.name }}" name="username"
+                 required autocomplete="off" placeholder="app">
+        </div>
+        <div class="field">
+          <label class="label" for="user-password-{{ eng.name }}">Password</label>
+          <input class="mono" type="password" id="user-password-{{ eng.name }}" name="password"
+                 autocomplete="new-password" aria-describedby="user-password-hint-{{ eng.name }}">
+          <span class="field__hint" id="user-password-hint-{{ eng.name }}">
+            Leave empty to generate a strong one. Either way it is shown exactly once.
+          </span>
+        </div>
+        <div class="field">
+          <label class="label" for="user-db-{{ eng.name }}">Grant on</label>
+          <select id="user-db-{{ eng.name }}" name="database">
+            <option value="">No grant</option>
+            {% for db in eng.databases %}
+              <option value="{{ db.name }}">{{ db.name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+      <button type="submit" class="btn btn--primary">Create user</button>
+    </form>
+  {% elif eng.installed %}
+    <p class="faint">
+      {{ eng.display_name }} is stopped: its databases and users cannot be read until it
+      starts. Start it above, or run <code>wasm db start {{ eng.name }}</code>.
+    </p>
+  {% else %}
+    <p class="faint">
+      {{ eng.display_name }} is not installed. Install it above, or run
+      <code>wasm db install {{ eng.name }}</code>.
+    </p>
+  {% endif %}
+
+  {% if eng.installed %}
+    <h3 class="label stack__title">Dumps</h3>
+    {% if eng.backups %}
+      <table class="table">
+        <thead>
+          <tr>
+            <th scope="col">Database</th>
+            <th scope="col">File</th>
+            <th scope="col">Size</th>
+            <th scope="col">Created</th>
+            <th scope="col"><span class="visually-hidden">Actions</span></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for backup in eng.backups %}
+            <tr>
+              <th scope="row"><span class="mono">{{ backup.database }}</span></th>
+              <td class="mono">{{ backup.file }}</td>
+              <td class="num">{{ backup.size_human }}</td>
+              <td>{{ backup.created | since }}</td>
+              <td>
+                <details>
+                  <summary class="btn btn--sm btn--danger">Restore</summary>
+                  <form hx-post="/databases/{{ eng.name }}/restore"
+                        hx-target="#db-engine-{{ eng.name }}" hx-swap="outerHTML"
+                        autocomplete="off">
+                    <input type="hidden" name="backup_name" value="{{ backup.file }}">
+                    <input type="hidden" name="database" value="{{ backup.database }}">
+                    <div class="field">
+                      <label class="label"
+                             for="restore-confirm-{{ eng.name }}-{{ loop.index }}">
+                        Type {{ backup.database }} to confirm. What the database holds now
+                        is replaced by this dump.
+                      </label>
+                      <input class="mono" type="text"
+                             id="restore-confirm-{{ eng.name }}-{{ loop.index }}"
+                             name="confirm" required placeholder="{{ backup.database }}"
+                             autocomplete="off">
+                    </div>
+                    <label class="choice">
+                      <input type="checkbox" name="drop_existing" value="yes">
+                      Drop the database first
+                    </label>
+                    <button type="submit" class="btn btn--sm btn--danger">Restore</button>
+                  </form>
+                </details>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="faint">
+        No dumps on disk for {{ eng.display_name }}.
+        {% if eng.running %}Back up a database from its row above.{% else %}They would appear here once one is taken.{% endif %}
+      </p>
+    {% endif %}
+  {% endif %}
+
+</div>

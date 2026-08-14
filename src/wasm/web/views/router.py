@@ -451,20 +451,6 @@ def sites(request: Request) -> HTMLResponse:
     return page(request, "pages/resources.html", _resource_page("sites"))
 
 
-@router.get("/databases", response_class=HTMLResponse)
-def databases(request: Request) -> HTMLResponse:
-    """
-    Render the databases list.
-
-    Args:
-        request: The incoming request.
-
-    Returns:
-        The databases page.
-    """
-    return page(request, "pages/resources.html", _resource_page("databases"))
-
-
 @router.get("/apps/{domain}", response_class=HTMLResponse)
 def app_detail(request: Request, domain: str) -> HTMLResponse:
     """

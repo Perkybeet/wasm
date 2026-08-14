@@ -1,0 +1,54 @@
+{#
+  Databases.
+
+  One section per engine WASM can manage, whether or not it is installed: the
+  screen's job is to say what this machine could run, not only what it does.
+  Each section is one swappable fragment, so every action redraws exactly the
+  engine it touched and the rest of the screen keeps the operator's place.
+
+  Below the engines, the SQL console - read-only unless the write opt-in is
+  ticked - and the store's own records. The records are a different fact from
+  the live listings: the store remembers what deploys provisioned, an engine
+  reports what it holds right now, and conflating the two is how a panel ends
+  up claiming a database exists on an engine that was purged last month.
+#}
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+
+{% block title %}Databases{% endblock %}
+
+{% block content %}
+
+{{ m.page_head("Databases", subtitle) }}
+
+{% for eng in engines %}
+  <section class="stack--tight">
+    <h2 class="label stack__title">{{ eng.display_name }}</h2>
+    {% include "fragments/db_engine.html" %}
+  </section>
+{% endfor %}
+
+<section class="stack--tight">
+  <h2 class="label stack__title">SQL console</h2>
+  {% include "fragments/db_console.html" %}
+</section>
+
+<section class="stack--tight">
+  <h2 class="label stack__title">Recorded for applications</h2>
+  {% if rows %}
+    <div class="rows">
+      {% for item in rows %}
+        {% call m.row(item.domain, item.state, item.meta, item.href, "row-" ~ item.id,
+                      none, item.state_text) %}
+          {{ m.danger_button("Delete", item.delete_endpoint, item.domain,
+                             item.delete_consequence) }}
+        {% endcall %}
+      {% endfor %}
+    </div>
+  {% else %}
+    {{ m.empty(record_copy.empty_title, record_copy.empty_body, none, none,
+               record_copy.command) }}
+  {% endif %}
+</section>
+
+{% endblock %}
