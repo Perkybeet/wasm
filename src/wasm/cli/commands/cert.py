@@ -33,6 +33,7 @@ from pathlib import Path
 import click
 
 from wasm.cli.app import Context, pass_context
+from wasm.cli.panel_links import open_in_panel
 from wasm.core.exceptions import CertificateError, DomainError, WASMError
 from wasm.core.logger import Logger
 from wasm.managers.cert_manager import CertManager
@@ -459,10 +460,18 @@ def create_command(
 
 
 @cli.command("list", short_help="List every certificate. Also 'ls'.")
+@click.option(
+    "--open",
+    "open_panel",
+    is_flag=True,
+    help="Print the panel URL for the certificate list, opening it if a display is available.",
+)
 @pass_context
-def list_command(ctx: Context) -> None:
+def list_command(ctx: Context, open_panel: bool) -> None:
     """List the certificates this machine holds, with their expiry dates."""
-    _list_certificates(_manager(ctx.verbose), ctx.logger)
+    code = _list_certificates(_manager(ctx.verbose), ctx.logger)
+    if open_panel and code == 0:
+        open_in_panel("/certificates", logger=ctx.logger)
 
 
 @cli.command("info", short_help="Show one certificate. Also 'show'.")

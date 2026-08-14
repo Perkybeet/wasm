@@ -38,6 +38,7 @@ from typing import Any, NoReturn
 import click
 
 from wasm.cli.app import Context, pass_context
+from wasm.cli.panel_links import open_in_panel
 from wasm.core.config import Config
 from wasm.core.exceptions import DatabaseError, DatabaseQueryError
 from wasm.core.logger import Logger
@@ -1592,10 +1593,19 @@ def drop(ctx: Context, name: str, engine: str, force: bool) -> None:
 
 @cli.command("list")
 @click.option("--engine", "-e", type=ENGINE, help="Only this engine. Defaults to all of them.")
+@click.option(
+    "--open",
+    "open_panel",
+    is_flag=True,
+    help="Print the panel URL for the database list, opening it if a display is available.",
+)
 @pass_context
-def list_databases(ctx: Context, engine: str | None) -> None:
+def list_databases(ctx: Context, engine: str | None, open_panel: bool) -> None:
     """List the databases on every running engine."""
-    _exit(_list(engine=engine, json_output=ctx.json_output, logger=ctx.logger))
+    code = _list(engine=engine, json_output=ctx.json_output, logger=ctx.logger)
+    if open_panel and code == 0:
+        open_in_panel("/databases", logger=ctx.logger)
+    _exit(code)
 
 
 @cli.command()

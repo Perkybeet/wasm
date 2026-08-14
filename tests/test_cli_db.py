@@ -26,6 +26,7 @@ from typing import Any
 
 import click
 import pytest
+import yaml
 from click.testing import CliRunner
 
 from wasm.cli import app as cli_app
@@ -283,6 +284,55 @@ def forgotten(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
 
 
 @pytest.fixture
+def isolated_panel_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """
+    Point the layered configuration at a per-test file.
+
+    ``panel_url`` reads ``web.*`` through the Config singleton, which would
+    otherwise read the developer's real ``/etc/wasm/config.yaml`` and make
+    these tests depend on the machine they run on. The self-signed TLS pair
+    path is pinned the same way, so a machine that has actually run
+    ``wasm web start --self-signed`` does not turn "http" into "https" under
+    a test.
+
+    Args:
+        tmp_path: Per-test temporary directory.
+        monkeypatch: Patching helper, scoped to the test.
+
+    Yields:
+        The configuration file the test may write.
+    """
+    from wasm.cli.commands import web as web_module
+    from wasm.core import config as config_module
+
+    path = tmp_path / "config.yaml"
+    monkeypatch.setattr(config_module, "DEFAULT_CONFIG_PATH", path)
+    monkeypatch.setattr(web_module, "PANEL_TLS_CERT", tmp_path / "panel-tls" / "panel.crt")
+    monkeypatch.setattr(web_module, "PANEL_TLS_KEY", tmp_path / "panel-tls" / "panel.key")
+    config_module.Config.reset_instance()
+    yield path
+    config_module.Config.reset_instance()
+
+
+def _configure_panel(path: Path, **settings: Any) -> None:
+    """
+    Declare a configured, reachable panel in the isolated config file.
+
+    Args:
+        path: The isolated configuration file.
+        **settings: Overrides for the ``web`` section; ``enabled``, ``host``
+            and ``port`` fall back to a plain local panel when not given.
+    """
+    from wasm.core.config import Config
+
+    settings.setdefault("enabled", True)
+    settings.setdefault("host", "127.0.0.1")
+    settings.setdefault("port", 8080)
+    path.write_text(yaml.safe_dump({"web": settings}), encoding="utf-8")
+    Config.reset_instance()
+
+
+@pytest.fixture
 def manager(monkeypatch: pytest.MonkeyPatch) -> FakeManager:
     """
     Put a recording manager behind every engine name.
@@ -441,6 +491,62 @@ class TestEngineCommands:
 
         assert result.exit_code == 0, result.output
         assert json.loads(result.output)[0]["display_name"] == "PostgreSQL"
+
+
+class TestOpenFlag:
+    """``--open`` deep-links ``db list`` into the panel."""
+
+    def test_prints_the_configured_panel_url_without_a_display(
+        self,
+        cli_runner: CliRunner,
+        manager: FakeManager,
+        logged: io.StringIO,
+        isolated_panel_config: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """``--open`` prints the panel URL and never touches xdg-open without a display."""
+        monkeypatch.delenv("DISPLAY", raising=False)
+        monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+        _configure_panel(isolated_panel_config)
+
+        result = cli_runner.invoke(cli_app.cli, ["db", "list", "--engine", "postgresql", "--open"])
+
+        assert result.exit_code == 0, result.output
+        output = logged.getvalue()
+        assert "http://127.0.0.1:8080/databases" in output
+
+    def test_launches_xdg_open_when_a_display_is_present(
+        self,
+        cli_runner: CliRunner,
+        manager: FakeManager,
+        logged: io.StringIO,
+        isolated_panel_config: Path,
+        runner,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """With a display available, ``--open`` hands the URL to xdg-open."""
+        monkeypatch.setenv("DISPLAY", ":0")
+        _configure_panel(isolated_panel_config)
+
+        result = cli_runner.invoke(cli_app.cli, ["db", "list", "--engine", "postgresql", "--open"])
+
+        assert result.exit_code == 0, result.output
+        assert runner.calls_to("xdg-open") == [("xdg-open", "http://127.0.0.1:8080/databases")]
+
+    def test_without_a_configured_panel_warns_and_exits_clean(
+        self,
+        cli_runner: CliRunner,
+        manager: FakeManager,
+        logged: io.StringIO,
+        isolated_panel_config: Path,
+        runner,
+    ):
+        """The panel is off by default, so ``--open`` warns instead of guessing a URL."""
+        result = cli_runner.invoke(cli_app.cli, ["db", "list", "--engine", "postgresql", "--open"])
+
+        assert result.exit_code == 0, result.output
+        assert "not configured" in logged.getvalue()
+        assert not runner.calls_to("xdg-open")
 
 
 class TestDestructiveCommands:

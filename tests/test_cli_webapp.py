@@ -25,6 +25,7 @@ from typing import Any
 
 import click
 import pytest
+import yaml
 from click.testing import CliRunner, Result
 
 from wasm.cli import app as cli_app
@@ -432,6 +433,55 @@ def deployer(monkeypatch: pytest.MonkeyPatch) -> DeployerSpy:
         lambda app_type, package_manager, verbose: (True, [], []),
     )
     return spy
+
+
+@pytest.fixture
+def isolated_panel_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """
+    Point the layered configuration at a per-test file.
+
+    ``panel_url`` reads ``web.*`` through the Config singleton, which would
+    otherwise read the developer's real ``/etc/wasm/config.yaml`` and make
+    these tests depend on the machine they run on. The self-signed TLS pair
+    path is pinned the same way, so a machine that has actually run
+    ``wasm web start --self-signed`` does not turn "http" into "https" under
+    a test.
+
+    Args:
+        tmp_path: Per-test temporary directory.
+        monkeypatch: Patching helper, scoped to the test.
+
+    Yields:
+        The configuration file the test may write.
+    """
+    from wasm.cli.commands import web as web_module
+    from wasm.core import config as config_module
+
+    path = tmp_path / "config.yaml"
+    monkeypatch.setattr(config_module, "DEFAULT_CONFIG_PATH", path)
+    monkeypatch.setattr(web_module, "PANEL_TLS_CERT", tmp_path / "panel-tls" / "panel.crt")
+    monkeypatch.setattr(web_module, "PANEL_TLS_KEY", tmp_path / "panel-tls" / "panel.key")
+    config_module.Config.reset_instance()
+    yield path
+    config_module.Config.reset_instance()
+
+
+def _configure_panel(path: Path, **settings: Any) -> None:
+    """
+    Declare a configured, reachable panel in the isolated config file.
+
+    Args:
+        path: The isolated configuration file.
+        **settings: Overrides for the ``web`` section; ``enabled``, ``host``
+            and ``port`` fall back to a plain local panel when not given.
+    """
+    from wasm.core.config import Config
+
+    settings.setdefault("enabled", True)
+    settings.setdefault("host", "127.0.0.1")
+    settings.setdefault("port", 8080)
+    path.write_text(yaml.safe_dump({"web": settings}), encoding="utf-8")
+    Config.reset_instance()
 
 
 # ---------------------------------------------------------------------------
@@ -1391,6 +1441,165 @@ def test_logs_of_a_compose_app_asks_docker(
     assert runner.calls == [
         ("docker", "compose", "-f", str(compose_file), "logs", "--tail", "50"),
     ]
+
+
+# ---------------------------------------------------------------------------
+# --open: deep links into the panel
+# ---------------------------------------------------------------------------
+
+
+def _status_relations() -> dict[str, Any]:
+    """
+    Returns:
+        A store relations payload that ``status --open`` can succeed against.
+    """
+    return {
+        "app": make_app(),
+        "site": SimpleNamespace(
+            webserver="nginx",
+            ssl_enabled=True,
+            config_path="/etc/nginx/sites-available/example.com",
+        ),
+        "service": SimpleNamespace(name="example-com"),
+        "databases": [],
+    }
+
+
+@pytest.mark.parametrize(
+    ("command", "args", "path"),
+    [
+        ("status", ["example.com"], "/apps/example.com"),
+        ("list", [], "/apps"),
+        ("logs", ["example.com"], "/apps/example.com"),
+    ],
+)
+def test_open_prints_the_configured_panel_url_without_a_display(
+    cli_runner: CliRunner,
+    store: StoreSpy,
+    services: ServiceSpy,
+    console: io.StringIO,
+    isolated_panel_config: Path,
+    runner: FakeRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    args: list[str],
+    path: str,
+) -> None:
+    """
+    ``--open`` prints the panel URL, and never touches xdg-open without a display.
+
+    Args:
+        cli_runner: Click test runner.
+        store: Store spy.
+        services: Service manager spy.
+        console: Buffer holding what the logger printed.
+        isolated_panel_config: Per-test configuration file.
+        runner: Fake process runner.
+        monkeypatch: Patching helper, scoped to the test.
+        command: Command under test.
+        args: Positional arguments the command needs.
+        path: Panel path the command is expected to print.
+    """
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    _configure_panel(isolated_panel_config)
+    store.relations["example.com"] = _status_relations()
+    store.apps["example.com"] = make_app()
+
+    result = cli_runner.invoke(webapp.cli.commands[command], [*args, "--open"])
+    output = shown(result, console)
+
+    assert result.exit_code == 0, output
+    assert f"http://127.0.0.1:8080{path}" in output
+    assert not runner.calls_to("xdg-open")
+
+
+@pytest.mark.parametrize(
+    ("command", "args", "path"),
+    [
+        ("status", ["example.com"], "/apps/example.com"),
+        ("list", [], "/apps"),
+        ("logs", ["example.com"], "/apps/example.com"),
+    ],
+)
+def test_open_launches_xdg_open_when_a_display_is_present(
+    cli_runner: CliRunner,
+    store: StoreSpy,
+    services: ServiceSpy,
+    console: io.StringIO,
+    isolated_panel_config: Path,
+    runner: FakeRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    args: list[str],
+    path: str,
+) -> None:
+    """
+    With a display available, ``--open`` hands the URL to xdg-open.
+
+    Args:
+        cli_runner: Click test runner.
+        store: Store spy.
+        services: Service manager spy.
+        console: Buffer holding what the logger printed.
+        isolated_panel_config: Per-test configuration file.
+        runner: Fake process runner.
+        monkeypatch: Patching helper, scoped to the test.
+        command: Command under test.
+        args: Positional arguments the command needs.
+        path: Panel path the command is expected to open.
+    """
+    monkeypatch.setenv("DISPLAY", ":0")
+    _configure_panel(isolated_panel_config)
+    store.relations["example.com"] = _status_relations()
+    store.apps["example.com"] = make_app()
+
+    result = cli_runner.invoke(webapp.cli.commands[command], [*args, "--open"])
+
+    assert result.exit_code == 0, result.output
+    assert runner.calls_to("xdg-open") == [("xdg-open", f"http://127.0.0.1:8080{path}")]
+
+
+@pytest.mark.parametrize(
+    ("command", "args"),
+    [
+        ("status", ["example.com"]),
+        ("list", []),
+        ("logs", ["example.com"]),
+    ],
+)
+def test_open_without_a_configured_panel_warns_and_exits_clean(
+    cli_runner: CliRunner,
+    store: StoreSpy,
+    services: ServiceSpy,
+    console: io.StringIO,
+    isolated_panel_config: Path,
+    runner: FakeRunner,
+    command: str,
+    args: list[str],
+) -> None:
+    """
+    The panel is off by default, so ``--open`` warns instead of guessing a URL.
+
+    Args:
+        cli_runner: Click test runner.
+        store: Store spy.
+        services: Service manager spy.
+        console: Buffer holding what the logger printed.
+        isolated_panel_config: Per-test configuration file, left unwritten.
+        runner: Fake process runner.
+        command: Command under test.
+        args: Positional arguments the command needs.
+    """
+    store.relations["example.com"] = _status_relations()
+    store.apps["example.com"] = make_app()
+
+    result = cli_runner.invoke(webapp.cli.commands[command], [*args, "--open"])
+    output = shown(result, console)
+
+    assert result.exit_code == 0, output
+    assert "not configured" in output
+    assert not runner.calls_to("xdg-open")
 
 
 # ---------------------------------------------------------------------------

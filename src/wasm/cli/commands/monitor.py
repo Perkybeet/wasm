@@ -26,6 +26,7 @@ from typing import Any
 import click
 
 from wasm.cli.app import Context, pass_context
+from wasm.cli.panel_links import open_in_panel
 from wasm.core.config import Config
 from wasm.core.exceptions import EmailError, MonitorError, WASMError
 from wasm.core.logger import Logger
@@ -517,10 +518,22 @@ def cli() -> None:
 
 
 @cli.command("status")
+@click.option(
+    "--open",
+    "open_panel",
+    is_flag=True,
+    help="Print the panel URL for the dashboard, opening it if a display is available.",
+)
 @pass_context
-def status(ctx: Context) -> int:
+def status(ctx: Context, open_panel: bool) -> int:
     """Show whether the monitor is running and what it is watching."""
-    return _show_status(verbose=ctx.verbose)
+    code = _show_status(verbose=ctx.verbose)
+    if open_panel and code == 0:
+        # A fresh Logger, like every other action in this module, rather than
+        # ctx.logger: this file never reads the shared context's logger, and
+        # _show_status already reports through one built the same way.
+        open_in_panel("/", logger=Logger(verbose=ctx.verbose))
+    return code
 
 
 @cli.command("scan")

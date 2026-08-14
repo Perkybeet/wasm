@@ -33,6 +33,7 @@ from typing import Any, TypeVar
 import click
 
 from wasm.cli.app import Context, enable_dry_run, pass_context
+from wasm.cli.panel_links import open_in_panel
 from wasm.core.app_state import RUNNING, STATIC, resolve_states
 from wasm.core.config import Config
 from wasm.core.dependencies import check_deployment_ready
@@ -1654,20 +1655,38 @@ def create(
 
 
 @cli.command(name="list")
+@click.option(
+    "--open",
+    "open_panel",
+    is_flag=True,
+    help="Print the panel URL for the app list, opening it if a display is available.",
+)
 @_global_flags
 @pass_context
-def list_apps(ctx: Context) -> None:
+def list_apps(ctx: Context, open_panel: bool) -> None:
     """List the applications deployed on this server."""
-    _exit(_list_apps(ctx.logger))
+    code = _list_apps(ctx.logger)
+    if open_panel and code == 0:
+        open_in_panel("/apps", logger=ctx.logger)
+    _exit(code)
 
 
 @cli.command()
 @click.argument("domain")
+@click.option(
+    "--open",
+    "open_panel",
+    is_flag=True,
+    help="Print the panel URL for this application, opening it if a display is available.",
+)
 @_global_flags
 @pass_context
-def status(ctx: Context, domain: str) -> None:
+def status(ctx: Context, domain: str, open_panel: bool) -> None:
     """Show how an application is configured and whether it is running."""
-    _exit(_show_status(domain, ctx.logger))
+    code = _show_status(domain, ctx.logger)
+    if open_panel and code == 0:
+        open_in_panel(f"/apps/{domain}", logger=ctx.logger)
+    _exit(code)
 
 
 @cli.command()
@@ -1771,8 +1790,17 @@ def delete(ctx: Context, domain: str, force: bool, keep_files: bool) -> None:
     show_default=True,
     help="How many recent lines to show.",
 )
+@click.option(
+    "--open",
+    "open_panel",
+    is_flag=True,
+    help="Print the panel URL for this application, opening it if a display is available.",
+)
 @_global_flags
 @pass_context
-def logs(ctx: Context, domain: str, follow: bool, lines: int) -> None:
+def logs(ctx: Context, domain: str, follow: bool, lines: int, open_panel: bool) -> None:
     """Show what an application has been writing to its log."""
-    _exit(_show_logs(domain, logger=ctx.logger, follow=follow, lines=lines))
+    code = _show_logs(domain, logger=ctx.logger, follow=follow, lines=lines)
+    if open_panel and code == 0:
+        open_in_panel(f"/apps/{domain}", logger=ctx.logger)
+    _exit(code)

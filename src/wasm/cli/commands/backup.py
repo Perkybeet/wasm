@@ -35,6 +35,7 @@ from typing import Any
 import click
 
 from wasm.cli.app import Context, pass_context
+from wasm.cli.panel_links import open_in_panel
 from wasm.core.exceptions import WASMError
 from wasm.core.logger import Logger
 from wasm.managers.backup_manager import BackupManager, BackupMetadata, RollbackManager
@@ -837,22 +838,35 @@ def backup_create(
 @click.argument("domain", required=False)
 @click.option("-t", "--tags", help="Only show backups carrying one of these tags.")
 @click.option("-n", "--limit", type=click.INT, help="Show at most this many backups.")
+@click.option(
+    "--open",
+    "open_panel",
+    is_flag=True,
+    help="Print the panel URL for the backup list, opening it if a display is available.",
+)
 @pass_context
-def backup_list(state: Context, domain: str | None, tags: str | None, limit: int | None) -> None:
+def backup_list(
+    state: Context,
+    domain: str | None,
+    tags: str | None,
+    limit: int | None,
+    open_panel: bool,
+) -> None:
     """
     List the backups on this server, newest first.
 
     Give a domain to see only that application's backups.
     """
-    _finish(
-        _list_backups(
-            logger=state.logger,
-            domain=domain,
-            tags=tags,
-            limit=limit,
-            json_output=state.json_output,
-        )
+    code = _list_backups(
+        logger=state.logger,
+        domain=domain,
+        tags=tags,
+        limit=limit,
+        json_output=state.json_output,
     )
+    if open_panel and code == 0:
+        open_in_panel("/backups", logger=state.logger)
+    _finish(code)
 
 
 @backup.command("restore")
