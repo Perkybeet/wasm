@@ -527,3 +527,12 @@ La API entera ya existe (`api/databases.py`). UI con tabs por engine:
   tests con deps de pip NO validan las deps de distro; toda API nueva de una librería
   empaquetada debe contrastarse con la versión de noble/bookworm/Fedora (tabla en
   CLAUDE.md) y el gate del contenedor es el chokepoint que lo garantiza.
+- 2026-08-14 (rediseño): el dueño rechazó la estética austera de la v1 tras usarla
+  ("pobre, asimétrica, componentes horribles"). Nueva dirección en
+  `docs/superpowers/specs/2026-08-14-wasm-panel-design-v2.md` (Geist, acento índigo,
+  elevación, esqueleto de página común, pills en vez de raíl) implementada entera y
+  **publicada como v1.6.0** (Release y CI verdes). Verificación visual con capturas
+  reales (scripts/panel_screenshots.py, 16 pantallas ambos temas + móvil) revisadas
+  en dos rondas por el implementador y una por el orquestador. El spec de diseño de
+  2026-08-12 queda superado en lo estético; sus restricciones técnicas (CSP, sin
+  build, vendor con checksum, color de estado + acento) siguen vigentes.
