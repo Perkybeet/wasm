@@ -1,0 +1,23 @@
+{#
+  One deployment attempt per row, shared by the global history, a domain's
+  history and the application page's own section, so the three can never
+  disagree about what an attempt looks like.
+
+  The rail carries the outcome; the meta carries the four facts an operator
+  scans for: what triggered it, which commit, how long it took and when. For a
+  failed attempt the note is the first line of the error, verbatim. The row
+  links to the detail, which is where the captured build log lives.
+#}
+{% import "_macros.html" as m %}
+<div class="rows">
+  {% for row in deploy_rows %}
+    {% call m.row(row.domain, row.state,
+                  [("trigger", row.trigger),
+                   ("commit", row.commit),
+                   ("took", row.duration),
+                   ("started", row.started)],
+                  row.href, "deployment-" ~ row.id, row.note, row.status) %}
+      <a class="btn btn--sm" href="{{ row.href }}">Open</a>
+    {% endcall %}
+  {% endfor %}
+</div>

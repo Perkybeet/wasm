@@ -68,6 +68,30 @@
   {% include "fragments/app_env.html" %}
 </section>
 
+{#
+  These two sections load over htmx rather than rendering inline, so they
+  live entirely in views/deployments.py and this page's handler does not have
+  to know they exist. Listing rollback points also walks the backup directory,
+  which is work the first paint should not wait on.
+#}
+<section class="stack--tight">
+  <h2 class="label stack__title">Deployments</h2>
+  <div id="deploy-history-section"
+       hx-get="/apps/{{ domain }}/deployments/recent"
+       hx-trigger="load" hx-swap="outerHTML">
+    <p class="muted">Reading deployment history…</p>
+  </div>
+</section>
+
+<section class="stack--tight">
+  <h2 class="label stack__title">Rollback</h2>
+  <div id="deploy-rollback-section"
+       hx-get="/apps/{{ domain }}/rollback/section"
+       hx-trigger="load" hx-swap="outerHTML">
+    <p class="muted">Reading rollback points…</p>
+  </div>
+</section>
+
 <section>
   <h2 class="label stack__title">Recent jobs</h2>
   {% if jobs %}

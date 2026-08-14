@@ -1,0 +1,23 @@
+{#
+  The application page's deployment history section.
+
+  Loaded over htmx when the page opens, like the rollback section below it,
+  so the section lives entirely in views/deployments.py and the page handler
+  in views/router.py does not have to know it exists. It shows the most
+  recent attempts in the same rows the history pages use; the full record is
+  one click away.
+#}
+{% import "_macros.html" as m %}
+<div id="deploy-history-section">
+  {% if deploy_rows %}
+    {% include "fragments/deploy_rows.html" %}
+    <p class="stack__note">
+      <a href="/apps/{{ history_domain }}/deployments">View all deployments of {{ history_domain }}</a>
+    </p>
+  {% else %}
+    <p class="muted">
+      No deployment has been recorded for {{ history_domain }} yet.
+      History is kept from the next deploy, update or rollback onwards.
+    </p>
+  {% endif %}
+</div>

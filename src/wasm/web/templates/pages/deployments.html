@@ -1,0 +1,36 @@
+{#
+  Deployment history.
+
+  One row per attempt, newest first, for the whole machine or for one domain.
+  The rail carries the outcome and the row links to the detail, where the
+  captured build log is shown verbatim. The history outlives the application
+  it describes on purpose: the record of a deleted app matters most at
+  exactly the moment the app is gone.
+#}
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+
+{% block title %}{{ title }}{% endblock %}
+
+{% block content %}
+
+{% call m.page_head(title, subtitle) %}
+  {% if history_domain %}
+    <a class="btn btn--sm" href="/apps/{{ history_domain }}">Open {{ history_domain }}</a>
+  {% endif %}
+{% endcall %}
+
+{% if deploy_rows %}
+  {% include "fragments/deploy_rows.html" %}
+{% elif history_domain %}
+  {{ m.empty("No deployments recorded",
+             "Nothing has been recorded for " ~ history_domain ~
+             " yet. History is kept from the next deploy, update or rollback onwards.",
+             command="wasm update -d " ~ history_domain) }}
+{% else %}
+  {{ m.empty("No deployments recorded",
+             "Every deploy, update and rollback is recorded here, with its captured build log.",
+             command="wasm create -d example.com -s https://github.com/you/app") }}
+{% endif %}
+
+{% endblock %}

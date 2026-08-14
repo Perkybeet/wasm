@@ -1,0 +1,71 @@
+{#
+  Rollback points for one application, as one swappable section.
+
+  Two states render through this fragment: the list of backups the
+  application can return to, and the confirmation over one of them. Rolling
+  back overwrites the deployed files, so the confirmation is not a browser
+  dialog that habit clicks through - the operator types the domain, and the
+  name is checked server-side. A wrong name renders the refusal inline at
+  200, because htmx does not swap an error status, and changes nothing.
+
+  The rollback itself is the existing job the JSON API queues; this section
+  only offers it. Progress is reported by the live feed and the activity
+  screen, like every queued job.
+#}
+{% import "_macros.html" as m %}
+<div class="rows" id="deploy-rollback-section">
+
+  {% if rollback_problem %}
+    {{ m.problem(rollback_problem.fix, rollback_problem.output) }}
+  {% endif %}
+
+  {% if rollback_queued %}
+    <p class="stack__lead">
+      {{ m.badge("busy", "queued") }}
+      {{ rollback_queued }} is queued. Progress is reported by the live feed
+      and the <a href="/activity">activity</a> screen.
+    </p>
+  {% endif %}
+
+  {% if rollback_mode == "confirm" and rollback_confirm %}
+    <form hx-post="/apps/{{ rollback_domain }}/rollback"
+          hx-target="#deploy-rollback-section" hx-swap="outerHTML">
+      <input type="hidden" name="backup_id" value="{{ rollback_confirm.id }}">
+      <p>
+        Roll {{ rollback_domain }} back to <span class="mono">{{ rollback_confirm.id }}</span>
+        (taken {{ rollback_confirm.taken }}, {{ rollback_confirm.size }})?
+        This overwrites the files currently deployed at {{ rollback_domain }}
+        and cannot be undone.
+      </p>
+      <div class="field">
+        <label class="label" for="rollback-confirm-input">
+          Type {{ rollback_domain }} to confirm
+        </label>
+        <input class="mono" type="text" id="rollback-confirm-input" name="confirm"
+               autocomplete="off" spellcheck="false">
+      </div>
+      <button class="btn btn--sm btn--danger" type="submit">Roll back</button>
+      <button class="btn btn--sm" type="button"
+              hx-get="/apps/{{ rollback_domain }}/rollback/section"
+              hx-target="#deploy-rollback-section" hx-swap="outerHTML">Cancel</button>
+    </form>
+
+  {% elif rollback_points %}
+    {% for point in rollback_points %}
+      {% call m.row(point.id, "idle",
+                    [("taken", point.taken), ("size", point.size), ("tags", point.tags)],
+                    none, "rollback-" ~ point.id, point.note) %}
+        <button type="button" class="btn btn--sm"
+                hx-get="/apps/{{ rollback_domain }}/rollback/confirm/{{ point.id }}"
+                hx-target="#deploy-rollback-section" hx-swap="outerHTML">Roll back</button>
+      {% endcall %}
+    {% endfor %}
+
+  {% else %}
+    <p class="muted">
+      No rollback points exist for {{ rollback_domain }}. A backup is taken
+      before every deploy; the next one creates the first point to return to.
+    </p>
+  {% endif %}
+
+</div>

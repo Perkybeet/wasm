@@ -1,0 +1,45 @@
+{#
+  One deployment attempt.
+
+  The facts, the failure verbatim when there was one, and the captured build
+  log exactly as the pipeline wrote it. The log is never paraphrased: it is
+  what the operator will search or paste into an issue, and a friendly
+  rewrite of npm's or nginx's own words would be worthless there.
+#}
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+
+{% block title %}Deployment {{ deployment.id }} - {{ deployment.domain }}{% endblock %}
+
+{% block content %}
+
+{% call m.page_head("Deployment " ~ deployment.id, deployment.domain) %}
+  <a class="btn btn--sm" href="{{ history_href }}">History</a>
+  <a class="btn btn--sm" href="/apps/{{ deployment.domain }}">Open {{ deployment.domain }}</a>
+{% endcall %}
+
+<section class="stack--tight">
+  <h2 class="label stack__title">Outcome</h2>
+  <p class="stack__lead">{{ m.badge(deployment.state, deployment.status) }}</p>
+  {% if error %}
+    {{ m.problem("The deployment failed. What the pipeline reported is below; the captured build log holds the full context.", error) }}
+  {% endif %}
+  {{ m.facts(facts) }}
+</section>
+
+<section>
+  <h2 class="label stack__title">Build log</h2>
+  {% if log_text is not none %}
+    {% if log_truncated %}
+      <p class="faint">
+        The log is longer than this page shows; this is the most recent
+        512 KiB. The full file is at {{ deployment.log_path }}.
+      </p>
+    {% endif %}
+    <pre class="problem__output">{{ log_text }}</pre>
+  {% else %}
+    <p class="muted">{{ log_absence }}</p>
+  {% endif %}
+</section>
+
+{% endblock %}

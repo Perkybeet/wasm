@@ -1066,6 +1066,10 @@ textarea.mono {
   line-height: 1.5;
   white-space: pre-wrap;
   overflow-x: auto;
+  /* Captured build logs render through this block too; without a ceiling a
+     long build pushes the page's own controls out of reach. */
+  max-height: 60vh;
+  overflow-y: auto;
   color: var(--text-muted);
 }
 
