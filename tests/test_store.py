@@ -146,7 +146,15 @@ class TestWASMStore:
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
             tables = {row[0] for row in cursor.fetchall()}
 
-        expected = {"schema_version", "apps", "sites", "services", "databases", "database_users"}
+        expected = {
+            "schema_version",
+            "apps",
+            "sites",
+            "services",
+            "databases",
+            "database_users",
+            "deployments",
+        }
         assert expected.issubset(tables)
 
     def test_schema_version(self, temp_db):
@@ -156,6 +164,203 @@ class TestWASMStore:
             version = cursor.fetchone()[0]
 
         assert version == SCHEMA_VERSION
+
+
+#: The v1 schema exactly as the 1.2.x releases shipped it, frozen here so the
+#: migration is always exercised against what is actually deployed on servers,
+#: not against whatever SCHEMA_SQL has since become.
+V1_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS schema_version (
+    version INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS apps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain TEXT NOT NULL UNIQUE,
+    app_type TEXT NOT NULL DEFAULT 'unknown',
+    source TEXT,
+    branch TEXT,
+    port INTEGER,
+    app_path TEXT NOT NULL,
+    webserver TEXT NOT NULL DEFAULT 'nginx',
+    ssl_enabled INTEGER NOT NULL DEFAULT 1,
+    ssl_certificate TEXT,
+    ssl_key TEXT,
+    status TEXT NOT NULL DEFAULT 'unknown',
+    is_static INTEGER NOT NULL DEFAULT 0,
+    env_vars TEXT DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    deployed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS sites (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    app_id INTEGER,
+    domain TEXT NOT NULL UNIQUE,
+    webserver TEXT NOT NULL DEFAULT 'nginx',
+    config_path TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    is_static INTEGER NOT NULL DEFAULT 0,
+    document_root TEXT,
+    proxy_port INTEGER,
+    ssl_enabled INTEGER NOT NULL DEFAULT 0,
+    ssl_certificate TEXT,
+    ssl_key TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (app_id) REFERENCES apps(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS services (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    app_id INTEGER,
+    name TEXT NOT NULL UNIQUE,
+    unit_file TEXT NOT NULL,
+    working_directory TEXT NOT NULL,
+    command TEXT NOT NULL,
+    user TEXT NOT NULL DEFAULT 'www-data',
+    "group" TEXT NOT NULL DEFAULT 'www-data',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'inactive',
+    port INTEGER,
+    environment TEXT DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (app_id) REFERENCES apps(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS databases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    app_id INTEGER,
+    name TEXT NOT NULL,
+    engine TEXT NOT NULL,
+    host TEXT NOT NULL DEFAULT 'localhost',
+    port INTEGER,
+    username TEXT,
+    encoding TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (app_id) REFERENCES apps(id) ON DELETE SET NULL,
+    UNIQUE(name, engine)
+);
+
+CREATE TABLE IF NOT EXISTS database_users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    database_id INTEGER,
+    username TEXT NOT NULL,
+    engine TEXT NOT NULL,
+    host TEXT NOT NULL DEFAULT 'localhost',
+    privileges TEXT NOT NULL DEFAULT 'ALL',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (database_id) REFERENCES databases(id) ON DELETE CASCADE,
+    UNIQUE(username, engine, host)
+);
+
+CREATE INDEX IF NOT EXISTS idx_apps_domain ON apps(domain);
+CREATE INDEX IF NOT EXISTS idx_apps_status ON apps(status);
+CREATE INDEX IF NOT EXISTS idx_sites_domain ON sites(domain);
+CREATE INDEX IF NOT EXISTS idx_sites_app_id ON sites(app_id);
+CREATE INDEX IF NOT EXISTS idx_services_app_id ON services(app_id);
+CREATE INDEX IF NOT EXISTS idx_services_name ON services(name);
+CREATE INDEX IF NOT EXISTS idx_databases_engine ON databases(engine);
+CREATE INDEX IF NOT EXISTS idx_databases_app_id ON databases(app_id);
+"""
+
+
+class TestSchemaV2Migration:
+    """Schema v2 adds the deployments history table without losing a row."""
+
+    def _create_v1_database(self, db_path: Path) -> None:
+        """
+        Create a real v1 database with rows, as a 1.2.x release left it.
+
+        Args:
+            db_path: Where the database file is created.
+        """
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.executescript(V1_SCHEMA_SQL)
+            conn.execute("INSERT INTO schema_version (version) VALUES (1)")
+            conn.execute(
+                "INSERT INTO apps (domain, app_type, app_path) VALUES (?, ?, ?)",
+                ("v1.example.com", "nextjs", "/var/www/apps/v1-example-com"),
+            )
+            conn.execute(
+                "INSERT INTO sites (domain, config_path) VALUES (?, ?)",
+                ("v1.example.com", "/etc/nginx/sites-available/v1.example.com"),
+            )
+            conn.execute(
+                "INSERT INTO services (name, unit_file, working_directory, command)"
+                " VALUES (?, ?, ?, ?)",
+                (
+                    "v1-example-com",
+                    "/etc/systemd/system/wasm-v1-example-com.service",
+                    "/var/www/apps/v1-example-com",
+                    "/usr/bin/npm run start",
+                ),
+            )
+            conn.execute(
+                "INSERT INTO databases (name, engine) VALUES (?, ?)",
+                ("v1_db", "postgresql"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_a_v1_database_migrates_to_v2_keeping_every_row(self, fresh, tmp_path):
+        """A server upgraded in place keeps its whole inventory."""
+        db_path = tmp_path / "wasm.db"
+        self._create_v1_database(db_path)
+
+        store = WASMStore(db_path, fs=RecordingFileSystem())
+
+        with store._transaction() as cursor:
+            cursor.execute("SELECT MAX(version) FROM schema_version")
+            assert cursor.fetchone()[0] == 2
+        assert store.get_app("v1.example.com") is not None
+        assert store.get_site("v1.example.com") is not None
+        assert store.get_service("v1-example-com") is not None
+        assert store.get_database("v1_db", "postgresql") is not None
+
+    def test_the_migration_creates_the_deployments_table_and_index(self, fresh, tmp_path):
+        """The table and its (domain, started_at) index exist after migrating."""
+        db_path = tmp_path / "wasm.db"
+        self._create_v1_database(db_path)
+
+        store = WASMStore(db_path, fs=RecordingFileSystem())
+
+        with store._transaction() as cursor:
+            cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?", ("deployments",)
+            )
+            assert cursor.fetchone() is not None
+            cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name=?",
+                ("idx_deployments_domain_started",),
+            )
+            assert cursor.fetchone() is not None
+
+    def test_a_migrated_database_records_deployments(self, fresh, tmp_path):
+        """Migration produces a table the new API can actually use."""
+        db_path = tmp_path / "wasm.db"
+        self._create_v1_database(db_path)
+        store = WASMStore(db_path, fs=RecordingFileSystem())
+
+        deployment_id = store.record_deployment_start("v1.example.com", "cli")
+
+        assert store.get_deployment(deployment_id) is not None
+
+    def test_a_fresh_database_is_created_directly_at_v2(self, temp_db):
+        """A new install does not take the migration path to reach v2."""
+        with temp_db._transaction() as cursor:
+            cursor.execute("SELECT MAX(version) FROM schema_version")
+            assert cursor.fetchone()[0] == 2
+            cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?", ("deployments",)
+            )
+            assert cursor.fetchone() is not None
 
 
 class TestAppCRUD:
@@ -447,6 +652,123 @@ class TestDatabaseUserCRUD:
         user = temp_db.get_database_user("getuser", "mysql")
 
         assert user is not None
+
+
+class TestDeploymentHistory:
+    """The deployments table is the product's memory of what it did."""
+
+    def test_start_and_finish_roundtrip_computes_duration(self, temp_db):
+        """A deployment is recorded running, then closed with its outcome."""
+        deployment_id = temp_db.record_deployment_start(
+            "example.com",
+            "cli",
+            git_commit="0123abc",
+            git_branch="main",
+            log_path="/var/lib/wasm/deploy-logs/example.com/1.log",
+        )
+
+        started = temp_db.get_deployment(deployment_id)
+        assert started is not None
+        assert started.status == "running"
+        assert started.triggered_by == "cli"
+        assert started.git_commit == "0123abc"
+        assert started.git_branch == "main"
+        assert started.log_path == "/var/lib/wasm/deploy-logs/example.com/1.log"
+        assert started.started_at is not None
+        assert started.finished_at is None
+        assert started.duration_s is None
+
+        temp_db.finish_deployment(deployment_id, "success")
+
+        finished = temp_db.get_deployment(deployment_id)
+        assert finished.status == "success"
+        assert finished.finished_at is not None
+        assert finished.duration_s is not None
+        assert finished.duration_s >= 0
+        assert finished.error is None
+
+    def test_a_failure_keeps_the_error_verbatim(self, temp_db):
+        """The captured error is what the operator reads later, unparaphrased."""
+        deployment_id = temp_db.record_deployment_start("example.com", "panel")
+
+        temp_db.finish_deployment(deployment_id, "failed", error="npm ERR! code ELIFECYCLE")
+
+        assert temp_db.get_deployment(deployment_id).error == "npm ERR! code ELIFECYCLE"
+
+    def test_list_filters_by_domain_and_orders_newest_first(self, temp_db):
+        """History reads back most recent first, per domain."""
+        first = temp_db.record_deployment_start("a.example.com", "cli")
+        second = temp_db.record_deployment_start("a.example.com", "panel")
+        temp_db.record_deployment_start("b.example.com", "webhook")
+
+        rows = temp_db.list_deployments(domain="a.example.com")
+
+        assert [row.id for row in rows] == [second, first]
+        assert all(row.domain == "a.example.com" for row in rows)
+
+    def test_list_without_domain_honours_the_limit(self, temp_db):
+        """The default listing covers every domain, newest first, capped."""
+        ids = [temp_db.record_deployment_start("c.example.com", "cli") for _ in range(3)]
+
+        rows = temp_db.list_deployments(limit=2)
+
+        assert [row.id for row in rows] == [ids[2], ids[1]]
+
+    def test_prune_keeps_the_most_recent_and_reports_the_deleted(self, temp_db):
+        """Rotation deletes the oldest rows beyond keep, nothing else."""
+        ids = [temp_db.record_deployment_start("a.example.com", "cli") for _ in range(5)]
+        other = temp_db.record_deployment_start("b.example.com", "cli")
+
+        deleted = temp_db.prune_deployments("a.example.com", keep=2)
+
+        assert deleted == 3
+        remaining = temp_db.list_deployments(domain="a.example.com")
+        assert [row.id for row in remaining] == [ids[4], ids[3]]
+        assert temp_db.get_deployment(other) is not None
+
+    def test_prune_below_the_limit_deletes_nothing(self, temp_db):
+        """A history shorter than keep comes out untouched."""
+        temp_db.record_deployment_start("a.example.com", "cli")
+
+        assert temp_db.prune_deployments("a.example.com", keep=20) == 0
+        assert len(temp_db.list_deployments(domain="a.example.com")) == 1
+
+    def test_an_invalid_status_is_rejected(self, temp_db):
+        """The status vocabulary is closed; a typo cannot invent a state."""
+        deployment_id = temp_db.record_deployment_start("a.example.com", "cli")
+
+        with pytest.raises(StoreError):
+            temp_db.finish_deployment(deployment_id, "exploded")
+
+        assert temp_db.get_deployment(deployment_id).status == "running"
+
+    def test_an_invalid_trigger_is_rejected(self, temp_db):
+        """Only panel, cli and webhook can start a deployment."""
+        with pytest.raises(StoreError):
+            temp_db.record_deployment_start("a.example.com", "cron")
+
+        assert temp_db.list_deployments() == []
+
+    def test_finishing_a_missing_deployment_is_an_error(self, temp_db):
+        """Finishing a pruned or never-recorded id fails loudly, not silently."""
+        with pytest.raises(StoreError):
+            temp_db.finish_deployment(999, "success")
+
+    def test_history_survives_the_app_being_deleted(self, populated_store):
+        """
+        Why there is no foreign key to apps: deleting a broken app is exactly
+        the moment the operator most needs to read what happened to it. A
+        CASCADE would erase the record at that moment.
+        """
+        store = populated_store
+        deployment_id = store.record_deployment_start("example.com", "cli")
+        store.finish_deployment(deployment_id, "failed", error="unit failed to start")
+
+        store.delete_app("example.com")
+
+        record = store.get_deployment(deployment_id)
+        assert record is not None
+        assert record.error == "unit failed to start"
 
 
 class TestRelations:

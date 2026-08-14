@@ -10,6 +10,7 @@ Provides a centralized store for all WASM-managed resources:
 - Sites (Nginx/Apache configurations)
 - Services (systemd services)
 - Databases (MySQL, PostgreSQL, Redis, MongoDB)
+- Deployments (history of every deployment attempt)
 
 The rows hold credentials: ``apps.env_vars`` and ``services.environment`` carry
 DATABASE_URL, API keys and generated secrets. So the database file is 0600
@@ -86,6 +87,24 @@ class DatabaseEngine(str, Enum):
     POSTGRESQL = "postgresql"
     REDIS = "redis"
     MONGODB = "mongodb"
+
+
+class DeploymentStatus(str, Enum):
+    """Deployment lifecycle status enumeration."""
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCESS = "success"
+    FAILED = "failed"
+    ROLLED_BACK = "rolled_back"
+
+
+class DeploymentTrigger(str, Enum):
+    """What initiated a deployment."""
+
+    PANEL = "panel"
+    CLI = "cli"
+    WEBHOOK = "webhook"
 
 
 @dataclass
@@ -244,6 +263,32 @@ class DatabaseUser:
 
 
 @dataclass
+class DeploymentRecord:
+    """One deployment attempt, kept as history."""
+
+    id: int | None = None
+    domain: str = ""
+    status: str = DeploymentStatus.QUEUED.value
+    triggered_by: str = DeploymentTrigger.CLI.value
+    git_commit: str | None = None
+    git_branch: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    duration_s: float | None = None
+    log_path: str | None = None
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return asdict(self)
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "DeploymentRecord":
+        """Create from database row."""
+        return cls(**dict(row))
+
+
+@dataclass
 class MonorepoWorkspace:
     """
     Configuration for a workspace app within a monorepo.
@@ -270,9 +315,45 @@ class MonorepoWorkspace:
 
 
 # Schema version for migrations
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
-SCHEMA_SQL = """
+_DEPLOYMENT_STATUSES_SQL = ", ".join(f"'{status.value}'" for status in DeploymentStatus)
+_DEPLOYMENT_TRIGGERS_SQL = ", ".join(f"'{trigger.value}'" for trigger in DeploymentTrigger)
+
+# Schema v2: deployment history as a first-class entity. Shared by the fresh
+# install path and the v1-to-v2 migration so there is exactly one definition.
+#
+# The column is ``triggered_by`` rather than ``trigger``: TRIGGER is a reserved
+# word in SQLite, and the services table already shows what a reserved column
+# name costs - every statement touching ``"group"`` must remember its quotes or
+# fail at runtime.
+#
+# There is deliberately no foreign key to apps: ON DELETE CASCADE would erase
+# the history of a domain at the exact moment - deleting a broken app - when
+# the operator most needs to read it. The record outlives the app and survives
+# a later redeploy under the same name.
+DEPLOYMENTS_SCHEMA_SQL = f"""
+-- Deployment history
+CREATE TABLE IF NOT EXISTS deployments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ({_DEPLOYMENT_STATUSES_SQL})),
+    triggered_by TEXT NOT NULL CHECK (triggered_by IN ({_DEPLOYMENT_TRIGGERS_SQL})),
+    git_commit TEXT,
+    git_branch TEXT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    duration_s REAL,
+    log_path TEXT,
+    error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_deployments_domain_started
+    ON deployments(domain, started_at DESC);
+"""
+
+SCHEMA_SQL = (
+    """
 -- Schema version tracking
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER PRIMARY KEY,
@@ -377,6 +458,8 @@ CREATE INDEX IF NOT EXISTS idx_services_name ON services(name);
 CREATE INDEX IF NOT EXISTS idx_databases_engine ON databases(engine);
 CREATE INDEX IF NOT EXISTS idx_databases_app_id ON databases(app_id);
 """
+    + DEPLOYMENTS_SCHEMA_SQL
+)
 
 
 class WASMStore:
@@ -670,15 +753,24 @@ class WASMStore:
             cursor: Database cursor.
             from_version: Current schema version.
         """
-        # Migration functions will be added as schema evolves
+        # Keyed by the version each migration produces, matching the loop.
         migrations = {
-            # 1: self._migrate_v1_to_v2,
+            2: self._migrate_v1_to_v2,
         }
 
         for version in range(from_version + 1, SCHEMA_VERSION + 1):
             if version in migrations:
                 migrations[version](cursor)
             cursor.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+
+    def _migrate_v1_to_v2(self, cursor: sqlite3.Cursor) -> None:
+        """
+        Add the deployments history table (schema v2).
+
+        Args:
+            cursor: Cursor the migration runs on.
+        """
+        cursor.executescript(DEPLOYMENTS_SCHEMA_SQL)
 
     # =========================================================================
     # Application CRUD
@@ -1234,6 +1326,184 @@ class WASMStore:
                 (username, engine, host),
             )
             return cursor.rowcount > 0
+
+    # =========================================================================
+    # Deployment history
+    # =========================================================================
+
+    def record_deployment_start(
+        self,
+        domain: str,
+        trigger: str,
+        git_commit: str | None = None,
+        git_branch: str | None = None,
+        log_path: str | None = None,
+    ) -> int:
+        """
+        Record the start of a deployment attempt.
+
+        The row is created in ``running`` state with ``started_at`` set to now;
+        :meth:`finish_deployment` closes it with the outcome.
+
+        Args:
+            domain: Domain being deployed.
+            trigger: What initiated the deployment: 'panel', 'cli' or 'webhook'.
+            git_commit: Commit being deployed, when known.
+            git_branch: Branch being deployed, when known.
+            log_path: Where the captured build log is written, when there is one.
+
+        Returns:
+            The id of the history row, to pass to :meth:`finish_deployment`.
+
+        Raises:
+            StoreError: If ``trigger`` is not an accepted value.
+        """
+        try:
+            DeploymentTrigger(trigger)
+        except ValueError as exc:
+            raise StoreError(
+                f"Invalid deployment trigger {trigger!r}",
+                details="Accepted triggers: "
+                + ", ".join(member.value for member in DeploymentTrigger),
+            ) from exc
+
+        with self._transaction() as cursor:
+            cursor.execute(
+                """INSERT INTO deployments
+                   (domain, status, triggered_by, git_commit, git_branch, started_at, log_path)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    domain,
+                    DeploymentStatus.RUNNING.value,
+                    trigger,
+                    git_commit,
+                    git_branch,
+                    datetime.now().isoformat(),
+                    log_path,
+                ),
+            )
+            deployment_id = cursor.lastrowid
+
+        if deployment_id is None:
+            raise StoreError(
+                "SQLite reported no id for the new deployment row",
+                details="This should not happen after a successful INSERT.",
+            )
+        return deployment_id
+
+    def finish_deployment(self, deployment_id: int, status: str, error: str | None = None) -> None:
+        """
+        Record the outcome of a deployment.
+
+        ``finished_at`` and ``duration_s`` are computed here from the recorded
+        start, so callers only say how it ended.
+
+        Args:
+            deployment_id: Id returned by :meth:`record_deployment_start`.
+            status: Final status, usually 'success', 'failed' or 'rolled_back'.
+            error: What went wrong, verbatim, when the deployment failed.
+
+        Raises:
+            StoreError: If the deployment does not exist or ``status`` is not
+                an accepted value.
+        """
+        try:
+            DeploymentStatus(status)
+        except ValueError as exc:
+            raise StoreError(
+                f"Invalid deployment status {status!r}",
+                details="Accepted statuses: "
+                + ", ".join(member.value for member in DeploymentStatus),
+            ) from exc
+
+        with self._transaction() as cursor:
+            cursor.execute("SELECT started_at FROM deployments WHERE id = ?", (deployment_id,))
+            row = cursor.fetchone()
+            if row is None:
+                raise StoreError(
+                    f"Deployment {deployment_id} does not exist",
+                    details="It may have been pruned; there is nothing to finish.",
+                )
+
+            started = datetime.fromisoformat(row["started_at"])
+            finished = datetime.now()
+            cursor.execute(
+                """UPDATE deployments
+                   SET status = ?, finished_at = ?, duration_s = ?, error = ?
+                   WHERE id = ?""",
+                (
+                    status,
+                    finished.isoformat(),
+                    (finished - started).total_seconds(),
+                    error,
+                    deployment_id,
+                ),
+            )
+
+    def get_deployment(self, deployment_id: int) -> DeploymentRecord | None:
+        """
+        Get a deployment history row by id.
+
+        Args:
+            deployment_id: Deployment id.
+
+        Returns:
+            The record, or None if not found.
+        """
+        with self._transaction() as cursor:
+            cursor.execute("SELECT * FROM deployments WHERE id = ?", (deployment_id,))
+            row = cursor.fetchone()
+            return DeploymentRecord.from_row(row) if row else None
+
+    def list_deployments(
+        self, domain: str | None = None, limit: int = 50
+    ) -> list[DeploymentRecord]:
+        """
+        List deployment history, most recent first.
+
+        Args:
+            domain: Only this domain's history; all domains when None.
+            limit: Maximum number of rows returned.
+
+        Returns:
+            Deployment records ordered by start time, newest first.
+        """
+        query = "SELECT * FROM deployments"
+        params: list[Any] = []
+
+        if domain:
+            query += " WHERE domain = ?"
+            params.append(domain)
+
+        # id breaks the tie between rows started in the same instant.
+        query += " ORDER BY started_at DESC, id DESC LIMIT ?"
+        params.append(limit)
+
+        with self._transaction() as cursor:
+            cursor.execute(query, params)
+            return [DeploymentRecord.from_row(row) for row in cursor.fetchall()]
+
+    def prune_deployments(self, domain: str, keep: int = 20) -> int:
+        """
+        Delete a domain's oldest deployment rows beyond ``keep``.
+
+        Args:
+            domain: Domain whose history is rotated.
+            keep: How many of the most recent rows survive.
+
+        Returns:
+            How many rows were deleted.
+        """
+        with self._transaction() as cursor:
+            cursor.execute(
+                """DELETE FROM deployments
+                   WHERE domain = ? AND id NOT IN (
+                       SELECT id FROM deployments WHERE domain = ?
+                       ORDER BY started_at DESC, id DESC LIMIT ?
+                   )""",
+                (domain, domain, keep),
+            )
+            return cursor.rowcount
 
     # =========================================================================
     # Utility methods

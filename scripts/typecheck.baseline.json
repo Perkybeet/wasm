@@ -6,5 +6,5 @@
   "no-any-return": 6,
   "return-value": 2,
   "unused-ignore": 1,
-  "var-annotated": 3
+  "var-annotated": 2
 }
