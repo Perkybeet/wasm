@@ -51,6 +51,50 @@
   </section>
 {% endif %}
 
+{#
+  The machine's vital signs over time. The history comes from
+  /api/metrics/{metric} and the live edge rides the metrics event on the
+  shared /events stream; panel.js owns both, keyed off the data-chart hooks.
+  The buttons are read by the client rather than being links: switching the
+  window re-reads history without a navigation, and a plain data attribute is
+  all the delegated click listener needs under script-src 'self'.
+#}
+<section class="stack">
+  <div class="charts__head">
+    <h2 class="label stack__title">Machine</h2>
+    <div class="charts__windows" role="group" aria-label="History window">
+      <button type="button" class="btn btn--sm btn--quiet"
+              data-chart-window="1h" aria-pressed="true">1h</button>
+      <button type="button" class="btn btn--sm btn--quiet"
+              data-chart-window="24h" aria-pressed="false">24h</button>
+    </div>
+  </div>
+  <div class="charts">
+    <figure class="chart">
+      <figcaption class="label chart__title">CPU</figcaption>
+      <div class="chart__plot" data-chart="cpu.percent"></div>
+    </figure>
+    <figure class="chart">
+      <figcaption class="label chart__title">Memory</figcaption>
+      <div class="chart__plot" data-chart="mem.used_bytes"></div>
+    </figure>
+    <figure class="chart">
+      <figcaption class="label chart__title">
+        Network
+        <span class="chart__key">
+          <span class="chart__swatch chart__swatch--rx" aria-hidden="true"></span>rx
+          <span class="chart__swatch chart__swatch--tx" aria-hidden="true"></span>tx
+        </span>
+      </figcaption>
+      <div class="chart__plot" data-chart="net.bytes_s"></div>
+    </figure>
+    <figure class="chart">
+      <figcaption class="label chart__title">Disk</figcaption>
+      <div class="chart__plot" data-chart="disk.percent"></div>
+    </figure>
+  </div>
+</section>
+
 <section class="stack">
   <h2 class="label stack__title">Applications</h2>
 

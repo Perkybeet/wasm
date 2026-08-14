@@ -495,6 +495,86 @@ pre,
   font-weight: 500;
 }
 
+/* ----------------------------------------------------------------- charts */
+
+/*
+ * The dashboard's chart band. The heights are fixed here rather than inline
+ * because the panel's own style-src policy throws away style attributes, and
+ * because uPlot is sized from the box the stylesheet gives it, not the other
+ * way round.
+ */
+.charts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+  gap: var(--space-3);
+}
+
+.charts__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.charts__windows {
+  display: flex;
+  gap: var(--space-1);
+}
+
+.charts__windows .btn[aria-pressed="true"] {
+  background: var(--surface-hover);
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.chart {
+  margin: 0;
+  padding: var(--space-2) var(--space-3) var(--space-3);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  min-width: 0;
+}
+
+.chart__title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+
+/* Values on the axes must not jitter as the live edge advances. */
+.chart__plot {
+  height: 9.5rem;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The network chart's two directions, keyed in the caption with the same
+   tokens the series are stroked with, so the legend can never disagree with
+   the lines. */
+.chart__key {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.chart__swatch {
+  width: 0.5rem;
+  height: 2px;
+  background: var(--state-idle);
+}
+
+.chart__swatch--rx {
+  background: var(--state-active);
+}
+
+.chart__swatch--tx {
+  background: var(--state-busy);
+}
+
 /* --------------------------------------------------------------- layout */
 
 .shell {

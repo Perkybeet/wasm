@@ -23,10 +23,13 @@
 
   {# Everything is served from this host. The panel works on a machine with no
      route to the internet, which is rather the point of self-hosting. #}
+  {# uPlot's stylesheet is not here: only pages with charts need it, and
+     panel.js injects it beside the lazily loaded script. #}
   <link rel="stylesheet" href="/static/app.css">
   <link rel="stylesheet" href="/static/vendor/xterm.css">
-  <link rel="stylesheet" href="/static/vendor/uplot.min.css">
-  <link rel="icon" href="/static/logo.webp" type="image/webp">
+  {# The id is the client's hook: panel.js swaps this icon for a coloured
+     status dot that follows the machine's worst active state. #}
+  <link rel="icon" id="favicon" href="/static/logo.webp" type="image/webp">
 
   {# Three scripts, and no Alpine.
 

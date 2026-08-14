@@ -335,6 +335,22 @@ def test_every_address_the_script_fetches_resolves(app: FastAPI, url: str) -> No
     assert _resolves(app, url, websocket=False), f"panel.js fetches {url!r}, which does not resolve"
 
 
+def test_the_chart_history_address_the_script_fetches_resolves(app: FastAPI) -> None:
+    """
+    The charts load their history from a template literal -
+    ``fetch(`/api/metrics/${...}`)`` - which the literal-URL sweep above
+    cannot see, so the address is pinned by hand: the script must still name
+    it, and a representative metric must still route.
+
+    Args:
+        app: The application.
+    """
+    assert "/api/metrics/" in PANEL_JS, "panel.js no longer fetches the metrics history"
+    assert _resolves(app, "/api/metrics/cpu.percent", websocket=False), (
+        "panel.js fetches /api/metrics/{metric}, which no HTTP route answers"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Identifiers the script looks up
 # ---------------------------------------------------------------------------
@@ -379,6 +395,17 @@ def test_the_identifier_sweep_covers_the_live_connection_gate() -> None:
     """The regex above is load-bearing; assert it found the known lookups."""
     found = set(_looked_up_ids())
     assert {"machine-strip", "notices"} <= found, f"only found {found}"
+
+
+def test_the_identifier_sweep_covers_the_status_favicon() -> None:
+    """
+    The favicon swap resolves ``#favicon``, so it rides the parametrised
+    sweep above; this pins that the sweep still sees it. Without the id the
+    lookup returns null and the tab silently stops reporting state.
+    """
+    assert "favicon" in set(_looked_up_ids()), (
+        "panel.js no longer looks up #favicon; the status favicon is dead code"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -447,6 +474,36 @@ def test_the_hook_sweep_covers_the_drawer_and_the_navigation() -> None:
     found = _handled_hooks()
 
     assert {"data-follow-log", "data-drawer-toggle", "data-nav-toggle"} <= found, found
+    assert "data-chart-window" in found, "the chart window buttons are no longer handled"
+
+
+def _queried_hooks() -> set[str]:
+    """
+    Returns:
+        Every ``data-`` hook the script sweeps the document for. These are the
+        hooks the delegated click listener does not cover: containers the
+        script fills (charts, QR codes) and figures it refreshes.
+    """
+    return set(re.findall(r'querySelectorAll\(\s*"\[(data-[\w-]+)\]"', PANEL_JS))
+
+
+@pytest.mark.parametrize("hook", sorted(_queried_hooks()))
+def test_every_hook_the_script_sweeps_for_is_rendered_somewhere(hook: str) -> None:
+    """
+    A container hook no template renders is a feature that silently never
+    runs: the sweep finds nothing, builds nothing, and reports nothing.
+
+    Args:
+        hook: A data attribute the script queries the document for.
+    """
+    assert hook in ALL_MARKUP, f"panel.js sweeps for [{hook}], which no template renders"
+
+
+def test_the_query_sweep_covers_the_charts() -> None:
+    """The regex above is load-bearing; assert it found the known containers."""
+    found = _queried_hooks()
+
+    assert {"data-chart", "data-metric"} <= found, found
 
 
 def _dataset_reads() -> set[str]:

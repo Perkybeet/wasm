@@ -282,6 +282,8 @@ HOOKS = (
     "data-theme-toggle",
     "data-follow-log",
     "data-metric",
+    "data-chart",
+    "data-chart-window",
 )
 
 
@@ -396,6 +398,21 @@ def test_the_shell_has_a_real_sidebar_footer() -> None:
     """Sign-out was a bare div with two inline styles and no separator."""
     assert 'class="sidebar__footer"' in BASE
     assert "border-top: 1px solid var(--border)" in rule(".sidebar__footer")
+
+
+def test_the_charts_are_sized_by_the_stylesheet() -> None:
+    """
+    uPlot draws into whatever box it is given, and the panel's own style-src
+    policy throws away style attributes, so the box has to come from here: a
+    chart container without a height from the stylesheet renders zero pixels
+    tall and no other test can see it.
+    """
+    declarations = rule(".chart__plot")
+
+    assert "height:" in declarations, "the chart containers have no fixed height"
+    assert "font-variant-numeric: tabular-nums" in declarations, (
+        "chart figures must be tabular so the axes do not jitter as they update"
+    )
 
 
 def test_the_notices_stack_clears_the_open_drawer() -> None:
