@@ -23,6 +23,7 @@ change nothing.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -59,6 +60,51 @@ SCHEDULE_ALIASES = {
     "weekly": "Mon *-*-* 02:00:00",
     "monthly": "*-*-01 02:00:00",
 }
+
+#: How a timer unit's description names the application it backs up. The
+#: description is rendered by this module's own template, so reading the
+#: domain back out of it is reading this module's own writing.
+_DESCRIPTION_PREFIX = "WASM backup timer for "
+
+#: The ``OnCalendar`` expression inside systemd's ``TimersCalendar`` property,
+#: which prints as ``{ OnCalendar=*-*-* 02:00:00 ; next_elapse=... }``.
+_ON_CALENDAR = re.compile(r"OnCalendar=([^;}]+)")
+
+
+def validate_calendar(schedule: str) -> str:
+    """
+    Expand a schedule alias and refuse anything a unit file must not contain.
+
+    This is the single definition of what WASM will write after ``OnCalendar=``
+    in a root-owned unit: :meth:`BackupScheduler._validate` and the web API's
+    request model both call it, so the panel cannot accept an expression the
+    scheduler would refuse.
+
+    Args:
+        schedule: Alias from :data:`SCHEDULE_ALIASES` or a systemd calendar
+            expression.
+
+    Returns:
+        The expansion of the alias, or the expression itself.
+
+    Raises:
+        BackupError: If the expression is empty, too long, or contains a
+            character that could become a systemd directive.
+    """
+    calendar = SCHEDULE_ALIASES.get(schedule, schedule)
+    if not calendar or len(calendar) > _MAX_CALENDAR_LENGTH:
+        raise BackupError(
+            "Backup schedule is empty or too long",
+            details=f"Use an alias ({', '.join(SCHEDULE_ALIASES)}) or a calendar expression.",
+        )
+    # Weekday prefixes such as "Mon" are the only letters a calendar
+    # expression needs, so letters are allowed but nothing else is.
+    if any(not (char.isalpha() or char in _CALENDAR_ALPHABET) for char in calendar):
+        raise BackupError(
+            f"Invalid backup schedule: {calendar!r}",
+            details="A calendar expression may only contain letters, digits and '*-/,:. '.",
+        )
+    return calendar
 
 
 @dataclass
@@ -214,21 +260,7 @@ class BackupScheduler:
                 "restricted to characters that cannot become a systemd directive.",
             ) from exc
 
-        calendar = schedule.on_calendar
-        if not calendar or len(calendar) > _MAX_CALENDAR_LENGTH:
-            raise BackupError(
-                "Backup schedule is empty or too long",
-                details=f"Use an alias ({', '.join(SCHEDULE_ALIASES)}) or a calendar expression.",
-            )
-        # Weekday prefixes such as "Mon" are the only letters a calendar
-        # expression needs, so letters are allowed but nothing else is.
-        if any(not (char.isalpha() or char in _CALENDAR_ALPHABET) for char in calendar):
-            raise BackupError(
-                f"Invalid backup schedule: {calendar!r}",
-                details="A calendar expression may only contain letters, digits and '*-/,:. '.",
-            )
-
-        return domain, app_name, calendar
+        return domain, app_name, validate_calendar(schedule.schedule)
 
     def _unit_path(self, unit_name: str) -> Path:
         """
@@ -347,8 +379,19 @@ class BackupScheduler:
         """
         List all WASM backup schedules.
 
+        ``list-timers`` only finds the units; every value comes from
+        ``systemctl show``, whose ``Property=value`` lines are a stable
+        contract. The human columns of ``list-timers`` are not: they shift
+        with locale and systemd version, and splitting them on whitespace is
+        how the next run used to be reported as the word "Sat".
+
         Returns:
-            One dictionary per timer, with its name, application and run times.
+            One dictionary per timer: ``timer`` and ``app_name`` from the unit
+            name, ``domain`` read back from the unit's own description,
+            ``next_run`` and ``last_run`` as systemd prints them (``pending``
+            and ``never`` when it prints nothing), plus ``schedule`` (the raw
+            ``TimersCalendar`` property) and ``on_calendar`` (the expression
+            inside it) when the unit can be inspected.
         """
         result = self._systemctl(
             "list-timers",
@@ -362,29 +405,51 @@ class BackupScheduler:
             return schedules
 
         for line in result.stdout.strip().splitlines():
-            if not line.strip():
-                continue
-            parts = line.split()
-            if len(parts) < 5:
+            # The columns vary; the one fact safely in the line is the unit
+            # name, so it is found by its suffix rather than by position.
+            unit = next((part for part in line.split() if part.endswith(".timer")), None)
+            if unit is None:
                 continue
 
-            timer_name = parts[-1].replace(".timer", "")
+            timer_name = unit[: -len(".timer")]
+            app_name = timer_name.replace("wasm-backup-", "")
             schedule_info: dict[str, str] = {
                 "timer": timer_name,
-                "app_name": timer_name.replace("wasm-backup-", ""),
-                "next_run": parts[0] if parts[0] != "n/a" else "pending",
-                "last_run": parts[2] if len(parts) > 2 and parts[2] != "n/a" else "never",
+                "app_name": app_name,
+                "domain": app_name,
+                "next_run": "pending",
+                "last_run": "never",
             }
 
             detail = self._systemctl(
                 "show",
-                f"{timer_name}.timer",
-                "--property=TimersCalendar,LastTriggerUSec,NextElapseUSecRealtime",
+                unit,
+                "--property=Description,TimersCalendar,LastTriggerUSec,NextElapseUSecRealtime",
             )
             if detail.success:
+                properties: dict[str, str] = {}
                 for prop_line in detail.stdout.splitlines():
-                    if prop_line.startswith("TimersCalendar="):
-                        schedule_info["schedule"] = prop_line.split("=", 1)[1]
+                    key, separator, value = prop_line.partition("=")
+                    if separator:
+                        properties[key] = value.strip()
+
+                calendar = properties.get("TimersCalendar", "")
+                if calendar:
+                    schedule_info["schedule"] = calendar
+                    match = _ON_CALENDAR.search(calendar)
+                    if match:
+                        schedule_info["on_calendar"] = match.group(1).strip()
+
+                description = properties.get("Description", "")
+                if description.startswith(_DESCRIPTION_PREFIX):
+                    schedule_info["domain"] = description[len(_DESCRIPTION_PREFIX) :]
+
+                next_run = properties.get("NextElapseUSecRealtime", "")
+                if next_run and next_run != "n/a":
+                    schedule_info["next_run"] = next_run
+                last_run = properties.get("LastTriggerUSec", "")
+                if last_run and last_run != "n/a":
+                    schedule_info["last_run"] = last_run
 
             schedules.append(schedule_info)
 

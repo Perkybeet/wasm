@@ -1,0 +1,120 @@
+{#
+  Scheduled backups, as one swappable section.
+
+  The table answers the question an operator actually has: what will run, and
+  when. The schedule is shown in words with the exact OnCalendar expression
+  beside it in mono, because "daily" is what a person scans for and the
+  expression is what they paste into a terminal to check.
+
+  Retention shows an em dash for listed timers: systemd keeps no record of a
+  schedule's retention, and inventing a number here would be lying about what
+  the machine will do.
+
+  A refused action renders at 200 with the refusal inline: htmx does not swap
+  an error status, so answering 4xx would freeze the screen and report
+  nothing. Deleting confirms first, and the question names the domain and the
+  consequence; the row is the target, so it only disappears when the timer
+  actually did.
+#}
+{% import "_macros.html" as m %}
+<div id="backup-schedules">
+
+  {% if problem %}
+    {{ m.problem(problem.fix, problem.output) }}
+  {% endif %}
+
+  {% if notice %}
+    <p class="stack__lead">{{ notice }}</p>
+  {% endif %}
+
+  {% if schedules %}
+    <table class="table">
+      <thead>
+        <tr>
+          <th scope="col">Application</th>
+          <th scope="col">Schedule</th>
+          <th scope="col">Retention</th>
+          <th scope="col">Next run</th>
+          <th scope="col">Last run</th>
+          <th scope="col"><span class="visually-hidden">Actions</span></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for item in schedules %}
+          <tr>
+            <th scope="row">{{ item.domain }}</th>
+            <td>{{ item.schedule }} <span class="mono faint">{{ item.on_calendar }}</span></td>
+            <td>{{ item.retention }}</td>
+            <td class="mono">{{ item.next_run }}</td>
+            <td class="mono">{{ item.last_run }}</td>
+            <td>
+              <button type="button" class="btn btn--sm btn--danger"
+                      hx-delete="{{ item.delete_endpoint }}"
+                      hx-confirm="{{ item.delete_question }}"
+                      hx-target="closest tr" hx-swap="delete">Delete</button>
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="faint">
+      No scheduled backups. A schedule is a systemd timer that runs
+      <code>wasm backup create</code> on its own, so an application is backed
+      up before anyone is frightened rather than after.
+    </p>
+  {% endif %}
+
+  {% if apps %}
+    <form hx-post="/backups/schedules" hx-target="#backup-schedules"
+          hx-swap="outerHTML" autocomplete="off">
+      <div class="field">
+        <label class="label" for="schedule-domain">Application</label>
+        <select id="schedule-domain" name="domain" required>
+          {% for domain in apps %}
+            <option value="{{ domain }}"
+                    {% if domain == form.domain %}selected{% endif %}>{{ domain }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="field">
+        <label class="label" for="schedule-preset">Schedule</label>
+        <select id="schedule-preset" name="schedule">
+          {% for alias, calendar in presets %}
+            <option value="{{ alias }}"
+                    {% if alias == form.schedule %}selected{% endif %}>{{ alias }} ({{ calendar }})</option>
+          {% endfor %}
+          <option value="custom" {% if form.schedule == "custom" %}selected{% endif %}>custom</option>
+        </select>
+      </div>
+      <div class="field">
+        <label class="label" for="schedule-calendar">Custom OnCalendar</label>
+        <input class="mono" type="text" id="schedule-calendar" name="on_calendar"
+               value="{{ form.on_calendar }}" placeholder="Mon *-*-* 02:00:00"
+               aria-describedby="schedule-calendar-hint">
+        <span class="field__hint" id="schedule-calendar-hint">
+          Used only when the schedule is custom. A systemd calendar expression,
+          as systemd-analyze calendar accepts it.
+        </span>
+      </div>
+      <div class="field">
+        <label class="label" for="schedule-retention-count">Keep at most</label>
+        <input class="mono" type="number" id="schedule-retention-count"
+               name="retention_count" value="7" min="1" max="365" required>
+      </div>
+      <div class="field">
+        <label class="label" for="schedule-retention-days">Max age, days</label>
+        <input class="mono" type="number" id="schedule-retention-days"
+               name="retention_days" value="30" min="1" max="3650" required>
+      </div>
+      <button class="btn btn--primary" type="submit">Schedule backups</button>
+    </form>
+  {% else %}
+    <p class="faint">
+      Nothing to schedule: no applications are deployed. Deploy one first, or
+      run <code>wasm backup schedule create example.com --schedule daily</code>
+      for a domain this machine serves.
+    </p>
+  {% endif %}
+
+</div>

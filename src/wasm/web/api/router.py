@@ -15,6 +15,7 @@ from fastapi import APIRouter
 
 from wasm.web.api.apps import router as apps_router
 from wasm.web.api.auth import router as auth_router
+from wasm.web.api.backup_schedules import router as backup_schedules_router
 from wasm.web.api.backups import router as backups_router
 from wasm.web.api.certs import router as certs_router
 from wasm.web.api.config import router as config_router
@@ -43,4 +44,7 @@ router.include_router(metrics_router, prefix="/metrics", tags=["Metrics"])
 router.include_router(jobs_router, tags=["Jobs"])
 router.include_router(config_router, prefix="/config", tags=["Configuration"])
 router.include_router(backups_router, prefix="/backups", tags=["Backups"])
+router.include_router(
+    backup_schedules_router, prefix="/backup-schedules", tags=["Backup Schedules"]
+)
 router.include_router(databases_router, prefix="/databases", tags=["Databases"])

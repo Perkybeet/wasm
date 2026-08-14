@@ -19,6 +19,21 @@
 
 {{ m.page_head("Backups", storage.summary if rows else none) }}
 
+{#
+  Loaded over htmx rather than rendered inline, so it lives entirely in
+  views/backup_schedules.py and this page's handler does not have to know it
+  exists. Listing the timers also runs two systemctl calls per schedule,
+  which is work the first paint should not wait on.
+#}
+<section class="stack--tight">
+  <h2 class="label stack__title">Scheduled backups</h2>
+  <div id="backup-schedules"
+       hx-get="/backups/schedules"
+       hx-trigger="load" hx-swap="outerHTML">
+    <p class="muted">Reading timers…</p>
+  </div>
+</section>
+
 {% if rows %}
   <div class="rows">
     {% for backup in rows %}
