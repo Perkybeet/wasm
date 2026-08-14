@@ -315,6 +315,29 @@ def run(shots: Path | None) -> int:
                 next((m for m in console if "Lost the live" in m), ""),
             )
 
+            # ------------------------------------------- the command palette
+            page.keyboard.press("Control+k")
+            page.wait_for_timeout(300)
+            checks.record(
+                bool(page.evaluate("document.getElementById('command-palette').open")),
+                "Ctrl+K opens the command palette",
+            )
+            page.keyboard.type("settings")
+            page.wait_for_timeout(300)
+            first = page.locator("#palette-list .palette__item").first
+            checks.record(
+                first.count() > 0 and "settings" in first.inner_text().lower(),
+                "typing filters the palette down to what was asked for",
+                first.inner_text().strip() if first.count() else "no items",
+            )
+            shot(page, "08-palette")
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(300)
+            checks.record(
+                not page.evaluate("document.getElementById('command-palette').open"),
+                "Escape closes the palette again",
+            )
+
             # --------------------------------------------------------- mobile
             phone = browser.new_context(viewport=PHONE)
             phone_page = phone.new_page()

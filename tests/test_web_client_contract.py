@@ -506,6 +506,51 @@ def test_the_query_sweep_covers_the_charts() -> None:
     assert {"data-chart", "data-metric"} <= found, found
 
 
+def test_the_marks_attribute_the_charts_read_is_emitted() -> None:
+    """
+    The deploy marks travel as a JSON attribute the fragment renders and the
+    script reads with getAttribute - a spelling the dataset sweep cannot see,
+    so the pair is pinned by hand. Half of it missing is an application page
+    whose deploys silently never paint.
+    """
+    assert 'getAttribute("data-chart-marks")' in PANEL_JS, (
+        "panel.js no longer reads data-chart-marks; the deploy marks are dead code"
+    )
+    assert "data-chart-marks=" in ALL_MARKUP, (
+        "no template emits data-chart-marks, so the marks the script reads never arrive"
+    )
+
+
+def test_the_app_chart_families_the_fragment_renders_are_recognised() -> None:
+    """
+    The application fragment's containers name per-domain metrics, which the
+    static spec table cannot key; panel.js resolves them by shape. A family
+    dropped on either side is a container that is an empty box forever.
+    """
+    for family in (r"app\..+\.cpu\.percent", r"app\..+\.mem\.bytes"):
+        assert family in PANEL_JS, f"panel.js no longer recognises the {family} chart family"
+
+
+def test_the_identifier_sweep_covers_the_command_palette() -> None:
+    """
+    The palette resolves its dialog, catalogue, input and list by id, so it
+    rides the parametrised sweep above; this pins that the sweep still sees
+    them. Any of them renamed is a keyboard shortcut that silently does
+    nothing.
+    """
+    found = set(_looked_up_ids())
+    assert {"command-palette", "palette-data", "palette-input", "palette-list"} <= found, (
+        f"panel.js no longer looks up the palette's elements; only found {sorted(found)}"
+    )
+
+
+def test_the_hook_sweep_covers_the_drawer_find_controls() -> None:
+    """The regex above is load-bearing; assert it found the drawer's find."""
+    found = _handled_hooks()
+
+    assert {"data-drawer-search", "data-drawer-jump"} <= found, found
+
+
 def _dataset_reads() -> set[str]:
     """
     Returns:

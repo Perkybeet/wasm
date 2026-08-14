@@ -1147,7 +1147,53 @@ textarea.mono {
 .drawer__tools {
   margin-left: auto;
   display: flex;
+  align-items: center;
   gap: var(--space-1);
+}
+
+/* The find field. Quiet until it is used: a bordered input in the bar would
+   outweigh the source name, and the bar is chrome, not a form. */
+.drawer__search {
+  width: 11rem;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  font-size: var(--text-xs);
+}
+
+.drawer__search:hover,
+.drawer__search:focus {
+  border-color: var(--border-strong);
+  background: var(--surface);
+}
+
+.drawer__search::placeholder {
+  color: var(--text-faint);
+}
+
+.drawer__count {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* Floats over the terminal's lower edge while the viewport is scrolled up;
+   .drawer is position: sticky, which makes it the containing block. */
+.drawer__jump {
+  position: absolute;
+  right: var(--space-4);
+  bottom: var(--space-3);
+  z-index: 1;
+}
+
+/* .btn's display is an author style, and author styles beat the UA sheet's
+   [hidden] rule whatever their specificity - so without this the button
+   stayed painted while following the tail, with the attribute set and no
+   test able to see it. Only a browser lays this out. */
+.drawer__jump[hidden] {
+  display: none;
 }
 
 .drawer__body {
@@ -1274,6 +1320,96 @@ select {
   width: 100%;
 }
 
+/* ------------------------------------------------------ command palette */
+
+/*
+ * Ctrl+K. An instrument, not a spotlight: one bordered surface near the top
+ * of the screen, destinations as rows with their routes in mono, and no
+ * dramatic shadow - the dimmed backdrop already separates it from the page.
+ * Colour rules hold here too; the only emphasis is the selection.
+ */
+.palette {
+  width: min(34rem, calc(100vw - 2 * var(--space-5)));
+  margin: 14vh auto auto;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+}
+
+.palette::backdrop {
+  background: rgb(0 0 0 / 30%);
+}
+
+.palette__input {
+  width: 100%;
+  padding: var(--space-3) var(--space-4);
+  border: none;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: var(--text-base);
+}
+
+.palette__input:focus {
+  outline: none;
+  border-bottom-color: var(--focus);
+}
+
+.palette__list {
+  margin: 0;
+  padding: var(--space-1) 0;
+  list-style: none;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+/* The same anatomy as a navigation entry: rail on the left, quiet until
+   chosen. The rail is what marks the selection, not a colour wash. */
+.palette__item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-2) var(--space-4);
+  border-left: var(--rail-width) solid transparent;
+  cursor: pointer;
+}
+
+.palette__item[aria-selected="true"] {
+  background: var(--surface-hover);
+  border-left-color: var(--text);
+}
+
+.palette__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The route is system data, so it is set in mono like every other path. */
+.palette__href {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.palette__empty {
+  margin: 0;
+  padding: var(--space-3) var(--space-4);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.palette__hint {
+  margin: 0;
+  padding: var(--space-2) var(--space-4);
+  border-top: 1px solid var(--border);
+}
+
 /* ----------------------------------------------------------- skeletons */
 
 @keyframes shimmer {
@@ -1296,6 +1432,29 @@ select {
   background-size: 200% 100%;
   animation: shimmer 1.4s linear infinite;
   color: transparent;
+}
+
+/*
+ * The lazily loaded sections' placeholders: the silhouette of what is coming,
+ * at roughly its final height, so the page does not reflow under the
+ * operator's pointer when the fragment lands. The reduced-motion block at the
+ * bottom of this file already freezes the shimmer into a plain grey block.
+ */
+.skeleton--row {
+  height: 3.25rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.skeleton--row + .skeleton--row {
+  margin-top: var(--space-2);
+}
+
+/* A chart figure's worth of height: caption plus the fixed .chart__plot box. */
+.skeleton--chart {
+  height: 12.5rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
 }
 
 /* htmx marks in-flight requests; showing it beats a spinner nobody asked

@@ -187,6 +187,13 @@ const drawer = {
   terminal: null,
   socket: null,
 
+  /** What the find field last asked for. */
+  query: "",
+  /** Buffer positions of the current find, as {row, column} pairs. */
+  matches: [],
+  /** Which match is highlighted, an index into matches. */
+  matchIndex: -1,
+
   /** @returns {boolean} Whether the drawer is open. */
   get open() {
     return this.element?.dataset.open === "true";
@@ -223,6 +230,7 @@ const drawer = {
       open ? DRAWER_HEIGHT : "0px",
     );
     this.render();
+    this.updateJump();
   },
 
   /**
@@ -273,6 +281,119 @@ const drawer = {
       },
     });
     this.terminal.open(document.getElementById("log-drawer-body"));
+    // xterm stops following the tail on its own the moment the viewport is
+    // scrolled up; this keeps the way back on screen exactly while that
+    // pause is in effect.
+    this.terminal.onScroll(() => this.updateJump());
+  },
+
+  /**
+   * Show or hide the way back to the tail.
+   *
+   * The pause itself is xterm's: output written while the viewport is
+   * scrolled up does not drag it back down. What was missing is any sign
+   * that following has stopped, so the button appears whenever the viewport
+   * is above the bottom and names the way back.
+   */
+  updateJump() {
+    const jump = document.querySelector("[data-drawer-jump]");
+    if (!jump) return;
+    if (!this.terminal || !this.open) {
+      jump.hidden = true;
+      return;
+    }
+    const buffer = this.terminal.buffer.active;
+    jump.hidden = buffer.viewportY >= buffer.baseY;
+  },
+
+  /** Return to the tail and resume following it. */
+  jumpToBottom() {
+    if (this.terminal) this.terminal.scrollToBottom();
+    this.updateJump();
+  },
+
+  /**
+   * Find every occurrence of a query in the terminal's buffer.
+   *
+   * The vendored xterm build ships without the search addon, and the buffer
+   * API already exposes every line while selection is already a highlight
+   * the terminal knows how to draw, so this stays first-party rather than
+   * vendoring more third-party script into a root panel. Case-insensitive,
+   * because an operator hunting an error does not know how it was cased.
+   *
+   * @param {string} query What to look for. Empty clears the find.
+   */
+  search(query) {
+    this.query = query;
+    this.matches = [];
+    this.matchIndex = -1;
+
+    if (this.terminal && query) {
+      const needle = query.toLowerCase();
+      const buffer = this.terminal.buffer.active;
+      for (let row = 0; row < buffer.length; row += 1) {
+        const line = buffer.getLine(row);
+        if (!line) continue;
+        const text = line.translateToString(true).toLowerCase();
+        for (let at = text.indexOf(needle); at !== -1; at = text.indexOf(needle, at + 1)) {
+          this.matches.push({ row, column: at });
+        }
+      }
+    }
+
+    if (this.matches.length) {
+      this.showMatch(0);
+    } else {
+      if (this.terminal) this.terminal.clearSelection();
+      this.renderCount();
+    }
+  },
+
+  /**
+   * Step to another match.
+   *
+   * The buffer keeps growing under a live stream, so an empty result is
+   * retried against the current content before giving up: the line being
+   * hunted may have arrived since the query was typed.
+   *
+   * @param {number} step How far to move through the matches, +1 or -1.
+   */
+  findNext(step) {
+    if (!this.query) return;
+    if (!this.matches.length) {
+      this.search(this.query);
+      return;
+    }
+    this.showMatch(this.matchIndex + step);
+  },
+
+  /**
+   * Highlight one match and bring it on screen.
+   *
+   * @param {number} index Which match; wraps around either end.
+   */
+  showMatch(index) {
+    const count = this.matches.length;
+    this.matchIndex = ((index % count) + count) % count;
+    const match = this.matches[this.matchIndex];
+    this.terminal.select(match.column, match.row, this.query.length);
+    this.terminal.scrollToLine(match.row);
+    this.updateJump();
+    this.renderCount();
+  },
+
+  /** Keep the "3/17" figure beside the find field in step with it. */
+  renderCount() {
+    const count = document.querySelector("[data-drawer-count]");
+    if (!count) return;
+    count.hidden = !this.query;
+    if (!this.query) {
+      count.textContent = "";
+    } else if (this.matches.length) {
+      count.textContent = `${this.matchIndex + 1}/${this.matches.length}`;
+    } else {
+      count.textContent = "0 matches";
+    }
   },
 
   /**
@@ -309,6 +430,9 @@ const drawer = {
       default:
         this.terminal.writeln(payload.data ?? payload.message ?? raw);
     }
+    // New lines move the bottom away from a paused viewport without firing a
+    // scroll, so the way back is refreshed on every frame as well.
+    this.updateJump();
   },
 
   /**
@@ -543,7 +667,104 @@ const CHART_SPECS = {
   },
 };
 
-/** The charts on screen: {host, spec, plot, data, ceiling, load}. */
+/**
+ * Per-application chart shapes, resolved by metric name.
+ *
+ * The dashboard's containers are enumerable, so CHART_SPECS keys them
+ * outright; an application page's containers name the collector's per-app
+ * metrics - app.{domain}.cpu.percent and app.{domain}.mem.bytes - and the
+ * domain cannot be known here. Each shape recognises one family and builds
+ * the same spec object the static table holds. The tones repeat the
+ * dashboard's vocabulary: amber for work happening now, green for occupancy.
+ */
+const APP_CHART_SHAPES = [
+  {
+    pattern: /^app\..+\.cpu\.percent$/,
+    build: (metric) => ({
+      kind: "percent",
+      series: [{ label: "cpu", tone: "--state-busy", metrics: [metric] }],
+    }),
+  },
+  {
+    pattern: /^app\..+\.mem\.bytes$/,
+    build: (metric) => ({
+      kind: "bytes",
+      series: [{ label: "mem", tone: "--state-active", metrics: [metric] }],
+    }),
+  },
+];
+
+/**
+ * Resolve the spec a container's data-chart value names.
+ *
+ * @param {string} name The container's data-chart value.
+ * @returns {Object|null} The spec, or null when nothing recognises the name.
+ */
+function chartSpec(name) {
+  if (CHART_SPECS[name]) return CHART_SPECS[name];
+  const shape = APP_CHART_SHAPES.find((candidate) => candidate.pattern.test(name));
+  return shape ? shape.build(name) : null;
+}
+
+/**
+ * Read the deploy marks a chart container carries.
+ *
+ * The application fragment embeds the domain's deployment history as a JSON
+ * attribute - server-rendered, like the catalogue the palette reads - so the
+ * client neither fetches nor invents it. Anything that does not parse into a
+ * timestamped mark is dropped rather than guessed at.
+ *
+ * @param {Element} host The chart container.
+ * @returns {Array<{ts: number, state: string}>} The marks, possibly empty.
+ */
+function readChartMarks(host) {
+  const raw = host.getAttribute("data-chart-marks");
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? parsed.filter((mark) => typeof mark.ts === "number" && typeof mark.state === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Paint one chart's deploy marks: a vertical dashed line per deployment, in
+ * the outcome's state tone, so a step in the trace can be read against the
+ * deploy that caused it.
+ *
+ * Drawn from uPlot's draw hook, clipped to the plot area, so a mark scrolls
+ * with the data and leaves with its window. Colour only ever encodes state,
+ * and a deploy's outcome is state: green landed, red failed.
+ *
+ * @param {Object} u The uPlot instance mid-draw.
+ * @param {Object} chart The chart record carrying the marks.
+ * @param {Object} theme What chartStyles read when the plot was built.
+ */
+function drawDeployMarks(u, chart, theme) {
+  if (!chart.marks.length) return;
+  const { min, max } = u.scales.x;
+  if (min == null || max == null) return;
+
+  const ctx = u.ctx;
+  ctx.save();
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  for (const mark of chart.marks) {
+    if (mark.ts < min || mark.ts > max) continue;
+    const x = Math.round(u.valToPos(mark.ts, "x", true));
+    ctx.strokeStyle = theme.tone(mark.state === "failed" ? "--state-failed" : "--state-active");
+    ctx.beginPath();
+    ctx.moveTo(x, u.bbox.top);
+    ctx.lineTo(x, u.bbox.top + u.bbox.height);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+/** The charts on screen: {host, spec, marks, plot, data, ceiling, load}. */
 const liveCharts = [];
 
 /** The window the band is showing. The buttons write it, buildChart reads it. */
@@ -768,6 +989,9 @@ function chartOptions(chart, theme) {
     // reading) is worse than none.
     legend: { show: false },
     cursor: { show: false },
+    hooks: {
+      draw: [(u) => drawDeployMarks(u, chart, theme)],
+    },
     scales: {
       x: {
         time: true,
@@ -892,7 +1116,7 @@ async function initCharts() {
   }
 
   const hosts = [...document.querySelectorAll("[data-chart]")].filter(
-    (host) => CHART_SPECS[host.dataset.chart] && !liveCharts.some((chart) => chart.host === host),
+    (host) => chartSpec(host.dataset.chart) && !liveCharts.some((chart) => chart.host === host),
   );
   if (!hosts.length) return;
 
@@ -907,7 +1131,8 @@ async function initCharts() {
   for (const host of hosts) {
     const chart = {
       host,
-      spec: CHART_SPECS[host.dataset.chart],
+      spec: chartSpec(host.dataset.chart),
+      marks: readChartMarks(host),
       plot: null,
       data: null,
       ceiling: null,
@@ -1098,6 +1323,186 @@ async function renderTotpQrs() {
   }
 }
 
+/* ------------------------------------------------------- command palette */
+
+/**
+ * The Ctrl+K palette: type a few letters, land on any screen or application.
+ *
+ * The catalogue is server-rendered into #palette-data by the shell - the
+ * fixed screens plus every deployed application - so opening it costs no
+ * request and shows exactly what the server last knew. This side only
+ * filters. Everything is built with createElement and textContent: a domain
+ * name goes through here, and this panel is a root shell.
+ *
+ * A native dialog, because showModal traps focus and closes on Escape
+ * without either being hand-rolled.
+ */
+const palette = {
+  /** The catalogue as read at open, so a swap mid-use cannot shift entries. */
+  entries: [],
+  /** The entries the current query keeps, in rank order. */
+  filtered: [],
+  /** Which entry is selected, an index into filtered. */
+  index: 0,
+
+  /** @returns {HTMLDialogElement|null} The dialog, fresh from the document. */
+  dialog() {
+    return document.getElementById("command-palette");
+  },
+
+  /**
+   * Read the server-rendered catalogue.
+   *
+   * Re-read at every open rather than held: hx-boost replaces the body's
+   * contents, and the block that arrives with a new page is the truth about
+   * what exists now.
+   *
+   * @returns {Array<{label: string, href: string, hint: string}>} Entries.
+   */
+  catalogue() {
+    const holder = document.getElementById("palette-data");
+    if (!holder) return [];
+    try {
+      const parsed = JSON.parse(holder.textContent);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  },
+
+  /** Open the palette empty, or close it if it is already up. */
+  toggle() {
+    const dialog = this.dialog();
+    if (!dialog) return;
+    if (dialog.open) {
+      dialog.close();
+      return;
+    }
+
+    this.entries = this.catalogue();
+    const input = document.getElementById("palette-input");
+    if (input) input.value = "";
+    dialog.showModal();
+    this.filter("");
+    if (input) input.focus();
+  },
+
+  /**
+   * Keep the entries the query matches, best first.
+   *
+   * Subsequence matching, so "dbs" finds Databases and a few letters of a
+   * domain find the application; a prefix outranks a substring outranks a
+   * scattered subsequence, and rank ties keep the catalogue's own order.
+   *
+   * @param {string} query What the operator has typed.
+   */
+  filter(query) {
+    const needle = query.trim().toLowerCase();
+    const ranked = [];
+    for (const entry of this.entries) {
+      const rank = Math.min(matchRank(needle, entry.label), matchRank(needle, entry.href));
+      if (rank !== Infinity) ranked.push([rank, entry]);
+    }
+    ranked.sort((first, second) => first[0] - second[0]);
+    this.filtered = ranked.map((pair) => pair[1]);
+    this.index = 0;
+    this.render();
+  },
+
+  /** Rebuild the list to match filtered and the selection. */
+  render() {
+    const list = document.getElementById("palette-list");
+    if (!list) return;
+    list.replaceChildren();
+
+    if (!this.filtered.length) {
+      const empty = document.createElement("li");
+      empty.className = "palette__empty";
+      empty.textContent = "Nothing matches.";
+      list.append(empty);
+    }
+
+    this.filtered.forEach((entry, index) => {
+      const item = document.createElement("li");
+      item.className = "palette__item";
+      item.id = `palette-item-${index}`;
+      item.setAttribute("role", "option");
+      item.setAttribute("aria-selected", index === this.index ? "true" : "false");
+
+      const label = document.createElement("span");
+      label.className = "palette__label";
+      label.textContent = entry.label;
+
+      const href = document.createElement("span");
+      href.className = "palette__href";
+      href.textContent = entry.href;
+
+      item.append(label, href);
+      list.append(item);
+    });
+
+    const input = document.getElementById("palette-input");
+    if (input) {
+      input.setAttribute(
+        "aria-activedescendant",
+        this.filtered.length ? `palette-item-${this.index}` : "",
+      );
+    }
+  },
+
+  /**
+   * Move the selection.
+   *
+   * @param {number} step +1 or -1; wraps around either end.
+   */
+  move(step) {
+    if (!this.filtered.length) return;
+    const count = this.filtered.length;
+    this.index = (this.index + step + count) % count;
+    this.render();
+    document.getElementById(`palette-item-${this.index}`)?.scrollIntoView({ block: "nearest" });
+  },
+
+  /**
+   * Go to an entry.
+   *
+   * A plain navigation rather than an htmx swap: the palette is how the
+   * operator leaves this screen, and a full load re-renders the catalogue
+   * on arrival.
+   *
+   * @param {number} index Position in the filtered list.
+   */
+  choose(index) {
+    const entry = this.filtered[index];
+    if (!entry) return;
+    this.dialog()?.close();
+    window.location.assign(entry.href);
+  },
+};
+
+/**
+ * How well a query matches a candidate. Lower is better.
+ *
+ * @param {string} needle The query, lowercased.
+ * @param {string} candidate The text to match against.
+ * @returns {number} 0 for an empty query, 1 for a prefix, 2 for a substring,
+ *   3 for a subsequence, Infinity for no match.
+ */
+function matchRank(needle, candidate) {
+  if (!needle) return 0;
+  const text = String(candidate || "").toLowerCase();
+  if (text.startsWith(needle)) return 1;
+  if (text.includes(needle)) return 2;
+
+  let at = 0;
+  for (const character of needle) {
+    at = text.indexOf(character, at);
+    if (at === -1) return Infinity;
+    at += 1;
+  }
+  return 3;
+}
+
 renderTotpQrs();
 initCharts();
 updateFavicon();
@@ -1146,8 +1551,32 @@ document.body.addEventListener("click", (event) => {
     return;
   }
 
+  // The find field sits inside the clickable bar; a click that lands in it
+  // must focus it, not slam the drawer shut around it.
+  if (target.closest("[data-drawer-search]")) {
+    return;
+  }
+
+  if (target.closest("[data-drawer-jump]")) {
+    drawer.jumpToBottom();
+    return;
+  }
+
   if (target.closest("[data-drawer-toggle]")) {
     drawer.toggle();
+    return;
+  }
+
+  const paletteItem = target.closest(".palette__item");
+  if (paletteItem && paletteItem.parentElement) {
+    palette.choose([...paletteItem.parentElement.children].indexOf(paletteItem));
+    return;
+  }
+
+  // A click on the dialog element itself can only be the backdrop area: the
+  // input, the list and the hint tile the interior completely.
+  if (target.id === "command-palette") {
+    palette.toggle();
     return;
   }
 
@@ -1177,7 +1606,62 @@ document.body.addEventListener("click", (event) => {
 });
 
 document.addEventListener("keydown", (event) => {
+  // Ctrl+K / Cmd+K from anywhere, including inside the palette, where it
+  // closes again. It has to win against the browser's own address-bar
+  // shortcut, hence the preventDefault.
+  if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "k") {
+    event.preventDefault();
+    palette.toggle();
+    return;
+  }
+
+  const target = event.target instanceof Element ? event.target : null;
+
+  if (target && target.id === "palette-input") {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      palette.move(1);
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      palette.move(-1);
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      palette.choose(palette.index);
+    }
+    // Escape falls through to the dialog's own cancel behaviour.
+    return;
+  }
+
+  if (target && target.closest("[data-drawer-search]")) {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      drawer.findNext(event.shiftKey ? -1 : 1);
+    } else if (event.key === "Escape") {
+      target.value = "";
+      drawer.search("");
+      target.blur();
+    }
+    return;
+  }
+
   if (event.key === "Escape") setNavOpen(false);
+});
+
+// Filtering rides input events so it works per keystroke, and it is
+// delegated for the same reason every other listener here is: the elements
+// it watches are replaced by swaps, the body is not.
+document.body.addEventListener("input", (event) => {
+  const target = event.target instanceof Element ? event.target : null;
+  if (!target) return;
+
+  if (target.closest("[data-drawer-search]")) {
+    drawer.search(target.value);
+    return;
+  }
+
+  if (target.id === "palette-input") {
+    palette.filter(target.value);
+  }
 });
 
 // The shell is one document; htmx swaps fragments inside it, so this runs once

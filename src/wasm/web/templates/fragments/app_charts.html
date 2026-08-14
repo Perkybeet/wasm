@@ -1,0 +1,32 @@
+{#
+  The application page's resource charts.
+
+  Loaded over htmx when the page opens, like the deployment history below it,
+  so the section lives entirely in views/app_charts.py and the page handler in
+  views/router.py does not have to know it exists.
+
+  Each container names one of the collector's per-application metrics as its
+  data-chart hook; panel.js resolves the spec from the name, loads the history
+  from /api/metrics and rides the live edge on the shared /events stream,
+  exactly like the dashboard band. The deployment history travels as a JSON
+  attribute - single-quoted, because tojson escapes for exactly that position -
+  and the client paints it as vertical marks in the state tones, so a step in
+  the trace can be read against the deploy that caused it.
+#}
+<div id="app-charts-section">
+  <div class="charts">
+    <figure class="chart">
+      <figcaption class="label chart__title">CPU</figcaption>
+      <div class="chart__plot" data-chart="app.{{ charts_domain }}.cpu.percent"
+           data-chart-marks='{{ chart_marks | tojson }}'></div>
+    </figure>
+    <figure class="chart">
+      <figcaption class="label chart__title">Memory</figcaption>
+      <div class="chart__plot" data-chart="app.{{ charts_domain }}.mem.bytes"
+           data-chart-marks='{{ chart_marks | tojson }}'></div>
+    </figure>
+  </div>
+  {% if chart_marks %}
+    <p class="faint stack__note">Vertical marks are deployments: green landed, red failed.</p>
+  {% endif %}
+</div>

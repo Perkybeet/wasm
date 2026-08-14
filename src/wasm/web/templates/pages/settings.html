@@ -42,7 +42,9 @@
 </section>
 
 <div hx-get="/settings/config" hx-trigger="load" hx-swap="outerHTML">
-  <p class="faint">Loading configuration sections…</p>
+  <span class="visually-hidden">Loading configuration sections…</span>
+  <div class="skeleton skeleton--row" aria-hidden="true"></div>
+  <div class="skeleton skeleton--row" aria-hidden="true"></div>
 </div>
 
 {% if problem %}

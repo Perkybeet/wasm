@@ -113,6 +113,7 @@
 
       <div class="nav__group label">Operations</div>
       {{ nav_item("/deployments", "Deployments", "deployments", none) }}
+      {{ nav_item("/cron", "Cron jobs", "cron", none) }}
       {{ nav_item("/activity", "Activity", "activity", counts.running_jobs) }}
       {{ nav_item("/settings", "Settings", "settings", none) }}
     </div>
@@ -168,17 +169,50 @@
            and on a machine where it never does. #}
         <span class="drawer__source" data-drawer-source>nothing attached</span>
         <span class="drawer__tools">
+          {# The find field sits inside the clickable bar, so panel.js returns
+             before the toggle branch when the click lands here: typing a
+             search must not slam the drawer shut around it. Enter walks the
+             matches, Shift+Enter walks them backwards. #}
+          <input type="search" class="drawer__search mono" data-drawer-search
+                 placeholder="Find in log" aria-label="Find in log"
+                 autocomplete="off" spellcheck="false">
+          <span class="drawer__count num" data-drawer-count hidden></span>
           <button type="button" class="btn btn--sm btn--quiet" data-drawer-clear>Clear</button>
           <button type="button" class="btn btn--sm btn--quiet" data-drawer-toggle
                   aria-controls="log-drawer-body" aria-expanded="false">Show</button>
         </span>
       </div>
+      {# Hidden while the terminal is following the tail; scrolling up pauses
+         the follow (xterm's own behaviour) and this is the way back down. #}
+      <button type="button" class="btn btn--sm drawer__jump" data-drawer-jump hidden>
+        Jump to bottom</button>
       <div class="drawer__body" id="log-drawer-body"></div>
     </section>
   </main>
 </div>
 
 <div class="notice" id="notices" aria-live="polite"></div>
+
+{#
+  The command palette: Ctrl+K (Cmd+K on a Mac) anywhere in the shell.
+
+  The catalogue is server-rendered into the JSON block below - the fixed
+  screens plus every deployed application, from the shared context - so the
+  overlay works the instant the shortcut lands, with no fetch and nothing the
+  client has to be trusted to assemble. panel.js only filters it. tojson
+  escapes <, & and quotes, so the block cannot be broken out of by a domain
+  name. A native dialog, because showModal gives focus trapping and Escape
+  for free instead of hand-rolling both.
+#}
+<script type="application/json" id="palette-data">{{ palette | tojson }}</script>
+<dialog class="palette" id="command-palette" aria-label="Go to">
+  <input type="text" class="palette__input mono" id="palette-input"
+         placeholder="Type to filter" aria-label="Filter destinations"
+         role="combobox" aria-controls="palette-list" aria-expanded="true"
+         autocomplete="off" spellcheck="false">
+  <ul class="palette__list" id="palette-list" role="listbox" aria-label="Destinations"></ul>
+  <p class="palette__hint label">Enter opens - Esc closes</p>
+</dialog>
 
 </body>
 </html>

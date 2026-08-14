@@ -30,7 +30,8 @@
   <div id="backup-schedules"
        hx-get="/backups/schedules"
        hx-trigger="load" hx-swap="outerHTML">
-    <p class="muted">Reading timers…</p>
+    <span class="visually-hidden">Reading timers…</span>
+    <div class="skeleton skeleton--row" aria-hidden="true"></div>
   </div>
 </section>
 

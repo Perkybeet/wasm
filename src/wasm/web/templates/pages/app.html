@@ -37,6 +37,25 @@
   {{ m.facts(facts) }}
 </section>
 
+{#
+  The unit's own vital signs, loaded over htmx like the webhook and history
+  sections below so the fragment lives entirely in views/app_charts.py.
+  Reading the deployment history for the marks is store work the first paint
+  should not wait on. The placeholder is the charts' own silhouette.
+#}
+<section class="stack--tight">
+  <h2 class="label stack__title">Resources</h2>
+  <div id="app-charts-section"
+       hx-get="/apps/{{ domain }}/charts"
+       hx-trigger="load" hx-swap="outerHTML">
+    <span class="visually-hidden">Reading resource history…</span>
+    <div class="charts" aria-hidden="true">
+      <div class="skeleton skeleton--chart"></div>
+      <div class="skeleton skeleton--chart"></div>
+    </div>
+  </div>
+</section>
+
 <section class="stack--tight">
   <h2 class="label stack__title">Certificate</h2>
   {{ m.facts(certificate) }}
@@ -80,7 +99,8 @@
   <div id="webhook-section"
        hx-get="/apps/{{ domain }}/webhook/section"
        hx-trigger="load" hx-swap="outerHTML">
-    <p class="muted">Reading webhook state…</p>
+    <span class="visually-hidden">Reading webhook state…</span>
+    <div class="skeleton skeleton--row" aria-hidden="true"></div>
   </div>
 </section>
 
@@ -90,7 +110,9 @@
   <div id="deploy-history-section"
        hx-get="/apps/{{ domain }}/deployments/recent"
        hx-trigger="load" hx-swap="outerHTML">
-    <p class="muted">Reading deployment history…</p>
+    <span class="visually-hidden">Reading deployment history…</span>
+    <div class="skeleton skeleton--row" aria-hidden="true"></div>
+    <div class="skeleton skeleton--row" aria-hidden="true"></div>
   </div>
 </section>
 
@@ -99,7 +121,8 @@
   <div id="deploy-rollback-section"
        hx-get="/apps/{{ domain }}/rollback/section"
        hx-trigger="load" hx-swap="outerHTML">
-    <p class="muted">Reading rollback points…</p>
+    <span class="visually-hidden">Reading rollback points…</span>
+    <div class="skeleton skeleton--row" aria-hidden="true"></div>
   </div>
 </section>
 

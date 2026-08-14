@@ -1152,3 +1152,6 @@ router.include_router(_backup_schedule_pages.router)
 from wasm.web.views import cron as _cron_pages  # noqa: E402
 
 router.include_router(_cron_pages.router)
+from wasm.web.views import app_charts as _app_charts_pages  # noqa: E402
+
+router.include_router(_app_charts_pages.router)

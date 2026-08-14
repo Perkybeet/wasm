@@ -72,6 +72,64 @@ def resource_counts() -> dict[str, int | None]:
     return counts
 
 
+#: The panel's fixed destinations, in the order the command palette offers
+#: them. Every entry resolves to a route declared in the views; a dead entry
+#: here is a dead link with a keyboard shortcut on it.
+_PALETTE_ROUTES: tuple[tuple[str, str], ...] = (
+    ("Overview", "/"),
+    ("Applications", "/apps"),
+    ("Deploy an application", "/apps/new"),
+    ("Services", "/services"),
+    ("Sites", "/sites"),
+    ("Certificates", "/certificates"),
+    ("Databases", "/databases"),
+    ("Backups", "/backups"),
+    ("Deployments", "/deployments"),
+    ("Activity", "/activity"),
+    ("Settings", "/settings"),
+)
+
+
+def palette_entries() -> list[dict[str, str]]:
+    """
+    Build the command palette's catalogue: the fixed screens, then every
+    deployed application.
+
+    Server-rendered rather than fetched, so the palette works the instant
+    Ctrl+K lands and holds exactly what this response could see; the client
+    only filters it.
+
+    Returns:
+        ``label``/``href``/``hint`` mappings, fixed routes first.
+    """
+    entries = [{"label": label, "href": href, "hint": "screen"} for label, href in _PALETTE_ROUTES]
+
+    try:
+        from wasm.core.store import get_store
+    except ImportError:
+        return entries
+
+    import sqlite3
+
+    from wasm.core.exceptions import WASMError
+
+    try:
+        domains = sorted(app.domain for app in get_store().list_apps() if app.domain)
+    except (WASMError, sqlite3.Error, OSError) as exc:
+        # The store being unreadable must not take the shell down with it -
+        # the operator may be here precisely because something is broken -
+        # but it is worth a line.
+        import logging
+
+        logging.getLogger(__name__).warning("Could not read applications for the palette: %s", exc)
+        return entries
+
+    entries.extend(
+        {"label": domain, "href": f"/apps/{domain}", "hint": "application"} for domain in domains
+    )
+    return entries
+
+
 def shared_context(request: Request) -> dict[str, Any]:
     """
     Build the context the shell needs.
@@ -103,6 +161,7 @@ def shared_context(request: Request) -> dict[str, Any]:
         "csrf_cookie": CSRF_COOKIE_NAME,
         "page": request.url.path.strip("/").split("/")[0] or "dashboard",
         "theme": None,
+        "palette": palette_entries(),
     }
 
 

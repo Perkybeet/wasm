@@ -277,6 +277,8 @@ HOOKS = (
     "data-drawer-toggle",
     "data-drawer-clear",
     "data-drawer-source",
+    "data-drawer-search",
+    "data-drawer-jump",
     "data-nav-toggle",
     "data-nav-close",
     "data-theme-toggle",
@@ -284,6 +286,7 @@ HOOKS = (
     "data-metric",
     "data-chart",
     "data-chart-window",
+    "data-chart-marks",
 )
 
 
@@ -423,3 +426,75 @@ def test_the_notices_stack_clears_the_open_drawer() -> None:
     assert "--log-drawer-offset" in CSS, "the offset is no longer used"
     panel_js = (WEB / "static" / "panel.js").read_text(encoding="utf-8")
     assert "--log-drawer-offset" in panel_js, "nothing sets the offset the stylesheet reads"
+
+
+# ---------------------------------------------------------------------------
+# The command palette
+# ---------------------------------------------------------------------------
+
+
+def test_the_command_palette_is_part_of_the_shell() -> None:
+    """
+    Ctrl+K is wired to elements the shell must render: a native dialog, so
+    focus trapping and Escape come from the browser rather than being
+    hand-rolled, and a server-rendered catalogue, so opening it costs no
+    request. Either missing is a shortcut that silently does nothing.
+    """
+    assert 'id="command-palette"' in BASE, "the palette dialog left the shell"
+    assert 'id="palette-data"' in BASE, "the palette's catalogue left the shell"
+    assert 'type="application/json"' in BASE, "the catalogue must be inert data, not script"
+
+
+def test_the_palette_reads_as_instrument_not_spotlight() -> None:
+    """
+    The design direction: one bordered surface, no dramatic shadow - the
+    dimmed backdrop already separates it from the page - and routes in mono,
+    because a path is system data wherever it appears.
+    """
+    declarations = rule(".palette")
+    assert "border: 1px solid" in declarations, "the palette lost its surface border"
+    assert "box-shadow" not in declarations, "the palette grew a dramatic shadow"
+    assert "font-family: var(--font-mono)" in rule(".palette__href"), (
+        "the palette's routes are no longer set in mono"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Skeletons on the lazily loaded sections
+# ---------------------------------------------------------------------------
+
+#: Pages whose sections load over htmx after first paint. cron.html lazy-loads
+#: too but belongs to another work stream; it joins this sweep when it gains
+#: its skeletons.
+LAZY_PAGES = ("pages/app.html", "pages/backups.html", "pages/settings.html")
+
+
+@pytest.mark.parametrize("name", LAZY_PAGES)
+def test_lazy_sections_load_behind_a_skeleton_not_a_blank(name: str) -> None:
+    """
+    The design direction promises placeholders while remote data loads. A
+    lazy container whose only content is prose reads as a finished, empty
+    section for as long as the request takes.
+
+    Args:
+        name: A template with hx-trigger="load" containers.
+    """
+    source = TEMPLATES[name]
+    containers = re.findall(r'<div[^>]*hx-trigger="load"[^>]*>(.*?)</div>', source, re.DOTALL)
+
+    assert containers, f"{name} no longer lazy-loads anything; drop it from this sweep"
+    for content in containers:
+        assert "skeleton" in content, f"a lazy container in {name} loads behind a blank"
+
+
+def test_the_skeleton_pulse_is_frozen_under_reduced_motion() -> None:
+    """
+    The pulse is animation, and the panel's reduced-motion block flattens
+    every animation to a single imperceptible frame: the skeleton must stay a
+    static grey block for the operators who asked for stillness.
+    """
+    assert "animation: shimmer" in rule(".skeleton"), "the skeleton no longer pulses at all"
+    reduced = re.search(r"@media \(prefers-reduced-motion: reduce\)\s*\{(.*?)\n\}", CSS, re.DOTALL)
+    assert reduced, "the reduced-motion block left the stylesheet"
+    assert "animation-duration: 0.01ms !important" in reduced.group(1)
+    assert "animation-iteration-count: 1 !important" in reduced.group(1)
