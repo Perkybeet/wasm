@@ -1272,3 +1272,13 @@ def _resource_page(kind: str) -> dict[str, Any]:
         "action_label": copy.get("action_label"),
         "action_href": copy.get("action_href"),
     }
+
+
+# Sub-view modules own their pages so concurrent panel work never edits this
+# file. They import this module's session dependency and error route, which is
+# why the includes must stay below every definition above.
+from wasm.web.views import databases as _database_pages  # noqa: E402
+from wasm.web.views import deployments as _deployment_pages  # noqa: E402
+
+router.include_router(_database_pages.router)
+router.include_router(_deployment_pages.router)
