@@ -468,3 +468,25 @@ La API entera ya existe (`api/databases.py`). UI con tabs por engine:
 
 - 2026-08-13: Plan creado. Investigación completa (8 informes). Línea base: 2959 tests
   verdes, ruff limpio, mypy baseline 28. Fases 0-1 en ejecución en esta sesión.
+- 2026-08-14: **Fases 0 y 1 COMPLETAS** (v1.3.0 committeada en local, sin tag/push:
+  la publicación queda a decisión del dueño). Hecho: 0.1 contadores del strip,
+  0.2 config web.* cableada, 0.3 default user de servicios, 0.4 browser check en CI +
+  panel_factory, 1.1 TLS obligatorio + --self-signed/--insecure-http, 1.2 configtest
+  antes de persistir, 1.3 TOTP 2FA (core/totp.py, qrcodegen vendorizado), 1.4 tokens
+  API con scopes (matriz en required_scope, un solo chokepoint), 1.5 sesiones visibles
+  y revocables, 1.6 cabeceras. Además adelantado de fases 2-4: **2.1** editor de env
+  vars; **3.1** tabla deployments (v2, `triggered_by`); **3.2** DeploymentRecorder con
+  log de build capturado y rotación (monorepo/docker-compose quedan fuera: no usan el
+  pipeline — follow-up anotado); **3.3** MetricsStore RRD + MetricsCollector (2s,
+  cgroup v2 por app) + `GET /api/metrics`; **3.4** SSE multiplexado (eventos `metrics`
+  y `machine`, strip sin polling, htmx-ext-sse vendorizado); **4.2a** core/notifier.py
+  (webhook/Slack/Discord/Telegram/email; falta cablear eventos de jobs/monitor y UI).
+  Suite: 3189 verdes. En curso al cierre de esta anotación: 2.3 página BD completa,
+  3.6+2.7 historial+rollback UI, 4.1 webhooks backend, 3.5 gráficas dashboard+favicon.
+  Pendiente de fases 2-5: 2.2 settings editables, 2.4 services UI, 2.5 sites UI,
+  2.6 backup schedules API+UI, 2.8 deploy form htmx avanzado, gráficas en página de
+  app, 4.2b wiring+UI notificaciones, 4.3 cron UI, 4.4 deep links, fase 5 entera.
+  Nota: entrada "Deployments" en la sidebar de base.html puede quedar pendiente de
+  cablear (base.html estaba asignado al agente de charts). Hallazgo lateral anotado:
+  test_cli_webapp deja DryRunFileSystem global sin resetear (conviene fixture en
+  conftest).
