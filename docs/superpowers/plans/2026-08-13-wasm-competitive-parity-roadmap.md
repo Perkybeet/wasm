@@ -516,3 +516,14 @@ La API entera ya existe (`api/databases.py`). UI con tabs por engine:
   web, preview deploys, multiusuario, one-click, multi-server) sigue vigente.
   Decisión de publicación: tags v1.3.0/v1.4.0/v1.5.0 sin crear; cuando el dueño quiera
   publicar, seguir el proceso del spec de release (tag + push dispara PyPI/OBS).
+- 2026-08-14 (publicación): **v1.5.0 publicada** (solo ese tag; 1.3/1.4 quedan como
+  hitos internos — los números publicados no necesitan ser contiguos y esos árboles
+  tenían man pages sin regenerar). **Rota en Ubuntu 24.04 al arrancar el panel**:
+  noble empaqueta pydantic v1 y tres ficheros nuevos usaban `field_validator` (v2).
+  **v1.5.1 publicada con el fix**: `web/pydantic_compat.py` (puente v1/v2), guardias
+  AST en test_architecture contra API exclusiva de una major de pydantic, job CI
+  `pydantic-v1` (tests web con 1.10 pineado) y paso de release que importa la capa web
+  dentro del contenedor deb/rpm con las deps de la distro. Lección permanente: los
+  tests con deps de pip NO validan las deps de distro; toda API nueva de una librería
+  empaquetada debe contrastarse con la versión de noble/bookworm/Fedora (tabla en
+  CLAUDE.md) y el gate del contenedor es el chokepoint que lo garantiza.
