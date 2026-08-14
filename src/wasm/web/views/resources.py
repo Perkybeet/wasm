@@ -238,6 +238,7 @@ def _shape(kind: str, record: Any) -> dict[str, Any]:
             ],
             "href": f"/apps/{record.domain}",
             "log_url": f"/ws/logs/{record.domain}",
+            "links": [],
             "restart_endpoint": f"/api/apps/{record.domain}/restart",
             # Taking a backup is the one thing an operator wants to do
             # immediately before anything risky, so it belongs on the row
@@ -269,6 +270,10 @@ def _shape(kind: str, record: Any) -> dict[str, Any]:
             ],
             "href": None,
             "log_url": None,
+            # The editor is a place to go, not a verb to fire, so it travels
+            # as a link rather than an action button: a GET the browser can
+            # open, prefetch and middle-click like any other page.
+            "links": [{"label": "Edit config", "href": f"/sites/{record.domain}/config"}],
             "restart_endpoint": None,
             "actions": _site_actions(record),
             "delete_endpoint": f"/api/sites/{record.domain}",
@@ -286,6 +291,7 @@ def _shape(kind: str, record: Any) -> dict[str, Any]:
             "meta": [("port", record.port or "—"), ("user", record.user)],
             "href": None,
             "log_url": f"/ws/logs/{record.name}",
+            "links": [{"label": "Edit unit", "href": f"/services/{record.name}/config"}],
             "restart_endpoint": None,
             "actions": _service_actions(record),
             "delete_endpoint": f"/api/services/{record.name}",
@@ -304,6 +310,7 @@ def _shape(kind: str, record: Any) -> dict[str, Any]:
         "meta": [("engine", engine), ("user", getattr(record, "username", None) or "—")],
         "href": None,
         "log_url": None,
+        "links": [],
         "restart_endpoint": None,
         # Two segments, and both are meant. The API router mounts the databases
         # module under /api/databases and the module declares its own

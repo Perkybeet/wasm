@@ -1,0 +1,49 @@
+{#
+  The site config editor fragment.
+
+  A rejected save renders at 200 with the web server's own output verbatim in
+  mono and the fix above it - never paraphrased - while the textarea keeps
+  exactly what the operator typed and the file on disk stays as it was. A
+  save only lands after the server's own syntax check accepted it, which is
+  why the reload button beside it is safe to offer.
+#}
+{% import "_macros.html" as m %}
+<div id="site-editor">
+
+  {% if editor.problem %}
+    {{ m.problem(editor.problem.fix, editor.problem.output) }}
+  {% endif %}
+
+  {% if editor.notice %}
+    <p class="stack__lead">{{ editor.notice }}</p>
+  {% endif %}
+
+  <form class="form" hx-post="/sites/{{ editor.domain }}/config"
+        hx-target="#site-editor" hx-swap="outerHTML" autocomplete="off">
+    <div class="field">
+      <label class="label" for="site-config">Configuration</label>
+      <textarea class="mono" id="site-config" name="config" rows="18" required
+                spellcheck="false"
+                aria-describedby="site-config-hint">{{ editor.content }}</textarea>
+      <span class="field__hint" id="site-config-hint">
+        Checked with {{ editor.webserver }}'s own configuration test before it
+        replaces {{ editor.path }}; a rejected configuration changes nothing.
+        Saving does not reload the server: use the button below when ready.
+      </span>
+    </div>
+    <div class="toolbar">
+      <button class="btn btn--primary" type="submit">Save configuration</button>
+    </div>
+  </form>
+
+  <div class="toolbar">
+    <button type="button" class="btn"
+            hx-post="/sites/{{ editor.domain }}/reload"
+            hx-target="#site-editor" hx-swap="outerHTML">Reload {{ editor.webserver }}</button>
+    <span class="field__hint">
+      Runs the configuration test first and keeps the running configuration
+      when it fails, so a reload cannot take the other sites down.
+    </span>
+  </div>
+
+</div>

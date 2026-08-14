@@ -1,0 +1,22 @@
+{#
+  The unit editor for one systemd service.
+
+  The whole editable surface is one swappable fragment: a save redraws exactly
+  the editor, with either the manager's confirmation or its refusal - the
+  backend's own words verbatim, fix above - and never navigates away from the
+  text the operator is working on.
+#}
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+
+{% block title %}{{ editor.name }} unit{% endblock %}
+
+{% block content %}
+
+{% call m.page_head(editor.name, editor.path) %}
+  <a class="btn" href="/services">Back to services</a>
+{% endcall %}
+
+{% include "fragments/infra_service_editor.html" %}
+
+{% endblock %}

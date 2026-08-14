@@ -1,0 +1,123 @@
+{#
+  The service creation form, one mode at a time.
+
+  The tab buttons swap this whole fragment over htmx, so the active tab, the
+  form and any refusal always agree: there is no client-side state to drift.
+  A refused submission renders at 200 with the problem block above the form
+  and every field holding what the operator typed.
+
+  Raw mode prefills a complete unit body carrying the WASM marker, because the
+  manager refuses to write a unit without it: prefilling something the backend
+  would reject is a form that teaches the operator to fail.
+#}
+{% import "_macros.html" as m %}
+<div id="service-form">
+
+  {% if sform.problem %}
+    {{ m.problem(sform.problem.fix, sform.problem.output) }}
+  {% endif %}
+
+  <div class="toolbar">
+    <button type="button" class="btn btn--sm{% if sform.mode == 'simple' %} btn--primary{% endif %}"
+            aria-pressed="{{ 'true' if sform.mode == 'simple' else 'false' }}"
+            hx-get="/services/new/form?mode=simple"
+            hx-target="#service-form" hx-swap="outerHTML">Simple</button>
+    <button type="button" class="btn btn--sm{% if sform.mode == 'raw' %} btn--primary{% endif %}"
+            aria-pressed="{{ 'true' if sform.mode == 'raw' else 'false' }}"
+            hx-get="/services/new/form?mode=raw"
+            hx-target="#service-form" hx-swap="outerHTML">Unit file</button>
+  </div>
+
+  {% if sform.mode == 'raw' %}
+    <form class="form" hx-post="/services/new" hx-target="#service-form" hx-swap="outerHTML"
+          autocomplete="off">
+      <input type="hidden" name="mode" value="raw">
+
+      <div class="field">
+        <label class="label" for="service-name">Name</label>
+        <input class="mono" type="text" id="service-name" name="name" required autofocus
+               value="{{ sform.submitted.name or '' }}" placeholder="queue-worker"
+               aria-describedby="service-name-hint">
+        <span class="field__hint" id="service-name-hint">
+          Becomes the unit name, with .service appended.
+        </span>
+      </div>
+
+      <div class="field">
+        <label class="label" for="service-unit">Unit file</label>
+        <textarea class="mono" id="service-unit" name="unit" rows="16" required
+                  spellcheck="false"
+                  aria-describedby="service-unit-hint">{{ sform.submitted.unit or sform.skeleton }}</textarea>
+        <span class="field__hint" id="service-unit-hint">
+          Written verbatim. Keep the "# {{ sform.marker }}" comment: without it
+          WASM stops recognising the unit as its own and refuses to manage it.
+        </span>
+      </div>
+
+      <div class="toolbar">
+        <button class="btn btn--primary" type="submit">Create service</button>
+        <a class="btn" href="/services">Cancel</a>
+      </div>
+    </form>
+  {% else %}
+    <form class="form" hx-post="/services/new" hx-target="#service-form" hx-swap="outerHTML"
+          autocomplete="off">
+      <input type="hidden" name="mode" value="simple">
+
+      <div class="field">
+        <label class="label" for="service-name">Name</label>
+        <input class="mono" type="text" id="service-name" name="name" required autofocus
+               value="{{ sform.submitted.name or '' }}" placeholder="queue-worker"
+               aria-describedby="service-name-hint">
+        <span class="field__hint" id="service-name-hint">
+          Becomes the unit name, with .service appended.
+        </span>
+      </div>
+
+      <div class="field">
+        <label class="label" for="service-command">Command</label>
+        <input class="mono" type="text" id="service-command" name="command" required
+               value="{{ sform.submitted.command or '' }}"
+               placeholder="/usr/bin/node worker.js" aria-describedby="service-command-hint">
+        <span class="field__hint" id="service-command-hint">
+          Absolute path to the executable; systemd starts it without a shell.
+        </span>
+      </div>
+
+      <div class="form__row">
+        <div class="field">
+          <label class="label" for="service-directory">Working directory</label>
+          <input class="mono" type="text" id="service-directory" name="directory"
+                 value="{{ sform.submitted.directory or '/var/www' }}" placeholder="/var/www">
+        </div>
+
+        <div class="field">
+          <label class="label" for="service-user">User</label>
+          <input class="mono" type="text" id="service-user" name="user"
+                 value="{{ sform.submitted.user or '' }}"
+                 placeholder="{{ sform.service_user }}" aria-describedby="service-user-hint">
+          <span class="field__hint" id="service-user-hint">
+            Leave empty to run as {{ sform.service_user }}, the configured
+            service user. Never defaults to root.
+          </span>
+        </div>
+
+        <div class="field">
+          <label class="label" for="service-port">Port</label>
+          <input class="mono" type="number" id="service-port" name="port" min="1" max="65535"
+                 value="{{ sform.submitted.port or '' }}" placeholder="none"
+                 aria-describedby="service-port-hint">
+          <span class="field__hint" id="service-port-hint">
+            Optional; handed to the process as the PORT environment variable.
+          </span>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <button class="btn btn--primary" type="submit">Create service</button>
+        <a class="btn" href="/services">Cancel</a>
+      </div>
+    </form>
+  {% endif %}
+
+</div>

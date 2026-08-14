@@ -31,6 +31,12 @@
         {% if item.log_url %}
           {{ m.follow_button("Logs", item.domain, item.log_url) }}
         {% endif %}
+        {# Places to go, not verbs to fire: the unit and config editors are
+           pages, so they travel as links the browser can open like any
+           other, not as htmx posts. #}
+        {% for link in item.links or [] %}
+          <a class="btn btn--sm" href="{{ link.href }}">{{ link.label }}</a>
+        {% endfor %}
         {% if item.restart_endpoint %}
           {{ m.action_button("Restart", item.restart_endpoint, none, "Restarted " ~ item.domain) }}
         {% endif %}

@@ -1,0 +1,26 @@
+{#
+  Create a virtual host.
+
+  The configuration file is named and rendered by the web server manager, the
+  same code path the CLI uses, so a site created here is visible to
+  `wasm site list`, can be enabled and disabled from either side, and is seen
+  by certificate issuance. The form lives in a swappable fragment so a refusal
+  redraws exactly the form, with the refusal on it and the input preserved.
+#}
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+
+{% block title %}New site{% endblock %}
+
+{% block content %}
+
+{{ m.page_head("New site", "A domain in front of an application or a directory of files") }}
+
+{% include "fragments/infra_site_form.html" %}
+
+<p class="muted form__aside">
+  The same from a terminal:
+  <code>wasm site create -d example.com</code>
+</p>
+
+{% endblock %}

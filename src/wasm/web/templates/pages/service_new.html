@@ -1,0 +1,30 @@
+{#
+  Create a systemd service.
+
+  This is the feature the classic segment runs a VPS for: anything systemd can
+  run - daemons, queue workers, schedulers - becomes a managed unit here, not
+  only the web applications the deploy flow creates.
+
+  Two modes, as htmx tabs over one swappable fragment: simple asks for a
+  command and writes a correct unit around it; raw takes a whole unit file and
+  writes it verbatim. The form itself lives in the fragment so a refusal
+  redraws exactly the form, with the refusal on it and the input preserved.
+#}
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+
+{% block title %}New service{% endblock %}
+
+{% block content %}
+
+{{ m.page_head("New service", "Run anything systemd can run: daemons, workers, schedulers.") }}
+
+{% include "fragments/infra_service_form.html" %}
+
+<p class="muted form__aside">
+  The unit is written to /etc/systemd/system and enabled to start on boot.
+  Manage it afterwards from the services list or with
+  <code>wasm service list</code>.
+</p>
+
+{% endblock %}

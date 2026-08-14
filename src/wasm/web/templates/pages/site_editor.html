@@ -1,0 +1,22 @@
+{#
+  The configuration editor for one virtual host.
+
+  The whole editable surface is one swappable fragment. Every save is gated by
+  the web server's own configuration test before anything is persisted: an
+  invalid configuration comes back with the server's output verbatim and the
+  file on disk untouched, so this screen cannot take a running site down.
+#}
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+
+{% block title %}{{ editor.domain }} config{% endblock %}
+
+{% block content %}
+
+{% call m.page_head(editor.domain, editor.path) %}
+  <a class="btn" href="/sites">Back to sites</a>
+{% endcall %}
+
+{% include "fragments/infra_site_editor.html" %}
+
+{% endblock %}

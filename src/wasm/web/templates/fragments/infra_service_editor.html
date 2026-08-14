@@ -1,0 +1,40 @@
+{#
+  The unit editor fragment.
+
+  A refused save renders at 200 with the refusal inline - the manager's or
+  systemd's own words verbatim in mono, the fix above them - and the textarea
+  keeps exactly what the operator typed, so the correction happens in place.
+  The file on disk is only ever the last accepted body.
+#}
+{% import "_macros.html" as m %}
+<div id="service-editor">
+
+  {% if editor.problem %}
+    {{ m.problem(editor.problem.fix, editor.problem.output) }}
+  {% endif %}
+
+  {% if editor.notice %}
+    <p class="stack__lead">{{ editor.notice }}</p>
+  {% endif %}
+
+  <form class="form" hx-post="/services/{{ editor.name }}/config"
+        hx-target="#service-editor" hx-swap="outerHTML" autocomplete="off">
+    <div class="field">
+      <label class="label" for="unit-config">Unit file</label>
+      <textarea class="mono" id="unit-config" name="config" rows="18" required
+                spellcheck="false"
+                aria-describedby="unit-config-hint">{{ editor.content }}</textarea>
+      <span class="field__hint" id="unit-config-hint">
+        Saved to {{ editor.path }}, followed by a daemon-reload. Keep the
+        "# {{ editor.marker }}" comment, and restart the service to apply
+        what you change.
+      </span>
+    </div>
+    <div class="toolbar">
+      <button class="btn btn--primary" type="submit">Save unit</button>
+      {{ m.action_button("Restart service", "/api/services/" ~ editor.name ~ "/restart",
+                         none, "Restarted " ~ editor.name) }}
+    </div>
+  </form>
+
+</div>

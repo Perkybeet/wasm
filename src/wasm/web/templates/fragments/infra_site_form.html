@@ -1,0 +1,91 @@
+{#
+  The site creation form.
+
+  A refused submission renders at 200 with the problem block above the form
+  and every field holding what the operator typed. The template names come
+  from the server; the chosen backend's manager refuses one it does not ship.
+#}
+{% import "_macros.html" as m %}
+<div id="site-form">
+
+  {% if nsite.problem %}
+    {{ m.problem(nsite.problem.fix, nsite.problem.output) }}
+  {% endif %}
+
+  <form class="form" hx-post="/sites/new" hx-target="#site-form" hx-swap="outerHTML"
+        autocomplete="off">
+
+    <div class="field">
+      <label class="label" for="site-domain">Domain</label>
+      <input class="mono" type="text" id="site-domain" name="domain" required autofocus
+             value="{{ nsite.submitted.domain or '' }}" placeholder="app.example.com"
+             aria-describedby="site-domain-hint">
+      <span class="field__hint" id="site-domain-hint">
+        The web server answers for this name; it is also the configuration
+        file's name.
+      </span>
+    </div>
+
+    <div class="form__row">
+      <div class="field">
+        <label class="label" for="site-type">Type</label>
+        <select id="site-type" name="type" aria-describedby="site-type-hint">
+          {% for template in nsite.templates %}
+            <option value="{{ template }}"
+                    {% if template == (nsite.submitted.type or 'proxy') %}selected{% endif %}>
+              {{ template }}
+            </option>
+          {% endfor %}
+        </select>
+        <span class="field__hint" id="site-type-hint">
+          proxy passes requests to a local port; static serves files from the
+          domain's directory under /var/www/apps.
+        </span>
+      </div>
+
+      <div class="field">
+        <label class="label" for="site-port">Port</label>
+        <input class="mono" type="number" id="site-port" name="port" min="1" max="65535"
+               value="{{ nsite.submitted.port or '' }}" placeholder="3000"
+               aria-describedby="site-port-hint">
+        <span class="field__hint" id="site-port-hint">
+          Where the proxy type sends requests on this machine. The static type
+          ignores it.
+        </span>
+      </div>
+    </div>
+
+    <div class="form__row">
+      <div class="field">
+        <label class="label" for="site-webserver">Web server</label>
+        <select id="site-webserver" name="webserver">
+          {% for option in nsite.webservers %}
+            <option value="{{ option }}"
+                    {% if option == (nsite.submitted.webserver or 'nginx') %}selected{% endif %}>
+              {{ option }}
+            </option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div class="field">
+        <label class="label" for="site-ssl">TLS</label>
+        <label class="choice">
+          <input type="checkbox" id="site-ssl" name="ssl" value="yes"
+                 {% if nsite.submitted.ssl %}checked{% endif %}>
+          Render the HTTPS directives
+        </label>
+        <span class="field__hint">
+          Points at the Let's Encrypt paths for the domain; issue the
+          certificate from the certificates screen if it does not exist yet.
+        </span>
+      </div>
+    </div>
+
+    <div class="toolbar">
+      <button class="btn btn--primary" type="submit">Create site</button>
+      <a class="btn" href="/sites">Cancel</a>
+    </div>
+  </form>
+
+</div>
