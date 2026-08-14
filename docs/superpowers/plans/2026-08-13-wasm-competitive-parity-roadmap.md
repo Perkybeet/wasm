@@ -490,3 +490,29 @@ La API entera ya existe (`api/databases.py`). UI con tabs por engine:
   cablear (base.html estaba asignado al agente de charts). Hallazgo lateral anotado:
   test_cli_webapp deja DryRunFileSystem global sin resetear (conviene fixture en
   conftest).
+- 2026-08-14 (cierre de sesión): **FASES 2, 3 y 4 COMPLETAS y Fase 5 casi entera.**
+  v1.4.0 y v1.5.0 committeadas en local (SIN tag ni push: la publicación la decide el
+  dueño). Terminado desde la anotación anterior: 2.2 settings editables, 2.3 página BD
+  completa (engines/usuarios/backups/consola SQL), 2.4 services UI (create+editor unit),
+  2.5 sites UI (create+editor con configtest), 2.6 backups programados API+UI (con
+  next-run real; list_schedules del scheduler estaba roto y se corrigió), 2.7 rollback
+  UI, 2.8 deploy form htmx con opciones monorepo/compose extremo a extremo, 3.5 gráficas
+  uPlot (dashboard + por-app con marcas de deploys), 3.6 páginas de historial + favicon
+  de estado, 4.1 webhooks firmados (GitHub/GitLab/Gitea, anti-replay, store v3) con UI,
+  4.2 notificaciones (módulo + wiring jobs/monitor + UI con test por canal), 4.3 cron
+  jobs (manager+API+UI), 4.4 deep links --open, 5.1 palette Ctrl+K, 5.2 confirmación
+  por nombre (adoptada en BD/rollback/cron/webhook), 5.4 logs (búsqueda + autoscroll
+  pausable), 5.5 esqueletos. Estado final verificado: **3468 tests verdes** (+509 sobre
+  la línea base), ruff/format limpios, mypy en baseline (28), vendor 14/14, paridad CLI
+  OK, browser check 22/22.
+  **Pendiente para futuras sesiones**: 5.3 deep-linking hx-push-url en tabs/filtros;
+  `wasm cron` CLI (paridad con el panel); retención en backups programados (el template
+  backup-service.j2 no interpola --retention-*: las ejecuciones programadas no rotan);
+  monorepo/docker-compose no registran historial de deployments (no usan el pipeline);
+  cert_expiring no lo detecta el monitor daemon (solo la página de certificados);
+  fuga de aislamiento en tests (USER_DB_PATH se resuelve al importar, antes del sandbox
+  — un test sin fixture de store puede abrir la BD real del usuario); DryRunFileSystem
+  global sin reset en test_cli_webapp; sección "Diferido con razón" del spec (terminal
+  web, preview deploys, multiusuario, one-click, multi-server) sigue vigente.
+  Decisión de publicación: tags v1.3.0/v1.4.0/v1.5.0 sin crear; cuando el dueño quiera
+  publicar, seguir el proceso del spec de release (tag + push dispara PyPI/OBS).
