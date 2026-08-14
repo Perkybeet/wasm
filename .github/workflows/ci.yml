@@ -139,6 +139,34 @@ jobs:
           wasm --version
           wasm --help
 
+  browser:
+    name: Browser check
+    runs-on: ubuntu-latest
+    # scripts/panel_browser_check.py is what caught the sidebar losing its
+    # position on scroll, the log drawer not opening and the mobile nav being
+    # unreachable: all three are decided by a layout engine, and nothing else
+    # in this suite drives one. It used to be run by hand only, which is
+    # exactly how those shipped. continue-on-error stays on for the first two
+    # weeks this job exists, to absorb runner-specific flakiness in a real
+    # browser before it can block a merge; flip it once it has passed ten
+    # consecutive runs.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install project and Playwright
+        run: |
+          pip install -e ".[web]" playwright
+          playwright install --with-deps chromium
+
+      - name: Run the browser check
+        run: python scripts/panel_browser_check.py
+
   packaging:
     name: Packaging
     runs-on: ubuntu-latest

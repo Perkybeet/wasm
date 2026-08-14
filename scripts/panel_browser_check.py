@@ -35,6 +35,13 @@ import time
 from pathlib import Path
 from typing import Any
 
+# This is a script, not a test, so pytest never puts the repository root on
+# sys.path for it. It still wants tests/panel_factory.py: that module is the
+# one implementation of the panel's seed data (CLAUDE.md rule 3), shared with
+# tests/test_panel_factory.py and any future test that wants a populated
+# panel, and this is the other caller.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 #: Where the panel is served for the duration of the run.
 HOST = "127.0.0.1"
 
@@ -74,58 +81,27 @@ class Panel:
 
     def start(self) -> None:
         """Populate a store, build the app and serve it on a thread."""
-        from wasm.core.store import App, Service, Site, WASMStore
+        from tests.panel_factory import DEFAULT_DOMAINS, seed_panel_state
+        from wasm.core.store import WASMStore
 
         WASMStore.reset_instance()
         store = WASMStore(self.root / "wasm.db")
 
         # A screen with nothing on it exercises none of the layout that broke.
-        for index, domain in enumerate(
-            [
-                "arennalabs.com",
-                "picconia.com",
-                "cittek.es",
-                "qrboda.com",
-                "convertidordepdf.com",
-                "clientes.arennalabs.com",
-                "taller.arennalabs.com",
-                "bodas.arennalabs.com",
-            ]
-        ):
-            app = store.create_app(
-                App(
-                    domain=domain,
-                    app_type="nextjs",
-                    source="https://github.com/you/app",
-                    port=3000 + index,
-                    app_path=f"/var/www/apps/{domain}",
-                    status="running" if index % 3 else "stopped",
-                    ssl_enabled=True,
-                )
-            )
-            store.create_service(
-                Service(
-                    app_id=app.id,
-                    name=f"wasm-{domain.replace('.', '-')}",
-                    unit_file=f"/etc/systemd/system/wasm-{domain}.service",
-                    working_directory=f"/var/www/apps/{domain}",
-                    command="/usr/bin/node server.js",
-                    status="active" if index % 3 else "inactive",
-                    enabled=index % 2 == 0,
-                    port=3000 + index,
-                )
-            )
-            store.create_site(
-                Site(
-                    app_id=app.id,
-                    domain=domain,
-                    webserver="nginx",
-                    config_path=f"/etc/nginx/sites-available/{domain}",
-                    enabled=index % 4 != 0,
-                    proxy_port=3000 + index,
-                    ssl_enabled=True,
-                )
-            )
+        # These counts reproduce, field for field, what this script used to
+        # build inline: every one of the eight domains gets a service and a
+        # site, none of them failed, none carries an explicit certificate
+        # path. tests/test_panel_factory.py pins that equivalence down.
+        domain_count = len(DEFAULT_DOMAINS)
+        seed_panel_state(
+            store,
+            apps=domain_count,
+            services=domain_count,
+            sites=domain_count,
+            certs=0,
+            backups=0,
+            failed=0,
+        )
 
         import uvicorn
 
@@ -395,9 +371,25 @@ def main() -> int:
     parser.add_argument("--shots", type=Path, default=None, help="Write screenshots here")
     args = parser.parse_args()
 
-    with contextlib.suppress(KeyboardInterrupt):
-        return run(args.shots)
-    return 130
+    try:
+        with contextlib.suppress(KeyboardInterrupt):
+            return run(args.shots)
+        return 130
+    except ModuleNotFoundError as exc:
+        # A 150 MB browser download is not a condition of running the rest of
+        # the suite, so it is not a project dependency: the traceback this
+        # would otherwise print is correct but unhelpful about what to do
+        # next.
+        if exc.name != "playwright":
+            raise
+        print(
+            "Playwright is not installed, so this check cannot open a browser.\n"
+            "Install it and its Chromium runtime, then try again:\n\n"
+            "    pip install playwright\n"
+            "    playwright install --with-deps chromium\n",
+            file=sys.stderr,
+        )
+        return 1
 
 
 if __name__ == "__main__":
