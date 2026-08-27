@@ -303,6 +303,10 @@ def configure(state: Context, domain: str) -> None:
 @click.option(
     "--unmask",
     is_flag=True,
+    # Explicit, not implied: click 8.5 reports an unset flag default as a
+    # sentinel, and the guarantee that secrets stay masked must not depend on
+    # which click a distribution ships.
+    default=False,
     help="Print secret values in clear instead of hiding them.",
 )
 @pass_context
