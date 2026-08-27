@@ -536,3 +536,15 @@ La API entera ya existe (`api/databases.py`). UI con tabs por engine:
   en dos rondas por el implementador y una por el orquestador. El spec de diseño de
   2026-08-12 queda superado en lo estético; sus restricciones técnicas (CSP, sin
   build, vendor con checksum, color de estado + acento) siguen vigentes.
+- 2026-08-27 (v1.6.1): **EACCES al arrancar toda app no-monorepo**: el deploy corre
+  como root y dejaba `/var/www/apps/{app}` propiedad de root mientras la unidad corre
+  como `service_user` (www-data); pnpm escribe un temporal `_tmp_*` en el cwd en cada
+  `pnpm run`, así que el servicio moría en bucle de reinicios (visto en producción en
+  bodas.arennalabs.com). El chown existía solo en el deployer monorepo — regla 3 rota:
+  la implementación nunca llegó al pipeline común. Fix en v1.6.1:
+  `deployers/helpers/permissions.py::hand_over_tree` como implementación única, paso
+  "Setting permissions" en el pipeline base tras el build (afecta a nextjs, nodejs,
+  python y vite; static define su propia lista y docker-compose no usa el pipeline —
+  a propósito: un `chown -R` sobre bind mounts rompería los datos de contenedores), y
+  los `.env` vuelven a 0600 tras el `chmod -R`. Remediación en servidores ya
+  desplegados: `chown -R www-data:www-data /var/www/apps/{app}` y restart del unit.
