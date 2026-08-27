@@ -42,6 +42,7 @@ from wasm.deployers.helpers import (
 )
 from wasm.deployers.helpers.health import failure_output, wait_until_healthy
 from wasm.deployers.helpers.nginx_config import NginxAdvancedConfig
+from wasm.deployers.helpers.permissions import hand_over_tree
 from wasm.deployers.helpers.registration import StoreRegistrar
 from wasm.deployers.helpers.summary import print_deployment_summary
 from wasm.deployers.interface import AppDeployer, StepReporter, UpdateResult
@@ -1164,6 +1165,11 @@ class BaseDeployer(AppDeployer):
                 run=self.build,
             ),
             DeployStep(
+                title="Setting permissions",
+                icon=Icons.LOCK,
+                run=self._set_permissions,
+            ),
+            DeployStep(
                 title="Creating site configuration",
                 icon=Icons.GLOBE,
                 run=lambda: self.create_site(with_ssl=False),
@@ -1234,6 +1240,36 @@ class BaseDeployer(AppDeployer):
 
         if self.app_name:
             self.store.update_service_status(self.app_name, active=True, enabled=True)
+
+    def _set_permissions(self) -> None:
+        """
+        Hand the deployed tree over to the account the service runs as.
+
+        The deployment ran as root, so without this step the service user
+        cannot write into its own app directory and the unit fails at start
+        with EACCES.
+        """
+        hand_over_tree(
+            self.app_path,
+            user=self.config.service_user,
+            group=self.config.service_group,
+            runner=self.runner,
+            fs=self.fs,
+            logger=self.logger,
+            env_files=self._env_files(),
+        )
+
+    def _env_files(self) -> list[Path]:
+        """
+        List the environment files whose modes must survive ``_set_permissions``.
+
+        Returns:
+            The dotenv files at the application root. Subclasses that write
+            environment files elsewhere override this.
+        """
+        if not self.app_path.is_dir():
+            return []
+        return sorted(path for path in self.app_path.glob(".env*") if path.is_file())
 
     def _recorder(self) -> DeploymentRecorder:
         """

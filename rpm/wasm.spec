@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        1.6.0
+Version:        1.6.1
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -222,6 +222,9 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
 fi
 
 %changelog
+* Thu Aug 27 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.6.1-1
+- Fix EACCES at service start: the deploy pipeline now hands the app directory over to the service user after the build
+- One shared permissions implementation for the base pipeline and the monorepo deployer
 * Fri Aug 14 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.6.0-1
 - Visual redesign: Geist typography, indigo accent, refined components and a common page skeleton across the panel
 * Fri Aug 14 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.5.1-1

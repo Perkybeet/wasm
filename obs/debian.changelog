@@ -1,3 +1,10 @@
+wasm (1.6.1-1) unstable; urgency=medium
+
+  * Fix EACCES at service start: the deploy pipeline now hands the app directory over to the service user after the build
+  * One shared permissions implementation for the base pipeline and the monorepo deployer
+
+ -- Yago Lopez Prado <yago.lopez.adeje@gmail.com>  Thu, 27 Aug 2026 15:07:14 +0000
+
 wasm (1.6.0-1) unstable; urgency=medium
 
   * Visual redesign: Geist typography, indigo accent, refined components and a common page skeleton across the panel

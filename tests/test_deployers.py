@@ -174,7 +174,9 @@ def build_deployer(
         The configured deployer, with ``web``, ``services`` and ``certs``
         attributes exposing the fakes for assertions.
     """
-    deployer = deployer_class(verbose=False)
+    # The pipeline now runs chown/chmod itself, so every deploy() needs a
+    # runner that answers instead of the blocked process-wide one.
+    deployer = deployer_class(verbose=False, runner=FakeRunner())
     deployer.configure(
         domain,
         "https://github.com/example/app.git",
@@ -794,6 +796,60 @@ def test_static_pipeline_has_no_install_or_build_steps(tmp_path: Path, store: WA
     assert "Installing dependencies" not in titles
     assert "Building application" not in titles
     assert titles[0] == "Fetching source code"
+
+
+def test_pipeline_sets_permissions_right_after_build(tmp_path: Path, store: WASMStore) -> None:
+    """The build runs as root, so the tree must be handed over before start."""
+    deployer = build_deployer(NextJSDeployer, tmp_path)
+
+    titles = [step.title for step in deployer.build_pipeline()]
+
+    assert titles.index("Setting permissions") == titles.index("Building application") + 1
+
+
+def test_set_permissions_chowns_the_tree_to_the_service_user(
+    tmp_path: Path, store: WASMStore
+) -> None:
+    """pnpm writes temp files into the cwd at start; a root-owned tree is EACCES."""
+    runner = FakeRunner()
+    deployer = NextJSDeployer(runner=runner)
+    deployer.configure("app.example.com", "src", app_path=tmp_path / "app")
+    (tmp_path / "app").mkdir(parents=True)
+
+    deployer._set_permissions()
+
+    user = deployer.config.service_user
+    group = deployer.config.service_group
+    assert ("chown", "-R", f"{user}:{group}", str(tmp_path / "app")) in runner.calls
+
+
+def test_set_permissions_keeps_env_files_owner_only(tmp_path: Path, store: WASMStore) -> None:
+    """The recursive chmod opens o+r; the .env files must come back to 0600."""
+    deployer = NextJSDeployer(runner=FakeRunner(), fs=RecordingFileSystem())
+    deployer.configure("app.example.com", "src", app_path=tmp_path / "app")
+    app_dir = tmp_path / "app"
+    app_dir.mkdir(parents=True)
+    env_file = app_dir / ".env"
+    env_file.write_text("SECRET=x\n")
+    env_file.chmod(0o644)
+
+    deployer._set_permissions()
+
+    assert stat.S_IMODE(env_file.stat().st_mode) == SECRET_MODE
+
+
+def test_monorepo_set_permissions_chowns_like_the_base(tmp_path: Path, store: WASMStore) -> None:
+    """Both deployers hand the tree over through the same implementation."""
+    runner = FakeRunner()
+    deployer = MonorepoDeployer(runner=runner)
+    deployer.configure("app.example.com", "src", app_path=tmp_path / "app")
+    (tmp_path / "app").mkdir(parents=True)
+
+    deployer._set_permissions()
+
+    user = deployer.config.service_user
+    group = deployer.config.service_group
+    assert ("chown", "-R", f"{user}:{group}", str(tmp_path / "app")) in runner.calls
 
 
 def test_deploy_without_configure_is_a_clear_error(tmp_path: Path, store: WASMStore) -> None:

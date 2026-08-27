@@ -49,6 +49,7 @@ from wasm.deployers.helpers import (
     TurboHelper,
     WorkspaceHelper,
 )
+from wasm.deployers.helpers.permissions import hand_over_tree
 from wasm.deployers.interface import AppDeployer, StepReporter, UpdateResult
 from wasm.deployers.registry import DeployerRegistry
 from wasm.managers.apache_manager import ApacheManager
@@ -948,34 +949,22 @@ class MonorepoDeployer(AppDeployer):
         return False
 
     def _set_permissions(self) -> None:
-        """Set correct ownership and permissions for the app directory."""
-        service_user = self.config.service_user
-        service_group = self.config.service_group
+        """
+        Hand the deployed tree over to the account the services run as.
 
-        try:
-            # Change ownership recursively
-            result = self.runner.run(
-                ["chown", "-R", f"{service_user}:{service_group}", str(self.app_path)],
-                timeout=60,
-            )
-            if not result.success:
-                self.logger.debug(f"chown failed: {result.stderr}")
-
-            # Ensure directories are executable and writable
-            self.runner.run(
-                ["chmod", "-R", "u+rwX,g+rX,o+rX", str(self.app_path)],
-                timeout=60,
-            )
-        except OSError as e:
-            self.logger.debug(f"Failed to set permissions: {e}")
-
-        # That -R also put o+r on the .env files written a step earlier, which
-        # hold the database password this deployer generated. The chown above
-        # has just made the service account their owner, so 0600 is readable by
-        # the application and by nobody else.
-        for env_file in self._env_files():
-            if env_file.exists():
-                self.fs.chmod(env_file, SECRET_MODE)
+        The deployment ran as root, so without this step the workspace units
+        cannot write into their own app directory and fail at start with
+        EACCES.
+        """
+        hand_over_tree(
+            self.app_path,
+            user=self.config.service_user,
+            group=self.config.service_group,
+            runner=self.runner,
+            fs=self.fs,
+            logger=self.logger,
+            env_files=self._env_files(),
+        )
 
     def _env_files(self) -> list[Path]:
         """
