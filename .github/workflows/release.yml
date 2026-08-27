@@ -271,18 +271,21 @@ jobs:
           # and update. A timed-out mirror at download.opensuse.org therefore
           # failed all three SUSE builds at once and, because publishing is
           # gated on them, refused to release a version whose packages were
-          # fine. The refresh is best-effort now; the install that follows is
-          # not, so a package that genuinely cannot be found still stops the
-          # release.
+          # fine. The refresh is best-effort now. The install that follows is
+          # not, with one exception: zypper exits 106 when a repository could
+          # not be refreshed but the operation itself completed, so after every
+          # package reported "done" the v1.6.1 release was still refused. 106
+          # is accepted; a package that genuinely cannot be found still exits
+          # 104 and stops the release.
           - image: "opensuse/tumbleweed"
-            install: "zypper --non-interactive --gpg-auto-import-keys refresh || true; zypper --non-interactive install -y rpm-build python3-devel python3-setuptools python3-pip python3-wheel python-rpm-macros git tar gzip"
+            install: "zypper --non-interactive --gpg-auto-import-keys refresh || true; zypper --non-interactive install -y rpm-build python3-devel python3-setuptools python3-pip python3-wheel python-rpm-macros git tar gzip || [ $? -eq 106 ]"
           # Leap 15.6's python3 is 3.6, which cannot parse this code. It builds
           # against the packaged 3.11 flavor instead, and this is what proves
           # the resulting package targets that interpreter.
           - image: "opensuse/leap:15.6"
-            install: "zypper --non-interactive --gpg-auto-import-keys refresh || true; zypper --non-interactive install -y rpm-build python311-devel python311-setuptools python311-pip python311-wheel python-rpm-macros git tar gzip"
+            install: "zypper --non-interactive --gpg-auto-import-keys refresh || true; zypper --non-interactive install -y rpm-build python311-devel python311-setuptools python311-pip python311-wheel python-rpm-macros git tar gzip || [ $? -eq 106 ]"
           - image: "opensuse/leap:16.0"
-            install: "zypper --non-interactive --gpg-auto-import-keys refresh || true; zypper --non-interactive install -y rpm-build python3-devel python3-setuptools python3-pip python3-wheel python-rpm-macros git tar gzip"
+            install: "zypper --non-interactive --gpg-auto-import-keys refresh || true; zypper --non-interactive install -y rpm-build python3-devel python3-setuptools python3-pip python3-wheel python-rpm-macros git tar gzip || [ $? -eq 106 ]"
     steps:
       - name: Install only what a build host has
         run: ${{ matrix.install }}
@@ -341,7 +344,9 @@ jobs:
           if command -v dnf > /dev/null; then
             dnf install -y --nogpgcheck "$rpm"
           else
-            zypper --non-interactive install --allow-unsigned-rpm -y "$rpm"
+            # 106 is "a repository could not be refreshed, the operation
+            # completed"; the wasm --version below proves the install happened.
+            zypper --non-interactive install --allow-unsigned-rpm -y "$rpm" || [ $? -eq 106 ]
           fi
           wasm --version
           wasm --help > /dev/null
