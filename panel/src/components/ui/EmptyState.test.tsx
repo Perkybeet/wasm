@@ -25,6 +25,11 @@ describe("EmptyState", () => {
     expect(screen.getByRole("button", { name: "Copy command" })).toBeInTheDocument();
   });
 
+  it("takes the heading level the page outline needs", () => {
+    render(<EmptyState title="No applications yet" level={2} />);
+    expect(screen.getByRole("heading", { level: 2, name: "No applications yet" })).toBeInTheDocument();
+  });
+
   it("has no accessibility violations", async () => {
     const { container } = render(
       <EmptyState icon={<Boxes />} title="No applications yet" description="Deploy one." command={COMMAND} />,

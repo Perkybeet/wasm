@@ -16,6 +16,11 @@ export interface DrawerProps {
   defaultOpen?: boolean;
   onOpenChange?: (open: boolean) => void;
   size?: "md" | "lg";
+  /**
+   * Where focus goes on close; defaults to the trigger. Return false from a function to leave
+   * it alone, for a drawer whose action moved the operator to another page.
+   */
+  finalFocus?: BaseDrawer.Popup.Props["finalFocus"];
 }
 
 /**
@@ -32,6 +37,7 @@ export function Drawer({
   defaultOpen,
   onOpenChange,
   size = "md",
+  finalFocus,
 }: DrawerProps) {
   return (
     <BaseDrawer.Root
@@ -45,6 +51,7 @@ export function Drawer({
         <BaseDrawer.Backdrop className={BACKDROP} />
         <BaseDrawer.Viewport className="fixed inset-0 z-50 flex justify-end">
           <BaseDrawer.Popup
+            {...(finalFocus !== undefined ? { finalFocus } : {})}
             className={cx(
               "flex h-dvh w-full flex-col border-l border-border bg-surface-raised text-fg shadow-overlay outline-none",
               "[transform:translateX(var(--drawer-swipe-movement-x))] transition-transform duration-(--duration-base) ease-out",

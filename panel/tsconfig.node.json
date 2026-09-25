@@ -8,6 +8,7 @@
     "moduleDetection": "force",
     "types": ["node"],
     "noEmit": true,
+    "allowImportingTsExtensions": true,
     "skipLibCheck": true,
     "isolatedModules": true,
     "verbatimModuleSyntax": true,
@@ -28,6 +29,7 @@
     "vitest.config.ts",
     "playwright.config.ts",
     "scripts/**/*.mjs",
+    "mock/**/*.ts",
     "e2e/**/*.ts"
   ]
 }

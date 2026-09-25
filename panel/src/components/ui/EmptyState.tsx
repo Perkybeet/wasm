@@ -12,11 +12,14 @@ export interface EmptyStateProps {
   action?: ReactNode;
   /** The CLI command that does the same thing, for operators who live in a terminal. */
   command?: string;
+  /** Heading level of the title, to keep the page outline correct: 2 directly under a page h1. */
+  level?: 2 | 3 | 4;
   className?: string;
 }
 
 /** What a list or page shows before it has anything in it. */
-export function EmptyState({ icon, title, description, action, command, className }: EmptyStateProps) {
+export function EmptyState({ icon, title, description, action, command, level = 3, className }: EmptyStateProps) {
+  const Heading = `h${level}` as const;
   return (
     <div
       className={cx(
@@ -29,7 +32,7 @@ export function EmptyState({ icon, title, description, action, command, classNam
           {icon}
         </div>
       ) : null}
-      <h3 className="title text-16 text-fg">{title}</h3>
+      <Heading className="title text-16 text-fg">{title}</Heading>
       {description !== undefined ? (
         <p className="mt-1.5 max-w-[46ch] text-14 text-pretty text-fg-muted">{description}</p>
       ) : null}

@@ -59,7 +59,7 @@ export default defineConfig(
     extends: [tseslint.configs.disableTypeChecked],
   },
   {
-    files: ["*.{js,ts}", "scripts/**/*.mjs", "e2e/**/*.ts"],
+    files: ["*.{js,ts}", "scripts/**/*.mjs", "e2e/**/*.ts", "mock/**/*.ts"],
     languageOptions: { globals: { ...globals.node, ...globals.browser } },
   },
 );

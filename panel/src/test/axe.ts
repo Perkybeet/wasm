@@ -8,12 +8,13 @@ import { expect } from "vitest";
  * because jsdom does not compute styles; contrast is verified on the tokens themselves
  * (styles/tokens.test.ts) and in the browser by the E2E suite.
  */
-export async function expectNoAxeViolations(container: Element): Promise<void> {
+export async function expectNoAxeViolations(container: Element, { page = false }: { page?: boolean } = {}): Promise<void> {
   const results = await axe.run(container, {
     rules: {
       "color-contrast": { enabled: false },
-      // A component rendered in isolation is not a page; landmark rules apply in the E2E.
-      region: { enabled: false },
+      // A component rendered in isolation is not a page; landmark rules apply to whole pages
+      // (`page: true`: the shell, the sign-in screen) and in the E2E.
+      region: { enabled: page },
     },
   });
   const report = results.violations.map(

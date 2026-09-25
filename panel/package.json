@@ -8,6 +8,7 @@
   },
   "scripts": {
     "dev": "vite",
+    "dev:mock": "VITE_MOCK=1 vite --port 5199 --strictPort",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "typecheck": "tsc -b --noEmit",
@@ -17,7 +18,8 @@
     "e2e": "playwright test",
     "gen:api": "openapi-typescript openapi.json -o src/api/schema.gen.ts",
     "check:api": "node scripts/check-api.mjs",
-    "screens": "node scripts/screens.mjs"
+    "screens": "node scripts/screens.mjs",
+    "screens:shell": "node scripts/shell-screens.mjs"
   },
   "dependencies": {
     "@base-ui/react": "1.8.0",
