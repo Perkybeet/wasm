@@ -305,6 +305,42 @@ class DeploymentRecord:
 
 
 @dataclass
+class JobRecord:
+    """
+    One background job the panel queued, kept so a restart does not erase it.
+
+    The in-memory shape :class:`wasm.web.jobs.Job` carries - live progress
+    messages, per-line logs kept for the SSE feed - lives only in the panel
+    process. This is what survives it: the id, what it was, how it ended, and
+    where its captured log lives on disk.
+    """
+
+    id: str = ""
+    type: str = ""
+    name: str = ""
+    description: str = ""
+    status: str = "pending"
+    progress: int = 0
+    total_steps: int = 100
+    domain: str | None = None
+    error: str | None = None
+    result_json: str | None = None
+    created_at: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    log_path: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return asdict(self)
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "JobRecord":
+        """Create from database row."""
+        return cls(**dict(row))
+
+
+@dataclass
 class MonorepoWorkspace:
     """
     Configuration for a workspace app within a monorepo.
@@ -331,7 +367,7 @@ class MonorepoWorkspace:
 
 
 # Schema version for migrations
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _DEPLOYMENT_STATUSES_SQL = ", ".join(f"'{status.value}'" for status in DeploymentStatus)
 _DEPLOYMENT_TRIGGERS_SQL = ", ".join(f"'{trigger.value}'" for trigger in DeploymentTrigger)
@@ -366,6 +402,44 @@ CREATE TABLE IF NOT EXISTS deployments (
 
 CREATE INDEX IF NOT EXISTS idx_deployments_domain_started
     ON deployments(domain, started_at DESC);
+"""
+
+# Statuses a job row may be in. Mirrors the values of
+# ``wasm.web.jobs.JobStatus`` without importing it: the store is core and web
+# is a client of core, never the reverse, so the accepted set is restated here
+# as plain SQL, the same way the deployment statuses above are. The CHECK
+# constraint is the enforcement, not a second copy of the enum in Python -
+# guards belong at the chokepoint, and the database is the chokepoint for what
+# a row is allowed to say about itself.
+_JOB_STATUSES_SQL = "'pending', 'running', 'completed', 'failed', 'cancelled'"
+
+# Schema v4: background jobs (deploys, updates, backups... queued from the
+# panel), persisted so a panel restart does not erase what was in flight. The
+# id is caller-assigned (the job manager's short uuid) rather than an
+# autoincrement, because the manager hands out the id before the row exists
+# and every subscriber, log line and SSE event needs to agree on it.
+JOBS_SCHEMA_SQL = f"""
+-- Background jobs queued from the panel
+CREATE TABLE IF NOT EXISTS jobs (
+    id TEXT PRIMARY KEY,
+    type TEXT NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL CHECK (status IN ({_JOB_STATUSES_SQL})),
+    progress INTEGER NOT NULL DEFAULT 0,
+    total_steps INTEGER NOT NULL DEFAULT 100,
+    domain TEXT,
+    error TEXT,
+    result_json TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    started_at TEXT,
+    finished_at TEXT,
+    log_path TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+CREATE INDEX IF NOT EXISTS idx_jobs_domain ON jobs(domain);
+CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC);
 """
 
 SCHEMA_SQL = (
@@ -479,6 +553,7 @@ CREATE INDEX IF NOT EXISTS idx_databases_engine ON databases(engine);
 CREATE INDEX IF NOT EXISTS idx_databases_app_id ON databases(app_id);
 """
     + DEPLOYMENTS_SCHEMA_SQL
+    + JOBS_SCHEMA_SQL
 )
 
 
@@ -801,6 +876,7 @@ class WASMStore:
         migrations = {
             2: self._migrate_v1_to_v2,
             3: self._migrate_v2_to_v3,
+            4: self._migrate_v3_to_v4,
         }
 
         for version in range(from_version + 1, SCHEMA_VERSION + 1):
@@ -828,6 +904,15 @@ class WASMStore:
             cursor: Cursor the migration runs on.
         """
         cursor.execute("ALTER TABLE apps ADD COLUMN webhook_secret TEXT")
+
+    def _migrate_v3_to_v4(self, cursor: sqlite3.Cursor) -> None:
+        """
+        Add the jobs table (schema v4).
+
+        Args:
+            cursor: Cursor the migration runs on.
+        """
+        cursor.executescript(JOBS_SCHEMA_SQL)
 
     # =========================================================================
     # Application CRUD
@@ -1672,6 +1757,167 @@ class WASMStore:
                        ORDER BY started_at DESC, id DESC LIMIT ?
                    )""",
                 (domain, domain, keep),
+            )
+            return cursor.rowcount
+
+    # =========================================================================
+    # Job persistence
+    # =========================================================================
+
+    def create_job(self, job: JobRecord) -> JobRecord:
+        """
+        Persist a newly queued job.
+
+        Args:
+            job: The job to record. Its id is caller-assigned, unlike the
+                autoincrement ids the rest of this store hands out.
+
+        Returns:
+            The job, with ``created_at`` filled in when the caller left it
+            blank.
+        """
+        if not job.created_at:
+            job.created_at = datetime.now().isoformat()
+
+        with self._transaction() as cursor:
+            data = job.to_dict()
+            columns = ", ".join(data.keys())
+            placeholders = ", ".join(["?" for _ in data])
+            cursor.execute(
+                f"INSERT INTO jobs ({columns}) VALUES ({placeholders})", list(data.values())
+            )
+
+        return job
+
+    def update_job(
+        self,
+        job_id: str,
+        *,
+        status: str | None = None,
+        progress: int | None = None,
+        domain: str | None = None,
+        error: str | None = None,
+        result_json: str | None = None,
+        started_at: str | None = None,
+        finished_at: str | None = None,
+        log_path: str | None = None,
+    ) -> bool:
+        """
+        Update the fields of a job that changed.
+
+        Only the fields explicitly passed are written: None means "no change"
+        here, not "clear the column" - a caller reporting progress should not
+        have to restate the domain and the log path to avoid erasing them.
+
+        Args:
+            job_id: Identifier of the job to update.
+            status: New status.
+            progress: New progress value.
+            domain: Resource the job acts on.
+            error: Failure message, verbatim.
+            result_json: JSON-encoded result of a finished job.
+            started_at: When the worker picked the job up.
+            finished_at: When the job finished, whatever the outcome.
+            log_path: Where the job's captured log lives.
+
+        Returns:
+            True if the row exists and was updated.
+        """
+        updates = []
+        params: list[Any] = []
+        for column, value in (
+            ("status", status),
+            ("progress", progress),
+            ("domain", domain),
+            ("error", error),
+            ("result_json", result_json),
+            ("started_at", started_at),
+            ("finished_at", finished_at),
+            ("log_path", log_path),
+        ):
+            if value is not None:
+                updates.append(f"{column} = ?")
+                params.append(value)
+
+        if not updates:
+            return False
+
+        params.append(job_id)
+        with self._transaction() as cursor:
+            cursor.execute(f"UPDATE jobs SET {', '.join(updates)} WHERE id = ?", params)
+            return cursor.rowcount > 0
+
+    def get_job(self, job_id: str) -> JobRecord | None:
+        """
+        Get a job by id.
+
+        Args:
+            job_id: Job identifier.
+
+        Returns:
+            The record, or None if not found.
+        """
+        with self._transaction() as cursor:
+            cursor.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
+            row = cursor.fetchone()
+            return JobRecord.from_row(row) if row else None
+
+    def list_jobs(
+        self,
+        limit: int = 50,
+        status: str | None = None,
+        domain: str | None = None,
+    ) -> list[JobRecord]:
+        """
+        List jobs, most recent first.
+
+        Args:
+            limit: Maximum number of rows returned.
+            status: Only jobs in this status, when given.
+            domain: Only jobs acting on this domain, when given.
+
+        Returns:
+            Job records ordered by creation time, newest first.
+        """
+        query = "SELECT * FROM jobs WHERE 1=1"
+        params: list[Any] = []
+
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        if domain:
+            query += " AND domain = ?"
+            params.append(domain)
+
+        # id breaks the tie between rows created in the same instant.
+        query += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        params.append(limit)
+
+        with self._transaction() as cursor:
+            cursor.execute(query, params)
+            return [JobRecord.from_row(row) for row in cursor.fetchall()]
+
+    def fail_interrupted_jobs(self, reason: str) -> int:
+        """
+        Mark every job still pending or running as failed.
+
+        Called once, when :class:`~wasm.web.jobs.JobManager` starts up: a job
+        in either state at that moment was not resumed, it was orphaned by the
+        previous process exiting, and leaving it "running" forever is how a
+        history screen comes to lie about the state of the machine.
+
+        Args:
+            reason: Error message recorded on every affected row.
+
+        Returns:
+            How many rows were changed.
+        """
+        now = datetime.now().isoformat()
+        with self._transaction() as cursor:
+            cursor.execute(
+                """UPDATE jobs SET status = 'failed', error = ?, finished_at = ?
+                   WHERE status IN ('pending', 'running')""",
+                (reason, now),
             )
             return cursor.rowcount
 

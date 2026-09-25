@@ -2,10 +2,17 @@
 Jobs API endpoints.
 
 The queue itself lives in :mod:`wasm.web.jobs`; this module only translates
-HTTP into calls on it. The job functions it queues are the same ones the
-resource endpoints queue, so ``POST /api/jobs/deploy`` and ``POST /api/apps``
-run identical code - they used to be two different implementations of a
-deployment, one of which shelled out to the ``wasm`` binary.
+HTTP into calls on it. Deploying a new application is not among them:
+``POST /api/apps`` is the one route that queues a deployment, so there is one
+implementation of "deploy" rather than two that could disagree - an earlier
+``POST /api/jobs/deploy`` shelled out to the ``wasm`` binary and has been
+removed in favour of it.
+
+History is read from the store, not from the queue's own memory: a panel
+restart empties the queue but the store remembers every job it ever
+persisted, which is the whole point of persisting them. The in-memory queue
+stays the source of truth only for what this process is doing right now
+(``/active``).
 
 Literal routes are declared before ``/{job_id}``: registered the other way
 round, ``/active`` and ``/cleanup`` would be matched as job identifiers.
@@ -13,13 +20,16 @@ round, ``/active`` and ``/cleanup`` would be matched as job identifiers.
 
 from __future__ import annotations
 
+import json
 import re
+from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from wasm.core.exceptions import ValidationError
+from wasm.core.store import JobRecord, get_store
 from wasm.validators.names import validate_filename
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import WASMErrorRoute, strict_domain
@@ -30,7 +40,6 @@ from wasm.web.jobs import (
     backup_app_job,
     cert_create_job,
     delete_app_job,
-    deploy_app_job,
     get_job_manager,
     rollback_app_job,
     update_app_job,
@@ -41,18 +50,8 @@ router = APIRouter(prefix="/jobs", tags=["jobs"], route_class=WASMErrorRoute)
 #: Job identifiers are the first eight characters of a uuid4.
 JOB_ID_PATTERN = re.compile(r"^[0-9a-f]{1,36}$")
 
-
-class DeployRequest(BaseModel):
-    """Request to deploy a new application."""
-
-    domain: str = Field(..., description="Domain name for the application")
-    source: str = Field(..., description="Git repository URL or local path")
-    app_type: str = Field(default="auto", description="Application type")
-    port: int | None = Field(default=None, description="Port, assigned when omitted")
-    branch: str | None = Field(default=None, description="Git branch to deploy")
-    env_vars: dict[str, str] | None = Field(default=None, description="Environment variables")
-    webserver: str = Field(default="nginx", description="Web server to configure")
-    ssl: bool = Field(default=True, description="Obtain a certificate")
+#: Default number of trailing lines a job log request returns.
+DEFAULT_LOG_TAIL = 500
 
 
 class UpdateRequest(BaseModel):
@@ -141,6 +140,13 @@ class CleanupResponse(BaseModel):
     removed: int
 
 
+class JobLogResponse(BaseModel):
+    """The tail of a job's captured log."""
+
+    content: str
+    truncated: bool
+
+
 def _to_response(job: Job) -> JobResponse:
     """
     Convert a job into its API representation.
@@ -152,6 +158,50 @@ def _to_response(job: Job) -> JobResponse:
         The API model.
     """
     return JobResponse(**job.to_dict())
+
+
+def _from_record(record: JobRecord) -> JobResponse:
+    """
+    Convert a persisted job into its API representation.
+
+    The store keeps less than the live queue does - individual log lines live
+    in the job's own log file, read separately through
+    :func:`get_job_log`, and ``current_step`` was never durable - so those
+    fields come back empty rather than reconstructed. Everything a client
+    already depends on is still there, at the same name.
+
+    Args:
+        record: The stored job.
+
+    Returns:
+        The API model.
+    """
+    result: dict[str, Any] | None = None
+    if record.result_json:
+        try:
+            parsed = json.loads(record.result_json)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            result = parsed
+
+    return JobResponse(
+        id=record.id,
+        type=record.type,
+        name=record.name,
+        description=record.description,
+        status=record.status,
+        progress=record.progress,
+        total_steps=record.total_steps,
+        current_step="",
+        created_at=record.created_at or "",
+        started_at=record.started_at,
+        completed_at=record.finished_at,
+        result=result,
+        error=record.error,
+        logs=[],
+        metadata={"domain": record.domain} if record.domain else {},
+    )
 
 
 def _validated_job_id(job_id: str) -> str:
@@ -194,13 +244,15 @@ def list_jobs(
     session: Annotated[dict, Depends(get_current_session)],
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     status: Annotated[str | None, Query(description="Filter by job status")] = None,
+    domain: Annotated[str | None, Query(description="Filter by domain")] = None,
 ) -> JobListResponse:
     """
-    List recent jobs.
+    List recent jobs, from the store, so a panel restart does not erase history.
 
     Args:
         limit: Maximum number of jobs to return.
         status: Status to filter by.
+        domain: Domain to filter by.
         session: The authenticated session.
 
     Returns:
@@ -209,23 +261,21 @@ def list_jobs(
     Raises:
         ValidationError: When the status filter is not a known status.
     """
-    manager = get_job_manager()
-    jobs = manager.get_all_jobs(limit=limit)
-
     if status:
         try:
-            wanted = JobStatus(status)
+            JobStatus(status)
         except ValueError as exc:
             raise ValidationError(
                 f"Unknown job status: {status!r}",
                 details=f"Use one of: {', '.join(s.value for s in JobStatus)}.",
             ) from exc
-        jobs = [job for job in jobs if job.status == wanted]
+
+    records = get_store().list_jobs(limit=limit, status=status, domain=domain)
 
     return JobListResponse(
-        jobs=[_to_response(job) for job in jobs],
-        total=len(jobs),
-        active=len(manager.get_active_jobs()),
+        jobs=[_from_record(record) for record in records],
+        total=len(records),
+        active=len(get_job_manager().get_active_jobs()),
     )
 
 
@@ -244,41 +294,6 @@ def list_active_jobs(session: Annotated[dict, Depends(get_current_session)]) -> 
     return JobListResponse(
         jobs=[_to_response(job) for job in jobs], total=len(jobs), active=len(jobs)
     )
-
-
-@router.post("/deploy", response_model=JobCreatedResponse, status_code=202)
-def create_deploy_job(
-    request: DeployRequest, session: Annotated[dict, Depends(get_current_session)]
-) -> JobCreatedResponse:
-    """
-    Queue a deployment.
-
-    Args:
-        request: The deployment request.
-        session: The authenticated session.
-
-    Returns:
-        The queued job.
-    """
-    domain = strict_domain(request.domain)
-    job = get_job_manager().create_job(
-        job_type=JobType.DEPLOY,
-        name=f"Deploy {domain}",
-        description=f"Deploying a {request.app_type} application to {domain}",
-        func=deploy_app_job,
-        kwargs={
-            "domain": domain,
-            "source": request.source,
-            "app_type": request.app_type,
-            "port": request.port,
-            "branch": request.branch,
-            "env_vars": request.env_vars,
-            "webserver": request.webserver,
-            "ssl": request.ssl,
-        },
-        metadata={"domain": domain, "source": request.source, "app_type": request.app_type},
-    )
-    return _queued("Deployment job created", job)
 
 
 @router.post("/update", response_model=JobCreatedResponse, status_code=202)
@@ -446,7 +461,7 @@ def cleanup_jobs(
 @router.get("/{job_id}", response_model=JobResponse)
 def get_job(job_id: str, session: Annotated[dict, Depends(get_current_session)]) -> JobResponse:
     """
-    Describe one job.
+    Describe one job, from the store, so it is still there after a restart.
 
     Args:
         job_id: Job identifier.
@@ -456,12 +471,54 @@ def get_job(job_id: str, session: Annotated[dict, Depends(get_current_session)])
         The job.
 
     Raises:
-        HTTPException: 404 when the job is unknown or has been cleaned up.
+        HTTPException: 404 when the job is unknown.
     """
-    job = get_job_manager().get_job(_validated_job_id(job_id))
-    if job is None:
+    record = get_store().get_job(_validated_job_id(job_id))
+    if record is None:
         raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
-    return _to_response(job)
+    return _from_record(record)
+
+
+@router.get("/{job_id}/log", response_model=JobLogResponse)
+def get_job_log(
+    job_id: str,
+    session: Annotated[dict, Depends(get_current_session)],
+    tail: Annotated[int, Query(ge=1, le=20000, description="Lines to return, from the end")] = (
+        DEFAULT_LOG_TAIL
+    ),
+) -> JobLogResponse:
+    """
+    Read a job's captured log.
+
+    The log is a plain file on disk, one line per progress update or message
+    the job reported, written by the job manager as the job ran; this reads
+    it back rather than replaying it from memory, which is what makes it
+    available after a restart.
+
+    Args:
+        job_id: Job identifier.
+        tail: Maximum number of trailing lines to return.
+        session: The authenticated session.
+
+    Returns:
+        The log tail and whether earlier lines were left out.
+
+    Raises:
+        HTTPException: 404 when the job is unknown.
+    """
+    record = get_store().get_job(_validated_job_id(job_id))
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+
+    if not record.log_path:
+        return JobLogResponse(content="", truncated=False)
+
+    try:
+        lines = Path(record.log_path).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return JobLogResponse(content="", truncated=False)
+
+    return JobLogResponse(content="\n".join(lines[-tail:]), truncated=len(lines) > tail)
 
 
 @router.post("/{job_id}/cancel", response_model=JobActionResponse)

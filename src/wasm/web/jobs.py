@@ -19,9 +19,11 @@ panel and the CLI now perform the same operations through the same code.
 
 from __future__ import annotations
 
+import json
 import logging
 import queue
 import shutil
+import sqlite3
 import threading
 import uuid
 from collections.abc import Callable
@@ -29,7 +31,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from wasm.core.exceptions import (
     BackupError,
@@ -38,7 +40,8 @@ from wasm.core.exceptions import (
     RollbackError,
     WASMError,
 )
-from wasm.core.store import get_store
+from wasm.core.fs import SECRET_DIR_MODE, SECRET_MODE, get_fs
+from wasm.core.store import JobRecord, get_store
 from wasm.core.utils import domain_to_app_name
 
 logger = logging.getLogger(__name__)
@@ -51,6 +54,24 @@ MAX_CONCURRENT_JOBS = 3
 #: not turn every poll of the jobs API into a megabyte of JSON.
 MAX_SERIALISED_LOGS = 100
 
+#: Directory job logs live in, a sibling of the ``deploy-logs`` directory
+#: :class:`wasm.deployers.recorder.DeploymentRecorder` uses, both next to the
+#: store's database file.
+JOB_LOG_DIR_NAME = "job-logs"
+
+#: What persisting a job transition can fail with: the store's own errors, the
+#: SQLite errors underneath it, and filesystem trouble around the log file.
+#: Persisting must never fail the job it records - the job is real work on the
+#: machine, and its history is only an account of it, the same boundary
+#: :class:`wasm.deployers.recorder.DeploymentRecorder` draws for deployments.
+_RECORDING_ERRORS: tuple[type[Exception], ...] = (WASMError, OSError, sqlite3.Error)
+
+#: The reason recorded on every job a panel restart orphaned. A job in
+#: ``pending`` or ``running`` when the process starts was not resumed - the
+#: thread that was running it is gone - and this is the whole review focus of
+#: Task 1.7: it must reappear as failed, never stay "running" forever.
+INTERRUPTED_REASON = "Interrupted by a panel restart"
+
 
 class JobStatus(str, Enum):
     """Job execution status."""
@@ -60,6 +81,10 @@ class JobStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+#: Statuses that close a job's log file and stop expecting further transitions.
+FINISHED_STATUSES = frozenset({JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED})
 
 
 class JobType(str, Enum):
@@ -299,9 +324,47 @@ class JobManager:
         self._global_subscribers: list[Callable[[Job], None]] = []
         self._worker_thread: threading.Thread | None = None
         self._shutdown = False
+        self._log_handles: dict[str, TextIO] = {}
+        self._log_paths: dict[str, str] = {}
         self._initialized = True
 
+        self._fail_interrupted_jobs()
         self._start_worker()
+
+    @classmethod
+    def reset_instance(cls) -> None:
+        """
+        Drop the singleton, so the next call to ``JobManager()`` starts fresh.
+
+        This is what lets a test - and, conceptually, a real process restart -
+        simulate "the panel came back up": the next construction runs
+        :meth:`_fail_interrupted_jobs` again, against whatever the store says
+        was pending or running.
+
+        The worker thread of the discarded instance is asked to stop; nothing
+        joins it; it is daemonic so the process does not wait on it either.
+        """
+        if cls._instance is not None:
+            cls._instance._shutdown = True
+        cls._instance = None
+
+    def _fail_interrupted_jobs(self) -> None:
+        """
+        Mark jobs the previous process left pending or running as failed.
+
+        Called once, at startup: whatever thread was running those jobs is
+        gone, and a job stuck at "running" forever is how a history screen
+        comes to lie about the state of the machine. Recording is an error
+        boundary of its own - a store that cannot be reached at startup must
+        not stop the panel from starting.
+        """
+        try:
+            changed = get_store().fail_interrupted_jobs(INTERRUPTED_REASON)
+        except _RECORDING_ERRORS as exc:
+            logger.warning("Could not check for interrupted jobs at startup: %s", exc)
+            return
+        if changed:
+            logger.warning("%d job(s) marked failed after a panel restart", changed)
 
     def _start_worker(self) -> None:
         """Start the background worker thread if it is not already running."""
@@ -413,6 +476,7 @@ class JobManager:
         )
 
         self._jobs[job_id] = job
+        self._open_log(job_id)
         self._job_queue.put((job_id, func, args, kwargs or {}))
         self._notify_subscribers(job)
 
@@ -534,11 +598,18 @@ class JobManager:
 
     def _notify_subscribers(self, job: Job) -> None:
         """
-        Push a job snapshot to everyone watching it.
+        Persist the job's current state and push a snapshot to everyone watching it.
+
+        Persistence happens here, at the one chokepoint every transition and
+        every log line already passes through, rather than being sprinkled
+        across every place that changes a job: a step this method does not see
+        is a step neither the store nor a panel restart will ever know about.
 
         Args:
             job: The job that changed.
         """
+        self._persist(job)
+
         for callback in [*self._subscribers.get(job.id, []), *self._global_subscribers]:
             # A subscriber is a WebSocket push that can fail at any moment; one
             # dead client must not stop the others from being notified.
@@ -546,6 +617,158 @@ class JobManager:
                 callback(job)
             except Exception:
                 logger.debug("Job subscriber failed for job %s", job.id, exc_info=True)
+
+    def _persist(self, job: Job) -> None:
+        """
+        Write a job's current state to the store and its newest line to disk.
+
+        Tries an update first and falls back to an insert when the row does
+        not exist yet, so the very first notification - queueing the job,
+        before it has run a single step - is what creates the row. A store
+        that cannot be reached must not fail the job it is only recording.
+
+        Args:
+            job: The job that changed.
+        """
+        if job.logs:
+            latest = job.logs[-1]
+            self._write_log_line(job.id, latest.message, latest.level)
+
+        domain = job.metadata.get("domain")
+        started_at = job.started_at.isoformat() if job.started_at else None
+        finished_at = job.completed_at.isoformat() if job.completed_at else None
+        result_json = self._safe_json(job.result) if job.result is not None else None
+        log_path = self._log_paths.get(job.id)
+
+        try:
+            store = get_store()
+            updated = store.update_job(
+                job.id,
+                status=job.status.value,
+                progress=job.progress,
+                domain=domain,
+                error=job.error,
+                result_json=result_json,
+                started_at=started_at,
+                finished_at=finished_at,
+                log_path=log_path,
+            )
+            if not updated:
+                store.create_job(
+                    JobRecord(
+                        id=job.id,
+                        type=job.type.value,
+                        name=job.name,
+                        description=job.description,
+                        status=job.status.value,
+                        progress=job.progress,
+                        total_steps=job.total_steps,
+                        domain=domain,
+                        error=job.error,
+                        result_json=result_json,
+                        started_at=started_at,
+                        finished_at=finished_at,
+                        log_path=log_path,
+                    )
+                )
+        except _RECORDING_ERRORS as exc:
+            logger.warning("Could not persist job %s: %s", job.id, exc)
+
+        if job.status in FINISHED_STATUSES:
+            self._close_log(job.id)
+            self._log_paths.pop(job.id, None)
+
+    @staticmethod
+    def _safe_json(value: Any) -> str:
+        """
+        Serialise a job's result for storage, without ever raising.
+
+        Args:
+            value: The job function's return value.
+
+        Returns:
+            JSON text. A value that ``json.dumps`` refuses is stringified
+            first rather than losing the whole row over one field the caller
+            could not have predicted.
+        """
+        try:
+            return json.dumps(value)
+        except TypeError:
+            return json.dumps(str(value))
+
+    def _log_root(self) -> Path:
+        """
+        Returns:
+            Where job logs live: a ``job-logs`` directory next to the store's
+            database file, the sibling of
+            :class:`wasm.deployers.recorder.DeploymentRecorder`'s
+            ``deploy-logs``. Resolved fresh on every call rather than cached,
+            because the store singleton it reads from can be swapped out from
+            under a long-lived manager - in tests, and in principle across a
+            reconfiguration.
+        """
+        return get_store().db_path.parent / JOB_LOG_DIR_NAME
+
+    def _open_log(self, job_id: str) -> None:
+        """
+        Create the job's log file through the filesystem seam and open it.
+
+        Mirrors :class:`wasm.deployers.recorder.DeploymentRecorder`: the file
+        is created empty via the seam so its mode is applied at creation and a
+        rehearsal leaves nothing behind, then appended to with a plain handle.
+
+        Args:
+            job_id: Identifier of the job the log belongs to.
+        """
+        fs = get_fs()
+        try:
+            directory = self._log_root()
+            fs.make_dir(directory, mode=SECRET_DIR_MODE, parents=True)
+            path = directory / f"{job_id}.log"
+            fs.write_text(path, "", mode=SECRET_MODE)
+            if not path.exists():
+                # The seam declined to create it (a rehearsal); nothing to log to.
+                return
+            self._log_handles[job_id] = path.open("a", encoding="utf-8")
+            self._log_paths[job_id] = str(path)
+        except _RECORDING_ERRORS as exc:
+            logger.warning("Could not open the log file for job %s: %s", job_id, exc)
+
+    def _write_log_line(self, job_id: str, message: str, level: str) -> None:
+        """
+        Append one timestamped line to the job's captured log.
+
+        Args:
+            job_id: Identifier of the job the line belongs to.
+            message: The log message.
+            level: Severity the line was reported at.
+        """
+        handle = self._log_handles.get(job_id)
+        if handle is None:
+            return
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            for piece in message.replace("\r", "").split("\n"):
+                handle.write(f"[{stamp}] [{level.upper()}] {piece}\n")
+            handle.flush()
+        except OSError as exc:
+            logger.warning("Could not write to the log file for job %s: %s", job_id, exc)
+            self._close_log(job_id)
+
+    def _close_log(self, job_id: str) -> None:
+        """
+        Close a job's log handle, tolerating one that is already gone.
+
+        Args:
+            job_id: Identifier of the job whose log is being closed.
+        """
+        handle = self._log_handles.pop(job_id, None)
+        if handle is None:
+            return
+        try:
+            handle.close()
+        except OSError as exc:
+            logger.debug("Could not close the log file for job %s: %s", job_id, exc)
 
     def cleanup_old_jobs(self, max_age_hours: int = 24) -> int:
         """
@@ -558,35 +781,39 @@ class JobManager:
             How many jobs were removed.
         """
         cutoff = datetime.now().timestamp() - (max_age_hours * 3600)
-        finished = (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED)
 
         to_remove = [
             job_id
             for job_id, job in self._jobs.items()
-            if job.status in finished and job.completed_at and job.completed_at.timestamp() < cutoff
+            if job.status in FINISHED_STATUSES
+            and job.completed_at
+            and job.completed_at.timestamp() < cutoff
         ]
 
         for job_id in to_remove:
             del self._jobs[job_id]
             self._subscribers.pop(job_id, None)
+            self._close_log(job_id)
 
         return len(to_remove)
-
-
-_job_manager: JobManager | None = None
 
 
 def get_job_manager() -> JobManager:
     """
     Get the process-wide job manager.
 
+    ``JobManager()`` is already the singleton constructor - ``__new__`` and
+    ``__init__`` guard the one-time setup themselves - so this used to cache
+    it a second time in a module global. That second cache was a second
+    answer to "which manager is current": it kept handing out the previous
+    instance after :meth:`JobManager.reset_instance` had already moved on,
+    which is exactly the moment a test - or a real restart - needs the new
+    one.
+
     Returns:
         The job manager, created on first use.
     """
-    global _job_manager
-    if _job_manager is None:
-        _job_manager = JobManager()
-    return _job_manager
+    return JobManager()
 
 
 def _require_context(job_context: JobContext | None) -> JobContext:

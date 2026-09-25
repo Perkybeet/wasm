@@ -75,6 +75,19 @@ class FakeStatus:
         self.value = value
 
 
+class FakeLogEntry:
+    """Stands in for a JobLogEntry, with only what the feed reads off it."""
+
+    def __init__(self, message: str, level: str = "info") -> None:
+        """
+        Args:
+            message: The log message.
+            level: Severity the line was reported at.
+        """
+        self.message = message
+        self.level = level
+
+
 class FakeJob:
     """A job transition, with only what the feed reads off it."""
 
@@ -85,6 +98,9 @@ class FakeJob:
         name: str = "Deploy example.com",
         domain: str | None = "example.com",
         error: str | None = None,
+        job_type: str = "deploy",
+        progress: int = 0,
+        logs: list[FakeLogEntry] | None = None,
     ) -> None:
         """
         Args:
@@ -93,11 +109,17 @@ class FakeJob:
             name: Human-readable job name.
             domain: Resource the job acts on, if any.
             error: The tool's own failure message.
+            job_type: Job type value.
+            progress: Progress value.
+            logs: Log entries recorded so far, newest last.
         """
         self.id = job_id
         self.status = FakeStatus(status)
+        self.type = FakeStatus(job_type)
         self.name = name
         self.error = error
+        self.progress = progress
+        self.logs = logs or []
         self.metadata: dict[str, Any] = {"domain": domain} if domain else {}
 
 
@@ -253,12 +275,13 @@ def test_a_job_transition_reaches_an_open_stream() -> None:
         publish = manager._global_subscribers[-1]
         publish(FakeJob(job_id="job-9", status="completed", domain="example.com"))
 
-        frames = [await stream.__anext__() for _ in range(3)]
+        frames = [await stream.__anext__() for _ in range(4)]
         await stream.aclose()
         return frames
 
     frames = asyncio.run(exercise())
 
+    assert any(frame.startswith("event: job") for frame in frames)
     assert 'event: state\ndata: {"id":"job-9","state":"active"}\n\n' in frames
     assert 'event: state\ndata: {"id":"example.com","state":"active"}\n\n' in frames
     assert any(frame.startswith("event: notice") for frame in frames)
@@ -313,11 +336,13 @@ def test_a_running_job_pulses_both_the_job_row_and_the_resource_row() -> None:
     assert ("state", {"id": "example.com", "state": "busy"}) in events
 
 
-def test_a_job_with_no_resource_reports_only_itself() -> None:
+def test_a_job_with_no_resource_reports_only_itself_and_the_job_event() -> None:
     """A row id of None would pulse nothing and cost a frame."""
     events = job_events(FakeJob(job_id="job-7", status="running", domain=None))
 
-    assert events == [("state", {"id": "job-7", "state": "busy"})]
+    names = [name for name, _ in events]
+    assert names == ["job", "state"]
+    assert ("state", {"id": "job-7", "state": "busy"}) in events
 
 
 def test_a_finished_job_is_announced() -> None:
@@ -344,6 +369,62 @@ def test_a_transition_between_running_states_is_not_announced() -> None:
     names = [name for name, _ in job_events(FakeJob(status="running"))]
 
     assert "notice" not in names
+
+
+# ---------------------------------------------------------------------------
+# The `job` event: progress and log lines, for the console's activity feed
+# ---------------------------------------------------------------------------
+
+
+def test_the_job_event_carries_the_fields_the_console_needs() -> None:
+    """One event, one shape, whether it is a progress step or a log line."""
+    job = FakeJob(
+        job_id="job-7",
+        status="running",
+        domain="example.com",
+        job_type="deploy",
+        progress=40,
+        logs=[FakeLogEntry("Installing dependencies", "info")],
+    )
+
+    name, payload = job_events(job)[0]
+
+    assert name == "job"
+    assert payload == {
+        "id": "job-7",
+        "type": "deploy",
+        "status": "running",
+        "progress": 40,
+        "domain": "example.com",
+        "message": "Installing dependencies",
+        "level": "info",
+        "finished": False,
+    }
+
+
+def test_the_job_event_reports_finished_for_a_terminal_status() -> None:
+    """The console stops polling and closes the log stream on this flag."""
+    _, payload = job_events(FakeJob(status="failed"))[0]
+
+    assert payload["finished"] is True
+
+
+def test_the_job_event_without_a_log_line_yet_still_has_a_message_field() -> None:
+    """The event queueing a job fires before any log line exists."""
+    _, payload = job_events(FakeJob(status="pending", logs=[]))[0]
+
+    assert payload["message"] == ""
+    assert payload["level"] == "info"
+
+
+def test_the_job_event_reflects_only_the_newest_log_line() -> None:
+    """A chatty step must not repeat every earlier line on every frame."""
+    job = FakeJob(logs=[FakeLogEntry("first"), FakeLogEntry("second", "warning")])
+
+    _, payload = job_events(job)[0]
+
+    assert payload["message"] == "second"
+    assert payload["level"] == "warning"
 
 
 @pytest.mark.parametrize("status", sorted(JOB_STATES))

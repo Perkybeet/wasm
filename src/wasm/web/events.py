@@ -173,14 +173,34 @@ def job_events(job: Any) -> list[tuple[str, dict[str, Any]]]:
     """
     status = job.status.value
     state = JOB_STATES.get(status, "idle")
-
-    events: list[tuple[str, dict[str, Any]]] = [("state", {"id": job.id, "state": state})]
-
     domain = job.metadata.get("domain")
+    finished = status in NOTICEABLE
+
+    # The job manager persists every log line and every transition, so this
+    # fires once per line as well as once per status change; the console's
+    # LogViewer and its activity rail read the same event for both.
+    latest = job.logs[-1] if job.logs else None
+    events: list[tuple[str, dict[str, Any]]] = [
+        (
+            "job",
+            {
+                "id": job.id,
+                "type": job.type.value,
+                "status": status,
+                "progress": job.progress,
+                "domain": domain,
+                "message": latest.message if latest else "",
+                "level": latest.level if latest else "info",
+                "finished": finished,
+            },
+        ),
+        ("state", {"id": job.id, "state": state}),
+    ]
+
     if domain:
         events.append(("state", {"id": str(domain), "state": state}))
 
-    if status in NOTICEABLE:
+    if finished:
         # The tool's own words when there are any. This is the one place a
         # failure is summarised rather than shown verbatim, and it is a toast
         # pointing at the activity screen, not a replacement for the output.

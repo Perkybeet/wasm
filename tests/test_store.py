@@ -470,6 +470,225 @@ class TestSchemaV3Migration:
         assert "webhook_secret" in self._apps_columns(temp_db)
 
 
+class TestSchemaV4Migration:
+    """Schema v4 adds the jobs table, so a panel restart does not erase history."""
+
+    def _create_v3_database(self, db_path: Path) -> None:
+        """
+        Create a real v3 database with rows, as a 1.4.x release left it.
+
+        Args:
+            db_path: Where the database file is created.
+        """
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.executescript(V1_SCHEMA_SQL)
+            conn.executescript(V2_DEPLOYMENTS_SQL)
+            conn.execute("ALTER TABLE apps ADD COLUMN webhook_secret TEXT")
+            conn.execute("INSERT INTO schema_version (version) VALUES (1)")
+            conn.execute("INSERT INTO schema_version (version) VALUES (2)")
+            conn.execute("INSERT INTO schema_version (version) VALUES (3)")
+            conn.execute(
+                "INSERT INTO apps (domain, app_type, app_path) VALUES (?, ?, ?)",
+                ("v3.example.com", "nextjs", "/var/www/apps/v3-example-com"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_a_v3_database_migrates_to_v4_keeping_every_row(self, fresh, tmp_path):
+        """A server upgraded in place keeps its inventory and gains the jobs table."""
+        db_path = tmp_path / "wasm.db"
+        self._create_v3_database(db_path)
+
+        store = WASMStore(db_path, fs=RecordingFileSystem())
+
+        with store._transaction() as cursor:
+            cursor.execute("SELECT MAX(version) FROM schema_version")
+            assert cursor.fetchone()[0] == SCHEMA_VERSION
+        assert store.get_app("v3.example.com") is not None
+
+    def test_the_migration_creates_the_jobs_table_and_indexes(self, fresh, tmp_path):
+        """The table and its indexes exist after migrating."""
+        db_path = tmp_path / "wasm.db"
+        self._create_v3_database(db_path)
+
+        store = WASMStore(db_path, fs=RecordingFileSystem())
+
+        with store._transaction() as cursor:
+            cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?", ("jobs",)
+            )
+            assert cursor.fetchone() is not None
+            for index in ("idx_jobs_status", "idx_jobs_domain", "idx_jobs_created"):
+                cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND name=?", (index,)
+                )
+                assert cursor.fetchone() is not None
+
+    def test_a_migrated_database_records_jobs(self, fresh, tmp_path):
+        """Migration produces a table the job manager can actually use."""
+        db_path = tmp_path / "wasm.db"
+        self._create_v3_database(db_path)
+        store = WASMStore(db_path, fs=RecordingFileSystem())
+
+        store.create_job(
+            store_module.JobRecord(
+                id="job-1",
+                type="deploy",
+                name="Deploy v3.example.com",
+                status="running",
+                domain="v3.example.com",
+            )
+        )
+
+        job = store.get_job("job-1")
+        assert job is not None
+        assert job.status == "running"
+
+    def test_a_v1_database_walks_every_migration(self, fresh, tmp_path):
+        """A 1.2.x database reaches v4 in one opening."""
+        db_path = tmp_path / "wasm.db"
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.executescript(V1_SCHEMA_SQL)
+            conn.execute("INSERT INTO schema_version (version) VALUES (1)")
+            conn.commit()
+        finally:
+            conn.close()
+
+        store = WASMStore(db_path, fs=RecordingFileSystem())
+
+        with store._transaction() as cursor:
+            cursor.execute("SELECT MAX(version) FROM schema_version")
+            assert cursor.fetchone()[0] == SCHEMA_VERSION
+            cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?", ("jobs",)
+            )
+            assert cursor.fetchone() is not None
+
+    def test_a_fresh_database_has_the_jobs_table(self, temp_db):
+        """The fresh-install path and the migration agree on the schema."""
+        with temp_db._transaction() as cursor:
+            cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?", ("jobs",)
+            )
+            assert cursor.fetchone() is not None
+
+
+class TestJobRecordCRUD:
+    """The store's half of job persistence, independent of the job manager."""
+
+    def _job(self, **overrides: object) -> "store_module.JobRecord":
+        """
+        Args:
+            **overrides: Fields to override on the default record.
+
+        Returns:
+            A job record ready to persist.
+        """
+        defaults: dict[str, object] = {
+            "id": "job-abc123",
+            "type": "deploy",
+            "name": "Deploy example.com",
+            "description": "Deploying a nextjs application to example.com",
+            "status": "pending",
+            "domain": "example.com",
+        }
+        defaults.update(overrides)
+        return store_module.JobRecord(**defaults)  # type: ignore[arg-type]
+
+    def test_create_and_get_roundtrip(self, temp_db):
+        """A created job comes back with every field it was given."""
+        temp_db.create_job(self._job())
+
+        job = temp_db.get_job("job-abc123")
+
+        assert job is not None
+        assert job.type == "deploy"
+        assert job.name == "Deploy example.com"
+        assert job.status == "pending"
+        assert job.domain == "example.com"
+        assert job.created_at is not None
+
+    def test_create_fills_created_at_when_blank(self, temp_db):
+        """The caller should not have to compute a timestamp for every job."""
+        job = self._job(created_at=None)
+
+        created = temp_db.create_job(job)
+
+        assert created.created_at
+
+    def test_an_unknown_job_is_none(self, temp_db):
+        """A job id nothing created is not an error, just nothing to show."""
+        assert temp_db.get_job("does-not-exist") is None
+
+    def test_update_only_changes_the_given_fields(self, temp_db):
+        """Reporting progress must not blank out the domain or the log path."""
+        temp_db.create_job(self._job(log_path="/var/lib/wasm/job-logs/job-abc123.log"))
+
+        assert temp_db.update_job("job-abc123", status="running", progress=40) is True
+
+        job = temp_db.get_job("job-abc123")
+        assert job is not None
+        assert job.status == "running"
+        assert job.progress == 40
+        assert job.domain == "example.com"
+        assert job.log_path == "/var/lib/wasm/job-logs/job-abc123.log"
+
+    def test_updating_an_unknown_job_reports_no_change(self, temp_db):
+        """There is nothing to lie about: the row does not exist."""
+        assert temp_db.update_job("does-not-exist", status="running") is False
+
+    def test_an_invalid_status_is_rejected_by_the_database(self, temp_db):
+        """The CHECK constraint is the guard, not a Python-side allowlist."""
+        temp_db.create_job(self._job())
+
+        with pytest.raises(sqlite3.IntegrityError):
+            temp_db.update_job("job-abc123", status="sideways")
+
+    def test_list_jobs_orders_newest_first(self, temp_db):
+        """History reads top-down as "what happened most recently"."""
+        temp_db.create_job(self._job(id="job-1", created_at="2026-01-01T00:00:00"))
+        temp_db.create_job(self._job(id="job-2", created_at="2026-01-02T00:00:00"))
+
+        jobs = temp_db.list_jobs()
+
+        assert [job.id for job in jobs] == ["job-2", "job-1"]
+
+    def test_list_jobs_filters_by_status_and_domain(self, temp_db):
+        """The activity screen and a per-app history both need to narrow the list."""
+        temp_db.create_job(self._job(id="job-1", status="failed", domain="a.example.com"))
+        temp_db.create_job(self._job(id="job-2", status="running", domain="a.example.com"))
+        temp_db.create_job(self._job(id="job-3", status="running", domain="b.example.com"))
+
+        assert [job.id for job in temp_db.list_jobs(status="running")] == ["job-3", "job-2"]
+        assert [job.id for job in temp_db.list_jobs(domain="a.example.com")] == ["job-2", "job-1"]
+
+    def test_fail_interrupted_jobs_only_touches_pending_and_running(self, temp_db):
+        """A job that already finished must keep its real outcome."""
+        temp_db.create_job(self._job(id="job-pending", status="pending"))
+        temp_db.create_job(self._job(id="job-running", status="running"))
+        temp_db.create_job(self._job(id="job-done", status="completed"))
+
+        changed = temp_db.fail_interrupted_jobs("Interrupted by a panel restart")
+
+        assert changed == 2
+        assert temp_db.get_job("job-pending").status == "failed"
+        assert temp_db.get_job("job-running").status == "failed"
+        assert temp_db.get_job("job-done").status == "completed"
+
+    def test_fail_interrupted_jobs_records_the_reason_and_a_finish_time(self, temp_db):
+        """The history must say why, in the tool's own words, not just "failed"."""
+        temp_db.create_job(self._job(id="job-running", status="running"))
+
+        temp_db.fail_interrupted_jobs("Interrupted by a panel restart")
+
+        job = temp_db.get_job("job-running")
+        assert job.error == "Interrupted by a panel restart"
+        assert job.finished_at is not None
+
+
 class TestWebhookSecret:
     """The webhook secret is written and read only through its own methods."""
 
