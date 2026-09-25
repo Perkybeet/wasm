@@ -397,6 +397,7 @@ class BaseDatabaseManager(BaseManager):
         env: Mapping[str, str] | None = None,
         timeout: int = QUERY_TIMEOUT,
         secrets: Sequence[str] = (),
+        user: str | None = None,
     ) -> CommandResult:
         """
         Run a command through the audited runner.
@@ -408,11 +409,18 @@ class BaseDatabaseManager(BaseManager):
             env: Extra environment variables.
             timeout: Deadline in seconds.
             secrets: Values to keep out of the logs.
+            user: Run as this account instead of root. This is how a client
+                that only authenticates over its engine's local peer socket -
+                PostgreSQL's ``postgres`` superuser - gets invoked, without
+                ``sudo``: WASM already runs as root, so the runner wraps the
+                command in ``runuser`` instead.
 
         Returns:
             The command outcome.
         """
-        return self.runner.run(argv, input=input, env=env, timeout=timeout, secrets=secrets)
+        return self.runner.run(
+            argv, input=input, env=env, timeout=timeout, secrets=secrets, user=user
+        )
 
     # ==================== Passwords ====================
 
@@ -1060,6 +1068,7 @@ class BaseDatabaseManager(BaseManager):
         env: Mapping[str, str] | None = None,
         secrets: Sequence[str] = (),
         timeout: int = TRANSFER_TIMEOUT,
+        user: str | None = None,
     ) -> BackupInfo:
         """
         Run a dump command and stream its stdout straight into a file.
@@ -1075,6 +1084,9 @@ class BaseDatabaseManager(BaseManager):
             env: Extra environment variables, for credentials.
             secrets: Values to keep out of the logs.
             timeout: Deadline in seconds.
+            user: Run as this account instead of root. The destination file is
+                still opened, created and owned by root before the dump starts:
+                only the write end of the pipe is handed to the other account.
 
         Returns:
             Information about the backup that was written.
@@ -1090,6 +1102,7 @@ class BaseDatabaseManager(BaseManager):
             env=env,
             timeout=timeout,
             secrets=secrets,
+            user=user,
         )
         if not result.success:
             raise DatabaseBackupError(

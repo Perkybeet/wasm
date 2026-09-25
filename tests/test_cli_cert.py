@@ -288,7 +288,7 @@ def test_a_global_flag_still_reaches_the_command(
     The flag is declared once, on the root, and read from the shared context.
     Nothing in this subtree can overwrite it.
     """
-    runner.script(["sudo", "certbot", "certificates"], exit_code=1)
+    runner.script(["certbot", "certificates"], exit_code=1)
 
     assert _invoke(["ssl", "ls"]).exit_code == 0
     assert not [line for line in log if "Could not read" in line]
@@ -391,7 +391,6 @@ def test_create_pins_the_lineage_and_carries_every_domain(
     assert result.exit_code == 0
     (issued,) = _certbot_calls(runner, "certonly")
     assert issued == (
-        "sudo",
         "certbot",
         "certonly",
         "--cert-name",
@@ -412,7 +411,7 @@ def test_create_pins_the_lineage_and_carries_every_domain(
 
 def test_create_asks_for_the_plugin_the_operator_named(live_dir: Path, runner: FakeRunner) -> None:
     """--nginx and --apache choose how control of the domain is proved."""
-    runner.script(["sudo", "certbot", "plugins"], stdout="* apache\nDescription: Apache\n")
+    runner.script(["certbot", "plugins"], stdout="* apache\nDescription: Apache\n")
 
     result = _invoke(["cert", "new", "-d", "shop.tld", "--apache"])
 
@@ -424,7 +423,7 @@ def test_create_asks_for_the_plugin_the_operator_named(live_dir: Path, runner: F
 def test_create_expands_only_when_asked(live_dir: Path, runner: FakeRunner) -> None:
     """--expand rewrites an existing certificate instead of leaving it alone."""
     _put_certificate_on_disk(live_dir, "shop.tld")
-    runner.script(["sudo", "certbot", "certificates"], stdout=CERTBOT_OUTPUT)
+    runner.script(["certbot", "certificates"], stdout=CERTBOT_OUTPUT)
 
     without = _invoke(["cert", "create", "-d", "shop.tld", "--standalone"])
     assert without.exit_code == 0
@@ -441,7 +440,7 @@ def test_list_shows_what_certbot_reports(
     live_dir: Path, runner: FakeRunner, log: list[str]
 ) -> None:
     """The table is how an operator finds out what is about to expire."""
-    runner.script(["sudo", "certbot", "certificates"], stdout=CERTBOT_OUTPUT)
+    runner.script(["certbot", "certificates"], stdout=CERTBOT_OUTPUT)
 
     result = _invoke(["cert", "list"])
 
@@ -454,7 +453,7 @@ def test_list_says_so_when_there_is_nothing(
     live_dir: Path, runner: FakeRunner, log: list[str]
 ) -> None:
     """An empty table reads as a broken command."""
-    runner.script(["sudo", "certbot", "certificates"], stdout="No certificates found.\n")
+    runner.script(["certbot", "certificates"], stdout="No certificates found.\n")
 
     result = _invoke(["ssl", "ls"])
 
@@ -472,7 +471,7 @@ def test_list_open_prints_the_configured_panel_url_without_a_display(
     """``--open`` prints the panel URL and never touches xdg-open without a display."""
     monkeypatch.delenv("DISPLAY", raising=False)
     monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
-    runner.script(["sudo", "certbot", "certificates"], stdout="No certificates found.\n")
+    runner.script(["certbot", "certificates"], stdout="No certificates found.\n")
     _configure_panel(isolated_panel_config)
 
     result = _invoke(["cert", "list", "--open"])
@@ -491,7 +490,7 @@ def test_list_open_launches_xdg_open_when_a_display_is_present(
 ) -> None:
     """With a display available, ``--open`` hands the URL to xdg-open."""
     monkeypatch.setenv("DISPLAY", ":0")
-    runner.script(["sudo", "certbot", "certificates"], stdout="No certificates found.\n")
+    runner.script(["certbot", "certificates"], stdout="No certificates found.\n")
     _configure_panel(isolated_panel_config)
 
     result = _invoke(["cert", "list", "--open"])
@@ -507,7 +506,7 @@ def test_list_open_without_a_configured_panel_warns_and_exits_clean(
     isolated_panel_config: Path,
 ) -> None:
     """The panel is off by default, so ``--open`` warns instead of guessing a URL."""
-    runner.script(["sudo", "certbot", "certificates"], stdout="No certificates found.\n")
+    runner.script(["certbot", "certificates"], stdout="No certificates found.\n")
 
     result = _invoke(["cert", "list", "--open"])
 
@@ -521,7 +520,7 @@ def test_info_reports_the_domains_and_the_validity_window(
 ) -> None:
     """``cert show`` answers 'what does this certificate actually cover'."""
     _put_certificate_on_disk(live_dir, "shop.tld")
-    runner.script(["sudo", "certbot", "certificates"], stdout=CERTBOT_OUTPUT)
+    runner.script(["certbot", "certificates"], stdout=CERTBOT_OUTPUT)
     runner.script(
         ["openssl", "x509"],
         stdout="notBefore=Sep  1 10:00:00 2026 GMT\nnotAfter=Nov 30 10:00:00 2026 GMT\n",
@@ -538,7 +537,7 @@ def test_info_on_an_unknown_domain_fails_without_issuing(
     live_dir: Path, runner: FakeRunner
 ) -> None:
     """Reading is not a reason to obtain anything."""
-    runner.script(["sudo", "certbot", "certificates"], stdout="No certificates found.\n")
+    runner.script(["certbot", "certificates"], stdout="No certificates found.\n")
 
     result = _invoke(["cert", "info", "other.tld"])
 
@@ -553,7 +552,6 @@ def test_renew_names_the_lineage_when_a_domain_is_given(live_dir: Path, runner: 
     assert result.exit_code == 0
     assert runner.calls == [
         (
-            "sudo",
             "certbot",
             "renew",
             "--non-interactive",
@@ -572,7 +570,7 @@ def test_renew_without_a_domain_warns_before_forcing_everything(
 
     assert result.exit_code == 0
     assert any("rate limit" in line for line in log)
-    assert runner.calls == [("sudo", "certbot", "renew", "--non-interactive", "--force-renewal")]
+    assert runner.calls == [("certbot", "renew", "--non-interactive", "--force-renewal")]
 
 
 # -- Destructive commands -----------------------------------------------------
@@ -591,7 +589,6 @@ def test_revoke_names_the_certificate_and_the_consequence(
     assert "Browsers will reject shop.tld" in result.output
     (revoked,) = _certbot_calls(runner, "revoke")
     assert revoked == (
-        "sudo",
         "certbot",
         "revoke",
         "--cert-path",
@@ -634,7 +631,7 @@ def test_delete_asks_before_removing_the_files(live_dir: Path, runner: FakeRunne
     assert "Delete the certificate files for shop.tld" in result.output
     assert "It is not revoked" in result.output
     assert _certbot_calls(runner, "delete") == [
-        ("sudo", "certbot", "delete", "--cert-name", "shop.tld", "--non-interactive")
+        ("certbot", "delete", "--cert-name", "shop.tld", "--non-interactive")
     ]
 
 

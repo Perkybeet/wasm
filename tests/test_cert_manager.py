@@ -120,7 +120,7 @@ def test_an_unreadable_certificate_list_never_triggers_an_order(
     burning the rate limit of a domain that was already served.
     """
     _put_certificate_on_disk(certs, "shop.tld")
-    runner.script(["sudo", "certbot", "certificates"], stderr="permission denied", exit_code=1)
+    runner.script(["certbot", "certificates"], stderr="permission denied", exit_code=1)
 
     with pytest.raises(CertificateError) as raised:
         certs.obtain("shop.tld", email="ops@shop.tld")
@@ -133,7 +133,7 @@ def test_an_unreadable_certificate_list_is_no_obstacle_when_nothing_is_on_disk(
     certs: CertManager, runner: FakeRunner
 ) -> None:
     """A first issuance must not be blocked by a certbot that lists nothing."""
-    runner.script(["sudo", "certbot", "certificates"], stderr="permission denied", exit_code=1)
+    runner.script(["certbot", "certificates"], stderr="permission denied", exit_code=1)
 
     assert certs.obtain("shop.tld", email="ops@shop.tld") is True
     assert len(_issued(runner)) == 1
@@ -143,7 +143,7 @@ def test_an_empty_certificate_list_still_reads_as_an_answer(
     certs: CertManager, runner: FakeRunner
 ) -> None:
     """Certbot succeeding with nothing to report is a fact, not a failure."""
-    runner.script(["sudo", "certbot", "certificates"], stdout="No certificates found.\n")
+    runner.script(["certbot", "certificates"], stdout="No certificates found.\n")
 
     assert certs.list_certificates() == []
     assert certs._query_certificates() == []
@@ -153,7 +153,7 @@ def test_a_failed_query_is_hidden_from_the_read_only_callers(
     certs: CertManager, runner: FakeRunner
 ) -> None:
     """``wasm cert list`` and ``wasm health`` still get an empty list."""
-    runner.script(["sudo", "certbot", "certificates"], exit_code=1)
+    runner.script(["certbot", "certificates"], exit_code=1)
 
     assert certs.list_certificates() == []
     assert certs._query_certificates() is None
@@ -164,7 +164,7 @@ def test_a_certificate_that_covers_the_request_is_left_alone(
 ) -> None:
     """Running the same deploy twice must cost nothing at Let's Encrypt."""
     _put_certificate_on_disk(certs, "shop.tld")
-    runner.script(["sudo", "certbot", "certificates"], stdout=CERTBOT_OUTPUT)
+    runner.script(["certbot", "certificates"], stdout=CERTBOT_OUTPUT)
 
     assert certs.obtain("shop.tld", email="ops@shop.tld", include_www=True) is True
     assert _issued(runner) == []
@@ -181,12 +181,12 @@ def test_expanding_keeps_the_domains_the_certificate_already_carries(
     longer matches.
     """
     _put_certificate_on_disk(certs, "shop.tld")
-    runner.script(["sudo", "certbot", "certificates"], stdout=CERTBOT_OUTPUT)
+    runner.script(["certbot", "certificates"], stdout=CERTBOT_OUTPUT)
 
     certs.obtain("shop.tld", email="ops@shop.tld", additional_domains=["api.shop.tld"])
 
     (issued,) = _issued(runner)
-    assert issued[:5] == ("sudo", "certbot", "certonly", "--cert-name", "shop.tld")
+    assert issued[:4] == ("certbot", "certonly", "--cert-name", "shop.tld")
     assert "--expand" in issued
     assert [issued[i + 1] for i, arg in enumerate(issued) if arg == "-d"] == [
         "shop.tld",
@@ -207,7 +207,7 @@ def test_a_dry_run_issuance_does_not_consult_the_existing_certificate(
 ) -> None:
     """A staging order is free, so the rehearsal always reaches certbot."""
     _put_certificate_on_disk(certs, "shop.tld")
-    runner.script(["sudo", "certbot", "certificates"], exit_code=1)
+    runner.script(["certbot", "certificates"], exit_code=1)
 
     assert certs.obtain("shop.tld", email="ops@shop.tld", dry_run=True) is True
 
@@ -221,7 +221,6 @@ def test_renewal_names_the_lineage_and_nothing_else(certs: CertManager, runner: 
 
     assert runner.calls == [
         (
-            "sudo",
             "certbot",
             "renew",
             "--non-interactive",
@@ -236,14 +235,14 @@ def test_renewal_of_everything_asks_for_no_lineage(certs: CertManager, runner: F
     """Without a domain, certbot decides which certificates are due."""
     certs.renew()
 
-    assert runner.calls == [("sudo", "certbot", "renew", "--non-interactive")]
+    assert runner.calls == [("certbot", "renew", "--non-interactive")]
 
 
 def test_a_failed_renewal_says_what_the_acme_server_reported(
     certs: CertManager, runner: FakeRunner
 ) -> None:
     """The one error an operator has to be able to act on."""
-    runner.script(["sudo", "certbot", "renew"], stderr="too many certificates", exit_code=1)
+    runner.script(["certbot", "renew"], stderr="too many certificates", exit_code=1)
 
     with pytest.raises(CertificateError) as raised:
         certs.renew("shop.tld")
@@ -459,7 +458,7 @@ def test_tls_is_recorded_only_once_the_certificate_files_exist(
 
     _put_certificate_on_disk(certs, "shop.tld")
     runner.script(
-        ["sudo", "certbot", "certificates"],
+        ["certbot", "certificates"],
         stdout=CERTBOT_OUTPUT.replace(" www.shop.tld", ""),
     )
 

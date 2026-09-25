@@ -200,7 +200,7 @@ class FakeManager:
         self, database: str | None = None, username: str | None = None
     ) -> list[str]:
         self._record("get_interactive_command", database=database, username=username)
-        return ["sudo", "-u", "postgres", "psql"]
+        return ["runuser", "-u", "postgres", "--", "psql"]
 
     def restore(self, database: str, backup_path: Path, drop_existing: bool = False) -> None:
         self._record("restore", database, backup_path=backup_path, drop_existing=drop_existing)
@@ -847,7 +847,7 @@ class TestConnect:
         result = cli_runner.invoke(cli_app.cli, ["db", "connect", "-e", "postgresql", "-d", "shop"])
 
         assert result.exit_code == 0, result.output
-        assert opened == [["sudo", "-u", "postgres", "psql"]]
+        assert opened == [["runuser", "-u", "postgres", "--", "psql"]]
         assert manager.called("get_interactive_command") == {
             "database": "shop",
             "username": None,
@@ -868,7 +868,7 @@ class TestConnect:
 
         assert result.exit_code == 0
         assert opened == []
-        assert "would run: sudo -u postgres psql" in logged.getvalue()
+        assert "would run: runuser -u postgres -- psql" in logged.getvalue()
 
 
 class TestConnectionString:

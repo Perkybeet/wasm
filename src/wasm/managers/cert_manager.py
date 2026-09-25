@@ -241,31 +241,26 @@ class CertManager(BaseManager):
         self,
         argv: Sequence[str],
         *,
-        sudo: bool = True,
         timeout: int = DEFAULT_TIMEOUT,
     ) -> CommandResult:
         """
         Run a certbot-adjacent command through the shared runner.
 
-        Certbot reads and writes ``/etc/letsencrypt``. Every unprivileged
-        invocation lies: it cannot see its own configuration, exits non-zero,
-        and the caller concludes the machine has no certificates and no plugins.
-        That is how ``certbot plugins`` came to answer False for everything and
-        every issuance quietly degraded to ``--webroot /var/www/html``.
+        Certbot reads and writes ``/etc/letsencrypt``, which only root can do,
+        and WASM requires root (decision D6): there is no unprivileged install
+        to accommodate and no ``sudo`` to reach for, on a box that may not even
+        have it. A manager that re-elevated here would either be redundant or,
+        on a minimal Debian or Ubuntu server with no ``sudo`` package, break
+        outright with "command not found" on every certbot call.
 
         Args:
             argv: Program and arguments.
-            sudo: Run the command with privileges.
             timeout: Deadline in seconds.
 
         Returns:
             The command outcome.
         """
-        # WASM requires root, so the prefix is redundant on a correct install
-        # and harmless on one where the operator used sudo to reach us. It stays
-        # until the CLI entry point enforces root by itself.
-        command = ["sudo", *argv] if sudo else list(argv)
-        return self._run(command, timeout=timeout)
+        return self._run(list(argv), timeout=timeout)
 
     def is_installed(self) -> bool:
         """
@@ -937,7 +932,6 @@ class CertManager(BaseManager):
                 "-checkend",
                 str(_SELF_SIGNED_MIN_VALIDITY),
             ],
-            sudo=False,
         )
         return result.success
 
@@ -1101,10 +1095,7 @@ class CertManager(BaseManager):
             return CertificateTest(valid=False, error="Certificate not found")
 
         cert_path = self.get_cert_path(primary).fullchain
-        result = self._exec(
-            ["openssl", "x509", "-in", str(cert_path), "-noout", "-dates"],
-            sudo=False,
-        )
+        result = self._exec(["openssl", "x509", "-in", str(cert_path), "-noout", "-dates"])
 
         if not result.success:
             return CertificateTest(valid=False, error=result.stderr.strip() or "openssl failed")

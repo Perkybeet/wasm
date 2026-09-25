@@ -974,7 +974,7 @@ def test_certificate_info_is_read_with_the_names_the_manager_writes(
     certs: CertManager, runner: FakeRunner
 ) -> None:
     """The health check and the CLI read exactly these fields."""
-    runner.script(["sudo", "certbot", "certificates"], stdout=CERTBOT_OUTPUT)
+    runner.script(["certbot", "certificates"], stdout=CERTBOT_OUTPUT)
 
     (info,) = certs.list_certificates()
 
@@ -991,7 +991,7 @@ def test_the_health_check_consumes_the_record_this_manager_produces(
 ) -> None:
     """The reader is run against the writer's output, not against a fixture."""
     try:
-        from wasm.cli.commands import health
+        from wasm.managers import health
     except Exception as exc:
         # The contract under test is the field names, and the sibling test above
         # checks those from source. An unrelated import failure elsewhere in the
@@ -1000,7 +1000,7 @@ def test_the_health_check_consumes_the_record_this_manager_produces(
 
     expiry = (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d")
     runner.script(
-        ["sudo", "certbot", "certificates"],
+        ["certbot", "certificates"],
         stdout=CERTBOT_OUTPUT.replace("2026-11-30", expiry),
     )
 
@@ -1016,7 +1016,7 @@ def test_the_expiry_key_that_was_never_written_is_now_an_error(
     certs: CertManager, runner: FakeRunner
 ) -> None:
     """``wasm health`` looked for 'expires' for releases and got None."""
-    runner.script(["sudo", "certbot", "certificates"], stdout=CERTBOT_OUTPUT)
+    runner.script(["certbot", "certificates"], stdout=CERTBOT_OUTPUT)
     (info,) = certs.list_certificates()
 
     with pytest.raises(KeyError):
@@ -1035,7 +1035,7 @@ def test_every_field_the_health_check_reads_is_a_field_of_the_record(
     """
     import re as _re
 
-    source = (Path(__file__).resolve().parents[1] / "src/wasm/cli/commands/health.py").read_text()
+    source = (Path(__file__).resolve().parents[1] / "src/wasm/managers/health.py").read_text()
     keys = set(_re.findall(r'cert(?:_info)?(?:\.get\(|\[)"([a-z_]+)"', source))
 
     assert keys, "the health check no longer reads certificate fields by name"
@@ -1048,7 +1048,7 @@ def test_the_expiry_a_reader_alerts_on_is_a_parseable_date(
     """The health check turns this field into a number of days."""
     expiry = (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d")
     runner.script(
-        ["sudo", "certbot", "certificates"],
+        ["certbot", "certificates"],
         stdout=CERTBOT_OUTPUT.replace("2026-11-30", expiry),
     )
 
@@ -1075,22 +1075,21 @@ def test_certbot_plugin_probe_runs_with_privileges_and_is_asked_once(
     certs: CertManager, runner: FakeRunner
 ) -> None:
     """Unprivileged, certbot cannot read its own configuration and lies."""
-    runner.script(["sudo", "certbot", "plugins"], stdout="* nginx\nDescription: Nginx\n")
+    runner.script(["certbot", "plugins"], stdout="* nginx\nDescription: Nginx\n")
 
     assert certs._check_certbot_plugin("nginx") is True
     assert certs._check_certbot_plugin("nginx") is True
-    assert runner.calls_to("sudo").count(("sudo", "certbot", "plugins")) == 1
+    assert runner.calls_to("certbot").count(("certbot", "plugins")) == 1
 
 
 def test_issuance_pins_the_lineage_and_covers_www(certs: CertManager, runner: FakeRunner) -> None:
     """Without --cert-name certbot invents example.com-0001 on the next change."""
-    runner.script(["sudo", "certbot", "plugins"], stdout="* nginx\n")
+    runner.script(["certbot", "plugins"], stdout="* nginx\n")
 
     certs.obtain("example.com", email="ops@example.com", nginx=True, include_www=True)
 
     (issued,) = [c for c in runner.calls if "certonly" in c]
     assert issued == (
-        "sudo",
         "certbot",
         "certonly",
         "--cert-name",
@@ -1111,7 +1110,7 @@ def test_issuance_falls_back_to_webroot_when_the_plugin_is_missing(
     certs: CertManager, runner: FakeRunner
 ) -> None:
     """A missing plugin degrades the method, and says so, but still issues."""
-    runner.script(["sudo", "certbot", "plugins"], stdout="* standalone\n")
+    runner.script(["certbot", "plugins"], stdout="* standalone\n")
 
     certs.obtain("example.com", email="ops@example.com", nginx=True)
 
@@ -1125,7 +1124,7 @@ def test_a_certificate_that_already_covers_everything_is_left_alone(
 ) -> None:
     """Issuance is rate limited; running the deploy twice must be cheap."""
     _issue_certificate(certs, "example.com")
-    runner.script(["sudo", "certbot", "certificates"], stdout=CERTBOT_OUTPUT)
+    runner.script(["certbot", "certificates"], stdout=CERTBOT_OUTPUT)
 
     assert certs.obtain("example.com", email="ops@example.com", include_www=True) is True
     assert not any("certonly" in call for call in runner.calls)
@@ -1137,7 +1136,7 @@ def test_a_certificate_missing_a_domain_is_expanded_not_reissued(
     """A second lineage would leave two half-right certificates renewing."""
     _issue_certificate(certs, "example.com")
     runner.script(
-        ["sudo", "certbot", "certificates"],
+        ["certbot", "certificates"],
         stdout=CERTBOT_OUTPUT.replace(" www.example.com", ""),
     )
 
@@ -1149,7 +1148,7 @@ def test_a_certificate_missing_a_domain_is_expanded_not_reissued(
 
     (issued,) = [c for c in runner.calls if "certonly" in c]
     assert "--expand" in issued
-    assert issued[:5] == ("sudo", "certbot", "certonly", "--cert-name", "example.com")
+    assert issued[:4] == ("certbot", "certonly", "--cert-name", "example.com")
     assert issued.count("-d") == 2
 
 
@@ -1181,7 +1180,6 @@ def test_renewal_names_the_lineage(certs: CertManager, runner: FakeRunner) -> No
 
     assert runner.calls == [
         (
-            "sudo",
             "certbot",
             "renew",
             "--non-interactive",
@@ -1194,7 +1192,7 @@ def test_renewal_names_the_lineage(certs: CertManager, runner: FakeRunner) -> No
 
 def test_renewal_failure_is_actionable(certs: CertManager, runner: FakeRunner) -> None:
     """A failed renewal is the one error an operator must be able to act on."""
-    runner.script(["sudo", "certbot", "renew"], stderr="rate limit exceeded", exit_code=1)
+    runner.script(["certbot", "renew"], stderr="rate limit exceeded", exit_code=1)
 
     with pytest.raises(CertificateError) as raised:
         certs.renew()
@@ -1346,7 +1344,7 @@ def test_auto_renewal_under_dry_run_installs_no_cron_entry(
     monkeypatch.setattr("wasm.managers.cert_manager._CRON_FILE", cron_file)
     # Without a certbot.timer the manager falls through to the cron entry, which
     # is the only path in this manager that writes a file.
-    runner.script(["sudo", "systemctl", "enable", "certbot.timer"], exit_code=1)
+    runner.script(["systemctl", "enable", "certbot.timer"], exit_code=1)
 
     assert CertManager(fs=dry_fs).setup_auto_renewal() is True
 
@@ -1361,7 +1359,7 @@ def test_auto_renewal_writes_the_cron_entry_through_the_seam(
     """The real path still has to work, and cron ignores a writable file."""
     cron_file = tmp_path / "cron.d/certbot-renew"
     monkeypatch.setattr("wasm.managers.cert_manager._CRON_FILE", cron_file)
-    runner.script(["sudo", "systemctl", "enable", "certbot.timer"], exit_code=1)
+    runner.script(["systemctl", "enable", "certbot.timer"], exit_code=1)
 
     assert CertManager().setup_auto_renewal() is True
 

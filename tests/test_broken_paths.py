@@ -507,7 +507,7 @@ def test_health_warns_about_a_certificate_close_to_expiry(
     """The expiry check must read the key CertManager actually writes."""
     expiry = (datetime.now() + timedelta(days=days_left)).strftime("%Y-%m-%d")
     runner.script(
-        ["sudo", "certbot", "certificates"],
+        ["certbot", "certificates"],
         stdout=(
             "Found the following certs:\n"
             "  Certificate Name: example.com\n"
@@ -631,10 +631,10 @@ def test_certbot_plugin_probe_runs_with_privileges(
     """``certbot plugins`` returns nothing useful unless it runs as root."""
     from wasm.managers.cert_manager import CertManager
 
-    runner.script(["sudo", "certbot", "plugins"], stdout="* nginx\nDescription: Nginx Web Server\n")
+    runner.script(["certbot", "plugins"], stdout="* nginx\nDescription: Nginx Web Server\n")
 
     assert CertManager()._check_certbot_plugin("nginx") is True
-    assert runner.ran("sudo", "certbot", "plugins")
+    assert runner.ran("certbot", "plugins")
 
 
 # ---------------------------------------------------------------------------

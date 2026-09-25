@@ -25,6 +25,7 @@ from wasm.core.exceptions import (
     DatabaseQueryError,
     DatabaseUserError,
 )
+from wasm.core.runner import runuser_prefix
 from wasm.managers.database.base import (
     QUERY_TIMEOUT,
     TRANSFER_TIMEOUT,
@@ -158,6 +159,11 @@ class PostgresManager(BaseDatabaseManager):
         """
         Build a psql invocation that fails loudly and prints only data.
 
+        Runs as :data:`SUPERUSER`, applied by the caller through ``_exec``'s
+        ``user=`` rather than baked in here: PostgreSQL's peer authentication
+        only accepts a connection from the OS account of the same name, and
+        WASM runs as root, not ``postgres``.
+
         Args:
             database: Database to connect to.
             *tail: Arguments describing where the SQL comes from.
@@ -166,9 +172,6 @@ class PostgresManager(BaseDatabaseManager):
             The argument vector.
         """
         return [
-            "sudo",
-            "-u",
-            self.SUPERUSER,
             "psql",
             "-v",
             "ON_ERROR_STOP=1",
@@ -207,6 +210,7 @@ class PostgresManager(BaseDatabaseManager):
             timeout=timeout,
             secrets=secrets,
             env=env,
+            user=self.SUPERUSER,
         )
         return result.success, result.stdout if result.success else result.stderr
 
@@ -696,6 +700,7 @@ class PostgresManager(BaseDatabaseManager):
             destination,
             database=database,
             compress=compress,
+            user=self.SUPERUSER,
         )
 
     def _pg_dump_argv(
@@ -703,6 +708,9 @@ class PostgresManager(BaseDatabaseManager):
     ) -> list[str]:
         """
         Build a pg_dump invocation that writes to stdout.
+
+        Runs as :data:`SUPERUSER`, applied by the caller through
+        ``_dump_to_file``'s ``user=``; see :meth:`_psql_argv` for why.
 
         Args:
             database: Database name.
@@ -713,9 +721,6 @@ class PostgresManager(BaseDatabaseManager):
             The argument vector.
         """
         argv = [
-            "sudo",
-            "-u",
-            self.SUPERUSER,
             "pg_dump",
             "--no-password",
             f"--format={dump_format}",
@@ -787,6 +792,7 @@ class PostgresManager(BaseDatabaseManager):
             destination,
             database=database,
             compress=compress,
+            user=self.SUPERUSER,
         )
         info.database = f"{database}/{schema}"
         return info
@@ -870,9 +876,6 @@ class PostgresManager(BaseDatabaseManager):
         with self._staged_backup(backup_path, staged_name, owner=self.SUPERUSER) as staged:
             if dump_format == "custom":
                 argv = [
-                    "sudo",
-                    "-u",
-                    self.SUPERUSER,
                     "pg_restore",
                     "--no-password",
                     "-d",
@@ -881,7 +884,7 @@ class PostgresManager(BaseDatabaseManager):
                 ]
             else:
                 argv = self._psql_argv(database, "-f", str(staged))
-            result = self._exec(argv, timeout=TRANSFER_TIMEOUT)
+            result = self._exec(argv, timeout=TRANSFER_TIMEOUT, user=self.SUPERUSER)
 
         if not result.success:
             raise DatabaseBackupError(
@@ -1046,9 +1049,12 @@ class PostgresManager(BaseDatabaseManager):
             username: Role to connect as.
 
         Returns:
-            The argument vector.
+            The argument vector. This one is handed to ``os.execvp`` directly
+            instead of going through the runner - an interactive client needs
+            the real terminal - so the ``runuser`` prefix that peer
+            authentication requires is applied here rather than by ``user=``.
         """
-        argv = ["sudo", "-u", self.SUPERUSER, "psql"]
+        argv = [*runuser_prefix(self.SUPERUSER), "psql"]
         if database:
             argv.extend(["-d", database])
         if username:

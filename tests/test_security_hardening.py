@@ -53,10 +53,10 @@ from wasm.core.store import App, WASMStore
 from wasm.web.api import hooks as hooks_module
 from wasm.web.api.hooks import mint_webhook_secret
 from wasm.web.auth import SecurityConfig
+from wasm.web.server import ASSETS_DIR, run_server
 from wasm.web.server import create_app as build_app
-from wasm.web.server import run_server
 
-PSQL_PREFIX = ("sudo", "-u", "postgres", "psql")
+PSQL_PREFIX = ("runuser", "-u", "postgres", "--", "psql")
 
 #: The address under test, never actually bound: uvicorn.run is mocked below.
 ALL_INTERFACES = "0.0.0.0"  # noqa: S104
@@ -289,10 +289,21 @@ class TestCacheControlIsPathAware:
 
     def test_a_hashed_asset_is_cached_forever(self, tmp_path: Path) -> None:
         client = self._client(tmp_path)
+        asset = next((ASSETS_DIR).glob("*.js")).name
 
-        response = client.get("/assets/index-abc123.js")
+        response = client.get(f"/assets/{asset}")
 
+        assert response.status_code == 200, response.text
         assert response.headers["cache-control"] == "public, max-age=31536000, immutable"
+
+    def test_a_missing_asset_is_never_stored(self, tmp_path: Path) -> None:
+        """A 404 under ``/assets`` must not outlive the deploy that fixes it."""
+        client = self._client(tmp_path)
+
+        response = client.get("/assets/does-not-exist.js")
+
+        assert response.status_code == 404
+        assert response.headers["cache-control"] == "no-store"
 
     def test_everything_else_is_never_stored(self, tmp_path: Path) -> None:
         client = self._client(tmp_path)

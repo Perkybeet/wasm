@@ -138,6 +138,27 @@ def _redact(argv: Sequence[str], secrets: Iterable[str]) -> tuple[str, ...]:
     return tuple(out)
 
 
+def runuser_prefix(user: str) -> list[str]:
+    """
+    Build the argv prefix that switches to another account via ``runuser``.
+
+    This is the one place that assembles it. :meth:`SubprocessRunner._prepare`
+    uses it for every ``user=`` call, and :class:`FakeRunner` uses it too, so a
+    test sees the same argv a real run would produce. The rare caller that
+    execs a client directly instead of going through the runner - an
+    interactive database session needs the real terminal, which the runner
+    cannot hand over - uses it as well, so "how to run as another account" has
+    one definition instead of being re-typed at each call site.
+
+    Args:
+        user: Account to switch to.
+
+    Returns:
+        The ``runuser`` prefix. The program and its arguments follow it.
+    """
+    return ["runuser", "-u", user, "--"]
+
+
 def _validate(argv: Sequence[str]) -> list[str]:
     """
     Reject argument vectors that cannot be executed safely.
@@ -317,8 +338,9 @@ class SubprocessRunner(CommandRunner):
         args = _validate(argv)
         redacted = _redact(args, secrets)
         if user is not None:
-            args = ["runuser", "-u", user, "--", *args]
-            redacted = ("runuser", "-u", user, "--", *redacted)
+            prefix = runuser_prefix(user)
+            args = [*prefix, *args]
+            redacted = (*prefix, *redacted)
         run_env = dict(os.environ)
         if env:
             run_env.update(env)
@@ -809,22 +831,30 @@ class FakeRunner(CommandRunner):
             return True
         return program in self._known_programs
 
-    def _lookup(self, argv: Sequence[str]) -> CommandResult:
+    def _lookup(self, argv: Sequence[str], user: str | None = None) -> CommandResult:
         """
         Find the scripted response for a call, recording the call first.
 
         Args:
             argv: The argument vector the code under test built.
+            user: Account the real runner would switch to, if any. Folded into
+                the recorded and matched argv the same way
+                :meth:`SubprocessRunner._prepare` folds it in, so a test's
+                ``.script(...)`` and ``.calls`` assertions see exactly what
+                would execute for real.
 
         Returns:
             The scripted result, or a default success.
         """
-        args = tuple(_validate(argv))
-        self.calls.append(args)
+        args = _validate(argv)
+        if user is not None:
+            args = [*runuser_prefix(user), *args]
+        recorded = tuple(args)
+        self.calls.append(recorded)
         for scripted in reversed(self._scripted):
-            if args[: len(scripted.match)] == scripted.match:
-                return replace(scripted.result, argv=args)
-        return CommandResult(argv=args, exit_code=self._default_exit_code)
+            if recorded[: len(scripted.match)] == scripted.match:
+                return replace(scripted.result, argv=recorded)
+        return CommandResult(argv=recorded, exit_code=self._default_exit_code)
 
     def run(
         self,
@@ -839,7 +869,7 @@ class FakeRunner(CommandRunner):
         secrets: Sequence[str] = (),
     ) -> CommandResult:
         self.inputs.append(input)
-        result = self._lookup(argv)
+        result = self._lookup(argv, user)
         return result.check() if check else result
 
     def stream(
@@ -853,7 +883,7 @@ class FakeRunner(CommandRunner):
         user: str | None = None,
         secrets: Sequence[str] = (),
     ) -> CommandResult:
-        result = self._lookup(argv)
+        result = self._lookup(argv, user)
         for line in result.stdout.splitlines():
             on_line(line)
         return result
@@ -870,7 +900,7 @@ class FakeRunner(CommandRunner):
         user: str | None = None,
         secrets: Sequence[str] = (),
     ) -> CommandResult:
-        result = self._lookup(argv)
+        result = self._lookup(argv, user)
         self.written[destination] = result.argv
         if result.success:
             destination.parent.mkdir(parents=True, exist_ok=True)

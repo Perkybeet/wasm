@@ -55,7 +55,7 @@ PASSWORD = "s3cr3t'; DROP TABLE users; --"
 #: absent from argv is evidence rather than an artefact.
 PLAIN_PASSWORD = "correcthorsebatterystaple42"
 
-PSQL_PREFIX = ("sudo", "-u", "postgres", "psql")
+PSQL_PREFIX = ("runuser", "-u", "postgres", "--", "psql")
 
 
 class StubConfig:
@@ -193,15 +193,16 @@ def test_postgres_backup_streams_through_capture_to_file_not_through_run(
     argv. Byte fidelity is proven against a real producer below.
     """
     runner.script(PSQL_PREFIX, stdout="1")
-    runner.script(["sudo", "-u", "postgres", "pg_dump"], stdout="dump")
+    runner.script(["runuser", "-u", "postgres", "--", "pg_dump"], stdout="dump")
     inputs_before = len(runner.inputs)
 
     info = postgres.backup("shop", compress=False)
 
     expected = (
-        "sudo",
+        "runuser",
         "-u",
         "postgres",
+        "--",
         "pg_dump",
         "--no-password",
         "--format=plain",
@@ -247,7 +248,7 @@ def test_no_manager_operation_ever_invokes_a_shell(
 ) -> None:
     """No recorded command may name a shell or hand it a script."""
     runner.script(PSQL_PREFIX, stdout="1")
-    runner.script(["sudo", "-u", "postgres", "pg_dump"], stdout=NASTY_DUMP)
+    runner.script(["runuser", "-u", "postgres", "--", "pg_dump"], stdout=NASTY_DUMP)
     runner.script(["mysql"], stdout="shop")
     runner.script(["mysqldump"], stdout=NASTY_DUMP)
     runner.script(["mongosh"], stdout='["shop"]')
@@ -304,9 +305,10 @@ def test_postgres_statement_argv_is_stdin_only(
     postgres.database_exists("shop")
 
     assert runner.calls[-1] == (
-        "sudo",
+        "runuser",
         "-u",
         "postgres",
+        "--",
         "psql",
         "-v",
         "ON_ERROR_STOP=1",
@@ -326,17 +328,44 @@ def test_postgres_statement_argv_is_stdin_only(
         (
             False,
             "plain",
-            ("sudo", "-u", "postgres", "pg_dump", "--no-password", "--format=plain", "shop"),
+            (
+                "runuser",
+                "-u",
+                "postgres",
+                "--",
+                "pg_dump",
+                "--no-password",
+                "--format=plain",
+                "shop",
+            ),
         ),
         (
             True,
             "plain",
-            ("sudo", "-u", "postgres", "pg_dump", "--no-password", "--format=plain", "shop"),
+            (
+                "runuser",
+                "-u",
+                "postgres",
+                "--",
+                "pg_dump",
+                "--no-password",
+                "--format=plain",
+                "shop",
+            ),
         ),
         (
             False,
             "custom",
-            ("sudo", "-u", "postgres", "pg_dump", "--no-password", "--format=custom", "shop"),
+            (
+                "runuser",
+                "-u",
+                "postgres",
+                "--",
+                "pg_dump",
+                "--no-password",
+                "--format=custom",
+                "shop",
+            ),
         ),
     ],
 )
@@ -349,7 +378,7 @@ def test_postgres_backup_argv(
 ) -> None:
     """pg_dump is invoked with the format asked for and nothing else."""
     runner.script(PSQL_PREFIX, stdout="1")
-    runner.script(["sudo", "-u", "postgres", "pg_dump"], stdout="dump")
+    runner.script(["runuser", "-u", "postgres", "--", "pg_dump"], stdout="dump")
 
     postgres.backup("shop", compress=compress, format=dump_format)
 
@@ -371,9 +400,10 @@ def test_postgres_restore_stages_the_dump_for_the_postgres_account(
     assert runner.calls[-3] == ("chown", "postgres:postgres", staged)
     assert runner.calls[-2] == ("chmod", "600", staged)
     assert runner.calls[-1] == (
-        "sudo",
+        "runuser",
         "-u",
         "postgres",
+        "--",
         "psql",
         "-v",
         "ON_ERROR_STOP=1",
@@ -392,7 +422,9 @@ def test_postgres_failed_dump_is_reported_not_swallowed(
 ) -> None:
     """A dump that fails must not leave the caller thinking it has a backup."""
     runner.script(PSQL_PREFIX, stdout="1")
-    runner.script(["sudo", "-u", "postgres", "pg_dump"], stderr="permission denied", exit_code=1)
+    runner.script(
+        ["runuser", "-u", "postgres", "--", "pg_dump"], stderr="permission denied", exit_code=1
+    )
 
     with pytest.raises(Exception) as excinfo:
         postgres.backup("shop", compress=False)
@@ -703,7 +735,7 @@ def test_postgres_grant_splits_privileges_by_object_type(
 
     assert runner.inputs[-2] == 'GRANT CONNECT ON DATABASE "shop" TO "app";'
     assert runner.inputs[-1] == 'GRANT SELECT ON ALL TABLES IN SCHEMA public TO "app";'
-    assert runner.calls[-1][7] == "shop"
+    assert runner.calls[-1][8] == "shop"
 
 
 def test_postgres_revoke_uses_the_same_whitelist(
@@ -1102,7 +1134,7 @@ def test_backup_directory_wasm_owns_is_root_only(
 ) -> None:
     """WASM's own backup directory is created 0750 even under a lax umask."""
     runner.script(PSQL_PREFIX, stdout="1")
-    runner.script(["sudo", "-u", "postgres", "pg_dump"], stdout="dump")
+    runner.script(["runuser", "-u", "postgres", "--", "pg_dump"], stdout="dump")
 
     postgres.backup("shop", compress=False)
 
@@ -1116,7 +1148,7 @@ def test_backup_directory_wasm_owns_is_tightened_when_it_already_exists(
     postgres.BACKUP_DIR.mkdir(parents=True)
     postgres.BACKUP_DIR.chmod(0o777)
     runner.script(PSQL_PREFIX, stdout="1")
-    runner.script(["sudo", "-u", "postgres", "pg_dump"], stdout="dump")
+    runner.script(["runuser", "-u", "postgres", "--", "pg_dump"], stdout="dump")
 
     postgres.backup("shop", compress=False)
 
@@ -1131,7 +1163,7 @@ def test_a_directory_the_caller_chose_keeps_its_own_mode(
     chosen.mkdir()
     chosen.chmod(0o755)
     runner.script(PSQL_PREFIX, stdout="1")
-    runner.script(["sudo", "-u", "postgres", "pg_dump"], stdout="dump")
+    runner.script(["runuser", "-u", "postgres", "--", "pg_dump"], stdout="dump")
 
     postgres.backup("shop", output_path=chosen / "dump.sql", compress=False)
 
@@ -1278,7 +1310,7 @@ class TestReadOnlyEnforcement:
     """
 
     def test_postgres_wraps_a_read_in_a_read_only_transaction(self, postgres, runner):
-        runner.script(["sudo", "-u", "postgres", "psql"], stdout="1\n")
+        runner.script(["runuser", "-u", "postgres", "--", "psql"], stdout="1\n")
 
         postgres.execute_query(
             database="app",
@@ -1291,7 +1323,7 @@ class TestReadOnlyEnforcement:
         assert sent.rstrip().endswith("COMMIT;")
 
     def test_postgres_does_not_wrap_a_write(self, postgres, runner):
-        runner.script(["sudo", "-u", "postgres", "psql"], stdout="1\n")
+        runner.script(["runuser", "-u", "postgres", "--", "psql"], stdout="1\n")
 
         postgres.execute_query(database="app", query="DELETE FROM t", read_only=False)
 

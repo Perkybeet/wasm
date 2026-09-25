@@ -24,6 +24,7 @@ from wasm.core.runner import (
     SubprocessRunner,
     get_runner,
     is_read_only,
+    runuser_prefix,
     set_runner,
 )
 
@@ -308,13 +309,41 @@ class TestUserSwitching:
     """Running as another account is part of argv, not a shell escape."""
 
     def test_wraps_the_command_in_runuser(self):
-        fake = FakeRunner()
         real = SubprocessRunner()
         argv, _, redacted = real._prepare(["psql", "-c", "SELECT 1"], None, "postgres", ())
 
         assert argv[:4] == ["runuser", "-u", "postgres", "--"]
         assert redacted[:4] == ("runuser", "-u", "postgres", "--")
-        assert fake is not None
+
+    def test_runuser_prefix_is_the_one_definition_of_the_wrapping(self):
+        assert runuser_prefix("postgres") == ["runuser", "-u", "postgres", "--"]
+
+    def test_fake_runner_records_the_same_prefix_a_real_run_would_use(self):
+        fake = FakeRunner()
+
+        fake.run(["psql", "-c", "SELECT 1"], user="postgres")
+
+        assert fake.calls == [("runuser", "-u", "postgres", "--", "psql", "-c", "SELECT 1")]
+
+    def test_fake_runner_script_matches_against_the_wrapped_argv(self):
+        fake = FakeRunner()
+        fake.script(["runuser", "-u", "postgres", "--", "psql"], stdout="1\n")
+
+        result = fake.run(["psql"], user="postgres")
+
+        assert result.stdout == "1\n"
+
+    def test_fake_runner_stream_and_capture_apply_the_prefix_too(self, tmp_path):
+        fake = FakeRunner()
+
+        lines: list[str] = []
+        fake.stream(["psql"], on_line=lines.append, user="postgres")
+        fake.capture_to_file(["pg_dump", "app"], tmp_path / "dump.sql", user="postgres")
+
+        assert fake.calls == [
+            ("runuser", "-u", "postgres", "--", "psql"),
+            ("runuser", "-u", "postgres", "--", "pg_dump", "app"),
+        ]
 
 
 class TestGlobalRunner:
