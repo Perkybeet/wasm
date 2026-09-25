@@ -522,7 +522,7 @@ def make_runner(
     Returns:
         A :class:`wasm.core.runner.FakeRunner` answering from the model.
     """
-    from wasm.core.runner import CommandResult, FakeRunner
+    from wasm.core.runner import CommandResult, FakeRunner, runuser_prefix
 
     lock = threading.Lock()
 
@@ -550,13 +550,12 @@ def make_runner(
             self._stdin.value = kwargs.get("input") or ""
             return super().run(argv, **kwargs)
 
-        def _lookup(self, argv: Sequence[str]) -> CommandResult:
+        def _lookup(self, argv: Sequence[str], user: str | None = None) -> CommandResult:
             args = tuple(str(a) for a in argv)
-            self.calls.append(args)
-            # Answered as the command it wraps: a manager that prefixes sudo
-            # (or sudo -u postgres) asks the same question of the machine.
-            while args[:1] == ("sudo",):
-                args = args[3:] if args[1:2] == ("-u",) else args[1:]
+            recorded = (*runuser_prefix(user), *args) if user is not None else args
+            self.calls.append(recorded)
+            # Answered as the command it runs: switching the account (runuser -u
+            # postgres -- psql) asks the same question of the machine.
             program = args[0] if args else ""
             with lock:
                 if program == "systemctl":

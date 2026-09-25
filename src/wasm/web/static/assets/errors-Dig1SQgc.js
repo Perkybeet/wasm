@@ -1,0 +1,1 @@
+function e(e,t){if(typeof e!=`object`||!e||!(t in e))return null;let n=e[t];return typeof n==`string`&&n!==``?n:null}function t(t){let n=e(t,`detail`)??e(t,`message`)??String(t);return{hint:e(t,`hint`),detail:n}}export{t};
