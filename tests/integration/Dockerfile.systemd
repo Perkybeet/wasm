@@ -1,0 +1,64 @@
+# Ubuntu 24.04 with systemd as PID 1, for the WASM real-machine integration
+# harness (tests/integration/run.py).
+#
+# This is the standard "systemd in Docker" pattern: install systemd itself,
+# mask the units that only make sense on real hardware (getty, console,
+# udev triggers that never fire without real devices), and let /sbin/init
+# run as PID 1. The container must be started with --privileged
+# --cgroupns=host and the host cgroup filesystem bind-mounted read-write, plus
+# tmpfs mounts for /run and /run/lock - run.py does all of that.
+#
+# certbot is deliberately not installed: every scenario that needs a
+# certificate is skipped in favour of --no-ssl, because this container has no
+# real domain and no path to the public internet's ACME servers.
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        systemd \
+        systemd-sysv \
+        dbus \
+        nginx \
+        git \
+        curl \
+        ca-certificates \
+        python3 \
+        python3-venv \
+        python3-pip \
+        nodejs \
+        npm \
+        sqlite3 \
+        procps \
+        iproute2 \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Units that assume real hardware or an interactive console. Masking them is
+# what keeps `systemctl is-system-running` from sitting in "starting" forever
+# waiting for a getty that will never attach to anything in a container.
+RUN systemctl mask \
+        getty.target \
+        getty-static.service \
+        console-getty.service \
+        systemd-udevd.service \
+        systemd-udev-trigger.service \
+        systemd-udevd-kernel.socket \
+        systemd-udevd-control.socket \
+        systemd-modules-load.service \
+        systemd-random-seed.service \
+        sys-kernel-config.mount \
+        sys-kernel-debug.mount \
+        sys-kernel-tracing.mount \
+        systemd-remount-fs.service \
+    && systemctl set-default multi-user.target
+
+# nginx starts under its own unit once WASM configures a site; the packaged
+# default site is removed so it never answers on port 80 before that.
+RUN rm -f /etc/nginx/sites-enabled/default
+
+STOPSIGNAL SIGRTMIN+3
+
+CMD ["/sbin/init"]
