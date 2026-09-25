@@ -52,6 +52,7 @@ from wasm.managers.database.base import (
     DatabaseInfo,
     UserInfo,
 )
+from wasm.web.server import get_token_manager
 
 #: The password the fake engine issues when the operator does not choose one.
 #: It must appear in exactly one response, ever.
@@ -414,6 +415,14 @@ def test_the_console_refuses_a_write_without_the_opt_in(client, db) -> None:
 
 def test_the_console_writes_only_with_the_checkbox(client, db) -> None:
     """Ticking "Allow writes" is the explicit mode='write' the API demands."""
+    # A write through the console is the same operation POST /api/databases/query
+    # performs in mode="write", so it is the same sudo-mode confirmation that
+    # gates it (tests/test_web_sudo.py); the read-only path above needs none.
+    elevated = client.post(
+        "/api/auth/elevate", json={"token": get_token_manager().generate_master_token()}
+    )
+    assert elevated.status_code == 200, elevated.text
+
     response = client.post(
         "/databases/console",
         data={"target": "postgresql:appdb", "query": "DELETE FROM t", "allow_writes": "yes"},

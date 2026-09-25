@@ -33,7 +33,13 @@ from wasm.managers.service_manager import ServiceManager
 from wasm.validators.environment import EnvironmentValidationError, validate_environment
 from wasm.validators.port import find_available_port, validate_port
 from wasm.web.api.auth import get_current_session
-from wasm.web.api.deps import JobAcceptedResponse, WASMErrorRoute, strict_domain
+from wasm.web.api.deps import (
+    JobAcceptedResponse,
+    WASMErrorRoute,
+    ensure_elevated,
+    require_elevated,
+    strict_domain,
+)
 from wasm.web.auth import ensure_scope, get_audit_logger, get_client_ip
 from wasm.web.jobs import JobType, delete_app_job, deploy_app_job, get_job_manager
 
@@ -636,6 +642,7 @@ def get_app_env(
         # policy: the panel's reveal and edit pages call this function too, and
         # a guard keyed on the /api path let a read token through them.
         ensure_scope(request, session, "admin")
+        ensure_elevated(request, session)
 
     app = _env_app(domain)
     values = (
@@ -663,7 +670,7 @@ def update_app_env(
     domain: str,
     body: UpdateAppEnvRequest,
     request: Request,
-    session: Annotated[dict, Depends(get_current_session)],
+    session: Annotated[dict, Depends(require_elevated)],
 ) -> AppEnvUpdateResponse:
     """
     Replace an application's ``.env`` file wholesale.
@@ -722,7 +729,7 @@ def update_app_env(
 @router.delete("/{domain}", response_model=JobAcceptedResponse, status_code=202)
 def delete_app(
     domain: str,
-    session: Annotated[dict, Depends(get_current_session)],
+    session: Annotated[dict, Depends(require_elevated)],
     remove_files: Annotated[bool, Query()] = False,
     remove_ssl: Annotated[bool, Query()] = False,
 ) -> JobAcceptedResponse:

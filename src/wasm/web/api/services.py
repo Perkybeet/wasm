@@ -30,7 +30,7 @@ from wasm.core.store import get_store
 from wasm.managers.service_manager import ServiceManager
 from wasm.validators.names import resolve_within, validate_service_name
 from wasm.web.api.auth import get_current_session
-from wasm.web.api.deps import WASMErrorRoute
+from wasm.web.api.deps import WASMErrorRoute, require_elevated
 from wasm.web.auth import ensure_scope
 
 # The error boundary: ValidationError and SecurityError from name/path
@@ -471,7 +471,7 @@ def update_service_config(
     name: str,
     data: UpdateServiceConfigRequest,
     request: Request,
-    session: dict = Depends(get_current_session),
+    session: dict = Depends(require_elevated),
 ):
     """
     Update the systemd unit file content for a service.
@@ -547,7 +547,7 @@ def create_service(
 
 
 @router.delete("/{name}", response_model=ServiceActionResponse)
-def delete_service(name: str, request: Request, session: dict = Depends(get_current_session)):
+def delete_service(name: str, request: Request, session: dict = Depends(require_elevated)):
     """
     Delete a systemd service.
     """

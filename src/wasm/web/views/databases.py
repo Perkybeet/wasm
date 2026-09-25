@@ -319,7 +319,7 @@ def console_run(request: Request, body: bytes = Body(default=b"")) -> HTMLRespon
         )
 
     try:
-        result = execute_query(model, _session(request))
+        result = execute_query(model, request, _session(request))
     except WASMError as exc:
         return _console_fragment(request, problem=_refusal(exc), **redisplay)
     return _console_fragment(request, result=result, **redisplay)

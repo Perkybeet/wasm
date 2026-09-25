@@ -37,7 +37,7 @@ import logging
 from pathlib import Path
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from wasm.core.exceptions import (
@@ -53,7 +53,12 @@ from wasm.managers.database import (
 from wasm.managers.service_manager import ServiceManager
 from wasm.validators.names import resolve_within, validate_filename
 from wasm.web.api.auth import get_current_session
-from wasm.web.api.deps import JobAcceptedResponse, WASMErrorRoute
+from wasm.web.api.deps import (
+    JobAcceptedResponse,
+    WASMErrorRoute,
+    ensure_elevated,
+    require_elevated,
+)
 from wasm.web.jobs import JobType, database_engine_job, get_job_manager
 
 router = APIRouter(route_class=WASMErrorRoute)
@@ -820,7 +825,7 @@ def get_database_info(
 def drop_database(
     engine: str,
     name: str,
-    session: Annotated[dict, Depends(get_current_session)],
+    session: Annotated[dict, Depends(require_elevated)],
     force: Annotated[bool, Query(description="Disconnect clients first")] = False,
 ) -> ActionResponse:
     """
@@ -1019,7 +1024,7 @@ def list_users(
 def delete_user(
     engine: str,
     username: str,
-    session: Annotated[dict, Depends(get_current_session)],
+    session: Annotated[dict, Depends(require_elevated)],
     host: Annotated[str, Query()] = "localhost",
 ) -> ActionResponse:
     """
@@ -1183,7 +1188,9 @@ def restore_backup(
 
 @router.post("/query", response_model=QueryResponse)
 def execute_query(
-    request: QueryRequest, session: Annotated[dict, Depends(get_current_session)]
+    request: QueryRequest,
+    http_request: Request,
+    session: Annotated[dict, Depends(get_current_session)],
 ) -> QueryResponse:
     """
     Run one statement against a database.
@@ -1193,6 +1200,8 @@ def execute_query(
 
     Args:
         request: The query request.
+        http_request: The incoming request, for the audit record of a write
+            refused for want of elevation.
         session: The authenticated session.
 
     Returns:
@@ -1201,7 +1210,13 @@ def execute_query(
     Raises:
         DatabaseQueryError: When the statement is empty, is more than one
             statement, or is not a read in read mode.
+        HTTPException: 403 with ``error: "elevation_required"`` when a write
+            is attempted from a cookie session that has not confirmed
+            recently. See D5: a read needs only the session's own scope.
     """
+    if request.mode == "write":
+        ensure_elevated(http_request, session)
+
     manager = get_manager(request.engine)
     check_running(manager)
 

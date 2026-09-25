@@ -32,7 +32,7 @@ from pydantic import BaseModel, Field
 
 from wasm.core.config import DEFAULT_CONFIG, Config, redact_secrets
 from wasm.web.api.auth import get_current_session
-from wasm.web.api.deps import WASMErrorRoute
+from wasm.web.api.deps import WASMErrorRoute, require_elevated
 
 # The error boundary: Config.replace()/set() raise ConfigError (a WASMError)
 # for a rejected key, which used to crash with a bare 500 because this router
@@ -207,7 +207,7 @@ def get_config(session: dict = Depends(get_current_session)) -> ConfigResponse:
 
 @router.put("")
 def update_config(
-    request: ConfigUpdateRequest, session: dict = Depends(get_current_session)
+    request: ConfigUpdateRequest, session: dict = Depends(require_elevated)
 ) -> dict[str, str]:
     """
     Replace the full configuration.
@@ -233,7 +233,7 @@ def update_config(
 
 @router.patch("")
 def patch_config(
-    request: ConfigPatchRequest, session: dict = Depends(get_current_session)
+    request: ConfigPatchRequest, session: dict = Depends(require_elevated)
 ) -> dict[str, Any]:
     """
     Update a single configuration value addressed by a dotted path.

@@ -58,7 +58,17 @@ def client(sandbox: Path, runner: object) -> TestClient:
     """
     test_client = build_client(sandbox)
     token = get_token_manager().generate_master_token()
-    login(test_client, token)
+    body = login(test_client, token)
+    # Several tests below mutate through an endpoint sudo mode now guards
+    # (PUT /api/config); this fixture is about the error contract, not about
+    # elevation, so it confirms once up front rather than making every test
+    # that touches a guarded endpoint do it.
+    elevated = test_client.post(
+        "/api/auth/elevate",
+        json={"token": token},
+        headers={CSRF_HEADER_NAME: body["csrf_token"]},
+    )
+    assert elevated.status_code == 200, elevated.text
     return test_client
 
 

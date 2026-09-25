@@ -35,7 +35,7 @@ from wasm.web.auth import (
 from wasm.web.server import _uvicorn_kwargs, create_app, get_token_manager
 
 #: Endpoints that answer without credentials, on purpose.
-PUBLIC_API_PATHS = frozenset({"/api/auth/login"})
+PUBLIC_API_PATHS = frozenset({"/api/auth/login", "/api/auth/session"})
 
 #: The bind address an operator reaches for when they want the panel "on the
 #: network". Every test that uses it expects a refusal or an explicit guard.
@@ -47,7 +47,9 @@ ALL_INTERFACES = "0.0.0.0"  # noqa: S104 - the address under test, not a bind
 #: what authenticates a delivery is the per-app HMAC secret checked inside the
 #: route; an anonymous probe gets a generic 404. See tests/test_web_hooks.py
 #: for the refusals that route owes.
-PUBLIC_PATHS = frozenset({"/", "/login", "/health", "/api/auth/login", "/hooks/deploy/{domain}"})
+PUBLIC_PATHS = frozenset(
+    {"/", "/login", "/health", "/api/auth/login", "/api/auth/session", "/hooks/deploy/{domain}"}
+)
 
 
 def make_config(sandbox: Path, **overrides) -> SecurityConfig:
@@ -1052,6 +1054,12 @@ def test_disable_requires_a_current_code_and_restores_plain_login(sandbox: Path)
     token = get_token_manager().generate_master_token()
     csrf = login(client, token)["csrf_token"]
     secret, _codes = enable_totp(client, csrf)
+    elevated = client.post(
+        "/api/auth/elevate",
+        json={"code": totp.totp_now(secret)},
+        headers={CSRF_HEADER_NAME: csrf},
+    )
+    assert elevated.status_code == 200, elevated.text
 
     refused = client.post(
         "/api/auth/2fa/disable", json={"code": "000000"}, headers={CSRF_HEADER_NAME: csrf}
@@ -1081,7 +1089,13 @@ def test_a_backup_code_can_disable_when_the_authenticator_is_lost(sandbox: Path)
     client = build_client(sandbox)
     token = get_token_manager().generate_master_token()
     csrf = login(client, token)["csrf_token"]
-    _secret, codes = enable_totp(client, csrf)
+    secret, codes = enable_totp(client, csrf)
+    elevated = client.post(
+        "/api/auth/elevate",
+        json={"code": totp.totp_now(secret)},
+        headers={CSRF_HEADER_NAME: csrf},
+    )
+    assert elevated.status_code == 200, elevated.text
 
     response = client.post(
         "/api/auth/2fa/disable", json={"code": codes[-1]}, headers={CSRF_HEADER_NAME: csrf}
@@ -1245,6 +1259,7 @@ def bearer(token: str) -> dict[str, str]:
 def issue_token(
     client: TestClient,
     csrf: str,
+    master: str,
     name: str = "ci",
     scope: str = "read",
     expires_hours: int | None = None,
@@ -1252,9 +1267,16 @@ def issue_token(
     """
     Issue an API token through the API.
 
+    Minting a token is one of the actions D5's sudo mode guards (see
+    tests/test_web_sudo.py), so a cookie session has to confirm itself before
+    it may - this is not what any of this helper's callers are testing, so it
+    elevates first rather than making every one of them do it.
+
     Args:
         client: A signed-in client.
         csrf: The session's CSRF token.
+        master: The master token, to confirm sudo mode with. Two-factor
+            authentication is never enabled in a test that calls this.
         name: Token name.
         scope: Token scope.
         expires_hours: Optional lifetime in hours.
@@ -1262,6 +1284,11 @@ def issue_token(
     Returns:
         The creation response body, the only place the token is ever clear.
     """
+    elevated = client.post(
+        "/api/auth/elevate", json={"token": master}, headers={CSRF_HEADER_NAME: csrf}
+    )
+    assert elevated.status_code == 200, elevated.text
+
     body: dict[str, object] = {"name": name, "scope": scope}
     if expires_hours is not None:
         body["expires_hours"] = expires_hours
@@ -1286,7 +1313,7 @@ def test_a_read_token_reads_but_cannot_mutate_and_the_refusal_is_audited(
     client = build_client(sandbox)
     master = get_token_manager().generate_master_token()
     csrf = login(client, master)["csrf_token"]
-    issued = issue_token(client, csrf, name="reader", scope="read")
+    issued = issue_token(client, csrf, master, name="reader", scope="read")
     assert issued["token"].startswith("wasm_tok_")
     assert issued["scope"] == "read"
 
@@ -1322,7 +1349,7 @@ def test_a_read_token_cannot_unmask_an_environment(sandbox: Path, runner: object
     client = build_client(sandbox)
     master = get_token_manager().generate_master_token()
     csrf = login(client, master)["csrf_token"]
-    issued = issue_token(client, csrf, name="dashboard", scope="read")
+    issued = issue_token(client, csrf, master, name="dashboard", scope="read")
 
     refused = client.get(
         "/api/apps/example.com/env", params={"unmask": "true"}, headers=bearer(issued["token"])
@@ -1355,7 +1382,7 @@ def test_no_route_hands_a_read_token_a_secret(sandbox: Path, runner: object, pat
     client = build_client(sandbox)
     master = get_token_manager().generate_master_token()
     csrf = login(client, master)["csrf_token"]
-    reader = issue_token(client, csrf, name="dashboard", scope="read")["token"]
+    reader = issue_token(client, csrf, master, name="dashboard", scope="read")["token"]
     client.cookies.clear()
 
     refused = client.get(path, headers=bearer(reader))
@@ -1376,7 +1403,7 @@ def test_a_deploy_token_queues_deployments_but_cannot_delete(
     client = build_client(sandbox)
     master = get_token_manager().generate_master_token()
     csrf = login(client, master)["csrf_token"]
-    issued = issue_token(client, csrf, name="deployer", scope="deploy")
+    issued = issue_token(client, csrf, master, name="deployer", scope="deploy")
 
     captured: list[dict] = []
 
@@ -1414,13 +1441,33 @@ def test_a_deploy_token_queues_deployments_but_cannot_delete(
         captured.append(dict(kwargs))
         return Queued()
 
-    fake = type("FakeJobs", (), {"create_job": staticmethod(create_job)})()
-    monkeypatch.setattr("wasm.web.api.jobs.get_job_manager", lambda: fake)
+    class FakeStore:
+        """Stands in for the store; the endpoint only checks for a conflict."""
 
+        def get_app(self, domain: str) -> None:
+            """
+            Args:
+                domain: Ignored; the domain is always reported free.
+
+            Returns:
+                None, so the endpoint never refuses with a 409.
+            """
+            return None
+
+    fake = type("FakeJobs", (), {"create_job": staticmethod(create_job)})()
+    monkeypatch.setattr("wasm.web.api.apps.get_job_manager", lambda: fake)
+    monkeypatch.setattr("wasm.web.api.apps.get_store", lambda: FakeStore())
+
+    # There is one route that queues a deployment, POST /api/apps;
+    # POST /api/jobs/deploy was a duplicate of it and has been removed.
     accepted = client.post(
-        "/api/jobs/deploy",
+        "/api/apps",
         headers=bearer(issued["token"]),
-        json={"domain": "app.example.com", "source": "https://github.com/you/app"},
+        json={
+            "domain": "app.example.com",
+            "source": "https://github.com/you/app",
+            "port": 4000,
+        },
     )
     assert accepted.status_code == 202, accepted.text
     assert captured, "the deployment never reached the job manager"
@@ -1439,7 +1486,7 @@ def test_an_expired_api_token_is_refused(sandbox: Path) -> None:
     client = build_client(sandbox)
     master = get_token_manager().generate_master_token()
     csrf = login(client, master)["csrf_token"]
-    issued = issue_token(client, csrf, name="short-lived", scope="admin", expires_hours=1)
+    issued = issue_token(client, csrf, master, name="short-lived", scope="admin", expires_hours=1)
 
     before = client.get("/api/auth/verify", headers=bearer(issued["token"]))
     assert before.status_code == 200
@@ -1458,7 +1505,7 @@ def test_a_revoked_api_token_is_refused(sandbox: Path) -> None:
     client = build_client(sandbox)
     master = get_token_manager().generate_master_token()
     csrf = login(client, master)["csrf_token"]
-    issued = issue_token(client, csrf, name="doomed", scope="read")
+    issued = issue_token(client, csrf, master, name="doomed", scope="read")
 
     assert client.get("/api/auth/verify", headers=bearer(issued["token"])).status_code == 200
 
@@ -1522,7 +1569,7 @@ def test_the_clear_token_appears_only_in_the_creation_response(
     client = build_client(sandbox)
     master = get_token_manager().generate_master_token()
     csrf = login(client, master)["csrf_token"]
-    issued = issue_token(client, csrf, name="once-only", scope="deploy")
+    issued = issue_token(client, csrf, master, name="once-only", scope="deploy")
 
     listing = client.get("/api/auth/tokens")
     assert listing.status_code == 200
@@ -1546,7 +1593,7 @@ def test_token_management_needs_admin_even_for_the_listing(sandbox: Path) -> Non
     client = build_client(sandbox)
     master = get_token_manager().generate_master_token()
     csrf = login(client, master)["csrf_token"]
-    issued = issue_token(client, csrf, name="curious", scope="read")
+    issued = issue_token(client, csrf, master, name="curious", scope="read")
 
     assert client.get("/api/auth/tokens", headers=bearer(issued["token"])).status_code == 403
     assert (
@@ -1559,7 +1606,7 @@ def test_token_management_needs_admin_even_for_the_listing(sandbox: Path) -> Non
     )
 
     # An admin-scoped token manages tokens the way the master token does.
-    admin = issue_token(client, csrf, name="steward", scope="admin")
+    admin = issue_token(client, csrf, master, name="steward", scope="admin")
     assert client.get("/api/auth/tokens", headers=bearer(admin["token"])).status_code == 200
 
 
@@ -1568,7 +1615,7 @@ def test_a_duplicate_token_name_is_refused_with_the_reason(sandbox: Path) -> Non
     client = build_client(sandbox)
     master = get_token_manager().generate_master_token()
     csrf = login(client, master)["csrf_token"]
-    issue_token(client, csrf, name="ci", scope="read")
+    issue_token(client, csrf, master, name="ci", scope="read")
 
     duplicate = client.post(
         "/api/auth/tokens",

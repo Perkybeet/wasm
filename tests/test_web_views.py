@@ -714,6 +714,24 @@ def test_an_application_environment_hides_its_credentials(
 # ------------------------------------------------------- app environment editor
 
 
+def elevate(client: TestClient) -> None:
+    """
+    Confirm sudo mode for the signed-in client.
+
+    Revealing a ``.env`` in clear and writing one are both actions D5 guards
+    (see tests/test_web_sudo.py for the gate itself); this section is about
+    the environment editor's own behaviour, so it confirms once per test that
+    needs it rather than that being what is under test here.
+
+    Args:
+        client: A signed-in client.
+    """
+    response = client.post(
+        "/api/auth/elevate", json={"token": get_token_manager().generate_master_token()}
+    )
+    assert response.status_code == 200, response.text
+
+
 def test_get_app_env_redacts_secret_looking_keys_by_default(
     client: TestClient, store: WASMStore, tmp_path: Path
 ) -> None:
@@ -749,6 +767,7 @@ def test_get_app_env_unmask_returns_clear_values_and_is_audited(
 ) -> None:
     """``?unmask=true`` is the explicit request, and it leaves a trail."""
     deployed_env(store, tmp_path, env_text=f"API_KEY={ENV_SECRET}\n")
+    elevate(client)
 
     response = client.get("/api/apps/example.com/env", params={"unmask": "true"})
 
@@ -768,6 +787,7 @@ def test_put_app_env_rewrites_the_file_and_reports_restart_required(
 ) -> None:
     """A full roundtrip: the file on disk becomes exactly what was sent."""
     app_dir = deployed_env(store, tmp_path, env_text="API_KEY=old\n")
+    elevate(client)
 
     response = client.put(
         "/api/apps/example.com/env",
@@ -785,6 +805,7 @@ def test_put_app_env_rejects_an_invalid_name_with_422(
 ) -> None:
     """A name that could inject a systemd directive is refused before any write."""
     app_dir = deployed_env(store, tmp_path, env_text="API_KEY=old\n")
+    elevate(client)
 
     response = client.put("/api/apps/example.com/env", json={"variables": {"BAD NAME": "x"}})
 
@@ -798,6 +819,7 @@ def test_put_app_env_never_writes_a_value_to_the_audit_log(
 ) -> None:
     """The audit line names the changed keys; the values never appear anywhere near it."""
     deployed_env(store, tmp_path, env_text="API_KEY=old\n")
+    elevate(client)
 
     response = client.put(
         "/api/apps/example.com/env",
@@ -834,6 +856,7 @@ def test_reveal_shows_the_values_in_clear_and_is_audited(
 ) -> None:
     """The htmx Reveal control is the same audited read as ?unmask=true."""
     deployed_env(store, tmp_path, env_text=f"API_KEY={ENV_SECRET}\n")
+    elevate(client)
 
     response = client.get("/apps/example.com/env/reveal")
 
@@ -850,6 +873,7 @@ def test_edit_prefills_the_textarea_with_clear_values(
 ) -> None:
     """The operator has to see what they are editing."""
     deployed_env(store, tmp_path, env_text=f"API_KEY={ENV_SECRET}\nPORT=3000\n")
+    elevate(client)
 
     response = client.get("/apps/example.com/env/edit")
 
@@ -878,6 +902,7 @@ def test_saving_an_invalid_line_is_refused_inline_and_keeps_the_edit_open(
 ) -> None:
     """A rejected save re-opens the editor with what was typed, not the old file."""
     app_dir = deployed_env(store, tmp_path, env_text="API_KEY=old\n")
+    elevate(client)
 
     response = client.post("/apps/example.com/env/save", data={"env": "BAD NAME=x"})
 

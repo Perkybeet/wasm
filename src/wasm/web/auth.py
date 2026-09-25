@@ -46,6 +46,7 @@ import secrets
 import sqlite3
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -141,7 +142,6 @@ DEPLOY_SCOPE_PATHS = frozenset(
     {
         "/api/apps",
         "/api/apps/inspect",
-        "/api/jobs/deploy",
         "/api/jobs/update",
         "/api/jobs/rollback",
     }
@@ -174,6 +174,17 @@ AUDIT_BACKUPS = 3
 
 FILE_MODE = 0o600
 DIR_MODE = 0o700
+
+#: How long POST /api/auth/elevate confirms a cookie session for, per D5:
+#: "marca la sesion como elevada 10 minutos". Destructive actions - deleting
+#: an app, a database, a service or a site, revealing a .env, writing raw
+#: config - all require it.
+ELEVATION_SECONDS = 600
+
+#: Indirection over time.time(), so a test can advance a fake clock to expire
+#: an elevation window without perturbing session expiry, which is computed
+#: from the real wall clock elsewhere in this module.
+_now: Callable[[], float] = time.time
 
 
 def utcnow() -> datetime:
@@ -736,6 +747,10 @@ class SessionStore:
                     "ALTER TABLE sessions ADD COLUMN created_at REAL NOT NULL DEFAULT 0"
                 )
                 self._conn.execute("UPDATE sessions SET created_at = issued_at")
+            if "elevated_until" not in columns:
+                # NULL by default: a session predating sudo mode, like a
+                # freshly created one, has not confirmed anything yet.
+                self._conn.execute("ALTER TABLE sessions ADD COLUMN elevated_until REAL")
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS ws_tickets (
@@ -831,6 +846,20 @@ class SessionStore:
                 "UPDATE sessions SET expires_at = ? WHERE sid = ?", (expires_at, sid)
             )
 
+    def set_elevated(self, sid: str, elevated_until: float | None) -> None:
+        """
+        Record or clear a session's sudo-mode confirmation.
+
+        Args:
+            sid: Session identifier.
+            elevated_until: Timestamp the elevation expires at, or None to
+                drop it, for example on logout.
+        """
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE sessions SET elevated_until = ? WHERE sid = ?", (elevated_until, sid)
+            )
+
     def rotate(self, old_sid: str, new_sid: str, csrf_token: str, expires_at: float) -> dict | None:
         """
         Replace a session with a fresh identifier in one transaction.
@@ -853,9 +882,19 @@ class SessionStore:
                 return None
             self._conn.execute(
                 "INSERT OR REPLACE INTO sessions "
-                "(sid, csrf_token, client_ip, issued_at, created_at, expires_at, revoked) "
-                "VALUES (?, ?, ?, ?, ?, ?, 0)",
-                (new_sid, csrf_token, row["client_ip"], now, row["created_at"], expires_at),
+                "(sid, csrf_token, client_ip, issued_at, created_at, expires_at, revoked, "
+                "elevated_until) VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+                (
+                    new_sid,
+                    csrf_token,
+                    row["client_ip"],
+                    now,
+                    row["created_at"],
+                    expires_at,
+                    # Renewal must not reset the 10 minute window, only carry
+                    # whatever is left of it to the new session id.
+                    row["elevated_until"],
+                ),
             )
             # The retired identifier is not deleted outright: a dashboard fires
             # several requests at once and they all still carry the old cookie.
@@ -1872,6 +1911,7 @@ class TokenManager:
         # A session is an operator in a browser; scopes exist to narrow
         # automation, not to narrow the person holding the panel.
         payload["scope"] = "admin"
+        payload["elevated_until"] = record.get("elevated_until")
         return payload
 
     def _absolute_seconds(self) -> float:
@@ -1947,6 +1987,22 @@ class TokenManager:
             expires_at=expires.timestamp(),
             max_age=int(expires.timestamp() - now_ts),
         )
+
+    def elevate(self, sid: str, seconds: int = ELEVATION_SECONDS) -> float:
+        """
+        Confirm a session for sudo mode: the destructive actions D5 names.
+
+        Args:
+            sid: Session identifier being elevated.
+            seconds: How long the confirmation lasts. Defaults to the ten
+                minutes the design calls for.
+
+        Returns:
+            The elevation deadline, as a UNIX timestamp.
+        """
+        elevated_until = _now() + seconds
+        self.sessions.set_elevated(sid, elevated_until)
+        return elevated_until
 
     def issue_ws_ticket(self, session_id: str, client_ip: str) -> tuple[str, int]:
         """
@@ -2426,6 +2482,26 @@ def record_auth_failure(client_ip: str, resource: str, source: str) -> None:
         )
 
 
+def is_elevated(payload: dict[str, Any]) -> bool:
+    """
+    Report whether a session payload is currently inside its sudo-mode window.
+
+    Args:
+        payload: A verified session payload, as :func:`require_auth` builds
+            it. Only a cookie session ever carries a meaningful
+            ``elevated_until``; see :func:`wasm.web.api.deps.ensure_elevated`
+            for who is asked at all.
+
+    Returns:
+        True while ``POST /api/auth/elevate`` was called within the last
+        :data:`ELEVATION_SECONDS`.
+    """
+    elevated_until = payload.get("elevated_until")
+    if elevated_until is None:
+        return False
+    return float(elevated_until) > _now()
+
+
 def scope_satisfies(granted: str, required: str) -> bool:
     """
     Report whether a granted scope covers a required one.
@@ -2552,14 +2628,19 @@ def verify_credential(
         credential: A session token or the master token.
         client_ip: Address presenting it.
         resource: Path being reached, for the audit record.
-        source: Channel the credential arrived on.
+        source: Channel the credential arrived on: ``"cookie"`` or ``"bearer"``.
 
     Returns:
-        The session payload, or None when the credential is not valid.
+        The session payload, tagged with the channel it arrived on under
+        ``"source"`` - :func:`require_elevated` reads it to tell a browser's
+        cookie session from automation presenting a Bearer credential -, or
+        None when the credential is not valid.
     """
     payload = check_credential(credential, client_ip)
     if payload is None:
         record_auth_failure(client_ip, resource, source)
+        return None
+    payload["source"] = source
     return payload
 
 

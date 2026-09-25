@@ -287,7 +287,7 @@ def test_a_read_token_cannot_cancel_a_job_over_the_socket(sandbox: Path) -> None
     client = build_client(sandbox)
     master = get_token_manager().generate_master_token()
     csrf = login(client, master)["csrf_token"]
-    reader = issue_token(client, csrf, name="dashboard", scope="read")["token"]
+    reader = issue_token(client, csrf, master, name="dashboard", scope="read")["token"]
 
     # A job that is queued but never started: exactly what cancel can stop.
     manager = get_job_manager()

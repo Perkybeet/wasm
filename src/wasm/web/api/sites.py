@@ -37,7 +37,7 @@ from wasm.managers.apache_manager import ApacheManager
 from wasm.managers.nginx_manager import NginxManager
 from wasm.managers.webserver import WebServerManager
 from wasm.web.api.auth import get_current_session
-from wasm.web.api.deps import WASMErrorRoute, strict_domain
+from wasm.web.api.deps import WASMErrorRoute, require_elevated, strict_domain
 
 router = APIRouter(route_class=WASMErrorRoute)
 
@@ -389,7 +389,7 @@ def get_site_config(
 def update_site_config(
     domain: str,
     data: UpdateSiteConfigRequest,
-    session: Annotated[dict, Depends(get_current_session)],
+    session: Annotated[dict, Depends(require_elevated)],
 ) -> SiteActionResponse:
     """
     Replace the raw configuration of a site.
@@ -487,7 +487,7 @@ def disable_site(
 
 @router.delete("/{domain}", response_model=SiteActionResponse)
 def delete_site(
-    domain: str, session: Annotated[dict, Depends(get_current_session)]
+    domain: str, session: Annotated[dict, Depends(require_elevated)]
 ) -> SiteActionResponse:
     """
     Delete a site configuration.

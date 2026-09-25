@@ -34,7 +34,7 @@ from __future__ import annotations
 from collections.abc import Callable, Coroutine, Mapping
 from typing import Any
 
-from fastapi import Depends, FastAPI, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.exception_handlers import (
     http_exception_handler as _default_http_exception_handler,
 )
@@ -60,7 +60,14 @@ from wasm.core.exceptions import (
     PermissionError as WASMPermissionError,
 )
 from wasm.validators.domain import validate_domain
-from wasm.web.auth import SCOPE_RANK, ensure_scope, require_auth
+from wasm.web.auth import (
+    SCOPE_RANK,
+    ensure_scope,
+    get_audit_logger,
+    get_client_ip,
+    is_elevated,
+    require_auth,
+)
 from wasm.web.pydantic_compat import dump_model
 
 #: Requests under this prefix are the JSON API and answer in the contract this
@@ -449,6 +456,79 @@ def require_scope(scope: str) -> Callable[..., Coroutine[Any, Any, dict[str, Any
         return session
 
     return dependency
+
+
+#: Wire format for a refused destructive action, per D5 and the auth
+#: endpoints' own error shape: passes through ``handle_http_exception``
+#: verbatim because it already carries ``error``.
+_ELEVATION_REQUIRED_DETAIL: dict[str, Any] = {
+    "error": "elevation_required",
+    "detail": "Confirm it's you to continue",
+    "hint": "POST /api/auth/elevate with your two-factor code, or the master token.",
+    "fields": None,
+}
+
+
+def ensure_elevated(request: Request, session: dict[str, Any]) -> None:
+    """
+    Refuse a destructive action from a cookie session that has not confirmed recently.
+
+    This is the chokepoint D5's sudo mode runs at. A browser holding a session
+    cookie must have called ``POST /api/auth/elevate`` within the last ten
+    minutes; automation presenting a Bearer credential - an admin-scoped API
+    token or the master token - is exempt, because issuing that credential at
+    all already required an operator's confirmation once. Which channel a
+    session arrived on is decided once, at ``require_auth``, and carried here
+    as ``session["source"]`` rather than re-derived, so this can be called
+    both as a route dependency and, for the handful of endpoints where
+    elevation depends on the request body (a write-mode database query, an
+    unmasked env read), directly from inside the handler.
+
+    Args:
+        request: The incoming request, for the audit record.
+        session: The authenticated session payload.
+
+    Raises:
+        HTTPException: 403 with ``error: "elevation_required"`` when a cookie
+            session has not elevated, or its window has expired.
+    """
+    if session.get("source") != "cookie" or is_elevated(session):
+        return
+
+    audit = get_audit_logger()
+    if audit:
+        audit.record(
+            action="auth.elevation",
+            result="denied",
+            client_ip=get_client_ip(request),
+            actor=str(session.get("sid", "unknown")),
+            resource=request.url.path,
+            detail="session is not elevated",
+        )
+    raise HTTPException(status_code=403, detail=dict(_ELEVATION_REQUIRED_DETAIL))
+
+
+async def require_elevated(
+    request: Request, session: dict[str, Any] = Depends(require_auth)
+) -> dict[str, Any]:
+    """
+    Dependency form of :func:`ensure_elevated`, for endpoints that require it
+    unconditionally.
+
+    Args:
+        request: The incoming request.
+        session: The authenticated session payload.
+
+    Returns:
+        The session payload, exactly as ``require_auth`` does, so it can
+        replace it in an endpoint signature.
+
+    Raises:
+        HTTPException: 403 with ``error: "elevation_required"``, per
+            :func:`ensure_elevated`.
+    """
+    ensure_elevated(request, session)
+    return session
 
 
 def strict_domain(value: str) -> str:

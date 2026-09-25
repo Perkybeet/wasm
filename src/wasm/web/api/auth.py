@@ -11,17 +11,22 @@ bug cannot steal.
 from __future__ import annotations
 
 import socket
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
+from wasm import __version__
 from wasm.core.totp import provisioning_uri
-from wasm.web.api.deps import WASMErrorRoute, require_scope
+from wasm.web.api.deps import WASMErrorRoute, require_elevated, require_scope
 from wasm.web.auth import (
     CSRF_COOKIE_NAME,
+    CSRF_HEADER_NAME,
     SESSION_COOKIE_NAME,
     IssuedSession,
+    bearer_token,
+    check_credential,
     get_audit_logger,
     get_client_ip,
     is_secure_request,
@@ -100,6 +105,79 @@ class WebSocketTicket(BaseModel):
 
     ticket: str
     expires_in: int
+
+
+class SessionInfo(BaseModel):
+    """
+    Bootstrap information the console reads before it knows anything else.
+
+    Answered for an anonymous caller too, with ``authenticated=False``, so the
+    console can decide between the sign-in screen and the shell from one
+    request instead of treating a 401 as "maybe not logged in yet".
+
+    Attributes:
+        authenticated: Whether a usable credential was presented.
+        scope: The credential's scope, or None when unauthenticated.
+        expires_at: Session expiry, ISO 8601, or None.
+        elevated_until: End of the sudo-mode confirmation window, ISO 8601,
+            or None when the session is not currently elevated.
+        totp_enabled: Whether logins require a second factor.
+        hostname: This machine's hostname, so an operator with several panels
+            open can tell them apart.
+        version: The installed WASM version.
+        csrf_header: Header name a mutation must echo the CSRF cookie in.
+        csrf_cookie: Name of the readable CSRF cookie.
+    """
+
+    authenticated: bool
+    scope: str | None = None
+    expires_at: str | None = None
+    elevated_until: str | None = None
+    totp_enabled: bool
+    hostname: str
+    version: str
+    csrf_header: str = CSRF_HEADER_NAME
+    csrf_cookie: str = CSRF_COOKIE_NAME
+
+
+class ElevateRequest(BaseModel):
+    """
+    Confirmation presented to enter sudo mode for the next ten minutes.
+
+    Attributes:
+        code: A TOTP code or a backup code, used when two-factor
+            authentication is enabled.
+        token: The master token, used when it is not.
+    """
+
+    code: str | None = None
+    token: str | None = None
+
+
+class ElevateResponse(BaseModel):
+    """
+    Result of a successful elevation.
+
+    Attributes:
+        elevated_until: End of the confirmation window, ISO 8601.
+    """
+
+    elevated_until: str
+
+
+def _iso(timestamp: float | None) -> str | None:
+    """
+    Render a UNIX timestamp the way every session field on the wire does.
+
+    Args:
+        timestamp: A UNIX timestamp, or None.
+
+    Returns:
+        The ISO 8601 form in UTC, or None.
+    """
+    if timestamp is None:
+        return None
+    return datetime.fromtimestamp(float(timestamp), tz=timezone.utc).isoformat()
 
 
 def _login_failure(error: str, detail: str) -> HTTPException:
@@ -245,6 +323,118 @@ async def login(request: Request, response: Response, body: LoginRequest) -> Log
         csrf_token=session.csrf_token,
         session_token=session.token if body.bearer else None,
     )
+
+
+@router.get("/session", response_model=SessionInfo)
+async def get_session_info(request: Request) -> SessionInfo:
+    """
+    Report whether the caller is signed in, without demanding that they are.
+
+    Every other endpoint under ``/api`` requires ``require_auth`` and answers
+    401 to an anonymous caller; this one exists so the console has something
+    to call before it knows which of those two things it is. The credential
+    is checked but never counted towards the lockout - an anonymous probe of
+    this endpoint is not a credential guess, because nothing here is graded
+    pass or fail the way a login attempt is.
+
+    Args:
+        request: The incoming request.
+
+    Returns:
+        The session's bootstrap information, ``authenticated=False`` and
+        nothing else populated when no credential, or an expired or revoked
+        one, was presented.
+    """
+    token_manager = get_token_manager()
+    client_ip = get_client_ip(request)
+    credential = bearer_token(request) or request.cookies.get(SESSION_COOKIE_NAME)
+    session = check_credential(credential, client_ip) if credential else None
+
+    if session is None:
+        return SessionInfo(
+            authenticated=False,
+            totp_enabled=token_manager.totp_enabled(),
+            hostname=socket.gethostname(),
+            version=__version__,
+        )
+
+    return SessionInfo(
+        authenticated=True,
+        scope=session.get("scope"),
+        expires_at=_iso(session.get("expires_at") or session.get("exp")),
+        elevated_until=_iso(session.get("elevated_until")),
+        totp_enabled=token_manager.totp_enabled(),
+        hostname=socket.gethostname(),
+        version=__version__,
+    )
+
+
+@router.post("/elevate", response_model=ElevateResponse)
+async def elevate(
+    request: Request, body: ElevateRequest, session: dict[str, Any] = Depends(require_auth)
+) -> ElevateResponse:
+    """
+    Confirm the caller's identity again, opening sudo mode for ten minutes.
+
+    D5: deleting an application, a database, a service or a site, writing raw
+    configuration or a unit file, running a write against a database console,
+    revealing a ``.env`` in clear, issuing an API token and turning
+    two-factor authentication off all require a cookie session to have
+    called this recently; see :func:`wasm.web.api.deps.require_elevated`.
+    The factor asked for is the same a login would ask for - a TOTP or backup
+    code when two-factor authentication is enabled, the master token
+    otherwise - and a wrong one is counted by the same lockout a login
+    failure is, through the same chokepoint.
+
+    Args:
+        request: The incoming request.
+        body: The code or the master token.
+        session: The authenticated session being elevated.
+
+    Returns:
+        The new elevation deadline.
+
+    Raises:
+        HTTPException: 401 with ``error`` ``totp_required`` when two-factor
+            authentication is on and no code was sent, or ``invalid_totp``
+            or ``invalid_token`` when the factor presented does not verify.
+    """
+    token_manager = get_token_manager()
+    audit = get_audit_logger()
+    client_ip = get_client_ip(request)
+
+    if token_manager.totp_enabled():
+        code = (body.code or "").strip()
+        if not code:
+            raise _login_failure(
+                "totp_required", "Two-factor authentication is enabled. Include code."
+            )
+        if not token_manager.verify_second_factor(code):
+            record_auth_failure(client_ip, "/api/auth/elevate", "totp")
+            attempts_remaining = get_brute_force().get_attempts_remaining(client_ip)
+            raise _login_failure(
+                "invalid_totp",
+                f"Invalid two-factor code. {attempts_remaining} attempts remaining.",
+            )
+    elif not token_manager.verify_master_token(body.token or ""):
+        record_auth_failure(client_ip, "/api/auth/elevate", "master_token")
+        attempts_remaining = get_brute_force().get_attempts_remaining(client_ip)
+        raise _login_failure(
+            "invalid_token", f"Invalid token. {attempts_remaining} attempts remaining."
+        )
+
+    elevated_until = token_manager.elevate(str(session.get("sid")))
+
+    if audit:
+        audit.record(
+            action="auth.elevate",
+            result="success",
+            client_ip=client_ip,
+            actor=str(session.get("sid")),
+            resource="/api/auth/elevate",
+        )
+
+    return ElevateResponse(elevated_until=_iso(elevated_until) or "")
 
 
 @router.post("/logout")
@@ -622,7 +812,7 @@ def two_factor_confirm(
 
 @router.post("/2fa/disable")
 def two_factor_disable(
-    request: Request, body: TwoFactorCode, session: dict[str, Any] = Depends(require_auth)
+    request: Request, body: TwoFactorCode, session: dict[str, Any] = Depends(require_elevated)
 ) -> dict[str, Any]:
     """
     Turn the second factor off, on presentation of a current code.
@@ -636,10 +826,12 @@ def two_factor_disable(
         A confirmation payload.
 
     Raises:
-        HTTPException: 400 when the code does not verify. Counted by the same
-            lockout as a failed login: this endpoint guards the switch that
-            turns the second factor off, so a wrong code here is a credential
-            guess by whoever holds the session.
+        HTTPException: 403 with ``error: "elevation_required"`` when a cookie
+            session has not called ``POST /api/auth/elevate`` recently (D5).
+            400 when the code does not verify. Counted by the same lockout as
+            a failed login: this endpoint guards the switch that turns the
+            second factor off, so a wrong code here is a credential guess by
+            whoever holds the session.
     """
     token_manager = get_token_manager()
     audit = get_audit_logger()
@@ -765,6 +957,7 @@ def create_api_token(
     request: Request,
     body: ApiTokenRequest,
     session: dict[str, Any] = Depends(require_scope("admin")),
+    _elevated: dict[str, Any] = Depends(require_elevated),
 ) -> ApiTokenCreated:
     """
     Issue a named, scoped API token, returned in clear exactly once.
@@ -773,6 +966,10 @@ def create_api_token(
         request: The incoming request.
         body: Name, scope and optional expiry.
         session: The authenticated session, admin scope required.
+        _elevated: Unused beyond the check it performs: a cookie session must
+            have called ``POST /api/auth/elevate`` recently (D5). Issuing a
+            token is a standing credential, the same category of action as
+            deleting something.
 
     Returns:
         The record, including the one and only clear copy of the token.
@@ -781,6 +978,8 @@ def create_api_token(
         SecurityError: When the name is taken or the scope is not a scope. The
             audit record names the token; the token itself never reaches the
             audit log.
+        HTTPException: 403 with ``error: "elevation_required"`` per
+            :func:`wasm.web.api.deps.require_elevated`.
     """
     issued = get_token_manager().create_api_token(body.name, body.scope, body.expires_hours)
 
