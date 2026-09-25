@@ -167,7 +167,7 @@ def _no_findings(runner: FakeRunner) -> None:
     runner.script(
         ["journalctl", "-k", "--since", "-7d", "--grep", "oom", "-o", "short-iso"], stdout=""
     )
-    runner.script(["sudo", "certbot", "certificates"], stdout="")
+    runner.script(["certbot", "certificates"], stdout="")
 
 
 @pytest.fixture
@@ -218,7 +218,7 @@ def test_healthy_app_is_reported_healthy(
     _unit_state(runner)
     _listening(runner, 3000)
     _no_findings(runner)
-    runner.script(["sudo", "certbot", "certificates"], stdout=_certbot_output("2026-06-01"))
+    runner.script(["certbot", "certificates"], stdout=_certbot_output("2026-06-01"))
 
     result = _diagnose(
         monkeypatch,
@@ -264,7 +264,7 @@ def test_crash_loop_with_oom_blames_the_kernel(
         ["journalctl", "-k", "--since", "-7d", "--grep", "oom", "-o", "short-iso"],
         stdout="2026-01-01T00:00:00+00:00 host kernel: Out of memory: Killed process 100 (node)\n",
     )
-    runner.script(["sudo", "certbot", "certificates"], stdout="")
+    runner.script(["certbot", "certificates"], stdout="")
 
     result = _diagnose(monkeypatch, runner, app=_app())
 
@@ -375,7 +375,7 @@ def test_expired_certificate_is_the_probable_cause(
     runner.script(
         ["journalctl", "-k", "--since", "-7d", "--grep", "oom", "-o", "short-iso"], stdout=""
     )
-    runner.script(["sudo", "certbot", "certificates"], stdout=_certbot_output("2025-01-01"))
+    runner.script(["certbot", "certificates"], stdout=_certbot_output("2025-01-01"))
 
     result = _diagnose(monkeypatch, runner, app=_app())
 
@@ -389,7 +389,7 @@ def test_disk_almost_full_is_degraded(monkeypatch: pytest.MonkeyPatch, runner: F
     _unit_state(runner)
     _listening(runner, 3000)
     _no_findings(runner)
-    runner.script(["sudo", "certbot", "certificates"], stdout=_certbot_output("2026-06-01"))
+    runner.script(["certbot", "certificates"], stdout=_certbot_output("2026-06-01"))
 
     result = _diagnose(monkeypatch, runner, app=_app(), disk_usage=_disk(97.0))
 
@@ -410,7 +410,7 @@ def test_fallback_degraded_when_only_a_warning_check_fires(
     runner.script(
         ["journalctl", "-k", "--since", "-7d", "--grep", "oom", "-o", "short-iso"], stdout=""
     )
-    runner.script(["sudo", "certbot", "certificates"], stdout=_certbot_output("2026-06-01"))
+    runner.script(["certbot", "certificates"], stdout=_certbot_output("2026-06-01"))
 
     log_path = tmp_path / "error.log"
     log_path.write_text(
@@ -450,7 +450,7 @@ def test_a_raising_probe_becomes_skip_without_affecting_others(
     _unit_state(runner)
     _listening(runner, 3000)
     _no_findings(runner)
-    runner.script(["sudo", "certbot", "certificates"], stdout=_certbot_output("2026-06-01"))
+    runner.script(["certbot", "certificates"], stdout=_certbot_output("2026-06-01"))
 
     def _raising_disk(_path: str) -> _DiskUsage:
         raise OSError("no such directory")
@@ -517,7 +517,7 @@ def test_last_deployment_failure_is_reported(
     _unit_state(runner)
     _listening(runner, 3000)
     _no_findings(runner)
-    runner.script(["sudo", "certbot", "certificates"], stdout=_certbot_output("2026-06-01"))
+    runner.script(["certbot", "certificates"], stdout=_certbot_output("2026-06-01"))
 
     result = _diagnose(
         monkeypatch,

@@ -10,9 +10,9 @@ obtaining one, listing what the machine holds, renewing, revoking and deleting.
 
 The commands are thin. Each one validates what the user typed, builds a
 :class:`~wasm.managers.cert_manager.CertManager` and calls a single private
-function that both this Click tree and the argparse handler still wired into
-``wasm.cli.parser`` share, so the two front ends cannot drift while the
-migration finishes.
+function that both this Click tree and the argparse-shaped handler
+:mod:`wasm.cli.interactive` still calls for its certificate menu share, so the
+two front ends cannot drift.
 
 Two rules shape the code:
 
@@ -556,12 +556,15 @@ def delete_command(ctx: Context, domain: str, force: bool) -> None:
     _delete_certificate(_manager(ctx.verbose), ctx.logger, domain)
 
 
-# -- The argparse front end, until wasm.cli.parser is retired -----------------
+# -- The argparse-shaped front end, called by wasm.cli.interactive ------------
 
 
 def handle_cert(args: Namespace) -> int:
     """
-    Handle cert commands coming from the argparse parser.
+    Handle cert commands coming from an argparse-shaped ``Namespace``.
+
+    ``wasm.cli.parser`` is gone; :mod:`wasm.cli.interactive` is what still
+    builds one of these and calls this for its certificate menu.
 
     Args:
         args: Parsed arguments.

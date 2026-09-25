@@ -6,9 +6,10 @@
 Backup and rollback commands.
 
 The work itself lives in the private ``_backup_*`` helpers. The Click commands
-and the argparse handlers :mod:`wasm.cli.parser` still calls are both thin
-adapters over them, so the two entry points cannot drift while the migration
-finishes.
+and the argparse-shaped handlers below are both thin adapters over them, so the
+two entry points cannot drift. ``wasm.cli.parser`` is gone and nothing calls
+these handlers in production anymore; they are kept, and tested directly, for
+the same reason.
 
 Two things the argparse tree got wrong and this module does not:
 
@@ -1036,8 +1037,9 @@ def handle_backup(args: Namespace) -> int:
     """
     Handle ``wasm backup <action>`` on the argparse path.
 
-    Kept while :mod:`wasm.cli.parser` still routes through argparse; it shares
-    every helper with the Click commands rather than repeating them.
+    ``wasm.cli.parser`` is gone and nothing calls this in production; it is
+    kept, and tested directly, sharing every helper with the Click commands
+    rather than repeating them.
 
     Args:
         args: Parsed arguments.

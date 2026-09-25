@@ -1330,8 +1330,11 @@ def _config(*, engine: str, user: str | None, password: str | None, logger: Logg
 # ==================== The argparse front end, on its way out ====================
 
 #: How each legacy action reaches the function that does the work. The lambdas
-#: exist so the argparse tree and the Click tree share one implementation until
-#: ``wasm.cli.parser`` is deleted.
+#: exist so :func:`handle_db` and the Click tree share one implementation.
+#: ``wasm.cli.parser`` is gone and nothing in WASM calls :func:`handle_db`
+#: anymore - :mod:`wasm.cli.interactive` has no database menu - but the tests
+#: still exercise it directly, and this table is what keeps it from growing a
+#: second copy of the logic if it is ever wired up again.
 _LEGACY_ACTIONS: dict[str, Callable[[Namespace, Logger], int]] = {
     "install": lambda args, log: _install(args.engine, logger=log),
     "uninstall": lambda args, log: _uninstall(
@@ -1448,8 +1451,10 @@ def handle_db(args: Namespace) -> int:
     """
     Route a parsed argparse namespace to the right database action.
 
-    Kept while ``wasm.cli.parser`` is still the front end. It delegates to the
-    same functions the Click commands call.
+    ``wasm.cli.parser`` is gone and nothing calls this in production; it is
+    kept, and tested directly, so a change to the Click commands cannot drift
+    from :data:`_LEGACY_ACTIONS` unnoticed. It delegates to the same functions
+    the Click commands call.
 
     Args:
         args: The parsed arguments.

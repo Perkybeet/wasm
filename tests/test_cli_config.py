@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import sys
 from argparse import Namespace
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,6 +29,7 @@ from click.testing import CliRunner
 from wasm.cli import app as app_module
 from wasm.cli.app import cli as root_cli
 from wasm.cli.commands import config as config_cmd
+from wasm.core.config import Config
 from wasm.core.logger import Logger
 from wasm.core.runner import DryRunRunner, FakeRunner, get_runner
 
@@ -388,6 +389,194 @@ def test_path_notices_an_existing_file(
 
     assert result.exit_code == 0
     assert "Yes" in result.output
+
+
+# ---------------------------------------------------------------------------
+# config get and config set
+# ---------------------------------------------------------------------------
+
+#: ``fake_config`` has no get/set of its own: what these tests pin is the
+#: validation the real Config.set applies, which a fake could not fail to
+#: enforce. Every test in this section goes through the real singleton,
+#: pointed at a sandbox file so nothing here can touch a real machine.
+
+
+@pytest.fixture
+def real_config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """
+    Point the real :class:`~wasm.core.config.Config` singleton at a sandbox.
+
+    Args:
+        tmp_path: Per-test temporary directory.
+        monkeypatch: Patching helper, scoped to the test.
+
+    Yields:
+        The path the singleton reads from and writes to. It does not exist,
+        so every key starts out at its default.
+    """
+    path = tmp_path / "etc" / "wasm" / "config.yaml"
+    monkeypatch.setattr("wasm.core.config.DEFAULT_CONFIG_PATH", path)
+    monkeypatch.setattr(config_cmd, "DEFAULT_CONFIG_PATH", path)
+    Config.reset_instance()
+    try:
+        yield path
+    finally:
+        Config.reset_instance()
+
+
+def test_get_prints_a_scalar_value(wasm: Wasm, real_config_path: Path) -> None:
+    """A plain value is printed bare, ready for a script to capture."""
+    result = wasm("config", "get", "webserver")
+
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "nginx"
+
+
+def test_get_of_an_unknown_key_fails(wasm: Wasm, real_config_path: Path) -> None:
+    """A key nothing recognises is an error, not an empty success."""
+    result = wasm("config", "get", "no.such.key")
+
+    assert result.exit_code == 1
+    assert "No such configuration key: no.such.key" in result.output
+
+
+def test_get_redacts_a_secret(wasm: Wasm, real_config_path: Path) -> None:
+    """A secret is never printed in the clear, even by the command that reads it back."""
+    assert wasm("config", "set", "monitor.smtp.password", "hunter2").exit_code == 0
+
+    result = wasm("config", "get", "monitor.smtp.password")
+
+    assert result.exit_code == 0, result.output
+    assert "hunter2" not in result.output
+    assert "***" in result.output
+
+
+def test_set_writes_the_value_and_it_can_be_read_back(wasm: Wasm, real_config_path: Path) -> None:
+    """A round trip through set then get returns exactly what was written."""
+    result = wasm("config", "set", "ssl.email", "ops@example.com")
+
+    assert result.exit_code == 0, result.output
+    assert "ops@example.com" in result.output
+    assert wasm("config", "get", "ssl.email").output.strip() == "ops@example.com"
+    assert "ops@example.com" in real_config_path.read_text()
+
+
+def test_set_refuses_an_unsupported_webserver(wasm: Wasm, real_config_path: Path) -> None:
+    """
+    The same rule the panel's own /config/webserver endpoint enforces.
+
+    wasm.web.api.config answers a webserver it cannot manage with a plain 400;
+    the CLI answers the same refusal in the same words, because both go
+    through Config.set.
+    """
+    result = wasm("config", "set", "webserver", "caddy")
+
+    assert result.exit_code == 1
+    assert "Unsupported webserver" in result.output
+    assert not real_config_path.exists()
+
+
+def test_set_refuses_a_port_out_of_range(wasm: Wasm, real_config_path: Path) -> None:
+    """web.port carries the same 1-65535 range wasm.web.api.config.WebConfig applies."""
+    result = wasm("config", "set", "web.port", "70000")
+
+    assert result.exit_code == 1
+    assert "web.port must be between 1 and 65535" in result.output
+
+
+def test_set_accepts_a_port_in_range_and_stores_it_as_a_number(
+    wasm: Wasm, real_config_path: Path
+) -> None:
+    """The value is stored as YAML's integer, not as the literal string typed."""
+    result = wasm("config", "set", "web.port", "9090")
+
+    assert result.exit_code == 0, result.output
+    body = real_config_path.read_text()
+    assert yaml.safe_load(body)["web"]["port"] == 9090
+
+
+def test_set_refuses_a_relative_apps_directory(wasm: Wasm, real_config_path: Path) -> None:
+    """A relative path resolves against whatever CWD the caller happens to have."""
+    result = wasm("config", "set", "apps_directory", "var/www/apps")
+
+    assert result.exit_code == 1
+    assert "apps_directory must be an absolute path" in result.output
+    assert not real_config_path.exists()
+
+
+def test_set_accepts_an_absolute_apps_directory(wasm: Wasm, real_config_path: Path) -> None:
+    """The ordinary case, unaffected by the new guard."""
+    result = wasm("config", "set", "apps_directory", "/srv/apps")
+
+    assert result.exit_code == 0, result.output
+    assert wasm("config", "get", "apps_directory").output.strip() == "/srv/apps"
+
+
+def test_set_refuses_a_relative_value_for_the_documented_apps_directory_command(
+    wasm: Wasm, real_config_path: Path
+) -> None:
+    """'apps.directory' is the exact command operators were told to run; it gets the same guard."""
+    result = wasm("config", "set", "apps.directory", "relative/path")
+
+    assert result.exit_code == 1
+    assert "apps.directory must be an absolute path" in result.output
+    assert not real_config_path.exists()
+
+
+def test_set_coerces_a_boolean_from_the_existing_default(
+    wasm: Wasm, real_config_path: Path
+) -> None:
+    """
+    'false' must become False, not the truthy string "false".
+
+    Argv only ever hands the command a string; ssl.enabled already defaults to
+    a bool, and that is what tells 'false' apart from a new string setting.
+    """
+    result = wasm("config", "set", "ssl.enabled", "false")
+
+    assert result.exit_code == 0, result.output
+    assert yaml.safe_load(real_config_path.read_text())["ssl"]["enabled"] is False
+
+
+def test_set_rejects_a_boolean_that_does_not_parse(wasm: Wasm, real_config_path: Path) -> None:
+    """A typo against a boolean key is refused rather than stored as a string."""
+    result = wasm("config", "set", "ssl.enabled", "maybe")
+
+    assert result.exit_code == 1
+    assert "Expected a boolean" in result.output
+
+
+def test_the_panel_documented_apps_directory_command_works(
+    wasm: Wasm, real_config_path: Path
+) -> None:
+    """
+    settings.html tells an operator to run exactly this command.
+
+    'apps.directory' is a real, separate, dotted key (distinct from the flat
+    'apps_directory' the deployers use) that wasm.web.machine reads for the
+    disk usage meter; this pins that the documented command actually reaches
+    it, round trip.
+    """
+    result = wasm("config", "set", "apps.directory", "/var/www/apps")
+
+    assert result.exit_code == 0, result.output
+    assert wasm("config", "get", "apps.directory").output.strip() == "/var/www/apps"
+
+
+def test_the_panel_documented_smtp_host_command_works(wasm: Wasm, real_config_path: Path) -> None:
+    """settings_form_notifications.html tells an operator to run exactly this command."""
+    result = wasm("config", "set", "monitor.smtp.host", "smtp.example.com")
+
+    assert result.exit_code == 0, result.output
+    assert wasm("config", "get", "monitor.smtp.host").output.strip() == "smtp.example.com"
+
+
+def test_get_and_set_do_not_offer_json(wasm: Wasm) -> None:
+    """Nothing here builds a JSON payload, so --json is not offered."""
+    for name in ("get", "set"):
+        command = config_cmd.cli.get_command(click.Context(config_cmd.cli), name)
+        assert command is not None
+        assert "--json" not in {opt for param in command.params for opt in param.opts}
 
 
 # ---------------------------------------------------------------------------

@@ -11,9 +11,10 @@ group below only exists as a container: :mod:`wasm.cli.app` picks the command
 whose name the user typed out of it.
 
 Each command is a thin shell around a private function that takes explicit
-arguments. That seam is what lets the argparse entry point
-(:func:`handle_webapp`, still called by :mod:`wasm.cli.parser`) and the Click
-commands share one implementation instead of drifting into two.
+arguments. That seam is what lets the argparse-shaped entry point
+(:func:`handle_webapp`, still called by :mod:`wasm.cli.interactive` for its
+create, list and update flows) and the Click commands share one implementation
+instead of drifting into two.
 
 Everything this module needs is imported here rather than inside the handlers.
 An import that only exists inside one function is a NameError waiting for the
@@ -22,6 +23,7 @@ next caller, which is exactly how ``site delete`` lost its certificate cleanup.
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from argparse import Namespace
@@ -31,7 +33,7 @@ from typing import Any, TypeVar
 
 import click
 
-from wasm.cli.app import Context, enable_dry_run, pass_context
+from wasm.cli.app import Context, enable_dry_run, json_option, pass_context
 from wasm.cli.panel_links import open_in_panel
 from wasm.core.app_state import RUNNING, STATIC, resolve_states
 from wasm.core.config import Config
@@ -451,23 +453,49 @@ def _create_docker_compose(
     return 0
 
 
-def _list_apps(logger: Logger) -> int:
+def _app_summary(app: Any, current: Any) -> dict[str, Any]:
+    """
+    Build the JSON entry for one application, from the same data the table shows.
+
+    Args:
+        app: Store row for the application.
+        current: Live state, as :func:`~wasm.core.app_state.resolve_states`
+            reports it.
+
+    Returns:
+        A JSON-safe mapping: domain, type, status, whether it needs attention,
+        why when it does, port and whether SSL is enabled.
+    """
+    return {
+        "domain": app.domain,
+        "type": app.app_type,
+        "status": current.label,
+        "healthy": current.healthy,
+        "detail": current.detail or None,
+        "port": app.port,
+        "ssl_enabled": bool(app.ssl_enabled),
+    }
+
+
+def _list_apps(logger: Logger, *, json_output: bool = False) -> int:
     """
     Show every deployed application.
 
     Args:
         logger: Logger of the current command.
+        json_output: Print ``{"items": [...]}`` instead of a table.
 
     Returns:
         Exit code.
     """
     store = get_store()
-
-    logger.header("Deployed Applications")
-
     apps = store.list_apps()
 
     if not apps:
+        if json_output:
+            click.echo(json.dumps({"items": []}))
+            return 0
+        logger.header("Deployed Applications")
         logger.info("No applications deployed")
         logger.blank()
         logger.info("Deploy an application with:")
@@ -478,6 +506,13 @@ def _list_apps(logger: Logger) -> int:
     # column is written at deploy time and never again, so it called everything
     # Running while health, which did ask, reported half of them stopped.
     states = resolve_states(apps, ServiceManager(verbose=logger.verbose))
+
+    if json_output:
+        items = [_app_summary(app, states[app.domain]) for app in apps]
+        click.echo(json.dumps({"items": items}))
+        return 0
+
+    logger.header("Deployed Applications")
 
     headers = ["Domain", "Type", "Status", "Port", "SSL"]
     rows = []
@@ -515,13 +550,14 @@ def _list_apps(logger: Logger) -> int:
     return 0
 
 
-def _show_status(domain: str, logger: Logger) -> int:
+def _show_status(domain: str, logger: Logger, *, json_output: bool = False) -> int:
     """
     Show what is known about one application.
 
     Args:
         domain: Application domain.
         logger: Logger of the current command.
+        json_output: Print ``{"app": {...}}`` instead of a key/value report.
 
     Returns:
         Exit code.
@@ -545,6 +581,22 @@ def _show_status(domain: str, logger: Logger) -> int:
             logger.warning(f"Application not found: {domain}")
             return 1
 
+        if json_output:
+            click.echo(
+                json.dumps(
+                    {
+                        "app": {
+                            "domain": domain,
+                            "legacy": True,
+                            "service": status["name"],
+                            "active": bool(status["active"]),
+                            "enabled": bool(status["enabled"]),
+                        }
+                    }
+                )
+            )
+            return 0
+
         logger.header(f"Status: {domain}")
         logger.warning("Legacy app (not in store)")
         logger.key_value("Service", status["name"])
@@ -556,6 +608,44 @@ def _show_status(domain: str, logger: Logger) -> int:
     site = app_data["site"]
     service = app_data["service"]
     databases = app_data["databases"]
+
+    if json_output:
+        systemd_status = service_manager.get_status(app_name) if service else {}
+        click.echo(
+            json.dumps(
+                {
+                    "app": {
+                        "domain": domain,
+                        "type": app.app_type,
+                        "status": app.status,
+                        "path": app.app_path,
+                        "is_static": bool(app.is_static),
+                        "port": app.port,
+                        "source": app.source,
+                        "branch": app.branch,
+                        "deployed_at": app.deployed_at,
+                        "site": {
+                            "webserver": site.webserver,
+                            "ssl_enabled": bool(site.ssl_enabled),
+                            "config_path": site.config_path,
+                        }
+                        if site
+                        else None,
+                        "service": {
+                            "name": service.name,
+                            "active": bool(systemd_status.get("active")),
+                            "enabled": bool(systemd_status.get("enabled")),
+                            "pid": systemd_status.get("pid"),
+                            "uptime": systemd_status.get("uptime"),
+                        }
+                        if service
+                        else None,
+                        "databases": [{"engine": db.engine, "name": db.name} for db in databases],
+                    }
+                }
+            )
+        )
+        return 0
 
     logger.header(f"Status: {domain}")
 
@@ -898,7 +988,28 @@ def _preview_delete(
     return 0
 
 
-def _show_logs(domain: str, *, logger: Logger, follow: bool = False, lines: int = 50) -> int:
+def _print_or_emit_logs(text: str, *, json_output: bool) -> None:
+    """
+    Show a block of log text the way the caller asked for it.
+
+    Args:
+        text: The log output, verbatim.
+        json_output: Print ``{"lines": [...]}`` instead of the raw text.
+    """
+    if json_output:
+        click.echo(json.dumps({"lines": text.splitlines()}))
+    else:
+        print(text)
+
+
+def _show_logs(
+    domain: str,
+    *,
+    logger: Logger,
+    follow: bool = False,
+    lines: int = 50,
+    json_output: bool = False,
+) -> int:
     """
     Print the recent log of an application.
 
@@ -907,6 +1018,8 @@ def _show_logs(domain: str, *, logger: Logger, follow: bool = False, lines: int 
         logger: Logger of the current command.
         follow: Keep streaming until interrupted.
         lines: How many recent lines to show.
+        json_output: Print ``{"lines": [...]}`` instead of raw text. Refused
+            together with ``follow``: a stream has no single payload to print.
 
     Returns:
         Exit code.
@@ -943,7 +1056,9 @@ def _show_logs(domain: str, *, logger: Logger, follow: bool = False, lines: int 
             _follow(cmd, cwd=app_path)
         else:
             result = get_runner().run(cmd, cwd=app_path, timeout=_COMPOSE_TIMEOUT)
-            print(result.stdout if result.success else result.stderr)
+            _print_or_emit_logs(
+                result.stdout if result.success else result.stderr, json_output=json_output
+            )
         return 0
 
     # Resolves both the legacy wasm-* unit names and the current ones.
@@ -965,13 +1080,13 @@ def _show_logs(domain: str, *, logger: Logger, follow: bool = False, lines: int 
             return 1
     else:
         logs = service_manager.logs(app_name, lines=lines)
-        print(logs)
+        _print_or_emit_logs(logs, json_output=json_output)
 
     return 0
 
 
 # ---------------------------------------------------------------------------
-# argparse entry point, still used by wasm.cli.parser
+# argparse-shaped entry point, still used by wasm.cli.interactive
 # ---------------------------------------------------------------------------
 
 
@@ -1084,7 +1199,7 @@ def _handle_list(args: Namespace) -> int:
     Returns:
         Exit code.
     """
-    return _list_apps(Logger(verbose=args.verbose))
+    return _list_apps(Logger(verbose=args.verbose), json_output=getattr(args, "json", False))
 
 
 def _handle_status(args: Namespace) -> int:
@@ -1097,7 +1212,9 @@ def _handle_status(args: Namespace) -> int:
     Returns:
         Exit code.
     """
-    return _show_status(args.domain, Logger(verbose=args.verbose))
+    return _show_status(
+        args.domain, Logger(verbose=args.verbose), json_output=getattr(args, "json", False)
+    )
 
 
 def _handle_restart(args: Namespace) -> int:
@@ -1192,6 +1309,7 @@ def _handle_logs(args: Namespace) -> int:
         logger=Logger(verbose=args.verbose),
         follow=args.follow,
         lines=args.lines,
+        json_output=getattr(args, "json", False),
     )
 
 
@@ -1459,11 +1577,14 @@ def create(
     is_flag=True,
     help="Print the panel URL for the app list, opening it if a display is available.",
 )
+@json_option("Print machine-readable JSON instead of a table.")
 @_global_flags
 @pass_context
 def list_apps(ctx: Context, open_panel: bool) -> None:
     """List the applications deployed on this server."""
-    code = _list_apps(ctx.logger)
+    if ctx.json_output and open_panel:
+        raise click.UsageError("--json and --open cannot be combined.")
+    code = _list_apps(ctx.logger, json_output=ctx.json_output)
     if open_panel and code == 0:
         open_in_panel("/apps", logger=ctx.logger)
     _exit(code)
@@ -1477,11 +1598,14 @@ def list_apps(ctx: Context, open_panel: bool) -> None:
     is_flag=True,
     help="Print the panel URL for this application, opening it if a display is available.",
 )
+@json_option("Print machine-readable JSON instead of a table.")
 @_global_flags
 @pass_context
 def status(ctx: Context, domain: str, open_panel: bool) -> None:
     """Show how an application is configured and whether it is running."""
-    code = _show_status(domain, ctx.logger)
+    if ctx.json_output and open_panel:
+        raise click.UsageError("--json and --open cannot be combined.")
+    code = _show_status(domain, ctx.logger, json_output=ctx.json_output)
     if open_panel and code == 0:
         open_in_panel(f"/apps/{domain}", logger=ctx.logger)
     _exit(code)
@@ -1594,11 +1718,20 @@ def delete(ctx: Context, domain: str, force: bool, keep_files: bool) -> None:
     is_flag=True,
     help="Print the panel URL for this application, opening it if a display is available.",
 )
+@json_option("Print machine-readable JSON instead of a table.")
 @_global_flags
 @pass_context
 def logs(ctx: Context, domain: str, follow: bool, lines: int, open_panel: bool) -> None:
     """Show what an application has been writing to its log."""
-    code = _show_logs(domain, logger=ctx.logger, follow=follow, lines=lines)
+    if ctx.json_output and open_panel:
+        raise click.UsageError("--json and --open cannot be combined.")
+    if ctx.json_output and follow:
+        raise click.UsageError(
+            "--json cannot be combined with --follow: a stream has no single JSON payload."
+        )
+    code = _show_logs(
+        domain, logger=ctx.logger, follow=follow, lines=lines, json_output=ctx.json_output
+    )
     if open_panel and code == 0:
-        open_in_panel(f"/apps/{domain}", logger=ctx.logger)
+        open_in_panel(f"/apps/{domain}/logs", logger=ctx.logger)
     _exit(code)

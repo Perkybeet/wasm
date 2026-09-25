@@ -20,7 +20,7 @@ import json
 
 import click
 
-from wasm.cli.app import Context, pass_context
+from wasm.cli.app import Context, json_option, pass_context
 from wasm.core.logger import Colors, Logger
 from wasm.managers.diagnose import Diagnosis, diagnose
 
@@ -67,39 +67,9 @@ def print_diagnosis(logger: Logger, diagnosis: Diagnosis) -> None:
     logger.blank()
 
 
-def _adopt_json_flag(click_ctx: click.Context, _param: click.Parameter, value: bool) -> None:
-    """
-    Fold a ``--json`` typed after ``diagnose`` into the shared context.
-
-    ``--json`` before the command name already works: the root group declares
-    it and stores it on the shared :class:`~wasm.cli.app.Context`. Declaring
-    it again here as an ordinary option would give it a default that
-    overwrites whatever the user set before the command name - the exact
-    argparse-era bug ``tests/test_cli_surface.py::TestGlobalFlags`` exists to
-    catch. ``expose_value=False`` keeps it from ever becoming a parameter of
-    :func:`cli`; this callback is the only thing it does, and it can only ever
-    set the flag, never clear it.
-
-    Args:
-        click_ctx: The command's own Click context.
-        _param: The option that triggered this callback.
-        value: Whether ``--json`` was given.
-    """
-    if not value:
-        return
-    click_ctx.ensure_object(Context).json_output = True
-
-
 @click.command("diagnose")
 @click.argument("domain")
-@click.option(
-    "--json",
-    is_flag=True,
-    expose_value=False,
-    is_eager=True,
-    callback=_adopt_json_flag,
-    help="Print the diagnosis as JSON.",
-)
+@json_option("Print the diagnosis as JSON.")
 @pass_context
 def cli(ctx: Context, domain: str) -> None:
     """

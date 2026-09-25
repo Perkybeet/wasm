@@ -35,6 +35,41 @@ Show what changed in this release.
 .B \-i, \-\-interactive
 Start the interactive menu.
 
+.SS wasm app
+Change how a deployed application is laid out and what it may use.
+
+.SS wasm app limits
+Show or set the memory, CPU and task limits of an application.
+.TP
+.B Arguments
+.br
+\fIdomain\fR
+.TP
+.B \-\-memory
+Memory limit: 512M, 2G, or none to remove it. Default: Sentinel.UNSET.
+.TP
+.B \-\-cpu
+CPU quota: 50% of one CPU, 200% for two, or none. Default: Sentinel.UNSET.
+.TP
+.B \-\-tasks
+Processes and threads it may run, or none. Default: Sentinel.UNSET.
+.TP
+.B \-\-restart
+Restart now so the new limits apply.
+
+.SS wasm app migrate
+Move an in\-place application onto the release layout.
+.TP
+.B Arguments
+.br
+\fIdomain\fR
+.TP
+.B \-\-persist
+Keep this path in shared/ across releases. Repeat for each; replaces detection. Default: Sentinel.UNSET.
+.TP
+.B \-\-yes, \-y
+Do not ask for confirmation.
+
 .SS wasm backup
 Create, inspect and restore application backups.
 
@@ -250,8 +285,42 @@ Rehearse without changing anything.
 .B \-\-no\-color
 Never emit colour.
 
+.SS wasm config get
+Print one configuration value, addressed by its dotted key.
+.TP
+.B Arguments
+.br
+\fIkey\fR
+.TP
+.B \-v, \-\-verbose
+Show the detail of each step.
+.TP
+.B \-\-dry\-run
+Rehearse without changing anything.
+.TP
+.B \-\-no\-color
+Never emit colour.
+
 .SS wasm config path
 Show where the configuration file lives, and whether it exists.
+.TP
+.B \-v, \-\-verbose
+Show the detail of each step.
+.TP
+.B \-\-dry\-run
+Rehearse without changing anything.
+.TP
+.B \-\-no\-color
+Never emit colour.
+
+.SS wasm config set
+Set one configuration value, addressed by its dotted key, and save it.
+.TP
+.B Arguments
+.br
+\fIkey\fR
+.br
+\fIvalue\fR
 .TP
 .B \-v, \-\-verbose
 Show the detail of each step.
@@ -351,6 +420,74 @@ Rehearse without changing anything.
 .TP
 .B \-v, \-\-verbose
 Show the detail of each step.
+
+.SS wasm cron
+Run commands on a schedule, as systemd timers.
+
+.SS wasm cron create
+Create a cron job as a systemd timer, or rewrite one WASM already owns.
+.TP
+.B Arguments
+.br
+\fIname\fR
+.br
+\fIcommand\fR
+.TP
+.B \-\-schedule
+hourly, daily, weekly, monthly, or a systemd OnCalendar expression. Default: daily.
+.TP
+.B \-\-user
+Unix user to run as. The configured service_user by default. Default: Sentinel.UNSET.
+.TP
+.B \-\-working\-directory
+Absolute directory to run the command in. Default: Sentinel.UNSET.
+.TP
+.B \-\-app
+Associate the job with a deployed application; its directory becomes the default. Default: Sentinel.UNSET.
+
+.SS wasm cron delete
+Remove a cron job's timer and service units.
+.TP
+.B Arguments
+.br
+\fIname\fR
+.TP
+.B \-f, \-y, \-\-force
+Do not ask for confirmation.
+
+.SS wasm cron disable
+Disable a job's timer, keeping the unit files.
+.TP
+.B Arguments
+.br
+\fIname\fR
+
+.SS wasm cron enable
+Enable a job's timer and start it now.
+.TP
+.B Arguments
+.br
+\fIname\fR
+
+.SS wasm cron list
+List every WASM cron job with its schedule and last result.
+
+.SS wasm cron run
+Start a job's service immediately, outside its schedule.
+.TP
+.B Arguments
+.br
+\fIname\fR
+
+.SS wasm cron runs
+Show a job's recent executions, reconstructed from the journal.
+.TP
+.B Arguments
+.br
+\fIname\fR
+.TP
+.B \-\-limit
+Most runs to show. Default: 10.
 
 .SS wasm db
 Install engines, and manage databases, users and backups.
@@ -702,6 +839,9 @@ List the applications deployed on this server.
 .B \-\-open
 Print the panel URL for the app list, opening it if a display is available.
 .TP
+.B \-\-json
+Print machine\-readable JSON instead of a table.
+.TP
 .B \-\-no\-color
 Never emit colour.
 .TP
@@ -726,6 +866,9 @@ How many recent lines to show. Default: 50.
 .TP
 .B \-\-open
 Print the panel URL for this application, opening it if a display is available.
+.TP
+.B \-\-json
+Print machine\-readable JSON instead of a table.
 .TP
 .B \-\-no\-color
 Never emit colour.
@@ -777,6 +920,28 @@ Remove the monitor's systemd unit from this server.
 .TP
 .B \-y, \-\-yes
 Do not ask for confirmation.
+
+.SS wasm releases
+List an application's releases and go back to one instantly.
+
+.SS wasm releases list
+List the releases of an application, newest first.
+.TP
+.B Arguments
+.br
+\fIdomain\fR
+.TP
+.B \-\-json
+Print the releases as JSON.
+
+.SS wasm releases rollback
+Make an earlier release the one that serves, without rebuilding anything.
+.TP
+.B Arguments
+.br
+\fIdomain\fR
+.br
+\fIrelease\fR
 
 .SS wasm restart
 Restart an application, picking up its current build and environment.
@@ -1066,6 +1231,9 @@ Show how an application is configured and whether it is running.
 .TP
 .B \-\-open
 Print the panel URL for this application, opening it if a display is available.
+.TP
+.B \-\-json
+Print machine\-readable JSON instead of a table.
 .TP
 .B \-\-no\-color
 Never emit colour.

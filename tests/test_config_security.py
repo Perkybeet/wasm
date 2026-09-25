@@ -573,6 +573,55 @@ class TestRemovedKeysThroughTheParent:
         assert config.get("webserver") == "apache"
 
 
+class TestReplaceEnforcesTheSameRulesAsSet:
+    """
+    A full ``PUT`` must not be a back door around a rule ``set`` enforces.
+
+    ``Config.replace`` used to write its mapping straight in, so a value
+    'wasm config set' or 'PATCH /api/config' would refuse - an unsupported web
+    server, a relative apps directory - sailed through untouched as long as it
+    arrived inside a whole-configuration body.
+    """
+
+    def test_replace_refuses_an_unsupported_webserver(self, config_path: Path) -> None:
+        from wasm.core.exceptions import ConfigError
+
+        config = Config()
+
+        with pytest.raises(ConfigError, match="Unsupported webserver"):
+            config.replace({"webserver": "caddy"})
+
+        assert not config_path.exists()
+
+    def test_replace_refuses_a_relative_apps_directory(self, config_path: Path) -> None:
+        from wasm.core.exceptions import ConfigError
+
+        config = Config()
+
+        with pytest.raises(ConfigError, match="apps_directory must be an absolute path"):
+            config.replace({"apps_directory": "var/www/apps"})
+
+        assert not config_path.exists()
+
+    def test_replace_leaves_an_absent_key_alone(self, config_path: Path) -> None:
+        """Omitting a validated key from a PUT means 'leave it out', not 'reject'."""
+        config = Config()
+
+        config.replace({"monitor": {"enabled": True}})
+
+        assert config.get("apps_directory") is None
+
+    def test_replace_normalises_a_validated_value_the_same_way_set_does(
+        self, config_path: Path
+    ) -> None:
+        """A range-checked value posted as a string is stored typed, as set() stores it."""
+        config = Config()
+
+        config.replace({"web": {"port": "9090"}})
+
+        assert config.get("web.port") == 9090
+
+
 class TestReplacePreservesSecrets:
     """A full write coming from the panel carries placeholders, not secrets."""
 

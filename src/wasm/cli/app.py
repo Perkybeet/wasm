@@ -33,8 +33,9 @@ from __future__ import annotations
 import importlib
 import logging
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TypeVar
 
 import click
 
@@ -49,14 +50,17 @@ log = logging.getLogger(__name__)
 #: Command group to the module that defines it. The value is the module path;
 #: the attribute is always ``cli``.
 COMMAND_MODULES: dict[str, str] = {
+    "app": "wasm.cli.commands.app",
     "backup": "wasm.cli.commands.backup",
     "cert": "wasm.cli.commands.cert",
     "config": "wasm.cli.commands.config",
+    "cron": "wasm.cli.commands.cron",
     "db": "wasm.cli.commands.db",
     "diagnose": "wasm.cli.commands.diagnose",
     "env": "wasm.cli.commands.env",
     "health": "wasm.cli.commands.health",
     "monitor": "wasm.cli.commands.monitor",
+    "releases": "wasm.cli.commands.releases",
     "rollback": "wasm.cli.commands.backup",
     "service": "wasm.cli.commands.service",
     "setup": "wasm.cli.commands.setup",
@@ -125,6 +129,54 @@ class Context:
 
 
 pass_context = click.make_pass_decorator(Context, ensure=True)
+
+
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def _adopt_json(click_ctx: click.Context, _param: click.Parameter, value: bool | None) -> None:
+    """
+    Fold a ``--json`` typed after a command's name into the shared context.
+
+    Args:
+        click_ctx: The command's own Click context.
+        _param: The option that triggered this callback.
+        value: Whether ``--json`` was given.
+    """
+    if value:
+        click_ctx.ensure_object(Context).json_output = True
+
+
+def json_option(help_text: str = "Print machine-readable JSON.") -> Callable[[_F], _F]:
+    """
+    Accept ``--json`` after the command name, for commands that build a payload.
+
+    ``--json`` before the command name already works: the root group declares
+    it and stores it on the shared :class:`Context`. Declaring it again on a
+    command as an ordinary option would give it a default that overwrites what
+    the user set before the command name - the argparse-era bug
+    ``tests/test_cli_surface.py::TestGlobalFlags`` exists to catch. This option
+    has ``expose_value=False`` and can only ever set the flag, never clear it.
+
+    Args:
+        help_text: The option's help line.
+
+    Returns:
+        A decorator adding the option to a command.
+    """
+
+    def decorate(command: _F) -> _F:
+        return click.option(
+            "--json",
+            is_flag=True,
+            default=None,
+            is_eager=True,
+            expose_value=False,
+            callback=_adopt_json,
+            help=help_text,
+        )(command)
+
+    return decorate
 
 
 def enable_dry_run(state: Context) -> None:

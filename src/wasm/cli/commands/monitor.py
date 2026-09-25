@@ -12,9 +12,10 @@ run. Nothing here reads a configuration key that the monitor does not have; the
 handler map is exported so a test can exercise every action.
 
 Each action is a plain function taking the values it needs. The Click group and
-the argparse handler that :mod:`wasm.cli.parser` still calls both dispatch
-through :data:`ACTIONS`, so neither entry point can drift from the other while
-the migration finishes.
+the argparse-shaped :func:`handle_monitor` both dispatch through
+:data:`ACTIONS`, so neither can drift from the other. ``wasm.cli.parser`` is
+gone and nothing calls :func:`handle_monitor` in production anymore; it is
+kept, and tested directly, for the same reason.
 """
 
 from __future__ import annotations
@@ -644,8 +645,9 @@ def handle_monitor(args: Namespace) -> int:
     """
     Route a ``wasm monitor`` invocation to its handler.
 
-    Kept while :mod:`wasm.cli.parser` still routes through argparse; it shares
-    :data:`ACTIONS` with the Click group rather than repeating it.
+    ``wasm.cli.parser`` is gone and nothing calls this in production; it is
+    kept, and tested directly, sharing :data:`ACTIONS` with the Click group
+    rather than repeating it.
 
     Only :class:`WASMError` is caught here. A TypeError or an AttributeError is
     a defect in WASM, and the previous blanket ``except Exception`` is exactly

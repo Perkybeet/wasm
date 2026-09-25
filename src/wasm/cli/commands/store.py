@@ -11,8 +11,9 @@ create that file, fill it from a server that was set up before WASM existed,
 reconcile it with what systemd actually reports, and dump it.
 
 Both entry points, the Click commands below and the legacy
-:func:`handle_store` that ``wasm.cli.parser`` still calls, run the same private
-functions, so the two paths cannot drift apart while the migration finishes.
+:func:`handle_store`, run the same private functions, so the two paths cannot
+drift apart. ``wasm.cli.parser`` is gone and nothing calls :func:`handle_store`
+in production anymore; it is kept, and tested directly, for the same reason.
 """
 
 from __future__ import annotations
@@ -572,8 +573,9 @@ def handle_store(args: Namespace) -> int:
     """
     Run a store action from the argparse namespace.
 
-    Kept while ``wasm.cli.parser`` is still wired to argparse. It shares every
-    private function with the Click commands above.
+    ``wasm.cli.parser`` is gone and nothing calls this in production; it is
+    kept, and tested directly, sharing every private function with the Click
+    commands above.
 
     Args:
         args: Parsed command-line arguments.

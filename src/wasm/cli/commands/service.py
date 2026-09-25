@@ -433,8 +433,9 @@ def handle_service(args: Namespace) -> int:
     """
     Route an argparse invocation to the same implementations the Click tree uses.
 
-    ``wasm.cli.parser`` still calls this. It goes away with the last argparse
-    parser; until then it must not grow a second copy of the logic.
+    ``wasm.cli.parser`` is gone; :mod:`wasm.cli.interactive` is what still
+    builds a ``Namespace`` and calls this for its service menu, so it must not
+    grow a second copy of the logic.
 
     Args:
         args: Parsed arguments.

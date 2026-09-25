@@ -39,12 +39,13 @@ import os
 import re
 import stat
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import yaml  # type: ignore[import-untyped]
 
-from wasm.core.exceptions import SecurityError
+from wasm.core.exceptions import ConfigError, SecurityError
 from wasm.core.fs import SECRET_DIR_MODE, SECRET_MODE, FileSystem, get_fs
 
 logger = logging.getLogger(__name__)
@@ -207,6 +208,173 @@ REMOVED_KEYS: dict[str, Any] = {
     "monitor.terminate_malicious_only": False,
     "monitor.dry_run": True,
 }
+
+# Web servers WASM can actually front a site with. wasm.web.api.config keeps
+# its own copy for its dedicated /config/webserver endpoint; this is the one
+# both wasm.cli.commands.config's `set` and the generic PATCH /api/config
+# enforce, because that generic path is the one that had no rule of its own -
+# it wrote whatever value it was given straight into the unit and site
+# templates.
+SUPPORTED_WEBSERVERS = frozenset({"nginx", "apache"})
+
+
+def _validate_webserver(value: Any) -> Any:
+    """
+    Refuse a web server WASM has no manager for.
+
+    Args:
+        value: The candidate value, from either front end.
+
+    Returns:
+        The value unchanged, once it is known to be usable.
+
+    Raises:
+        ConfigError: When the value is not a web server WASM can manage.
+    """
+    if value not in SUPPORTED_WEBSERVERS:
+        raise ConfigError(
+            f"Unsupported webserver: {value!r}",
+            details=f"Choose one of: {', '.join(sorted(SUPPORTED_WEBSERVERS))}.",
+        )
+    return value
+
+
+def _validate_absolute_path(label: str) -> Callable[[Any], str]:
+    """
+    Build a validator that refuses a relative filesystem path.
+
+    A relative apps directory resolves against whatever the current working
+    directory happens to be at the time - the CLI's, the panel's, or a
+    ``systemd`` unit started with its own - which differs per caller and can
+    change under a long-running process. Every consumer downstream already
+    requires an absolute path (systemd units, nginx and Apache document
+    roots, the deployers): this is what stops a relative value from ever
+    reaching them broken.
+
+    Args:
+        label: Name used in the error message.
+
+    Returns:
+        A function raising :class:`ConfigError` for anything that is not an
+        absolute path.
+    """
+
+    def validator(value: Any) -> str:
+        text = str(value)
+        if not text or not Path(text).is_absolute():
+            raise ConfigError(
+                f"{label} must be an absolute path",
+                details=f"Got {text!r}. Use a path starting with '/', such as /var/www/apps.",
+            )
+        return text
+
+    return validator
+
+
+def _int_range_validator(label: str, low: int, high: int) -> Callable[[Any], int]:
+    """
+    Build a validator that requires a whole number in a closed range.
+
+    Accepting the raw value rather than only an ``int`` is what lets
+    ``wasm config set`` reuse this directly: argv never hands it anything but
+    a string, and ``int("8080")`` is exactly the conversion a human typing a
+    port number expects.
+
+    Args:
+        label: Name used in the error message.
+        low: Smallest value accepted, inclusive.
+        high: Largest value accepted, inclusive.
+
+    Returns:
+        A function raising :class:`ConfigError` outside the range.
+    """
+
+    def validator(value: Any) -> int:
+        try:
+            number = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"{label} must be a whole number", details=f"Got {value!r}.") from exc
+        if not low <= number <= high:
+            raise ConfigError(f"{label} must be between {low} and {high}", details=f"Got {number}.")
+        return number
+
+    return validator
+
+
+# Validation wasm.web.api.config applies through its own typed endpoints
+# (WebserverConfig, BackupConfig, WebConfig), reproduced here against the
+# dotted key each endpoint actually writes so a value the panel would reject
+# cannot be waved through by using 'wasm config set' or the generic
+# PATCH /api/config instead.
+_KEY_VALIDATORS: dict[str, Callable[[Any], Any]] = {
+    "webserver": _validate_webserver,
+    "backup.max_per_app": _int_range_validator("backup.max_per_app", 1, 100),
+    "web.port": _int_range_validator("web.port", 1, 65535),
+    "web.session_timeout": _int_range_validator("web.session_timeout", 300, 86400),
+    # The flat key the deployers, the panel's dedicated endpoint and
+    # wasm.core.config.Config.apps_directory read, and the dotted key
+    # wasm.web.machine reads for the disk usage meter - two separate settings
+    # that share a name in every command an operator is told to run, so both
+    # get the same guard against a relative path breaking their reader.
+    "apps_directory": _validate_absolute_path("apps_directory"),
+    "apps.directory": _validate_absolute_path("apps.directory"),
+}
+
+
+def _validate_known_value(key: str, value: Any) -> Any:
+    """
+    Apply the shared rule for a key, if one exists.
+
+    Args:
+        key: Fully resolved dotted key.
+        value: Value about to be written.
+
+    Returns:
+        The value, normalised by the validator when there is one.
+
+    Raises:
+        ConfigError: When the key has a rule and the value fails it.
+    """
+    validator = _KEY_VALIDATORS.get(key)
+    if validator is None:
+        return value
+    return validator(value)
+
+
+def _validate_known_values_in(tree: dict[str, Any]) -> None:
+    """
+    Apply every rule in :data:`_KEY_VALIDATORS` to the keys present in a tree.
+
+    This is what lets :meth:`Config.replace` enforce the same guards
+    :meth:`Config.set` does, without :meth:`Config.set`'s dotted-key API: a
+    full configuration replacement carries the whole tree already, and a key
+    the caller did not include is left alone rather than manufactured, so
+    omitting a setting from a ``PUT`` still means "leave it out", not
+    "reject the request".
+
+    Args:
+        tree: Resolved configuration about to be stored. Values that pass are
+            normalised in place, the same way :meth:`Config.set` normalises
+            them.
+
+    Raises:
+        ConfigError: When a present key's value fails its rule.
+    """
+    for key, validator in _KEY_VALIDATORS.items():
+        parts = key.split(".")
+        node: Any = tree
+        for part in parts[:-1]:
+            if not isinstance(node, dict) or part not in node:
+                node = None
+                break
+            node = node[part]
+        if not isinstance(node, dict):
+            continue
+        leaf = parts[-1]
+        if leaf not in node:
+            continue
+        node[leaf] = validator(node[leaf])
+
 
 # Words that mark a configuration key as holding a secret. The key name is split
 # on separators and camel case boundaries and each word is compared case
@@ -739,13 +907,24 @@ class Config:
         only ever saw the redacted configuration cannot destroy a credential by
         writing back what it was shown.
 
+        A handful of keys carry the same rule
+        :mod:`wasm.web.api.config` enforces through its own typed endpoints
+        (``webserver``, ``backup.max_per_app``, ``web.port``,
+        ``web.session_timeout``); a value one of them rejects is rejected here
+        too, whichever front end called.
+
         Args:
             key: Configuration key (supports dot notation).
             value: Value to set.
+
+        Raises:
+            ConfigError: When ``key`` has a shared rule and ``value`` fails it.
         """
         if key in REMOVED_KEYS:
             logger.debug("Ignoring write to removed configuration key %s", key)
             return
+
+        value = _validate_known_value(key, value)
 
         keys = key.split(".")
         config = self._config
@@ -763,17 +942,29 @@ class Config:
         """
         Replace the whole configuration with a caller-supplied mapping.
 
-        This is what a full update from the web panel goes through. Two things
-        happen on the way in: :data:`REDACTED` placeholders take the secret that
-        is currently stored, because the panel only ever saw the redacted dump,
-        and removed settings are dropped, because a stale form must not be able
-        to reintroduce them.
+        This is what a full update from the web panel goes through. Three
+        things happen on the way in: :data:`REDACTED` placeholders take the
+        secret that is currently stored, because the panel only ever saw the
+        redacted dump; removed settings are dropped, because a stale form
+        must not be able to reintroduce them; and every key in
+        :data:`_KEY_VALIDATORS` that is present is checked against the same
+        rule :meth:`set` enforces. Without that last step a value ``wasm
+        config set`` or ``PATCH /api/config`` would refuse - an unsupported
+        web server, a relative apps directory - sailed through a full
+        ``PUT /api/config`` untouched, because ``replace`` wrote the mapping
+        straight in.
 
         Args:
             config: The new configuration.
+
+        Raises:
+            ConfigError: When a validated key is present with a value that
+                fails its rule.
         """
         resolved: dict[str, Any] = restore_redacted(config, self._config)
-        self._config = _strip_removed_keys(resolved)
+        stripped = _strip_removed_keys(resolved)
+        _validate_known_values_in(stripped)
+        self._config = stripped
 
     @property
     def path(self) -> Path:

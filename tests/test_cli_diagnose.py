@@ -143,7 +143,7 @@ def _script_healthy(runner: FakeRunner) -> None:
     runner.script(
         ["journalctl", "-k", "--since", "-7d", "--grep", "oom", "-o", "short-iso"], stdout=""
     )
-    runner.script(["sudo", "certbot", "certificates"], stdout="")
+    runner.script(["certbot", "certificates"], stdout="")
 
 
 def _invoke(args: list[str], **kwargs: Any) -> Result:

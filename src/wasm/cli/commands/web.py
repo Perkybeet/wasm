@@ -30,8 +30,10 @@ Two structural notes about the Click migration:
 
 - The command bodies hold no logic. Every command parses its options and hands
   them to a private ``_start`` / ``_stop`` / ``_token`` helper, which is also
-  what the surviving ``handle_web`` argparse entry point calls. One
-  implementation, two front doors, until the argparse tree is deleted.
+  what the surviving ``handle_web`` argparse-shaped entry point calls. One
+  implementation, two front doors: ``wasm.cli.parser`` itself is gone, but
+  ``handle_web`` is kept and tested directly so it cannot drift from the Click
+  commands.
 - ``--verbose``, ``--dry-run`` and ``--no-color`` are accepted after the
   subcommand, as they always were, but they do not become per-command
   parameters: :func:`global_flags` declares them with ``expose_value=False`` and
@@ -1808,10 +1810,11 @@ def _handle_install(args: Namespace) -> int:
 
 def handle_web(args: Namespace) -> int:
     """
-    Route a ``web`` subcommand parsed by the legacy argparse tree.
+    Route a ``web`` subcommand parsed by a legacy argparse-shaped namespace.
 
-    Kept until ``wasm.cli.parser`` is deleted; it shares every implementation
-    with the Click commands above rather than duplicating them.
+    ``wasm.cli.parser`` is gone and nothing calls this in production; it is
+    kept, and tested directly, sharing every implementation with the Click
+    commands above rather than duplicating them.
 
     Args:
         args: Parsed arguments.

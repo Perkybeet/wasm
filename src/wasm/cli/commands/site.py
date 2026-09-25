@@ -8,8 +8,9 @@ The ``wasm site`` command group.
 Virtual hosts on nginx and apache: create, list, enable, disable, delete and
 show. The work lives in the private ``_site_*`` functions, so the Click
 commands and the legacy :func:`handle_site` argparse entry point run exactly
-the same code and only differ in how the parameters arrive. That entry point
-stays until :mod:`wasm.cli.parser` and the interactive menu are cut over.
+the same code and only differ in how the parameters arrive. ``wasm.cli.parser``
+is gone; that entry point stays because :mod:`wasm.cli.interactive` still
+builds a ``Namespace`` and calls it for the interactive menu.
 
 Every manager this module needs is imported here, at module level. Importing
 CertManager inside the create path meant ``wasm site delete`` raised NameError
@@ -455,11 +456,11 @@ def show(state: Context, domain: str) -> None:
 
 def handle_site(args: Namespace) -> int:
     """
-    Handle site commands coming from the argparse parser.
+    Handle site commands coming from an argparse-shaped ``Namespace``.
 
-    Kept while :mod:`wasm.cli.parser` and the interactive menu still dispatch
-    through argparse. It calls the same private functions as the Click
-    commands.
+    ``wasm.cli.parser`` is gone; :mod:`wasm.cli.interactive` is what still
+    builds one of these and calls this for its site menu. It calls the same
+    private functions as the Click commands.
 
     Args:
         args: Parsed arguments.
