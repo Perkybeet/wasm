@@ -46,9 +46,20 @@ ALL_INTERFACES = "0.0.0.0"  # noqa: S104 - the address under test, not a bind
 #: The webhook endpoint is public by design: a git forge holds no session, and
 #: what authenticates a delivery is the per-app HMAC secret checked inside the
 #: route; an anonymous probe gets a generic 404. See tests/test_web_hooks.py
-#: for the refusals that route owes.
+#: for the refusals that route owes. The console's own catch-all is public
+#: too, on purpose: it always answers with the same static ``index.html`` -
+#: the SPA shell carries no data of its own - and the client-side router
+#: decides from there what to ask the (still gated) ``/api`` for.
 PUBLIC_PATHS = frozenset(
-    {"/", "/login", "/health", "/api/auth/login", "/api/auth/session", "/hooks/deploy/{domain}"}
+    {
+        "/",
+        "/login",
+        "/health",
+        "/api/auth/login",
+        "/api/auth/session",
+        "/hooks/deploy/{domain}",
+        "/{path:path}",
+    }
 )
 
 
@@ -429,12 +440,12 @@ def test_security_headers_are_present(sandbox: Path) -> None:
     assert "script-src 'self';" in csp
     assert "unsafe-eval" not in csp
 
-    # style-src does allow inline, because xterm builds the log terminal out of
-    # inline styles and htmx sets them for its request indicators; strict here
-    # did not harden the panel, it switched those features off in silence.
-    # Server-rendered markup still carries no style attributes - see
-    # tests/test_web_style_contract.py.
-    assert "style-src 'self' 'unsafe-inline'" in csp
+    # style-src used to allow inline, because xterm built the log terminal out
+    # of inline styles and htmx set them for its request indicators. Both are
+    # gone with the server-rendered panel: the console is a Vite build with
+    # its CSS in a hashed stylesheet, so nothing needs the exception anymore.
+    assert "style-src 'self';" in csp
+    assert "unsafe-inline" not in csp
 
     assert headers["X-Content-Type-Options"] == "nosniff"
     assert headers["X-Frame-Options"] == "DENY"
@@ -747,36 +758,30 @@ def test_no_route_escapes_authentication(sandbox: Path) -> None:
         for method in sorted(getattr(route, "methods", set()) or {"GET"}):
             if method in ("HEAD", "OPTIONS"):
                 continue
-            # Redirects are not followed: a page route answers an anonymous
-            # browser with a redirect to the sign-in form rather than a JSON
-            # 401, and following it would land on the public login page and
-            # read as success.
             response = client.request(method, url, json={}, follow_redirects=False)
-            refused = response.status_code in (401, 403) or (
-                response.status_code in (302, 303, 307)
-                and response.headers.get("location", "").startswith("/login")
-            )
+            refused = response.status_code in (401, 403)
             if not refused:
                 reachable.append(f"{method} {path} -> {response.status_code}")
 
     assert not reachable, f"routes reachable without credentials: {reachable}"
 
 
-def test_pages_send_an_anonymous_browser_to_the_sign_in_form(sandbox: Path) -> None:
+def test_pages_send_an_anonymous_browser_to_the_console_shell(sandbox: Path) -> None:
     """
-    A person who typed a URL gets a form, not a JSON error.
+    A person who typed a URL gets the SPA shell, not a JSON error and not data.
 
-    The refusal is the same check the API uses; only its presentation differs,
-    so there is still one place where a credential is verified.
+    The console's catch-all answers every address the same static way; the
+    client-side router decides what to show, and what it is allowed to show
+    is still gated by the credential check on ``/api``.
     """
     app = create_app(make_config(sandbox, max_failed_attempts=10_000))
     client = TestClient(app, client=("testclient", 50000))
 
     response = client.get("/apps", follow_redirects=False)
 
-    assert response.status_code == 303
-    assert response.headers["location"] == "/login"
-    assert "row" not in response.text, "no page content may leak with the redirect"
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    assert "row" not in response.text, "no page content may leak through the shell"
 
 
 def test_cors_preflight_is_subject_to_the_ip_whitelist(sandbox: Path) -> None:
@@ -937,11 +942,10 @@ def enable_totp(client: TestClient, csrf: str) -> tuple[str, list[str]]:
 
 
 def test_with_two_factor_off_login_is_exactly_what_it_was(sandbox: Path) -> None:
-    """No code field on the form, no code required by the API."""
+    """No code required by the API until the second factor is turned on."""
     client = build_client(sandbox)
     token = get_token_manager().generate_master_token()
 
-    assert 'name="totp_code"' not in client.get("/login").text
     assert client.post("/api/auth/login", json={"token": token}).status_code == 200
 
 
@@ -1165,83 +1169,6 @@ def test_a_corrupt_state_file_refuses_rather_than_waves_through(sandbox: Path) -
     manager.sessions.close()
 
 
-def test_the_browser_form_gains_the_code_field_only_when_it_is_read(sandbox: Path) -> None:
-    """The form flow: field appears, code is required, wrong code is counted."""
-    client = build_client(sandbox, max_failed_attempts=3, lockout_duration=60)
-    token = get_token_manager().generate_master_token()
-    csrf = login(client, token)["csrf_token"]
-    secret, _codes = enable_totp(client, csrf)
-    client.cookies.clear()
-
-    form = client.get("/login").text
-    assert 'name="totp_code"' in form
-    assert "Authenticator code" in form
-
-    missing = client.post("/login", data={"token": token}, follow_redirects=False)
-    assert missing.status_code == 401
-    assert "authenticator" in missing.text.lower()
-
-    wrong = client.post(
-        "/login", data={"token": token, "totp_code": "000000"}, follow_redirects=False
-    )
-    assert wrong.status_code == 401
-    assert "attempts remaining" in wrong.text
-
-    good = client.post(
-        "/login",
-        data={"token": token, "totp_code": totp.totp_now(secret)},
-        follow_redirects=False,
-    )
-    assert good.status_code == 303
-    assert good.headers["location"] == "/"
-
-
-def test_the_settings_fragment_flow_enrolls_confirms_and_disables(
-    sandbox: Path, runner: object
-) -> None:
-    """
-    The htmx adapters drive the same implementation the JSON API does.
-
-    Args:
-        sandbox: Per-test temporary directory.
-        runner: The fake command runner, so rendering /settings reaches no
-            real process.
-    """
-    client = build_client(sandbox)
-    token = get_token_manager().generate_master_token()
-    csrf = login(client, token)["csrf_token"]
-    headers = {CSRF_HEADER_NAME: csrf}
-
-    page = client.get("/settings").text
-    assert "Two-factor authentication" in page
-    assert 'hx-post="/settings/2fa/enroll"' in page
-
-    enroll = client.post("/settings/2fa/enroll", headers=headers)
-    assert enroll.status_code == 200
-    assert "data-totp-uri=" in enroll.text
-    secret = get_token_manager().pending_totp_secret()
-    assert secret is not None
-    assert secret in enroll.text, "the manual key is not on the enrolment screen"
-
-    wrong = client.post("/settings/2fa/confirm", data={"code": "000000"}, headers=headers)
-    assert wrong.status_code == 200
-    assert "was not accepted" in wrong.text
-    assert "data-totp-uri=" in wrong.text, "a refused code must re-show the QR"
-
-    confirmed = client.post(
-        "/settings/2fa/confirm", data={"code": totp.totp_now(secret)}, headers=headers
-    )
-    assert confirmed.status_code == 200
-    assert "backup" in confirmed.text.lower()
-    assert secret not in confirmed.text, "the secret survived past confirmation"
-
-    disabled = client.post(
-        "/settings/2fa/disable", data={"code": totp.totp_now(secret)}, headers=headers
-    )
-    assert disabled.status_code == 200
-    assert 'hx-post="/settings/2fa/enroll"' in disabled.text
-
-
 # --------------------------------------------------------------- API tokens
 
 
@@ -1359,25 +1286,19 @@ def test_a_read_token_cannot_unmask_an_environment(sandbox: Path, runner: object
     assert "admin" in refused.json()["detail"]
 
 
-@pytest.mark.parametrize(
-    "path",
-    [
-        "/apps/example.com/env/reveal",
-        "/apps/example.com/env/edit",
-        "/api/services/wasm-example-com/config",
-    ],
-)
-def test_no_route_hands_a_read_token_a_secret(sandbox: Path, runner: object, path: str) -> None:
+def test_a_read_token_cannot_read_a_service_config(sandbox: Path, runner: object) -> None:
     """
-    The panel's own pages reach the same secrets as the API, so they refuse too.
+    A unit's config can carry secrets, so a ``read`` token is refused it too.
 
-    A guard keyed on the /api URL let a read token read every .env in clear
-    through the reveal page, which calls the very same function.
+    This used to be parametrised over the deleted panel's own env reveal and
+    edit pages as well - the guard was keyed on the ``/api`` prefix, and a
+    read token could reach the same secrets through the page, which called
+    the very same function. Both pages are gone with the panel; the endpoint
+    itself still has to hold the line.
 
     Args:
         sandbox: Per-test temporary directory.
         runner: The fake command runner.
-        path: A route that returns secrets.
     """
     client = build_client(sandbox)
     master = get_token_manager().generate_master_token()
@@ -1385,7 +1306,7 @@ def test_no_route_hands_a_read_token_a_secret(sandbox: Path, runner: object, pat
     reader = issue_token(client, csrf, master, name="dashboard", scope="read")["token"]
     client.cookies.clear()
 
-    refused = client.get(path, headers=bearer(reader))
+    refused = client.get("/api/services/wasm-example-com/config", headers=bearer(reader))
 
     assert refused.status_code == 403, refused.text
 
@@ -1628,49 +1549,6 @@ def test_a_duplicate_token_name_is_refused_with_the_reason(sandbox: Path) -> Non
     assert duplicate.json()["hint"]
 
 
-def test_the_settings_screen_issues_lists_and_revokes_tokens(sandbox: Path, runner: object) -> None:
-    """
-    The htmx adapters drive the same implementation the JSON API does.
-
-    Args:
-        sandbox: Per-test temporary directory.
-        runner: The fake command runner, so rendering /settings reaches no
-            real process.
-    """
-    client = build_client(sandbox)
-    master = get_token_manager().generate_master_token()
-    csrf = login(client, master)["csrf_token"]
-    headers = {CSRF_HEADER_NAME: csrf}
-
-    screen = client.get("/settings").text
-    assert "API tokens" in screen
-    assert 'hx-post="/settings/tokens"' in screen
-
-    created = client.post(
-        "/settings/tokens",
-        data={"name": "panel-ci", "scope": "deploy", "expires_hours": "720"},
-        headers=headers,
-    )
-    assert created.status_code == 200
-    assert "wasm_tok_" in created.text, "the fresh token is not on the screen it was issued from"
-    assert "panel-ci" in created.text
-
-    again = client.get("/settings").text
-    assert "wasm_tok_" not in again, "the token survived past its one showing"
-    assert "panel-ci" in again
-
-    refused = client.post(
-        "/settings/tokens", data={"name": "panel-ci", "scope": "read"}, headers=headers
-    )
-    assert refused.status_code == 200
-    assert "already exists" in refused.text
-
-    token_id = get_token_manager().list_api_tokens()[0]["id"]
-    revoked = client.post(f"/settings/tokens/{token_id}/revoke", headers=headers)
-    assert revoked.status_code == 200
-    assert "revoked" in revoked.text
-
-
 # ----------------------------------------------------------------- sessions
 
 
@@ -1745,15 +1623,16 @@ def test_an_ambiguous_or_malformed_prefix_is_refused(sandbox: Path) -> None:
     manager.sessions.close()
 
 
-def test_the_settings_screen_lists_and_revokes_sessions(sandbox: Path, runner: object) -> None:
+def test_revoke_all_sessions_signs_out_every_session_including_the_caller_s(
+    sandbox: Path,
+) -> None:
     """
-    The sessions fragment shows every session, marks the current one, revokes
-    the others and offers the sign-out-everywhere door.
+    ``POST /api/auth/sessions/revoke-all`` is the sign-out-everywhere door.
 
-    Args:
-        sandbox: Per-test temporary directory.
-        runner: The fake command runner, so rendering /settings reaches no
-            real process.
+    Ported from the deleted panel's settings screen, which was the only place
+    this endpoint was ever exercised: revoking one session by prefix (see
+    ``test_revoking_another_session_leaves_the_current_one_alive``) says
+    nothing about the caller's own session also going down with the rest.
     """
     app = create_app(make_config(sandbox))
     first = TestClient(app, client=("10.0.0.1", 50000))
@@ -1761,25 +1640,16 @@ def test_the_settings_screen_lists_and_revokes_sessions(sandbox: Path, runner: o
     master = get_token_manager().generate_master_token()
     csrf = login(first, master)["csrf_token"]
     login(second, master)
-    headers = {CSRF_HEADER_NAME: csrf}
 
-    screen = first.get("/settings").text
-    assert "Sign out everywhere" in screen
-    assert "this session" in screen
-    assert "10.0.0.2" in screen
+    everywhere = first.post("/api/auth/sessions/revoke-all", headers={CSRF_HEADER_NAME: csrf})
 
-    other = next(
-        row for row in first.get("/api/auth/sessions").json()["sessions"] if not row["is_current"]
-    )
-    swapped = first.post(f"/settings/sessions/{other['sid_prefix']}/revoke", headers=headers)
-    assert swapped.status_code == 200
-    assert "10.0.0.2" not in swapped.text, "the revoked session is still on the screen"
+    assert everywhere.status_code == 200, everywhere.text
+    assert everywhere.json()["success"] is True
+    assert first.get("/api/auth/verify").status_code == 401
     assert second.get("/api/auth/verify").status_code == 401
 
-    everywhere = first.post("/settings/sessions/revoke-all", headers=headers)
-    assert everywhere.status_code == 200
-    assert everywhere.headers["HX-Redirect"] == "/login"
-    assert first.get("/api/auth/verify").status_code == 401
+    entries = read_audit(sandbox)
+    assert any(e["action"] == "auth.revoke_all" and e["result"] == "success" for e in entries)
 
 
 def test_rate_limiter_does_not_grow_without_bound() -> None:

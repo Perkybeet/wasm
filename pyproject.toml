@@ -110,10 +110,10 @@ wasm = [
     "templates/**/*.j2",
     # Committed, not generated: see src/wasm/completions/README.md.
     "completions/*",
-    # The panel: its pages, its stylesheet and every third-party asset it
-    # serves. All of it has to ship, because the panel renders server-side and
-    # fetches nothing from the network.
-    "web/templates/**/*.html",
+    # The console: the committed Vite build of panel/ (index.html, the
+    # favicon and every hashed chunk, font and stylesheet under assets/). All
+    # of it has to ship, because OBS never runs Node and the console fetches
+    # nothing from the network.
     "web/static/**/*",
     "py.typed",
 ]

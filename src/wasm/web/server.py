@@ -15,12 +15,17 @@ whitelist, outside the HTTPS requirement, outside the rate limiter and outside
 the lockout. :class:`SecurityMiddleware` speaks ASGI directly, so ``http`` and
 ``websocket`` connections go through exactly the same checks, and the
 WebSocket handshake is authenticated centrally instead of once per handler.
+
+**The console is a static client.** The server renders no pages: it serves
+the committed Vite build of ``panel/`` from ``static/`` - hashed chunks under
+``/assets`` and ``index.html`` for every other GET outside the machine paths -
+and everything the console shows comes from the JSON API, the ``/events``
+stream and the two WebSockets, the same surface a script uses.
 """
 
 from __future__ import annotations
 
 import logging
-import socket
 import threading
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -30,7 +35,7 @@ from urllib.parse import parse_qs
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import MutableHeaders
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -58,87 +63,148 @@ from wasm.web.auth import (
     ip_matches,
     is_allowed_origin,
     is_secure_request,
-    record_auth_failure,
     set_audit_logger,
     set_brute_force_protection,
     set_security_config,
     set_token_manager,
 )
+from wasm.web.events import AppStatePublisher, announce_app_mutation
 
 logger = logging.getLogger(__name__)
 
+#: The console's committed Vite build: ``index.html``, the files Vite copies
+#: from ``panel/public`` (the favicon) and ``assets/`` with every hashed chunk.
+#: The source lives in ``panel/``; nothing here is written by hand.
 STATIC_DIR = Path(__file__).parent / "static"
+ASSETS_DIR = STATIC_DIR / "assets"
+INDEX_HTML = STATIC_DIR / "index.html"
 
-#: No inline scripts, no third party origins, no framing. The panel executes
-#: systemd as root, so an injected script is a root shell.
+#: Path prefixes that belong to machines, not to the console: the API, the
+#: build's assets, the event stream, the WebSockets, the forge webhooks and the
+#: health probe. A GET anywhere else is a console address - a bookmark, a
+#: reload on a deep link - and answers with the console's ``index.html`` so the
+#: client router can draw it. A miss under one of these answers JSON: a script
+#: probing ``/api/nope`` must get an error it can parse, not an HTML page with
+#: a 200 that reads as success.
+MACHINE_PATH_PREFIXES = ("/api", "/assets", "/events", "/ws", "/hooks", "/health")
+
+#: No inline code, no third-party origins, no framing. The panel drives
+#: systemd as root, so an injected script is a root shell, and an injected
+#: style can exfiltrate what is on screen through attribute selectors.
 #:
-#: ``style-src`` allows inline styles and ``script-src`` does not, and the
-#: asymmetry is deliberate. The strict form of both was tried and shipped, and
-#: what it actually did was switch features off in silence: xterm builds the
-#: whole log terminal out of inline styles and htmx sets them for its request
-#: indicators, so the drawer rendered blank and every pending state was
-#: invisible. Nothing reported it, because a Content Security Policy is only
-#: enforced in a browser and the suite has none.
+#: The console is what makes the strict form possible. The Jinja panel needed
+#: ``style-src 'unsafe-inline'`` because xterm built its terminal out of inline
+#: styles and htmx set them for its indicators; the React console applies
+#: styles through the CSSOM, which a policy does not block, Base UI runs with
+#: ``disableStyleElements``, and the log viewer is plain spans. The E2E suite
+#: (``panel/e2e``) fails on any ``securitypolicyviolation`` in a real browser,
+#: which is the only place a policy is enforced at all.
 #:
-#: The exposure the two directives control is not comparable. An injected
-#: script here runs systemd as root; an injected style can deface the page and,
-#: with attribute selectors and a background image, leak what is already on
-#: screen to a third party - which ``default-src 'self'`` also has to allow
-#: before it works at all. Against that, the templates are autoescaped and
-#: tested against injection on every screen.
+#: ``connect-src 'self'`` covers the WebSockets too: CSP Level 3 matches
+#: ``ws:``/``wss:`` on the page's own host against ``'self'``, so the old
+#: ``ws: wss:`` - any host at all - is gone.
 #:
-#: Server-rendered markup still carries no style attributes: that rule is
-#: enforced in tests/test_web_style_contract.py and is about the stylesheet
-#: being the one place styling lives, not about this header.
+#: ``require-trusted-types-for 'script'`` closes the DOM sinks: no string
+#: reaches ``innerHTML``, ``eval`` or a script URL, so an XSS that got a string
+#: into the page still cannot turn it into markup or code. It is on because the
+#: whole E2E suite runs clean with it - React, TanStack and Base UI write the
+#: DOM through properties - and a dependency that starts needing a sink fails
+#: that suite with the violation and the file that caused it.
 CONTENT_SECURITY_POLICY = (
     "default-src 'self'; "
     "script-src 'self'; "
-    "style-src 'self' 'unsafe-inline'; "
+    "style-src 'self'; "
     "img-src 'self' data:; "
     "font-src 'self'; "
-    "connect-src 'self' ws: wss:; "
-    "form-action 'self'; "
+    "connect-src 'self'; "
     "frame-ancestors 'none'; "
     "base-uri 'none'; "
-    "object-src 'none'"
+    "form-action 'self'; "
+    "object-src 'none'; "
+    "require-trusted-types-for 'script'"
 )
 
 HSTS_VALUE = "max-age=31536000; includeSubDomains"
 
 #: The build's hashed static assets: Vite names every file
-#: ``<name>.<content-hash>.<ext>``, so a stale copy of one is a filename that
+#: ``<name>-<content-hash>.<ext>``, so a stale copy of one is a filename that
 #: no longer exists in the manifest rather than an old version of a page
 #: quietly served again. Everything else - the SPA shell, the API, the event
-#: stream - carries a session and must be revalidated on every request, or a
-#: shared proxy caching one operator's dashboard would hand it to the next
-#: visitor on the same connection.
+#: stream - carries a session or points at the current build, and must be
+#: revalidated on every request, or a shared proxy caching one operator's
+#: dashboard would hand it to the next visitor on the same connection.
 _IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
 
-#: What every response gets whose path is not under ``/assets/``.
+#: What every response gets that is not a hashed asset actually served.
 _NO_STORE_CACHE_CONTROL = "no-store"
 
 
-def _cache_control_for(path: str) -> str:
+def _cache_control_for(path: str, status_code: int = 200) -> str:
     """
     Decide the ``Cache-Control`` an outgoing response carries.
 
     Args:
         path: The request path.
+        status_code: The status being answered. Only a served asset is
+            immutable: a 404 for ``/assets/x.js`` cached for a year would
+            outlive the deploy that ships the file.
 
     Returns:
         :data:`_IMMUTABLE_CACHE_CONTROL` for a hashed build asset under
-        ``/assets/``, :data:`_NO_STORE_CACHE_CONTROL` for everything else.
+        ``/assets/`` that was found, :data:`_NO_STORE_CACHE_CONTROL` for
+        everything else.
     """
-    if path.startswith("/assets/"):
+    if path.startswith("/assets/") and status_code in (200, 304):
         return _IMMUTABLE_CACHE_CONTROL
     return _NO_STORE_CACHE_CONTROL
 
 
+def is_machine_path(path: str) -> bool:
+    """
+    Report whether a path belongs to a machine rather than to the console.
+
+    Args:
+        path: The request path.
+
+    Returns:
+        True for a path equal to or below one of
+        :data:`MACHINE_PATH_PREFIXES`, matched by whole segment so that a
+        console address such as ``/apis`` is not mistaken for the API.
+    """
+    return any(path == prefix or path.startswith(prefix + "/") for prefix in MACHINE_PATH_PREFIXES)
+
+
+def _spends_no_rate_budget(scope: Scope, path: str) -> bool:
+    """
+    Report whether a request is exempt from the per-client rate limit.
+
+    Loading the console fetches every hashed chunk its router may need - some
+    forty files - before the first API call, and a hard reload fetches them
+    all again. Counted against the default 120 requests a minute, two reloads
+    would lock the operator out of a blank page. The chunks are public,
+    content-addressed, immutable and cheap to serve, so a flood of them costs
+    nothing the limiter protects; everything that reaches a manager, a
+    credential or the event stream still counts.
+
+    Args:
+        scope: The ASGI connection scope.
+        path: The request path.
+
+    Returns:
+        True for a GET or HEAD of a build asset under ``/assets/``.
+    """
+    return (
+        scope["type"] == "http"
+        and str(scope.get("method", "")).upper() in ("GET", "HEAD")
+        and path.startswith("/assets/")
+    )
+
+
 #: Endpoints that exist to be given a credential by an anonymous client, and
 #: are therefore the ones a lockout has to guard even before authentication.
-#: ``/login`` is the browser's form; ``/api/auth/login`` is the same exchange
-#: for a script. Both count towards the same lockout.
-AUTH_PATHS = frozenset({"/login", "/api/auth/login", "/api/auth/token"})
+#: The console signs in through ``/api/auth/login`` like any script does; there
+#: is no second, form-encoded sign-in route any more.
+AUTH_PATHS = frozenset({"/api/auth/login", "/api/auth/token"})
 
 _token_manager: TokenManager | None = None
 _rate_limiter: RateLimiter | None = None
@@ -352,8 +418,9 @@ async def lifespan(app: FastAPI):
     running this, which is what keeps the sampling thread out of every test
     that is not about it.
 
-    The deploy notification subscriber is attached here for the same reason:
-    subscribing is a process-wide side effect on the job manager singleton,
+    The deploy notification subscriber and the ``app`` event publisher are
+    attached here for the same reason: subscribing is a process-wide side
+    effect on the job manager singleton,
     and doing it in ``create_app`` would stack one subscriber per application
     a test builds.
 
@@ -368,9 +435,14 @@ async def lifespan(app: FastAPI):
     jobs = get_job_manager()
     notify_jobs = JobNotificationSubscriber()
     jobs.subscribe_all(notify_jobs)
+    # One publisher per process, not per open stream: it reads the
+    # application's state once per change and the event hub fans it out.
+    app_states = AppStatePublisher()
+    jobs.subscribe_all(app_states)
     start_metrics_collector()
     yield
     stop_metrics_collector()
+    jobs.unsubscribe_all(app_states)
     jobs.unsubscribe_all(notify_jobs)
     manager.purge_expired_sessions()
 
@@ -484,237 +556,12 @@ def create_app(config: SecurityConfig | None = None) -> FastAPI:
 
     app.include_router(ws_router, prefix="/ws")
 
-    # The live feed the shell listens to, at the root rather than under /api,
-    # because that is the address the client opens and an EventSource is not
-    # an API call. Mounted before the pages so the routing table reads in the
-    # order a browser meets it: data, then documents.
+    # The live feed the console listens to, at the root rather than under
+    # /api, because that is the address the client opens and an EventSource
+    # is not an API call.
     from wasm.web.events import router as events_router
 
     app.include_router(events_router)
-
-    if STATIC_DIR.exists():
-        app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-
-    # Pages are rendered on the server and updated by htmx. The single-page
-    # application this replaces built its markup by interpolating server data
-    # into innerHTML in eighty-six places and loaded Tailwind and Font Awesome
-    # from public CDNs, so a control panel with root over the machine could not
-    # render without internet access.
-    from wasm.web.views import router as views_router
-
-    app.include_router(views_router)
-
-    def render_login(request: Request, *, error: str | None = None, status: int = 200) -> Response:
-        """
-        Render the sign-in page.
-
-        Args:
-            request: The incoming request.
-            error: Message to show above the form.
-            status: HTTP status to answer with.
-
-        Returns:
-            The sign-in page. Tokens are never accepted in the URL: query
-            strings are recorded by proxies, browsers and access logs.
-        """
-        from wasm.web.views.rendering import templates
-
-        client_ip = get_client_ip(request)
-        locked_for = get_brute_force().get_lockout_remaining(client_ip) or None
-
-        return HTMLResponse(
-            templates.get_template("login.html").render(
-                hostname=socket.gethostname(),
-                csrf_token="",
-                error=error,
-                locked_for=locked_for,
-                theme=None,
-                # The server knows whether a second factor is required, so the
-                # form only shows the code field when it will actually be read.
-                totp_required=get_token_manager().totp_enabled(),
-            ),
-            status_code=status,
-        )
-
-    @app.get("/login", response_class=HTMLResponse)
-    def login_page(request: Request) -> Response:
-        """
-        Serve the sign-in page.
-
-        Args:
-            request: The incoming request.
-
-        Returns:
-            The sign-in page.
-        """
-        return render_login(request)
-
-    # The browser posts here. It used to post to a route that did not exist:
-    # the page offered a form and the only login endpoint was the JSON one
-    # under /api/auth/login, so nobody could sign in with a browser at all.
-    # Async, unlike the rest: reading a request body requires awaiting it, and
-    # this handler does no blocking work of its own. The body is parsed here
-    # rather than with fastapi.Form, which would pull in python-multipart for
-    # a plain urlencoded field and add a dependency to package on four
-    # distributions for no gain.
-    @app.post("/login")
-    async def login_submit(request: Request) -> Response:
-        """
-        Exchange a token typed into the form for a session cookie.
-
-        Args:
-            request: The incoming request.
-
-        Returns:
-            A redirect to the panel, or the form again with the reason.
-        """
-        body = await request.body()
-        fields = parse_qs(body.decode("utf-8", errors="replace"))
-        token = fields.get("token", [""])[0]
-        totp_code = fields.get("totp_code", [""])[0].strip()
-        manager = get_token_manager()
-        brute_force = get_brute_force()
-        audit = get_audit()
-        client_ip = get_client_ip(request)
-
-        if brute_force.is_locked(client_ip):
-            return render_login(
-                request,
-                error=f"Too many attempts. Try again in "
-                f"{brute_force.get_lockout_remaining(client_ip)} seconds.",
-                status=429,
-            )
-
-        if not manager.verify_master_token(token):
-            brute_force.record_failure(client_ip)
-            if audit:
-                audit.record(
-                    action="auth.login",
-                    result="failure",
-                    client_ip=client_ip,
-                    resource="/login",
-                    detail=f"{brute_force.get_attempts_remaining(client_ip)} attempts remaining",
-                )
-            return render_login(
-                request,
-                error=(
-                    "That token was not accepted. "
-                    f"{brute_force.get_attempts_remaining(client_ip)} attempts remaining."
-                ),
-                status=401,
-            )
-
-        if manager.totp_enabled():
-            if not totp_code:
-                # Not counted: an absent code is a form submitted before the
-                # operator saw the field, not a guess at the second factor.
-                return render_login(
-                    request,
-                    error="Enter the code from your authenticator app.",
-                    status=401,
-                )
-            if not manager.verify_second_factor(totp_code):
-                # The same chokepoint that counts a bad token, so the lockout
-                # cannot be escaped by bringing a stolen token to this form
-                # and guessing only the second factor.
-                record_auth_failure(client_ip, "/login", "totp")
-                return render_login(
-                    request,
-                    error=(
-                        "That code was not accepted. "
-                        f"{brute_force.get_attempts_remaining(client_ip)} attempts remaining."
-                    ),
-                    status=401,
-                )
-
-        brute_force.record_success(client_ip)
-        session = manager.create_session(client_ip)
-
-        # 303 so the browser follows with GET; a 302 after a POST is allowed to
-        # repeat the POST, which would replay the credential.
-        response = RedirectResponse("/", status_code=303)
-        from wasm.web.api.auth import set_session_cookies
-
-        set_session_cookies(response, session, secure=is_secure_request(request))
-
-        if audit:
-            audit.record(
-                action="auth.login",
-                result="success",
-                client_ip=client_ip,
-                actor=session.session_id,
-                resource="/login",
-            )
-        return response
-
-    # Sign-out lives in wasm.web.views.router, which is included above and
-    # therefore answers POST /logout. A second one used to be declared here and
-    # was unreachable for that reason alone - which was fortunate, because it
-    # read session_id off request.state.session, and that is a dict: the
-    # attribute was always None, so it cleared the browser's cookies and left
-    # the root session live on the server for the rest of its 24 hours. One
-    # implementation of each thing, and this was not it.
-
-    @app.exception_handler(404)
-    async def not_found(request: Request, exc: Exception) -> Response:
-        """
-        Answer a mistyped panel address with the panel's own missing screen.
-
-        The template has existed all along and exactly one route rendered it,
-        for a domain that is not deployed. Every other unknown address - a
-        stale bookmark, a truncated paste, a link from an older version -
-        produced Starlette's plain-text 404, which reads like the server is
-        broken rather than like the page is gone.
-
-        Starlette dispatches by status code before it dispatches by exception
-        type, so every 404 - including one an ``/api`` handler raised on
-        purpose, such as "Service not found: foo" - lands here rather than in
-        :func:`~wasm.web.api.deps.handle_http_exception`. An API path
-        delegates to it explicitly so a 404 still answers in the one error
-        contract instead of the generic body below.
-
-        Args:
-            request: The request that matched no route.
-            exc: The 404 Starlette raised. An ``HTTPException`` in every case
-                that reaches this handler, since it is only ever dispatched
-                for one.
-
-        Returns:
-            The reshaped API error for ``/api``, the missing screen for a
-            browser with a session, and the plain answer for everything else.
-            A 404 is not a place to start rendering a root panel's navigation
-            to someone who has not signed in.
-        """
-        path = request.url.path
-        machine_paths = ("/api", "/ws", "/static", "/events", "/health", "/hooks")
-        wants_html = "text/html" in request.headers.get("accept", "")
-
-        if path.startswith(API_PATH_PREFIX) and isinstance(exc, StarletteHTTPException):
-            return await handle_http_exception(request, exc)
-
-        if path.startswith(machine_paths) or not wants_html:
-            return JSONResponse({"detail": "Not found"}, status_code=404)
-
-        from wasm.web.auth import require_auth
-
-        try:
-            await require_auth(request)
-        except HTTPException:
-            return RedirectResponse("/login", status_code=303)
-
-        from wasm.web.views.rendering import page as render_page
-
-        return render_page(
-            request,
-            "pages/missing.html",
-            {
-                "section": "Not found",
-                "title": "No such screen",
-                "body": f"The panel has nothing at {path}.",
-                "command": "wasm --help",
-            },
-            status_code=404,
-        )
 
     @app.get("/health")
     async def health_check() -> dict[str, str]:
@@ -725,6 +572,43 @@ def create_app(config: SecurityConfig | None = None) -> FastAPI:
             A static health payload with no environment details.
         """
         return {"status": "healthy", "service": "wasm-web"}
+
+    mount_console(app)
+
+    @app.exception_handler(404)
+    async def not_found(request: Request, exc: Exception) -> Response:
+        """
+        Answer an address nothing matched.
+
+        Starlette dispatches by status code before it dispatches by exception
+        type, so every 404 - including one an ``/api`` handler raised on
+        purpose, such as "Service not found: foo" - lands here rather than in
+        :func:`~wasm.web.api.deps.handle_http_exception`. An API path
+        delegates to it explicitly so a 404 still answers in the one error
+        contract.
+
+        Args:
+            request: The request that matched no route.
+            exc: The 404 Starlette raised.
+
+        Returns:
+            The reshaped API error for ``/api``, the same contract for the
+            other machine paths and for anything that is not a page load, and
+            the console for a browser asking for a page: the console has its
+            own "no such page" screen and the client router decides.
+        """
+        path = request.url.path
+
+        if path.startswith(API_PATH_PREFIX) and isinstance(exc, StarletteHTTPException):
+            return await handle_http_exception(request, exc)
+
+        if is_machine_path(path) or request.method not in ("GET", "HEAD"):
+            return JSONResponse(
+                {"error": "not_found", "detail": "Not found", "hint": None, "fields": None},
+                status_code=404,
+            )
+
+        return console_index()
 
     return app
 
@@ -840,7 +724,11 @@ class SecurityMiddleware:
             )
             return
 
-        if config.rate_limit_enabled and not get_rate_limiter().is_allowed(client_ip):
+        if (
+            config.rate_limit_enabled
+            and not _spends_no_rate_budget(scope, path)
+            and not get_rate_limiter().is_allowed(client_ip)
+        ):
             await self._deny(
                 scope,
                 receive,
@@ -967,7 +855,7 @@ class SecurityMiddleware:
         async def wrapped(message: Message) -> None:
             if message["type"] == "http.response.start":
                 headers = MutableHeaders(scope=message)
-                self._harden_headers(headers, connection)
+                self._harden_headers(headers, connection, int(message["status"]))
                 self._apply_renewed_session(scope, headers, connection)
                 if self.config.rate_limit_enabled:
                     headers["X-RateLimit-Remaining"] = str(
@@ -975,6 +863,15 @@ class SecurityMiddleware:
                     )
                     headers["X-RateLimit-Limit"] = str(self.config.rate_limit_requests)
                 self._audit_mutation(scope, client_ip, int(message["status"]))
+                # Beside the audit trail because it is the same question - did
+                # a mutation succeed - asked at the one place every API call
+                # passes, so no endpoint under /api/apps/{domain} can forget
+                # to tell the open consoles.
+                announce_app_mutation(
+                    str(scope.get("method", "GET")),
+                    str(scope.get("path", "")),
+                    int(message["status"]),
+                )
             await send(message)
 
         return wrapped
@@ -1026,13 +923,17 @@ class SecurityMiddleware:
             resource=path,
         )
 
-    def _harden_headers(self, headers: MutableHeaders, connection: HTTPConnection) -> None:
+    def _harden_headers(
+        self, headers: MutableHeaders, connection: HTTPConnection, status_code: int
+    ) -> None:
         """
         Set the response hardening headers.
 
         Args:
             headers: Headers of the outgoing response.
             connection: The connection being answered.
+            status_code: The status being answered, which decides whether an
+                asset may be cached.
         """
         headers["Content-Security-Policy"] = CONTENT_SECURITY_POLICY
         headers["X-Content-Type-Options"] = "nosniff"
@@ -1040,7 +941,7 @@ class SecurityMiddleware:
         headers["Referrer-Policy"] = "no-referrer"
         headers["Cross-Origin-Opener-Policy"] = "same-origin"
         headers["Cross-Origin-Resource-Policy"] = "same-origin"
-        headers["Cache-Control"] = _cache_control_for(connection.url.path)
+        headers["Cache-Control"] = _cache_control_for(connection.url.path, status_code)
         headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
 
         if self.config.require_https or is_secure_request(connection, self.config):
@@ -1095,7 +996,7 @@ class SecurityMiddleware:
             content={"error": error, "detail": detail, "hint": None, "fields": None},
             headers=headers,
         )
-        self._harden_headers(MutableHeaders(raw=response.raw_headers), connection)
+        self._harden_headers(MutableHeaders(raw=response.raw_headers), connection, status_code)
         await response(scope, receive, send)
 
 
@@ -1116,9 +1017,84 @@ def _query_ticket(scope: Scope) -> str | None:
     return values[0] if values else None
 
 
-def _login_fallback_html() -> str:
+def console_index() -> Response:
     """
-    Render the login page used when the static assets are missing.
+    Serve the console's ``index.html``.
+
+    Read from disk on every request rather than cached at start-up, so a
+    rebuilt console (``npm run build`` during development, a package upgrade
+    in production) is picked up without restarting the panel. The file is two
+    kilobytes and the middleware marks the answer ``no-store``: it names the
+    current build's hashed assets, so a cached copy would pin a browser to a
+    build that no longer exists on disk.
+
+    Returns:
+        The console, or a script-free page saying the build is missing when
+        the package was installed without it.
+    """
+    if not INDEX_HTML.is_file():
+        return HTMLResponse(_missing_console_html(), status_code=503)
+    return FileResponse(INDEX_HTML, media_type="text/html")
+
+
+def mount_console(app: FastAPI) -> None:
+    """
+    Serve the console: its hashed assets, its root files and the SPA fallback.
+
+    Registered after every API router, the event stream and the WebSockets,
+    because Starlette matches routes in order and the fallback matches every
+    path: anything registered after it would be unreachable.
+
+    Args:
+        app: The application to mount the console on.
+    """
+    # Checked at start-up rather than at request time: StaticFiles refuses a
+    # directory that does not exist, and a panel installed without its build
+    # must still answer the API and explain itself on "/".
+    if ASSETS_DIR.is_dir():
+        app.mount("/assets", StaticFiles(directory=str(ASSETS_DIR)), name="assets")
+
+    # The files Vite copies from panel/public, served at the root where the
+    # built index.html references them. A fixed set read once: a name is only
+    # ever looked up in it, never joined onto a path, so no traversal can
+    # reach outside the directory.
+    root_files = (
+        {entry.name for entry in STATIC_DIR.iterdir() if entry.is_file()}
+        if STATIC_DIR.is_dir()
+        else set()
+    )
+    root_files.discard(INDEX_HTML.name)
+
+    @app.api_route("/{path:path}", methods=["GET", "HEAD"], include_in_schema=False)
+    async def console(path: str) -> Response:
+        """
+        Answer a console address with the console.
+
+        The client router owns every path outside the machine prefixes, so a
+        deep link or a reload on ``/apps/example.com/deployments`` has to
+        return the same document as ``/``.
+
+        Args:
+            path: The requested path, without its leading slash.
+
+        Returns:
+            A root file of the build, or the console.
+
+        Raises:
+            HTTPException: 404 for a machine path no route answered, so it is
+                reported in JSON by the not-found handler instead of being
+                shadowed by an HTML page with a 200.
+        """
+        if is_machine_path(f"/{path}"):
+            raise HTTPException(status_code=404, detail="Not found")
+        if path in root_files:
+            return FileResponse(STATIC_DIR / path)
+        return console_index()
+
+
+def _missing_console_html() -> str:
+    """
+    Render the page served when the console's build is not installed.
 
     Returns:
         A script-free page, so it works under the panel's CSP.
@@ -1128,17 +1104,15 @@ def _login_fallback_html() -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WASM - Login</title>
+    <title>WASM Console</title>
 </head>
 <body>
-    <h1>WASM Web Interface</h1>
-    <p>The dashboard assets are not installed on this server.</p>
-    <p>Authenticate by posting your access token to <code>/api/auth/login</code>:</p>
-    <pre>curl -X POST http://HOST:PORT/api/auth/login \\
-     -H 'Content-Type: application/json' \\
-     -d '{"token": "YOUR_TOKEN", "bearer": true}'</pre>
-    <p>The token is never accepted in a URL, because query strings are stored in
-    browser history, proxy logs and access logs.</p>
+    <h1>The WASM console is not installed</h1>
+    <p>This package was built without the console in <code>wasm/web/static/</code>.
+    Reinstall WASM from a release package, or build it from a checkout with
+    <code>cd panel &amp;&amp; npm ci &amp;&amp; npm run build</code>.</p>
+    <p>The API is available: authenticate by posting your access token to
+    <code>/api/auth/login</code>.</p>
 </body>
 </html>
 """

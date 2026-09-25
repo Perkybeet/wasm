@@ -6,9 +6,10 @@
 Tests for the panel's shared seed data factory.
 
 :func:`tests.panel_factory.seed_panel_state` backs both
-``scripts/panel_browser_check.py`` and any test that wants a populated panel.
-These tests are its own contract: that it seeds exactly the counts it is
-asked for, and that the parameters the browser check relies on to reproduce
+``scripts/console_server.py`` (formerly the now-deleted
+``scripts/panel_browser_check.py``) and any test that wants a populated
+panel. These tests are its own contract: that it seeds exactly the counts it
+is asked for, and that the parameters the seed script relies on to reproduce
 its historical data still do.
 """
 
@@ -19,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.panel_factory import DEFAULT_DOMAINS, seed_panel_state
+from tests.panel_factory import DEFAULT_DOMAINS, seed_console_state, seed_panel_state
 from wasm.core.store import WASMStore
 
 
@@ -127,3 +128,68 @@ def test_asking_for_more_than_the_applications_created_is_rejected(store: WASMSt
     """Every count is a subset of the applications; a caller that gets this backwards should fail loudly."""
     with pytest.raises(ValueError, match="failed=2"):
         seed_panel_state(store, apps=1, services=0, sites=0, certs=0, backups=0, failed=2)
+
+
+# ---------------------------------------------------------------------------
+# seed_console_state: what scripts/console_server.py and the E2E suite draw
+# ---------------------------------------------------------------------------
+
+
+def test_the_console_seed_covers_every_application_state(store: WASMStore) -> None:
+    """
+    The E2E suite runs axe over every page; a state that is never seeded is a
+    state whose pill, colour and label are never checked.
+
+    Args:
+        store: A store of its own.
+    """
+    state = seed_console_state(store)
+
+    apps = {app.domain: app for app in store.list_apps()}
+    assert set(apps) == set(DEFAULT_DOMAINS)
+    assert {app.status for app in apps.values()} >= {"running", "stopped", "failed"}
+
+    assert len(state.static_domains) == 2
+    for domain in state.static_domains:
+        app = apps[domain]
+        assert app.app_type == "static"
+        assert app.id is not None
+        assert store.get_service_by_app_id(app.id) is None, "a static site has no unit"
+
+
+def test_every_seeded_deployment_has_its_build_log(store: WASMStore) -> None:
+    """
+    The deployment page shows the captured log; a history with none of them
+    leaves the log viewer untested against real output.
+
+    Args:
+        store: A store of its own.
+    """
+    state = seed_console_state(store)
+
+    for domain in state.deployment_domains:
+        for record in store.list_deployments(domain):
+            assert record.log_path, f"{domain} deployment {record.id} has no log"
+            text = Path(record.log_path).read_text(encoding="utf-8")
+            assert "==> Installing dependencies" in text
+            if record.status == "failed":
+                # The tool's own words, verbatim, for the failure the pill reports.
+                assert "npm ERR! code ELIFECYCLE" in text.replace("\x1b[31m", "").replace(
+                    "\x1b[0m", ""
+                )
+
+
+def test_the_console_seed_has_databases_and_a_job_history(store: WASMStore) -> None:
+    """
+    Args:
+        store: A store of its own.
+    """
+    state = seed_console_state(store)
+
+    engines = {database.engine for database in store.list_databases()}
+    assert len(state.database_names) == 3
+    assert engines == {"postgresql", "mysql", "redis"}
+
+    jobs = store.list_jobs()
+    assert len(jobs) == 4
+    assert {job.status for job in jobs} == {"completed", "failed"}

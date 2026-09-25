@@ -75,11 +75,15 @@ src/wasm/
   managers/         adapters: web server, systemd, certs, backups, databases, source
   deployers/        strategies over a declarative pipeline
   web/
-    api/            thin layer over the managers
-    views/          server-rendered pages
-    templates/      Jinja, autoescaped
-    static/vendor/  third-party assets, pinned by SHA-256
+    api/            thin layer over the managers; one error contract for every router
+    server.py       security middleware, CSP, serves the console
+    events.py       the /events SSE stream the console listens to
+    static/         the console's committed Vite build (generated from panel/, never edited)
   cli/              argparse tree; handlers hold no business logic
+panel/              WASM Console source: React 19, TypeScript, Vite, TanStack Router/Query,
+                    Base UI, Tailwind v4; src/api/schema.gen.ts is generated from openapi.json
+  e2e/              Playwright + axe + CSP gate against the real backend
+scripts/console_server.py   the real API on a seeded, sandboxed store (development and E2E)
 ```
 
 ### Adding a deployer
@@ -117,8 +121,34 @@ ruff format src/wasm tests      # format (blocking in CI)
 mypy                            # types (blocking in CI)
 
 python scripts/release.py --check         # version consistency
-python scripts/vendor_assets.py --check   # vendored asset checksums
 ```
+
+The console needs Node 22 (the major in `panel/.nvmrc`); CI runs every one of these:
+
+```bash
+cd panel && npm ci              # the lock file, exactly; never `npm install` in CI
+npm run lint                    # eslint, zero warnings
+npm run typecheck               # tsc, strict
+npm test                        # vitest unit + component tests (axe included)
+npm run check:api               # schema.gen.ts matches openapi.json (npm run gen:api to fix)
+npm run build                   # writes src/wasm/web/static: commit the result
+npm run e2e                     # Playwright: every page, both themes, zero axe/CSP violations
+npm run e2e:screens             # screenshots of every route, both themes + 390px mobile
+```
+
+To work on the console against the real API, run a seeded, sandboxed backend and the Vite
+dev server, which proxies `/api`, `/events`, `/hooks` and `/ws` to it:
+
+```bash
+python scripts/console_server.py --port 8080    # prints {"url", "token", ...}; sign in with the token
+cd panel && npm run dev                          # http://localhost:5173
+```
+
+`console_server.py` runs the real FastAPI app under uvicorn over a store seeded by
+`tests/panel_factory.seed_console_state`, with every system path redirected into a temporary
+directory and a fake runner answering systemctl, journalctl, nginx and certbot, so nothing on
+the development machine is touched. `--totp` turns on the second sign-in factor; the E2E suite
+starts one per Playwright worker.
 
 ---
 
@@ -145,8 +175,12 @@ GitHub Actions publishes to PyPI and OBS on tag push.
 ## Packaging notes
 
 The OBS tarball is produced with `git archive HEAD`, so **only committed files ship** and
-the build environment has no network. That is why the panel has no build step and why every
-third-party asset is vendored into `src/wasm/web/static/vendor/` with a checksum.
+the build environment has no network. That is why the console's Vite build is committed to
+`src/wasm/web/static/`: Node never runs during packaging, and the `web/static/**/*` glob in
+`pyproject.toml` ships it in the wheel, sdist, deb and rpm. Frontend dependencies are
+build-time only; nothing but the build ships, and it loads nothing from a CDN. The CI `panel`
+job rebuilds and fails when the committed build differs from what `panel/` produces, so
+after any change under `panel/src` run `npm run build` and commit `src/wasm/web/static`.
 
 When adding a dependency, declare it in all four places: `pyproject.toml`, `setup.py`,
 `obs/debian.control` and `rpm/wasm.spec`. `tests/test_architecture.py` fails if an import is
@@ -168,13 +202,31 @@ Debian or Ubuntu, which is why interactive mode never worked there.
 
 ## The panel
 
-Server-rendered HTML updated by htmx, with Alpine for small islands and xterm.js for the log
-drawer. No build step, no Node, no CDN. This is the architecture Coolify uses, translated to
-Python.
+The WASM Console is a React single-page application. Its source lives in `panel/`; its build
+is committed to `src/wasm/web/static/` and served by `server.py`: hashed chunks under
+`/assets` (cached immutable for a year) and `index.html` (`no-store`) for every GET outside
+`/api`, `/assets`, `/events`, `/ws`, `/hooks` and `/health`, where a miss answers JSON. The
+backend renders no pages: the console is a client of the JSON API, the `/events` stream
+(`machine`, `metrics`, `app`, `job`, `notice`) and the log and job WebSockets, like any script.
+FastAPI's OpenAPI schema is exported to `panel/openapi.json` and compiled into
+`panel/src/api/schema.gen.ts`, so the console cannot call an endpoint that does not exist.
 
-Colour only ever encodes state: navigation, surfaces and text are achromatic, so anything
-coloured on screen is telling the operator something. The design direction is recorded in
-`docs/superpowers/specs/2026-08-12-wasm-panel-design-direction.md`.
+The Content Security Policy is strict: `script-src 'self'; style-src 'self'`, no
+`unsafe-inline` anywhere, and `require-trusted-types-for 'script'`. That rules out inline
+`<script>`/`<style>`, style attributes in markup, `data:` fonts (hence `assetsInlineLimit: 0`
+in `vite.config.ts`) and every string-to-DOM sink (`innerHTML`, `insertAdjacentHTML`, `eval`).
+React sets styles through the CSSOM, which the policy allows, and Base UI runs with
+`disableStyleElements`. Never add a library that injects `<style>` elements or writes HTML
+strings (Radix, sonner and xterm all do, which is why they are not used). A policy is only
+enforced in a browser, so the E2E suite collects every `securitypolicyviolation` and console
+error and fails on any, and runs axe on every page in both themes (WCAG 2.2 AA, zero
+violations).
+
+Colour only ever encodes state (running green, in progress amber, failed red, stopped grey),
+plus the violet accent for interactive elements; every state also has a shape and a text
+label. Navigation, surfaces and text are achromatic, so anything coloured on screen is
+telling the operator something. The design direction is D8 in
+`docs/superpowers/specs/2026-09-25-wasm-v2-design.md`; UI copy is English, sentence case.
 
 A system error is never paraphrased. Show nginx's or systemd's own output verbatim in mono,
 with the suggested fix above it.

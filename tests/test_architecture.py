@@ -459,46 +459,85 @@ class TestPydanticBridge:
 
 
 class TestSelfContained:
-    """The panel works on a machine with no route to the internet."""
+    """The console works on a machine with no route to the internet."""
 
-    #: Nothing. The single-page application that loaded Tailwind and Font
-    #: Awesome from public CDNs has been replaced by server-rendered pages, so
-    #: this list is empty and must stay that way.
+    STATIC = SRC / "web/static"
+
+    #: Nothing. The first single-page application loaded Tailwind and Font
+    #: Awesome from public CDNs; the console bundles every dependency into its
+    #: build, so this list is empty and must stay that way.
     CDN_ALLOWED: set[str] = set()
+
+    def references(self, html: str) -> list[str]:
+        """
+        Return every ``src`` and ``href`` in a document.
+
+        Args:
+            html: The document.
+
+        Returns:
+            The attribute values, in order.
+        """
+        return re.findall(r"""\b(?:src|href)\s*=\s*["']([^"']*)["']""", html)
+
+    def test_the_built_console_references_only_same_origin_assets(self):
+        """
+        Every script, stylesheet and icon the console loads comes from this server.
+
+        A third-party origin would be both a machine that cannot render its
+        own panel offline and a third party injecting code into a page with
+        root over the machine; the CSP would also block it, silently, in
+        production only.
+        """
+        html = (self.STATIC / "index.html").read_text(encoding="utf-8")
+        refs = self.references(html)
+
+        assert refs, "the built index.html references nothing; is it the Vite build?"
+        foreign = [ref for ref in refs if not ref.startswith("/") or ref.startswith("//")]
+        assert not foreign, f"index.html references other origins: {foreign}"
+
+        code = re.findall(r"""<(?:script|link)\b[^>]*\b(?:src|href)=["']([^"']+)["']""", html)
+        outside_assets = [
+            ref for ref in code if not ref.startswith("/assets/") and not ref.endswith(".svg")
+        ]
+        assert not outside_assets, f"code outside /assets/: {outside_assets}"
+
+    def test_every_asset_the_console_names_is_committed(self):
+        """
+        A build committed in part is a console that loads a blank page.
+
+        OBS packages ``git archive HEAD``: a chunk that was built but never
+        committed does not exist on any installed machine.
+        """
+        html = (self.STATIC / "index.html").read_text(encoding="utf-8")
+        missing = [
+            ref
+            for ref in self.references(html)
+            if ref.startswith("/") and not (self.STATIC / ref.lstrip("/")).is_file()
+        ]
+
+        assert not missing, f"index.html names files that are not in the build: {missing}"
 
     def test_no_external_assets(self):
         """
-        Nothing the panel serves is fetched from a third party.
+        Nothing the console serves is fetched from a third party.
 
-        A control panel with root over the machine used to load Tailwind and
-        Font Awesome from public CDNs, so it could not render without internet
-        access and two third parties were injecting JavaScript into it.
+        The bundle is scanned as well as the document: a stylesheet
+        ``@import`` or ``url()`` pointing at a CDN would load exactly like a
+        script tag would.
         """
-        pattern = re.compile(r"""(?:src|href)\s*=\s*["']https?://""")
+        markup = re.compile(r"""(?:src|href)\s*=\s*["']https?://""")
+        css_remote = re.compile(
+            r"""url\(\s*["']?(?:https?:)?//|@import\s+(?:url\()?["']?(?:https?:)?//"""
+        )
         offenders = set()
-        web = SRC / "web"
-        for path in list(web.rglob("*.html")) + list(web.rglob("*.js")) + list(web.rglob("*.css")):
-            if "vendor" in path.parts:
-                continue
-            if pattern.search(path.read_text(encoding="utf-8", errors="replace")):
+        files = [p for p in self.STATIC.rglob("*") if p.suffix in {".html", ".js", ".css"}]
+        for path in files:
+            text = path.read_text(encoding="utf-8", errors="replace")
+            if markup.search(text) or (path.suffix == ".css" and css_remote.search(text)):
                 offenders.add(relative(path))
 
-        check_ratchet(offenders, self.CDN_ALLOWED, "the panel serves no external assets")
-
-    def test_vendored_assets_match_their_checksums(self):
-        """Vendoring without an update process is how CVEs accumulate."""
-        import json
-
-        lock = json.loads((REPO / "scripts/vendor.lock.json").read_text(encoding="utf-8"))
-        vendor = SRC / "web/static/vendor"
-
-        import hashlib
-
-        for name, meta in lock.items():
-            path = vendor / name
-            assert path.exists(), f"{name} is in the lock but not vendored"
-            digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            assert digest == meta["sha256"], f"{name} does not match its recorded checksum"
+        check_ratchet(offenders, self.CDN_ALLOWED, "the console serves no external assets")
 
 
 class TestPackaging:
@@ -574,7 +613,6 @@ class TestPackaging:
 
         needed = {
             "templates/**/*.j2": SRC / "templates",
-            "web/templates/**/*.html": SRC / "web/templates",
             "web/static/**/*": SRC / "web/static",
         }
 
@@ -589,6 +627,19 @@ class TestPackaging:
             "not in [tool.setuptools.package-data]:\n"
             + "\n".join(f"  {pattern}" for pattern in missing)
         )
+
+    def test_the_source_distribution_carries_the_console(self):
+        """
+        The sdist is built from MANIFEST.in, not from package-data.
+
+        A console missing from the sdist is a console missing from every
+        distribution package built from it, and nothing fails until somebody
+        opens the panel.
+        """
+        manifest = (REPO / "MANIFEST.in").read_text(encoding="utf-8")
+
+        assert "recursive-include src/wasm/web/static *" in manifest
+        assert "web/templates" not in manifest, "the Jinja pages are gone"
 
     def test_the_debian_build_dependencies_agree(self):
         """

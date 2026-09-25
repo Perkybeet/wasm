@@ -35,11 +35,16 @@ export default defineConfig(({ mode }) => {
     ],
     base: "/",
     build: {
-      // Until the server cut-over (Task 2.1, later step) the legacy panel still owns
-      // src/wasm/web/static, so the console builds into a gitignored directory.
-      outDir: "dist",
+      // The build is committed: OBS packages from `git archive HEAD` with no network and
+      // never runs Node, so the Python package has to carry the console ready to serve.
+      // CI rebuilds and fails when this directory differs from what the source produces.
+      outDir: "../src/wasm/web/static",
       emptyOutDir: true,
       assetsDir: "assets",
+      // Never inline an asset as a data: URI. Vite inlines anything under 4 KiB by default,
+      // which turned the smallest font subset into data:font/woff2 - and the CSP's
+      // `font-src 'self'` blocks that, so the glyphs it covers silently fell back.
+      assetsInlineLimit: 0,
       sourcemap: false,
       // Rolldown (Vite 8) names chunks by content hash and has no parallel-file-ops or
       // CommonJS-plugin knobs; determinism is verified by building twice and diffing.

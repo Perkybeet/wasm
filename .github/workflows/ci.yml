@@ -138,8 +138,19 @@ jobs:
           print(f"The web layer imports under pydantic {pydantic.VERSION}")
           PY
 
+      # Endpoints whose models and validators go through the bridge, the
+      # error contract every router answers in, sudo mode, the job and app
+      # events the console caches as API responses, and the console itself
+      # being served on the stack Ubuntu 24.04 actually installs.
       - name: Run the bridged endpoints' tests
-        run: pytest tests/test_web_backup_schedules.py tests/test_web_cron_pages.py -q
+        run: |
+          pytest -q \
+            tests/test_web_backup_schedules.py \
+            tests/test_web_cron_api.py \
+            tests/test_web_errors.py \
+            tests/test_web_sudo.py \
+            tests/test_web_events.py \
+            tests/test_spa_serving.py
 
   smoke:
     name: Smoke
@@ -182,18 +193,67 @@ jobs:
           wasm --version
           wasm --help
 
-  browser:
-    name: Browser check
+  # The console is built by Node but shipped by Python: src/wasm/web/static
+  # is the committed output of panel/, because OBS packages `git archive
+  # HEAD` with no network and never runs Node. This job is the proof that
+  # what is committed is what the source produces - the same pattern as the
+  # man page and the completions - plus the frontend's own gates: the typed
+  # API contract is current, lint, types and unit tests.
+  panel:
+    name: Console
     runs-on: ubuntu-latest
-    # scripts/panel_browser_check.py is what caught the sidebar losing its
-    # position on scroll, the log drawer not opening and the mobile nav being
-    # unreachable: all three are decided by a layout engine, and nothing else
-    # in this suite drives one. It used to be run by hand only, which is
-    # exactly how those shipped. continue-on-error stays on for the first two
-    # weeks this job exists, to absorb runner-specific flakiness in a real
-    # browser before it can block a merge; flip it once it has passed ten
-    # consecutive runs.
-    continue-on-error: true
+    defaults:
+      run:
+        working-directory: panel
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: panel/.nvmrc
+          cache: npm
+          cache-dependency-path: panel/package-lock.json
+
+      - name: Install exactly the locked dependencies
+        run: npm ci
+
+      - name: Check the API types match the exported OpenAPI schema
+        run: npm run check:api
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      # `git diff` alone misses a chunk the build created and nobody
+      # committed; `git status` sees both that and a deleted one.
+      - name: Check the committed build matches the source
+        working-directory: .
+        run: |
+          git diff --exit-code --stat -- src/wasm/web/static
+          untracked=$(git status --porcelain -- src/wasm/web/static)
+          if [ -n "$untracked" ]; then
+            echo "The committed console build differs from what panel/ produces:"
+            echo "$untracked"
+            echo "Run 'cd panel && npm run build' and commit src/wasm/web/static."
+            exit 1
+          fi
+
+  # The console against the real backend in a real browser: every page in
+  # both themes with axe reporting zero WCAG 2.2 AA violations and zero
+  # Content Security Policy violations. A policy is only enforced in a
+  # browser, which is how the strict one once shipped and silently switched
+  # features off; this job is what makes that impossible now.
+  e2e:
+    name: Console end-to-end
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
@@ -202,13 +262,41 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install project and Playwright
-        run: |
-          pip install -e ".[web]" playwright
-          playwright install --with-deps chromium
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: panel/.nvmrc
+          cache: npm
+          cache-dependency-path: panel/package-lock.json
 
-      - name: Run the browser check
-        run: python scripts/panel_browser_check.py
+      # scripts/console_server.py runs the real FastAPI app on a sandboxed,
+      # seeded store with a fake command runner, so nothing here needs root
+      # or touches the runner's own systemd.
+      - name: Install the project
+        run: pip install -e ".[web]"
+
+      - name: Install the console's dependencies
+        working-directory: panel
+        run: npm ci
+
+      - name: Install the browser
+        working-directory: panel
+        run: npx playwright install --with-deps chromium
+
+      - name: Run the end-to-end suite
+        working-directory: panel
+        env:
+          WASM_PYTHON: python
+        run: npm run e2e
+
+      - name: Keep the report of a failed run
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: |
+            panel/playwright-report
+            panel/test-results
+          retention-days: 14
 
   packaging:
     name: Packaging
@@ -225,11 +313,6 @@ jobs:
       - name: Check version consistency
         run: python scripts/release.py --check
 
-      # The panel serves no third-party asset it does not carry, so an
-      # air-gapped server still gets a working page.
-      - name: Check vendored assets
-        run: python scripts/vendor_assets.py --check
-
       # Every command, alias and option the argparse tree exposed still exists.
       # They are in scripts and in muscle memory, so losing one is a breaking
       # change whether or not anyone meant it.
@@ -240,6 +323,12 @@ jobs:
 
       # There used to be two man pages, diverged, fifteen releases stale, and
       # the one shipped in the .deb declared the wrong licence.
+      # panel/openapi.json is the one input of the console's generated
+      # types; a schema the API no longer produces is a contract the panel
+      # was built against that the server has since moved past.
+      - name: Check the OpenAPI export is current
+        run: python scripts/export_openapi.py --check
+
       - name: Check the man page is current
         run: python scripts/generate_man.py --check
 

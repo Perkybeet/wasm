@@ -258,6 +258,13 @@ export function CommandPalette({ open, onOpenChange, commands, returnFocus }: Co
   const inputRef = useRef<HTMLInputElement>(null);
   const lastRun = useRef<Command["kind"] | null>(null);
 
+  // The palette is opened from outside (the trigger, Ctrl+K), which Base UI's onOpenChange
+  // never reports; without this, a page opened from it once kept focus from ever being
+  // handed back on a later Escape.
+  useEffect(() => {
+    if (open) lastRun.current = null;
+  }, [open]);
+
   const run = (command: Command): void => {
     lastRun.current = command.kind;
     onOpenChange(false);

@@ -53,9 +53,6 @@ jobs:
       - name: Check the command surface
         run: python scripts/cli_parity.py
 
-      - name: Check vendored assets
-        run: python scripts/vendor_assets.py --check
-
       - name: Check the completion scripts are current
         run: python scripts/generate_completions.py --check
 
@@ -195,9 +192,9 @@ jobs:
           for path in \
             usr/share/bash-completion/completions/wasm \
             usr/share/man/man1/wasm.1 \
-            web/templates/base.html \
-            web/static/app.css \
-            web/static/vendor/htmx.min.js
+            web/static/index.html \
+            web/static/favicon.svg \
+            web/static/assets/
           do
             grep -q "$path" contents.txt || { echo "MISSING from the package: $path"; exit 1; }
           done
@@ -330,9 +327,9 @@ jobs:
           for path in \
             share/bash-completion/completions/wasm \
             share/man/man1/wasm.1 \
-            web/templates/base.html \
-            web/static/app.css \
-            web/static/vendor/htmx.min.js
+            web/static/index.html \
+            web/static/favicon.svg \
+            web/static/assets/
           do
             grep -q "$path" contents.txt || { echo "MISSING from the package: $path"; exit 1; }
           done

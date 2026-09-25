@@ -3,13 +3,12 @@
 # https://github.com/Perkybeet/wasm/blob/main/LICENSE
 
 """
-Tests for scheduled backups: the API and the backups page section.
+Tests for scheduled backups: the JSON API.
 
 The scheduler writes root-owned systemd units and runs systemctl, so what is
 asserted here is the exact argv the manager builds and the exact unit files
 it writes - through the FakeRunner and a systemd directory inside tmp_path,
-never a real process. The API is a thin client of the scheduler; the section
-is a thin client of the API; these tests hold both to that.
+never a real process.
 
 The refusal that matters most: a calendar expression the scheduler would not
 write into a unit answers 422 with the scheduler's own words, and nothing is
@@ -17,32 +16,61 @@ written. A schedule that is half-created is a backup that silently never
 happens, which is the worst state a backup feature can have.
 """
 
-# The web fixtures are imported from test_web_views rather than replicated, so
-# there stays one definition of "a signed-in panel client". Ruff reads a test
-# parameter named after an imported fixture as a redefinition; here it is the
-# mechanism.
-# ruff: noqa: F811
-
 from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from tests.test_web_views import (  # noqa: F401  (pytest resolves fixtures by name)
-    MISSING_MARKER,
-    anonymous,
-    app,
-    body_of,
-    client,
-    config_file,
-    deploy,
-    store,
-)
 from wasm.core.runner import FakeRunner
-from wasm.core.store import WASMStore
 from wasm.managers.backup_scheduler import BackupScheduler
+from wasm.web.auth import CSRF_HEADER_NAME, SecurityConfig
+from wasm.web.server import create_app, get_token_manager
+
+
+@pytest.fixture
+def app(tmp_path: Path, runner: FakeRunner) -> FastAPI:
+    """
+    Args:
+        tmp_path: Per-test temporary directory.
+        runner: The fake command runner, so no manager reaches a real process.
+
+    Returns:
+        The application.
+    """
+    return create_app(SecurityConfig(state_dir=tmp_path / "state", rate_limit_requests=5000))
+
+
+@pytest.fixture
+def client(app: FastAPI) -> TestClient:
+    """
+    Args:
+        app: The application.
+
+    Returns:
+        A signed-in client carrying the CSRF header.
+    """
+    signed_in = TestClient(app, client=("testclient", 50000), follow_redirects=False)
+    token = get_token_manager().generate_master_token()
+    response = signed_in.post("/api/auth/login", json={"token": token})
+    assert response.status_code == 200, response.text
+    signed_in.headers[CSRF_HEADER_NAME] = response.json()["csrf_token"]
+    return signed_in
+
+
+@pytest.fixture
+def anonymous(app: FastAPI) -> TestClient:
+    """
+    Args:
+        app: The application.
+
+    Returns:
+        A client with no session.
+    """
+    return TestClient(app, client=("testclient", 50000), follow_redirects=False)
+
 
 #: What ``systemctl list-timers --no-legend`` prints for one WASM timer. The
 #: columns are the human ones a real systemd emits; the manager must find the
@@ -221,109 +249,3 @@ def test_the_api_demands_a_session(anonymous: TestClient) -> None:
         403,
     )
     assert anonymous.delete("/api/backup-schedules/a.com").status_code in (401, 403)
-
-
-# --------------------------------------------------------------- the section
-
-
-def test_the_backups_page_loads_the_section(client: TestClient) -> None:
-    """The page hands the browser the section's address."""
-    body = body_of(client, "/backups")
-
-    assert 'hx-get="/backups/schedules"' in body
-    assert "Scheduled backups" in body
-
-
-def test_the_section_renders_each_schedule(
-    client: TestClient, runner: FakeRunner, store: WASMStore
-) -> None:
-    """The table names the domain, the calendar in mono and the next run."""
-    deploy(store)
-    scripted_timer(runner)
-
-    body = body_of(client, "/backups/schedules")
-
-    assert MISSING_MARKER not in body
-    assert "example.com" in body
-    assert "*-*-* 02:00:00" in body
-    assert "Sat 2026-08-15 02:00:00 UTC" in body
-
-
-def test_deleting_from_the_section_confirms_and_names_the_domain(
-    client: TestClient, runner: FakeRunner, store: WASMStore
-) -> None:
-    """The Delete button asks first, and the question is not "are you sure"."""
-    deploy(store)
-    scripted_timer(runner)
-
-    body = body_of(client, "/backups/schedules")
-
-    assert 'hx-delete="/api/backup-schedules/example.com"' in body
-    assert "Delete the backup schedule for example.com?" in body
-
-
-def test_the_form_offers_the_deployed_applications(client: TestClient, store: WASMStore) -> None:
-    """The select is built from what is deployed, not typed free-hand."""
-    deploy(store)
-    deploy(store, domain="other.example.com")
-
-    body = body_of(client, "/backups/schedules")
-
-    assert '<option value="example.com"' in body
-    assert '<option value="other.example.com"' in body
-
-
-def test_creating_from_the_form_reaches_the_manager(
-    client: TestClient, runner: FakeRunner, store: WASMStore, systemd_dir: Path
-) -> None:
-    """The htmx form drives the same create the JSON API drives."""
-    deploy(store)
-
-    response = client.post(
-        "/backups/schedules",
-        data={
-            "domain": "example.com",
-            "schedule": "daily",
-            "retention_count": "7",
-            "retention_days": "30",
-        },
-    )
-
-    assert response.status_code == 200, response.text
-    assert "Backup schedule created for example.com" in response.text
-    timer, service = written_units(systemd_dir)
-    assert timer.exists() and service.exists()
-    assert ("systemctl", "enable", "--now", "wasm-backup-example-com.timer") in runner.calls
-
-
-def test_a_refused_calendar_renders_inline_and_writes_nothing(
-    client: TestClient, runner: FakeRunner, store: WASMStore, systemd_dir: Path
-) -> None:
-    """
-    htmx does not swap an error status, so the refusal answers 200 with the
-    scheduler's words on the fragment - and no unit half-written behind it.
-    """
-    deploy(store)
-
-    response = client.post(
-        "/backups/schedules",
-        data={
-            "domain": "example.com",
-            "schedule": "custom",
-            "on_calendar": INJECTED_CALENDAR,
-            "retention_count": "7",
-            "retention_days": "30",
-        },
-    )
-
-    assert response.status_code == 200
-    assert "Invalid backup schedule" in response.text
-    assert list(systemd_dir.iterdir()) == []
-
-
-def test_the_section_demands_a_session(anonymous: TestClient) -> None:
-    """The section redirects to the sign-in form, like every page."""
-    response = anonymous.get("/backups/schedules")
-
-    assert response.status_code == 303
-    assert response.headers["location"] == "/login"

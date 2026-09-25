@@ -16,6 +16,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "e2e": "playwright test",
+    "e2e:screens": "WASM_SCREENS=1 playwright test",
     "gen:api": "openapi-typescript openapi.json -o src/api/schema.gen.ts",
     "check:api": "node scripts/check-api.mjs",
     "screens": "node scripts/screens.mjs",

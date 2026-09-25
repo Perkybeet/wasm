@@ -69,6 +69,16 @@ export function LoginForm({ next, expired }: LoginFormProps) {
     (step === "token" ? tokenRef : codeRef).current?.focus();
   }, [step]);
 
+  // A refused value is selected for retyping once the field is enabled again: the fields are
+  // disabled while a request is in flight, and a disabled field drops focus and ignores
+  // select(), which left keyboard and screen reader users on <body> after every typo.
+  useEffect(() => {
+    if (pending || fieldError === null) return;
+    const field = (step === "token" ? tokenRef : codeRef).current;
+    field?.focus();
+    field?.select();
+  }, [fieldError, pending, step]);
+
   useEffect(() => {
     if (expired) announce("Your session expired. Sign in again to continue where you left off.");
   }, [expired]);
@@ -110,11 +120,9 @@ export function LoginForm({ next, expired }: LoginFormProps) {
         case "invalid_token":
           backToToken();
           setFieldError(error.detail);
-          tokenRef.current?.select();
           return;
         case "invalid_totp":
           setFieldError(error.detail);
-          codeRef.current?.select();
           return;
         case "locked_out":
         case "rate_limited": {

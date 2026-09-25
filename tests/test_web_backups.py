@@ -3,19 +3,19 @@
 # https://github.com/Perkybeet/wasm/blob/main/LICENSE
 
 """
-Tests for taking and checking backups from the panel.
+Tests for taking and checking backups through the JSON API.
 
 The panel could restore a backup and delete one, and could neither take one nor
 check that one was sound. Both matter more than restoring does: the moment an
 operator wants a backup is immediately before doing something risky, and the
 moment they find out an archive is corrupt must not be the moment they need it.
 
-The load-bearing test here is the one about a failed verification. The API
-answers 200 with ``valid: false`` for a corrupt archive, which is right for a
-JSON client and wrong for a button: reported through the panel's success path
-it would say "is sound", in the same green it uses for a restart that worked,
-about an archive that cannot be restored. A backup nobody can restore is worse
-than no backup, because it is the one people are counting on.
+The test that matters most is the one about a failed verification: the API
+answers 200 with ``valid: false`` for a corrupt archive, on purpose, so a JSON
+client can branch on the field - but the field itself has to carry the true
+verdict, or a corrupt archive reads no differently from a sound one. A backup
+nobody can restore is worse than no backup, because it is the one people are
+counting on.
 """
 
 from __future__ import annotations
@@ -133,34 +133,40 @@ def queued(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
 
 def verification(monkeypatch: pytest.MonkeyPatch, **result: Any) -> None:
     """
-    Make the backup checker report a fixed verdict.
+    Make the backup checker report a fixed verdict for any identifier asked.
+
+    Replaces :class:`~wasm.web.api.backups.BackupManager` itself rather than
+    the endpoint function: the endpoint is reached through a real request
+    here, and FastAPI already holds its own reference to the original
+    function by the time a test runs, so patching the module attribute the
+    route was built from would have no effect on it.
 
     Args:
         monkeypatch: Patching helper, scoped to the test.
         **result: Fields of the verdict to report.
     """
-    from wasm.web.api.backups import VerifyBackupResponse
-
     verdict = {"valid": True, "checksum_ok": True, "files_ok": True, "errors": [], "warnings": []}
     verdict.update(result)
 
-    def verify(backup_id: str, session: Any) -> VerifyBackupResponse:
-        """
-        Stand in for the API endpoint the adapter calls.
+    class FakeBackup:
+        """Stands in for the metadata :meth:`get_backup` would load."""
 
-        The adapter is what is under test: whether a verdict of "not valid"
-        reaches the operator as a failure rather than through the success path.
+        def __init__(self, backup_id: str) -> None:
+            self.id = backup_id
 
-        Args:
-            backup_id: The archive being checked.
-            session: The authenticated session.
+    class FakeManager:
+        """Stands in for the manager, so no real archive has to exist on disk."""
 
-        Returns:
-            The verdict, in the shape the endpoint returns it.
-        """
-        return VerifyBackupResponse(backup_id=backup_id, **verdict)
+        def __init__(self, verbose: bool = False) -> None:
+            pass
 
-    monkeypatch.setattr("wasm.web.api.backups.verify_backup", verify)
+        def get_backup(self, backup_id: str) -> FakeBackup:
+            return FakeBackup(backup_id)
+
+        def verify(self, backup_id: str) -> dict[str, Any]:
+            return verdict
+
+    monkeypatch.setattr("wasm.web.api.backups.BackupManager", FakeManager)
 
 
 # ---------------------------------------------------------------------------
@@ -168,17 +174,15 @@ def verification(monkeypatch: pytest.MonkeyPatch, **result: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_an_application_can_be_backed_up_from_its_row(
-    client: TestClient, queued: list[dict[str, Any]]
-) -> None:
+def test_creating_a_backup_queues_the_job(client: TestClient, queued: list[dict[str, Any]]) -> None:
     """The panel could restore and delete backups, and never make one."""
-    response = client.post("/apps/example.com/backup")
+    response = client.post("/api/backups", json={"domain": "example.com"})
 
-    assert response.status_code == 204
+    assert response.status_code == 202, response.text
     assert len(queued) == 1
 
 
-def test_the_backup_names_the_application_it_is_of(
+def test_the_queued_backup_names_the_application_it_is_of(
     client: TestClient, queued: list[dict[str, Any]]
 ) -> None:
     """
@@ -186,23 +190,9 @@ def test_the_backup_names_the_application_it_is_of(
         client: A signed-in client.
         queued: Captured jobs.
     """
-    client.post("/apps/example.com/backup")
+    client.post("/api/backups", json={"domain": "example.com"})
 
     assert queued[0]["kwargs"]["domain"] == "example.com"
-
-
-def test_the_applications_screen_offers_the_backup(client: TestClient) -> None:
-    """
-    The moment an operator wants a backup is immediately before something
-    risky, which is when they are looking at the application.
-
-    Args:
-        client: A signed-in client.
-    """
-    body = client.get("/apps").text
-
-    assert "/apps/example.com/backup" in body
-    assert "Back up" in body
 
 
 def test_taking_a_backup_demands_a_session(app: FastAPI) -> None:
@@ -212,7 +202,9 @@ def test_taking_a_backup_demands_a_session(app: FastAPI) -> None:
     """
     anonymous = TestClient(app, client=("testclient", 50000), follow_redirects=False)
 
-    assert anonymous.post("/apps/example.com/backup").status_code in (303, 401, 403)
+    response = anonymous.post("/api/backups", json={"domain": "example.com"})
+
+    assert response.status_code in (401, 403)
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +212,7 @@ def test_taking_a_backup_demands_a_session(app: FastAPI) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_a_sound_archive_verifies_quietly(
+def test_a_sound_archive_verifies_as_valid(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
@@ -230,63 +222,35 @@ def test_a_sound_archive_verifies_quietly(
     """
     verification(monkeypatch, valid=True)
 
-    response = client.post("/backups/example-com_20260101_120000/verify")
+    response = client.post("/api/backups/example-com_20260101_120000/verify")
 
-    assert response.status_code == 204
+    assert response.status_code == 200, response.text
+    assert response.json()["valid"] is True
 
 
-def test_a_corrupt_archive_is_not_reported_as_sound(
+def test_a_corrupt_archive_is_reported_as_invalid(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    The test this file exists for.
-
-    The API answers 200 with valid: false, and the panel's success path would
-    have said "is sound" in green about an archive that cannot be restored.
+    ``valid: false`` is a 200 for a JSON client to branch on - unlike the
+    deleted panel's own button, which translated it into an HTTP failure so
+    it would not report through the same success path as a restart that
+    worked. That translation was the page's job; a JSON client reads the
+    field directly, and the field itself is what this guards.
     """
     verification(monkeypatch, valid=False, checksum_ok=False, errors=["checksum mismatch"])
 
-    response = client.post("/backups/example-com_20260101_120000/verify")
+    response = client.post("/api/backups/example-com_20260101_120000/verify")
 
-    assert response.status_code >= 400, "a corrupt archive was reported as a success"
-
-
-def test_a_failed_verification_says_what_was_found(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """
-    "Verification failed" sends the operator to a terminal. The checker's own
-    finding is what tells them whether the archive is worth anything.
-
-    Args:
-        client: A signed-in client.
-        monkeypatch: Patching helper, scoped to the test.
-    """
-    verification(monkeypatch, valid=False, errors=["checksum mismatch on payload.tar.gz"])
-
-    body = client.post("/backups/example-com_20260101_120000/verify").text
-
-    assert "checksum mismatch on payload.tar.gz" in body
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["valid"] is False
+    assert body["checksum_ok"] is False
+    assert body["backup_id"] == "example-com_20260101_120000"
+    assert "checksum mismatch" in body["errors"]
 
 
-def test_a_failed_verification_names_the_archive(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """
-    An operator checking several archives needs to know which one failed.
-
-    Args:
-        client: A signed-in client.
-        monkeypatch: Patching helper, scoped to the test.
-    """
-    verification(monkeypatch, valid=False, errors=["truncated"])
-
-    body = client.post("/backups/example-com_20260101_120000/verify").text
-
-    assert "example-com_20260101_120000" in body
-
-
-def test_an_archive_with_only_warnings_still_fails_loudly(
+def test_an_archive_with_only_warnings_is_still_reported_as_invalid(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
@@ -299,7 +263,9 @@ def test_an_archive_with_only_warnings_still_fails_loudly(
     """
     verification(monkeypatch, valid=False, errors=[], warnings=["missing manifest entry"])
 
-    response = client.post("/backups/example-com_20260101_120000/verify")
+    response = client.post("/api/backups/example-com_20260101_120000/verify")
 
-    assert response.status_code >= 400
-    assert "missing manifest entry" in response.text
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["valid"] is False
+    assert body["warnings"] == ["missing manifest entry"]

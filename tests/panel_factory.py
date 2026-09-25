@@ -1,11 +1,11 @@
 """
 Shared seed data for the panel's browser check and its API/view tests.
 
-``scripts/panel_browser_check.py`` used to build its own domains,
-applications, services and sites inline. Every future page that wants
-realistic data (the databases screen, the deployments history, ...) would
-otherwise repeat that siembra with its own set of magic numbers, and CLAUDE.md
-rule 3 says there is one implementation of each thing. This module is that one
+A now-deleted ``scripts/panel_browser_check.py`` used to build its own
+domains, applications, services and sites inline. ``scripts/console_server.py``
+seeds a populated console the same way now, through this module instead of
+repeating that setup with its own set of magic numbers, and CLAUDE.md rule 3
+says there is one implementation of each thing. This module is that one
 implementation.
 
 Importable both from pytest, as ``tests.panel_factory`` (``tests/`` is a
@@ -13,14 +13,25 @@ package, and pytest puts the repository root -- the first parent directory
 without an ``__init__.py`` -- on ``sys.path`` when it collects a package like
 this one), and from a plain script, which is not run under pytest and so adds
 the repository root to ``sys.path`` itself before importing this module. See
-``scripts/panel_browser_check.py`` for that.
+``scripts/console_server.py`` for that.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 
-from wasm.core.store import App, AppStatus, Service, Site, WASMStore
+from wasm.core.fs import get_fs
+from wasm.core.store import (
+    App,
+    AppStatus,
+    Database,
+    DatabaseEngine,
+    JobRecord,
+    Service,
+    Site,
+    WASMStore,
+)
 
 #: The domains the panel browser check has always used, in the order it
 #: always created them. Seeding with ``apps=len(DEFAULT_DOMAINS)`` and every
@@ -78,6 +89,8 @@ class SeededState:
     cert_domains: list[str] = field(default_factory=list)
     backup_domains: list[str] = field(default_factory=list)
     deployment_domains: list[str] = field(default_factory=list)
+    static_domains: list[str] = field(default_factory=list)
+    database_names: list[str] = field(default_factory=list)
 
 
 def _domain_pool(count: int) -> list[str]:
@@ -239,5 +252,155 @@ def seed_panel_state(
             else:
                 store.finish_deployment(second, "success")
             state.deployment_domains.append(domain)
+
+    return state
+
+
+#: A build log as the deploy pipeline captures it: one line per step, the
+#: tools' own words, ANSI colour included, so the console's log viewer has the
+#: real thing to render.
+_BUILD_LOG = (
+    "==> Fetching https://github.com/you/app (main)\n"
+    "HEAD is now at {commit} Update dependencies\n"
+    "==> Installing dependencies\n"
+    "added 812 packages, and audited 813 packages in 14s\n"
+    "\x1b[33mnpm WARN\x1b[0m deprecated inflight@1.0.6: This module is not supported\n"
+    "==> Building\n"
+    "   \x1b[1mNext.js 15.2.4\x1b[0m\n"
+    "   Creating an optimized production build ...\n"
+    " \x1b[32m✓\x1b[0m Compiled successfully in 21.4s\n"
+    "{outcome}"
+)
+
+_SUCCESS_TAIL = (
+    "==> Activating release {commit}\n"
+    "==> Health check passed: GET http://127.0.0.1:{port}/ answered 200 in 84 ms\n"
+    "Deployed {domain}\n"
+)
+
+_FAILURE_TAIL = (
+    "\x1b[31mnpm ERR!\x1b[0m code ELIFECYCLE\n"
+    "\x1b[31mnpm ERR!\x1b[0m errno 1\n"
+    "\x1b[31mnpm ERR!\x1b[0m app@1.4.2 build: `next build`\n"
+    "\x1b[31mnpm ERR!\x1b[0m Exit status 1\n"
+    "Deploy failed; the previous release keeps serving {domain}\n"
+)
+
+
+def seed_console_state(store: WASMStore) -> SeededState:
+    """
+    Populate a store with every state the console has to draw.
+
+    :func:`seed_panel_state` gives every application a Next.js unit; the
+    console also has to show static sites, captured build logs, databases
+    and a job history, so this builds on it rather than beside it: six
+    applications with units (running, stopped and one failed, each with a
+    deployment history), then two static sites with no unit at all, then the
+    rest. Build logs are written where
+    :class:`wasm.deployers.recorder.DeploymentRecorder` writes them, next to
+    the store, through the filesystem seam.
+
+    Args:
+        store: The store to write to. Its directory also receives the
+            captured build logs.
+
+    Returns:
+        What was created.
+    """
+    state = seed_panel_state(
+        store, apps=6, services=6, sites=6, certs=4, backups=3, failed=1, deployments=6
+    )
+
+    for domain in DEFAULT_DOMAINS[6:8]:
+        app = store.create_app(
+            App(
+                domain=domain,
+                app_type="static",
+                source="https://github.com/you/landing",
+                port=None,
+                app_path=f"/var/www/apps/{domain}",
+                status=AppStatus.RUNNING.value,
+                ssl_enabled=True,
+            )
+        )
+        assert app.id is not None
+        state.domains.append(domain)
+        state.app_ids[domain] = app.id
+        state.static_domains.append(domain)
+        store.create_site(
+            Site(
+                app_id=app.id,
+                domain=domain,
+                webserver="nginx",
+                config_path=f"/etc/nginx/sites-available/{domain}",
+                enabled=True,
+                proxy_port=None,
+                ssl_enabled=True,
+                ssl_certificate=f"/etc/letsencrypt/live/{domain}/fullchain.pem",
+                ssl_key=f"/etc/letsencrypt/live/{domain}/privkey.pem",
+            )
+        )
+        state.site_domains.append(domain)
+        state.cert_domains.append(domain)
+
+    log_root = store.db_path.parent / "deploy-logs"
+    fs = get_fs()
+    for index, domain in enumerate(state.deployment_domains):
+        directory = log_root / domain
+        fs.make_dir(directory, mode=0o700, parents=True)
+        for record in store.list_deployments(domain):
+            assert record.id is not None
+            commit = record.git_commit or "0000000"
+            tail = _FAILURE_TAIL if record.status == "failed" else _SUCCESS_TAIL
+            content = _BUILD_LOG.format(
+                commit=commit,
+                outcome=tail.format(commit=commit, port=3000 + index, domain=domain),
+            )
+            path = directory / f"{record.id}.log"
+            fs.write_text(path, content, mode=0o600)
+            store.annotate_deployment(record.id, log_path=str(path))
+
+    first, second = state.domains[0], state.domains[1]
+    for name, engine, port, owner in (
+        ("arennalabs_production", DatabaseEngine.POSTGRESQL.value, 5432, first),
+        ("picconia_wp", DatabaseEngine.MYSQL.value, 3306, second),
+        ("sessions", DatabaseEngine.REDIS.value, 6379, None),
+    ):
+        store.create_database(
+            Database(
+                app_id=state.app_ids[owner] if owner else None,
+                name=name,
+                engine=engine,
+                port=port,
+                username=None if engine == DatabaseEngine.REDIS.value else name,
+            )
+        )
+        state.database_names.append(name)
+
+    now = datetime.now()
+    for offset, (job_type, status, domain, error) in enumerate(
+        (
+            ("deploy", "completed", first, None),
+            ("backup", "completed", second, None),
+            ("cert_renew", "completed", "all", None),
+            ("update", "failed", state.failed_domains[0], "npm ERR! code ELIFECYCLE"),
+        )
+    ):
+        started = now - timedelta(hours=offset + 1)
+        store.create_job(
+            JobRecord(
+                id=f"seed{offset:04d}",
+                type=job_type,
+                name=f"{job_type.replace('_', ' ').capitalize()} {domain}",
+                description=f"Seeded {job_type} job",
+                status=status,
+                progress=100,
+                domain=domain,
+                error=error,
+                created_at=started.isoformat(),
+                started_at=started.isoformat(),
+                finished_at=(started + timedelta(minutes=2)).isoformat(),
+            )
+        )
 
     return state

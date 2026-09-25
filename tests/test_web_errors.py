@@ -19,7 +19,8 @@ defect classes are pinned here:
   ``error`` value.
 
 HTML routes are untouched: the JSON reshaping only applies under ``/api``,
-which is checked directly against the login page and the missing-page screen.
+which is checked directly against the SPA's own fallback for ``/login`` and
+for any other address the console's client-side router owns.
 """
 
 from __future__ import annotations
@@ -216,9 +217,10 @@ class TestLoginFailuresAreMachineReadable:
 
 
 class TestHtmlRoutesAreUntouched:
-    """The JSON reshaping is scoped to ``/api``; server-rendered pages do not change."""
+    """The JSON reshaping is scoped to ``/api``; the console's own routes do not change."""
 
-    def test_the_login_page_still_renders_html(self, sandbox: Path) -> None:
+    def test_login_falls_back_to_the_console(self, sandbox: Path) -> None:
+        """``/login`` is not a route of its own: the SPA owns sign-in client-side."""
         app = create_app(make_config(sandbox))
         test_client = TestClient(app, client=("testclient", 50000))
 
@@ -234,11 +236,11 @@ class TestHtmlRoutesAreUntouched:
         assert response.status_code == 404
         assert response.json()["error"] == "not_found"
 
-    def test_a_missing_page_still_renders_the_panels_own_screen(self, client: TestClient) -> None:
-        """A mistyped panel address for a signed-in browser is unaffected."""
+    def test_a_missing_page_still_falls_back_to_the_console(self, client: TestClient) -> None:
+        """A mistyped panel address for a signed-in browser reaches the SPA, not a 404."""
         response = client.get("/no-such-page", headers={"Accept": "text/html"})
 
-        assert response.status_code == 404
+        assert response.status_code == 200
         assert "text/html" in response.headers["content-type"]
 
 
