@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        1.6.1
+Version:        1.6.2
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -222,6 +222,11 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
 fi
 
 %changelog
+* Fri Sep 25 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.6.2-1
+- Fix EACCES at runtime after wasm update: the update now hands the app directory back to the service user after the build, so Next.js can write .next/cache/images and uploads work in directories the pull added
+- Fix monorepo deploys and updates handing the tree over before the build, which left every workspace's build output owned by root
+- Fix wasm update on a monorepo leaving the workspace .env.production files world-readable: it now runs the deployer's own update instead of a copy of its steps
+- A failed chown or chmod during the hand-over is now a visible warning instead of a debug line
 * Thu Aug 27 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.6.1-1
 - Fix EACCES at service start: the deploy pipeline now hands the app directory over to the service user after the build
 - One shared permissions implementation for the base pipeline and the monorepo deployer

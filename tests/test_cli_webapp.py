@@ -1169,6 +1169,51 @@ def test_update_delegates_the_rebuild_to_the_deployer(
     assert ("restart", "example-com") in services.calls
 
 
+def test_update_rebuilds_a_monorepo_through_its_deployer(
+    cli_runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    store: StoreSpy,
+    services: ServiceSpy,
+    deployer: DeployerSpy,
+    tmp_path: Path,
+) -> None:
+    """
+    The command drove the deployer's private steps in its own order.
+
+    That copy handed the tree over before building, so every update left the
+    build output owned by root.
+
+    Args:
+        cli_runner: Click test runner.
+        monkeypatch: Patching helper.
+        store: Store spy.
+        services: Service manager spy.
+        deployer: Deployer spy, replacing the monorepo deployer.
+        tmp_path: Directory standing in for the deployed application.
+    """
+    app_path = tmp_path / "example-com"
+    app_path.mkdir()
+    store.apps["example.com"] = make_app(app_path=str(app_path), app_type="monorepo")
+    monkeypatch.setattr(webapp, "MonorepoDeployer", lambda verbose=False: deployer)
+    monkeypatch.setattr(
+        webapp,
+        "SourceManager",
+        lambda verbose=False: SimpleNamespace(pull=lambda path, branch=None: None),
+    )
+    monkeypatch.setattr(
+        webapp,
+        "RollbackManager",
+        lambda verbose=False: SimpleNamespace(create_pre_deploy_backup=lambda **kw: None),
+    )
+    monkeypatch.setattr(webapp.time, "sleep", lambda seconds: None)
+
+    result = cli_runner.invoke(webapp.cli.commands["update"], ["example.com"])
+
+    assert result.exit_code == 0, result.output
+    assert deployer.updated is True
+    assert deployer.steps == ["Installing dependencies", "Building"]
+
+
 def test_update_refuses_an_application_that_is_not_there(
     cli_runner: CliRunner, monkeypatch: pytest.MonkeyPatch, store: StoreSpy, tmp_path: Path
 ) -> None:

@@ -12,6 +12,7 @@ leave a service, a site and three store rows behind.
 
 from __future__ import annotations
 
+import io
 import json
 import stat
 from pathlib import Path
@@ -21,10 +22,12 @@ import pytest
 
 from wasm.core.exceptions import BuildError, DeploymentError
 from wasm.core.fs import SECRET_MODE, DryRunFileSystem, RecordingFileSystem
+from wasm.core.logger import Logger
 from wasm.core.runner import FakeRunner
 from wasm.core.store import App, AppStatus, MonorepoWorkspace, WASMStore
 from wasm.deployers.auto import AutoDeployer
 from wasm.deployers.docker_compose import DockerComposeDeployer
+from wasm.deployers.helpers.permissions import hand_over_tree
 from wasm.deployers.interface import AppDeployer, UpdateResult
 from wasm.deployers.monorepo import MonorepoDeployer
 from wasm.deployers.nextjs import NextJSDeployer
@@ -850,6 +853,122 @@ def test_monorepo_set_permissions_chowns_like_the_base(tmp_path: Path, store: WA
     user = deployer.config.service_user
     group = deployer.config.service_group
     assert ("chown", "-R", f"{user}:{group}", str(tmp_path / "app")) in runner.calls
+
+
+def test_a_failed_hand_over_is_shown_to_the_operator(tmp_path: Path) -> None:
+    """It was a debug line, so the only visible symptom was the app's EACCES later."""
+    runner = FakeRunner().script(
+        ["chown"], exit_code=1, stderr="chown: invalid user: 'www-data:www-data'"
+    )
+    out = io.StringIO()
+
+    hand_over_tree(
+        tmp_path,
+        user="www-data",
+        group="www-data",
+        runner=runner,
+        fs=RecordingFileSystem(),
+        logger=Logger(no_color=True, stream=out),
+    )
+
+    assert "chown: invalid user" in out.getvalue()
+
+
+def _first_call(runner: FakeRunner, *prefix: str) -> int:
+    """
+    Position of the first recorded call that starts with ``prefix``.
+
+    Args:
+        runner: The runner the code under test used.
+        *prefix: Leading arguments identifying the call.
+
+    Returns:
+        Its index in ``runner.calls``.
+    """
+    return next(i for i, call in enumerate(runner.calls) if call[: len(prefix)] == prefix)
+
+
+def test_update_hands_the_tree_over_after_the_build(
+    tmp_path: Path, store: WASMStore, runner: FakeRunner
+) -> None:
+    """
+    ``wasm update`` rebuilt as root and never gave the result back.
+
+    Everything the pull and the build created stayed root's, so at runtime the
+    service could not write into it: Next.js failed with EACCES creating
+    ``.next/cache/images``, and uploads failed in any directory a pull added.
+    """
+    app_path = tmp_path / "app"
+    write_tree(app_path, TREES["nextjs"])
+    deployer = NextJSDeployer(runner=runner)
+    deployer.configure("app.example.com", str(app_path), app_path=app_path)
+
+    deployer.update()
+
+    user = deployer.config.service_user
+    group = deployer.config.service_group
+    chown = _first_call(runner, "chown", "-R", f"{user}:{group}", str(app_path))
+    assert chown > _first_call(runner, "npm", "run", "build")
+
+
+def test_update_keeps_env_files_owner_only(
+    tmp_path: Path, store: WASMStore, runner: FakeRunner
+) -> None:
+    """The hand-over's recursive chmod must not leave the secrets world-readable."""
+    app_path = tmp_path / "app"
+    write_tree(app_path, TREES["nextjs"])
+    env_file = app_path / ".env"
+    env_file.write_text("SECRET=x\n")
+    env_file.chmod(0o644)
+    deployer = NextJSDeployer(runner=runner, fs=RecordingFileSystem())
+    deployer.configure("app.example.com", str(app_path), app_path=app_path)
+
+    deployer.update()
+
+    assert stat.S_IMODE(env_file.stat().st_mode) == SECRET_MODE
+
+
+def test_monorepo_update_hands_the_tree_over_after_the_build(
+    tmp_path: Path, store: WASMStore, runner: FakeRunner
+) -> None:
+    """Handing over before ``pnpm build`` left every workspace's build output to root."""
+    app_path = tmp_path / "app"
+    write_tree(app_path, TREES["monorepo"])
+    deployer = MonorepoDeployer(runner=runner)
+    deployer.configure("example.com", str(app_path), app_path=app_path)
+
+    deployer.update()
+
+    assert _first_call(runner, "chown", "-R") > _first_call(runner, "pnpm", "build")
+
+
+def test_monorepo_deploy_hands_the_tree_over_after_the_build(
+    tmp_path: Path, store: WASMStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first deploy had the same order, so a monorepo never had a writable ``.next``."""
+    deployer = MonorepoDeployer(runner=FakeRunner())
+    deployer.configure("example.com", "src", app_path=tmp_path / "app", ssl=False)
+    order: list[str] = []
+    for step in (
+        "_pre_flight_check",
+        "_fetch_source",
+        "_discover_workspaces",
+        "_provision_databases",
+        "_configure_environment",
+        "_install_dependencies",
+        "_set_permissions",
+        "_run_prisma_migrations",
+        "_build_all",
+        "_create_sites",
+        "_create_services",
+        "_start_and_verify",
+        "_show_deployment_summary",
+    ):
+        monkeypatch.setattr(deployer, step, lambda *_a, _step=step, **_kw: order.append(_step))
+
+    deployer.deploy()
+
+    assert order.index("_set_permissions") > order.index("_build_all")
 
 
 def test_deploy_without_configure_is_a_clear_error(tmp_path: Path, store: WASMStore) -> None:

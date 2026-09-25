@@ -416,9 +416,6 @@ class MonorepoDeployer(AppDeployer):
             self.logger.step(5, total_steps, "Installing dependencies", Icons.PACKAGE)
             self._install_dependencies()
 
-            # Set permissions for service user
-            self._set_permissions()
-
             # Step 6: Prisma migrations
             self.logger.step(6, total_steps, "Running database migrations", Icons.DATABASE)
             self._run_prisma_migrations()
@@ -426,6 +423,10 @@ class MonorepoDeployer(AppDeployer):
             # Step 7: Build
             self.logger.step(7, total_steps, "Building applications", Icons.BUILD)
             self._build_all()
+
+            # Only now: the build runs as root too, and handing over before it
+            # left every workspace's build output unwritable by its service.
+            self._set_permissions()
 
             # Step 8: Create sites (without SSL initially)
             self.logger.step(8, total_steps, "Creating site configurations", Icons.GLOBE)
@@ -534,8 +535,8 @@ class MonorepoDeployer(AppDeployer):
         prisma_updated = self._run_prisma_migrations()
 
         report("Building applications")
-        self._set_permissions()
         self._build_all()
+        self._set_permissions()
 
         return UpdateResult(
             package_manager=self.package_manager,

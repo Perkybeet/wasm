@@ -56,15 +56,25 @@ def hand_over_tree(
         ["chown", "-R", f"{user}:{group}", str(app_path)],
         timeout=_PERMISSIONS_TIMEOUT,
     )
+    # Not fatal: the build is good, and an app that never writes runs fine. One
+    # that does fails with EACCES in its own log, far from here, so this is the
+    # only place the operator can be told the cause.
     if not result.success:
-        logger.debug(f"chown failed: {result.stderr}")
+        logger.warning(
+            f"Could not hand {app_path} over to {user}:{group}; the service may fail "
+            f"with EACCES: {result.stderr.strip()}"
+        )
 
     # Directories need the execute bit and the built assets must stay readable
     # by the web server, whatever umask the fetch and the build left behind.
-    runner.run(
+    result = runner.run(
         ["chmod", "-R", "u+rwX,g+rX,o+rX", str(app_path)],
         timeout=_PERMISSIONS_TIMEOUT,
     )
+    if not result.success:
+        logger.warning(
+            f"Could not make {app_path} readable by the web server: {result.stderr.strip()}"
+        )
 
     # That -R also put o+r on the .env files, which hold the secrets this
     # deployment was given. The chown above has just made the service account

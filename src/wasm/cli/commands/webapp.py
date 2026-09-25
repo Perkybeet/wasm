@@ -833,15 +833,10 @@ def _update_monorepo(
     deployer.domain = domain
     deployer.package_manager = "pnpm"
 
-    logger.step(4, total_steps, "Installing dependencies")
-    deployer._install_dependencies()
-
-    logger.step(5, total_steps, "Running database migrations")
-    deployer._run_prisma_migrations()
-
-    logger.step(6, total_steps, "Building applications")
-    deployer._set_permissions()
-    deployer._build_all()
+    # The deployer's own update, not a copy of its steps: the copy handed the
+    # tree over before building and left every build output owned by root.
+    step = iter(range(4, total_steps + 1))
+    deployer.update(on_step=lambda message: logger.step(next(step), total_steps, message))
 
     logger.step(7, total_steps, "Restarting applications")
     service_manager = ServiceManager(verbose=logger.verbose)

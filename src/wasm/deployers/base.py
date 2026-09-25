@@ -1348,6 +1348,12 @@ class BaseDeployer(AppDeployer):
             report("Building")
             self.build()
 
+            # The pull, the install and the build all ran as root, and the
+            # service writes into what they produced: Next.js creates
+            # .next/cache/images on the first optimised image, and uploads land
+            # in directories a pull may have just added.
+            self._set_permissions()
+
             start_command = self.get_start_command()
             result = UpdateResult(
                 package_manager=self.package_manager,
