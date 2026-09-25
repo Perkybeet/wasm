@@ -1,0 +1,299 @@
+@import "tailwindcss";
+@import "./tokens.css";
+@import "uplot/dist/uPlot.min.css" layer(components);
+
+/*
+ * Tailwind is re-pointed at the tokens. The default palette, type scale, shadows and radii
+ * are removed so a raw `bg-red-500` or `text-sm` cannot compile: every colour and size on
+ * screen comes from tokens.css.
+ *
+ * Tokens whose names coincide with Tailwind's namespaces (--font-sans, --font-mono,
+ * --ease-out, --radius-*, --shadow-overlay) are defined unlayered in tokens.css, which beats
+ * Tailwind's `theme` layer, so the self-references below resolve to the token value.
+ */
+@theme {
+  --color-*: initial;
+  --text-*: initial;
+  --shadow-*: initial;
+  --radius-*: initial;
+  --animate-*: initial;
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-bg-sunken: var(--bg-sunken);
+  --color-surface: var(--surface);
+  --color-surface-raised: var(--surface-raised);
+  --color-surface-hover: var(--surface-hover);
+  --color-surface-active: var(--surface-active);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-fg: var(--text);
+  --color-fg-muted: var(--text-muted);
+  --color-fg-faint: var(--text-faint);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-soft: var(--accent-soft);
+  --color-accent-fg: var(--accent-text);
+  --color-on-accent: var(--on-accent);
+  --color-ok: var(--ok);
+  --color-ok-soft: var(--ok-soft);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
+  --color-fail: var(--fail);
+  --color-fail-soft: var(--fail-soft);
+  --color-fail-strong: var(--fail-strong);
+  --color-idle: var(--idle);
+  --color-idle-soft: var(--idle-soft);
+  --color-focus: var(--focus);
+  --color-match: var(--match);
+  --color-ansi-blue: var(--ansi-blue);
+  --color-ansi-magenta: var(--ansi-magenta);
+  --color-ansi-cyan: var(--ansi-cyan);
+  --color-backdrop: var(--backdrop);
+
+  --text-12: var(--fs-12);
+  --text-12--line-height: var(--lh-12);
+  --text-13: var(--fs-13);
+  --text-13--line-height: var(--lh-13);
+  --text-14: var(--fs-14);
+  --text-14--line-height: var(--lh-14);
+  --text-16: var(--fs-16);
+  --text-16--line-height: var(--lh-16);
+  --text-18: var(--fs-18);
+  --text-18--line-height: var(--lh-18);
+  --text-24: var(--fs-24);
+  --text-24--line-height: var(--lh-24);
+  --text-32: var(--fs-32);
+  --text-32--line-height: var(--lh-32);
+
+  --radius-control: var(--radius-control);
+  --radius-card: var(--radius-card);
+  --radius-pill: var(--radius-pill);
+
+  --shadow-raised: var(--shadow-raised);
+  --shadow-overlay: var(--shadow-overlay);
+
+  --animate-spin: spin 0.8s linear infinite;
+  --animate-pulse-once: pulse-once 0.9s var(--ease-out) 1;
+  --animate-breathe: breathe 1.6s ease-in-out infinite;
+  --animate-indeterminate: indeterminate 1.4s var(--ease-out) infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* A state change is announced visually as one opacity pulse, never as movement. */
+@keyframes pulse-once {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  35% {
+    opacity: 0.35;
+  }
+}
+
+@keyframes breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+
+@keyframes indeterminate {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(250%);
+  }
+}
+
+@layer base {
+  html {
+    font-family: var(--font-sans);
+    font-size: 100%;
+    background: var(--bg);
+    color: var(--text);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    font-synthesis: none;
+    scrollbar-color: var(--border-strong) transparent;
+  }
+
+  body {
+    min-height: 100dvh;
+    font-size: var(--fs-14);
+    line-height: var(--lh-14);
+  }
+
+  ::selection {
+    background: var(--selection);
+    color: var(--text);
+  }
+
+  /* Mono carries system values verbatim: ligatures would redraw `->` or `!=` as other glyphs. */
+  code,
+  kbd,
+  samp,
+  pre {
+    font-family: var(--font-mono);
+    font-variant-ligatures: none;
+    font-feature-settings: "calt" 0;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: 2px;
+  }
+
+  /* Sticky chrome must never hide the focused element (WCAG 2.4.11). */
+  html {
+    scroll-padding-top: 4.5rem;
+  }
+
+  /* Everything becomes instant. Durations are 0s, not a tiny positive value: a running
+     transition, however short, makes getComputedStyle report the value it is leaving. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation: none !important;
+      transition-duration: 0s !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+/*
+ * What Base UI would inject as a <style> element. The console runs under `style-src 'self'`
+ * with <CSPProvider disableStyleElements>, so the rule ships here instead (ScrollArea viewport,
+ * Select popup aligned with its trigger).
+ */
+@layer base {
+  .base-ui-disable-scrollbar {
+    scrollbar-width: none;
+  }
+  .base-ui-disable-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+@utility title {
+  font-weight: 600;
+  font-stretch: var(--stretch-title);
+  letter-spacing: var(--tracking-title);
+}
+
+@utility display {
+  font-weight: 600;
+  font-stretch: var(--stretch-title);
+  letter-spacing: var(--tracking-display);
+}
+
+@utility mono {
+  font-family: var(--font-mono);
+  font-variant-ligatures: none;
+  font-feature-settings: "calt" 0;
+  font-variant-numeric: tabular-nums slashed-zero;
+}
+
+@utility scroll-thin {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+/* uPlot draws on canvas; only its overlay elements need tokens. */
+@layer components {
+  .uplot {
+    font-family: var(--font-mono);
+  }
+  .uplot .u-select {
+    background: var(--selection);
+  }
+  .uplot .u-cursor-x,
+  .uplot .u-cursor-y {
+    border-color: var(--border-strong);
+  }
+}
+
+/*
+ * Toast stacking. Base UI measures the toasts and exposes the geometry as custom properties;
+ * the collapsed stack peeks the two behind the front one, and hovering or focusing the region
+ * fans them out.
+ */
+@layer components {
+  .toast {
+    --gap: 0.5rem;
+    --peek: 0.5rem;
+    --scale: calc(max(0, 1 - (var(--toast-index) * 0.04)));
+    --shrink: calc(1 - var(--scale));
+    --height: var(--toast-frontmost-height, var(--toast-height));
+    --offset-y: calc(
+      var(--toast-offset-y) * -1 + (var(--toast-index) * var(--gap) * -1) + var(--toast-swipe-movement-y)
+    );
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    width: 100%;
+    height: var(--height);
+    z-index: calc(1000 - var(--toast-index));
+    transform-origin: bottom center;
+    transform: translateX(var(--toast-swipe-movement-x))
+      translateY(
+        calc(var(--toast-swipe-movement-y) - (var(--toast-index) * var(--peek)) - (var(--shrink) * var(--height)))
+      )
+      scale(var(--scale));
+    transition:
+      transform var(--duration-base) var(--ease-out),
+      opacity var(--duration-base) var(--ease-out),
+      height var(--duration-fast) var(--ease-out);
+    user-select: none;
+  }
+  .toast::after {
+    content: "";
+    position: absolute;
+    top: 100%;
+    left: 0;
+    width: 100%;
+    height: calc(var(--gap) + 1px);
+  }
+  .toast[data-expanded] {
+    height: var(--toast-height);
+    transform: translateX(var(--toast-swipe-movement-x)) translateY(var(--offset-y));
+  }
+  .toast[data-starting-style] {
+    opacity: 0;
+    transform: translateY(0.75rem);
+  }
+  .toast[data-ending-style] {
+    opacity: 0;
+  }
+  .toast[data-ending-style][data-swipe-direction="right"] {
+    transform: translateX(calc(var(--toast-swipe-movement-x) + 110%)) translateY(var(--offset-y));
+  }
+  .toast[data-ending-style][data-swipe-direction="down"] {
+    transform: translateY(calc(var(--toast-swipe-movement-y) + 110%));
+  }
+  .toast[data-limited] {
+    opacity: 0;
+  }
+  .toast-content {
+    height: 100%;
+    transition: opacity var(--duration-base) var(--ease-out);
+  }
+  .toast-content[data-behind] {
+    opacity: 0;
+  }
+  .toast-content[data-expanded] {
+    opacity: 1;
+  }
+}

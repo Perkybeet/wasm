@@ -1,0 +1,123 @@
+/*
+ * WASM Console design tokens.
+ *
+ * Every colour is written once as light-dark(light, dark). The document follows the system
+ * theme through `color-scheme: light dark`; `data-theme` on any element pins a subtree to one
+ * theme, which is how the explicit theme setting and the design gallery work without a second
+ * copy of the palette.
+ *
+ * Surfaces are strictly achromatic (R = G = B). Hue on screen means one of two things: the
+ * state of something (ok, warn, fail, idle) or something the operator can act on (accent).
+ * Contrast is verified by styles/tokens.test.ts; change a value here and that test tells you
+ * whether the pair still reads.
+ */
+
+:root {
+  color-scheme: light dark;
+
+  /* Surfaces. In dark, elevation is luminance: each step up is lighter. */
+  --bg: light-dark(#f7f7f7, #111111);
+  --bg-sunken: light-dark(#f0f0f0, #0b0b0b);
+  --surface: light-dark(#ffffff, #171717);
+  --surface-raised: light-dark(#ffffff, #1f1f1f);
+  --surface-hover: light-dark(#f2f2f2, #222222);
+  --surface-active: light-dark(#ebebeb, #2a2a2a);
+
+  /* Hairlines separate; strong borders bound a control and meet 3:1 (WCAG 1.4.11). */
+  --border: light-dark(#e3e3e3, #2a2a2a);
+  --border-strong: light-dark(#898989, #6e6e6e);
+
+  /* Text. Faint is still body-legible (4.5:1 on every surface), never decorative grey. */
+  --text: light-dark(#161616, #ededed);
+  --text-muted: light-dark(#555555, #a3a3a3);
+  --text-faint: light-dark(#6b6b6b, #8c8c8c);
+
+  /* The accent: violet from the start of the logo gradient. Interactive only. */
+  --accent: light-dark(#6a45d5, #7152de);
+  --accent-hover: light-dark(#5b37c2, #7a5be5);
+  --accent-soft: light-dark(#f0ebfd, #1f1937);
+  --accent-text: light-dark(#5a36c6, #ae9aff);
+  --on-accent: #ffffff;
+
+  /* State. Each pairs a foreground (text, icons) with a soft ground (pills, rows). */
+  --ok: light-dark(#16784a, #4dc47e);
+  --ok-soft: light-dark(#e6f4ec, #0f2619);
+  --warn: light-dark(#8c5800, #e3a73c);
+  --warn-soft: light-dark(#fbf0da, #2a1f0b);
+  --fail: light-dark(#c12c24, #ff736a);
+  --fail-soft: light-dark(#fceae8, #301514);
+  --fail-strong: light-dark(#c12c24, #cf3a30);
+  --idle: light-dark(#636363, #9e9e9e);
+  --idle-soft: light-dark(#ececec, #242424);
+
+  --focus: light-dark(#6a45d5, #a08bff);
+  --selection: light-dark(#ddd3fb, #3a2c73);
+  --match: light-dark(#e3dafc, #352868);
+
+  /* A program's own ANSI colours, reproduced verbatim in logs and tuned for the log ground. */
+  --ansi-blue: light-dark(#1f5fbf, #6fa8ff);
+  --ansi-magenta: light-dark(#a3319f, #e58be0);
+  --ansi-cyan: light-dark(#0e7285, #4fc7d6);
+
+  /* The brand gradient. It lives in the logo mark and nowhere else. */
+  --brand-violet: #7b4fd6;
+  --brand-blue: #4aa3d9;
+  --brand-green: #4fc97a;
+
+  /* Type. Mona Sans carries the interface; JetBrains Mono carries every system value. */
+  --font-sans: "Mona Sans Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --fs-12: 0.75rem;
+  --lh-12: 1rem;
+  --fs-13: 0.8125rem;
+  --lh-13: 1.25rem;
+  --fs-14: 0.875rem;
+  --lh-14: 1.25rem;
+  --fs-16: 1rem;
+  --lh-16: 1.5rem;
+  --fs-18: 1.125rem;
+  --lh-18: 1.5rem;
+  --fs-24: 1.5rem;
+  --lh-24: 2rem;
+  --fs-32: 2rem;
+  --lh-32: 2.5rem;
+  /* Titles are set a notch wider and tighter: Mona Sans's width axis is the display voice. */
+  --stretch-title: 110%;
+  --tracking-title: -0.018em;
+  --tracking-display: -0.028em;
+
+  /* Space follows 4-8-12-16-20-24-32-40-48-64 (Tailwind's 0.25rem step: p-1 ... p-16). */
+  --space: 0.25rem;
+
+  --radius-control: 6px;
+  --radius-card: 10px;
+  --radius-pill: 999px;
+
+  /* Light gets a whisper of shadow; dark relies on luminance and keeps shadows for overlays. */
+  --shadow-color: light-dark(rgb(0 0 0 / 0.1), rgb(0 0 0 / 0.55));
+  --shadow-raised: 0 1px 2px light-dark(rgb(0 0 0 / 0.05), transparent);
+  --shadow-overlay:
+    0 0 0 1px light-dark(rgb(0 0 0 / 0.04), rgb(255 255 255 / 0.02)),
+    0 2px 4px -1px var(--shadow-color),
+    0 12px 32px -6px var(--shadow-color);
+  --backdrop: light-dark(rgb(10 10 10 / 0.28), rgb(0 0 0 / 0.64));
+
+  --duration-fast: 120ms;
+  --duration-base: 180ms;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --duration-fast: 0ms;
+    --duration-base: 0ms;
+  }
+}

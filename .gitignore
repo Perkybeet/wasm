@@ -124,3 +124,9 @@ install-local.sh
 
 # Development environment
 .venv/
+
+# WASM Console (panel/)
+node_modules/
+panel/dist/
+panel/test-results/
+panel/playwright-report/
