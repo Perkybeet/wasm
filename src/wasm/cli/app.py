@@ -53,6 +53,7 @@ COMMAND_MODULES: dict[str, str] = {
     "cert": "wasm.cli.commands.cert",
     "config": "wasm.cli.commands.config",
     "db": "wasm.cli.commands.db",
+    "diagnose": "wasm.cli.commands.diagnose",
     "env": "wasm.cli.commands.env",
     "health": "wasm.cli.commands.health",
     "monitor": "wasm.cli.commands.monitor",
