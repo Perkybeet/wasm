@@ -1434,6 +1434,13 @@ SEAM_RECEIVERS = frozenset({"self.fs", "fs", "filesystem", "self._fs"})
 #: Modules owned by another part of this refactor, checked by its own tests.
 NOT_SCANNED = frozenset({"env_manager.py"})
 
+#: Calls a module may make outside the seam, each with the reason it may.
+EXEMPT_CALLS = {
+    # A preview, not a deployment: the scratch checkout must be removed for
+    # real even under --dry-run, and nothing in it is application state.
+    ("inspect.py", "tempfile.TemporaryDirectory"),
+}
+
 
 def _mutating_calls(path: Path) -> list[tuple[str, str, int]]:
     """
@@ -1509,6 +1516,8 @@ def test_no_deployer_mutates_the_filesystem_outside_the_seam() -> None:
         if module.name in NOT_SCANNED:
             continue
         for function, call, line in _mutating_calls(module):
+            if (module.name, call) in EXEMPT_CALLS:
+                continue
             offenders.append(f"{module.relative_to(root)}:{line} {function}() calls {call}")
 
     assert offenders == [], "Filesystem mutations outside wasm.core.fs:\n" + "\n".join(offenders)

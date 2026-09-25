@@ -138,7 +138,13 @@ API_TOKEN_LAST_USED_THROTTLE = 60
 #: scope policy, stated once and enforced at the same chokepoint that
 #: resolves the credential; see :func:`required_scope`.
 DEPLOY_SCOPE_PATHS = frozenset(
-    {"/api/apps", "/api/jobs/deploy", "/api/jobs/update", "/api/jobs/rollback"}
+    {
+        "/api/apps",
+        "/api/apps/inspect",
+        "/api/jobs/deploy",
+        "/api/jobs/update",
+        "/api/jobs/rollback",
+    }
 )
 
 #: Recorded in the payload the auth dependency hands to endpoints. Kept as

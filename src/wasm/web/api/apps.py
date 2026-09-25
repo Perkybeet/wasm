@@ -28,6 +28,7 @@ from wasm.core.config import REDACTED, redact_secrets
 from wasm.core.store import App, Service, get_store
 from wasm.core.utils import domain_to_app_name
 from wasm.deployers.helpers.env_manager import EnvManager, redact_url_credentials
+from wasm.deployers.inspect import inspect_source
 from wasm.managers.service_manager import ServiceManager
 from wasm.validators.environment import EnvironmentValidationError, validate_environment
 from wasm.validators.port import find_available_port, validate_port
@@ -360,6 +361,110 @@ def create_app(
         status=job.status.value,
         message=f"Deployment queued for {domain}",
         job=job.to_dict(),
+    )
+
+
+class InspectSourceRequest(BaseModel):
+    """Request to preview what a repository is before deploying it."""
+
+    source: str = Field(..., description="Git URL, archive URL or local path")
+    branch: str | None = Field(default=None, description="Git branch to inspect")
+
+
+class EnvKeyResponse(BaseModel):
+    """One environment variable discovered in a repository's .env.example."""
+
+    name: str
+    default: str | None = None
+    secret: bool
+    required: bool
+
+
+class SourceInspectionResponse(BaseModel):
+    """
+    What a repository is, discovered before anything is deployed from it.
+
+    Attributes:
+        app_type: The application type the new-app wizard would deploy as;
+            the first entry of ``detected_types``.
+        detected_types: Every registered application type that recognised
+            the repository, most specific first (registry priority order).
+        package_manager: The Node package manager the repository's lock file
+            implies, or None when it is not a Node project.
+        install_command: Argv the chosen deployer would run to install
+            dependencies. Empty when the type has none.
+        build_command: Argv the chosen deployer would run to build the
+            project. Empty when there is nothing to build.
+        start_command: Shell command the chosen deployer would run as the
+            service's ``ExecStart``. Empty for a static site.
+        default_port: Port the chosen deployer uses when none is requested.
+        env_keys: Environment variables discovered from ``.env.example``.
+        branch: The branch inspected, or the checkout's current branch when
+            none was requested.
+        commit: Short commit hash of the checkout, empty when the source is
+            not a Git repository.
+    """
+
+    app_type: str
+    detected_types: list[str]
+    package_manager: str | None
+    install_command: list[str]
+    build_command: list[str]
+    start_command: str
+    default_port: int
+    env_keys: list[EnvKeyResponse]
+    branch: str
+    commit: str
+
+
+# NOTE: declared before GET /{domain} and its siblings so a request for
+# /api/apps/inspect is never shadowed by a route that treats "inspect" as a
+# domain.
+@router.post("/inspect", response_model=SourceInspectionResponse)
+def inspect_app_source(
+    body: InspectSourceRequest, session: Annotated[dict, Depends(get_current_session)]
+) -> SourceInspectionResponse:
+    """
+    Preview what a repository is before deploying it.
+
+    Fetches the source into a throwaway checkout, detects the application
+    type, and reports the commands, port and environment variables a
+    deployment would use, so the new-app wizard has something real to show
+    instead of a guess. Nothing is written outside the checkout, which is
+    removed before this returns, and no application, domain or unit is
+    created.
+
+    Args:
+        body: The source to inspect and the branch to check out.
+        session: The authenticated session.
+
+    Returns:
+        The inspection result.
+
+    Raises:
+        SourceError: The source is invalid, or fetching it failed.
+        DeploymentError: The checkout matches no registered application type.
+    """
+    result = inspect_source(body.source, branch=body.branch)
+    return SourceInspectionResponse(
+        app_type=result.app_type,
+        detected_types=result.detected_types,
+        package_manager=result.package_manager,
+        install_command=result.install_command,
+        build_command=result.build_command,
+        start_command=result.start_command,
+        default_port=result.default_port,
+        env_keys=[
+            EnvKeyResponse(
+                name=key.name,
+                default=key.default,
+                secret=key.secret,
+                required=key.required,
+            )
+            for key in result.env_keys
+        ],
+        branch=result.branch,
+        commit=result.commit,
     )
 
 
