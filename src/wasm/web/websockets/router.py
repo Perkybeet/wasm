@@ -33,6 +33,7 @@ from wasm.web.auth import (
     authenticate_connection,
     get_audit_logger,
     get_client_ip,
+    scope_satisfies,
 )
 
 logger = logging.getLogger(__name__)
@@ -614,7 +615,13 @@ async def websocket_job(
                     if msg.get("type") == "ping":
                         await websocket.send_json({"type": "pong"})
                     elif msg.get("type") == "cancel":
-                        if manager.cancel_job(job_id):
+                        # The same operation as POST /api/jobs/{id}/cancel, so
+                        # it needs the same scope; a read token only watches.
+                        if not scope_satisfies(str(session.get("scope") or "read"), "admin"):
+                            await websocket.send_json(
+                                {"type": "error", "message": "Cancelling a job needs admin scope"}
+                            )
+                        elif manager.cancel_job(job_id):
                             await websocket.send_json({"type": "cancelled", "job_id": job_id})
                 except WebSocketDisconnect:
                     break

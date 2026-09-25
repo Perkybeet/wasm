@@ -40,7 +40,7 @@ from wasm.core.store import DeploymentTrigger, get_store
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import WASMErrorRoute, strict_domain
 from wasm.web.auth import get_audit_logger, get_client_ip
-from wasm.web.jobs import JobContext, JobType, _require_context, get_job_manager
+from wasm.web.jobs import JobContext, JobType, get_job_manager, run_update
 
 #: The unauthenticated delivery surface, mounted at ``/hooks``.
 router = APIRouter(route_class=WASMErrorRoute)
@@ -176,11 +176,8 @@ def webhook_update_job(domain: str, job_context: JobContext | None = None) -> di
     """
     Update a deployed application, recorded as webhook-triggered.
 
-    A mirror of :func:`wasm.web.jobs.update_app_job` with the provenance
-    changed: that function pins ``trigger="panel"``, and the deployment
-    history has to say a robot did this, not an operator. The deployment
-    itself is still the deployer's one implementation; only this wiring
-    differs.
+    The same sequence as the panel's update job with the provenance changed:
+    the deployment history has to say a robot did this, not an operator.
 
     Args:
         domain: Domain of the application to update.
@@ -190,45 +187,9 @@ def webhook_update_job(domain: str, job_context: JobContext | None = None) -> di
         Summary of the update.
 
     Raises:
-        DeploymentError: When the application is unknown or the deploy fails.
+        WASMError: When the application is unknown or a step fails.
     """
-    from wasm.deployers import get_deployer
-    from wasm.managers.backup_manager import RollbackManager
-
-    context = _require_context(job_context)
-    context.set_metadata("domain", domain)
-
-    app = get_store().get_app(domain)
-    if app is None:
-        raise DeploymentError(
-            f"Application not found: {domain}",
-            details="It may have been deleted after the webhook was accepted.",
-        )
-
-    context.update("Creating rollback point", 10)
-    RollbackManager(verbose=False).create_pre_deploy_backup(domain)
-
-    deployer = get_deployer(app.app_type, verbose=False)
-    deployer.configure(
-        domain=domain,
-        source=app.source,
-        port=app.port,
-        webserver=app.webserver,
-        ssl=app.ssl_enabled,
-        branch=app.branch,
-        env_vars=app.env_vars,
-        trigger=DeploymentTrigger.WEBHOOK.value,
-    )
-
-    context.update("Redeploying", 30)
-    if not deployer.deploy():
-        raise DeploymentError(
-            f"Update failed for {domain}",
-            details="Roll back with 'wasm rollback' or inspect the job log.",
-        )
-
-    context.update("Update complete", 100)
-    return {"domain": domain, "status": "updated", "trigger": DeploymentTrigger.WEBHOOK.value}
+    return run_update(domain, trigger=DeploymentTrigger.WEBHOOK.value, job_context=job_context)
 
 
 def _hmac_hex(secret: str, body: bytes) -> str:

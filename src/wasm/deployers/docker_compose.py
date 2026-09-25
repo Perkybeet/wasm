@@ -928,7 +928,9 @@ class DockerComposeDeployer(AppDeployer):
         self._build_images()
 
         report("Recreating containers")
-        result = self._run(self._compose("up", "-d", "--remove-orphans"))
+        # Services that name an image instead of building one pull it here,
+        # which is a download, not a local recreate.
+        result = self._run(self._compose("up", "-d", "--remove-orphans"), timeout=BUILD_TIMEOUT)
         if not result.success:
             raise DockerError("Failed to update containers", result.stderr)
 

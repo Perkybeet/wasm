@@ -271,3 +271,37 @@ def test_master_token_subprotocol_is_accepted(sandbox: Path, path: str) -> None:
 
     with client.websocket_connect(path, subprotocols=token_subprotocols(token)) as ws:
         assert ws.receive_json()["type"] == "connected"
+
+
+def test_a_read_token_cannot_cancel_a_job_over_the_socket(sandbox: Path) -> None:
+    """
+    Cancelling over /ws/jobs/{id} is the same operation as the admin-only POST.
+
+    A read token handed to a dashboard watched the job and could also stop it,
+    because the socket checked that the credential was valid but never what it
+    was allowed to do.
+    """
+    from tests.test_web_auth import issue_token
+    from wasm.web.jobs import Job, JobType, get_job_manager
+
+    client = build_client(sandbox)
+    master = get_token_manager().generate_master_token()
+    csrf = login(client, master)["csrf_token"]
+    reader = issue_token(client, csrf, name="dashboard", scope="read")["token"]
+
+    # A job that is queued but never started: exactly what cancel can stop.
+    manager = get_job_manager()
+    job = Job(id="queued1", type=JobType.UPDATE, name="update", description="update")
+    manager._jobs[job.id] = job
+
+    client.cookies.clear()
+    with client.websocket_connect(
+        f"/ws/jobs/{job.id}", subprotocols=token_subprotocols(reader)
+    ) as ws:
+        assert ws.receive_json()["type"] == "connected"
+        ws.send_json({"type": "cancel"})
+        reply = ws.receive_json()
+
+    assert reply["type"] == "error"
+    assert "admin" in reply["message"]
+    assert manager.get_job(job.id).status.value != "cancelled"

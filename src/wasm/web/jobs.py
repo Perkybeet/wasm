@@ -695,11 +695,6 @@ def update_app_job(
     """
     Update a deployed application.
 
-    A rollback point is taken and the application's own deployer is run again
-    with the settings recorded in the store. Re-running is the update: the
-    deployer refreshes the source, reinstalls, rebuilds and rewrites the site
-    in place rather than recreating it.
-
     Args:
         domain: Domain of the application to update.
         job_context: Injected by the job manager.
@@ -708,45 +703,61 @@ def update_app_job(
         Summary of the update.
 
     Raises:
-        DeploymentError: When the application is unknown or the deploy fails.
+        WASMError: When the application is unknown or a step fails.
     """
-    from wasm.deployers import get_deployer
-    from wasm.managers.backup_manager import RollbackManager
+    return run_update(domain, trigger="panel", job_context=job_context)
+
+
+def run_update(domain: str, *, trigger: str, job_context: JobContext | None) -> dict[str, Any]:
+    """
+    Run the shared update sequence as a job, reporting its phases as progress.
+
+    This used to re-run the whole deploy pipeline, whose fetch deletes the
+    application directory and clones it again: the ``.env`` edited here, the
+    files the application had written into its own tree and its generated
+    secrets were replaced on every update. The sequence is now
+    :func:`wasm.deployers.lifecycle.update_app`, the same one the CLI runs.
+
+    Args:
+        domain: Domain of the application to update.
+        trigger: Who asked for it, recorded in the deployment history.
+        job_context: Injected by the job manager.
+
+    Returns:
+        Summary of the update.
+
+    Raises:
+        WASMError: When the application is unknown or a step fails.
+    """
+    from wasm.deployers.lifecycle import update_app
 
     context = _require_context(job_context)
     context.set_metadata("domain", domain)
 
-    app = get_store().get_app(domain)
-    if app is None:
+    if get_store().get_app(domain) is None:
         raise DeploymentError(
             f"Application not found: {domain}",
             details="Deploy it first, or check 'wasm list' for the exact domain.",
         )
 
-    context.update("Creating rollback point", 10)
-    RollbackManager(verbose=False).create_pre_deploy_backup(domain)
-
-    deployer = get_deployer(app.app_type, verbose=False)
-    deployer.configure(
-        domain=domain,
-        source=app.source,
-        port=app.port,
-        webserver=app.webserver,
-        ssl=app.ssl_enabled,
-        branch=app.branch,
-        env_vars=app.env_vars,
-        trigger="panel",
+    outcome = update_app(
+        domain,
+        trigger=trigger,
+        on_phase=lambda index, total, message: context.update(message, 100 * (index - 1) // total),
+        on_step=context.log,
     )
 
-    context.update("Redeploying", 30)
-    if not deployer.deploy():
-        raise DeploymentError(
-            f"Update failed for {domain}",
-            details="Roll back with 'wasm rollback' or inspect the job log.",
-        )
+    if outcome.restarted and not outcome.active:
+        context.log("Restarted, but the unit is not running: check its logs", "warning")
 
     context.update("Update complete", 100)
-    return {"domain": domain, "status": "updated"}
+    return {
+        "domain": domain,
+        "status": "updated",
+        "trigger": trigger,
+        "restarted": list(outcome.restarted),
+        "active": outcome.active,
+    }
 
 
 def delete_app_job(

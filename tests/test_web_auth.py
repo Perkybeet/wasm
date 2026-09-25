@@ -1311,6 +1311,58 @@ def test_a_read_token_reads_but_cannot_mutate_and_the_refusal_is_audited(
     assert issued["token"] not in (sandbox / "state" / "web-audit.log").read_text()
 
 
+def test_a_read_token_cannot_unmask_an_environment(sandbox: Path, runner: object) -> None:
+    """
+    The unmasked .env is refused at the chokepoint, before the endpoint runs.
+
+    Args:
+        sandbox: Per-test temporary directory.
+        runner: The fake command runner.
+    """
+    client = build_client(sandbox)
+    master = get_token_manager().generate_master_token()
+    csrf = login(client, master)["csrf_token"]
+    issued = issue_token(client, csrf, name="dashboard", scope="read")
+
+    refused = client.get(
+        "/api/apps/example.com/env", params={"unmask": "true"}, headers=bearer(issued["token"])
+    )
+
+    assert refused.status_code == 403
+    assert "admin" in refused.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/apps/example.com/env/reveal",
+        "/apps/example.com/env/edit",
+        "/api/services/wasm-example-com/config",
+    ],
+)
+def test_no_route_hands_a_read_token_a_secret(sandbox: Path, runner: object, path: str) -> None:
+    """
+    The panel's own pages reach the same secrets as the API, so they refuse too.
+
+    A guard keyed on the /api URL let a read token read every .env in clear
+    through the reveal page, which calls the very same function.
+
+    Args:
+        sandbox: Per-test temporary directory.
+        runner: The fake command runner.
+        path: A route that returns secrets.
+    """
+    client = build_client(sandbox)
+    master = get_token_manager().generate_master_token()
+    csrf = login(client, master)["csrf_token"]
+    reader = issue_token(client, csrf, name="dashboard", scope="read")["token"]
+    client.cookies.clear()
+
+    refused = client.get(path, headers=bearer(reader))
+
+    assert refused.status_code == 403, refused.text
+
+
 def test_a_deploy_token_queues_deployments_but_cannot_delete(
     sandbox: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

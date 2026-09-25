@@ -14,10 +14,12 @@ opt out with ``@pytest.mark.allow_subprocess``.
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
+from wasm.core.fs import set_fs
 from wasm.core.runner import FakeRunner, set_runner
 
 
@@ -140,6 +142,23 @@ def ports(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> Po
     monkeypatch.setattr("wasm.core.app_state.port_answers", probe)
     monkeypatch.setattr("wasm.cli.commands.web._port_in_use", probe.in_use)
     return probe
+
+
+@pytest.fixture(autouse=True)
+def default_filesystem() -> Iterator[None]:
+    """
+    Put the process-wide filesystem back to the real one after every test.
+
+    ``--dry-run`` swaps a :class:`~wasm.core.fs.DryRunFileSystem` in globally,
+    and a CLI test that exercised it left it installed for whatever ran next:
+    a later test's store then refused to create its database file, and only
+    when the two happened to run in that order.
+
+    Yields:
+        Nothing; the reset happens on the way out.
+    """
+    yield
+    set_fs(None)
 
 
 @pytest.fixture

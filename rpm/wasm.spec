@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        1.6.2
+Version:        1.6.3
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -222,6 +222,12 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
 fi
 
 %changelog
+* Fri Sep 25 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.6.3-1
+- Fix data loss on panel and webhook updates: they re-ran the full deploy, whose fetch deletes the app directory, destroying the .env, uploaded files and generated secrets; every surface now runs one shared update (backup, git pull, rebuild, hand-over, restart)
+- Fix a read-scope API token being able to read every application .env in clear, through the API with unmask and through the panel reveal page, and to read unit files that inline secrets
+- Fix a read-scope token being able to cancel jobs over the jobs WebSocket
+- A monorepo update where any workspace unit failed to restart is no longer reported as running
+- Applications deployed from an archive or a local directory update by fetching their recorded source again, keeping the .env
 * Fri Sep 25 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.6.2-1
 - Fix EACCES at runtime after wasm update: the update now hands the app directory back to the service user after the build, so Next.js can write .next/cache/images and uploads work in directories the pull added
 - Fix monorepo deploys and updates handing the tree over before the build, which left every workspace's build output owned by root

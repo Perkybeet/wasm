@@ -33,7 +33,7 @@ from wasm.validators.environment import EnvironmentValidationError, validate_env
 from wasm.validators.port import find_available_port, validate_port
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import JobAcceptedResponse, WASMErrorRoute, strict_domain
-from wasm.web.auth import get_audit_logger, get_client_ip
+from wasm.web.auth import ensure_scope, get_audit_logger, get_client_ip
 from wasm.web.jobs import JobType, delete_app_job, deploy_app_job, get_job_manager
 
 router = APIRouter(route_class=WASMErrorRoute)
@@ -523,8 +523,15 @@ def get_app_env(
         The stored variables, redacted unless unmask was asked for.
 
     Raises:
-        HTTPException: 404 when the application is unknown.
+        HTTPException: 403 when unmasking with less than an admin credential,
+            404 when the application is unknown.
     """
+    if unmask:
+        # Here, in the function that produces the secrets, and not in the URL
+        # policy: the panel's reveal and edit pages call this function too, and
+        # a guard keyed on the /api path let a read token through them.
+        ensure_scope(request, session, "admin")
+
     app = _env_app(domain)
     values = (
         EnvManager(verbose=False).get_current_values(Path(app.app_path)) if app.app_path else {}

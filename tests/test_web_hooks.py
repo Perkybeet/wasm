@@ -608,38 +608,37 @@ def test_ignored_deliveries_are_audited_too(
 # ---------------------------------------------------------------------------
 
 
-def test_webhook_update_job_deploys_with_webhook_trigger(
+def test_webhook_update_job_updates_with_webhook_trigger(
     store: WASMStore, seeded: App, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The deployment history must say a robot did it, not the panel."""
-    configured: dict[str, Any] = {}
+    """
+    A push runs the shared update, recorded as a robot's doing.
 
-    class FakeDeployer:
-        """Records its configuration instead of deploying."""
+    It used to re-run the whole deploy pipeline, whose fetch deletes the
+    application directory: the .env and every uploaded file went with it.
+    """
+    from wasm.deployers import lifecycle
 
-        def configure(self, **kwargs: Any) -> None:
-            configured.update(kwargs)
+    calls: list[dict[str, Any]] = []
 
-        def deploy(self) -> bool:
-            return True
+    def fake_update(domain: str, **kwargs: Any) -> lifecycle.AppUpdate:
+        calls.append({"domain": domain, **kwargs})
+        return lifecycle.AppUpdate(
+            domain=domain,
+            app_type="nextjs",
+            package_manager="npm",
+            prisma_updated=False,
+            is_static=False,
+            restarted=("example-com",),
+            active=True,
+        )
 
-    class FakeRollback:
-        """Stands in for the pre-deploy backup."""
-
-        def __init__(self, verbose: bool = False) -> None:
-            pass
-
-        def create_pre_deploy_backup(self, domain: str) -> None:
-            configured["backup_domain"] = domain
-
-    monkeypatch.setattr("wasm.deployers.get_deployer", lambda *a, **k: FakeDeployer())
-    monkeypatch.setattr("wasm.managers.backup_manager.RollbackManager", FakeRollback)
+    monkeypatch.setattr(lifecycle, "update_app", fake_update)
 
     job = Job(id="j1", type=JobType.UPDATE, name="update", description="update")
     result = webhook_update_job(DOMAIN, job_context=JobContext(job, lambda _job: None))
 
     assert result["status"] == "updated"
-    assert configured["trigger"] == "webhook"
-    assert configured["backup_domain"] == DOMAIN
-    assert configured["domain"] == DOMAIN
-    assert configured["branch"] == "main"
+    assert result["trigger"] == "webhook"
+    assert [call["domain"] for call in calls] == [DOMAIN]
+    assert calls[0]["trigger"] == "webhook"

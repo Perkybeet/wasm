@@ -30,6 +30,7 @@ from wasm.core.store import get_store
 from wasm.managers.service_manager import ServiceManager
 from wasm.validators.names import resolve_within, validate_service_name
 from wasm.web.api.auth import get_current_session
+from wasm.web.auth import ensure_scope
 
 router = APIRouter()
 
@@ -463,7 +464,12 @@ def get_service_logs(
 def get_service_config(name: str, request: Request, session: dict = Depends(get_current_session)):
     """
     Get the systemd unit file content for a service.
+
+    Simple-mode services inline their environment as ``Environment=`` lines,
+    so the unit can carry secrets: reading it needs an admin credential, not
+    the ``read`` a GET would otherwise ask for.
     """
+    ensure_scope(request, session, "admin")
     try:
         service_name, service_path = _resolve_unit(name)
     except (ValidationError, SecurityError) as exc:

@@ -34,6 +34,7 @@ from wasm.cli.app import cli as root_cli
 from wasm.cli.commands import webapp
 from wasm.core.logger import Logger
 from wasm.core.runner import DryRunRunner, FakeRunner, get_runner
+from wasm.deployers import lifecycle
 
 #: The commands this module owns, as the user types them.
 COMMANDS = (
@@ -390,6 +391,7 @@ def store(monkeypatch: pytest.MonkeyPatch) -> StoreSpy:
     """
     spy = StoreSpy()
     monkeypatch.setattr(webapp, "get_store", lambda: spy)
+    monkeypatch.setattr(lifecycle, "get_store", lambda: spy)
     return spy
 
 
@@ -411,6 +413,7 @@ def services(monkeypatch: pytest.MonkeyPatch) -> ServiceSpy:
         return spy
 
     monkeypatch.setattr(webapp, "ServiceManager", _build)
+    monkeypatch.setattr(lifecycle, "ServiceManager", _build)
     return spy
 
 
@@ -427,6 +430,7 @@ def deployer(monkeypatch: pytest.MonkeyPatch) -> DeployerSpy:
     """
     spy = DeployerSpy()
     monkeypatch.setattr(webapp, "get_deployer", lambda app_type, verbose=False: spy)
+    monkeypatch.setattr(lifecycle, "get_deployer", lambda app_type, verbose=False: spy)
     monkeypatch.setattr(
         webapp,
         "check_deployment_ready",
@@ -1137,12 +1141,12 @@ def test_update_delegates_the_rebuild_to_the_deployer(
         tmp_path: Directory standing in for the deployed application.
     """
     app_path = tmp_path / "example-com"
-    app_path.mkdir()
+    (app_path / ".git").mkdir(parents=True)
     store.apps["example.com"] = make_app(app_path=str(app_path))
 
     pulls: list[tuple[Path, str | None]] = []
     monkeypatch.setattr(
-        webapp,
+        lifecycle,
         "SourceManager",
         lambda verbose=False: SimpleNamespace(
             pull=lambda path, branch=None: pulls.append((path, branch)),
@@ -1150,11 +1154,11 @@ def test_update_delegates_the_rebuild_to_the_deployer(
         ),
     )
     monkeypatch.setattr(
-        webapp,
+        lifecycle,
         "RollbackManager",
         lambda verbose=False: SimpleNamespace(create_pre_deploy_backup=lambda **kw: None),
     )
-    monkeypatch.setattr(webapp.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(lifecycle.time, "sleep", lambda seconds: None)
 
     result = cli_runner.invoke(
         webapp.cli.commands["update"], ["example.com", "-b", "release", "--pm", "pnpm"]
@@ -1192,20 +1196,20 @@ def test_update_rebuilds_a_monorepo_through_its_deployer(
         tmp_path: Directory standing in for the deployed application.
     """
     app_path = tmp_path / "example-com"
-    app_path.mkdir()
+    (app_path / ".git").mkdir(parents=True)
     store.apps["example.com"] = make_app(app_path=str(app_path), app_type="monorepo")
-    monkeypatch.setattr(webapp, "MonorepoDeployer", lambda verbose=False: deployer)
+    monkeypatch.setattr(lifecycle, "MonorepoDeployer", lambda verbose=False: deployer)
     monkeypatch.setattr(
-        webapp,
+        lifecycle,
         "SourceManager",
         lambda verbose=False: SimpleNamespace(pull=lambda path, branch=None: None),
     )
     monkeypatch.setattr(
-        webapp,
+        lifecycle,
         "RollbackManager",
         lambda verbose=False: SimpleNamespace(create_pre_deploy_backup=lambda **kw: None),
     )
-    monkeypatch.setattr(webapp.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(lifecycle.time, "sleep", lambda seconds: None)
 
     result = cli_runner.invoke(webapp.cli.commands["update"], ["example.com"])
 

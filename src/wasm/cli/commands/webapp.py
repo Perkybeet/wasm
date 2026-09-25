@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import re
 import sys
-import time
 from argparse import Namespace
 from collections.abc import Callable
 from pathlib import Path
@@ -43,18 +42,17 @@ from wasm.core.runner import (
     CommandResult,
     get_runner,
 )
-from wasm.core.store import get_store
+from wasm.core.store import DeploymentTrigger, get_store
 from wasm.core.utils import domain_to_app_name, remove_directory
-from wasm.deployers import detect_app_type, get_deployer
+from wasm.deployers import get_deployer
 from wasm.deployers.docker_compose import DockerComposeDeployer
+from wasm.deployers.lifecycle import update_app
 from wasm.deployers.monorepo import MonorepoDeployer
 from wasm.deployers.registry import available_types
 from wasm.managers.apache_manager import ApacheManager
-from wasm.managers.backup_manager import RollbackManager
 from wasm.managers.cert_manager import CertManager
 from wasm.managers.nginx_manager import NginxManager
 from wasm.managers.service_manager import ServiceManager
-from wasm.managers.source_manager import SourceManager
 from wasm.validators.domain import should_include_www, validate_domain
 from wasm.validators.port import find_available_port, validate_port
 
@@ -648,8 +646,8 @@ def _update_app(
     """
     Rebuild a deployed application from its source, then restart it.
 
-    The service is only restarted once the new build succeeded, so a broken
-    build leaves the previous one serving traffic.
+    The sequence itself is :func:`wasm.deployers.lifecycle.update_app`, shared
+    with the panel and the git webhook; this only presents it.
 
     Args:
         domain: Application domain.
@@ -664,260 +662,46 @@ def _update_app(
     Raises:
         WASMError: When the application is unknown or a step fails.
     """
-    config = Config()
-    store = get_store()
-
-    domain = validate_domain(domain)
-
-    # The store holds the real path, which is what keeps legacy apps deployed
-    # under a wasm- prefix updatable.
-    app = store.get_app(domain)
-
-    if app and app.app_path:
-        app_path = Path(app.app_path)
-        app_name = app_path.name
-    else:
-        app_name = domain_to_app_name(domain)
-        app_path = config.apps_directory / app_name
-
-    if not app_path.exists():
-        raise WASMError(
-            f"Application not found: {domain}",
-            details=f"Nothing is deployed at {app_path}. Deploy it with: wasm create -d {domain}",
-        )
-
     logger.header(f"Updating: {domain}")
     logger.blank()
 
-    total_steps = 7
-
-    logger.step(1, total_steps, "Creating pre-update backup")
-    try:
-        rollback_manager = RollbackManager(verbose=logger.verbose)
-        backup = rollback_manager.create_pre_deploy_backup(
-            domain=domain, description="Pre-update automatic backup"
-        )
-        if backup:
-            logger.substep(f"Backup created: {backup.id}")
-        else:
-            logger.substep("No existing app to backup")
-    except (WASMError, OSError) as e:
-        logger.substep(f"Backup skipped: {e}")
-
-    source_manager = SourceManager(verbose=logger.verbose)
-
-    if source:
-        logger.step(2, total_steps, "Fetching from new source")
-        logger.substep(f"Source: {source}")
-        # A forced fetch wipes the tree, and the environment file is the one
-        # thing in it that is not in version control.
-        env_backup = None
-        env_file = app_path / ".env"
-        if env_file.exists():
-            env_backup = env_file.read_text()
-
-        source_manager.fetch(source, app_path, branch=branch, force=True)
-
-        if env_backup:
-            env_file.write_text(env_backup)
-            logger.substep("Restored .env file")
-    else:
-        logger.step(2, total_steps, "Pulling latest changes")
-        source_manager.pull(app_path, branch=branch)
-
-    logger.step(3, total_steps, "Detecting application type")
-
-    # The initial deploy already settled the type; re-detecting can only change
-    # its mind for the worse on a tree that now has build output in it.
-    stored_type = app.app_type if app else None
-    if stored_type and stored_type != "unknown":
-        app_type = stored_type
-        logger.substep(f"Detected: {app_type}")
-    else:
-        detected = detect_app_type(app_path, verbose=logger.verbose)
-        if not detected:
-            app_type = "nodejs"
-            logger.substep(f"Using default: {app_type}")
-        else:
-            app_type = detected
-            logger.substep(f"Detected: {app_type}")
-
-    if app_type == "monorepo":
-        return _update_monorepo(app_path, app_name, domain, logger, total_steps)
-
-    if app_type == "docker-compose":
-        return _update_docker_compose(app_path, app_name, domain, logger)
-
-    deployer = get_deployer(app_type, verbose=logger.verbose)
-    deployer.configure(
-        domain=domain,
-        source=str(app_path),
-        app_path=app_path,
+    outcome = update_app(
+        domain,
+        source=source,
+        branch=branch,
         package_manager=package_manager,
+        trigger=DeploymentTrigger.CLI.value,
+        on_phase=logger.step,
+        on_step=logger.substep,
+        logger=logger,
+        verbose=logger.verbose,
     )
 
-    # One call, not a second copy of the deploy pipeline. The deployer reports
-    # each step as it starts so the numbering here stays the CLI's business.
-    step = iter(range(4, total_steps + 1))
-    result = deployer.update(on_step=lambda message: logger.step(next(step), total_steps, message))
-
-    logger.substep(f"Package manager: {result.package_manager}")
-    if result.prisma_updated:
-        logger.substep("Prisma updated")
-
-    logger.step(7, total_steps, "Restarting application")
-    service_manager = ServiceManager(verbose=logger.verbose)
-
-    if result.is_static:
-        logger.substep("Static application - no service restart needed")
-        logger.success(f"Application updated successfully: {domain}")
+    if outcome.is_static:
+        logger.success(f"Application updated successfully: {outcome.domain}")
         logger.blank()
-        logger.key_value("Type", "Static")
-        logger.key_value("Package Manager", result.package_manager)
+        logger.key_value("Type", outcome.app_type)
+        logger.key_value("Package Manager", outcome.package_manager)
         return 0
 
-    status = service_manager.get_status(app_name)
-    if not status.get("exists"):
-        logger.warning("Service not found - application may need to be redeployed")
-        logger.info(f"Try: wasm create -d {domain}")
+    if not outcome.restarted:
+        logger.warning("No service found to restart - the application may need to be redeployed")
+        logger.info(f"Try: wasm create -d {outcome.domain}")
         return 0
 
-    logger.substep("Minimal downtime during restart...")
-    service_manager.restart(app_name)
-
-    # systemd reports the unit active the instant it forks, so give the process
-    # a moment to fail before believing the health check.
-    time.sleep(2)
-
-    status = service_manager.get_status(app_name)
-    if status.get("active"):
-        logger.success(f"Application updated successfully: {domain}")
-        logger.blank()
-        logger.key_value("Status", "Running")
-        logger.key_value("Package Manager", result.package_manager)
-        if result.prisma_updated:
-            logger.key_value("Prisma", "Updated")
-    else:
+    if not outcome.active:
         logger.warning("Application restarted but may not be running correctly")
-        logger.info(f"Check logs with: wasm logs {domain}")
+        logger.info(f"Check logs with: wasm logs {outcome.domain}")
+        return 0
 
-    return 0
-
-
-def _update_monorepo(
-    app_path: Path,
-    app_name: str,
-    domain: str,
-    logger: Logger,
-    total_steps: int,
-) -> int:
-    """
-    Rebuild every workspace of a monorepo and restart their services.
-
-    Args:
-        app_path: Directory holding the application.
-        app_name: Directory name of the application.
-        domain: Validated domain.
-        logger: Logger of the current command.
-        total_steps: Number of steps reported to the user.
-
-    Returns:
-        Exit code.
-
-    Raises:
-        WASMError: When a build step fails.
-    """
-    deployer = MonorepoDeployer(verbose=logger.verbose)
-    deployer.app_path = app_path
-    deployer.app_name = app_name
-    deployer.domain = domain
-    deployer.package_manager = "pnpm"
-
-    # The deployer's own update, not a copy of its steps: the copy handed the
-    # tree over before building and left every build output owned by root.
-    step = iter(range(4, total_steps + 1))
-    deployer.update(on_step=lambda message: logger.step(next(step), total_steps, message))
-
-    logger.step(7, total_steps, "Restarting applications")
-    service_manager = ServiceManager(verbose=logger.verbose)
-
-    store = get_store()
-    app = store.get_app(domain)
-
-    restarted = []
-    if app:
-        all_services = store.list_services()
-        services = [s for s in all_services if s.app_id == app.id]
-        for service in services:
-            logger.substep(f"Restarting {service.name}")
-            try:
-                service_manager.restart(service.name)
-                restarted.append(service.name)
-            except ServiceError as e:
-                logger.warning(f"Failed to restart {service.name}: {e}")
-    else:
-        status = service_manager.get_status(app_name)
-        if status.get("exists"):
-            service_manager.restart(app_name)
-            restarted.append(app_name)
-
-    if restarted:
-        time.sleep(3)
-        logger.success(f"Monorepo updated successfully: {domain}")
-        logger.blank()
-        for name in restarted:
-            logger.key_value("Restarted", name)
-    else:
-        logger.warning("No services found to restart")
-        logger.info(f"Try redeploying: wasm create -d {domain}")
-
-    return 0
-
-
-def _update_docker_compose(
-    app_path: Path,
-    app_name: str,
-    domain: str,
-    logger: Logger,
-) -> int:
-    """
-    Rebuild the images of a Docker Compose project and recreate its containers.
-
-    Args:
-        app_path: Directory holding the application.
-        app_name: Directory name of the application.
-        domain: Validated domain.
-        logger: Logger of the current command.
-
-    Returns:
-        Exit code.
-
-    Raises:
-        WASMError: When the compose file cannot be found or a build fails.
-    """
-    deployer = DockerComposeDeployer(verbose=logger.verbose)
-    deployer.app_path = app_path
-    deployer.app_name = app_name
-    deployer.domain = domain
-
-    deployer._discover_compose_file()
-
-    logger.step(4, 5, "Rebuilding Docker images")
-    deployer._build_images()
-
-    logger.step(5, 5, "Restarting containers")
-    cmd = ["docker", "compose"]
-    if deployer.compose_path:
-        cmd.extend(["-f", str(deployer.compose_path)])
-    cmd.extend(["up", "-d", "--remove-orphans"])
-    result = get_runner().run(cmd, cwd=app_path, timeout=_COMPOSE_TIMEOUT)
-
-    if result.success:
-        logger.success(f"Docker Compose app updated: {domain}")
-    else:
-        logger.warning("Update may have issues. Check with: docker compose ps")
-        logger.warning(result.stderr)
-
+    logger.success(f"Application updated successfully: {outcome.domain}")
+    logger.blank()
+    logger.key_value("Status", "Running")
+    for name in outcome.restarted:
+        logger.key_value("Restarted", name)
+    logger.key_value("Package Manager", outcome.package_manager)
+    if outcome.prisma_updated:
+        logger.key_value("Prisma", "Updated")
     return 0
 
 
