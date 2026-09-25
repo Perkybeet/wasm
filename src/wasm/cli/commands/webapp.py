@@ -253,13 +253,14 @@ def _create_app(
                 details="Free a port in the range WASM allocates from, or pass --port.",
             )
 
-    # The real type is settled after the source is fetched; nodejs is only the
-    # value the readiness check is run against.
-    if app_type == "auto":
-        app_type = "nodejs"
+    # The readiness check needs a concrete type before anything is fetched, so
+    # it runs against nodejs; the deployer itself keeps "auto" and detects the
+    # real type from the fetched source. Rewriting app_type here, as this used
+    # to, deployed every untyped app as a plain Node service.
+    readiness_type = "nodejs" if app_type == "auto" else app_type
 
     can_deploy, missing, warnings = check_deployment_ready(
-        app_type=app_type,
+        app_type=readiness_type,
         package_manager=package_manager,
         verbose=logger.verbose,
     )
@@ -286,7 +287,7 @@ def _create_app(
     logger.header("WASM Deployment")
     logger.key_value("Domain", domain)
     logger.key_value("Source", source)
-    logger.key_value("Type", app_type)
+    logger.key_value("Type", "detected from the source" if app_type == "auto" else app_type)
     logger.key_value("Port", str(port))
     logger.key_value("Package Manager", package_manager)
     logger.key_value("SSL", "Yes" if ssl else "No")

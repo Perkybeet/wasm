@@ -710,6 +710,46 @@ def test_create_configures_the_deployer_and_deploys(
     }
 
 
+def test_create_without_a_type_detects_it_after_fetching(
+    cli_runner: CliRunner, monkeypatch: pytest.MonkeyPatch, deployer: DeployerSpy
+) -> None:
+    """
+    ``--type auto`` (the default) must reach the deployer that detects the type.
+
+    It was rewritten to ``nodejs`` before choosing the deployer, so every app
+    created without ``-t`` was deployed as a plain Node service: a Vite or
+    static site got a unit running ``npm start`` instead of files served by the
+    web server.
+
+    Args:
+        cli_runner: Click test runner.
+        monkeypatch: Patching helper.
+        deployer: Deployer spy.
+    """
+    asked: list[str] = []
+
+    def get_deployer(app_type: str, verbose: bool = False) -> DeployerSpy:
+        asked.append(app_type)
+        return deployer
+
+    monkeypatch.setattr(webapp, "get_deployer", get_deployer)
+    readiness: list[str] = []
+    monkeypatch.setattr(
+        webapp,
+        "check_deployment_ready",
+        lambda app_type, package_manager, verbose: readiness.append(app_type) or (True, [], []),
+    )
+
+    result = cli_runner.invoke(
+        webapp.cli.commands["create"], ["-d", "example.com", "-s", ".", "-p", "3100"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert asked == ["auto"]
+    # The readiness check needs a concrete type before the source is fetched.
+    assert readiness == ["nodejs"]
+
+
 def test_create_without_ssl_asks_the_deployer_for_no_certificate(
     cli_runner: CliRunner, deployer: DeployerSpy
 ) -> None:
