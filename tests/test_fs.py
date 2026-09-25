@@ -26,6 +26,7 @@ from wasm.core.fs import (
     SECRET_MODE,
     DryRunFileSystem,
     RealFileSystem,
+    RecordingFileSystem,
     get_fs,
     set_fs,
 )
@@ -145,6 +146,182 @@ class TestSymlinksInCopies:
         assert (
             "root:x:0:0" not in copied.read_bytes().decode(errors="replace") or copied.is_symlink()
         )
+
+
+class TestAtomicSymlinks:
+    """
+    Replacing a link never leaves a moment in which it does not exist.
+
+    The release layout swaps ``current`` under a running service and nginx:
+    unlinking the old link and creating the new one leaves a window in which
+    every request fails.
+    """
+
+    def test_the_target_is_stored_verbatim(self, fs: RealFileSystem, tmp_path):
+        """A relative target stays relative, so the tree can be moved."""
+        (tmp_path / "releases" / "a").mkdir(parents=True)
+
+        fs.symlink(Path("releases/a"), tmp_path / "current")
+
+        assert os.readlink(tmp_path / "current") == "releases/a"
+        assert (tmp_path / "current").resolve() == (tmp_path / "releases" / "a").resolve()
+
+    def test_replaces_a_link_to_a_directory_instead_of_nesting_inside_it(
+        self, fs: RealFileSystem, tmp_path
+    ):
+        """shutil.move() would have put the new link inside the old target."""
+        old = tmp_path / "old"
+        new = tmp_path / "new"
+        old.mkdir()
+        new.mkdir()
+        link = tmp_path / "current"
+        link.symlink_to("old")
+
+        fs.symlink(Path("new"), link)
+
+        assert os.readlink(link) == "new"
+        assert list(old.iterdir()) == []
+
+    def test_the_old_link_still_resolves_when_the_new_one_takes_its_place(
+        self, fs: RealFileSystem, tmp_path, monkeypatch
+    ):
+        old = tmp_path / "old"
+        new = tmp_path / "new"
+        old.mkdir()
+        new.mkdir()
+        link = tmp_path / "current"
+        link.symlink_to("old")
+        seen: list[tuple[str, str]] = []
+        real_replace = os.replace
+
+        def spy(source, destination):
+            seen.append((os.readlink(destination), os.readlink(source)))
+            real_replace(source, destination)
+
+        monkeypatch.setattr(os, "replace", spy)
+
+        fs.symlink(Path("new"), link)
+
+        assert seen == [("old", "new")], "the link was not swapped by a single rename"
+        assert os.readlink(link) == "new"
+
+    def test_a_failed_swap_keeps_the_old_link_and_leaves_no_temporary(
+        self, fs: RealFileSystem, tmp_path, monkeypatch
+    ):
+        (tmp_path / "old").mkdir()
+        link = tmp_path / "current"
+        link.symlink_to("old")
+
+        def explode(*_args, **_kwargs):
+            raise OSError("read-only filesystem")
+
+        monkeypatch.setattr(os, "replace", explode)
+
+        with pytest.raises(OSError, match="read-only"):
+            fs.symlink(Path("new"), link)
+
+        assert os.readlink(link) == "old"
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["current", "old"]
+
+    def test_a_real_directory_is_not_replaced(self, fs: RealFileSystem, tmp_path):
+        """An in-place tree where a link was expected must survive, whole."""
+        tree = tmp_path / "current"
+        tree.mkdir()
+        (tree / "index.html").write_text("live")
+
+        with pytest.raises(OSError):
+            fs.symlink(Path("releases/a"), tree)
+
+        assert (tree / "index.html").read_text() == "live"
+        assert [p.name for p in tmp_path.iterdir()] == ["current"]
+
+    def test_the_temporary_name_is_not_predictable(self, fs: RealFileSystem, tmp_path, monkeypatch):
+        names: list[str] = []
+        real_symlink = os.symlink
+
+        def record(target, link, *args, **kwargs):
+            names.append(Path(link).name)
+            real_symlink(target, link, *args, **kwargs)
+
+        monkeypatch.setattr(os, "symlink", record)
+
+        fs.symlink(Path("a"), tmp_path / "current")
+        fs.symlink(Path("b"), tmp_path / "current")
+
+        assert len(set(names)) == 2
+        assert all(name.startswith("current.tmp-") for name in names)
+
+    def test_dry_run_does_not_link(self, dry: DryRunFileSystem, tmp_path):
+        (tmp_path / "old").mkdir()
+        link = tmp_path / "current"
+        link.symlink_to("old")
+
+        dry.symlink(Path("new"), link)
+        dry.symlink(Path("x"), tmp_path / "other")
+
+        assert os.readlink(link) == "old"
+        assert not os.path.lexists(tmp_path / "other")
+        assert len(dry.skipped) == 2
+        assert "would link" in dry.skipped[0]
+
+    def test_recording_records_and_links(self, tmp_path):
+        recording = RecordingFileSystem()
+
+        recording.symlink(Path("target"), tmp_path / "link")
+
+        assert recording.changes == [("symlink", tmp_path / "link")]
+        assert os.readlink(tmp_path / "link") == "target"
+
+
+class TestExclusiveDirectories:
+    """exist_ok=False lets exactly one caller claim a directory."""
+
+    @pytest.mark.parametrize("parents", [True, False])
+    def test_an_existing_directory_is_refused(self, fs: RealFileSystem, tmp_path, parents):
+        target = tmp_path / "20260925-143012-a1b2c3d"
+        target.mkdir()
+        (target / "build").write_text("someone else's")
+
+        with pytest.raises(FileExistsError):
+            fs.make_dir(target, parents=parents, exist_ok=False)
+
+        assert (target / "build").read_text() == "someone else's"
+
+    @pytest.mark.parametrize("parents", [True, False])
+    def test_a_missing_directory_is_created(self, fs: RealFileSystem, tmp_path, parents):
+        target = tmp_path / "claimed"
+
+        fs.make_dir(target, parents=parents, exist_ok=False)
+
+        assert target.is_dir()
+
+    def test_missing_parents_are_created_before_the_claim(self, fs: RealFileSystem, tmp_path):
+        target = tmp_path / "releases" / "one"
+
+        fs.make_dir(target, exist_ok=False)
+
+        assert target.is_dir()
+
+    def test_the_default_still_accepts_an_existing_directory(self, fs: RealFileSystem, tmp_path):
+        fs.make_dir(tmp_path)
+        fs.make_dir(tmp_path, parents=False)
+
+        assert tmp_path.is_dir()
+
+    def test_dry_run_claims_nothing(self, dry: DryRunFileSystem, tmp_path):
+        dry.make_dir(tmp_path / "claimed", parents=False, exist_ok=False)
+
+        assert not (tmp_path / "claimed").exists()
+        assert dry.skipped == [f"would create directory {tmp_path / 'claimed'} (mode 755)"]
+
+    def test_recording_passes_the_claim_through(self, tmp_path):
+        recording = RecordingFileSystem()
+        (tmp_path / "taken").mkdir()
+
+        with pytest.raises(FileExistsError):
+            recording.make_dir(tmp_path / "taken", parents=False, exist_ok=False)
+
+        assert recording.changes == [("mkdir", tmp_path / "taken")]
 
 
 class TestDryRun:

@@ -23,6 +23,7 @@ nothing but noise.
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 from abc import ABC, abstractmethod
@@ -58,7 +59,9 @@ class FileSystem(ABC):
         """
 
     @abstractmethod
-    def make_dir(self, path: Path, *, mode: int = 0o755, parents: bool = True) -> None:
+    def make_dir(
+        self, path: Path, *, mode: int = 0o755, parents: bool = True, exist_ok: bool = True
+    ) -> None:
         """
         Create a directory.
 
@@ -66,6 +69,13 @@ class FileSystem(ABC):
             path: Directory to create.
             mode: Permissions, applied to every level this call creates.
             parents: Create missing parents.
+            exist_ok: Accept a directory that is already there. False makes
+                the creation of the leaf a claim: exactly one caller can win
+                it, which is how two deploys racing for the same release name
+                end up in different directories instead of the same one.
+
+        Raises:
+            FileExistsError: exist_ok is False and the path already exists.
         """
 
     @abstractmethod
@@ -120,10 +130,17 @@ class FileSystem(ABC):
     @abstractmethod
     def symlink(self, target: Path, link: Path) -> None:
         """
-        Create a symbolic link, replacing one that is already there.
+        Create a symbolic link, atomically replacing one that is already there.
+
+        Anything that follows the path while it changes sees either the old
+        target or the new one, never nothing. That is what lets a release swap
+        happen under a running service and nginx: removing the old link first
+        and creating the new one leaves a window in which ``current`` does not
+        exist.
 
         Args:
-            target: What the link points at.
+            target: What the link points at, stored verbatim: a relative target
+                stays relative, so the tree it lives in can be moved.
             link: The link to create.
         """
 
@@ -156,9 +173,11 @@ class RealFileSystem(FileSystem):
             temporary.unlink(missing_ok=True)
             raise
 
-    def make_dir(self, path: Path, *, mode: int = 0o755, parents: bool = True) -> None:
+    def make_dir(
+        self, path: Path, *, mode: int = 0o755, parents: bool = True, exist_ok: bool = True
+    ) -> None:
         if not parents:
-            path.mkdir(mode=mode, exist_ok=True)
+            path.mkdir(mode=mode, exist_ok=exist_ok)
             return
         # pathlib applies the mode only to the leaf and creates the parents
         # with the process umask, which is how a 0700 secrets directory ends up
@@ -168,6 +187,11 @@ class RealFileSystem(FileSystem):
         while not current.exists() and current != current.parent:
             missing.append(current)
             current = current.parent
+        if not missing and not exist_ok:
+            raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), str(path))
+        # The leaf is created last and without exist_ok, so a racer that
+        # creates it after the walk above makes this call fail rather than
+        # both callers believing the directory is theirs.
         for directory in reversed(missing):
             directory.mkdir(mode=mode)
 
@@ -190,8 +214,22 @@ class RealFileSystem(FileSystem):
         path.chmod(mode)
 
     def symlink(self, target: Path, link: Path) -> None:
-        link.unlink(missing_ok=True)
-        link.symlink_to(target)
+        # rename(2) replaces the destination in one step, so the new link is
+        # built beside the old one and renamed over it. The random suffix is
+        # not for uniqueness alone: symlink(2) never follows or reuses an
+        # existing entry, so a name planted in advance makes this fail instead
+        # of redirecting it, and an unpredictable name makes planting useless.
+        temporary = link.with_name(f"{link.name}.tmp-{os.urandom(6).hex()}")
+        os.symlink(target, temporary)
+        try:
+            # os.replace, not shutil.move: when the destination is a link to a
+            # directory, move() puts the new link *inside* that directory.
+            os.replace(temporary, link)
+        finally:
+            # After a successful rename the temporary name is gone, so this
+            # only ever removes a link that failed to take its place.
+            if os.path.lexists(temporary):
+                temporary.unlink()
 
 
 class DryRunFileSystem(FileSystem):
@@ -224,7 +262,9 @@ class DryRunFileSystem(FileSystem):
     def write_text(self, path: Path, content: str, *, mode: int = 0o644) -> None:
         self._skip(f"would write {path} ({len(content)} bytes, mode {mode:o})")
 
-    def make_dir(self, path: Path, *, mode: int = 0o755, parents: bool = True) -> None:
+    def make_dir(
+        self, path: Path, *, mode: int = 0o755, parents: bool = True, exist_ok: bool = True
+    ) -> None:
         self._skip(f"would create directory {path} (mode {mode:o})")
 
     def remove(self, path: Path, *, missing_ok: bool = True) -> None:
@@ -261,9 +301,11 @@ class RecordingFileSystem(RealFileSystem):
         self.changes.append(("write", path))
         super().write_text(path, content, mode=mode)
 
-    def make_dir(self, path: Path, *, mode: int = 0o755, parents: bool = True) -> None:
+    def make_dir(
+        self, path: Path, *, mode: int = 0o755, parents: bool = True, exist_ok: bool = True
+    ) -> None:
         self.changes.append(("mkdir", path))
-        super().make_dir(path, mode=mode, parents=parents)
+        super().make_dir(path, mode=mode, parents=parents, exist_ok=exist_ok)
 
     def remove(self, path: Path, *, missing_ok: bool = True) -> None:
         self.changes.append(("remove", path))
