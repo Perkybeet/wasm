@@ -113,6 +113,7 @@ def test_inspect_detects_nextjs_from_a_local_directory(
     project.mkdir()
     (project / "next.config.js").write_text("module.exports = {}\n")
     (project / "package.json").write_text(NEXTJS_PACKAGE_JSON)
+    (project / "package-lock.json").write_text("{}\n")
     (project / ".env.example").write_text(ENV_EXAMPLE)
 
     result = inspect_source(str(project))
