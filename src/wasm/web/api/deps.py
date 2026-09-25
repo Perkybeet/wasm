@@ -1,8 +1,8 @@
 """
 What every endpoint in this package needs before it may call a manager.
 
-Two things live here because they used to be repeated, inconsistently, in every
-module of the API:
+Three things live here because they used to be repeated, inconsistently, in
+every module of the API:
 
 - **The error boundary.** Managers raise :class:`~wasm.core.exceptions.WASMError`
   subclasses carrying an actionable message. Each handler used to wrap its
@@ -10,6 +10,13 @@ module of the API:
   rejected domain name and a dead certbot ended up as the same HTTP status. The
   translation is stated once, as a route class every router installs, so a
   handler can simply let the error propagate.
+- **The same shape for everything else that can fail an API request.** A
+  pydantic validation failure and a plain ``HTTPException`` used to answer in
+  Starlette's own shapes - a list of ``{"loc": ..., "msg": ...}`` entries, or a
+  bare ``{"detail": ...}`` - which meant a client needed three parsers for one
+  API. :func:`install_error_handlers` reshapes both, but only under ``/api``:
+  the server-rendered pages this application still has raise the same
+  exceptions and must keep answering exactly as they did.
 - **Strict identifier checks.** The panel runs as root, so a name arriving in a
   path segment or a JSON body is validated with :mod:`wasm.validators.names`
   and :mod:`wasm.validators.domain` before it becomes a path, a unit name or
@@ -24,13 +31,21 @@ the two are deliberately the same function.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Mapping
 from typing import Any
 
 from fastapi import Depends, FastAPI, Request, Response
+from fastapi.exception_handlers import (
+    http_exception_handler as _default_http_exception_handler,
+)
+from fastapi.exception_handlers import (
+    request_validation_exception_handler as _default_validation_exception_handler,
+)
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from wasm.core.exceptions import (
     ConfigError,
@@ -47,6 +62,24 @@ from wasm.core.exceptions import (
 from wasm.validators.domain import validate_domain
 from wasm.web.auth import SCOPE_RANK, ensure_scope, require_auth
 from wasm.web.pydantic_compat import dump_model
+
+#: Requests under this prefix are the JSON API and answer in the contract this
+#: module defines. Everything else - server-rendered pages, the webhook
+#: surface mounted at the application root - keeps whatever shape it already
+#: had; reshaping it would change a response nobody asked to change.
+API_PATH_PREFIX = "/api"
+
+#: ``error`` value for a bare ``HTTPException``, keyed by its status code. A
+#: status this table does not name falls back to :func:`_default_error_for_status`.
+_ERROR_BY_STATUS: dict[int, str] = {
+    400: "validation_error",
+    401: "unauthorized",
+    403: "forbidden",
+    404: "not_found",
+    409: "conflict",
+    422: "validation_error",
+    429: "rate_limited",
+}
 
 #: Status used for a WASMError with no more specific mapping. A manager that
 #: raises anything else is reporting that the operation failed on the server,
@@ -76,12 +109,18 @@ class ErrorResponse(BaseModel):
             FastAPI's own ``HTTPException`` responses and clients need one
             code path.
         hint: How to fix it, when the manager supplied one.
-        error: Name of the error class, for clients that branch on it.
+        error: Machine-readable error code, for clients that branch on it:
+            the lowercased :class:`~wasm.core.exceptions.WASMError` subclass
+            name, or one of the fixed values in :data:`_ERROR_BY_STATUS` for
+            an error that never became a WASM exception.
+        fields: Field name to message, for a validation failure that names
+            more than one field. ``None`` for every other kind of error.
     """
 
     detail: str
     hint: str | None = None
     error: str
+    fields: dict[str, str] | None = None
 
 
 class JobAcceptedResponse(BaseModel):
@@ -127,15 +166,21 @@ def error_response(exc: WASMError) -> JSONResponse:
     Returns:
         The JSON response, with the status implied by the error class.
     """
-    # WASMError defaults ``details`` to an empty string; an empty hint is no
-    # hint, and the client should not have to know the difference.
+    # WASMError.__str__ appends "\n  Details: ..." when details is set, which
+    # would repeat the hint inside detail too; .message is the bare sentence,
+    # and details travels only in hint.  WASMError defaults ``details`` to an
+    # empty string; an empty hint is no hint, and the client should not have
+    # to know the difference.
     return JSONResponse(
         status_code=status_for(exc),
         content=dump_model(
             ErrorResponse(
-                detail=str(exc),
+                detail=exc.message,
                 hint=getattr(exc, "details", None) or None,
-                error=type(exc).__name__,
+                # Lowercased so a client branches on one casing convention
+                # regardless of whether the code came from a WASM exception
+                # or from the fixed vocabulary in _ERROR_BY_STATUS.
+                error=type(exc).__name__.lower(),
             )
         ),
     )
@@ -168,6 +213,121 @@ class WASMErrorRoute(APIRoute):
         return wrapped
 
 
+def _is_api_request(request: Request) -> bool:
+    """
+    Report whether a request is the JSON API, as opposed to a server-rendered
+    page or the webhook surface.
+
+    Args:
+        request: The request under evaluation.
+
+    Returns:
+        True when the reshaped error contract applies.
+    """
+    return request.url.path.startswith(API_PATH_PREFIX)
+
+
+def _default_error_for_status(status_code: int) -> str:
+    """
+    Choose an ``error`` value for a status :data:`_ERROR_BY_STATUS` does not name.
+
+    Args:
+        status_code: The HTTP status being answered.
+
+    Returns:
+        ``"internal"`` for a server error, ``"validation_error"`` otherwise -
+        a bare ``HTTPException`` below 500 is always a rejected request, never
+        a mapped WASM exception (those go through :func:`error_response`).
+    """
+    return "internal" if status_code >= 500 else "validation_error"
+
+
+def _error_for_http_exception(exc: StarletteHTTPException) -> str:
+    """
+    Args:
+        exc: The exception being answered.
+
+    Returns:
+        The ``error`` value for its status code.
+    """
+    return _ERROR_BY_STATUS.get(exc.status_code, _default_error_for_status(exc.status_code))
+
+
+async def handle_http_exception(request: Request, exc: StarletteHTTPException) -> Response:
+    """
+    Reshape a bare ``HTTPException`` into the API's error contract.
+
+    Two shapes reach here. Most handlers still raise ``HTTPException`` with a
+    plain string ``detail`` - "Service not found: foo" - which is mapped onto
+    an ``error`` value by status code. A few, such as login, need a code the
+    status alone cannot carry (``totp_required`` and ``invalid_token`` are
+    both a 401) and raise with a ``detail`` dict that already carries
+    ``error``; that dict passes through unchanged rather than being reduced
+    to the status-code default.
+
+    Args:
+        request: The request being answered.
+        exc: The exception raised.
+
+    Returns:
+        The reshaped response for an API request, or whatever FastAPI's own
+        handler would have answered for anything else - a server-rendered
+        page raises the same exception type and must not change shape.
+    """
+    if not _is_api_request(request):
+        return await _default_http_exception_handler(request, exc)
+
+    headers = getattr(exc, "headers", None)
+    detail = exc.detail
+
+    if isinstance(detail, Mapping) and "error" in detail:
+        body: dict[str, Any] = {
+            "error": detail["error"],
+            "detail": detail.get("detail", ""),
+            "hint": detail.get("hint"),
+            "fields": detail.get("fields"),
+        }
+        return JSONResponse(status_code=exc.status_code, content=body, headers=headers)
+
+    response = ErrorResponse(
+        detail=str(detail), hint=None, error=_error_for_http_exception(exc), fields=None
+    )
+    return JSONResponse(status_code=exc.status_code, content=dump_model(response), headers=headers)
+
+
+async def handle_validation_error(request: Request, exc: RequestValidationError) -> Response:
+    """
+    Reshape a pydantic validation failure into the API's error contract.
+
+    FastAPI's own body is a list of ``{"loc": [...], "msg": ...}`` entries, one
+    per failed field, which a client has to walk to find out what to show next
+    to which input. This keys the same information by field name instead.
+
+    Args:
+        request: The request being answered.
+        exc: The exception raised.
+
+    Returns:
+        The reshaped response for an API request, or FastAPI's own for
+        anything else.
+    """
+    if not _is_api_request(request):
+        return await _default_validation_exception_handler(request, exc)
+
+    fields: dict[str, str] = {}
+    for error in exc.errors():
+        loc = error.get("loc") or ()
+        # The leading element is "body", "query" or "path"; a client wants
+        # the field it filled in, not which part of the request carried it.
+        name = str(loc[-1]) if loc else "body"
+        fields[name] = str(error.get("msg", "Invalid value"))
+
+    response = ErrorResponse(
+        detail="Validation failed", hint=None, error="validation_error", fields=fields or None
+    )
+    return JSONResponse(status_code=422, content=dump_model(response))
+
+
 def install_error_handlers(app: FastAPI) -> None:
     """
     Register the same translation for errors raised outside a route.
@@ -197,7 +357,53 @@ def install_error_handlers(app: FastAPI) -> None:
             raise exc
         return error_response(exc)
 
+    async def handle_http(request: Request, exc: Exception) -> Response:
+        """
+        Narrow to :class:`StarletteHTTPException` before delegating.
+
+        Same reasoning as :func:`handle`: Starlette's registry types every
+        handler against the base ``Exception``, and the class actually
+        registered for is only known at the call site, so the narrowing has
+        to happen here rather than in :func:`handle_http_exception`'s own
+        signature.
+
+        Args:
+            request: The request being served.
+            exc: The exception Starlette caught.
+
+        Returns:
+            The error response.
+
+        Raises:
+            Exception: The original exception, on the type error this
+                registration guarantees never happens.
+        """
+        if not isinstance(exc, StarletteHTTPException):
+            raise exc
+        return await handle_http_exception(request, exc)
+
+    async def handle_validation(request: Request, exc: Exception) -> Response:
+        """
+        Narrow to :class:`RequestValidationError` before delegating.
+
+        Args:
+            request: The request being served.
+            exc: The exception Starlette caught.
+
+        Returns:
+            The error response.
+
+        Raises:
+            Exception: The original exception, on the type error this
+                registration guarantees never happens.
+        """
+        if not isinstance(exc, RequestValidationError):
+            raise exc
+        return await handle_validation_error(request, exc)
+
     app.add_exception_handler(WASMError, handle)
+    app.add_exception_handler(StarletteHTTPException, handle_http)
+    app.add_exception_handler(RequestValidationError, handle_validation)
 
 
 def require_scope(scope: str) -> Callable[..., Coroutine[Any, Any, dict[str, Any]]]:

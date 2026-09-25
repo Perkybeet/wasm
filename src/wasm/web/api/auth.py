@@ -102,6 +102,31 @@ class WebSocketTicket(BaseModel):
     expires_in: int
 
 
+def _login_failure(error: str, detail: str) -> HTTPException:
+    """
+    Build a 401 whose reason a client can branch on without parsing English.
+
+    ``error`` distinguishes a wrong master token from a missing or wrong
+    second factor - three failures that used to share one string a client
+    had to pattern-match. :func:`~wasm.web.api.deps.handle_http_exception`
+    passes a ``detail`` dict carrying ``error`` through unchanged, which is
+    what makes this different from every other ``HTTPException`` in this
+    module.
+
+    Args:
+        error: Machine-readable reason - one of ``invalid_token``,
+            ``totp_required``, ``invalid_totp``.
+        detail: Human-readable message, unchanged from what this endpoint
+            answered before the reason was machine-readable.
+
+    Returns:
+        The exception to raise.
+    """
+    return HTTPException(
+        status_code=401, detail={"error": error, "detail": detail, "hint": None, "fields": None}
+    )
+
+
 def set_session_cookies(response: Response, session: IssuedSession, secure: bool) -> None:
     """
     Attach the session and CSRF cookies to a response.
@@ -147,8 +172,12 @@ async def login(request: Request, response: Response, body: LoginRequest) -> Log
         The login result.
 
     Raises:
-        HTTPException: 401 when the master token is wrong, when a required
-            second factor is missing, or when the second factor is wrong.
+        HTTPException: 401 with ``error`` ``invalid_token`` when the master
+            token is wrong, ``totp_required`` when a required second factor
+            is missing, or ``invalid_totp`` when the second factor is wrong.
+            A client locked out by too many attempts never reaches this
+            handler: ``SecurityMiddleware`` answers 429 with ``locked_out``
+            first.
     """
     token_manager = get_token_manager()
     brute_force = get_brute_force()
@@ -166,8 +195,8 @@ async def login(request: Request, response: Response, body: LoginRequest) -> Log
                 resource="/api/auth/login",
                 detail=f"invalid master token, {attempts_remaining} attempts remaining",
             )
-        raise HTTPException(
-            status_code=401, detail=f"Invalid token. {attempts_remaining} attempts remaining."
+        raise _login_failure(
+            "invalid_token", f"Invalid token. {attempts_remaining} attempts remaining."
         )
 
     if token_manager.totp_enabled():
@@ -183,9 +212,8 @@ async def login(request: Request, response: Response, body: LoginRequest) -> Log
                     resource="/api/auth/login",
                     detail="second factor required but not presented",
                 )
-            raise HTTPException(
-                status_code=401,
-                detail="Two-factor authentication is enabled. Include totp_code.",
+            raise _login_failure(
+                "totp_required", "Two-factor authentication is enabled. Include totp_code."
             )
         if not token_manager.verify_second_factor(code):
             # The same chokepoint that counts a bad master token: a wrong
@@ -193,9 +221,9 @@ async def login(request: Request, response: Response, body: LoginRequest) -> Log
             # own, softer counter.
             record_auth_failure(client_ip, "/api/auth/login", "totp")
             attempts_remaining = brute_force.get_attempts_remaining(client_ip)
-            raise HTTPException(
-                status_code=401,
-                detail=f"Invalid two-factor code. {attempts_remaining} attempts remaining.",
+            raise _login_failure(
+                "invalid_totp",
+                f"Invalid two-factor code. {attempts_remaining} attempts remaining.",
             )
 
     brute_force.record_success(client_ip)

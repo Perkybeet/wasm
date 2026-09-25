@@ -33,6 +33,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import MutableHeaders
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import HTTPConnection
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -424,6 +425,14 @@ def create_app(config: SecurityConfig | None = None) -> FastAPI:
     app.add_middleware(SecurityMiddleware, config=security_config)
 
     from wasm.web.api import router as api_router
+    from wasm.web.api.deps import API_PATH_PREFIX, handle_http_exception, install_error_handlers
+
+    # Every /api response that fails answers in one contract - see
+    # wasm.web.api.deps for what it looks like and why a router alone cannot
+    # register it. Deferred like the router import above: wasm.web.api.auth
+    # imports get_brute_force/get_token_manager from this module, so importing
+    # the package at module scope here would be circular.
+    install_error_handlers(app)
 
     app.include_router(api_router, prefix="/api")
 
@@ -628,18 +637,31 @@ def create_app(config: SecurityConfig | None = None) -> FastAPI:
         produced Starlette's plain-text 404, which reads like the server is
         broken rather than like the page is gone.
 
+        Starlette dispatches by status code before it dispatches by exception
+        type, so every 404 - including one an ``/api`` handler raised on
+        purpose, such as "Service not found: foo" - lands here rather than in
+        :func:`~wasm.web.api.deps.handle_http_exception`. An API path
+        delegates to it explicitly so a 404 still answers in the one error
+        contract instead of the generic body below.
+
         Args:
             request: The request that matched no route.
-            exc: The 404 Starlette raised. Unused; the signature requires it.
+            exc: The 404 Starlette raised. An ``HTTPException`` in every case
+                that reaches this handler, since it is only ever dispatched
+                for one.
 
         Returns:
-            The missing screen for a browser with a session, and the plain
-            answer for everything else. A 404 is not a place to start rendering
-            a root panel's navigation to someone who has not signed in.
+            The reshaped API error for ``/api``, the missing screen for a
+            browser with a session, and the plain answer for everything else.
+            A 404 is not a place to start rendering a root panel's navigation
+            to someone who has not signed in.
         """
         path = request.url.path
         machine_paths = ("/api", "/ws", "/static", "/events", "/health", "/hooks")
         wants_html = "text/html" in request.headers.get("accept", "")
+
+        if path.startswith(API_PATH_PREFIX) and isinstance(exc, StarletteHTTPException):
+            return await handle_http_exception(request, exc)
 
         if path.startswith(machine_paths) or not wants_html:
             return JSONResponse({"detail": "Not found"}, status_code=404)
@@ -772,6 +794,7 @@ class SecurityMiddleware:
                 status_code=403,
                 ws_code=WS_CLOSE_FORBIDDEN,
                 detail="Access denied: IP not whitelisted",
+                error="forbidden",
             )
             return
 
@@ -784,6 +807,7 @@ class SecurityMiddleware:
                 status_code=403,
                 ws_code=WS_CLOSE_FORBIDDEN,
                 detail="HTTPS is required to reach this panel.",
+                error="forbidden",
             )
             return
 
@@ -796,6 +820,7 @@ class SecurityMiddleware:
                 status_code=429,
                 ws_code=WS_CLOSE_RATE_LIMITED,
                 detail="Too many requests. Please try again later.",
+                error="rate_limited",
                 headers={
                     "Retry-After": str(config.rate_limit_window),
                     "X-RateLimit-Remaining": "0",
@@ -820,6 +845,7 @@ class SecurityMiddleware:
                 status_code=403,
                 ws_code=WS_CLOSE_FORBIDDEN,
                 detail="Origin not allowed for this panel.",
+                error="forbidden",
             )
             return
 
@@ -843,6 +869,7 @@ class SecurityMiddleware:
                     status_code=429,
                     ws_code=WS_CLOSE_RATE_LIMITED,
                     detail=f"Too many failed attempts. Locked for {remaining} seconds.",
+                    error="locked_out",
                     headers={"Retry-After": str(remaining)},
                 )
                 return
@@ -858,6 +885,7 @@ class SecurityMiddleware:
                     status_code=401,
                     ws_code=WS_CLOSE_UNAUTHORIZED,
                     detail="Authentication required",
+                    error="unauthorized",
                 )
                 return
             scope.setdefault("state", {})["session"] = session
@@ -999,10 +1027,15 @@ class SecurityMiddleware:
         status_code: int,
         ws_code: int,
         detail: str,
+        error: str,
         headers: dict[str, str] | None = None,
     ) -> None:
         """
         Refuse a connection in the shape its protocol understands.
+
+        This runs ahead of routing, so it answers in the API's error contract
+        directly rather than through :func:`wasm.web.api.deps.error_response`:
+        there is no request here for a router to have matched.
 
         Args:
             scope: The ASGI connection scope.
@@ -1012,6 +1045,8 @@ class SecurityMiddleware:
             status_code: HTTP status for an ``http`` scope.
             ws_code: Close code for a ``websocket`` scope.
             detail: Message for the client.
+            error: Machine-readable error code - see
+                ``wasm.web.api.deps.ErrorResponse``.
             headers: Extra response headers.
         """
         if scope["type"] == "websocket":
@@ -1027,7 +1062,9 @@ class SecurityMiddleware:
             return
 
         response = JSONResponse(
-            status_code=status_code, content={"detail": detail}, headers=headers
+            status_code=status_code,
+            content={"error": error, "detail": detail, "hint": None, "fields": None},
+            headers=headers,
         )
         self._harden_headers(MutableHeaders(raw=response.raw_headers), connection)
         await response(scope, receive, send)

@@ -460,7 +460,7 @@ class TestSiteConfigValidation:
 
         assert response.status_code == 400, response.text
         body = response.json()
-        assert body["error"] == "ValidationError"
+        assert body["error"] == "validationerror"
         assert stderr.strip() in (body["hint"] or ""), body
         assert sandbox_nginx().get_site_config(domain) == before
 
@@ -652,7 +652,7 @@ class TestErrorBoundary:
 
         assert response.status_code == 400, response.text
         body = response.json()
-        assert body["error"] == "DomainError"
+        assert body["error"] == "domainerror"
         assert "not a domain" in body["detail"]
 
     def test_the_boundary_carries_the_managers_hint(self, sites_client: TestClient) -> None:

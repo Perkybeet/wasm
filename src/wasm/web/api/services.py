@@ -25,14 +25,19 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from wasm.core.config import SYSTEMD_DIR, Config
-from wasm.core.exceptions import SecurityError, ServiceError, ValidationError, WASMError
+from wasm.core.exceptions import ServiceError, ValidationError, WASMError
 from wasm.core.store import get_store
 from wasm.managers.service_manager import ServiceManager
 from wasm.validators.names import resolve_within, validate_service_name
 from wasm.web.api.auth import get_current_session
+from wasm.web.api.deps import WASMErrorRoute
 from wasm.web.auth import ensure_scope
 
-router = APIRouter()
+# The error boundary: ValidationError and SecurityError from name/path
+# validation used to be caught by hand at every call site and turned into an
+# HTTPException(400) that duplicated exactly what WASMErrorRoute already does
+# for any WASMError. Letting them propagate is the one implementation.
+router = APIRouter(route_class=WASMErrorRoute)
 
 #: Directory unit files are read from and written to. Module level on purpose:
 #: the path used to be interpolated inline at each call site, which made the
@@ -113,19 +118,6 @@ class UpdateServiceConfigRequest(BaseModel):
     """Request to update service configuration."""
 
     config: str
-
-
-def _bad_request(exc: WASMError) -> HTTPException:
-    """
-    Turn a validation or containment failure into a client error.
-
-    Args:
-        exc: The raised WASM error.
-
-    Returns:
-        An HTTPException carrying the actionable message.
-    """
-    return HTTPException(status_code=400, detail=str(exc))
 
 
 def _unit_path(service_name: str) -> Path:
@@ -328,10 +320,7 @@ def get_service(name: str, request: Request, session: dict = Depends(get_current
     """
     Get details for a specific service.
     """
-    try:
-        service_name = validate_service_name(name)
-    except ValidationError as exc:
-        raise _bad_request(exc) from exc
+    service_name = validate_service_name(name)
 
     store = get_store()
     service_manager = ServiceManager(verbose=False)
@@ -372,22 +361,19 @@ def _run_service_action(name: str, action: str, past_tense: str) -> ServiceActio
         The action response.
 
     Raises:
-        HTTPException: 400 for an unsafe name, 404 when the unit does not exist,
-            500 when systemd refuses the operation.
+        ValidationError: For an unsafe name.
+        SecurityError: For a path that would leave the unit directory.
+        HTTPException: 404 when the unit does not exist. A failure inside
+            ``action`` propagates as whatever WASMError systemd's manager
+            raised, mapped by :data:`~wasm.web.api.deps._STATUS_BY_ERROR`.
     """
-    try:
-        service_name, service_path = _resolve_unit(name)
-    except (ValidationError, SecurityError) as exc:
-        raise _bad_request(exc) from exc
+    service_name, service_path = _resolve_unit(name)
 
     if not service_path.exists():
         raise HTTPException(status_code=404, detail=f"Service not found: {service_name}")
 
     service_manager = ServiceManager(verbose=False)
-    try:
-        getattr(service_manager, action)(service_name)
-    except WASMError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    getattr(service_manager, action)(service_name)
 
     return ServiceActionResponse(
         success=True,
@@ -446,10 +432,7 @@ def get_service_logs(
     """
     Get service logs from journalctl.
     """
-    try:
-        service_name, _ = _resolve_unit(name)
-    except (ValidationError, SecurityError) as exc:
-        raise _bad_request(exc) from exc
+    service_name, _ = _resolve_unit(name)
 
     service_manager = ServiceManager(verbose=False)
     try:
@@ -470,10 +453,7 @@ def get_service_config(name: str, request: Request, session: dict = Depends(get_
     the ``read`` a GET would otherwise ask for.
     """
     ensure_scope(request, session, "admin")
-    try:
-        service_name, service_path = _resolve_unit(name)
-    except (ValidationError, SecurityError) as exc:
-        raise _bad_request(exc) from exc
+    service_name, service_path = _resolve_unit(name)
 
     if not service_path.is_file():
         raise HTTPException(status_code=404, detail=f"Service not found: {service_name}")
@@ -496,10 +476,7 @@ def update_service_config(
     """
     Update the systemd unit file content for a service.
     """
-    try:
-        service_name, service_path = _resolve_unit(name)
-    except (ValidationError, SecurityError) as exc:
-        raise _bad_request(exc) from exc
+    service_name, service_path = _resolve_unit(name)
 
     if not service_path.is_file():
         raise HTTPException(status_code=404, detail=f"Service not found: {service_name}")
@@ -508,10 +485,13 @@ def update_service_config(
     # ownership is checked, and writing here would let the panel rewrite any
     # unit in /etc/systemd/system, which is the exact hole the ownership guard
     # exists to close.
+    #
+    # ServiceError is caught explicitly because a rewrite that drops the WASM
+    # marker is a conflict with the unit's own management, not a malformed
+    # request; WASMErrorRoute's default for an unmapped WASMError is 500,
+    # which would be wrong here.
     try:
         ServiceManager(verbose=False).update_config(service_name, data.config)
-    except (ValidationError, SecurityError) as exc:
-        raise _bad_request(exc) from exc
     except ServiceError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -533,6 +513,10 @@ def create_service(
     # the ownership rules are enforced in one place. Writing the file here,
     # which is what this endpoint used to do, meant raw_content could put any
     # content into any unit path as root while the manager's guard looked on.
+    #
+    # ServiceError is caught explicitly for the same reason as in
+    # update_service_config: a name collision is a conflict, not the 500
+    # WASMErrorRoute's default would answer for an unmapped WASMError.
     service_manager = ServiceManager(verbose=False)
     try:
         service_name = validate_service_name(data.name).removesuffix(".service")
@@ -552,8 +536,6 @@ def create_service(
                 environment=data.environment or {},
                 restart=data.restart,
             )
-    except (ValidationError, SecurityError) as exc:
-        raise _bad_request(exc) from exc
     except ServiceError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -569,10 +551,7 @@ def delete_service(name: str, request: Request, session: dict = Depends(get_curr
     """
     Delete a systemd service.
     """
-    try:
-        service_name, service_path = _resolve_unit(name)
-    except (ValidationError, SecurityError) as exc:
-        raise _bad_request(exc) from exc
+    service_name, service_path = _resolve_unit(name)
 
     if not service_path.is_file():
         raise HTTPException(status_code=404, detail=f"Service not found: {service_name}")

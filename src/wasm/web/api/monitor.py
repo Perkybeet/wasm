@@ -16,14 +16,13 @@ and both are fixed by that rule:
 
 from __future__ import annotations
 
-import logging
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from wasm.core.config import Config
-from wasm.core.exceptions import EmailError, MonitorError, WASMError
+from wasm.core.exceptions import EmailError, MonitorError
 from wasm.monitor import (
     DEFAULT_CPU_SAMPLE_INTERVAL,
     DEFAULT_CPU_THRESHOLD,
@@ -40,10 +39,13 @@ from wasm.monitor import (
     list_processes,
 )
 from wasm.web.api.auth import get_current_session
+from wasm.web.api.deps import WASMErrorRoute
 
-logger = logging.getLogger(__name__)
-
-router = APIRouter()
+# The error boundary: this router had none, so an unmapped WASMError from
+# ProcessMonitor/ObservationStore crashed the request instead of answering
+# with a status. The 502/503 catches below stay: they answer a status
+# WASMErrorRoute's default (500) does not.
+router = APIRouter(route_class=WASMErrorRoute)
 
 #: Upper bound on rows any list endpoint returns, so a caller cannot ask the
 #: panel to serialise the whole observation store.
@@ -296,12 +298,10 @@ def get_monitor_status(session: Session) -> MonitorStatus:
         The unit state, plus the scope note the panel displays.
 
     Raises:
-        HTTPException: When systemd could not be queried.
+        WASMError: When systemd could not be queried; caught by
+            ``WASMErrorRoute`` and answered as a 500.
     """
-    try:
-        status = ProcessMonitor(verbose=False).get_service_status()
-    except WASMError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    status = ProcessMonitor(verbose=False).get_service_status()
 
     return MonitorStatus(
         installed=bool(status["installed"]),
@@ -488,7 +488,9 @@ def get_observations(
         The requested page and the store totals.
 
     Raises:
-        HTTPException: When the store cannot be read.
+        WASMError: When the store cannot be read; caught by ``WASMErrorRoute``.
+        HTTPException: 500 for a filesystem error the store itself did not
+            wrap - OSError is not a WASMError, so it would otherwise crash.
     """
     try:
         store = ObservationStore(verbose=False)
@@ -498,7 +500,7 @@ def get_observations(
             severity=severity,
         )
         stats = store.stats()
-    except (WASMError, OSError) as exc:
+    except OSError as exc:
         raise HTTPException(
             status_code=500, detail=f"Observation store unavailable: {exc}"
         ) from exc
@@ -555,11 +557,13 @@ def acknowledge_observation(
         A success payload.
 
     Raises:
-        HTTPException: When the row does not exist or the store is unreadable.
+        WASMError: When the store is unreadable; caught by ``WASMErrorRoute``.
+        HTTPException: 404 when the row does not exist, 500 for a filesystem
+            error the store itself did not wrap.
     """
     try:
         acknowledged = ObservationStore(verbose=False).acknowledge(observation_id)
-    except (WASMError, OSError) as exc:
+    except OSError as exc:
         raise HTTPException(
             status_code=500, detail=f"Observation store unavailable: {exc}"
         ) from exc
@@ -581,7 +585,10 @@ def _service_action(action: str) -> dict[str, Any]:
         A success payload.
 
     Raises:
-        HTTPException: When systemd or the filesystem refused.
+        WASMError: When systemd or the filesystem refused; caught by
+            ``WASMErrorRoute`` and answered with the message and hint the
+            manager raised, rather than the reformatted single string this
+            used to build by hand.
     """
     monitor = ProcessMonitor(verbose=False)
     methods = {
@@ -593,15 +600,7 @@ def _service_action(action: str) -> dict[str, Any]:
         "stop": monitor.stop_service,
     }
 
-    try:
-        methods[action]()
-    except WASMError as exc:
-        logger.error("Monitor service %s failed: %s", action, exc)
-        detail = getattr(exc, "details", "") or ""
-        raise HTTPException(
-            status_code=500,
-            detail=f"{exc}{f': {detail}' if detail else ''}",
-        ) from exc
+    methods[action]()
 
     return {"success": True, "message": f"Monitor service {action} completed"}
 

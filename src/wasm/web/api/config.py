@@ -26,14 +26,19 @@ import os
 from pathlib import Path
 from typing import Any
 
+import yaml
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from wasm.core.config import DEFAULT_CONFIG, Config, redact_secrets
-from wasm.core.exceptions import WASMError
 from wasm.web.api.auth import get_current_session
+from wasm.web.api.deps import WASMErrorRoute
 
-router = APIRouter()
+# The error boundary: Config.replace()/set() raise ConfigError (a WASMError)
+# for a rejected key, which used to crash with a bare 500 because this router
+# had no way to catch it - WASMErrorRoute is the one place that translation
+# is stated.
+router = APIRouter(route_class=WASMErrorRoute)
 
 #: Web servers WASM can actually configure.
 SUPPORTED_WEBSERVERS = frozenset({"nginx", "apache"})
@@ -62,7 +67,11 @@ def persist(config: Config) -> Path:
         The path that was written.
 
     Raises:
-        HTTPException: 403 when the path is not writable, 500 for anything else.
+        HTTPException: 403 when the path is not writable, 500 when the write
+            itself fails for a reason that is not a WASM error (disk full,
+            unserialisable value). A ``SecurityError`` from a symlinked
+            destination is a WASMError and is left to propagate: WASMErrorRoute
+            maps it to 400, which a bare 500 here used to hide.
     """
     try:
         return config.write()
@@ -70,7 +79,7 @@ def persist(config: Config) -> Path:
         raise HTTPException(
             status_code=403, detail=f"Permission denied writing to {config.path}"
         ) from exc
-    except (OSError, WASMError) as exc:
+    except (OSError, yaml.YAMLError) as exc:
         raise HTTPException(status_code=500, detail=f"Failed to save configuration: {exc}") from exc
 
 
