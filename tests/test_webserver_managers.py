@@ -31,6 +31,7 @@ every manager in this area including these ones.
 
 from __future__ import annotations
 
+import re
 import tempfile
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -43,6 +44,7 @@ import pytest
 from wasm.core.exceptions import (
     ApacheError,
     CertificateError,
+    DomainConflictError,
     DomainError,
     NginxError,
     SecurityError,
@@ -51,6 +53,7 @@ from wasm.core.exceptions import (
 )
 from wasm.core.fs import DryRunFileSystem, set_fs
 from wasm.core.runner import FakeRunner
+from wasm.core.store import DomainRecord, StoreError
 from wasm.managers.apache_manager import ApacheManager
 from wasm.managers.cert_manager import CertificateInfo, CertManager
 from wasm.managers.nginx_manager import NginxManager
@@ -60,6 +63,7 @@ from wasm.managers.webserver import (
     SiteInfo,
     WebServerManager,
     WebServerStatus,
+    create_secured_site,
 )
 
 CERTBOT_OUTPUT = (
@@ -78,6 +82,32 @@ class FakeStore:
     def __init__(self) -> None:
         self.sites: dict[str, Any] = {}
         self.apps: dict[str, Any] = {}
+        self.domains: dict[str, list[DomainRecord]] = {}
+        self.owners: dict[str, tuple[str, str]] = {}
+
+    def domain_owner(self, domain: str) -> tuple[str, str] | None:
+        """
+        Find the application a name belongs to.
+
+        Args:
+            domain: The name.
+
+        Returns:
+            ``(application domain, kind)``, or None.
+        """
+        return self.owners.get(domain)
+
+    def list_domains(self, app_domain: str) -> list[DomainRecord]:
+        """
+        List the domains of an application.
+
+        Args:
+            app_domain: The application's primary domain.
+
+        Returns:
+            Its records, empty for a domain that is not an application.
+        """
+        return list(self.domains.get(app_domain, []))
 
     def get_site(self, domain: str) -> Any:
         """
@@ -586,6 +616,82 @@ def test_apache_syntax_warning_is_not_a_syntax_error(
     assert apache.test_config() is True
 
 
+def test_a_failed_configuration_test_is_reported_in_the_servers_own_words(
+    nginx: NginxManager, runner: FakeRunner
+) -> None:
+    """An operator fixing a broken vhost needs nginx's line number, not our paraphrase."""
+    runner.script(
+        ["nginx", "-t"],
+        stderr='nginx: [emerg] unknown directive "servr_name" in /etc/nginx/sites-enabled/x:4\n',
+        exit_code=1,
+    )
+
+    assert nginx.config_errors() == (
+        'nginx: [emerg] unknown directive "servr_name" in /etc/nginx/sites-enabled/x:4\n'
+    )
+    assert nginx.test_config() is False
+
+
+def test_a_configuration_that_passes_has_no_errors(
+    apache: ApacheManager, runner: FakeRunner
+) -> None:
+    runner.script(
+        ["apache2ctl", "configtest"],
+        stderr="Could not reliably determine the server's FQDN\nSyntax OK\n",
+        exit_code=1,
+    )
+
+    assert apache.config_errors() is None
+
+
+def test_the_names_a_live_nginx_site_answers_on_are_read_back(nginx: NginxManager) -> None:
+    """What a 1.x deploy served with --www is only recorded in the file itself."""
+    nginx.create_site(
+        "example.com",
+        "proxy",
+        {
+            "ssl": True,
+            "server_names": "example.com www.example.com",
+            "redirect_domains": ["old.example.org"],
+        },
+    )
+
+    assert nginx.served_names("example.com") == [
+        "old.example.org",
+        "example.com",
+        "www.example.com",
+    ]
+
+
+def test_the_names_a_live_apache_site_answers_on_are_read_back(apache: ApacheManager) -> None:
+    apache.create_site(
+        "example.com",
+        "proxy",
+        {"ssl": True, "server_names": "example.com www.example.com shop.example.com"},
+    )
+
+    assert apache.served_names("example.com") == [
+        "example.com",
+        "www.example.com",
+        "shop.example.com",
+    ]
+
+
+def test_a_missing_site_answers_on_nothing(nginx: NginxManager) -> None:
+    assert nginx.served_names("example.com") == []
+
+
+def test_names_read_back_are_domains_only(nginx: NginxManager) -> None:
+    """A hand-edited catch-all or wildcard is not something to adopt as a domain."""
+    path = nginx.config_path("example.com")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "server {\n    listen 80;\n    server_name example.com _ *.example.com EXAMPLE.org;\n}\n"
+    )
+
+    assert nginx.served_names("example.com") == ["example.com", "example.org"]
+
+
 # ---------------------------------------------------------------------------
 # A configuration is validated without touching the live one
 # ---------------------------------------------------------------------------
@@ -899,6 +1005,42 @@ RENDER_CASES = [
             "server_names": "example.com www.example.com",
         },
     ),
+    (
+        "proxy-alias",
+        {
+            "ssl": False,
+            "port": 3000,
+            "server_names": "example.com shop.example.com example.org",
+        },
+    ),
+    (
+        "proxy-redirect",
+        {
+            "ssl": False,
+            "port": 3000,
+            "redirect_domains": ["www.example.com"],
+        },
+    ),
+    (
+        "proxy-redirect-ssl",
+        {
+            "ssl": True,
+            "port": 3000,
+            "server_names": "example.com shop.example.com",
+            "redirect_domains": ["www.example.com", "old.example.org"],
+            "ssl_certificate": "/etc/letsencrypt/live/example.com/fullchain.pem",
+            "ssl_certificate_key": "/etc/letsencrypt/live/example.com/privkey.pem",
+        },
+    ),
+    (
+        "static-redirect-ssl",
+        {
+            "ssl": True,
+            "static_dir": "/var/www/apps/example.com/current/dist",
+            "server_names": "example.com shop.example.com",
+            "redirect_domains": ["www.example.com"],
+        },
+    ),
 ]
 
 
@@ -912,7 +1054,7 @@ def test_rendered_configuration_matches_the_snapshot(
     snapshot: Any,
 ) -> None:
     """A change to what the web server is told must be visible in review."""
-    template = "static" if case == "static" else "proxy"
+    template = case.split("-")[0]
     rendered = managers[backend].render_config("example.com", template, context)
 
     assert rendered == snapshot(name=f"{backend}-{case}")
@@ -929,6 +1071,148 @@ def test_www_alias_reaches_both_templates(
 
     assert "server_name example.com www.example.com;" in nginx_config
     assert "ServerAlias www.example.com" in apache_config
+
+
+def _domains(*entries: tuple[str, str]) -> list[DomainRecord]:
+    """
+    Build the domain rows of example.com.
+
+    Args:
+        entries: ``(domain, kind)`` pairs after the primary.
+
+    Returns:
+        The primary followed by the given rows.
+    """
+    rows = [DomainRecord(id=1, app_id=1, domain="example.com", kind="primary")]
+    rows += [
+        DomainRecord(id=index, app_id=1, domain=domain, kind=kind)
+        for index, (domain, kind) in enumerate(entries, start=2)
+    ]
+    return rows
+
+
+@pytest.mark.parametrize("backend", ["nginx", "apache"])
+def test_writing_an_applications_site_serves_every_one_of_its_domains(
+    managers: dict[str, WebServerManager], store: FakeStore, backend: str
+) -> None:
+    """
+    The rows are read where the file is written, so no caller can forget them.
+
+    A redeploy, the certificate step and a site created from the panel all
+    write the same vhost; any one of them rendering from its own idea of the
+    names would drop every alias the next time it ran.
+    """
+    store.domains["example.com"] = _domains(
+        ("shop.example.com", "alias"), ("www.example.com", "redirect")
+    )
+    manager = managers[backend]
+
+    manager.create_site("example.com", "proxy", {"port": 3000})
+    written = manager.config_path("example.com").read_text()
+
+    if backend == "nginx":
+        assert "server_name example.com shop.example.com;" in written
+        assert "server_name www.example.com;" in written
+        assert "return 301 http://example.com$request_uri;" in written
+    else:
+        assert "ServerAlias shop.example.com" in written
+        assert "ServerName www.example.com" in written
+        assert "RewriteRule ^ http://example.com%{REQUEST_URI} [L,R=301]" in written
+
+
+def test_the_stored_domains_win_over_a_callers_idea_of_the_names(
+    nginx: NginxManager, store: FakeStore
+) -> None:
+    """A deployer still passing the old include_www names cannot resurrect a removed one."""
+    store.domains["example.com"] = _domains(("shop.example.com", "alias"))
+
+    nginx.create_site("example.com", "proxy", {"server_names": "example.com www.example.com"})
+    written = nginx.config_path("example.com").read_text()
+
+    assert "server_name example.com shop.example.com;" in written
+    assert "www.example.com" not in written
+
+
+def test_a_site_that_is_no_application_keeps_the_names_it_was_given(
+    nginx: NginxManager, store: FakeStore
+) -> None:
+    """``wasm site create --www`` has no domain rows; its own names are the truth."""
+    nginx.create_site("example.com", "proxy", {"server_names": "example.com www.example.com"})
+
+    assert "server_name example.com www.example.com;" in (
+        nginx.config_path("example.com").read_text()
+    )
+
+
+@pytest.mark.parametrize("backend", ["nginx", "apache"])
+@pytest.mark.parametrize(
+    "context",
+    [
+        {"server_names": "example.com evil.com;\n    root /"},
+        {"server_names": "example.com\nInclude /etc/shadow"},
+        {"redirect_domains": ["old.example.org; return 200"]},
+        {"redirect_domains": ["old.example.org\n    root /"]},
+    ],
+)
+def test_every_name_is_checked_before_it_becomes_a_directive(
+    managers: dict[str, WebServerManager], backend: str, context: dict[str, Any]
+) -> None:
+    """The primary was always checked; the names beside it now are too."""
+    with pytest.raises(DomainError):
+        managers[backend].render_config("example.com", "proxy", context)
+
+
+@pytest.mark.parametrize("kind", ["alias", "redirect"])
+def test_a_site_is_not_created_for_another_applications_domain(
+    nginx: NginxManager, store: FakeStore, kind: str
+) -> None:
+    """Two server blocks claiming one name: nginx picks one and warns nobody who is looking."""
+    store.owners["shop.example.com"] = ("example.com", kind)
+
+    with pytest.raises(DomainConflictError, match=re.escape(f"{kind} of example.com")):
+        create_secured_site("shop.example.com", manager=nginx, webserver="nginx", ssl=False)
+
+    assert not nginx.site_exists("shop.example.com")
+
+
+def test_an_applications_own_site_can_still_be_written(
+    nginx: NginxManager, store: FakeStore
+) -> None:
+    """The primary's vhost is the application's; ``wasm site create`` may rewrite it."""
+    store.owners["example.com"] = ("example.com", "primary")
+
+    create_secured_site("example.com", manager=nginx, webserver="nginx", ssl=False)
+
+    assert nginx.site_exists("example.com")
+
+
+def test_a_site_is_still_written_when_the_store_cannot_be_read(
+    nginx: NginxManager, store: FakeStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rehearsal on a fresh machine has no database; the vhost never needed one."""
+
+    def unreadable(*_args: Any) -> Any:
+        raise StoreError("Cannot open the WASM database at /var/lib/wasm/wasm.db")
+
+    monkeypatch.setattr(store, "list_domains", unreadable)
+    monkeypatch.setattr(store, "domain_owner", unreadable)
+
+    nginx.create_site("example.com", "proxy", {"server_names": "example.com www.example.com"})
+
+    assert "server_name example.com www.example.com;" in (
+        nginx.config_path("example.com").read_text()
+    )
+
+
+def test_a_redirect_that_is_also_served_is_rendered_once(nginx: NginxManager) -> None:
+    """Serving a name and redirecting it away are contradictory; serving wins."""
+    rendered = nginx.render_config(
+        "example.com",
+        "proxy",
+        {"server_names": "example.com shop.example.com", "redirect_domains": ["shop.example.com"]},
+    )
+
+    assert "server_name shop.example.com;" not in rendered
 
 
 # ---------------------------------------------------------------------------
@@ -1150,6 +1434,62 @@ def test_a_certificate_missing_a_domain_is_expanded_not_reissued(
     assert "--expand" in issued
     assert issued[:4] == ("certbot", "certonly", "--cert-name", "example.com")
     assert issued.count("-d") == 2
+
+
+def test_an_applications_certificate_covers_every_one_of_its_domains(
+    certs: CertManager, runner: FakeRunner, store: FakeStore
+) -> None:
+    """
+    Aliases and redirects alike: a redirect answers on 443 too, and a browser
+    shown the wrong certificate never sees the redirect.
+
+    The names are read where the order is placed, so ``wasm cert create``, the
+    deploy step and a domain change all ask for the same set.
+    """
+    store.domains["example.com"] = _domains(
+        ("shop.example.com", "alias"), ("www.example.com", "redirect")
+    )
+
+    certs.obtain("example.com", email="ops@example.com", nginx=True)
+
+    (issued,) = [c for c in runner.calls if "certonly" in c]
+    requested = [issued[i + 1] for i, arg in enumerate(issued) if arg == "-d"]
+    assert requested == ["example.com", "shop.example.com", "www.example.com"]
+    # The list the panel's certificate job reports back is the one ordered.
+    assert certs.certificate_domains("example.com") == requested
+
+
+def test_adding_a_domain_expands_the_lineage_and_keeps_what_it_covered(
+    certs: CertManager, runner: FakeRunner, store: FakeStore
+) -> None:
+    """A new alias re-issues with --expand under the same name; nothing is dropped or revoked."""
+    _issue_certificate(certs, "example.com")
+    runner.script(["certbot", "certificates"], stdout=CERTBOT_OUTPUT)
+    store.domains["example.com"] = _domains(("shop.example.com", "alias"))
+
+    certs.obtain("example.com", email="ops@example.com")
+
+    (issued,) = [c for c in runner.calls if "certonly" in c]
+    requested = [issued[i + 1] for i, arg in enumerate(issued) if arg == "-d"]
+    assert issued[:4] == ("certbot", "certonly", "--cert-name", "example.com")
+    assert "--expand" in issued
+    # www.example.com is no longer a domain of the app, but the certificate
+    # covered it: shrinking a live certificate is not what adding a name means.
+    assert requested == ["example.com", "shop.example.com", "www.example.com"]
+    assert not [c for c in runner.calls if "revoke" in c]
+
+
+def test_a_certificate_that_covers_every_domain_is_not_reissued(
+    certs: CertManager, runner: FakeRunner, store: FakeStore
+) -> None:
+    """Re-rendering after a domain change must not spend a rate limit for nothing."""
+    _issue_certificate(certs, "example.com")
+    runner.script(["certbot", "certificates"], stdout=CERTBOT_OUTPUT)
+    store.domains["example.com"] = _domains(("www.example.com", "redirect"))
+
+    assert certs.obtain("example.com", email="ops@example.com") is True
+
+    assert not [c for c in runner.calls if "certonly" in c]
 
 
 def test_duplicate_domains_are_collapsed(certs: CertManager) -> None:

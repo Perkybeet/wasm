@@ -67,7 +67,7 @@ from wasm.core.exceptions import (
 )
 from wasm.core.fs import FileSystem
 from wasm.core.runner import CommandRunner
-from wasm.core.store import Site, WASMStore, WebServer, get_store
+from wasm.core.store import DomainKind, Site, WASMStore, WebServer, get_store
 from wasm.managers.base_manager import BaseManager, MappingRecord
 from wasm.managers.cert_manager import CertManager
 from wasm.validators.domain import is_valid_domain, should_include_www
@@ -179,6 +179,8 @@ class WebServerBackend:
             backend has no module system.
         module_disable_program: Counterpart of ``module_enable_program``.
         required_modules: Modules that must be enabled before a site works.
+        server_name_pattern: Matches a directive naming what a virtual host
+            answers on; its first group is the space-separated names.
         error: Exception type raised for failures of this backend, so existing
             callers keep catching what they already catch.
     """
@@ -203,6 +205,7 @@ class WebServerBackend:
     module_disable_program: str | None = None
     required_modules: tuple[str, ...] = ()
     webserver_record: str = WebServer.NGINX.value
+    server_name_pattern: re.Pattern[str] = re.compile(r"^\s*server_name\s+([^;]*);", re.MULTILINE)
 
 
 #: Main configuration wrapping one staged virtual host for ``nginx -t -c``.
@@ -275,6 +278,7 @@ APACHE_BACKEND = WebServerBackend(
     module_disable_program="a2dismod",
     required_modules=("proxy", "proxy_http", "proxy_wstunnel", "rewrite", "headers"),
     webserver_record=WebServer.APACHE.value,
+    server_name_pattern=re.compile(r"^\s*Server(?:Name|Alias)\s+(.+?)\s*$", re.MULTILINE),
 )
 
 
@@ -443,9 +447,24 @@ class WebServerManager(BaseManager):
         Returns:
             True when the configuration is valid.
         """
+        return self.config_errors() is None
+
+    def config_errors(self) -> str | None:
+        """
+        Test the web server configuration and say what the server objected to.
+
+        Returns:
+            None when the configuration is valid; otherwise the server's own
+            output, verbatim, which is what an operator fixing it needs.
+        """
         result = self._run(list(self.backend.config_test_argv), timeout=_CONTROL_TIMEOUT)
         # apache2ctl exits non-zero on warnings it then describes as "Syntax OK".
-        return result.success or "Syntax OK" in f"{result.stdout}\n{result.stderr}"
+        if result.success or "Syntax OK" in f"{result.stdout}\n{result.stderr}":
+            return None
+        output = "\n".join(stream for stream in (result.stderr, result.stdout) if stream.strip())
+        return output or (
+            f"{' '.join(self.backend.config_test_argv)} exited with status {result.exit_code}"
+        )
 
     def reload(self) -> bool:
         """
@@ -656,7 +675,47 @@ class WebServerManager(BaseManager):
         }
         if context:
             ctx.update(context)
+
+        # ``server_names`` is what nginx is given verbatim; apache needs the
+        # same list split into its ServerName and its ServerAliases, so both
+        # are derived here from the one value rather than passed separately
+        # and left to disagree.
+        served = str(ctx.get("server_names") or domain).split()
+        ctx["server_names"] = " ".join(served)
+        ctx["server_aliases"] = [name for name in served if name != domain]
+        # A name that is served and redirected at once would be two server
+        # blocks claiming it; serving it is what the operator can see working.
+        ctx["redirect_domains"] = [
+            name for name in ctx.get("redirect_domains") or [] if name not in served
+        ]
         return ctx
+
+    def _check_names(self, ctx: Mapping[str, Any]) -> None:
+        """
+        Refuse a context naming anything that is not a domain.
+
+        Every name lands in a ``server_name``, ``ServerAlias`` or redirect
+        target directive of a file written as root, where a ``;`` or a newline
+        ends the directive and starts one of the caller's choosing. The primary
+        has always been checked by :meth:`config_path`; this checks the rest.
+
+        Args:
+            ctx: The full template context.
+
+        Raises:
+            DomainError: When a served or redirected name is not a domain.
+        """
+        # build_context already rejoined server_names on single spaces, so a
+        # newline in it can no longer end a directive; what is left to refuse
+        # is a token that is not a domain, such as ``evil.com;``.
+        for name in [*ctx["server_names"].split(), *ctx["redirect_domains"]]:
+            valid, reason = is_valid_domain(name)
+            if not valid or name != name.strip():
+                raise DomainError(
+                    f"Invalid domain in the configuration of {ctx['domain']}: {name!r}",
+                    details=f"{reason or 'Surrounding whitespace'}. Every name a site "
+                    "answers on becomes a directive in its configuration file.",
+                )
 
     def render_config(
         self,
@@ -686,6 +745,7 @@ class WebServerManager(BaseManager):
         # renders from smuggling a newline into a server_name directive.
         self.config_path(domain)
         ctx = self.build_context(domain, context)
+        self._check_names(ctx)
 
         try:
             template_obj = self.jinja_env.get_template(f"{template}.conf.j2")
@@ -741,6 +801,8 @@ class WebServerManager(BaseManager):
             ApacheError: When an apache site already exists or cannot be
                 written.
             DomainError: When the domain is not a valid domain name.
+            DomainConflictError: When the domain is another application's
+                alias or redirect.
             TemplateError: When the template is missing or fails to render.
         """
         if self.site_exists(domain):
@@ -748,6 +810,18 @@ class WebServerManager(BaseManager):
                 f"Site already exists: {domain}",
                 details=f"Use update_site() to change {self.config_path(domain)}.",
             )
+
+        # A name that is another application's alias or redirect is already
+        # in that application's server blocks; a second site claiming it is a
+        # conflict nginx settles by file order, with a warning nobody reads.
+        try:
+            owner = self.store.domain_owner(domain.strip().lower())
+        except (WASMError, sqlite3.Error) as exc:
+            # No store to ask - a rehearsal on a machine that has none yet.
+            self.logger.debug(f"Could not check who owns {domain}: {exc}")
+            owner = None
+        if owner is not None and owner[1] != DomainKind.PRIMARY.value:
+            raise WASMStore.conflict(domain.strip().lower(), owner)
 
         for module in self.backend.required_modules:
             self.enable_module(module)
@@ -812,7 +886,8 @@ class WebServerManager(BaseManager):
             ApacheError: When the apache configuration cannot be written.
         """
         config_path = self.config_path(domain)
-        ctx = self.build_context(domain, context)
+        names = self._application_names(domain.strip().lower())
+        ctx = self.build_context(domain, {**(context or {}), **names})
         content = self.render_config(domain, template, ctx)
 
         try:
@@ -829,6 +904,39 @@ class WebServerManager(BaseManager):
         self._record_site(domain, config_path, ctx)
         self.logger.debug(f"Wrote site configuration: {config_path}")
         return True
+
+    def _application_names(self, domain: str) -> dict[str, Any]:
+        """
+        Read the names an application's site answers on, from the store.
+
+        This is the one place those names reach a configuration file. The
+        deployer, the certificate step and the site endpoints all rewrite the
+        same vhost; if each brought its own list, whichever ran last would
+        decide which aliases survive, and a redeploy that knew nothing about
+        domains would quietly drop them all.
+
+        Args:
+            domain: Domain of the site being written.
+
+        Returns:
+            ``server_names`` and ``redirect_domains`` for the template when the
+            domain is an application's, overriding whatever the caller passed;
+            empty for a site that is no application's, which keeps the names
+            it was given (``wasm site create --www``), and for a store that
+            cannot be read, which is reported.
+        """
+        try:
+            records = self.store.list_domains(domain)
+        except (WASMError, sqlite3.Error) as exc:
+            # A rehearsal on a machine with no database yet has no rows to
+            # read; anything worse has already failed whoever called this.
+            self.logger.warning(f"Could not read the domains of {domain}: {exc}")
+            return {}
+        if not records:
+            return {}
+        served = [r.domain for r in records if r.kind != DomainKind.REDIRECT.value]
+        redirects = [r.domain for r in records if r.kind == DomainKind.REDIRECT.value]
+        return {"server_names": " ".join(served), "redirect_domains": redirects}
 
     def _record_site(self, domain: str, config_path: Path, ctx: Mapping[str, Any]) -> None:
         """
@@ -1019,6 +1127,33 @@ class WebServerManager(BaseManager):
         self.logger.debug(f"Deleted site: {domain}")
         return True
 
+    def served_names(self, domain: str) -> list[str]:
+        """
+        Read which names a site's configuration answers on.
+
+        The file is the only record of what a 1.x deploy served: ``include_www``
+        was never stored anywhere else.
+
+        Args:
+            domain: Domain of the site.
+
+        Returns:
+            Every domain named by a ``server_name`` (nginx) or ``ServerName``
+            / ``ServerAlias`` (apache) directive, lowercased, in file order,
+            once each. Catch-alls, wildcards and anything else that is not a
+            domain are left out. Empty when the site does not exist.
+        """
+        if not self.site_exists(domain):
+            return []
+        text = self.get_site_config(domain) or ""
+        names: list[str] = []
+        for match in self.backend.server_name_pattern.finditer(text):
+            for token in match.group(1).split():
+                name = token.lower()
+                if name not in names and is_valid_domain(name)[0]:
+                    names.append(name)
+        return names
+
     def get_site_config(self, domain: str) -> str | None:
         """
         Read a site configuration.
@@ -1103,13 +1238,16 @@ class WebServerManager(BaseManager):
             details=output,
         )
 
-    def replace_site_config(self, domain: str, config_text: str) -> Path:
+    def replace_site_config(self, domain: str, config_text: str, *, validate: bool = True) -> Path:
         """
         Validate a hand-edited configuration and install it atomically.
 
         Args:
             domain: Domain of the site.
             config_text: The new configuration, written verbatim.
+            validate: Check it with the web server first. False is only for
+                putting back a configuration that was live a moment ago, when
+                what just replaced it was refused.
 
         Returns:
             The path of the configuration file that was replaced.
@@ -1129,7 +1267,8 @@ class WebServerManager(BaseManager):
                 details="Create it first with create_site().",
             )
 
-        self.validate_config_text(config_text, domain=domain)
+        if validate:
+            self.validate_config_text(config_text, domain=domain)
 
         config_path = self.config_path(domain)
         try:
@@ -1332,6 +1471,8 @@ def create_secured_site(
 
     Raises:
         DomainError: When the domain is not a valid domain name.
+        DomainConflictError: When the domain is another application's alias
+            or redirect (raised by ``create_site``).
         NginxError: When the nginx configuration cannot be written.
         ApacheError: When the apache configuration cannot be written.
         TemplateError: When the template is missing or fails to render.

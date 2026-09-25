@@ -24,6 +24,7 @@ from wasm.web.api.databases import router as databases_router
 from wasm.web.api.deployments import router as deployments_router
 from wasm.web.api.deps import install_error_handlers
 from wasm.web.api.diagnose import router as diagnose_router
+from wasm.web.api.domains import router as domains_router
 from wasm.web.api.jobs import router as jobs_router
 from wasm.web.api.metrics import router as metrics_router
 from wasm.web.api.monitor import router as monitor_router
@@ -59,6 +60,8 @@ router.include_router(deployments_router, prefix="/deployments", tags=["Deployme
 # routers compose without colliding. Kept separate because apps.py is owned
 # by another agent while this task was in flight.
 router.include_router(diagnose_router, prefix="/apps", tags=["Applications"])
+# Same composition: domains.py owns only paths under "/{domain}/domains".
+router.include_router(domains_router, prefix="/apps", tags=["Domains"])
 # No prefix: the route is declared as "/openapi.json" and this router mounts
 # directly under "/api", giving GET /api/openapi.json.
 router.include_router(openapi_router, tags=["OpenAPI"])

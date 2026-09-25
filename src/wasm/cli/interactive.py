@@ -225,7 +225,7 @@ class InteractiveMode:
             www_questions = [
                 prompts.Confirm(
                     "include_www",
-                    message=f"Include www.{answers['domain']} in certificate and web server config?",
+                    message=f"Redirect www.{answers['domain']} to {answers['domain']}?",
                     default=True,
                 ),
             ]

@@ -12,6 +12,7 @@ up 0600 inside 0700, because ``apps.env_vars`` holds DATABASE_URL and API keys.
 """
 
 import ast
+import re
 import sqlite3
 import tempfile
 from pathlib import Path
@@ -19,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from wasm.core import store as store_module
+from wasm.core.exceptions import DomainConflictError, DomainError, ValidationError
 from wasm.core.fs import (
     SECRET_DIR_MODE,
     SECRET_MODE,
@@ -660,7 +662,7 @@ class TestSchemaV5Migration:
 
         with store._transaction() as cursor:
             cursor.execute("SELECT MAX(version) FROM schema_version")
-            assert cursor.fetchone()[0] == SCHEMA_VERSION == 5
+            assert cursor.fetchone()[0] == SCHEMA_VERSION
         app = store.get_app("v4.example.com")
         assert app is not None
         assert app.layout == "inplace"
@@ -744,6 +746,284 @@ class TestSchemaV5Migration:
         assert app.keep_releases == 3
         assert app.persistent_paths == ["uploads", "storage/app"]
         assert app.memory_max_mb == 512
+
+
+class TestSchemaV6Migration:
+    """
+    Schema v6 gives every application its domains as rows.
+
+    The migration knows only ``apps.domain``: whether a 1.x deploy also served
+    ``www`` was never recorded, and a migration must not read the web server
+    configuration off disk to find out. So each app gets exactly its primary,
+    and the next ``wasm domain`` change adopts whatever the live site served.
+    """
+
+    def _create_v5_database(self, db_path: Path) -> None:
+        """
+        Create a real v5 database with two applications, as 2.0 pre-releases left it.
+
+        Args:
+            db_path: Where the database file is created.
+        """
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.executescript(V1_SCHEMA_SQL)
+            conn.executescript(V2_DEPLOYMENTS_SQL)
+            conn.execute("ALTER TABLE apps ADD COLUMN webhook_secret TEXT")
+            conn.executescript(V4_JOBS_SQL)
+            for name, definition in store_module.APPS_V5_COLUMNS:
+                conn.execute(f"ALTER TABLE apps ADD COLUMN {name} {definition}")
+            conn.executescript(store_module.RELEASES_SCHEMA_SQL)
+            for version in (1, 2, 3, 4, 5):
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+            conn.execute(
+                "INSERT INTO apps (domain, app_type, app_path, created_at) VALUES (?, ?, ?, ?)",
+                ("shop.example.com", "nextjs", "/var/www/apps/shop", "2026-01-02 03:04:05"),
+            )
+            conn.execute(
+                "INSERT INTO apps (domain, app_type, app_path) VALUES (?, ?, ?)",
+                ("example.com", "static", "/var/www/apps/example-com"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _migrated(self, tmp_path: Path, name: str = "wasm.db") -> WASMStore:
+        """
+        Args:
+            tmp_path: Directory for the database.
+            name: File name of the database.
+
+        Returns:
+            A store opened over a v5 database, which migrates it.
+        """
+        db_path = tmp_path / name
+        self._create_v5_database(db_path)
+        return WASMStore(db_path, fs=RecordingFileSystem())
+
+    def _schema(self, store: WASMStore) -> dict[str, object]:
+        """
+        Args:
+            store: The store to inspect.
+
+        Returns:
+            The domains table's columns and the SQL of its indexes.
+        """
+        with store._transaction() as cursor:
+            cursor.execute("PRAGMA table_info(domains)")
+            columns = {
+                row["name"]: (row["type"], row["notnull"], row["dflt_value"], row["pk"])
+                for row in cursor.fetchall()
+            }
+            cursor.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'domains'"
+                " AND sql IS NOT NULL ORDER BY name"
+            )
+            indexes = {row["name"]: " ".join(row["sql"].split()) for row in cursor.fetchall()}
+        return {"columns": columns, "indexes": indexes}
+
+    def test_every_application_gets_its_primary_domain(self, fresh, tmp_path):
+        """Nothing is lost, and the primary is dated like the application."""
+        store = self._migrated(tmp_path)
+
+        with store._transaction() as cursor:
+            cursor.execute("SELECT MAX(version) FROM schema_version")
+            assert cursor.fetchone()[0] == SCHEMA_VERSION == 6
+
+        shop = store.list_domains("shop.example.com")
+        assert [(d.domain, d.kind) for d in shop] == [("shop.example.com", "primary")]
+        assert shop[0].created_at == "2026-01-02 03:04:05"
+        assert shop[0].id is not None
+        assert [(d.domain, d.kind) for d in store.list_domains("example.com")] == [
+            ("example.com", "primary")
+        ]
+
+    def test_the_migration_does_not_guess_www(self, fresh, tmp_path):
+        """A bare domain that may have been deployed with --www gets only its primary."""
+        store = self._migrated(tmp_path)
+
+        assert [d.domain for d in store.list_domains("example.com")] == ["example.com"]
+
+    def test_the_fresh_schema_and_the_migration_agree(self, fresh, tmp_path):
+        """Both paths to v6 produce the same table and the same indexes."""
+        upgraded = self._schema(self._migrated(tmp_path, "migrated.db"))
+        WASMStore.reset_instance()
+
+        installed = self._schema(WASMStore(tmp_path / "fresh.db", fs=RecordingFileSystem()))
+
+        assert installed == upgraded
+        assert "idx_domains_one_primary" in installed["indexes"]
+
+
+class TestDomains:
+    """The store is the chokepoint for which application answers on which name."""
+
+    def _app(self, store: WASMStore, domain: str = "example.com") -> App:
+        """
+        Args:
+            store: The store to write to.
+            domain: The application's domain.
+
+        Returns:
+            The created application.
+        """
+        return store.create_app(App(domain=domain, app_path=f"/var/www/apps/{domain}"))
+
+    def test_creating_an_application_records_its_primary(self, temp_db):
+        app = self._app(temp_db)
+
+        domains = temp_db.list_domains("example.com")
+
+        assert [(d.domain, d.kind, d.app_id) for d in domains] == [
+            ("example.com", "primary", app.id)
+        ]
+
+    def test_aliases_and_redirects_are_listed_after_the_primary(self, temp_db):
+        self._app(temp_db)
+        temp_db.add_domain("example.com", "old.example.org", "redirect")
+        temp_db.add_domain("example.com", "shop.example.com", "alias")
+        temp_db.add_domain("example.com", "www.example.com", "redirect")
+
+        listed = [(d.domain, d.kind) for d in temp_db.list_domains("example.com")]
+
+        assert listed == [
+            ("example.com", "primary"),
+            ("shop.example.com", "alias"),
+            ("old.example.org", "redirect"),
+            ("www.example.com", "redirect"),
+        ]
+
+    def test_a_domain_is_normalised_before_it_is_stored(self, temp_db):
+        self._app(temp_db)
+
+        record = temp_db.add_domain("example.com", "  Shop.Example.COM ", "alias")
+
+        assert record.domain == "shop.example.com"
+        assert record.created_at
+
+    @pytest.mark.parametrize(
+        "hostile",
+        ["shop.example.com;", "shop.example.com\nserver_name evil.com", "a b.com", "", "../x"],
+    )
+    def test_a_name_that_is_not_a_domain_never_reaches_a_config_file(self, temp_db, hostile):
+        """These rows become server_name and ServerAlias tokens in files written as root."""
+        self._app(temp_db)
+
+        with pytest.raises(DomainError):
+            temp_db.add_domain("example.com", hostile, "alias")
+
+    def test_a_domain_belongs_to_one_application_only(self, temp_db):
+        self._app(temp_db, "example.com")
+        self._app(temp_db, "other.com")
+        temp_db.add_domain("other.com", "shop.example.com", "alias")
+
+        with pytest.raises(DomainConflictError, match=re.escape("other.com")):
+            temp_db.add_domain("example.com", "shop.example.com", "redirect")
+        with pytest.raises(DomainConflictError, match=re.escape("other.com")):
+            temp_db.add_domain("example.com", "other.com", "alias")
+
+    def test_adding_a_domain_twice_is_a_conflict_naming_what_it_already_is(self, temp_db):
+        self._app(temp_db)
+        temp_db.add_domain("example.com", "shop.example.com", "alias")
+
+        with pytest.raises(DomainConflictError, match="alias"):
+            temp_db.add_domain("example.com", "shop.example.com", "alias")
+
+    def test_an_application_cannot_be_deployed_on_another_ones_alias(self, temp_db):
+        """The conflict is refused in the same transaction, so no app row is left."""
+        self._app(temp_db, "example.com")
+        temp_db.add_domain("example.com", "shop.example.com", "alias")
+
+        with pytest.raises(DomainConflictError, match=re.escape("example.com")):
+            self._app(temp_db, "shop.example.com")
+
+        assert temp_db.get_app("shop.example.com") is None
+
+    def test_a_second_primary_is_refused(self, temp_db):
+        self._app(temp_db)
+
+        with pytest.raises(DomainError, match="one primary"):
+            temp_db.add_domain("example.com", "shop.example.com", "primary")
+
+    def test_an_unknown_kind_is_refused(self, temp_db):
+        self._app(temp_db)
+
+        with pytest.raises(ValidationError, match="kind"):
+            temp_db.add_domain("example.com", "shop.example.com", "mirror")
+
+    def test_a_domain_of_an_unknown_application_is_refused(self, temp_db):
+        with pytest.raises(StoreError, match="not found"):
+            temp_db.add_domain("ghost.example.com", "shop.example.com", "alias")
+
+    def test_the_database_itself_refuses_a_second_primary_and_a_bad_kind(self, temp_db):
+        """The partial unique index and the CHECK hold even for a writer that skips the methods."""
+        app = self._app(temp_db)
+
+        with temp_db._transaction() as cursor, pytest.raises(sqlite3.IntegrityError):
+            cursor.execute(
+                "INSERT INTO domains (app_id, domain, kind) VALUES (?, ?, 'primary')",
+                (app.id, "second.example.com"),
+            )
+        with temp_db._transaction() as cursor, pytest.raises(sqlite3.IntegrityError):
+            cursor.execute(
+                "INSERT INTO domains (app_id, domain, kind) VALUES (?, ?, 'mirror')",
+                (app.id, "mirror.example.com"),
+            )
+
+    def test_removing_an_alias_frees_the_name(self, temp_db):
+        self._app(temp_db, "example.com")
+        self._app(temp_db, "other.com")
+        temp_db.add_domain("example.com", "shop.example.com", "alias")
+
+        assert temp_db.remove_domain("example.com", "shop.example.com") is True
+
+        assert [d.domain for d in temp_db.list_domains("example.com")] == ["example.com"]
+        temp_db.add_domain("other.com", "shop.example.com", "alias")
+
+    def test_removing_a_domain_the_application_does_not_have_is_false(self, temp_db):
+        self._app(temp_db, "example.com")
+        self._app(temp_db, "other.com")
+        temp_db.add_domain("other.com", "shop.example.com", "alias")
+
+        assert temp_db.remove_domain("example.com", "shop.example.com") is False
+        assert temp_db.remove_domain("example.com", "nothing.example.com") is False
+        assert [d.domain for d in temp_db.list_domains("other.com")] == [
+            "other.com",
+            "shop.example.com",
+        ]
+
+    def test_the_primary_cannot_be_removed(self, temp_db):
+        self._app(temp_db)
+
+        with pytest.raises(DomainError, match="primary"):
+            temp_db.remove_domain("example.com", "example.com")
+
+        assert [d.domain for d in temp_db.list_domains("example.com")] == ["example.com"]
+
+    def test_domains_go_with_their_application(self, temp_db):
+        self._app(temp_db)
+        temp_db.add_domain("example.com", "shop.example.com", "alias")
+
+        temp_db.delete_app("example.com")
+
+        with temp_db._transaction() as cursor:
+            cursor.execute("SELECT COUNT(*) FROM domains")
+            assert cursor.fetchone()[0] == 0
+
+    def test_an_application_without_a_primary_row_still_lists_one(self, temp_db):
+        """A row written behind the store's back reads as what it is, not as nothing."""
+        with temp_db._transaction() as cursor:
+            cursor.execute(
+                "INSERT INTO apps (domain, app_path) VALUES (?, ?)",
+                ("legacy.example.com", "/var/www/apps/legacy"),
+            )
+
+        listed = temp_db.list_domains("legacy.example.com")
+
+        assert [(d.domain, d.kind) for d in listed] == [("legacy.example.com", "primary")]
+
+    def test_an_unknown_application_has_no_domains(self, temp_db):
+        assert temp_db.list_domains("ghost.example.com") == []
 
 
 class TestJobRecordCRUD:
@@ -1503,10 +1783,10 @@ class TestEdgeCases:
     """Tests for edge cases."""
 
     def test_duplicate_domain(self, temp_db):
-        """Test that duplicate domains raise an error."""
+        """A duplicate domain is refused, naming the application that has it."""
         temp_db.create_app(App(domain="dup.com", app_type="nodejs", app_path="/dup"))
 
-        with pytest.raises(sqlite3.IntegrityError):
+        with pytest.raises(DomainConflictError, match=re.escape("dup.com")):
             temp_db.create_app(App(domain="dup.com", app_type="vite", app_path="/dup2"))
 
     def test_empty_env_vars(self, temp_db):

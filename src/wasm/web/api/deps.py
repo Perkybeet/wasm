@@ -51,6 +51,7 @@ from wasm.core.exceptions import (
     ConfigError,
     DatabaseExistsError,
     DatabaseNotFoundError,
+    DomainConflictError,
     DomainError,
     SecurityError,
     ValidationError,
@@ -99,6 +100,7 @@ DEFAULT_ERROR_STATUS = 500
 _STATUS_BY_ERROR: tuple[tuple[type[WASMError], int], ...] = (
     (DatabaseNotFoundError, 404),
     (DatabaseExistsError, 409),
+    (DomainConflictError, 409),
     (SecurityError, 400),
     (ValidationError, 400),
     (DomainError, 400),

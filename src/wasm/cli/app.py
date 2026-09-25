@@ -57,6 +57,7 @@ COMMAND_MODULES: dict[str, str] = {
     "cron": "wasm.cli.commands.cron",
     "db": "wasm.cli.commands.db",
     "diagnose": "wasm.cli.commands.diagnose",
+    "domain": "wasm.cli.commands.domain",
     "env": "wasm.cli.commands.env",
     "health": "wasm.cli.commands.health",
     "monitor": "wasm.cli.commands.monitor",

@@ -93,7 +93,16 @@ class StaticDeployer(BaseDeployer):
 
     def pre_install(self) -> bool:
         """Determine static directory."""
-        # Check for common static directories
+        self._detect_static_dir()
+        return True
+
+    def inspect_site(self) -> None:
+        """Find the directory the site serves, as a deploy would."""
+        super().inspect_site()
+        self._detect_static_dir()
+
+    def _detect_static_dir(self) -> None:
+        """Pick the first common output directory that holds an index.html."""
         static_dirs = ["public", "dist", "build", "www", "html", "."]
 
         for dir_name in static_dirs:
@@ -109,7 +118,6 @@ class StaticDeployer(BaseDeployer):
             self.static_dir = self.build_path
 
         self.logger.debug(f"Static directory: {self.static_dir}")
-        return True
 
     def get_template_context(self) -> dict:
         """Get template context for static site."""

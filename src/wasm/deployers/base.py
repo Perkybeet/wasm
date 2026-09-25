@@ -38,7 +38,14 @@ from pathlib import Path
 from typing import Any, ClassVar, Literal
 
 from wasm.core.config import Config
-from wasm.core.exceptions import BuildError, DeploymentError, OutOfMemoryError, WASMError
+from wasm.core.exceptions import (
+    BuildError,
+    CertificateError,
+    DeploymentError,
+    OutOfMemoryError,
+    ValidationError,
+    WASMError,
+)
 from wasm.core.fs import DryRunFileSystem, FileSystem
 from wasm.core.logger import Icons
 from wasm.core.runner import CommandResult, CommandRunner, get_runner
@@ -47,6 +54,7 @@ from wasm.core.store import (
     App,
     AppStatus,
     DeploymentTrigger,
+    DomainKind,
     ReleaseRecord,
     ReleaseStatus,
     get_store,
@@ -320,7 +328,9 @@ class BaseDeployer(AppDeployer):
             env_vars: Environment variables.
             app_path: Custom application path.
             package_manager: Package manager to use (npm/pnpm/bun/auto).
-            include_www: Include www subdomain in certificate and web server config.
+            include_www: Also answer on ``www.<domain>``, recorded as a domain
+                of kind ``redirect`` to the primary unless the application
+                already has that name in some other role.
             trigger: What initiated this deployment, recorded in the history:
                 ``cli`` (the default), ``panel`` or ``webhook``.
             layout: ``inplace`` or ``releases`` for a new application,
@@ -703,9 +713,10 @@ class BaseDeployer(AppDeployer):
         Returns:
             Context dictionary.
         """
+        # Only the primary: every other name the site answers on is a row in
+        # the store, and WebServerManager reads the rows where it writes the
+        # file, so no caller - this one included - decides them.
         server_names = self.domain
-        if self.include_www:
-            server_names = f"{self.domain} www.{self.domain}"
 
         if self._nginx_advanced_config is not None:
             ctx = self._nginx_config_builder.build_context(
@@ -1142,11 +1153,24 @@ class BaseDeployer(AppDeployer):
                 details="Call configure(domain=..., source=...) before deploy().",
             )
 
+        self._record_requested_domains()
+        manager = self._webserver_manager()
+        self._write_site(manager, with_ssl=with_ssl)
+        manager.reload()
+        return True
+
+    def _write_site(self, manager: NginxManager | ApacheManager, *, with_ssl: bool) -> None:
+        """
+        Render the site and put it on disk, without reloading anything.
+
+        Args:
+            manager: The web server manager to write through.
+            with_ssl: Render the TLS server blocks.
+        """
         context = self.get_template_context()
         # Override SSL setting based on parameter
         context["ssl"] = with_ssl
 
-        manager = self._webserver_manager()
         template = (
             self.get_nginx_template() if self.webserver == "nginx" else self.get_apache_template()
         )
@@ -1163,8 +1187,6 @@ class BaseDeployer(AppDeployer):
             manager.create_site(self.domain, template=template, context=context)
             manager.enable_site(self.domain)
 
-        manager.reload()
-
         self.registrar.register_site(
             domain=self.domain,
             webserver=self.webserver,
@@ -1174,7 +1196,119 @@ class BaseDeployer(AppDeployer):
             with_ssl=with_ssl,
         )
 
-        return True
+    def _record_requested_domains(self) -> None:
+        """
+        Record the ``www`` name ``--www`` asked for, as a redirect to the primary.
+
+        A redirect rather than an alias: one canonical address is what a site
+        wants, and a redirect costs the visitor nothing. An application that
+        already has the name keeps it in whatever role it has - an operator
+        who made it an alias with ``wasm domain`` is not overruled by a flag
+        on a redeploy.
+
+        Nothing is recorded when there is no application row to attach it to,
+        which is the case under ``--dry-run``: the store rolled the row back.
+        """
+        if not self.include_www or self.store.get_app(self.domain) is None:
+            return
+        www = f"www.{self.domain}"
+        if any(record.domain == www for record in self.store.list_domains(self.domain)):
+            return
+        self.store.add_domain(self.domain, www, DomainKind.REDIRECT.value)
+        self.logger.substep(f"{www} redirects to {self.domain}")
+
+    def inspect_site(self) -> None:
+        """
+        Read what the site's configuration depends on from the tree being served.
+
+        A deploy learns these as a side effect of building; re-rendering the
+        site of an application that is already deployed has to learn them
+        without building anything, so each deployer that renders from more
+        than its settings says what it reads here. Reads only.
+        """
+        self._detect_nginx_config()
+
+    def webserver_manager(self) -> NginxManager | ApacheManager:
+        """
+        Return the manager of the web server that serves this application.
+
+        Returns:
+            An NginxManager or an ApacheManager.
+        """
+        return self._webserver_manager()
+
+    def has_certificate(self) -> bool:
+        """
+        Tell whether a certificate lineage for this application is on disk.
+
+        Returns:
+            True when certbot's live directory holds one for the primary.
+        """
+        try:
+            return self.cert_manager.cert_exists(self.domain)
+        except CertificateError:
+            return False
+
+    def refresh_site(self, *, with_ssl: bool) -> None:
+        """
+        Render the site of a deployed application again, and load it.
+
+        The same rendering a deploy does, from what is deployed: the layout the
+        store records, the active release on releases, and whatever the
+        deployer reads off the served tree (:meth:`inspect_site`). Nothing is
+        fetched or built, and the unit is not touched. This is how a change to
+        an application's domains reaches its web server.
+
+        The whole configuration is tested before the web server is asked to
+        reload. A failing test puts the previous file back, so a change that
+        nginx refuses never lingers on disk to fail the next reload of some
+        other site.
+
+        Args:
+            with_ssl: Render the TLS server blocks.
+
+        Raises:
+            DeploymentError: When the application is on releases and none is
+                active, or the web server does not reload.
+            ValidationError: When the web server rejects the configuration;
+                ``details`` is its own output, and the previous configuration
+                is back in place.
+        """
+        self.resolve_layout(self._app_row())
+        if self.uses_releases and self._staged is None:
+            active = self.releases.current()
+            if active is None:
+                raise DeploymentError(
+                    f"{self.domain} has no active release to serve",
+                    details=f"Build one first: wasm update {self.domain}",
+                )
+            self.adopt_release(
+                StagedRelease(path=active.path, commit=active.commit, manager=self.releases)
+            )
+        self.inspect_site()
+
+        manager = self._webserver_manager()
+        previous = (
+            manager.get_site_config(self.domain) if manager.site_exists(self.domain) else None
+        )
+        self._write_site(manager, with_ssl=with_ssl)
+
+        problem = manager.config_errors()
+        if problem is not None:
+            if previous is None:
+                manager.delete_site(self.domain)
+            else:
+                manager.replace_site_config(self.domain, previous, validate=False)
+            raise ValidationError(
+                f"{self.webserver} rejected the new configuration of {self.domain}",
+                details=problem,
+            )
+        if not manager.reload():
+            raise DeploymentError(
+                f"{self.webserver} did not reload the configuration of {self.domain}",
+                details=f"The configuration is valid; see why the reload failed with: "
+                f"systemctl status {self.webserver}",
+            )
 
     def create_service(self) -> bool:
         """
@@ -1255,11 +1389,18 @@ class BaseDeployer(AppDeployer):
 
         self.logger.substep(f"Domain: {self.domain}")
 
-        additional_domains = None
-        if self.include_www:
-            www_domain = f"www.{self.domain}"
-            additional_domains = [www_domain]
-            self.logger.substep(f"Including: {www_domain}")
+        # Every name the application answers on, redirects included: they
+        # are served on 443 as well. CertManager reads the same rows when it
+        # places the order; they are listed here so the operator sees them.
+        names = [record.domain for record in self.store.list_domains(self.domain)]
+        names = names or [self.domain]
+        if self.include_www and f"www.{self.domain}" not in names:
+            # Under --dry-run the store keeps no rows; the rehearsal still
+            # shows what the certificate would cover.
+            names.append(f"www.{self.domain}")
+        additional_domains = [name for name in names if name != self.domain]
+        if additional_domains:
+            self.logger.substep(f"Including: {', '.join(additional_domains)}")
 
         # Use nginx plugin if using nginx
         nginx = self.webserver == "nginx"
@@ -1269,7 +1410,7 @@ class BaseDeployer(AppDeployer):
             self.domain,
             nginx=nginx,
             apache=apache,
-            additional_domains=additional_domains,
+            additional_domains=additional_domains or None,
         )
 
         return True
@@ -1788,13 +1929,21 @@ class BaseDeployer(AppDeployer):
 
         A certificate failure is not a deployment failure: the application is
         still reachable over HTTP, and forcing a rollback here would throw away
-        a working build because DNS had not propagated yet.
+        a working build because DNS had not propagated yet. When a certificate
+        is already on disk - the order failed because one new alias does not
+        resolve yet - the site keeps TLS with it.
         """
-        from wasm.core.exceptions import CertificateError
-
         try:
             self.obtain_certificate()
         except (CertificateError, WASMError) as e:
+            if self.has_certificate():
+                # Extending the lineage to a name whose DNS is not ready must
+                # not take TLS off the names the certificate already covers.
+                self.logger.warning(f"The certificate could not be extended: {e}")
+                self.logger.substep("The existing certificate keeps serving what it covers")
+                self._ssl_obtained = True
+                self.create_site(with_ssl=True)
+                return
             self.logger.warning(f"SSL certificate failed: {e}")
             self.logger.warning("Continuing deployment without SSL...")
             self.logger.substep("Application will be available via HTTP only")

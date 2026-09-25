@@ -30,13 +30,13 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, NoReturn, Optional
 from urllib.parse import quote
 
-from wasm.core.exceptions import WASMError
+from wasm.core.exceptions import DomainConflictError, DomainError, ValidationError, WASMError
 from wasm.core.fs import (
     SECRET_DIR_MODE,
     SECRET_MODE,
@@ -143,6 +143,18 @@ class ReleaseStatus(str, Enum):
     ROLLED_BACK = "rolled_back"
 
 
+class DomainKind(str, Enum):
+    """What a domain does for the application it belongs to."""
+
+    #: The domain the application was deployed as. Exactly one per
+    #: application; it names the site, the unit and the certificate lineage.
+    PRIMARY = "primary"
+    #: Serves the application exactly like the primary.
+    ALIAS = "alias"
+    #: Answers with a permanent redirect to the primary.
+    REDIRECT = "redirect"
+
+
 #: Releases kept on disk when the application does not say otherwise.
 DEFAULT_KEEP_RELEASES = 5
 
@@ -207,6 +219,18 @@ class App:
                 data["env_vars"] = {}
         data["persistent_paths"] = _decode_paths(data.get("persistent_paths"))
         return cls(**data)
+
+
+def _utc_now() -> str:
+    """
+    Timestamp a domain row.
+
+    Returns:
+        The current time in UTC, ISO 8601 with its offset, so a client in
+        another time zone reads it right. Rows backfilled by the v6 migration
+        keep their application's own timestamp instead.
+    """
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _decode_paths(raw: Any) -> list[str]:
@@ -413,6 +437,36 @@ class ReleaseRecord:
 
 
 @dataclass
+class DomainRecord:
+    """
+    One domain an application answers on.
+
+    Attributes:
+        id: Row id. None for a primary synthesised for an application whose
+            row was written without one.
+        app_id: The application.
+        domain: The domain, lowercased.
+        kind: One of :class:`DomainKind`.
+        created_at: When it was added, ISO 8601.
+    """
+
+    id: int | None = None
+    app_id: int | None = None
+    domain: str = ""
+    kind: str = DomainKind.PRIMARY.value
+    created_at: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return asdict(self)
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "DomainRecord":
+        """Create from database row."""
+        return cls(**dict(row))
+
+
+@dataclass
 class JobRecord:
     """
     One background job the panel queued, kept so a restart does not erase it.
@@ -475,7 +529,7 @@ class MonorepoWorkspace:
 
 
 # Schema version for migrations
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _DEPLOYMENT_STATUSES_SQL = ", ".join(f"'{status.value}'" for status in DeploymentStatus)
 _DEPLOYMENT_TRIGGERS_SQL = ", ".join(f"'{trigger.value}'" for trigger in DeploymentTrigger)
@@ -586,6 +640,29 @@ CREATE TABLE IF NOT EXISTS releases (
 );
 
 CREATE INDEX IF NOT EXISTS idx_releases_app_created ON releases(app_id, created_at DESC);
+"""
+
+_DOMAIN_KINDS_SQL = ", ".join(f"'{kind.value}'" for kind in DomainKind)
+
+# Schema v6: every name an application answers on, instead of one domain and
+# an include_www flag nobody recorded. The rules live in the database, so a
+# writer that skips the store's methods is refused all the same: a name
+# belongs to one application (UNIQUE), an application has at most one primary
+# (the partial index) and a kind is one of three (CHECK). The rows go with
+# their application: a domain is state, not history.
+DOMAINS_SCHEMA_SQL = f"""
+-- Domains every application answers on
+CREATE TABLE IF NOT EXISTS domains (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    app_id INTEGER NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
+    domain TEXT NOT NULL UNIQUE,
+    kind TEXT NOT NULL CHECK (kind IN ({_DOMAIN_KINDS_SQL})),
+    created_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_domains_app_id ON domains(app_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_domains_one_primary
+    ON domains(app_id) WHERE kind = '{DomainKind.PRIMARY.value}';
 """
 
 _APPS_V5_COLUMNS_SQL = "".join(
@@ -708,6 +785,7 @@ CREATE INDEX IF NOT EXISTS idx_databases_app_id ON databases(app_id);
     + DEPLOYMENTS_SCHEMA_SQL
     + JOBS_SCHEMA_SQL
     + RELEASES_SCHEMA_SQL
+    + DOMAINS_SCHEMA_SQL
 )
 
 
@@ -1032,6 +1110,7 @@ class WASMStore:
             3: self._migrate_v2_to_v3,
             4: self._migrate_v3_to_v4,
             5: self._migrate_v4_to_v5,
+            6: self._migrate_v5_to_v6,
         }
 
         for version in range(from_version + 1, SCHEMA_VERSION + 1):
@@ -1084,23 +1163,61 @@ class WASMStore:
             cursor.execute(f"ALTER TABLE apps ADD COLUMN {name} {definition}")
         cursor.executescript(RELEASES_SCHEMA_SQL)
 
+    def _migrate_v5_to_v6(self, cursor: sqlite3.Cursor) -> None:
+        """
+        Add the domains table and give every application its primary (schema v6).
+
+        Only the primary is known. Whether a 1.x deploy also served ``www`` was
+        never recorded - ``include_www`` lived in the deployer for the length
+        of one deploy and then only in the rendered ``server_name`` - and a
+        migration does not read the web server's files to find out: it runs
+        wherever the store is opened, including under ``--dry-run`` and in the
+        panel, and a schema change that depends on what happens to be on disk
+        is not reproducible. The live names are adopted instead, at runtime,
+        by the first ``wasm domain`` change to the application (see
+        :mod:`wasm.deployers.domains`); a redeploy with ``--www`` records
+        ``www`` explicitly.
+
+        Args:
+            cursor: Cursor the migration runs on.
+        """
+        cursor.executescript(DOMAINS_SCHEMA_SQL)
+        cursor.execute(
+            "INSERT INTO domains (app_id, domain, kind, created_at) "
+            "SELECT id, domain, ?, created_at FROM apps",
+            (DomainKind.PRIMARY.value,),
+        )
+
     # =========================================================================
     # Application CRUD
     # =========================================================================
 
     def create_app(self, app: App) -> App:
         """
-        Create a new application record.
+        Create a new application record, and its primary domain with it.
+
+        Both rows are written in one transaction, so every application has its
+        primary from the moment it exists, and a domain that already belongs
+        to another application - as its alias, say - is refused before any
+        row is left behind.
 
         Args:
             app: Application data.
 
         Returns:
             Created application with ID.
+
+        Raises:
+            DomainConflictError: When the domain already belongs to another
+                application.
         """
         now = datetime.now().isoformat()
         app.created_at = now
         app.updated_at = now
+
+        owner = self.domain_owner(app.domain)
+        if owner is not None:
+            raise self.conflict(app.domain, owner)
 
         with self._transaction() as cursor:
             data = app.to_dict()
@@ -1113,6 +1230,10 @@ class WASMStore:
                 f"INSERT INTO apps ({columns}) VALUES ({placeholders})", list(data.values())
             )
             app.id = cursor.lastrowid
+            cursor.execute(
+                "INSERT INTO domains (app_id, domain, kind, created_at) VALUES (?, ?, ?, ?)",
+                (app.id, app.domain, DomainKind.PRIMARY.value, _utc_now()),
+            )
 
         return app
 
@@ -1198,6 +1319,12 @@ class WASMStore:
 
             cursor.execute(
                 f"UPDATE apps SET {set_clause} WHERE id = ?", [*list(data.values()), app_id]
+            )
+            # The primary row is the application's domain by definition; a
+            # row rewritten under a new domain takes its primary with it.
+            cursor.execute(
+                "UPDATE domains SET domain = ? WHERE app_id = ? AND kind = ? AND domain != ?",
+                (app.domain, app_id, DomainKind.PRIMARY.value, app.domain),
             )
 
         return app
@@ -1285,6 +1412,270 @@ class WASMStore:
             cursor.execute("SELECT webhook_secret FROM apps WHERE domain = ?", (domain,))
             row = cursor.fetchone()
             return row["webhook_secret"] if row else None
+
+    # =========================================================================
+    # Domains
+    # =========================================================================
+
+    def list_domains(self, app_domain: str) -> list[DomainRecord]:
+        """
+        List the domains an application answers on.
+
+        Args:
+            app_domain: The application's (primary) domain.
+
+        Returns:
+            The primary first, then the aliases, then the redirects, each in
+            the order they were added. Empty for an unknown application. An
+            application whose row was written without a primary - by a writer
+            that bypassed :meth:`create_app` - still lists one, synthesised
+            from the row with no id, because that is the name it answers on.
+        """
+        with self._transaction() as cursor:
+            cursor.execute(
+                "SELECT id, domain, created_at FROM apps WHERE domain = ?", (app_domain,)
+            )
+            app = cursor.fetchone()
+            if app is None:
+                return []
+            cursor.execute(
+                f"""SELECT * FROM domains WHERE app_id = ?
+                   ORDER BY CASE kind WHEN '{DomainKind.PRIMARY.value}' THEN 0
+                                      WHEN '{DomainKind.ALIAS.value}' THEN 1 ELSE 2 END,
+                            id""",
+                (app["id"],),
+            )
+            records = [DomainRecord.from_row(row) for row in cursor.fetchall()]
+
+        if not any(record.kind == DomainKind.PRIMARY.value for record in records):
+            records.insert(
+                0,
+                DomainRecord(
+                    app_id=app["id"],
+                    domain=app["domain"],
+                    kind=DomainKind.PRIMARY.value,
+                    created_at=app["created_at"],
+                ),
+            )
+        return records
+
+    def add_domain(self, app_domain: str, domain: str, kind: str) -> DomainRecord:
+        """
+        Give an application another name to answer on.
+
+        This is the chokepoint for the rules every surface relies on: the name
+        is a valid domain (it becomes a ``server_name`` token in a file written
+        as root), it belongs to no other application, and the primary is the
+        one the application was created with.
+
+        Args:
+            app_domain: The application's (primary) domain.
+            domain: The name to add. Normalised to lowercase.
+            kind: ``alias`` or ``redirect``.
+
+        Returns:
+            The stored record.
+
+        Raises:
+            DomainError: When the name is not a domain, or ``kind`` asks for a
+                second primary.
+            ValidationError: When ``kind`` is not a kind.
+            DomainConflictError: When the name already belongs to an
+                application, this one included.
+            StoreError: When the application does not exist.
+        """
+        name = self._checked_domain(domain)
+        self._check_added_kind(kind)
+
+        app = self.get_app(app_domain)
+        if app is None or app.id is None:
+            raise StoreError(
+                f"Application not found: {app_domain}",
+                details="Run 'wasm list' to see what is deployed.",
+            )
+
+        owner = self.domain_owner(name)
+        if owner is not None:
+            raise self.conflict(name, owner)
+
+        record = DomainRecord(
+            app_id=app.id,
+            domain=name,
+            kind=kind,
+            created_at=_utc_now(),
+        )
+        try:
+            with self._transaction() as cursor:
+                cursor.execute(
+                    "INSERT INTO domains (app_id, domain, kind, created_at) VALUES (?, ?, ?, ?)",
+                    (record.app_id, record.domain, record.kind, record.created_at),
+                )
+                record.id = cursor.lastrowid
+        except sqlite3.IntegrityError as exc:
+            # Lost a race with another writer between the check and the insert.
+            raise DomainConflictError(
+                f"{name} already belongs to an application",
+                details=f"{exc}. Run 'wasm domain list' on the applications to find it.",
+            ) from exc
+        return record
+
+    def remove_domain(self, app_domain: str, domain: str) -> bool:
+        """
+        Stop an application answering on a name.
+
+        Args:
+            app_domain: The application's (primary) domain.
+            domain: The alias or redirect to remove.
+
+        Returns:
+            True when the application had the name and it was removed, False
+            when it did not have it.
+
+        Raises:
+            DomainError: When the name is the application's primary, which is
+                what the application is; deleting the application is how that
+                one goes.
+        """
+        name = domain.strip().lower()
+        with self._transaction() as cursor:
+            cursor.execute(
+                "SELECT d.id, d.kind FROM domains d JOIN apps a ON a.id = d.app_id "
+                "WHERE a.domain = ? AND d.domain = ?",
+                (app_domain, name),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                if name == app_domain:
+                    # A primary synthesised by list_domains has no row, and is
+                    # still the primary.
+                    self._refuse_primary(name)
+                return False
+            if row["kind"] == DomainKind.PRIMARY.value:
+                self._refuse_primary(name)
+            cursor.execute("DELETE FROM domains WHERE id = ?", (row["id"],))
+            return cursor.rowcount > 0
+
+    @staticmethod
+    def _refuse_primary(domain: str) -> NoReturn:
+        """
+        Refuse to remove a primary domain.
+
+        Args:
+            domain: The primary.
+
+        Raises:
+            DomainError: Always.
+        """
+        raise DomainError(
+            f"{domain} is the primary domain and cannot be removed",
+            details=(
+                "The primary is the domain the application was deployed as. Delete the "
+                f"application to stop serving it: wasm delete {domain}"
+            ),
+        )
+
+    def domain_owner(self, domain: str) -> tuple[str, str] | None:
+        """
+        Find the application a name belongs to.
+
+        Args:
+            domain: The name, normalised.
+
+        Returns:
+            ``(application domain, kind)``, or None when the name is free.
+        """
+        with self._transaction() as cursor:
+            cursor.execute(
+                "SELECT a.domain AS app_domain, d.kind FROM domains d "
+                "JOIN apps a ON a.id = d.app_id WHERE d.domain = ?",
+                (domain,),
+            )
+            row = cursor.fetchone()
+            if row is not None:
+                return row["app_domain"], row["kind"]
+            # An application whose primary row is missing still owns its name.
+            cursor.execute("SELECT domain FROM apps WHERE domain = ?", (domain,))
+            row = cursor.fetchone()
+            return (row["domain"], DomainKind.PRIMARY.value) if row is not None else None
+
+    @staticmethod
+    def conflict(domain: str, owner: tuple[str, str]) -> DomainConflictError:
+        """
+        Describe why a name cannot be given to an application.
+
+        Args:
+            domain: The name.
+            owner: ``(application domain, kind)`` it already has.
+
+        Returns:
+            The error to raise.
+        """
+        app_domain, kind = owner
+        if kind == DomainKind.PRIMARY.value:
+            return DomainConflictError(
+                f"{domain} is already deployed as an application",
+                details=f"Delete that application first, or choose another name: wasm status {app_domain}",
+            )
+        article = "an" if kind == DomainKind.ALIAS.value else "a"
+        return DomainConflictError(
+            f"{domain} is already {article} {kind} of {app_domain}",
+            details=f"Remove it there first: wasm domain remove {app_domain} {domain}",
+        )
+
+    @staticmethod
+    def _checked_domain(domain: str) -> str:
+        """
+        Normalise a name and refuse anything that is not a domain.
+
+        Args:
+            domain: Candidate name.
+
+        Returns:
+            The name, lowercased and stripped.
+
+        Raises:
+            DomainError: When it is not a valid domain name.
+        """
+        from wasm.validators.domain import is_valid_domain
+
+        name = domain.strip().lower()
+        valid, reason = is_valid_domain(name)
+        if not valid:
+            raise DomainError(
+                f"Invalid domain: {domain!r}",
+                details=(
+                    f"{reason}. A domain becomes a server_name in the web server's "
+                    "configuration, so only letters, digits, hyphens and dots are accepted."
+                ),
+            )
+        return name
+
+    @staticmethod
+    def _check_added_kind(kind: str) -> None:
+        """
+        Refuse a kind that cannot be added to an existing application.
+
+        Args:
+            kind: The requested kind.
+
+        Raises:
+            DomainError: For ``primary``; an application has exactly one.
+            ValidationError: For anything that is not a kind at all.
+        """
+        if kind == DomainKind.PRIMARY.value:
+            raise DomainError(
+                "An application has exactly one primary domain",
+                details=(
+                    "The primary is the domain the application was deployed as. Add the "
+                    "name as an alias (served the same) or a redirect (sent to the primary)."
+                ),
+            )
+        if kind not in (DomainKind.ALIAS.value, DomainKind.REDIRECT.value):
+            raise ValidationError(
+                f"Unknown domain kind {kind!r}",
+                details="Use 'alias' to serve the application on it, or 'redirect' to send it "
+                "to the primary.",
+            )
 
     # =========================================================================
     # Site CRUD

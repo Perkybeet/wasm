@@ -20,6 +20,26 @@
         "title": "ActionResponse",
         "type": "object"
       },
+      "AddAppDomainRequest": {
+        "description": "A domain to add to an application.\n\nAttributes:\n    domain: The bare domain name.\n    kind: ``alias`` or ``redirect``.",
+        "properties": {
+          "domain": {
+            "title": "Domain",
+            "type": "string"
+          },
+          "kind": {
+            "default": "alias",
+            "description": "alias or redirect",
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "domain"
+        ],
+        "title": "AddAppDomainRequest",
+        "type": "object"
+      },
       "ApiTokenCreated": {
         "description": "A freshly issued API token. The only response that ever carries the token.\n\nAttributes:\n    id: Record id, used to revoke it.\n    name: The token's name.\n    scope: The token's scope.\n    token: The credential, shown exactly once - only its salted hash is\n        stored, so it cannot be shown again.\n    created_at: Creation time as a UNIX timestamp.\n    expires_at: Expiry as a UNIX timestamp, or None for no expiry.",
         "properties": {
@@ -200,6 +220,103 @@
           "domain"
         ],
         "title": "AppActionResponse",
+        "type": "object"
+      },
+      "AppDomain": {
+        "description": "One domain an application answers on.\n\nAttributes:\n    domain: The domain.\n    kind: ``primary`` (the domain the application was deployed as),\n        ``alias`` (served the same) or ``redirect`` (sent permanently to\n        the primary).\n    created_at: When it was added, ISO 8601.",
+        "properties": {
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "domain": {
+            "title": "Domain",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "domain",
+          "kind"
+        ],
+        "title": "AppDomain",
+        "type": "object"
+      },
+      "AppDomainChange": {
+        "description": "An application's domains after a change.\n\nAttributes:\n    app: The application's primary domain.\n    domains: Its domains afterwards, primary first.\n    tls: Whether its site serves TLS.\n    adopted: Names the live site already answered on without a record,\n        kept as aliases so the change did not drop them.\n    certificate_job_id: The job extending the certificate to every\n        domain, when the site serves TLS and a domain was added.",
+        "properties": {
+          "adopted": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Adopted",
+            "type": "array"
+          },
+          "app": {
+            "title": "App",
+            "type": "string"
+          },
+          "certificate_job_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Certificate Job Id"
+          },
+          "domains": {
+            "items": {
+              "$ref": "#/components/schemas/AppDomain"
+            },
+            "title": "Domains",
+            "type": "array"
+          },
+          "tls": {
+            "title": "Tls",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "app",
+          "domains",
+          "tls"
+        ],
+        "title": "AppDomainChange",
+        "type": "object"
+      },
+      "AppDomainList": {
+        "description": "Every domain an application answers on.\n\nAttributes:\n    app: The application's primary domain.\n    domains: Its domains, primary first, then aliases, then redirects.",
+        "properties": {
+          "app": {
+            "title": "App",
+            "type": "string"
+          },
+          "domains": {
+            "items": {
+              "$ref": "#/components/schemas/AppDomain"
+            },
+            "title": "Domains",
+            "type": "array"
+          }
+        },
+        "required": [
+          "app",
+          "domains"
+        ],
+        "title": "AppDomainList",
         "type": "object"
       },
       "AppEnvResponse": {
@@ -2397,6 +2514,41 @@
           "percent_used"
         ],
         "title": "DiskInfo",
+        "type": "object"
+      },
+      "DnsCheckResponse": {
+        "description": "Whether a domain resolves to this server.\n\nAttributes:\n    domain: The domain that was resolved.\n    expected_addresses: This server's addresses.\n    resolved_addresses: What the domain resolves to, A and AAAA.\n    points_here: Whether every address it resolves to is this server's.",
+        "properties": {
+          "domain": {
+            "title": "Domain",
+            "type": "string"
+          },
+          "expected_addresses": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Expected Addresses",
+            "type": "array"
+          },
+          "points_here": {
+            "title": "Points Here",
+            "type": "boolean"
+          },
+          "resolved_addresses": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Resolved Addresses",
+            "type": "array"
+          }
+        },
+        "required": [
+          "domain",
+          "expected_addresses",
+          "resolved_addresses",
+          "points_here"
+        ],
+        "title": "DnsCheckResponse",
         "type": "object"
       },
       "ElevateRequest": {
@@ -6401,6 +6553,204 @@
         "summary": "Diagnose App",
         "tags": [
           "Applications"
+        ]
+      }
+    },
+    "/api/apps/{domain}/domains": {
+      "get": {
+        "description": "List the domains an application answers on.\n\nArgs:\n    domain: The application's primary domain.\n    session: Authenticated session, injected.\n\nReturns:\n    Its domains, primary first.",
+        "operationId": "get_domains_api_apps__domain__domains_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "domain",
+            "required": true,
+            "schema": {
+              "title": "Domain",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppDomainList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Domains",
+        "tags": [
+          "Domains"
+        ]
+      },
+      "post": {
+        "description": "Make an application answer on another domain.\n\nThe domain is recorded and the site re-rendered and reloaded before this\nreturns. When the site serves TLS, extending the certificate to the new\ndomain is queued as a job; follow ``certificate_job_id``.\n\nArgs:\n    domain: The application's primary domain.\n    data: The domain to add and its kind.\n    session: Authenticated session, injected.\n\nReturns:\n    The application's domains afterwards.",
+        "operationId": "post_domain_api_apps__domain__domains_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "domain",
+            "required": true,
+            "schema": {
+              "title": "Domain",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddAppDomainRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppDomainChange"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Post Domain",
+        "tags": [
+          "Domains"
+        ]
+      }
+    },
+    "/api/apps/{domain}/domains/{name}": {
+      "delete": {
+        "description": "Stop an application answering on a domain.\n\nThe site is re-rendered and reloaded before this returns. The certificate\nis left alone and nothing is revoked.\n\nArgs:\n    domain: The application's primary domain.\n    name: The alias or redirect to remove.\n    session: Authenticated and elevated session, injected.\n\nReturns:\n    The application's domains afterwards.",
+        "operationId": "delete_domain_api_apps__domain__domains__name__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "domain",
+            "required": true,
+            "schema": {
+              "title": "Domain",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppDomainChange"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Domain",
+        "tags": [
+          "Domains"
+        ]
+      }
+    },
+    "/api/apps/{domain}/domains/{name}/dns": {
+      "get": {
+        "description": "Check whether a domain resolves to this server.\n\nMeant for before a domain is added, so the name does not have to be one\nof the application's yet.\n\nArgs:\n    domain: The application's primary domain.\n    name: The domain to resolve.\n    session: Authenticated session, injected.\n\nReturns:\n    What it resolves to, compared with this server's addresses.",
+        "operationId": "get_domain_dns_api_apps__domain__domains__name__dns_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "domain",
+            "required": true,
+            "schema": {
+              "title": "Domain",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DnsCheckResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Domain Dns",
+        "tags": [
+          "Domains"
         ]
       }
     },

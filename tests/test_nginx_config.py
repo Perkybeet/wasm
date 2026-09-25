@@ -271,3 +271,21 @@ class TestValidation:
         )
         errors = builder.validate(config)
         assert len(errors) == 0
+
+
+class TestDomains:
+    """An app with a wasm.nginx.yaml answers on its aliases and redirects like any other."""
+
+    def test_the_advanced_template_serves_aliases_and_redirects(self, builder, sample_config):
+        from wasm.managers.nginx_manager import NginxManager
+
+        context = builder.build_context(sample_config, "example.com", ssl=True)
+        context["server_names"] = "example.com shop.example.com"
+        context["redirect_domains"] = ["www.example.com"]
+
+        rendered = NginxManager().render_config("example.com", "advanced", context)
+
+        assert rendered.count("server_name example.com shop.example.com;") == 2
+        assert rendered.count("server_name www.example.com;") == 2
+        assert "return 301 https://example.com$request_uri;" in rendered
+        assert "upstream frontend {" in rendered

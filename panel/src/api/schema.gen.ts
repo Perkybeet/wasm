@@ -170,6 +170,111 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/apps/{domain}/domains": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Domains
+         * @description List the domains an application answers on.
+         *
+         *     Args:
+         *         domain: The application's primary domain.
+         *         session: Authenticated session, injected.
+         *
+         *     Returns:
+         *         Its domains, primary first.
+         */
+        get: operations["get_domains_api_apps__domain__domains_get"];
+        put?: never;
+        /**
+         * Post Domain
+         * @description Make an application answer on another domain.
+         *
+         *     The domain is recorded and the site re-rendered and reloaded before this
+         *     returns. When the site serves TLS, extending the certificate to the new
+         *     domain is queued as a job; follow ``certificate_job_id``.
+         *
+         *     Args:
+         *         domain: The application's primary domain.
+         *         data: The domain to add and its kind.
+         *         session: Authenticated session, injected.
+         *
+         *     Returns:
+         *         The application's domains afterwards.
+         */
+        post: operations["post_domain_api_apps__domain__domains_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/apps/{domain}/domains/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete Domain
+         * @description Stop an application answering on a domain.
+         *
+         *     The site is re-rendered and reloaded before this returns. The certificate
+         *     is left alone and nothing is revoked.
+         *
+         *     Args:
+         *         domain: The application's primary domain.
+         *         name: The alias or redirect to remove.
+         *         session: Authenticated and elevated session, injected.
+         *
+         *     Returns:
+         *         The application's domains afterwards.
+         */
+        delete: operations["delete_domain_api_apps__domain__domains__name__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/apps/{domain}/domains/{name}/dns": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Domain Dns
+         * @description Check whether a domain resolves to this server.
+         *
+         *     Meant for before a domain is added, so the name does not have to be one
+         *     of the application's yet.
+         *
+         *     Args:
+         *         domain: The application's primary domain.
+         *         name: The domain to resolve.
+         *         session: Authenticated session, injected.
+         *
+         *     Returns:
+         *         What it resolves to, compared with this server's addresses.
+         */
+        get: operations["get_domain_dns_api_apps__domain__domains__name__dns_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/apps/{domain}/env": {
         parameters: {
             query?: never;
@@ -4399,6 +4504,24 @@ export interface components {
             success: boolean;
         };
         /**
+         * AddAppDomainRequest
+         * @description A domain to add to an application.
+         *
+         *     Attributes:
+         *         domain: The bare domain name.
+         *         kind: ``alias`` or ``redirect``.
+         */
+        AddAppDomainRequest: {
+            /** Domain */
+            domain: string;
+            /**
+             * Kind
+             * @description alias or redirect
+             * @default alias
+             */
+            kind: string;
+        };
+        /**
          * ApiTokenCreated
          * @description A freshly issued API token. The only response that ever carries the token.
          *
@@ -4494,6 +4617,64 @@ export interface components {
             message: string;
             /** Success */
             success: boolean;
+        };
+        /**
+         * AppDomain
+         * @description One domain an application answers on.
+         *
+         *     Attributes:
+         *         domain: The domain.
+         *         kind: ``primary`` (the domain the application was deployed as),
+         *             ``alias`` (served the same) or ``redirect`` (sent permanently to
+         *             the primary).
+         *         created_at: When it was added, ISO 8601.
+         */
+        AppDomain: {
+            /** Created At */
+            created_at?: string | null;
+            /** Domain */
+            domain: string;
+            /** Kind */
+            kind: string;
+        };
+        /**
+         * AppDomainChange
+         * @description An application's domains after a change.
+         *
+         *     Attributes:
+         *         app: The application's primary domain.
+         *         domains: Its domains afterwards, primary first.
+         *         tls: Whether its site serves TLS.
+         *         adopted: Names the live site already answered on without a record,
+         *             kept as aliases so the change did not drop them.
+         *         certificate_job_id: The job extending the certificate to every
+         *             domain, when the site serves TLS and a domain was added.
+         */
+        AppDomainChange: {
+            /** Adopted */
+            adopted?: string[];
+            /** App */
+            app: string;
+            /** Certificate Job Id */
+            certificate_job_id?: string | null;
+            /** Domains */
+            domains: components["schemas"]["AppDomain"][];
+            /** Tls */
+            tls: boolean;
+        };
+        /**
+         * AppDomainList
+         * @description Every domain an application answers on.
+         *
+         *     Attributes:
+         *         app: The application's primary domain.
+         *         domains: Its domains, primary first, then aliases, then redirects.
+         */
+        AppDomainList: {
+            /** App */
+            app: string;
+            /** Domains */
+            domains: components["schemas"]["AppDomain"][];
         };
         /**
          * AppEnvResponse
@@ -5714,6 +5895,26 @@ export interface components {
             total_gb: number;
             /** Used Gb */
             used_gb: number;
+        };
+        /**
+         * DnsCheckResponse
+         * @description Whether a domain resolves to this server.
+         *
+         *     Attributes:
+         *         domain: The domain that was resolved.
+         *         expected_addresses: This server's addresses.
+         *         resolved_addresses: What the domain resolves to, A and AAAA.
+         *         points_here: Whether every address it resolves to is this server's.
+         */
+        DnsCheckResponse: {
+            /** Domain */
+            domain: string;
+            /** Expected Addresses */
+            expected_addresses: string[];
+            /** Points Here */
+            points_here: boolean;
+            /** Resolved Addresses */
+            resolved_addresses: string[];
         };
         /**
          * ElevateRequest
@@ -7951,6 +8152,136 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["DiagnoseResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_domains_api_apps__domain__domains_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AppDomainList"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    post_domain_api_apps__domain__domains_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AddAppDomainRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AppDomainChange"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_domain_api_apps__domain__domains__name__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                domain: string;
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AppDomainChange"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_domain_dns_api_apps__domain__domains__name__dns_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                domain: string;
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DnsCheckResponse"];
                 };
             };
             /** @description Validation Error */

@@ -1,0 +1,40 @@
+{#
+    One redirect per domain of kind "redirect": a permanent redirect to the
+    primary, over HTTPS when the site has a certificate (which covers these
+    names too). Included by every application template, before its own
+    server blocks; renders nothing when there are no redirects.
+#}
+{% for redirect in redirect_domains %}
+
+# {{ redirect }} redirects permanently to {{ domain }}
+server {
+    listen 80;
+    listen [::]:80;
+    server_name {{ redirect }};
+
+    # ACME challenge location for Let's Encrypt (webroot method)
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+        allow all;
+    }
+
+    location / {
+        return 301 {{ 'https' if ssl else 'http' }}://{{ domain }}$request_uri;
+    }
+}
+{% if ssl %}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name {{ redirect }};
+
+    ssl_certificate {{ ssl_certificate | default('/etc/letsencrypt/live/' + domain + '/fullchain.pem') }};
+    ssl_certificate_key {{ ssl_certificate_key | default('/etc/letsencrypt/live/' + domain + '/privkey.pem') }};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    return 301 https://{{ domain }}$request_uri;
+}
+{% endif %}
+{% endfor %}

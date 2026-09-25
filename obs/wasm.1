@@ -383,7 +383,7 @@ Git branch to deploy. Default: Sentinel.UNSET.
 Serve over plain HTTP, without a certificate.
 .TP
 .B \-\-www
-Also serve and certify the www subdomain.
+Also answer on www.<domain>, redirecting it to the domain (see 'wasm domain').
 .TP
 .B \-\-env\-file
 File of KEY=value lines to install as the application environment. Default: Sentinel.UNSET.
@@ -799,6 +799,43 @@ Explain why an application is down.
 .TP
 .B \-\-json
 Print the diagnosis as JSON.
+
+.SS wasm domain
+Serve an application on more domains: aliases and redirects.
+
+.SS wasm domain add
+Make APP answer on DOMAIN too.
+.TP
+.B Arguments
+.br
+\fIapp_domain\fR
+.br
+\fIdomain\fR
+.TP
+.B \-\-kind
+alias serves the application on DOMAIN; redirect sends DOMAIN to APP. Default: alias.
+.TP
+.B \-\-no\-cert
+Do not extend the certificate now. Run the same command again to extend it.
+
+.SS wasm domain list
+List the domains APP answers on.
+.TP
+.B Arguments
+.br
+\fIapp_domain\fR
+.TP
+.B \-\-json
+Print the domains as JSON.
+
+.SS wasm domain remove
+Stop APP answering on DOMAIN.
+.TP
+.B Arguments
+.br
+\fIapp_domain\fR
+.br
+\fIdomain\fR
 
 .SS wasm env
 Read and set the environment variables of a deployed application.

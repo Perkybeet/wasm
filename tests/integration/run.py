@@ -1145,6 +1145,109 @@ def scenario_limits(sc: Scenario) -> None:
     )
 
 
+def curl_host(sc: Scenario, host: str, path: str = "/", *, head: bool = False) -> str:
+    """Ask nginx on loopback for ``path`` as ``host``; return the body, or the headers."""
+    flags = "-sS -I" if head else "-sS"
+    return sc.run(
+        f"curl {flags} -H 'Host: {host}' 'http://127.0.0.1{path}'",
+        timeout=30,
+        check=False,
+        label=f"curl {flags} -H 'Host: {host}' http://127.0.0.1{path}",
+    ).stdout
+
+
+def check_alias_and_redirect(sc: Scenario, primary: str, alias: str, redirect: str) -> None:
+    """Give an app an alias and a redirect, and see nginx serve and redirect them."""
+    sc.run(
+        f"wasm domain add {primary} {alias} --kind alias",
+        timeout=60,
+        label=f"wasm domain add {primary} {alias} --kind alias",
+    )
+    sc.run(
+        f"wasm domain add {primary} {redirect} --kind redirect",
+        timeout=60,
+        label=f"wasm domain add {primary} {redirect} --kind redirect",
+    )
+    listed = sc.run(
+        f"wasm domain list {primary} --json",
+        timeout=30,
+        label=f"wasm domain list {primary} --json",
+    )
+    kinds = {item["domain"]: item["kind"] for item in json.loads(listed.stdout)["items"]}
+    sc.check(
+        kinds == {primary: "primary", alias: "alias", redirect: "redirect"},
+        f"wasm domain list says {kinds!r}",
+    )
+
+    served = curl_host(sc, primary).strip()
+    sc.check(served.startswith("ok "), f"{primary} is not serving: {served!r}")
+    through_alias = curl_host(sc, alias).strip()
+    sc.check(through_alias == served, f"{alias} served {through_alias!r}, not {served!r}")
+
+    headers = curl_host(sc, redirect, "/some/path?q=1", head=True)
+    status_line = headers.splitlines()[0] if headers else ""
+    location = re.search(r"^location:\s*(\S+)", headers, re.IGNORECASE | re.MULTILINE)
+    sc.check(" 301" in status_line, f"{redirect} answered {status_line!r}, not a 301")
+    sc.check(
+        location is not None and location.group(1) == f"http://{primary}/some/path?q=1",
+        f"{redirect} redirected to {location.group(1) if location else None!r}",
+    )
+    sc.run("nginx -t", timeout=15, label="nginx -t (after the domain changes)")
+
+
+@scenario("domains_alias_redirect_and_removal")
+def scenario_domains(sc: Scenario) -> None:
+    """An app answers on an alias and redirects another name; removing the alias stops it.
+
+    Once in place and once on releases: the site of a release app is written
+    against ``current``, and a domain change must render it that way too.
+    The primary cannot be removed, and a removal takes effect at once.
+    """
+    sc.run(
+        "wasm create -d dom.test -s /root/fixtures/node-app -t nodejs --no-ssl --layout inplace",
+        timeout=DEPLOY_TIMEOUT,
+        label="wasm create -d dom.test -s /root/fixtures/node-app -t nodejs --no-ssl "
+        "--layout inplace",
+    )
+    check_alias_and_redirect(sc, "dom.test", "alias.dom.test", "old-dom.test")
+
+    sc.run(
+        "wasm domain remove dom.test alias.dom.test",
+        timeout=60,
+        label="wasm domain remove dom.test alias.dom.test",
+    )
+    after = curl_host(sc, "alias.dom.test").strip()
+    sc.check(
+        not after.startswith("ok "),
+        f"alias.dom.test is still served by dom.test after its removal: {after!r}",
+    )
+    sc.check(
+        curl_host(sc, "dom.test").strip().startswith("ok "),
+        "dom.test stopped serving when its alias was removed",
+    )
+    config = sc.run(
+        "cat /etc/nginx/sites-available/dom.test",
+        timeout=15,
+        label="cat /etc/nginx/sites-available/dom.test (after the removal)",
+    )
+    sc.check("alias.dom.test" not in config.stdout, "the removed alias is still in the site")
+
+    refused = sc.run(
+        "wasm domain remove dom.test dom.test",
+        timeout=30,
+        check=False,
+        label="wasm domain remove dom.test dom.test (the primary)",
+    )
+    sc.check(refused.returncode == 1, "removing the primary domain was not refused")
+
+    sc.run(
+        f"wasm create -d reldom.test -s {RELEASE_URL} -t nodejs --no-ssl --layout releases",
+        timeout=DEPLOY_TIMEOUT,
+        label=f"wasm create -d reldom.test -s {RELEASE_URL} -t nodejs --no-ssl --layout releases",
+    )
+    check_alias_and_redirect(sc, "reldom.test", "alias.reldom.test", "old-reldom.test")
+
+
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------

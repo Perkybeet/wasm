@@ -139,6 +139,14 @@ class FakeStore:
         """Report that the application is unknown."""
         return None
 
+    def list_domains(self, app_domain: str) -> list[Any]:
+        """Report that no application owns the domain."""
+        return []
+
+    def domain_owner(self, domain: str) -> None:
+        """Report that no application owns the domain."""
+        return None
+
 
 @pytest.fixture
 def sandbox_nginx(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:

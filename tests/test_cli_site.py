@@ -61,6 +61,30 @@ GLOBAL_FLAGS = frozenset({"--verbose", "-v", "--dry-run", "--json", "--no-color"
 class FakeStore:
     """A store that accepts site records and forgets them."""
 
+    def list_domains(self, app_domain: str) -> list[Any]:
+        """
+        List the domains of an application.
+
+        Args:
+            app_domain: Domain name.
+
+        Returns:
+            Nothing: no application is deployed here.
+        """
+        return []
+
+    def domain_owner(self, domain: str) -> None:
+        """
+        Find the application a name belongs to.
+
+        Args:
+            domain: Domain name.
+
+        Returns:
+            None: no application is deployed here.
+        """
+        return None
+
     def get_site(self, domain: str) -> None:
         """
         Look up a site record.

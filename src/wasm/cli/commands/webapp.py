@@ -218,7 +218,8 @@ def _create_app(
         webserver: ``nginx`` or ``apache``.
         branch: Git branch to deploy.
         ssl: Request a certificate.
-        www: Also serve and certify the ``www.`` subdomain.
+        www: Also answer on ``www.<domain>``, recorded as a redirect to the
+            domain and covered by its certificate.
         env_file: File of KEY=value pairs for the application environment.
         package_manager: Node package manager, or ``auto``.
         subdomains: ``app:subdomain`` mappings, for a monorepo.
@@ -292,7 +293,7 @@ def _create_app(
     logger.key_value("Package Manager", package_manager)
     logger.key_value("SSL", "Yes" if ssl else "No")
     if ssl and www and should_include_www(domain):
-        logger.key_value("WWW", f"www.{domain} included")
+        logger.key_value("WWW", f"www.{domain} redirects to {domain}")
     logger.blank()
 
     if app_type == "monorepo":
@@ -1469,7 +1470,11 @@ def cli() -> None:
 )
 @click.option("-b", "--branch", help="Git branch to deploy.")
 @click.option("--no-ssl", is_flag=True, help="Serve over plain HTTP, without a certificate.")
-@click.option("--www", is_flag=True, help="Also serve and certify the www subdomain.")
+@click.option(
+    "--www",
+    is_flag=True,
+    help="Also answer on www.<domain>, redirecting it to the domain (see 'wasm domain').",
+)
 @click.option(
     "--env-file",
     type=click.Path(exists=True, dir_okay=False, readable=True, path_type=Path),

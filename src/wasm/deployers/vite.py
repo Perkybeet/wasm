@@ -154,14 +154,23 @@ class ViteDeployer(BaseDeployer):
         """Pre-installation hook."""
         # Call parent to detect package manager and prisma
         super().pre_install()
-        self.output_dir = self._detect_output_dir()
-        self.is_ssr = self._check_ssr_mode()
+        self._detect_build_mode()
 
         self.logger.debug(f"Package manager: {self.package_manager}")
         self.logger.debug(f"Output directory: {self.output_dir}")
         self.logger.debug(f"SSR mode: {self.is_ssr}")
 
         return True
+
+    def inspect_site(self) -> None:
+        """Read whether the build is served as files or proxied, and from where."""
+        super().inspect_site()
+        self._detect_build_mode()
+
+    def _detect_build_mode(self) -> None:
+        """Read the output directory and SSR mode from the Vite configuration."""
+        self.output_dir = self._detect_output_dir()
+        self.is_ssr = self._check_ssr_mode()
 
     def get_template_context(self) -> dict:
         """Get template context with Vite specifics."""

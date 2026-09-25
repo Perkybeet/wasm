@@ -1,0 +1,33 @@
+{#
+    One redirect per domain of kind "redirect": a permanent redirect to the
+    primary, over HTTPS when the site has a certificate (which covers these
+    names too). Included by every application template, before its own
+    virtual hosts; renders nothing when there are no redirects.
+#}
+{% for redirect in redirect_domains %}
+
+# {{ redirect }} redirects permanently to {{ domain }}
+<VirtualHost *:80>
+    ServerName {{ redirect }}
+    DocumentRoot /var/www/html
+
+    # Everything but the ACME challenge (webroot method) goes to the primary
+    RewriteEngine On
+    RewriteCond %{REQUEST_URI} !^/\.well-known/acme-challenge/
+    RewriteRule ^ {{ 'https' if ssl else 'http' }}://{{ domain }}%{REQUEST_URI} [L,R=301]
+</VirtualHost>
+{% if ssl %}
+
+<VirtualHost *:443>
+    ServerName {{ redirect }}
+
+    SSLEngine on
+    SSLCertificateFile {{ ssl_certificate | default('/etc/letsencrypt/live/' + domain + '/fullchain.pem') }}
+    SSLCertificateKeyFile {{ ssl_certificate_key | default('/etc/letsencrypt/live/' + domain + '/privkey.pem') }}
+    SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1
+
+    RewriteEngine On
+    RewriteRule ^ https://{{ domain }}%{REQUEST_URI} [L,R=301]
+</VirtualHost>
+{% endif %}
+{% endfor %}

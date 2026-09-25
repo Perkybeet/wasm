@@ -170,6 +170,15 @@ class DomainError(WASMError):
     pass
 
 
+class DomainConflictError(DomainError):
+    """
+    Raised when a domain already belongs to an application.
+
+    Its own class so the API can answer 409 instead of the 400 a malformed
+    domain gets: the request was well formed, the name is simply taken.
+    """
+
+
 class TemplateError(WASMError):
     """Raised when template rendering fails."""
 

@@ -156,6 +156,9 @@ class FakeCertManager:
         self.obtained.append(domain)
         return True
 
+    def cert_exists(self, domain: str) -> bool:
+        return domain in self.obtained
+
 
 def build_deployer(
     deployer_class: type,

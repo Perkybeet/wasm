@@ -78,6 +78,18 @@ class _Store:
         """
         return None
 
+    def list_domains(self, _domain: str) -> list[Any]:
+        """
+        List the domains of an application.
+
+        Args:
+            _domain: Domain name.
+
+        Returns:
+            Always empty: no test here has a deployed application.
+        """
+        return []
+
 
 @pytest.fixture
 def log(monkeypatch: pytest.MonkeyPatch) -> list[str]:

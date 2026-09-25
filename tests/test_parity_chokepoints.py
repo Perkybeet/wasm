@@ -278,6 +278,12 @@ class _FakeStore:
     def delete_site(self, domain: str) -> bool:
         return True
 
+    def list_domains(self, app_domain: str) -> list[Any]:
+        return []
+
+    def domain_owner(self, domain: str) -> None:
+        return None
+
 
 # ---------------------------------------------------------------------------
 # 3. Panel site create with ssl=true calls CertManager

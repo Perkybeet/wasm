@@ -452,6 +452,34 @@ class CertManager(BaseManager):
                 return list(cert.domains)
         return []
 
+    def _application_domains(self, primary: str) -> list[str]:
+        """
+        Read the other domains of the application a lineage belongs to.
+
+        Every order for an application's certificate covers every name it
+        answers on - aliases, and redirects too, since a redirect is served on
+        443 and a browser shown the wrong certificate never sees it. Reading
+        them where the list is built, not at each caller, is what keeps the
+        deploy step, ``wasm cert create``, the panel and a domain change from
+        each asking for a different set and expanding the lineage back and
+        forth.
+
+        Args:
+            primary: Lineage name, which is the application's primary domain.
+
+        Returns:
+            The application's other domains in the store's order, empty when
+            the name is not an application's. A store that cannot be read is
+            reported and treated as empty: the order still covers what the
+            caller asked for, which is what it did before domains had rows.
+        """
+        try:
+            records = self.store.list_domains(primary)
+        except (WASMError, sqlite3.Error) as exc:
+            self.logger.warning(f"Could not read the domains of {primary}: {exc}")
+            return []
+        return [record.domain for record in records if record.domain != primary]
+
     def _check_certbot_plugin(self, plugin: str) -> bool:
         """
         Check whether a certbot plugin is installed.
@@ -512,6 +540,9 @@ class CertManager(BaseManager):
         """
         Build the domain list a certificate should cover.
 
+        When the primary is an application's, every other domain it answers
+        on is part of the list too (see :meth:`_application_domains`).
+
         Args:
             domain: Primary domain, first in the result and the lineage name.
             additional_domains: Further domains to cover.
@@ -521,7 +552,8 @@ class CertManager(BaseManager):
                 and certbot would fail the whole order.
 
         Returns:
-            The validated domains, deduplicated, primary domain first.
+            The validated domains, deduplicated, primary domain first, then
+            ``www``, the additional domains and the application's own.
 
         Raises:
             CertificateError: When any domain is not a valid domain name.
@@ -532,7 +564,7 @@ class CertManager(BaseManager):
         if include_www and should_include_www(primary):
             ordered.append(f"www.{primary}")
 
-        for extra in additional_domains or []:
+        for extra in [*(additional_domains or []), *self._application_domains(primary)]:
             ordered.append(self._validated(extra))
 
         # Duplicates make certbot issue a certificate whose SAN list does not
