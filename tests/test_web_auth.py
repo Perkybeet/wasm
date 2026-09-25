@@ -571,7 +571,7 @@ def test_websocket_rejects_a_token_in_the_query_string(sandbox: Path) -> None:
     token = get_token_manager().generate_master_token()
 
     with pytest.raises(WebSocketDisconnect):
-        with client.websocket_connect(f"/ws/system?token={token}"):
+        with client.websocket_connect(f"/ws/events?token={token}"):
             pass
 
 
@@ -728,7 +728,7 @@ def test_no_route_escapes_authentication(sandbox: Path) -> None:
 
     inventory = iter_routes(app.routes) + iter_routes(app.router.routes)
     paths = {path for path, _ in inventory}
-    assert "/ws/system" in paths, "route discovery missed the websocket surface"
+    assert "/ws/events" in paths, "route discovery missed the websocket surface"
 
     reachable: list[str] = []
     for path, route in inventory:

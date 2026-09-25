@@ -3,40 +3,33 @@
 # https://github.com/Perkybeet/wasm/blob/main/LICENSE
 
 """
-The state of this one machine, as the panel's header shows it.
+The state of this one machine, as the legacy panel's header shows it.
 
-This is deliberately about a single box. WASM manages the server it runs on, so
-the header is an instrument reading rather than a fleet summary, and an
-operator with several servers open in several tabs can tell them apart at a
-glance.
+The JSON snapshot itself - hostname, load, memory, disk, unit and application
+tallies - is sampled exactly once, in :mod:`wasm.web.machine`. This module
+does not read psutil or systemd on its own; it reshapes that snapshot into the
+strings and buckets the Jinja fragment ``fragments/machine.html`` renders, for
+the server-rendered panel that has not been cut over to the console yet (see
+Task 2.1 of the v2 plan).
+
+One thing does not survive the reshape as a straight lookup: the fragment
+still shows a unit that systemd is restarting as "working", separately from
+"failed" and "running". The JSON schema folds that case into "stopped" - the
+console reads the ``job`` and ``app`` events for that, not a unit poll - so
+recovering it here costs one more ``systemctl list-units`` call, built from
+the same :func:`~wasm.web.machine.classify_unit` the JSON tally uses. That is
+the only extra reading this module does, and it goes away with the rest of
+this file once the legacy panel is deleted.
 """
 
 from __future__ import annotations
 
-import logging
-import os
 import platform
-import socket
-import time
-from collections import deque
 from dataclasses import dataclass
 
-from wasm.core.exceptions import WASMError
+from wasm.web.machine import classify_unit, fetch_service_states
+from wasm.web.machine import read_machine as _read_snapshot
 from wasm.web.views.rendering import duration, filesize
-
-try:
-    import psutil
-except ImportError:  # pragma: no cover - psutil is an optional extra
-    psutil = None  # type: ignore[assignment]
-
-log = logging.getLogger(__name__)
-
-#: How many load samples the sparkline draws. At one sample per refresh this is
-#: a couple of minutes of history, which is the window in which a spike is
-#: still worth reacting to.
-LOAD_HISTORY = 24
-
-_load_history: deque[float] = deque(maxlen=LOAD_HISTORY)
 
 
 @dataclass
@@ -118,95 +111,56 @@ def _sparkline(samples: list[float], width: int = 80, height: int = 18) -> str:
 
 def _count_units() -> tuple[int, int, int]:
     """
-    Tally the state of every systemd unit WASM manages.
+    Tally the state of every systemd unit WASM manages, "busy" included.
 
-    This reads :meth:`~wasm.managers.service_manager.ServiceManager.list_services`,
-    the same live systemd source the services screen and ``wasm service list``
-    already read, rather than the store's status column, which nothing writes
-    to after a deploy and which is exactly how ``wasm list`` and ``wasm health``
-    used to disagree. It is one ``systemctl list-units`` call scoped to units
-    WASM owns, never a probe per unit: the strip refreshes every five seconds,
-    and the per-application state resolver in :mod:`wasm.core.app_state`, at
-    three systemctl calls and a socket probe per application, is too costly to
-    run on that timer.
-
-    The active/failed/busy split mirrors the precedence
-    :func:`~wasm.core.app_state.resolve_state` uses for the same two systemd
-    fields, so the header never disagrees with the rest of the panel about
-    what "failed" or "working" means.
+    The JSON snapshot's own tally, on ``MachineState.units`` in
+    :mod:`wasm.web.machine`, folds a restarting unit into "stopped"; this
+    fragment still shows it separately, so it re-reads the live list through
+    :func:`~wasm.web.machine.fetch_service_states` and classifies it with
+    :func:`~wasm.web.machine.classify_unit` - the one place that decision is
+    made - rather than deciding it again here.
 
     Returns:
         Counts of active, failed and busy (restarting) units. A unit that is
         merely stopped counts as none of the three, the same as an idle
         resource elsewhere in the panel.
     """
-    from wasm.managers.service_manager import ServiceManager
-
-    try:
-        services = ServiceManager(verbose=False).list_services()
-    except WASMError as exc:
-        log.warning("Could not read service states for the machine strip: %s", exc)
-        return (0, 0, 0)
-
     active = failed = busy = 0
-    for service in services:
-        active_state = str(service.get("active", "")).strip()
-        sub_state = str(service.get("sub", "")).strip()
-
-        if active_state == "failed" or sub_state == "failed":
-            failed += 1
-        elif sub_state == "auto-restart" or active_state == "activating":
-            busy += 1
-        elif active_state == "active":
+    for service in fetch_service_states():
+        bucket = classify_unit(service)
+        if bucket == "active":
             active += 1
-
+        elif bucket == "failed":
+            failed += 1
+        elif bucket == "busy":
+            busy += 1
     return active, failed, busy
 
 
 def read_machine(apps_root: str = "/var/www/apps") -> MachineState:
     """
-    Read the current state of the host.
+    Read the current state of the host, for the legacy Jinja fragment.
 
     Args:
-        apps_root: Directory whose filesystem the disk meter reports on. The
-            applications live there, so that is the space that runs out first
-            and the space an operator cares about.
+        apps_root: Directory whose filesystem the disk meter reports on,
+            forwarded to :func:`wasm.web.machine.read_machine` untouched.
 
     Returns:
         A snapshot for the header.
     """
-    hostname = socket.gethostname()
-    os_name = f"{platform.system()} {platform.release()}"
-
-    try:
-        load = os.getloadavg()
-    except OSError:  # pragma: no cover - not available on every platform
-        load = (0.0, 0.0, 0.0)
-    _load_history.append(load[0])
-
-    if psutil is not None:
-        memory = psutil.virtual_memory()
-        memory_used, memory_total = memory.used, memory.total
-        target = apps_root if os.path.isdir(apps_root) else "/"
-        disk = psutil.disk_usage(target)
-        disk_used, disk_total = disk.used, disk.total
-        uptime_seconds = time.time() - psutil.boot_time()
-    else:
-        memory_used = memory_total = disk_used = disk_total = 0
-        uptime_seconds = 0.0
-
+    snapshot = _read_snapshot(apps_root)
     units_active, units_failed, units_busy = _count_units()
 
     return MachineState(
-        hostname=hostname,
-        os=os_name,
-        uptime=duration(uptime_seconds),
-        load=(load[0], load[1], load[2]),
-        load_history_points=_sparkline(list(_load_history)),
-        memory_used=memory_used,
-        memory_total=memory_total,
-        disk_used=disk_used,
-        disk_total=disk_total,
+        hostname=snapshot.hostname,
+        os=f"{platform.system()} {platform.release()}",
+        uptime=duration(snapshot.uptime_s),
+        load=(snapshot.load[0], snapshot.load[1], snapshot.load[2]),
+        load_history_points=_sparkline(snapshot.load_history),
+        memory_used=snapshot.memory.used,
+        memory_total=snapshot.memory.total,
+        disk_used=snapshot.disk.used,
+        disk_total=snapshot.disk.total,
         units_active=units_active,
         units_failed=units_failed,
         units_busy=units_busy,

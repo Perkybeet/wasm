@@ -26,13 +26,17 @@ What is defended here:
   reconnections, for days.
 - **The stream is multiplexed without breaking the jobs on it.** The named
   ``metrics`` and ``machine`` events ride the same connection the job events
-  use, in the wire format an EventSource and the htmx SSE extension parse,
-  and a failure to render the strip costs a frame, not the feed.
+  use, in the wire format an EventSource parses, and a failure to read the
+  machine snapshot costs a frame, not the feed.
+- **Every event on the stream is JSON**, ``machine`` included: there is one
+  implementation of the machine snapshot, :mod:`wasm.web.machine`, and both
+  the REST endpoint and this stream hand out exactly what it returns.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -51,13 +55,12 @@ from wasm.web.events import (
     _stream,
     events,
     format_event,
-    format_html_event,
     job_events,
     machine_frame,
     metrics_frame,
-    render_machine_strip,
 )
 from wasm.web.jobs import JobManager
+from wasm.web.machine import AppTally, DiskSnapshot, MachineState, MemorySnapshot, UnitTally
 from wasm.web.server import create_app, get_token_manager
 
 
@@ -440,18 +443,6 @@ class FakeCollector:
         return dict(self._snapshot)
 
 
-def test_markup_crosses_the_wire_as_one_event_with_a_data_line_per_line() -> None:
-    """
-    A raw newline ends an SSE data field early, and rendered templates are
-    full of them. The format's own answer is one ``data:`` field per line; the
-    browser joins consecutive fields with a newline, reproducing the markup.
-    """
-    frame = format_html_event("machine", "<header>\n  ok\n</header>")
-
-    assert frame == "event: machine\ndata: <header>\ndata:   ok\ndata: </header>\n\n"
-    assert frame.count("\n\n") == 1, "exactly one blank line, the one that ends the event"
-
-
 def test_the_stream_opens_with_the_collector_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -482,14 +473,31 @@ def test_without_a_collector_no_metrics_event_is_invented() -> None:
     assert metrics_frame() is None
 
 
-def test_the_stream_emits_the_machine_strip_as_a_named_event(
+#: A machine snapshot with recognisable, distinct values in every field, so a
+#: test can tell the JSON frame carried the real thing and not some other
+#: field's default.
+FAKE_MACHINE_STATE = MachineState(
+    hostname="box.example",
+    uptime_s=12345.0,
+    load=(0.1, 0.2, 0.3),
+    load_history=[0.1, 0.15, 0.2],
+    cpu_percent=42.5,
+    memory=MemorySnapshot(used=1024, total=4096, percent=25.0),
+    disk=DiskSnapshot(used=2048, total=8192, percent=25.0),
+    units=UnitTally(running=3, failed=1, stopped=2),
+    apps=AppTally(running=2, failed=1, stopped=0, static=1),
+)
+
+
+def test_the_stream_emits_the_machine_snapshot_as_a_named_json_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The strip rides the shared connection for the sse-swap to consume."""
+    """
+    The `machine` event rides the shared connection as JSON, for the console
+    to parse without an HTML fragment in the middle.
+    """
     monkeypatch.setattr(events_module, "MACHINE_INTERVAL_SECONDS", 0.0)
-    monkeypatch.setattr(
-        events_module, "render_machine_strip", lambda: '<header id="machine-strip">ok</header>'
-    )
+    monkeypatch.setattr(events_module, "read_machine", lambda: FAKE_MACHINE_STATE)
 
     async def exercise() -> str:
         """
@@ -504,7 +512,20 @@ def test_the_stream_emits_the_machine_strip_as_a_named_event(
 
     frame = asyncio.run(exercise())
 
-    assert frame == 'event: machine\ndata: <header id="machine-strip">ok</header>\n\n'
+    assert frame.startswith("event: machine\ndata: ")
+    assert frame.endswith("\n\n")
+    payload = json.loads(frame.removeprefix("event: machine\ndata: ").strip())
+    assert payload == {
+        "hostname": "box.example",
+        "uptime_s": 12345.0,
+        "load": [0.1, 0.2, 0.3],
+        "load_history": [0.1, 0.15, 0.2],
+        "cpu_percent": 42.5,
+        "memory": {"used": 1024, "total": 4096, "percent": 25.0},
+        "disk": {"used": 2048, "total": 8192, "percent": 25.0},
+        "units": {"running": 3, "failed": 1, "stopped": 2},
+        "apps": {"running": 2, "failed": 1, "stopped": 0, "static": 1},
+    }
 
 
 def test_job_events_still_flow_between_the_periodic_ones(
@@ -541,22 +562,22 @@ def test_job_events_still_flow_between_the_periodic_ones(
     assert 'event: state\ndata: {"id":"example.com","state":"active"}\n\n' in frames
 
 
-def test_a_strip_that_cannot_render_costs_a_frame_not_the_feed(
+def test_a_snapshot_that_cannot_be_read_costs_a_frame_not_the_feed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    The render reads systemd and psutil; a transient failure there must not
+    The read samples systemd and psutil; a transient failure there must not
     take down the connection carrying the job events.
     """
     from wasm.web.jobs import get_job_manager
 
-    def refuse() -> str:
+    def refuse() -> MachineState:
         raise WASMError("systemd is restarting")
 
     monkeypatch.setattr(events_module, "MACHINE_INTERVAL_SECONDS", 0.01)
-    monkeypatch.setattr(events_module, "render_machine_strip", refuse)
+    monkeypatch.setattr(events_module, "read_machine", refuse)
 
-    assert machine_frame() is None, "a failed render must yield nothing, not raise"
+    assert machine_frame() is None, "a failed read must yield nothing, not raise"
 
     async def exercise() -> list[str]:
         """
@@ -580,17 +601,28 @@ def test_a_strip_that_cannot_render_costs_a_frame_not_the_feed(
     assert not any(frame.startswith("event: machine") for frame in frames)
 
 
-def test_the_pushed_strip_is_the_same_fragment_the_shell_includes(runner: Any) -> None:
+def test_the_pushed_snapshot_is_the_one_true_implementation(runner: Any) -> None:
     """
-    One implementation: the ``machine`` event carries the very fragment the
-    shell renders and swaps, sse-swap attribute included, so the pushed strip
-    and the served one can never disagree.
+    One implementation: the ``machine`` event is exactly
+    :func:`wasm.web.machine.read_machine`'s answer, JSON-encoded, so the
+    pushed snapshot and ``GET /api/system/machine`` can never disagree.
 
     Args:
         runner: The fake command runner, so the unit tally reaches no process.
     """
-    html = render_machine_strip()
+    frame = machine_frame()
 
-    assert 'id="machine-strip"' in html
-    assert 'sse-swap="machine"' in html
-    assert 'hx-get="/fragments/machine"' not in html, "the strip must not also poll"
+    assert frame is not None
+    assert frame.startswith("event: machine\ndata: ")
+    payload = json.loads(frame.removeprefix("event: machine\ndata: ").strip())
+    assert set(payload) == {
+        "hostname",
+        "uptime_s",
+        "load",
+        "load_history",
+        "cpu_percent",
+        "memory",
+        "disk",
+        "units",
+        "apps",
+    }

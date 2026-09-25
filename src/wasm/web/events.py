@@ -32,13 +32,15 @@ that emits events nothing produces would be worse than no stream, because it
 would look like the feature works.
 
 The stream is multiplexed - one connection per tab, several named events -
-because that is the shape both ends want. htmx's SSE extension subscribes any
-number of ``sse-swap`` elements to one ``sse-connect`` ancestor, and a browser
-caps concurrent connections per origin low enough that a stream per concern
-would starve the panel of request slots. Alongside the job events, ``metrics``
-carries the collector's newest snapshot every couple of seconds and ``machine``
-carries the rendered machine strip, which used to be polled with an ``hx-get``
-timer at exactly the cost of this push plus an HTTP request each time.
+because that is the shape both ends want. A browser caps concurrent
+connections per origin low enough that a stream per concern would starve the
+panel of request slots. Alongside the job events, ``metrics`` carries the
+collector's newest snapshot every couple of seconds and ``machine`` carries
+the machine snapshot from :mod:`wasm.web.machine` as JSON, every event on this
+stream now being JSON: the strip used to be rendered HTML, polled with an
+``hx-get`` timer and then pushed as a second, server-rendered implementation
+of the same fragment; the console draws its own strip from the same numbers
+the ``GET /api/system/machine`` endpoint returns.
 """
 
 from __future__ import annotations
@@ -47,15 +49,16 @@ import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
+from dataclasses import asdict
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
-from jinja2 import TemplateError
 from starlette.concurrency import run_in_threadpool
 
 from wasm.core.exceptions import WASMError
 from wasm.web import metrics_collector
+from wasm.web.machine import read_machine
 from wasm.web.views.router import require_page_session
 
 log = logging.getLogger(__name__)
@@ -109,69 +112,30 @@ def format_event(name: str, payload: dict[str, Any]) -> str:
     return f"event: {name}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n"
 
 
-def format_html_event(name: str, html: str) -> str:
-    """
-    Render one server-sent event whose body is markup rather than JSON.
-
-    A raw newline would end the data field early, and rendered templates are
-    full of them. The SSE format's own answer is used instead of mangling the
-    markup: each line becomes its own ``data:`` field, and the browser joins
-    consecutive fields with a newline, reproducing the text exactly.
-
-    Args:
-        name: Event name the client listens for.
-        html: The rendered markup, newlines and all.
-
-    Returns:
-        The wire format, terminated by the blank line that ends an event.
-    """
-    lines = html.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    data = "".join(f"data: {line}\n" for line in lines)
-    return f"event: {name}\n{data}\n"
-
-
-def render_machine_strip() -> str:
-    """
-    Render the machine strip fragment for the ``machine`` event.
-
-    The same template the shell includes and ``/fragments/machine`` serves, so
-    the pushed strip can never disagree with the rendered one. Only the
-    machine state goes into the context: the fragment reads nothing else, and
-    the full shared context would price every push at a store read for counts
-    the strip does not show.
-
-    Returns:
-        The rendered fragment.
-    """
-    from wasm.web.views.context import machine_state
-    from wasm.web.views.rendering import templates
-
-    return templates.get_template("fragments/machine.html").render(machine=machine_state())
-
-
-#: What rendering the strip can fail with in operation: the managers' own
-#: errors, the OS reads underneath psutil, and the template machinery. Named
-#: rather than Exception so a bug in the fragment stays loud instead of
-#: becoming a strip that silently stops updating.
-RENDER_ERRORS: tuple[type[Exception], ...] = (WASMError, OSError, TemplateError)
+#: What reading the snapshot can fail with in operation: the managers' own
+#: errors and the OS reads underneath psutil. Named rather than Exception so a
+#: bug in the snapshot stays loud instead of becoming a strip that silently
+#: stops updating.
+RENDER_ERRORS: tuple[type[Exception], ...] = (WASMError, OSError)
 
 
 def machine_frame() -> str | None:
     """
     Build the periodic ``machine`` event, or nothing.
 
-    This is an error boundary: the render reads systemd and psutil, and a
+    This is an error boundary: the read samples systemd and psutil, and a
     transient failure there must cost one frame, not the whole stream with the
     job events on it.
 
     Returns:
-        The wire frame, or None when the strip could not be rendered.
+        The wire frame, or None when the snapshot could not be read.
     """
     try:
-        return format_html_event("machine", render_machine_strip())
+        state = read_machine()
     except RENDER_ERRORS:
-        log.exception("the machine strip could not be rendered for the stream")
+        log.exception("the machine snapshot could not be read for the stream")
         return None
+    return format_event("machine", asdict(state))
 
 
 def metrics_frame() -> str | None:

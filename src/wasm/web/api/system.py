@@ -18,6 +18,7 @@ for the duration.
 from __future__ import annotations
 
 import os
+from dataclasses import asdict
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query
@@ -27,6 +28,7 @@ from wasm import __version__
 from wasm.core.exceptions import DependencyError
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import WASMErrorRoute
+from wasm.web.machine import read_machine
 
 router = APIRouter(route_class=WASMErrorRoute)
 
@@ -138,6 +140,59 @@ class UpdateInfo(BaseModel):
     has_update: bool
     update_command: str | None = None
     release_url: str | None = None
+
+
+class MachineMemory(BaseModel):
+    """Memory usage, in bytes."""
+
+    used: int
+    total: int
+    percent: float
+
+
+class MachineDisk(BaseModel):
+    """Usage of the filesystem holding the applications, in bytes."""
+
+    used: int
+    total: int
+    percent: float
+
+
+class MachineUnits(BaseModel):
+    """How many WASM-managed systemd units are in each state."""
+
+    running: int
+    failed: int
+    stopped: int
+
+
+class MachineApps(BaseModel):
+    """How many deployed applications are in each state."""
+
+    running: int
+    failed: int
+    stopped: int
+    static: int
+
+
+class MachineOut(BaseModel):
+    """
+    The machine snapshot the console's topbar reads, and the ``machine`` SSE
+    event carries every five seconds. One implementation,
+    :func:`wasm.web.machine.read_machine`, composes it; this only describes
+    its shape for the OpenAPI contract, so a REST poll and the stream can
+    never disagree about what a field means.
+    """
+
+    hostname: str
+    uptime_s: float
+    load: tuple[float, float, float]
+    load_history: list[float]
+    cpu_percent: float
+    memory: MachineMemory
+    disk: MachineDisk
+    units: MachineUnits
+    apps: MachineApps
 
 
 def _psutil() -> Any:
@@ -276,6 +331,24 @@ def _disk_info() -> list[DiskInfo]:
             )
         )
     return disks
+
+
+@router.get("/machine", response_model=MachineOut)
+def get_machine(session: Annotated[dict, Depends(get_current_session)]) -> MachineOut:
+    """
+    Snapshot the host for the console's topbar.
+
+    The same read the ``machine`` SSE event pushes every five seconds, so a
+    freshly opened console has numbers before the first push, and a client
+    that only ever polls this endpoint never disagrees with one that streams.
+
+    Args:
+        session: The authenticated session.
+
+    Returns:
+        The machine snapshot.
+    """
+    return MachineOut(**asdict(read_machine()))
 
 
 @router.get("", response_model=SystemInfo)

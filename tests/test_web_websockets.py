@@ -65,7 +65,7 @@ def test_websocket_from_a_non_whitelisted_ip_is_rejected(sandbox: Path) -> None:
     client = build_client(sandbox, client_host="10.0.0.9", ip_whitelist=["10.0.0.5"])
     token = get_token_manager().generate_master_token()
 
-    code = connect_code(client, "/ws/system", subprotocols=token_subprotocols(token))
+    code = connect_code(client, "/ws/events", subprotocols=token_subprotocols(token))
 
     assert code == WS_CLOSE_FORBIDDEN, "a valid credential must not defeat the IP whitelist"
 
@@ -75,7 +75,7 @@ def test_websocket_from_a_whitelisted_ip_is_served(sandbox: Path) -> None:
     client = build_client(sandbox, client_host="10.0.0.5", ip_whitelist=["10.0.0.0/24"])
     token = get_token_manager().generate_master_token()
 
-    with client.websocket_connect("/ws/system", subprotocols=token_subprotocols(token)) as ws:
+    with client.websocket_connect("/ws/events", subprotocols=token_subprotocols(token)) as ws:
         assert ws.receive_json()["type"] == "connected"
 
 
@@ -84,7 +84,7 @@ def test_websocket_master_token_guesses_trigger_the_lockout(sandbox: Path) -> No
     client = build_client(sandbox, max_failed_attempts=3, lockout_duration=60)
 
     codes = [
-        connect_code(client, "/ws/system", subprotocols=token_subprotocols(f"wasm_guess{index}"))
+        connect_code(client, "/ws/events", subprotocols=token_subprotocols(f"wasm_guess{index}"))
         for index in range(6)
     ]
 
@@ -98,7 +98,7 @@ def test_websocket_failures_count_towards_the_http_lockout(sandbox: Path) -> Non
     client = build_client(sandbox, max_failed_attempts=3, lockout_duration=60)
 
     for index in range(3):
-        connect_code(client, "/ws/system", subprotocols=token_subprotocols(f"wasm_guess{index}"))
+        connect_code(client, "/ws/events", subprotocols=token_subprotocols(f"wasm_guess{index}"))
 
     response = client.post("/api/auth/login", json={"token": "wasm_guess"})
     assert response.status_code == 429, response.text
@@ -113,7 +113,7 @@ def test_websocket_handshakes_are_rate_limited(sandbox: Path) -> None:
         max_failed_attempts=1000,
     )
 
-    codes = [connect_code(client, "/ws/system") for _ in range(8)]
+    codes = [connect_code(client, "/ws/events") for _ in range(8)]
 
     assert codes[-1] == WS_CLOSE_RATE_LIMITED, codes
 
@@ -125,7 +125,7 @@ def test_cross_site_origin_is_rejected(sandbox: Path) -> None:
 
     code = connect_code(
         client,
-        "/ws/system",
+        "/ws/events",
         subprotocols=token_subprotocols(token),
         headers={"Origin": "https://evil.testserver"},
     )
@@ -139,7 +139,7 @@ def test_same_origin_handshake_is_accepted(sandbox: Path) -> None:
     token = get_token_manager().generate_master_token()
 
     with client.websocket_connect(
-        "/ws/system",
+        "/ws/events",
         subprotocols=token_subprotocols(token),
         headers={"Origin": "http://testserver"},
     ) as ws:
@@ -158,7 +158,7 @@ def test_unauthenticated_handshake_is_refused_on_every_websocket_route(sandbox: 
         for path, route in iter_routes(app.routes)
         if route.__class__.__name__.endswith("WebSocketRoute")
     ]
-    assert len(websocket_paths) >= 5, f"route discovery is broken: {websocket_paths}"
+    assert len(websocket_paths) >= 4, f"route discovery is broken: {websocket_paths}"
 
     served = []
     for path in websocket_paths:
@@ -179,7 +179,7 @@ def test_rejected_handshakes_cannot_fill_the_disk(sandbox: Path) -> None:
             action="ws.connect",
             result="denied",
             client_ip=f"10.0.0.{index % 256}",
-            resource="/ws/system",
+            resource="/ws/events",
             detail="no valid credential",
         )
 
@@ -204,13 +204,13 @@ def test_forwarded_header_from_a_trusted_proxy_reaches_the_websocket(sandbox: Pa
 
     allowed = connect_code(
         client,
-        "/ws/system",
+        "/ws/events",
         subprotocols=token_subprotocols(token),
         headers={"X-Forwarded-For": "203.0.113.7"},
     )
     denied = connect_code(
         client,
-        "/ws/system",
+        "/ws/events",
         subprotocols=token_subprotocols(token),
         headers={"X-Forwarded-For": "203.0.113.8"},
     )
@@ -229,7 +229,7 @@ def test_websocket_requires_https_when_configured(sandbox: Path, tmp_path: Path)
     client = build_client(sandbox, require_https=True, ssl_certfile=str(cert), ssl_keyfile=str(key))
     token = get_token_manager().generate_master_token()
 
-    code = connect_code(client, "/ws/system", subprotocols=token_subprotocols(token))
+    code = connect_code(client, "/ws/events", subprotocols=token_subprotocols(token))
 
     assert code == WS_CLOSE_FORBIDDEN
 
@@ -257,13 +257,13 @@ def test_ticket_authenticates_exactly_one_handshake(sandbox: Path) -> None:
     ).json()["ticket"]
 
     client.cookies.clear()
-    with client.websocket_connect(f"/ws/system?ticket={ticket}") as ws:
+    with client.websocket_connect(f"/ws/events?ticket={ticket}") as ws:
         assert ws.receive_json()["type"] == "connected"
 
-    assert connect_code(client, f"/ws/system?ticket={ticket}") == WS_CLOSE_UNAUTHORIZED
+    assert connect_code(client, f"/ws/events?ticket={ticket}") == WS_CLOSE_UNAUTHORIZED
 
 
-@pytest.mark.parametrize("path", ["/ws/system", "/ws/events", "/ws/jobs"])
+@pytest.mark.parametrize("path", ["/ws/events", "/ws/jobs"])
 def test_master_token_subprotocol_is_accepted(sandbox: Path, path: str) -> None:
     """Automation without a cookie jar authenticates with the subprotocol."""
     client = build_client(sandbox)

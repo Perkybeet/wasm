@@ -54,7 +54,6 @@ LOG_STREAM_MAX_SECONDS = 12 * 3600
 
 # Active WebSocket connections
 _log_connections: dict[str, set[WebSocket]] = {}
-_system_connections: set[WebSocket] = set()
 
 #: How long a journal follow is given to exit after being asked politely.
 TERMINATE_GRACE_SECONDS = 2.0
@@ -322,101 +321,6 @@ async def websocket_logs(
             pass  # WebSocket already closed
 
 
-@router.websocket("/system")
-async def websocket_system(
-    websocket: WebSocket,
-    ticket: str | None = Query(default=None),
-    interval: float = Query(default=2.0, ge=0.5, le=30.0),
-):
-    """
-    Stream system metrics in real-time.
-
-    Args:
-        websocket: The client connection.
-        ticket: Optional single-use handshake ticket.
-        interval: Seconds between metric samples.
-    """
-    session = await authenticate_websocket(websocket, ticket)
-    if session is None:
-        await _reject(websocket, "/ws/system")
-        return
-
-    await _accept(websocket, session, "/ws/system")
-    _system_connections.add(websocket)
-
-    try:
-        import psutil
-    except ImportError:
-        await websocket.send_json({"type": "error", "message": "psutil not installed"})
-        await websocket.close()
-        return
-
-    try:
-        await websocket.send_json({"type": "connected", "interval": interval})
-
-        while True:
-            # Gather system metrics
-            cpu_percent = psutil.cpu_percent(interval=0.1)
-            mem = psutil.virtual_memory()
-
-            # Get disk for root
-            try:
-                disk = psutil.disk_usage("/")
-                disk_percent = disk.percent
-            except Exception:
-                disk_percent = 0
-
-            # Get load average
-            load = list(psutil.getloadavg())
-
-            # Network I/O
-            net_io = psutil.net_io_counters()
-
-            metrics = {
-                "type": "metrics",
-                "timestamp": asyncio.get_event_loop().time(),
-                "cpu": {"percent": cpu_percent, "cores": psutil.cpu_count()},
-                "memory": {
-                    "percent": mem.percent,
-                    "used_gb": round(mem.used / (1024**3), 2),
-                    "total_gb": round(mem.total / (1024**3), 2),
-                },
-                "disk": {"percent": disk_percent},
-                "load": {"1min": load[0], "5min": load[1], "15min": load[2]},
-                "network": {"bytes_sent": net_io.bytes_sent, "bytes_recv": net_io.bytes_recv},
-            }
-
-            await websocket.send_json(metrics)
-
-            # Wait for next interval or message
-            try:
-                msg = await asyncio.wait_for(websocket.receive_text(), timeout=interval)
-                data = json.loads(msg)
-
-                if data.get("type") == "ping":
-                    await websocket.send_json({"type": "pong"})
-                elif data.get("type") == "close":
-                    break
-
-            except asyncio.TimeoutError:
-                # Normal - continue to next iteration
-                pass
-
-    except WebSocketDisconnect:
-        pass
-    except Exception as e:
-        try:
-            await websocket.send_json({"type": "error", "message": str(e)})
-        except Exception:
-            pass
-    finally:
-        _system_connections.discard(websocket)
-        try:
-            await websocket.close()
-        except Exception:
-            pass
-
-
 @router.websocket("/events")
 async def websocket_events(websocket: WebSocket, ticket: str | None = Query(default=None)):
     """
@@ -519,8 +423,6 @@ async def websocket_events(websocket: WebSocket, ticket: str | None = Query(defa
             pass
     finally:
         await _terminate(process)
-
-        _system_connections.discard(websocket)
 
         try:
             await websocket.close()
