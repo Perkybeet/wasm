@@ -32,7 +32,7 @@ from wasm.core.store import App, ReleaseStatus, WASMStore
 from wasm.deployers import base as base_module
 from wasm.deployers import lifecycle
 from wasm.deployers.auto import AutoDeployer
-from wasm.deployers.base import _collapse_attempts
+from wasm.deployers.helpers.health_gate import collapse_attempts as _collapse_attempts
 from wasm.deployers.helpers.layout import (
     CONFIGURED,
     INPLACE,

@@ -36,6 +36,9 @@ SyslogIdentifier={{ esc.line(name) }}
 
 # Resource limits
 LimitNOFILE=65535
+{% for directive in resource_limits | default([]) %}
+{{ esc.line(directive) }}
+{% endfor %}
 
 [Install]
 WantedBy=multi-user.target

@@ -72,6 +72,7 @@ from wasm.core.config import Config
 from wasm.core.exceptions import (
     BackupError,
     DatabaseError,
+    DeploymentError,
     SecurityError,
     ServiceError,
     ValidationError,
@@ -88,8 +89,16 @@ from wasm.core.logger import Logger
 from wasm.core.runner import DEFAULT_TIMEOUT, CommandResult, CommandRunner, get_runner
 from wasm.core.store import DeploymentTrigger, get_store
 from wasm.core.utils import domain_to_app_name
+from wasm.deployers.helpers.layout import RELEASES, env_file_in, layout_on_disk
 from wasm.deployers.helpers.permissions import hand_over_tree
 from wasm.deployers.recorder import CapturingLogger, DeploymentRecorder
+from wasm.deployers.releases import (
+    CURRENT_LINK,
+    RELEASES_DIR,
+    REPO_CACHE_DIR,
+    SHARED_DIR,
+    ReleaseManager,
+)
 from wasm.managers.service_manager import ServiceManager
 from wasm.managers.source_manager import SourceError, extract_archive
 from wasm.validators.names import resolve_within, validate_app_name, validate_filename
@@ -499,6 +508,66 @@ class BackupManager:
 
         return git_commit, git_branch
 
+    @staticmethod
+    def _code_path(app_path: Path) -> Path:
+        """
+        Return where the application's code is inside its directory.
+
+        Args:
+            app_path: Application directory.
+
+        Returns:
+            ``current`` on the release layout, the directory itself in place.
+        """
+        return app_path / CURRENT_LINK if layout_on_disk(app_path) == RELEASES else app_path
+
+    def _tree_git_info(self, app_path: Path) -> tuple[str | None, str | None]:
+        """
+        Read the commit and branch the application directory serves.
+
+        Args:
+            app_path: Application directory.
+
+        Returns:
+            The short commit and the branch, either of which may be None. On
+            the release layout the commit is the active release's (a release
+            has no ``.git``) and the branch the repository cache follows.
+        """
+        if layout_on_disk(app_path) != RELEASES:
+            return self._get_git_info(app_path)
+        active = ReleaseManager(app_path).current()
+        _, branch = self._get_git_info(app_path / REPO_CACHE_DIR)
+        return (active.commit if active is not None else None), branch
+
+    @staticmethod
+    def _layout_excludes(app_path: Path) -> list[str]:
+        """
+        Return what the layout keeps out of an archive.
+
+        On the release layout an archive carries ``current``, the active
+        release and ``shared/`` - the code that serves, and the data and
+        secrets every release shares. The repository cache is a clone of the
+        remote (and its ``.git`` is excluded anyway), and the other releases
+        would come back without the dependencies an archive never carries, as
+        releases a rollback could activate and that could never start.
+
+        Args:
+            app_path: Application directory.
+
+        Returns:
+            Anchored exclusion patterns; none in place.
+        """
+        if layout_on_disk(app_path) != RELEASES:
+            return []
+        releases = ReleaseManager(app_path)
+        active = releases.current()
+        excludes = [f"/{REPO_CACHE_DIR}"]
+        if active is not None:
+            excludes += [
+                f"/{RELEASES_DIR}/{release.id}" for release in releases.list() if not release.active
+            ]
+        return excludes
+
     def _detect_app_type(self, app_path: Path) -> str:
         """
         Detect the application type from the files in the tree.
@@ -558,6 +627,10 @@ class BackupManager:
         """
         Decide whether an archive member matches an exclusion pattern.
 
+        A pattern that starts with ``/`` names one path from the application
+        root, and everything below it: ``/repo`` is the repository cache, not
+        every directory called ``repo`` in the tree.
+
         Args:
             relative: Member path relative to the application root.
             patterns: Patterns from :meth:`_build_exclude_list`.
@@ -567,7 +640,11 @@ class BackupManager:
         """
         text = relative.as_posix()
         for pattern in patterns:
-            if "/" in pattern:
+            if pattern.startswith("/"):
+                anchored = pattern.lstrip("/")
+                if text == anchored or text.startswith(f"{anchored}/"):
+                    return True
+            elif "/" in pattern:
                 if (
                     text == pattern
                     or text.startswith(f"{pattern}/")
@@ -739,13 +816,15 @@ class BackupManager:
             if not result.success:
                 self.logger.warning(f"Pre-backup hook failed: {result.stderr}")
 
-        git_commit, git_branch = self._get_git_info(app_path)
-        app_type = self._detect_app_type(app_path)
+        git_commit, git_branch = self._tree_git_info(app_path)
+        app_type = self._detect_app_type(self._code_path(app_path))
         excludes = self._build_exclude_list(
             include_node_modules=include_node_modules,
             include_build=include_build,
+            custom_excludes=self._layout_excludes(app_path),
         )
         if not include_env:
+            # By name, anywhere: shared/.env on the release layout too.
             excludes.extend([".env", ".env.*"])
 
         with tempfile.TemporaryDirectory(prefix="wasm-backup-") as staging:
@@ -907,7 +986,7 @@ class BackupManager:
             app_name=app_name,
             created_at=datetime.now().isoformat(),
             size_bytes=0,
-            app_type=self._detect_app_type(app_path),
+            app_type=self._detect_app_type(self._code_path(app_path)),
             version=self.BACKUP_VERSION,
             description=description,
             includes_env=include_env,
@@ -1192,18 +1271,24 @@ class BackupManager:
                     self.logger.warning(f"Pre-restore hook failed: {result.stderr}")
 
             env_backup: str | None = None
-            env_file = app_path / ".env"
-            if not restore_env and env_file.is_file():
+            deployed_env = env_file_in(app_path, layout_on_disk(app_path))
+            if not restore_env and deployed_env.is_file():
                 try:
-                    env_backup = env_file.read_text()
+                    env_backup = deployed_env.read_text()
                 except OSError as exc:
                     self.logger.warning(f"Could not read the current .env: {exc}")
 
             self._swap_in_tree(app_root, app_path, tmp_path)
 
+            # Where the .env goes depends on the tree that came back, which
+            # need not be on the layout of the one it replaced.
+            layout = layout_on_disk(app_path)
+            env_file = env_file_in(app_path, layout)
             if env_backup is not None:
                 self.logger.debug("Restoring the previously deployed .env file")
                 self.fs.write_text(env_file, env_backup, mode=SECRET_MODE)
+            if layout == RELEASES:
+                self._relink_active_release(app_path)
 
             # The tree was just rebuilt as root; the unit runs as the
             # configured service account. This used to chown it to
@@ -1211,22 +1296,24 @@ class BackupManager:
             # restored app unwritable by its own service whenever the
             # operator's service_group differed from service_user, silently -
             # the chown's exit code was never checked.
-            hand_over_tree(
-                app_path,
-                user=self.config.service_user,
-                group=self.config.service_group,
-                runner=self.runner,
-                fs=self.fs,
-                logger=self.logger,
-                env_files=(env_file,),
-            )
+            for tree in self._service_trees(app_path, layout):
+                hand_over_tree(
+                    tree,
+                    user=self.config.service_user,
+                    group=self.config.service_group,
+                    runner=self.runner,
+                    fs=self.fs,
+                    logger=self.logger,
+                    env_files=(env_file,),
+                )
+            self._warn_about_a_layout_mismatch(domain, layout)
 
             # Putting only the files back was silent data loss for every
             # application whose state lives in a database or a volume.
             self._restore_databases(manifest, extracted, fallback)
             self._restore_docker_volumes(manifest, extracted, fallback)
 
-            self._warn_about_missing_environment(app_path)
+            self._warn_about_missing_environment(self._code_path(app_path))
 
         if post_restore_hook:
             self.logger.debug(f"Running post-restore hook: {post_restore_hook}")
@@ -1287,6 +1374,76 @@ class BackupManager:
             self.logger.info(f"Would restore Docker volume {entry.get('volume')}")
 
         return True
+
+    def _relink_active_release(self, app_path: Path) -> None:
+        """
+        Link the restored active release to ``shared/`` again.
+
+        An archive taken without the ``.env`` left out the release's link to
+        it along with the file; the ``.env`` kept from the deployment is back
+        in ``shared/`` and the release must see it again.
+
+        Args:
+            app_path: Application directory, on the release layout.
+        """
+        releases = ReleaseManager(app_path, fs=self.fs, logger=self.logger)
+        active = releases.current()
+        if active is None:
+            self.logger.warning(
+                f"{app_path / CURRENT_LINK} does not point at a release; "
+                "run 'wasm releases list <domain>' and activate one"
+            )
+            return
+        try:
+            releases.link_shared(active.path, [])
+        except DeploymentError as exc:
+            self.logger.warning(f"Could not link release {active.id} to shared/: {exc}")
+
+    @staticmethod
+    def _service_trees(app_path: Path, layout: str) -> list[Path]:
+        """
+        Return what the service account must own after a restore.
+
+        Args:
+            app_path: Application directory.
+            layout: The layout of the restored tree.
+
+        Returns:
+            The directory itself in place. On releases the active release and
+            ``shared/``, exactly what a deploy hands over: the directory
+            itself stays root's, or the service could re-point ``current``.
+        """
+        if layout != RELEASES:
+            return [app_path]
+        active = ReleaseManager(app_path).current()
+        trees = [active.path] if active is not None else []
+        shared = app_path / SHARED_DIR
+        return trees + ([shared] if shared.is_dir() else [])
+
+    def _warn_about_a_layout_mismatch(self, domain: str, layout: str) -> None:
+        """
+        Say so when the restored tree is not on the layout the store records.
+
+        Restoring a backup taken before ``wasm app migrate`` puts an in-place
+        tree under a unit that runs ``current``, and the reverse; neither can
+        start, and nothing else would say why.
+
+        Args:
+            domain: The application's domain.
+            layout: The layout of the restored tree.
+        """
+        try:
+            app = get_store().get_app(domain)
+        except (WASMError, sqlite3.Error) as exc:
+            self.logger.debug(f"Could not read the application's layout: {exc}")
+            return
+        recorded = getattr(app, "layout", None) if app is not None else None
+        if recorded is not None and recorded != layout:
+            self.logger.warning(
+                f"The restored tree is on the {layout} layout but {domain} is recorded "
+                f"on the {recorded} layout: its unit and site point at the wrong place. "
+                f"Restore a backup taken on the {recorded} layout, or redeploy {domain}."
+            )
 
     def _read_manifest_in_place(self, archive: Path) -> dict[str, Any] | None:
         """
@@ -2488,9 +2645,17 @@ class RollbackManager:
 
             app_name = domain_to_app_name(domain)
 
-            if rebuild:
-                app_path = self.config.apps_directory / app_name
-
+            app_path = self.config.apps_directory / app_name
+            if rebuild and layout_on_disk(app_path) == RELEASES:
+                # A rebuild in place would install and build in the
+                # application directory, which on releases is not where the
+                # code is. A release is built by an update, behind the health
+                # gate, and going back to one is `wasm releases rollback`.
+                self.logger.warning(
+                    "The restored application is on the release layout and was not rebuilt. "
+                    f"Run 'wasm update {domain}' to build a release from it."
+                )
+            elif rebuild:
                 self.logger.info("Rebuilding application...")
 
                 from wasm.deployers import detect_app_type, get_deployer

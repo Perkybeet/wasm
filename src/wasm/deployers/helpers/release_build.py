@@ -28,12 +28,20 @@ from wasm.core.fs import FileSystem
 from wasm.core.logger import Logger
 from wasm.core.runner import CommandRunner
 from wasm.deployers.helpers.health import failure_output
-from wasm.deployers.releases import Release, ReleaseManager
+from wasm.deployers.releases import REPO_CACHE_DIR, Release, ReleaseManager
 from wasm.managers.source_manager import SourceManager
 from wasm.validators.source import validate_source
 
-#: The repository cache, inside the application directory.
-REPO_CACHE_DIR = "repo"
+__all__ = [
+    "DEPENDENCY_DIRS",
+    "LOCKFILES",
+    "REPO_CACHE_DIR",
+    "StagedRelease",
+    "discard_release",
+    "lockfiles_match",
+    "reuse_dependencies",
+    "stage_release",
+]
 
 #: Files whose bytes decide the installed dependencies. When every one of them
 #: is identical to the active release's, the install would produce what the

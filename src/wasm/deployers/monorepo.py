@@ -29,13 +29,14 @@ from wasm.core.exceptions import (
     WASMError,
 )
 from wasm.core.fs import SECRET_MODE, FileSystem
-from wasm.core.logger import Icons, Logger
+from wasm.core.logger import Icons
 from wasm.core.runner import CommandResult, CommandRunner, get_runner
 from wasm.core.store import (
     App,
     AppStatus,
     Database,
     DatabaseEngine,
+    DeploymentTrigger,
     MonorepoWorkspace,
     Service,
     Site,
@@ -50,12 +51,20 @@ from wasm.deployers.helpers import (
     WorkspaceHelper,
 )
 from wasm.deployers.helpers.permissions import hand_over_tree
+from wasm.deployers.helpers.registration import StoreRegistrar
 from wasm.deployers.interface import AppDeployer, StepReporter, UpdateResult
+from wasm.deployers.recorder import (
+    CapturingLogger,
+    DeploymentRecorder,
+    checkout_git_info,
+    recorder_for,
+    recording,
+)
 from wasm.deployers.registry import DeployerRegistry
 from wasm.managers.apache_manager import ApacheManager
 from wasm.managers.cert_manager import CertManager
 from wasm.managers.nginx_manager import NginxManager
-from wasm.managers.service_manager import ServiceManager
+from wasm.managers.service_manager import ResourceLimits, ServiceManager
 from wasm.managers.source_manager import SourceManager
 
 #: Installs and builds in a monorepo touch every workspace; they need minutes,
@@ -129,8 +138,10 @@ class MonorepoDeployer(AppDeployer):
         self._runner = runner
         self._fs = fs
         self.config = Config()
-        self.logger = Logger(verbose=verbose)
+        # Capturable, so the deployment history holds the whole build log.
+        self.logger = CapturingLogger(verbose=verbose)
         self.store = get_store()
+        self.trigger: str = DeploymentTrigger.CLI.value
 
         # Managers are built on first use: detection instantiates every
         # registered deployer just to ask "is this yours?".
@@ -242,6 +253,7 @@ class MonorepoDeployer(AppDeployer):
         app_path: Path | None = None,
         package_manager: str = "auto",
         include_www: bool = False,
+        trigger: str = DeploymentTrigger.CLI.value,
         **options: Any,
     ) -> None:
         """
@@ -258,12 +270,14 @@ class MonorepoDeployer(AppDeployer):
             app_path: Custom application path.
             package_manager: Ignored; a turbo/pnpm workspace uses pnpm.
             include_www: Ignored; workspaces are served on their own subdomains.
+            trigger: What initiated this deployment, recorded in the history.
             **options: ``subdomain_overrides`` maps workspace names to
                 subdomains, ``workspace_filter`` limits which workspaces deploy,
                 and ``skip_database`` disables provisioning.
         """
         self.domain = domain
         self.source = source
+        self.trigger = trigger
         self.base_port = port or self.DEFAULT_BASE_PORT
         self.webserver = webserver
         self.ssl = ssl
@@ -358,12 +372,15 @@ class MonorepoDeployer(AppDeployer):
                 env=run_env or None,
                 timeout=timeout,
             )
-        return self.runner.run(
+        result = self.runner.run(
             command,
             cwd=cwd or self.app_path,
             env=run_env or None,
             timeout=timeout,
         )
+        # Printed only with --verbose, captured into the deployment log always.
+        self.logger.command_output(result.stdout, result.stderr)
+        return result
 
     def _generate_password(self, length: int = 32) -> str:
         """Generate a secure random password."""
@@ -377,10 +394,7 @@ class MonorepoDeployer(AppDeployer):
         Returns:
             True if deployment was successful.
         """
-        from wasm.core.exceptions import CertificateError
-
         total_steps = 11
-        ssl_obtained = False
 
         # Track if this is a new deployment (for rollback)
         self._is_new_deployment = not self.store.get_app(self.domain)
@@ -392,6 +406,23 @@ class MonorepoDeployer(AppDeployer):
         # Register app in store
         app = self._register_app_in_store(AppStatus.DEPLOYING.value)
 
+        with recording(self._recorder(), git_branch=self.branch):
+            return self._deploy_steps(app, total_steps)
+
+    def _deploy_steps(self, app: App, total_steps: int) -> bool:
+        """
+        Run the deployment steps, undoing a new deployment that fails.
+
+        Args:
+            app: The application row, updated with the outcome.
+            total_steps: How many steps are reported.
+
+        Returns:
+            True if deployment was successful.
+        """
+        from wasm.core.exceptions import CertificateError
+
+        ssl_obtained = False
         try:
             # Step 1: Fetch source
             self.logger.step(1, total_steps, "Fetching source code", Icons.DOWNLOAD)
@@ -517,8 +548,19 @@ class MonorepoDeployer(AppDeployer):
                 details="Call configure(domain=..., source=...) before update().",
             )
 
-        report = on_step or (lambda _message: None)
+        with recording(self._recorder(), git_branch=self.branch):
+            return self._update_steps(on_step or (lambda _message: None))
 
+    def _update_steps(self, report: StepReporter) -> UpdateResult:
+        """
+        Rebuild every workspace in place.
+
+        Args:
+            report: Called as each step begins.
+
+        Returns:
+            What was done.
+        """
         if not self.workspaces:
             report("Discovering workspaces")
             try:
@@ -1266,6 +1308,7 @@ class MonorepoDeployer(AppDeployer):
                 working_directory=str(working_dir),
                 environment=env,
                 description=f"WASM: {ws.subdomain}.{self.domain} ({ws.app_type})",
+                limits=ResourceLimits.of(self.store.get_app(self.domain)),
             )
 
             # Enable service
@@ -1357,10 +1400,20 @@ class MonorepoDeployer(AppDeployer):
                 self.logger.warning(f"Service {service_name} may not be running correctly")
 
     def _register_app_in_store(self, status: str) -> App:
-        """Register application in store."""
-        existing_app = self.store.get_app(self.domain)
+        """
+        Register or update the application row.
 
-        # Store workspaces as JSON in env_vars
+        Through the same registrar as every other deployer, so a redeploy
+        keeps what the row holds that this deployment does not know: the
+        layout, the retention and the resource limits.
+
+        Args:
+            status: Lifecycle status to record.
+
+        Returns:
+            The stored row.
+        """
+        # Workspaces are stored as JSON in env_vars.
         workspaces_json = json.dumps(
             [
                 {
@@ -1373,18 +1426,16 @@ class MonorepoDeployer(AppDeployer):
                 for ws in self.workspaces
             ]
         )
-
         env_with_meta = self.env_vars.copy()
         env_with_meta["_workspaces"] = workspaces_json
 
-        app = App(
-            id=existing_app.id if existing_app else None,
+        return StoreRegistrar(self.store).register_app(
             domain=self.domain,
             app_type=self.APP_TYPE,
             source=self.source,
             branch=self.branch,
             port=self.workspaces[0].port if self.workspaces else None,
-            app_path=str(self.app_path),
+            app_path=self.app_path,
             webserver=self.webserver,
             ssl_enabled=self.ssl,
             status=status,
@@ -1392,11 +1443,14 @@ class MonorepoDeployer(AppDeployer):
             env_vars=env_with_meta,
         )
 
-        if existing_app:
-            app.created_at = existing_app.created_at
-            return self.store.update_app(app)
-        else:
-            return self.store.create_app(app)
+    def _recorder(self) -> DeploymentRecorder:
+        """
+        Build the recorder a deploy or an update writes history with.
+
+        Returns:
+            A recorder, built where every deployer's is.
+        """
+        return recorder_for(self, git_info=checkout_git_info(self.source_manager, self.app_path))
 
     def _show_deployment_summary(self, ssl_obtained: bool) -> None:
         """Show deployment summary."""

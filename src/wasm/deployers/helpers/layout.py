@@ -18,13 +18,23 @@ that already exists. The rules:
 - Deployers that cannot build releases yet (monorepo, docker-compose) stay in
   place unless releases were explicitly requested, which is an error rather
   than a silent downgrade.
+
+It is also where the layout turns into paths for everything that is not a
+deploy: where an application's ``.env`` lives and where its running code is.
+``wasm env``, the panel's environment editor and the backups all used to
+assume ``<app>/.env``, which on the release layout reads nothing and writes a
+stray file the application never sees; they ask :func:`env_file_for` instead.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from wasm.core.config import Config
 from wasm.core.exceptions import DeploymentError
 from wasm.core.store import App, AppLayout
+from wasm.core.utils import domain_to_app_name
+from wasm.deployers.releases import CURRENT_LINK, ENV_FILE, SHARED_DIR
 
 #: The 1.x layout: the service runs the tree every update rebuilds.
 INPLACE = AppLayout.INPLACE.value
@@ -147,3 +157,87 @@ def choose_layout(
         # no release pipeline yet keeps working exactly as it did.
         return INPLACE
     return layout
+
+
+def app_root(app: App) -> Path:
+    """
+    Return an application's directory.
+
+    Args:
+        app: The application's store row.
+
+    Returns:
+        The directory the row records, or the conventional one under the apps
+        directory for a row that records none.
+    """
+    if app.app_path:
+        return Path(app.app_path)
+    return Config().apps_directory / domain_to_app_name(app.domain)
+
+
+def layout_on_disk(root: Path) -> str:
+    """
+    Tell which layout a directory is on, from what is in it.
+
+    For the callers that have a directory and no store row: an archive being
+    restored, or an application whose store went missing. A ``current`` link
+    is only ever created by the release layout; the in-place layout never has
+    one.
+
+    Args:
+        root: An application directory.
+
+    Returns:
+        ``releases`` when ``current`` is a symlink, ``inplace`` otherwise.
+    """
+    return RELEASES if (root / CURRENT_LINK).is_symlink() else INPLACE
+
+
+def env_file_in(root: Path, layout: str | None) -> Path:
+    """
+    Return where the ``.env`` of an application directory lives.
+
+    Args:
+        root: The application directory.
+        layout: ``inplace`` or ``releases``. None, which is what a row that
+            predates layouts says, means in place.
+
+    Returns:
+        ``<root>/shared/.env`` on releases, where every release links it
+        from; ``<root>/.env`` in place.
+    """
+    if layout == RELEASES:
+        return root / SHARED_DIR / ENV_FILE
+    return root / ENV_FILE
+
+
+def env_file_for(app: App) -> Path:
+    """
+    Return where an application's ``.env`` lives.
+
+    The one lookup every reader and writer of an application's environment
+    goes through: the CLI, the panel's editor, the deployers and the backups.
+
+    Args:
+        app: The application's store row.
+
+    Returns:
+        The file, which may not exist yet.
+    """
+    return env_file_in(app_root(app), app.layout)
+
+
+def code_path_for(app: App) -> Path:
+    """
+    Return where an application's running code is.
+
+    Args:
+        app: The application's store row.
+
+    Returns:
+        ``<root>/current`` on releases, the application directory in place.
+        This is where ``.env.example`` and the build are, not where anything
+        persistent should be written.
+    """
+    root = app_root(app)
+    return root / CURRENT_LINK if app.layout == RELEASES else root

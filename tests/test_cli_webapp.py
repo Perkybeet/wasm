@@ -1523,7 +1523,7 @@ def _status_relations() -> dict[str, Any]:
     [
         ("status", ["example.com"], "/apps/example.com"),
         ("list", [], "/apps"),
-        ("logs", ["example.com"], "/apps/example.com"),
+        ("logs", ["example.com"], "/apps/example.com/logs"),
     ],
 )
 def test_open_prints_the_configured_panel_url_without_a_display(
@@ -1572,7 +1572,7 @@ def test_open_prints_the_configured_panel_url_without_a_display(
     [
         ("status", ["example.com"], "/apps/example.com"),
         ("list", [], "/apps"),
-        ("logs", ["example.com"], "/apps/example.com"),
+        ("logs", ["example.com"], "/apps/example.com/logs"),
     ],
 )
 def test_open_launches_xdg_open_when_a_display_is_present(

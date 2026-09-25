@@ -24,6 +24,8 @@ filesystem bind-mounted. run.py wires all of that itself.
 from __future__ import annotations
 
 import argparse
+import json
+import re
 import secrets
 import subprocess
 import sys
@@ -734,19 +736,58 @@ def scenario_status_and_list(sc: Scenario) -> None:
     )
 
 
-@scenario("web_panel_starts_and_answers_health")
+#: The strict policy the console is served under (plan, Global Constraints).
+#: Trusted Types may follow it; nothing may relax it.
+CONSOLE_CSP = (
+    "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+    "font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; "
+    "form-action 'self'; object-src 'none'"
+)
+
+PANEL_URL = "http://127.0.0.1:8080"
+
+
+def http_head_and_body(sc: Scenario, path: str) -> tuple[int, dict[str, str], str]:
+    """Fetch a panel path inside the container; return status, headers, body."""
+    proc = sc.run(
+        f"curl -sS -D - {PANEL_URL}{path}",
+        timeout=15,
+        check=False,
+        label=f"curl -D - {PANEL_URL}{path} (body truncated in evidence)",
+    )
+    # Keep the evidence readable: the console bundle is not something to print.
+    if len(sc.evidence[-1]) > 4000:
+        sc.evidence[-1] = sc.evidence[-1][:4000] + "\n... (truncated)"
+    head, _, body = proc.stdout.replace("\r\n", "\n").partition("\n\n")
+    lines = head.splitlines()
+    sc.check(bool(lines), f"no response for {path}: {proc.stderr!r}")
+    status = int(lines[0].split()[1])
+    headers = {}
+    for line in lines[1:]:
+        name, _, value = line.partition(":")
+        headers[name.strip().lower()] = value.strip()
+    return status, headers, body
+
+
+@scenario("web_panel_serves_the_console")
 def scenario_web_panel(sc: Scenario) -> None:
-    """`wasm web start` binds on 127.0.0.1 and GET /health returns 200."""
+    """`wasm web start` answers /health and serves the console from the wheel.
+
+    The console's Vite build ships inside the package (web/static), so this
+    is also the packaging check: a build that was not committed, or a glob
+    that stopped matching, is a blank page here and nowhere else before an
+    operator opens it.
+    """
     sc.run("wasm web start --daemon", timeout=60, label="wasm web start --daemon")
 
     health: subprocess.CompletedProcess[str] | None = None
     deadline = time.time() + 30
     while time.time() < deadline:
         health = sc.run(
-            "curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/health",
+            f"curl -sS -o /dev/null -w '%{{http_code}}' {PANEL_URL}/health",
             timeout=15,
             check=False,
-            label="curl -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/health",
+            label=f"curl -o /dev/null -w '%{{http_code}}' {PANEL_URL}/health",
         )
         if health.stdout.strip() == "200":
             break
@@ -758,14 +799,350 @@ def scenario_web_panel(sc: Scenario) -> None:
     )
 
     body = sc.run(
-        "curl -sS http://127.0.0.1:8080/health",
+        f"curl -sS {PANEL_URL}/health",
         timeout=15,
         check=False,
-        label="curl http://127.0.0.1:8080/health",
+        label=f"curl {PANEL_URL}/health",
     )
     sc.check('"status"' in body.stdout, f"unexpected /health body: {body.stdout!r}")
 
-    sc.run("wasm web stop", timeout=30, check=False, label="wasm web stop")
+    try:
+        # The console, at the root and at a deep link a reload lands on.
+        for path in ("/", "/apps/example.com/deployments"):
+            status, headers, html = http_head_and_body(sc, path)
+            sc.check(status == 200, f"GET {path} answered {status}")
+            sc.check('<div id="root">' in html, f"GET {path} is not the console: {html[:200]!r}")
+            sc.check(
+                headers.get("content-type", "").startswith("text/html"),
+                f"GET {path} content-type {headers.get('content-type')!r}",
+            )
+            sc.check(
+                headers.get("cache-control") == "no-store",
+                f"GET {path} cache-control {headers.get('cache-control')!r}",
+            )
+            csp = headers.get("content-security-policy", "")
+            sc.check(
+                csp.startswith(CONSOLE_CSP) and "unsafe-inline" not in csp,
+                f"GET {path} is not served under the strict policy: {csp!r}",
+            )
+
+        # Every asset the console names loads, and is cached for good.
+        _, _, html = http_head_and_body(sc, "/")
+        assets = sorted(set(re.findall(r'(?:src|href)="(/assets/[^"]+)"', html)))
+        sc.check(bool(assets), "the console names no /assets/ file")
+        status_lines = sc.run(
+            "for p in "
+            + " ".join(assets)
+            + f'; do curl -sS -o /dev/null -w "%{{http_code}} $p\\n" {PANEL_URL}$p; done',
+            timeout=60,
+            check=False,
+            label=f"curl every one of the {len(assets)} assets index.html names",
+        ).stdout.splitlines()
+        failed = [line for line in status_lines if not line.startswith("200 ")]
+        sc.check(
+            len(status_lines) == len(assets) and not failed,
+            f"assets that did not load: {failed or status_lines}",
+        )
+        status, headers, _ = http_head_and_body(sc, assets[0])
+        sc.check(
+            "immutable" in headers.get("cache-control", ""),
+            f"{assets[0]} cache-control {headers.get('cache-control')!r}",
+        )
+        status, _, _ = http_head_and_body(sc, "/favicon.svg")
+        sc.check(status == 200, f"/favicon.svg answered {status}")
+
+        # A machine path is never shadowed by the console.
+        status, headers, _ = http_head_and_body(sc, "/api/does-not-exist")
+        sc.check(
+            status in (401, 404) and headers.get("content-type", "").startswith("application/json"),
+            f"/api/does-not-exist answered {status} {headers.get('content-type')!r}",
+        )
+    finally:
+        sc.run("wasm web stop", timeout=30, check=False, label="wasm web stop")
+
+
+# ---------------------------------------------------------------------------
+# Instant rollback, migration and resource limits
+# ---------------------------------------------------------------------------
+
+#: The in-place application the migration scenario moves onto releases.
+INPLACE_DOMAIN = "node.test"
+INPLACE_ROOT = "/var/www/apps/node-test"
+
+
+def tree_census(sc: Scenario, root: str, label: str) -> str:
+    """Count the regular files under a directory and their bytes, following nothing."""
+    return sc.run(
+        f"find {root} -type f -printf '%s\\n' | awk '{{n++; s+=$1}} END {{print n, s}}'",
+        timeout=30,
+        label=label,
+    ).stdout.strip()
+
+
+@scenario("release_app_instant_rollback")
+def scenario_instant_rollback(sc: Scenario) -> None:
+    """`wasm releases rollback` serves the previous release at once, with nothing rebuilt.
+
+    Runs after the release scenarios, which leave two releases on disk: the
+    first serving "ok 1" and the second, active, serving "ok 2".
+    """
+    listing = sc.run(
+        f"wasm releases list {RELEASE_DOMAIN} --json",
+        timeout=30,
+        label=f"wasm releases list {RELEASE_DOMAIN} --json",
+    )
+    items = json.loads(listing.stdout)["items"]
+    on_disk = [item for item in items if item["on_disk"]]
+    sc.check(len(on_disk) == 2, f"expected two releases on disk: {items!r}")
+    newer, older = on_disk[0]["id"], on_disk[1]["id"]
+    sc.check(on_disk[0]["active"], f"the newest release is not the active one: {items!r}")
+
+    timed = sc.run(
+        f"start=$(date +%s%N); wasm releases rollback {RELEASE_DOMAIN}; "
+        'echo "elapsed_ms=$(( ($(date +%s%N) - start) / 1000000 ))"',
+        timeout=120,
+        label=f"wasm releases rollback {RELEASE_DOMAIN} (timed)",
+    )
+    elapsed = int(timed.stdout.rsplit("elapsed_ms=", 1)[1].strip())
+    sc.check(elapsed < 30_000, f"the rollback took {elapsed} ms")
+    sc.check(
+        active_release(sc, "readlink current (after the rollback)") == f"releases/{older}",
+        "current does not point at the previous release",
+    )
+    page = sc.run(
+        f"curl -sS -H 'Host: {RELEASE_DOMAIN}' http://127.0.0.1/",
+        timeout=30,
+        label=f"curl -H 'Host: {RELEASE_DOMAIN}' http://127.0.0.1/ (after the rollback)",
+    )
+    sc.check(page.stdout.strip() == "ok 1", f"expected 'ok 1', got {page.stdout!r}")
+
+    row = sc.run(
+        store_query(
+            "SELECT status, triggered_by, log_path FROM deployments "
+            "WHERE domain = 'rel.test' ORDER BY id DESC LIMIT 1"
+        ),
+        timeout=15,
+        label="SELECT the deployment row of the rollback",
+    ).stdout.strip()
+    status, trigger, log_path = row.split("|")
+    sc.check((status, trigger) == ("success", "cli"), f"deployment row: {row!r}")
+    rebuilt = sc.run(
+        f"grep -cE 'npm (ci|install)|Installing' {log_path} || true",
+        timeout=15,
+        label="grep the rollback log for an install",
+    )
+    sc.check(rebuilt.stdout.strip() == "0", "the rollback installed something")
+    statuses = dict(
+        line.split("=", 1)
+        for line in sc.run(
+            store_query(
+                "SELECT r.id || '=' || r.status FROM releases r JOIN apps a ON a.id = r.app_id "
+                "WHERE a.domain = 'rel.test'"
+            ),
+            timeout=15,
+            label="SELECT the status of every release of rel.test",
+        ).stdout.split()
+    )
+    sc.check(
+        (statuses.get(older), statuses.get(newer)) == ("active", "rolled_back"),
+        f"release statuses: {statuses!r}",
+    )
+
+    # And forward again, by id.
+    sc.run(
+        f"wasm releases rollback {RELEASE_DOMAIN} {newer}",
+        timeout=120,
+        label=f"wasm releases rollback {RELEASE_DOMAIN} {newer}",
+    )
+    page = sc.run(
+        f"curl -sS -H 'Host: {RELEASE_DOMAIN}' http://127.0.0.1/",
+        timeout=30,
+        label=f"curl -H 'Host: {RELEASE_DOMAIN}' http://127.0.0.1/ (forward again)",
+    )
+    sc.check(page.stdout.strip() == "ok 2", f"expected 'ok 2', got {page.stdout!r}")
+
+
+@scenario("inplace_app_migrate_keeps_uploads")
+def scenario_migrate(sc: Scenario) -> None:
+    """An in-place app with an upload moves onto releases, keeps serving and keeps the upload.
+
+    node.test was deployed in place and took an upload into its own tree
+    (uploads/, gitignored) in the first Node scenario. A rehearsal changes
+    nothing; the migration moves every file, none copied or lost; the upload
+    ends in shared/ and is still reachable; an update afterwards builds a
+    release that sees it too.
+    """
+    before_listing = sc.run(f"ls -A {INPLACE_ROOT}", timeout=15, label=f"ls -A {INPLACE_ROOT}")
+    before = tree_census(sc, INPLACE_ROOT, "count files and bytes before the migration")
+
+    sc.run(
+        f"wasm --dry-run app migrate {INPLACE_DOMAIN}",
+        timeout=60,
+        label=f"wasm --dry-run app migrate {INPLACE_DOMAIN}",
+    )
+    sc.check(
+        sc.run(f"ls -A {INPLACE_ROOT}", timeout=15, label="ls -A (after the rehearsal)").stdout
+        == before_listing.stdout,
+        "the rehearsal changed the application directory",
+    )
+
+    sc.run(
+        f"wasm app migrate {INPLACE_DOMAIN} --yes",
+        timeout=DEPLOY_TIMEOUT,
+        label=f"wasm app migrate {INPLACE_DOMAIN} --yes",
+    )
+    after = tree_census(sc, INPLACE_ROOT, "count files and bytes after the migration")
+    sc.check(after == before, f"files and bytes before {before!r}, after {after!r}")
+
+    layout = sc.run(
+        store_query(
+            "SELECT layout || ' ' || persistent_paths FROM apps WHERE domain = 'node.test'"
+        ),
+        timeout=15,
+        label="SELECT layout, persistent_paths FROM apps WHERE domain = 'node.test'",
+    )
+    sc.check(
+        layout.stdout.strip().startswith("releases") and "uploads" in layout.stdout,
+        f"store row: {layout.stdout!r}",
+    )
+    tree = sc.run(
+        f"ls -A {INPLACE_ROOT}; readlink {INPLACE_ROOT}/current {INPLACE_ROOT}/current/uploads "
+        f"{INPLACE_ROOT}/current/.env; cat {INPLACE_ROOT}/shared/uploads/upload.txt",
+        timeout=15,
+        label="the migrated tree: entries, links and the upload in shared/",
+    )
+    for expected in ("current", "releases", "shared", "../../shared/uploads", "../../shared/.env"):
+        sc.check(expected in tree.stdout.split(), f"{expected} missing: {tree.stdout!r}")
+    sc.check("integration-harness-upload" in tree.stdout, "the upload is not in shared/uploads")
+    unit = sc.run(
+        "systemctl cat node-test | grep -E '^WorkingDirectory='",
+        timeout=15,
+        label="systemctl cat node-test | grep WorkingDirectory",
+    )
+    sc.check(
+        f"WorkingDirectory={INPLACE_ROOT}/current" in unit.stdout,
+        f"the unit does not run from current: {unit.stdout!r}",
+    )
+    page = sc.run(
+        f"curl -sS -H 'Host: {INPLACE_DOMAIN}' http://127.0.0.1/",
+        timeout=30,
+        label=f"curl -H 'Host: {INPLACE_DOMAIN}' http://127.0.0.1/ (after the migration)",
+    )
+    sc.check(page.stdout.strip() == "ok 2", f"expected 'ok 2', got {page.stdout!r}")
+
+    # A new upload lands in shared/, through the release.
+    sc.run(
+        f"curl -sS -H 'Host: {INPLACE_DOMAIN}' --data-binary 'after-migration' "
+        "http://127.0.0.1/upload",
+        timeout=30,
+        label=f"curl -H 'Host: {INPLACE_DOMAIN}' --data-binary ... /upload (after the migration)",
+    )
+    sc.check(
+        "after-migration"
+        in sc.run(
+            f"cat {INPLACE_ROOT}/shared/uploads/upload.txt",
+            timeout=15,
+            label="cat shared/uploads/upload.txt",
+        ).stdout,
+        "an upload after the migration did not land in shared/",
+    )
+
+    # The migrated application keeps updating, now as releases.
+    sc.run(
+        "cd /root/fixtures/node-app && echo 3 > VERSION && "
+        "git add VERSION && git commit -q -m 'bump version to 3'",
+        timeout=30,
+        label="(fixture repo) echo 3 > VERSION; git commit",
+    )
+    sc.run(
+        f"wasm update {INPLACE_DOMAIN}",
+        timeout=DEPLOY_TIMEOUT,
+        label=f"wasm update {INPLACE_DOMAIN} (after the migration)",
+    )
+    count = sc.run(f"ls {INPLACE_ROOT}/releases | wc -l", timeout=15, label="ls releases | wc -l")
+    sc.check(count.stdout.strip() == "2", f"expected 2 releases, found {count.stdout.strip()}")
+    page = sc.run(
+        f"curl -sS -H 'Host: {INPLACE_DOMAIN}' http://127.0.0.1/",
+        timeout=30,
+        label=f"curl -H 'Host: {INPLACE_DOMAIN}' http://127.0.0.1/ (after the update)",
+    )
+    sc.check(page.stdout.strip() == "ok 3", f"expected 'ok 3', got {page.stdout!r}")
+    kept = sc.run(
+        f"cat {INPLACE_ROOT}/current/uploads/upload.txt",
+        timeout=15,
+        check=False,
+        label="cat current/uploads/upload.txt (through the new release)",
+    )
+    sc.check("after-migration" in kept.stdout, "the new release does not see the upload")
+
+
+@scenario("resource_limits_in_systemd")
+def scenario_limits(sc: Scenario) -> None:
+    """`wasm app limits` puts the limits in the unit, and systemd reports them.
+
+    ``--restart`` passes the same health gate as a deploy, so the application
+    answers again the moment the command returns.
+    """
+    serving = sc.run(
+        f"curl -sS -H 'Host: {RELEASE_DOMAIN}' http://127.0.0.1/",
+        timeout=30,
+        label=f"curl -H 'Host: {RELEASE_DOMAIN}' http://127.0.0.1/ (before the limits)",
+    ).stdout.strip()
+    sc.check(serving.startswith("ok "), f"{RELEASE_DOMAIN} is not serving: {serving!r}")
+    sc.run(
+        f"wasm app limits {RELEASE_DOMAIN} --memory 512M --cpu 50% --tasks 256 --restart",
+        timeout=60,
+        label=f"wasm app limits {RELEASE_DOMAIN} --memory 512M --cpu 50% --tasks 256 --restart",
+    )
+    shown = sc.run(
+        "systemctl show rel-test -p MemoryMax,CPUQuotaPerSecUSec,TasksMax",
+        timeout=15,
+        label="systemctl show rel-test -p MemoryMax,CPUQuotaPerSecUSec,TasksMax",
+    )
+    properties = dict(line.split("=", 1) for line in shown.stdout.split())
+    sc.check(
+        properties
+        == {"MemoryMax": str(512 * 1024 * 1024), "CPUQuotaPerSecUSec": "500ms", "TasksMax": "256"},
+        f"systemd reports {properties!r}",
+    )
+    sc.check(
+        sc.run(
+            "systemctl is-active rel-test", timeout=15, check=False, label="is-active"
+        ).stdout.strip()
+        == "active",
+        "the application did not come back under its limits",
+    )
+    page = sc.run(
+        f"curl -sS -H 'Host: {RELEASE_DOMAIN}' http://127.0.0.1/",
+        timeout=30,
+        label=f"curl -H 'Host: {RELEASE_DOMAIN}' http://127.0.0.1/ (under limits)",
+    )
+    sc.check(page.stdout.strip() == serving, f"expected {serving!r}, got {page.stdout!r}")
+    row = sc.run(
+        store_query(
+            "SELECT memory_max_mb || ' ' || cpu_quota_percent || ' ' || tasks_max "
+            "FROM apps WHERE domain = 'rel.test'"
+        ),
+        timeout=15,
+        label="SELECT the limits of rel.test",
+    )
+    sc.check(row.stdout.strip() == "512 50 256", f"store row: {row.stdout!r}")
+
+    # Removing one removes its directive.
+    sc.run(
+        f"wasm app limits {RELEASE_DOMAIN} --memory none",
+        timeout=60,
+        label=f"wasm app limits {RELEASE_DOMAIN} --memory none",
+    )
+    unit = sc.run(
+        "systemctl cat rel-test | grep -E '^(MemoryMax|CPUQuota|TasksMax)=' || true",
+        timeout=15,
+        label="systemctl cat rel-test | grep the limit directives",
+    )
+    sc.check(
+        unit.stdout.split() == ["CPUQuota=50%", "TasksMax=256"],
+        f"directives after removing the memory limit: {unit.stdout!r}",
+    )
 
 
 # ---------------------------------------------------------------------------

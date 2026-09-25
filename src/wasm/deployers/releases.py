@@ -62,6 +62,9 @@ SHARED_DIR = "shared"
 #: Linked into every release whenever ``shared/`` holds one.
 ENV_FILE = ".env"
 
+#: The repository cache: a clone releases are exported from.
+REPO_CACHE_DIR = "repo"
+
 #: Stands in for the commit when the source is not a git checkout.
 NO_COMMIT = "nogit"
 
@@ -160,7 +163,7 @@ def _short_commit(commit: str | None) -> str:
     return normalized[:SHORT_COMMIT_LENGTH]
 
 
-def _order_key(release_id: str) -> tuple[str, int, str]:
+def release_order_key(release_id: str) -> tuple[str, int, str]:
     """
     Sort key that puts release ids in creation order.
 
@@ -173,6 +176,9 @@ def _order_key(release_id: str) -> tuple[str, int, str]:
 
     Returns:
         (stamp, sequence, id).
+
+    Raises:
+        ValueError: If it is not a release id.
     """
     match = _RELEASE_ID.match(release_id)
     if match is None:
@@ -180,7 +186,21 @@ def _order_key(release_id: str) -> tuple[str, int, str]:
     return match["stamp"], int(match["sequence"] or 1), release_id
 
 
-def _persistent_path(raw: str) -> PurePosixPath:
+def is_release_id(value: str) -> bool:
+    """
+    Tell whether a string is shaped like a release id.
+
+    Args:
+        value: Candidate, such as a path parameter.
+
+    Returns:
+        True for ``YYYYMMDD-HHMMSS-<commit>[-N]``. Nothing else can name a
+        release, so nothing else needs to reach the disk.
+    """
+    return _RELEASE_ID.match(value) is not None
+
+
+def persistent_path(raw: str) -> PurePosixPath:
     """
     Validate a persistent path from the app configuration.
 
@@ -210,7 +230,7 @@ def _persistent_path(raw: str) -> PurePosixPath:
     return candidate
 
 
-def _obstacle(root: Path, relative: PurePosixPath) -> Path | None:
+def first_obstacle(root: Path, relative: PurePosixPath) -> Path | None:
     """
     Find the first ancestor of ``root/relative`` that cannot be walked into safely.
 
@@ -307,7 +327,7 @@ class ReleaseManager:
         active = self._active_id()
         return [
             self._release(release_id, active=release_id == active)
-            for release_id in sorted(self._ids_on_disk(), key=_order_key, reverse=True)
+            for release_id in sorted(self._ids_on_disk(), key=release_order_key, reverse=True)
         ]
 
     def current(self) -> Release | None:
@@ -325,6 +345,25 @@ class ReleaseManager:
     # Changing it
     # ------------------------------------------------------------------
 
+    def next_release_id(self, commit: str | None) -> str:
+        """
+        Name the release :meth:`new_release_dir` would create now, without creating it.
+
+        For plans shown before anything changes. The name is only a forecast:
+        another release created in the meantime moves the real one along.
+
+        Args:
+            commit: Commit the release would be built from, or None.
+
+        Returns:
+            The release id.
+
+        Raises:
+            DeploymentError: The commit is not a commit id.
+        """
+        stamp, short, sequence = self._next_name(commit)
+        return f"{stamp}-{short}" if sequence == 1 else f"{stamp}-{short}-{sequence}"
+
     def new_release_dir(self, commit: str | None) -> Path:
         """
         Create the directory for a new release.
@@ -340,18 +379,7 @@ class ReleaseManager:
             DeploymentError: The commit is not a commit id, or no free name
                 could be claimed.
         """
-        short = _short_commit(commit)
-        known = self._known_ids()
-        stamp = self._now_stamp()
-        # A clock that moved backwards (NTP, a VM restored from a snapshot)
-        # would stamp the new release older than the active one, and rollback
-        # would then treat the newest build as history. Never go back.
-        newest = max((_order_key(i)[0] for i in known), default=stamp)
-        stamp = max(stamp, newest)
-        sequence = 1 + max(
-            (_order_key(i)[1] for i in known if i.startswith(f"{stamp}-")),
-            default=0,
-        )
+        stamp, short, sequence = self._next_name(commit)
 
         self.fs.make_dir(self.releases_dir)
         for _ in range(_MAX_NAME_ATTEMPTS):
@@ -404,7 +432,7 @@ class ReleaseManager:
         if os.path.lexists(self.shared_dir / ENV_FILE):
             paths.append(PurePosixPath(ENV_FILE))
         for raw in persistent:
-            path = _persistent_path(raw)
+            path = persistent_path(raw)
             # .env follows its own rule above: linked only when the shared copy
             # exists, never created as a directory for the lack of one.
             if path not in paths and path != PurePosixPath(ENV_FILE):
@@ -413,7 +441,7 @@ class ReleaseManager:
             shared = self.shared_dir / path
             if os.path.lexists(shared):
                 continue
-            blocked = _obstacle(self.shared_dir, path)
+            blocked = first_obstacle(self.shared_dir, path)
             if blocked is not None:
                 raise DeploymentError(
                     f"Refusing to create {shared}: {blocked} is not a plain directory",
@@ -434,7 +462,7 @@ class ReleaseManager:
             if link.is_symlink() and Path(os.readlink(link)) == target:
                 linked.append(str(path))
                 continue
-            blocked = _obstacle(root, path)
+            blocked = first_obstacle(root, path)
             if blocked is not None or os.path.lexists(link):
                 conflicts.append(str(path))
                 self.logger.warning(
@@ -587,6 +615,33 @@ class ReleaseManager:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    def _next_name(self, commit: str | None) -> tuple[str, str, int]:
+        """
+        Work out the parts of the next release id.
+
+        Args:
+            commit: Commit the release is built from, or None.
+
+        Returns:
+            (stamp, short commit, sequence within the second).
+
+        Raises:
+            DeploymentError: The commit is not a commit id.
+        """
+        short = _short_commit(commit)
+        known = self._known_ids()
+        stamp = self._now_stamp()
+        # A clock that moved backwards (NTP, a VM restored from a snapshot)
+        # would stamp the new release older than the active one, and rollback
+        # would then treat the newest build as history. Never go back.
+        newest = max((release_order_key(i)[0] for i in known), default=stamp)
+        stamp = max(stamp, newest)
+        sequence = 1 + max(
+            (release_order_key(i)[1] for i in known if i.startswith(f"{stamp}-")),
+            default=0,
+        )
+        return stamp, short, sequence
 
     def _now_stamp(self) -> str:
         """

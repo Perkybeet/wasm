@@ -147,6 +147,15 @@ DEPLOY_SCOPE_PATHS = frozenset(
     }
 )
 
+#: The same policy for mutations whose path carries a parameter, which no
+#: exact path can name. Each pattern is anchored at both ends and a segment
+#: never matches a ``/``, so a pattern cannot be satisfied by a longer path
+#: that merely contains it.
+DEPLOY_SCOPE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Activating a release is an instant rollback: the same act as queueing one.
+    re.compile(r"^/api/apps/[^/]+/releases/[^/]+/activate$"),
+)
+
 #: Recorded in the payload the auth dependency hands to endpoints. Kept as
 #: names rather than a JWT: see SessionStore._encode for why the JWT went.
 SESSION_ISSUER = "wasm-web"
@@ -2540,7 +2549,9 @@ def required_scope(method: str, path: str) -> str:
     verb = method.upper()
     if verb in SAFE_METHODS:
         return "read"
-    if verb == "POST" and path in DEPLOY_SCOPE_PATHS:
+    if verb == "POST" and (
+        path in DEPLOY_SCOPE_PATHS or any(p.match(path) for p in DEPLOY_SCOPE_PATTERNS)
+    ):
         return "deploy"
     return "admin"
 

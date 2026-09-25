@@ -1,0 +1,258 @@
+# Copyright (c) 2024-2026 Yago Lopez Prado
+# Licensed under WASM-NCSAL 1.0 (Commercial use prohibited)
+# https://github.com/Perkybeet/wasm/blob/main/LICENSE
+
+"""
+``wasm app``: settings of one deployed application that are not a deploy.
+
+``migrate`` moves an in-place application onto the release layout; it is
+:func:`wasm.deployers.migrate.plan_migration` and
+:func:`~wasm.deployers.migrate.migrate`, which ``POST /api/apps/{d}/migrate``
+calls too. ``limits`` sets the memory, CPU and task limits of its unit through
+:func:`wasm.deployers.lifecycle.set_resource_limits`, like ``PATCH
+/api/apps/{d}/limits``. This module only parses, presents and asks.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import re
+
+import click
+
+from wasm.cli.app import Context, pass_context
+from wasm.core.exceptions import WASMError
+from wasm.core.logger import Logger
+from wasm.core.store import DeploymentTrigger, get_store
+from wasm.deployers.lifecycle import set_resource_limits
+from wasm.deployers.migrate import MigrationPlan, migrate, plan_migration
+from wasm.deployers.recorder import CapturingLogger
+from wasm.managers.service_manager import ResourceLimits
+
+#: What removes a limit instead of setting one.
+NO_LIMIT = frozenset({"none", "unlimited", "off"})
+
+
+def print_plan(logger: Logger, plan: MigrationPlan) -> None:
+    """
+    Render a migration plan for a human.
+
+    Args:
+        logger: Logger the command writes through.
+        plan: The plan.
+    """
+    logger.key_value("Application", f"{plan.domain} ({plan.app_path})")
+    logger.key_value("First release", f"{plan.release_id} (the live tree, moved, not copied)")
+    how = {
+        "git": "what git does not track",
+        "explicit": "as named",
+        "common": "the usual upload directories that exist",
+    }[plan.persistent_source]
+    logger.key_value(
+        "Moves to shared/", ", ".join([*plan.env_files, *plan.persistent]) or "nothing"
+    )
+    logger.key_value("Persistent paths", f"{', '.join(plan.persistent) or 'none'} ({how})")
+    logger.key_value("Unit", "rewritten to run from current" if plan.unit_rewrite else "unchanged")
+    logger.key_value("Site", "rewritten to serve current" if plan.site_rewrite else "unchanged")
+    logger.key_value(
+        "Files", f"{plan.count.files} ({plan.count.bytes} bytes), all kept, none copied"
+    )
+    for warning in plan.warnings:
+        logger.warning(warning)
+
+
+@click.group("app")
+def cli() -> None:
+    """Change how a deployed application is laid out and what it may use."""
+
+
+@cli.command("migrate")
+@click.argument("domain")
+@click.option(
+    "--persist",
+    "persist",
+    multiple=True,
+    metavar="PATH",
+    help="Keep this path in shared/ across releases. Repeat for each; replaces detection.",
+)
+@click.option("--yes", "-y", is_flag=True, default=False, help="Do not ask for confirmation.")
+@pass_context
+def migrate_command(ctx: Context, domain: str, persist: tuple[str, ...], yes: bool) -> None:
+    """
+    Move an in-place application onto the release layout.
+
+    The live tree becomes the first release; the .env and every path the
+    application writes for itself move to shared/; the unit and the site are
+    rewritten to run from current. Nothing is deleted and nothing is copied.
+    If the application does not answer afterwards, everything is put back as
+    it was.
+    """
+    plan = plan_migration(domain, list(persist) if persist else None)
+    if not ctx.json_output:
+        print_plan(ctx.logger, plan)
+    elif not (yes or ctx.dry_run):
+        # A script asked for JSON without --yes: there is nobody to confirm,
+        # so it gets the plan and nothing changes.
+        click.echo(json.dumps({"plan": dataclasses.asdict(plan)}, default=str))
+        return
+
+    if not yes and not ctx.dry_run:
+        click.confirm(f"Migrate {plan.domain} to releases?", abort=True)
+
+    logger = CapturingLogger(verbose=ctx.verbose)
+    result = migrate(domain, plan, trigger=DeploymentTrigger.CLI.value, logger=logger)
+    if ctx.json_output:
+        click.echo(
+            json.dumps(
+                {"plan": dataclasses.asdict(plan), "result": dataclasses.asdict(result)},
+                default=str,
+            )
+        )
+        return
+    if result.rehearsed:
+        logger.info("Rehearsal: nothing was changed")
+        return
+    logger.success(f"{result.domain} runs from release {result.release_id}")
+    logger.info(
+        f"Kept {result.after.files} files ({result.after.bytes} bytes); "
+        f"see its releases with: wasm releases list {result.domain}"
+    )
+
+
+def parse_memory(value: str) -> int | None:
+    """
+    Read a memory limit as an operator writes it.
+
+    Args:
+        value: ``512M``, ``512``, ``2G`` or ``none``.
+
+    Returns:
+        Megabytes, or None to remove the limit.
+
+    Raises:
+        click.BadParameter: It is none of those.
+    """
+    if value.strip().lower() in NO_LIMIT:
+        return None
+    match = re.fullmatch(r"\s*(\d+)\s*([mMgG])?[bB]?\s*", value)
+    if match is None:
+        raise click.BadParameter(f"{value!r} is not a size; use 512M, 2G or none")
+    amount = int(match.group(1))
+    return amount * 1024 if (match.group(2) or "M").upper() == "G" else amount
+
+
+def parse_cpu(value: str) -> int | None:
+    """
+    Read a CPU quota as an operator writes it.
+
+    Args:
+        value: ``50%``, ``50``, ``200%`` (two CPUs) or ``none``.
+
+    Returns:
+        Percent of one CPU, or None to remove the limit.
+
+    Raises:
+        click.BadParameter: It is none of those.
+    """
+    if value.strip().lower() in NO_LIMIT:
+        return None
+    match = re.fullmatch(r"\s*(\d+)\s*%?\s*", value)
+    if match is None:
+        raise click.BadParameter(f"{value!r} is not a percentage; use 50%, 200% or none")
+    return int(match.group(1))
+
+
+def parse_tasks(value: str) -> int | None:
+    """
+    Read a task limit as an operator writes it.
+
+    Args:
+        value: A number, or ``none``.
+
+    Returns:
+        The limit, or None to remove it.
+
+    Raises:
+        click.BadParameter: It is neither.
+    """
+    if value.strip().lower() in NO_LIMIT:
+        return None
+    if not value.strip().isdigit():
+        raise click.BadParameter(f"{value!r} is not a number of tasks; use 256 or none")
+    return int(value)
+
+
+def _describe(limits: ResourceLimits) -> str:
+    """
+    Say what limits there are, in unit terms.
+
+    Args:
+        limits: The limits.
+
+    Returns:
+        The directives, or "no limits".
+    """
+    return ", ".join(limits.directives()) or "no limits"
+
+
+@cli.command("limits")
+@click.argument("domain")
+@click.option("--memory", metavar="SIZE", help="Memory limit: 512M, 2G, or none to remove it.")
+@click.option("--cpu", metavar="PERCENT", help="CPU quota: 50% of one CPU, 200% for two, or none.")
+@click.option("--tasks", metavar="N", help="Processes and threads it may run, or none.")
+@click.option("--restart", is_flag=True, default=False, help="Restart now so the new limits apply.")
+@pass_context
+def limits_command(
+    ctx: Context,
+    domain: str,
+    memory: str | None,
+    cpu: str | None,
+    tasks: str | None,
+    restart: bool,
+) -> None:
+    """
+    Show or set the memory, CPU and task limits of an application.
+
+    A limit not named keeps its value; name it as none to remove it. The
+    unit is rewritten and systemd reloaded; the running process keeps its
+    old limits until it restarts, which --restart does now.
+    """
+    app = get_store().get_app(domain)
+    if app is None:
+        raise WASMError(
+            f"Application not found: {domain}", details="Run 'wasm list' to see what is deployed."
+        )
+    current = ResourceLimits.of(app)
+    if memory is None and cpu is None and tasks is None and not restart:
+        if ctx.json_output:
+            click.echo(json.dumps({"domain": app.domain, **dataclasses.asdict(current)}))
+        else:
+            ctx.logger.key_value("Limits", _describe(current))
+        return
+
+    wanted = ResourceLimits(
+        memory_max_mb=current.memory_max_mb if memory is None else parse_memory(memory),
+        cpu_quota_percent=current.cpu_quota_percent if cpu is None else parse_cpu(cpu),
+        tasks_max=current.tasks_max if tasks is None else parse_tasks(tasks),
+    )
+    change = set_resource_limits(app.domain, wanted, restart=restart)
+    if ctx.json_output:
+        click.echo(
+            json.dumps(
+                {
+                    "domain": change.domain,
+                    **dataclasses.asdict(change.limits),
+                    "units": list(change.units),
+                    "restarted": change.restarted,
+                }
+            )
+        )
+        return
+    ctx.logger.success(f"{change.domain}: {_describe(change.limits)}")
+    if change.restarted:
+        ctx.logger.info(f"Restarted {', '.join(change.units)} under the new limits")
+    else:
+        ctx.logger.info(
+            f"The running process keeps its old limits until it restarts: wasm restart {domain}"
+        )

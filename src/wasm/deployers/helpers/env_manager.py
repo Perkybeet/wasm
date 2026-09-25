@@ -651,18 +651,48 @@ class EnvManager:
 
     def get_current_values(self, app_path: Path) -> dict[str, str]:
         """
-        Read current .env file values.
+        Read the ``.env`` at the top of a directory.
 
-        Strips quotes from values for consistency.
+        Only right for a directory that holds its own ``.env``: an in-place
+        application, or ``shared/`` of a release one. Callers that have an
+        application rather than a directory read through
+        :func:`wasm.deployers.helpers.app_env.read_app_env`, which knows which.
 
         Args:
-            app_path: Application root path.
+            app_path: Directory holding the ``.env``.
 
         Returns:
             Dictionary of current environment variable values.
         """
+        return self.read_env_file(app_path / ".env")
+
+    def write_env_file(self, path: Path, values: dict[str, str]) -> None:
+        """
+        Write one environment file, readable by its owner only.
+
+        Args:
+            path: The file to write.
+            values: Variable name to value.
+
+        Raises:
+            SecurityError: If the destination is a symlink.
+            OSError: If the file cannot be created or written.
+        """
+        self._write_single_env_file(path, values)
+
+    def read_env_file(self, env_file: Path) -> dict[str, str]:
+        """
+        Read the values of one environment file.
+
+        Strips quotes from values for consistency.
+
+        Args:
+            env_file: The file to read.
+
+        Returns:
+            Variable name to value; empty when the file does not exist.
+        """
         values: dict[str, str] = {}
-        env_file = app_path / ".env"
         if not env_file.exists():
             return values
 

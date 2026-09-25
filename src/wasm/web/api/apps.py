@@ -18,19 +18,23 @@ here for that to be true.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from wasm.core.config import REDACTED, redact_secrets
-from wasm.core.store import App, Service, get_store
+from wasm.core.store import App, DeploymentTrigger, Service, get_store
 from wasm.core.utils import domain_to_app_name
+from wasm.deployers.helpers.app_env import read_app_env, write_app_env
 from wasm.deployers.helpers.env_manager import EnvManager, redact_url_credentials
+from wasm.deployers.helpers.layout import RELEASES
 from wasm.deployers.inspect import inspect_source
+from wasm.deployers.lifecycle import activate_release, list_releases, set_resource_limits
+from wasm.deployers.migrate import MigrationPlan, migrate, plan_migration
+from wasm.deployers.releases import is_release_id
 from wasm.managers.backup_manager import RollbackManager
-from wasm.managers.service_manager import ServiceManager
+from wasm.managers.service_manager import ResourceLimits, ServiceManager
 from wasm.validators.environment import EnvironmentValidationError, validate_environment
 from wasm.validators.port import find_available_port, validate_port
 from wasm.web.api.auth import get_current_session
@@ -65,6 +69,10 @@ class AppInfo(BaseModel):
         port: Upstream port.
         app_type: Deployer that owns it.
         path: Application directory.
+        layout: ``inplace`` or ``releases``.
+        memory_max_mb: Memory limit of its unit, in MB, or None.
+        cpu_quota_percent: CPU quota of its unit, in percent of one CPU, or None.
+        tasks_max: Task limit of its unit, or None.
     """
 
     name: str
@@ -77,6 +85,10 @@ class AppInfo(BaseModel):
     port: int | None = None
     app_type: str | None = None
     path: str | None = None
+    layout: str = "inplace"
+    memory_max_mb: int | None = None
+    cpu_quota_percent: int | None = None
+    tasks_max: int | None = None
 
 
 class AppListResponse(BaseModel):
@@ -226,6 +238,10 @@ def _to_app_info(app: App, status: dict[str, Any], has_service: bool) -> AppInfo
         port=app.port,
         app_type=app.app_type,
         path=app.app_path,
+        layout=app.layout,
+        memory_max_mb=app.memory_max_mb,
+        cpu_quota_percent=app.cpu_quota_percent,
+        tasks_max=app.tasks_max,
     )
 
 
@@ -625,10 +641,10 @@ def get_app_env(
     """
     Read an application's environment from its ``.env`` file.
 
-    This reads the file :mod:`wasm.deployers.helpers.env_manager` writes, the
+    This reads the file :mod:`wasm.deployers.helpers.app_env` writes, the
     same one ``wasm env show`` reads on the terminal - not the snapshot the
     store recorded at deploy time, which can drift the moment anyone edits
-    the file by hand.
+    the file by hand. On the release layout that is ``shared/.env``.
 
     Args:
         domain: Domain of the application.
@@ -652,9 +668,7 @@ def get_app_env(
         ensure_elevated(request, session)
 
     app = _env_app(domain)
-    values = (
-        EnvManager(verbose=False).get_current_values(Path(app.app_path)) if app.app_path else {}
-    )
+    values = read_app_env(app)
 
     if unmask:
         audit = get_audit_logger()
@@ -685,9 +699,9 @@ def update_app_env(
     Every name and value is validated against what can safely reach a
     systemd unit (:mod:`wasm.validators.environment`) before anything is
     written, so a rejected variable leaves the file on disk untouched. The
-    write goes through :class:`~wasm.deployers.helpers.env_manager.EnvManager`,
-    the same seam ``wasm env configure`` uses, so the file lands 0600 either
-    way.
+    write goes through :func:`~wasm.deployers.helpers.app_env.write_app_env`,
+    the same function ``wasm env configure`` uses, so the file lands 0600,
+    owned by the service account, in ``shared/`` on the release layout.
 
     The application is not restarted: a process already running keeps the
     environment it started with until it is, so the caller is told a restart
@@ -713,10 +727,8 @@ def update_app_env(
     except EnvironmentValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    app_path = Path(app.app_path)
-    manager = EnvManager(verbose=False)
-    before = manager.get_current_values(app_path)
-    manager.write_env_files(app_path, clean)
+    before = read_app_env(app)
+    write_app_env(app, clean)
 
     changed = sorted(key for key in set(before) | set(clean) if before.get(key) != clean.get(key))
     audit = get_audit_logger()
@@ -836,3 +848,477 @@ def list_rollback_points(
         for point in points
     ]
     return RollbackPointsResponse(items=items, total=len(items))
+
+
+# ---------------------------------------------------------------------------
+# Releases
+# ---------------------------------------------------------------------------
+
+
+class ReleaseOut(BaseModel):
+    """
+    One release of an application on the release layout.
+
+    Attributes:
+        id: Release id, the directory name under ``releases/``.
+        commit: Short commit it was built from; None for a non-git source.
+        created_at: When it was created, ISO 8601 in UTC.
+        activated_at: When it last became active, if it ever did.
+        status: ``active``, ``superseded``, ``rolled_back``, ``failed`` or
+            ``built``.
+        active: Whether it is the one serving.
+        on_disk: Whether it can be activated. A failed release is listed for
+            a while after its directory was removed.
+    """
+
+    id: str
+    commit: str | None = None
+    created_at: str
+    activated_at: str | None = None
+    status: str
+    active: bool
+    on_disk: bool
+
+
+class ReleasesResponse(BaseModel):
+    """The releases of an application, newest first."""
+
+    domain: str
+    items: list[ReleaseOut]
+    total: int
+
+
+class ReleaseActivationResponse(BaseModel):
+    """
+    The outcome of activating a release.
+
+    Attributes:
+        domain: The application's domain.
+        release_id: The release now serving.
+        previous_id: The release that served before, if any.
+        changed: False when the release was already active and nothing was done.
+        rolled_back: Whether the release activated is older than the one it
+            replaced.
+        deployment_id: The deployment history row that records it.
+    """
+
+    domain: str
+    release_id: str
+    previous_id: str | None = None
+    changed: bool
+    rolled_back: bool
+    deployment_id: int | None = None
+
+
+def _release_app_or_error(domain: str) -> App:
+    """
+    Look up an application whose releases a request is about.
+
+    Args:
+        domain: Domain from the request.
+
+    Returns:
+        The stored application, on the release layout.
+
+    Raises:
+        HTTPException: 404 when it is unknown, 409 when it is deployed in
+            place: it has no releases until it is migrated.
+    """
+    app = _env_app(domain)
+    if app.layout != RELEASES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{app.domain} is deployed in place and has no releases. Migrate it to "
+            f"releases first (POST /api/apps/{app.domain}/migrate), or roll back to a backup.",
+        )
+    return app
+
+
+@router.get("/{domain}/releases", response_model=ReleasesResponse)
+def get_app_releases(
+    domain: str, session: Annotated[dict, Depends(get_current_session)]
+) -> ReleasesResponse:
+    """
+    List an application's releases, newest first.
+
+    Args:
+        domain: Domain of the application.
+        session: The authenticated session.
+
+    Returns:
+        The releases, from :func:`wasm.deployers.lifecycle.list_releases`,
+        the same listing ``wasm releases list`` prints.
+
+    Raises:
+        HTTPException: 404 when the application is unknown, 409 when it is
+            deployed in place.
+    """
+    app = _release_app_or_error(domain)
+    items = [
+        ReleaseOut(
+            id=release.id,
+            commit=release.commit,
+            created_at=release.created_at,
+            activated_at=release.activated_at,
+            status=release.status,
+            active=release.active,
+            on_disk=release.on_disk,
+        )
+        for release in list_releases(app.domain)
+    ]
+    return ReleasesResponse(domain=app.domain, items=items, total=len(items))
+
+
+@router.post("/{domain}/releases/{release_id}/activate", response_model=ReleaseActivationResponse)
+def activate_app_release(
+    domain: str, release_id: str, session: Annotated[dict, Depends(get_current_session)]
+) -> ReleaseActivationResponse:
+    """
+    Make a release the one that serves: an instant rollback, or a roll forward.
+
+    Needs the ``deploy`` scope, like queueing an update: it changes what code
+    runs, and nothing else. The release passes the same health gate as a
+    deploy; one that does not is recorded as failed and the release that was
+    serving is put back before this answers.
+
+    Args:
+        domain: Domain of the application.
+        release_id: The release to activate.
+        session: The authenticated session.
+
+    Returns:
+        What was done.
+
+    Raises:
+        HTTPException: 400 for something that is not a release id, 404 for an
+            unknown application or a release that is not on disk, 409 for an
+            application deployed in place.
+        DeploymentError: The release did not pass its health check; the
+            details carry the probe's and the journal's own output.
+    """
+    app = _release_app_or_error(domain)
+    if not is_release_id(release_id):
+        raise HTTPException(status_code=400, detail=f"Not a release id: {release_id!r}")
+    if not any(r.id == release_id and r.on_disk for r in list_releases(app.domain)):
+        raise HTTPException(
+            status_code=404, detail=f"Release {release_id} of {app.domain} is not on disk"
+        )
+
+    outcome = activate_release(app.domain, release_id, trigger=DeploymentTrigger.PANEL.value)
+    return ReleaseActivationResponse(
+        domain=outcome.domain,
+        release_id=outcome.release.id,
+        previous_id=outcome.previous.id if outcome.previous is not None else None,
+        changed=outcome.changed,
+        rolled_back=outcome.went_back,
+        deployment_id=outcome.deployment_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Migration to the release layout
+# ---------------------------------------------------------------------------
+
+
+class MigrationPlanOut(BaseModel):
+    """
+    What migrating an in-place application to releases would do.
+
+    Attributes:
+        domain: The application's domain.
+        app_path: Its directory.
+        release_id: The name the first release would get (a forecast).
+        commit: The commit the tree is at, when it is a git checkout.
+        persistent: Paths that move to ``shared/`` and are linked into every
+            release from now on.
+        persistent_source: ``git`` (what git does not track), ``explicit``
+            (as named) or ``common`` (the usual upload directories).
+        env_files: Environment files that move to ``shared/``.
+        unit: The unit that runs it, or None for a site.
+        unit_rewrite: Whether the unit is rewritten to run from ``current``.
+        site_rewrite: Whether the site is rewritten to serve ``current``.
+        untracked_files: Files that stay in the first release only.
+        warnings: What the operator should read before going ahead.
+        files: Regular files the directory holds; all of them are kept.
+        bytes: Their total size.
+    """
+
+    domain: str
+    app_path: str
+    release_id: str
+    commit: str | None = None
+    persistent: list[str]
+    persistent_source: str
+    env_files: list[str]
+    unit: str | None = None
+    unit_rewrite: bool
+    site_rewrite: bool
+    untracked_files: list[str]
+    warnings: list[str]
+    files: int
+    bytes: int
+
+
+class MigrateRequest(BaseModel):
+    """Request to migrate an application to the release layout."""
+
+    persist: list[str] | None = Field(
+        default=None,
+        description="Paths to keep in shared/, relative to the application. "
+        "Omitted: what git does not track, or the usual upload directories",
+    )
+
+
+class MigrationResultOut(BaseModel):
+    """
+    What a migration did.
+
+    Attributes:
+        domain: The application's domain.
+        release_id: The first release, now active.
+        persistent: What is kept in ``shared/``.
+        env_files: Environment files moved to ``shared/``.
+        files_before: Regular files before.
+        files_after: Regular files after, ``shared/`` included; always equal.
+        bytes_before: Their size before.
+        bytes_after: Their size after.
+        unit_rewritten: Whether the unit was rewritten.
+        site_rewritten: Whether the site was rewritten.
+        deployment_id: The deployment history row that records it.
+    """
+
+    domain: str
+    release_id: str
+    persistent: list[str]
+    env_files: list[str]
+    files_before: int
+    files_after: int
+    bytes_before: int
+    bytes_after: int
+    unit_rewritten: bool
+    site_rewritten: bool
+    deployment_id: int | None = None
+
+
+def _migratable(domain: str) -> App:
+    """
+    Look up an application a migration request is about.
+
+    Args:
+        domain: Domain from the request.
+
+    Returns:
+        The stored application, deployed in place.
+
+    Raises:
+        HTTPException: 404 when it is unknown, 409 when it is on releases
+            already.
+    """
+    app = _env_app(domain)
+    if app.layout == RELEASES:
+        raise HTTPException(
+            status_code=409, detail=f"{app.domain} is on the release layout already"
+        )
+    return app
+
+
+def _plan_out(plan: MigrationPlan) -> MigrationPlanOut:
+    """
+    Translate a plan to its API model.
+
+    Args:
+        plan: The plan.
+
+    Returns:
+        The model.
+    """
+    return MigrationPlanOut(
+        domain=plan.domain,
+        app_path=plan.app_path,
+        release_id=plan.release_id,
+        commit=plan.commit,
+        persistent=list(plan.persistent),
+        persistent_source=plan.persistent_source,
+        env_files=list(plan.env_files),
+        unit=plan.unit,
+        unit_rewrite=plan.unit_rewrite,
+        site_rewrite=plan.site_rewrite,
+        untracked_files=list(plan.untracked_files),
+        warnings=list(plan.warnings),
+        files=plan.count.files,
+        bytes=plan.count.bytes,
+    )
+
+
+@router.get("/{domain}/migrate/plan", response_model=MigrationPlanOut)
+def get_migration_plan(
+    domain: str,
+    session: Annotated[dict, Depends(get_current_session)],
+    persist: Annotated[list[str] | None, Query()] = None,
+) -> MigrationPlanOut:
+    """
+    Show what migrating an in-place application to releases would do. Changes nothing.
+
+    Args:
+        domain: Domain of the application.
+        session: The authenticated session.
+        persist: Paths to keep in ``shared/``; repeat the parameter for each.
+
+    Returns:
+        The plan, from :func:`wasm.deployers.migrate.plan_migration`.
+
+    Raises:
+        HTTPException: 404 when the application is unknown, 409 when it is on
+            releases already.
+        ValidationError: A path in ``persist`` is not inside the application.
+        DeploymentError: Its type cannot use releases.
+    """
+    app = _migratable(domain)
+    return _plan_out(plan_migration(app.domain, persist))
+
+
+@router.post("/{domain}/migrate", response_model=MigrationResultOut)
+def migrate_app(
+    domain: str,
+    body: MigrateRequest,
+    session: Annotated[dict, Depends(require_elevated)],
+) -> MigrationResultOut:
+    """
+    Move an in-place application onto the release layout.
+
+    Rewrites the unit and the site and moves the whole application tree, so
+    it needs sudo mode. The plan is worked out again here rather than taken
+    from the client: what is executed is what is on disk now.
+
+    Args:
+        domain: Domain of the application.
+        body: Paths to keep in ``shared/``, if the detection is not wanted.
+        session: The authenticated, elevated session.
+
+    Returns:
+        What was done.
+
+    Raises:
+        HTTPException: 404 when the application is unknown, 409 when it is on
+            releases already.
+        ValidationError: A path in ``persist`` is not inside the application.
+        DeploymentError: A step failed or the application did not answer on
+            the new layout; everything was put back, and the details carry
+            the health check's own output.
+    """
+    app = _migratable(domain)
+    plan = plan_migration(app.domain, body.persist)
+    result = migrate(app.domain, plan, trigger=DeploymentTrigger.PANEL.value)
+    return MigrationResultOut(
+        domain=result.domain,
+        release_id=result.release_id,
+        persistent=list(result.persistent),
+        env_files=list(result.env_files),
+        files_before=result.before.files,
+        files_after=result.after.files,
+        bytes_before=result.before.bytes,
+        bytes_after=result.after.bytes,
+        unit_rewritten=result.unit_rewritten,
+        site_rewritten=result.site_rewritten,
+        deployment_id=result.deployment_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Resource limits
+# ---------------------------------------------------------------------------
+
+
+class UpdateLimitsRequest(BaseModel):
+    """
+    The memory, CPU and task limits an application's unit must have.
+
+    The three are set together: a field left out or null removes that limit.
+    """
+
+    memory_max_mb: int | None = Field(
+        default=None, description="MemoryMax, in MB; at least 64. Null: no limit"
+    )
+    cpu_quota_percent: int | None = Field(
+        default=None,
+        description="CPUQuota, in percent of one CPU (200 is two CPUs); 1 to 100 per CPU. "
+        "Null: no limit",
+    )
+    tasks_max: int | None = Field(
+        default=None, description="TasksMax, processes and threads; at least 16. Null: no limit"
+    )
+    restart: bool = Field(
+        default=False, description="Restart now, so the processes run under the new limits"
+    )
+
+
+class LimitsResponse(BaseModel):
+    """
+    The limits an application has now.
+
+    Attributes:
+        domain: The application's domain.
+        memory_max_mb: Memory limit in MB, or None.
+        cpu_quota_percent: CPU quota in percent of one CPU, or None.
+        tasks_max: Task limit, or None.
+        units: The units rewritten.
+        restarted: Whether they were restarted.
+        restart_required: Whether the running processes still have the old
+            limits until they are restarted.
+    """
+
+    domain: str
+    memory_max_mb: int | None = None
+    cpu_quota_percent: int | None = None
+    tasks_max: int | None = None
+    units: list[str]
+    restarted: bool
+    restart_required: bool
+
+
+@router.patch("/{domain}/limits", response_model=LimitsResponse)
+def update_app_limits(
+    domain: str,
+    body: UpdateLimitsRequest,
+    session: Annotated[dict, Depends(require_elevated)],
+) -> LimitsResponse:
+    """
+    Set the memory, CPU and task limits of an application's unit.
+
+    Rewrites the unit (every unit, for a monorepo) and reloads systemd, which
+    is a change to what runs as root's configuration, so it needs sudo mode
+    like editing a unit by hand does. The values are validated where every
+    caller's are, in the service manager.
+
+    Args:
+        domain: Domain of the application.
+        body: The limits, and whether to restart now.
+        session: The authenticated, elevated session.
+
+    Returns:
+        The limits the application has now.
+
+    Raises:
+        HTTPException: 404 when the application is unknown.
+        ValidationError: A limit is out of range (400, with the range).
+        DeploymentError: Nothing runs as a unit for it.
+    """
+    app = _env_app(domain)
+    change = set_resource_limits(
+        app.domain,
+        ResourceLimits(
+            memory_max_mb=body.memory_max_mb,
+            cpu_quota_percent=body.cpu_quota_percent,
+            tasks_max=body.tasks_max,
+        ),
+        restart=body.restart,
+    )
+    return LimitsResponse(
+        domain=change.domain,
+        memory_max_mb=change.limits.memory_max_mb,
+        cpu_quota_percent=change.limits.cpu_quota_percent,
+        tasks_max=change.limits.tasks_max,
+        units=list(change.units),
+        restarted=change.restarted,
+        restart_required=not change.restarted,
+    )

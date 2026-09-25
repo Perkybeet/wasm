@@ -53,6 +53,7 @@ optional, since this manager is the single step every caller must pass through.
 
 from __future__ import annotations
 
+import os
 import re
 import sqlite3
 from collections.abc import Callable, Mapping
@@ -64,10 +65,10 @@ from jinja2 import Environment, PackageLoader, TemplateNotFound
 from jinja2 import TemplateError as JinjaTemplateError
 
 from wasm.core.config import SYSTEMD_DIR
-from wasm.core.exceptions import ServiceError, TemplateError, WASMError
+from wasm.core.exceptions import ServiceError, TemplateError, ValidationError, WASMError
 from wasm.core.fs import FileSystem
 from wasm.core.runner import DEFAULT_TIMEOUT, CommandResult, CommandRunner
-from wasm.core.store import Service, get_store
+from wasm.core.store import App, Service, get_store
 from wasm.managers.base_manager import BaseManager
 from wasm.validators.environment import validate_environment, validate_unit_value
 from wasm.validators.names import validate_service_name
@@ -88,6 +89,161 @@ _FOLLOW_TIMEOUT = 3600
 #: Unit files are not secret - systemd reads them as root and users need to be
 #: able to inspect them - but nothing outside root may rewrite one.
 UNIT_FILE_MODE = 0o644
+
+
+#: The smallest memory limit accepted. Below it a Node or Python process is
+#: killed by the OOM killer while it is still loading, which looks like a
+#: crash loop rather than a limit.
+MIN_MEMORY_MB = 64
+
+#: The smallest task limit accepted. A runtime starts a handful of threads
+#: before it runs any application code, and a limit it cannot start under is
+#: a unit that never comes up.
+MIN_TASKS = 16
+
+#: The directives this manager owns in a unit's ``[Service]`` section.
+LIMIT_DIRECTIVES = ("MemoryMax", "CPUQuota", "TasksMax")
+
+
+@dataclass(frozen=True)
+class ResourceLimits:
+    """
+    What a unit may use. None means unlimited, and writes no directive.
+
+    Attributes:
+        memory_max_mb: ``MemoryMax=``, in megabytes.
+        cpu_quota_percent: ``CPUQuota=``, in percent of one CPU; 200 is two.
+        tasks_max: ``TasksMax=``, processes and threads together.
+    """
+
+    memory_max_mb: int | None = None
+    cpu_quota_percent: int | None = None
+    tasks_max: int | None = None
+
+    @classmethod
+    def of(cls, app: App | None) -> ResourceLimits:
+        """
+        Read the limits an application's row records.
+
+        Args:
+            app: The application, or None for no limits.
+
+        Returns:
+            Its limits.
+        """
+        if app is None:
+            return cls()
+        return cls(
+            memory_max_mb=app.memory_max_mb,
+            cpu_quota_percent=app.cpu_quota_percent,
+            tasks_max=app.tasks_max,
+        )
+
+    def validated(self, cpus: int | None = None) -> ResourceLimits:
+        """
+        Check that the limits are ones a unit can run under.
+
+        Args:
+            cpus: CPUs on this machine; read from the machine when None.
+
+        Returns:
+            The same limits.
+
+        Raises:
+            ValidationError: A limit is below what a runtime needs to start,
+                or asks for more CPU than the machine has.
+        """
+        available = cpus if cpus is not None else (os.cpu_count() or 1)
+        if self.memory_max_mb is not None and self.memory_max_mb < MIN_MEMORY_MB:
+            raise ValidationError(
+                f"A memory limit of {self.memory_max_mb}M is too small",
+                details=f"Allow at least {MIN_MEMORY_MB}M, or no limit.",
+            )
+        if self.cpu_quota_percent is not None and not (
+            1 <= self.cpu_quota_percent <= 100 * available
+        ):
+            raise ValidationError(
+                f"A CPU quota of {self.cpu_quota_percent}% is not possible here",
+                details=f"This machine has {available} CPU(s): use 1% to {100 * available}%.",
+            )
+        if self.tasks_max is not None and self.tasks_max < MIN_TASKS:
+            raise ValidationError(
+                f"A limit of {self.tasks_max} tasks is too small",
+                details=f"Allow at least {MIN_TASKS}, or no limit.",
+            )
+        return self
+
+    def directives(self) -> list[str]:
+        """
+        Write the limits as unit directives.
+
+        The one spelling of them: the template renders these lines when a unit
+        is created and :func:`with_resource_limits` puts them into one that
+        exists, so the two cannot disagree.
+
+        Returns:
+            One line per limit that is set, in a fixed order.
+        """
+        lines = []
+        if self.memory_max_mb is not None:
+            lines.append(f"MemoryMax={self.memory_max_mb}M")
+        if self.cpu_quota_percent is not None:
+            lines.append(f"CPUQuota={self.cpu_quota_percent}%")
+        if self.tasks_max is not None:
+            lines.append(f"TasksMax={self.tasks_max}")
+        return lines
+
+
+def with_resource_limits(unit: str, limits: ResourceLimits) -> str:
+    """
+    Put limits into an existing unit, leaving everything else as it is.
+
+    The unit is edited rather than rendered again, because an operator may
+    have edited it by hand (the panel's unit editor exists for that) and a
+    limit is no reason to throw that away. Any previous limit directive in
+    ``[Service]`` is removed; the new ones go after ``LimitNOFILE=`` when the
+    unit has it, which is where the template puts them, or at the end of the
+    section.
+
+    Args:
+        unit: The unit file.
+        limits: The limits it must have.
+
+    Returns:
+        The unit with exactly these limits.
+
+    Raises:
+        ServiceError: The unit has no ``[Service]`` section.
+    """
+    lines = unit.split("\n")
+    section = ""
+    start = end = anchor = None
+    kept: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if section == "[Service]" and end is None:
+                end = len(kept)
+            section = stripped
+            if section == "[Service]":
+                start = len(kept)
+        elif section == "[Service]" and stripped.split("=", 1)[0] in LIMIT_DIRECTIVES:
+            continue
+        elif section == "[Service]" and stripped.startswith("LimitNOFILE="):
+            anchor = len(kept) + 1
+        kept.append(line)
+    if start is None:
+        raise ServiceError(
+            "The unit has no [Service] section to put limits in",
+            details="Check the unit with 'systemctl cat <name>'; WASM writes one in every unit.",
+        )
+    if end is None:
+        end = len(kept)
+    # Blank lines closing the section stay after the directives, not before.
+    while end > start + 1 and not kept[end - 1].strip():
+        end -= 1
+    position = anchor if anchor is not None else end
+    return "\n".join(kept[:position] + limits.directives() + kept[position:])
 
 
 @dataclass(frozen=True)
@@ -737,6 +893,7 @@ class ServiceManager(BaseManager):
         environment: dict[str, str] | None = None,
         description: str | None = None,
         template: str = "app",
+        limits: ResourceLimits | None = None,
         **kwargs: Any,
     ) -> None:
         """
@@ -756,6 +913,7 @@ class ServiceManager(BaseManager):
             environment: Environment variables.
             description: Service description.
             template: Template name.
+            limits: Memory, CPU and task limits, validated here. None for none.
             **kwargs: Extra context variables passed to the template.
 
         Raises:
@@ -790,6 +948,7 @@ class ServiceManager(BaseManager):
             "user": validate_unit_value(user or self.config.service_user, field="User"),
             "group": validate_unit_value(group or self.config.service_group, field="Group"),
             "environment": env,
+            "resource_limits": (limits or ResourceLimits()).validated().directives(),
         }
         ctx.update(kwargs)
 
@@ -925,6 +1084,36 @@ class ServiceManager(BaseManager):
         self._write_unit_atomically(info.path, content)
         self.daemon_reload()
         return previous
+
+    def set_resource_limits(self, name: str, limits: ResourceLimits) -> str:
+        """
+        Give a unit WASM manages exactly these limits.
+
+        The chokepoint for limits: they are validated here, whoever asks, and
+        written through :meth:`update_config`, which keeps the ownership rules
+        and reloads systemd. The running process keeps the limits it started
+        with until it is restarted.
+
+        Args:
+            name: Service name.
+            limits: The limits the unit must have.
+
+        Returns:
+            The previous unit body, to put back with :meth:`update_config`.
+
+        Raises:
+            ValidationError: A limit is out of range.
+            ServiceError: The unit is not WASM's, or cannot be read or written.
+        """
+        limits.validated()
+        info = self._require_managed(name, operation="limit")
+        try:
+            body = info.path.read_text()
+        except OSError as exc:
+            raise ServiceError(
+                f"Could not read the current unit file: {info.path}", details=str(exc)
+            ) from exc
+        return self.update_config(name, with_resource_limits(body, limits))
 
     def delete_service(self, name: str) -> None:
         """

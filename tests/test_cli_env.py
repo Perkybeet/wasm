@@ -15,8 +15,10 @@ only reason this group needs care at all.
 from __future__ import annotations
 
 import io
+import os
 import stat
 from argparse import Namespace
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -30,6 +32,9 @@ from wasm.core.config import REDACTED
 from wasm.core.exceptions import EnvConfigError
 from wasm.core.fs import DryRunFileSystem, set_fs
 from wasm.core.logger import Logger
+from wasm.core.runner import FakeRunner
+from wasm.core.store import App, WASMStore
+from wasm.deployers.helpers import app_env as app_env_module
 from wasm.deployers.helpers.env_manager import EnvManager, EnvVariable
 
 #: Flags the root group owns. A subcommand that declares one of them again is
@@ -88,13 +93,39 @@ def logged(monkeypatch: pytest.MonkeyPatch) -> io.StringIO:
 
 
 @pytest.fixture
-def deployed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[WASMStore]:
     """
-    Provide an application deployed at example.com.
+    Provide an empty store in the test's directory, where the command looks.
 
     Args:
         tmp_path: Per-test temporary directory.
         monkeypatch: Patching helper, scoped to the test.
+
+    Yields:
+        The store.
+    """
+    WASMStore.reset_instance()
+    instance = WASMStore(tmp_path / "wasm.db")
+    monkeypatch.setattr(app_env_module, "get_store", lambda: instance)
+    yield instance
+    WASMStore.reset_instance()
+
+
+@pytest.fixture
+def deployed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, store: WASMStore, runner: FakeRunner
+) -> Path:
+    """
+    Provide an application deployed at example.com, with no store row.
+
+    That is how an application deployed before the store existed looks, and
+    it is found by its directory; the tests that need a row add one.
+
+    Args:
+        tmp_path: Per-test temporary directory.
+        monkeypatch: Patching helper, scoped to the test.
+        store: The empty store.
+        runner: Fake runner for the ownership hand-over of a written .env.
 
     Returns:
         The application root.
@@ -102,7 +133,13 @@ def deployed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     apps = tmp_path / "apps"
     app_path = apps / "example-com"
     app_path.mkdir(parents=True)
-    monkeypatch.setattr(env_module, "Config", lambda: SimpleNamespace(apps_directory=apps))
+    monkeypatch.setattr(
+        app_env_module,
+        "Config",
+        lambda: SimpleNamespace(
+            apps_directory=apps, service_user="www-data", service_group="www-data"
+        ),
+    )
     return app_path
 
 
@@ -549,3 +586,93 @@ def test_show_is_the_only_command_that_prints_values_and_it_needs_a_flag() -> No
         if "--unmask" in param.opts
     )
     assert unmask.default is False
+
+
+# ---------------------------------------------------------------------------
+# The release layout: the .env lives in shared/
+# ---------------------------------------------------------------------------
+
+#: A release, as ReleaseManager names them.
+RELEASE_ID = "20260925-120000-nogit"
+
+
+def on_releases(root: Path, store: WASMStore, *, env_text: str | None = None) -> Path:
+    """
+    Turn the deployed application into one on the release layout.
+
+    Args:
+        root: The application directory.
+        store: Where its row is recorded.
+        env_text: What ``shared/.env`` holds, or None for no ``.env`` yet.
+
+    Returns:
+        The active release.
+    """
+    release = root / "releases" / RELEASE_ID
+    release.mkdir(parents=True)
+    (release / ".env.example").write_text("API_KEY=\n", encoding="utf-8")
+    (root / "current").symlink_to(Path("releases") / RELEASE_ID)
+    (root / "shared").mkdir()
+    if env_text is not None:
+        (root / "shared" / ".env").write_text(env_text, encoding="utf-8")
+        (release / ".env").symlink_to(Path("../../shared/.env"))
+    store.create_app(App(domain="example.com", app_path=str(root), layout="releases"))
+    return release
+
+
+def test_show_reads_the_shared_env_of_a_release_app(
+    deployed: Path, store: WASMStore, logged: io.StringIO
+) -> None:
+    """<app>/.env does not exist on releases; reading it showed nothing."""
+    on_releases(deployed, store, env_text="PORT=4000\n")
+
+    assert env_module._env_show("example.com", unmask=False, verbose=False) == 0
+
+    assert "4000" in logged.getvalue()
+    assert not (deployed / ".env").exists()
+
+
+def test_export_reads_the_shared_env_of_a_release_app(
+    deployed: Path, store: WASMStore, tmp_path: Path
+) -> None:
+    """The export is the file the application runs with, wherever it is."""
+    on_releases(deployed, store, env_text="API_KEY=ak_live_9f3c\n")
+    target = tmp_path / "exported.env"
+
+    assert env_module._env_export("example.com", str(target), verbose=False) == 0
+
+    assert target.read_text(encoding="utf-8") == "API_KEY=ak_live_9f3c\n"
+
+
+def test_configure_on_a_release_app_writes_shared_and_never_a_stray_file(
+    deployed: Path, store: WASMStore, runner: FakeRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Declared by the active release, written to shared/, handed to the service.
+
+    A first .env on an app deployed without one is linked into the active
+    release, so a restart picks it up without a redeploy.
+    """
+    release = on_releases(deployed, store)
+    discovered_in: list[Path] = []
+
+    def discover(self: EnvManager, path: Path) -> list[EnvVariable]:
+        discovered_in.append(path)
+        return [EnvVariable(name="API_KEY")]
+
+    monkeypatch.setattr(EnvManager, "discover", discover)
+    monkeypatch.setattr(
+        EnvManager, "prompt_variables", lambda self, variables, existing: {"API_KEY": "k"}
+    )
+
+    assert env_module._env_configure("example.com", verbose=False) == 0
+
+    shared_env = deployed / "shared" / ".env"
+    assert discovered_in == [deployed / "current"]
+    assert shared_env.read_text(encoding="utf-8") == "API_KEY=k\n"
+    assert stat.S_IMODE(shared_env.stat().st_mode) == 0o600
+    assert not os.path.lexists(deployed / ".env")
+    assert os.readlink(release / ".env") == "../../shared/.env"
+    assert ("chown", "www-data:www-data", str(shared_env)) in runner.calls
+    assert (deployed / "shared" / ".wasm" / "env-config.json").is_file()
+    assert not (deployed / ".wasm").exists()

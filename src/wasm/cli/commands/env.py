@@ -8,12 +8,17 @@ Environment variables of a deployed application.
 The three actions share one rule: a ``.env`` holds credentials, so nothing here
 prints a value in clear unless the operator asked for it with ``--unmask``, and
 every file written goes through
-:meth:`~wasm.deployers.helpers.env_manager.EnvManager._write_single_env_file`,
+:meth:`~wasm.deployers.helpers.env_manager.EnvManager.write_env_file`,
 which creates it 0600 rather than letting the process umask decide.
 
-Both entry points, the Click commands below and the legacy
-:func:`handle_env` that ``wasm.cli.parser`` still calls, run the same private
-functions, so the two paths cannot drift apart while the migration finishes.
+Which file is the application's ``.env`` is not decided here: on the release
+layout it is ``shared/.env``, and :mod:`wasm.deployers.helpers.app_env` reads
+and writes it wherever it is, for this command and the panel alike.
+
+Both entry points, the Click commands below and the legacy :func:`handle_env`,
+run the same private functions, so the two paths cannot drift apart.
+``wasm.cli.parser`` is gone and nothing calls :func:`handle_env` in
+production anymore; it is kept, and tested directly, for the same reason.
 """
 
 from __future__ import annotations
@@ -26,11 +31,13 @@ from typing import Any
 import click
 
 from wasm.cli.app import Context, pass_context
-from wasm.core.config import REDACTED, Config, redact_secrets
+from wasm.core.config import REDACTED, redact_secrets
 from wasm.core.exceptions import EnvConfigError, WASMError
 from wasm.core.logger import Logger
-from wasm.core.utils import domain_to_app_name
+from wasm.core.store import App
+from wasm.deployers.helpers.app_env import find_app, read_app_env, write_app_env
 from wasm.deployers.helpers.env_manager import EnvConfig, EnvManager, redact_url_credentials
+from wasm.deployers.helpers.layout import code_path_for, env_file_for
 
 #: Historical spellings of the subcommand names. They are in scripts and in the
 #: published documentation, so dropping one is a breaking change.
@@ -135,15 +142,15 @@ def _redact(values: Mapping[str, str]) -> dict[str, str]:
     return safe
 
 
-def _app_path(domain: str) -> Path:
+def _app(domain: str) -> App:
     """
-    Locate the directory of a deployed application.
+    Locate a deployed application.
 
     Args:
         domain: Domain the application is served on.
 
     Returns:
-        Path to the application root.
+        The application, as the store records it or as its directory shows.
 
     Raises:
         EnvConfigError: If the domain is empty or nothing is deployed there.
@@ -154,13 +161,13 @@ def _app_path(domain: str) -> Path:
             details="Name the application, for example: wasm env show example.com",
         )
 
-    path = Config().apps_directory / domain_to_app_name(domain)
-    if not path.exists():
+    app = find_app(domain)
+    if app is None:
         raise EnvConfigError(
             f"Application not found: {domain}",
-            details=f"Nothing is deployed at {path}. Run 'wasm list' to see what is.",
+            details="Nothing is deployed at that domain. Run 'wasm list' to see what is.",
         )
-    return path
+    return app
 
 
 def _env_configure(domain: str, verbose: bool) -> int:
@@ -178,27 +185,29 @@ def _env_configure(domain: str, verbose: bool) -> int:
         EnvConfigError: If nothing is deployed at this domain.
     """
     logger = Logger(verbose=verbose)
-    app_path = _app_path(domain)
+    app = _app(domain)
     manager = EnvManager(verbose=verbose)
 
     logger.header(f"Environment Configuration: {domain}")
 
-    variables = manager.discover(app_path)
+    # The variables are declared by the code (.env.example), which on the
+    # release layout is the active release; the values live in the .env,
+    # which is in shared/.
+    variables = manager.discover(code_path_for(app))
     if not variables:
         logger.info("No .env.example files found")
         return 0
 
     logger.info(f"Found {len(variables)} variables")
 
-    existing = manager.get_current_values(app_path)
+    existing = read_app_env(app, manager=manager)
     values = manager.prompt_variables(variables, existing)
 
-    # write_env_files goes through secure_write, so the .env lands 0600 and is
-    # never left readable by the web server user.
-    for path in manager.write_env_files(app_path, values):
-        logger.success(f"Written: {path}")
+    # Written 0600 and owned by the service account, never left readable by
+    # the web server user.
+    logger.success(f"Written: {write_app_env(app, values, manager=manager, logger=logger)}")
 
-    manager.save_config(app_path, EnvConfig(variables=variables))
+    manager.save_config(env_file_for(app).parent, EnvConfig(variables=variables))
     return 0
 
 
@@ -218,10 +227,7 @@ def _env_show(domain: str, unmask: bool, verbose: bool) -> int:
         EnvConfigError: If nothing is deployed at this domain.
     """
     logger = Logger(verbose=verbose)
-    app_path = _app_path(domain)
-
-    manager = EnvManager(verbose=verbose)
-    values = manager.get_current_values(app_path)
+    values = read_app_env(_app(domain), manager=EnvManager(verbose=verbose))
 
     if not values:
         logger.info(f"No environment variables found for {domain}")
@@ -262,10 +268,8 @@ def _env_export(domain: str, output: str, verbose: bool) -> int:
         SecurityError: If the destination is a symlink.
     """
     logger = Logger(verbose=verbose)
-    app_path = _app_path(domain)
-
     manager = EnvManager(verbose=verbose)
-    values = manager.get_current_values(app_path)
+    values = read_app_env(_app(domain), manager=manager)
 
     if not values:
         logger.info(f"No environment variables found for {domain}")
@@ -274,7 +278,7 @@ def _env_export(domain: str, output: str, verbose: bool) -> int:
     output_path = Path(output)
     # The export carries the secrets in clear, so it is written through the
     # same 0600 seam as the deployed .env rather than with a plain write.
-    manager._write_single_env_file(output_path, values)
+    manager.write_env_file(output_path, values)
     logger.success(f"Exported {len(values)} variables to {output_path}")
     logger.info("The file holds secrets in clear and is readable by its owner only.")
     return 0
@@ -335,8 +339,9 @@ def handle_env(args: Namespace) -> int:
     """
     Run an env action from the argparse namespace.
 
-    Kept while ``wasm.cli.parser`` is still wired to argparse. It shares every
-    private function with the Click commands above.
+    ``wasm.cli.parser`` is gone and nothing calls this in production; it is
+    kept, and tested directly, sharing every private function with the Click
+    commands above so the two cannot drift apart.
 
     Args:
         args: Parsed command-line arguments.

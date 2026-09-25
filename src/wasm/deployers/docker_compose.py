@@ -27,11 +27,18 @@ from wasm.core.exceptions import (
     WASMError,
 )
 from wasm.core.fs import FileSystem
-from wasm.core.logger import Logger
 from wasm.core.runner import CommandResult, CommandRunner, get_runner
-from wasm.core.store import App, AppStatus, AppType, get_store
+from wasm.core.store import AppStatus, AppType, DeploymentTrigger, get_store
 from wasm.core.utils import domain_to_app_name
+from wasm.deployers.helpers.registration import StoreRegistrar
 from wasm.deployers.interface import AppDeployer, StepReporter, UpdateResult
+from wasm.deployers.recorder import (
+    CapturingLogger,
+    DeploymentRecorder,
+    checkout_git_info,
+    recorder_for,
+    recording,
+)
 from wasm.deployers.registry import DeployerRegistry
 from wasm.managers.cert_manager import CertManager
 from wasm.managers.nginx_manager import NginxManager
@@ -113,9 +120,12 @@ class DockerComposeDeployer(AppDeployer):
         self.verbose = verbose
         self._runner = runner
         self._fs = fs
-        self.logger = Logger(verbose=verbose)
+        # Capturable, so the deployment history holds the whole build log.
+        self.logger = CapturingLogger(verbose=verbose)
         self.config = Config()
         self.store = get_store()
+        self.trigger: str = DeploymentTrigger.CLI.value
+        self._is_new_deployment = True
 
         # Deployment state
         self.domain = ""
@@ -225,6 +235,7 @@ class DockerComposeDeployer(AppDeployer):
         app_path: Path | None = None,
         package_manager: str = "auto",
         include_www: bool = False,
+        trigger: str = DeploymentTrigger.CLI.value,
         **options: Any,
     ) -> None:
         """
@@ -241,11 +252,13 @@ class DockerComposeDeployer(AppDeployer):
             app_path: Override the directory the application lives in.
             package_manager: Ignored; images are built by docker.
             include_www: Ignored; compose stacks are proxied on one hostname.
+            trigger: What initiated this deployment, recorded in the history.
             **options: ``compose_file`` selects a specific compose file and
                 ``compose_profiles`` activates Docker Compose profiles.
         """
         self.domain = domain
         self.source = source
+        self.trigger = trigger
         self.app_name = domain_to_app_name(domain)
         self.app_path = app_path or (self.config.apps_directory / self.app_name)
         self.webserver = webserver
@@ -297,7 +310,10 @@ class DockerComposeDeployer(AppDeployer):
             return self.runner.stream(
                 command, on_line=self.logger.debug, cwd=self.app_path, timeout=timeout
             )
-        return self.runner.run(command, cwd=self.app_path, timeout=timeout)
+        result = self.runner.run(command, cwd=self.app_path, timeout=timeout)
+        # Printed only with --verbose, captured into the deployment log always.
+        self.logger.command_output(result.stdout, result.stderr)
+        return result
 
     def _is_headless(self) -> bool:
         """
@@ -329,8 +345,24 @@ class DockerComposeDeployer(AppDeployer):
         Returns:
             True when the stack ended up deployed.
 
+        Every attempt is recorded in the deployment history with its log. A
+        failed first deployment is undone; a failed redeployment leaves the
+        application as it is and marks it failed, because undoing it would
+        delete a stack that was serving.
+
         Raises:
             DeploymentError: If any deployment step fails.
+        """
+        self._is_new_deployment = self.store.get_app(self.domain) is None
+        with recording(self._recorder(), git_branch=self.branch):
+            return self._deploy_steps()
+
+    def _deploy_steps(self) -> bool:
+        """
+        Run the deployment steps.
+
+        Returns:
+            True when the stack ended up deployed.
         """
         total_steps = 9
 
@@ -389,7 +421,10 @@ class DockerComposeDeployer(AppDeployer):
 
         except Exception as e:
             self.logger.error(f"Deployment failed: {e}")
-            self._rollback()
+            if self._is_new_deployment:
+                self._rollback()
+            else:
+                self.store.update_app_status(self.domain, AppStatus.FAILED.value)
             raise
 
     def _compose_file_path(self) -> Path:
@@ -766,27 +801,43 @@ class DockerComposeDeployer(AppDeployer):
         return False
 
     def _register_app(self) -> None:
-        """Register the application in the WASM store."""
+        """
+        Register or update the application in the WASM store.
+
+        Through the same registrar as every other deployer: a redeploy
+        updates the row it has instead of failing to insert a second one,
+        and keeps what this deployment does not know (the layout, the
+        retention, the resource limits).
+        """
         headless = self._is_headless()
-        primary_port = 0 if headless else self._get_primary_port()
-
-        app = App(
-            domain=self.domain,
-            app_type=AppType.DOCKER_COMPOSE.value,
-            source=self.source,
-            branch=self.branch,
-            port=primary_port,
-            app_path=str(self.app_path),
-            webserver="" if headless else self.webserver,
-            ssl_enabled=self.ssl,
-            status=AppStatus.RUNNING.value,
-            env_vars=self.env_vars,
-        )
-
         try:
-            self.store.create_app(app)
+            StoreRegistrar(self.store).register_app(
+                domain=self.domain,
+                app_type=AppType.DOCKER_COMPOSE.value,
+                source=self.source,
+                branch=self.branch,
+                port=0 if headless else self._get_primary_port(),
+                app_path=self.app_path,
+                webserver="" if headless else self.webserver,
+                ssl_enabled=self.ssl,
+                status=AppStatus.RUNNING.value,
+                is_static=False,
+                env_vars=self.env_vars,
+            )
         except (WASMError, sqlite3.Error) as e:
             self.logger.warning(f"Could not register app in store: {e}")
+
+    def _recorder(self) -> DeploymentRecorder:
+        """
+        Build the recorder a deploy or an update writes history with.
+
+        Returns:
+            A recorder, built where every deployer's is.
+        """
+        return recorder_for(
+            self,
+            git_info=checkout_git_info(SourceManager(verbose=self.verbose), self.app_path),
+        )
 
     def _rollback(self) -> None:
         """Clean up on deployment failure."""
@@ -919,8 +970,22 @@ class DockerComposeDeployer(AppDeployer):
             DeploymentError: When no compose file can be found.
             DockerError: When the build or the recreate fails.
         """
-        report = on_step or (lambda _message: None)
+        with recording(self._recorder(), git_branch=self.branch):
+            return self._update_steps(on_step or (lambda _message: None))
 
+    def _update_steps(self, report: StepReporter) -> UpdateResult:
+        """
+        Rebuild the images and recreate the containers.
+
+        Args:
+            report: Called as each step begins.
+
+        Returns:
+            What was done.
+
+        Raises:
+            DockerError: When the build or the recreate fails.
+        """
         if self.compose_path is None:
             self._discover_compose_file()
 

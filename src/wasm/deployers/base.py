@@ -30,7 +30,6 @@ exactly as it was.
 
 from __future__ import annotations
 
-import re
 import sqlite3
 from abc import abstractmethod
 from collections.abc import Callable, Mapping, Sequence
@@ -61,8 +60,9 @@ from wasm.deployers.helpers import (
     PrismaHelper,
     preflight,
 )
-from wasm.deployers.helpers.health import answers, failure_output, wait_until_healthy
-from wasm.deployers.helpers.layout import RELEASES, choose_layout
+from wasm.deployers.helpers.health import failure_output, wait_until_healthy
+from wasm.deployers.helpers.health_gate import HealthGate
+from wasm.deployers.helpers.layout import RELEASES, choose_layout, env_file_in
 from wasm.deployers.helpers.nginx_config import NginxAdvancedConfig
 from wasm.deployers.helpers.permissions import hand_over_tree
 from wasm.deployers.helpers.registration import StoreRegistrar
@@ -76,12 +76,18 @@ from wasm.deployers.helpers.release_build import (
 from wasm.deployers.helpers.summary import print_deployment_summary
 from wasm.deployers.interface import AppDeployer, StepReporter, UpdateResult
 from wasm.deployers.pipeline import DeployStep, run_pipeline
-from wasm.deployers.recorder import CapturingLogger, DeploymentRecorder
-from wasm.deployers.releases import CURRENT_LINK, ENV_FILE, ReleaseManager
+from wasm.deployers.recorder import (
+    CapturingLogger,
+    DeploymentRecorder,
+    checkout_git_info,
+    recorder_for,
+    recording,
+)
+from wasm.deployers.releases import CURRENT_LINK, ReleaseManager
 from wasm.managers.apache_manager import ApacheManager
 from wasm.managers.cert_manager import CertManager
 from wasm.managers.nginx_manager import NginxManager
-from wasm.managers.service_manager import ServiceManager
+from wasm.managers.service_manager import ResourceLimits, ServiceManager
 from wasm.managers.source_manager import SourceManager
 from wasm.validators.environment import validate_environment, validate_unit_value
 
@@ -96,16 +102,6 @@ BUILD_TIMEOUT = 2700
 
 #: Everything else in a deployer is a quick local command.
 COMMAND_TIMEOUT = 300
-
-#: How long a new release gets to answer before it is rolled back: attempts,
-#: and seconds between them. Longer than the post-deploy check, because a
-#: failed gate throws a good build away while a failed report only warns.
-HEALTH_GATE_ATTEMPTS = 15
-HEALTH_GATE_DELAY = 2.0
-
-#: Journal lines attached to a failed health gate, so the deployment record
-#: shows why the process did not come up, not only that it did not.
-HEALTH_GATE_JOURNAL_LINES = 40
 
 #: Failures while writing release bookkeeping. The release on disk is the
 #: truth; a row that could not be written is reported, never fatal.
@@ -143,6 +139,7 @@ class BaseDeployer(AppDeployer):
     #: without ``__init__`` (as some tests do) still behaves in place.
     _layout: str | None = None
     _staged: StagedRelease | None = None
+    _app_record: App | None = None
 
     def __init__(
         self,
@@ -219,7 +216,6 @@ class BaseDeployer(AppDeployer):
         self._persistent_request: list[str] | None = None
         self._releases: ReleaseManager | None = None
         self._staged: StagedRelease | None = None
-        self._health_attempts: list[str] = []
         #: The release whose dependencies the last build reused, if any.
         self.dependencies_reused_from: str | None = None
 
@@ -768,7 +764,7 @@ class BaseDeployer(AppDeployer):
 
         # A release shares the .env every earlier release used; generating a
         # new one would replace the secrets the application already runs on.
-        if self.uses_releases and (self.releases.shared_dir / ENV_FILE).exists():
+        if self.uses_releases and self._env_file().exists():
             return False
 
         # Check for .env.example
@@ -796,13 +792,20 @@ class BaseDeployer(AppDeployer):
         for key, val in self.env_vars.items():
             values[key] = val
 
-        # Write .env file
-        env_dir = self.releases.shared_dir if self.uses_releases else self.app_path
-        self._env_manager.write_env_files(env_dir, values)
+        self._env_manager.write_env_file(self._env_file(), values)
         self.logger.substep("Created .env from .env.example")
 
         # Update env_vars so they're available for systemd
         self.env_vars.update(values)
+
+    def _env_file(self) -> Path:
+        """
+        Return where this application's ``.env`` lives.
+
+        Returns:
+            ``shared/.env`` on releases, the application directory's in place.
+        """
+        return env_file_in(self.app_path, self._layout)
 
     def check_dependencies(self) -> bool:
         """
@@ -1219,6 +1222,9 @@ class BaseDeployer(AppDeployer):
             working_directory=working_directory,
             environment=env,
             description=description,
+            # The application's settings, not this deployment's: a redeploy
+            # writes a new unit and must not drop the limits set on the old.
+            limits=ResourceLimits.of(self._app_row()),
         )
 
         # Enable service
@@ -1590,20 +1596,11 @@ class BaseDeployer(AppDeployer):
             Whether it is healthy, and when it is not, the evidence: the
             failed probes and the unit's journal, verbatim.
         """
-        self._health_attempts = []
-        try:
-            self.restart()
-        except WASMError as exc:
-            # str() of a WASMError carries its details: systemctl's own output.
-            return False, self._health_evidence(str(exc))
+        return self._health_gate().restart_and_probe()
 
-        if self._release_is_healthy():
-            return True, ""
-        return False, self._health_evidence("The application did not answer the health check.")
-
-    def _release_is_healthy(self) -> bool:
+    def _health_gate(self) -> HealthGate:
         """
-        Ask the release that was just activated whether it is up.
+        Build the gate a release must pass to stay active.
 
         A service answers over HTTP: any response below 500 means the process
         started and routes requests, redirects included. A site without a
@@ -1611,54 +1608,19 @@ class BaseDeployer(AppDeployer):
         looks for the files it serves.
 
         Returns:
-            True when it is up.
+            The gate, the same one an operator's rollback goes through.
         """
-        if not self.get_start_command():
-            return self.health_check()
-        url = f"http://127.0.0.1:{self.port}{self.get_health_check()}"
-        self.logger.substep(f"Checking: {url}")
-        return wait_until_healthy(
-            url,
-            retries=HEALTH_GATE_ATTEMPTS,
-            delay=HEALTH_GATE_DELAY,
-            on_attempt=self._note_health_attempt,
-            accept=answers,
+        serves = bool(self.get_start_command())
+        return HealthGate(
+            unit=self.app_name if serves and self.app_name else None,
+            url=f"http://127.0.0.1:{self.port}{self.get_health_check()}" if serves else None,
+            services=self.service_manager,
+            logger=self.logger,
+            # Looked up here, at call time, so it is the one this module holds.
+            probe=wait_until_healthy,
+            restart=self.restart,
+            files_check=None if serves else self.health_check,
         )
-
-    def _note_health_attempt(self, message: str) -> None:
-        """
-        Keep a failed probe for the evidence, and log it like any other.
-
-        Args:
-            message: What the probe reported.
-        """
-        self._health_attempts.append(message)
-        self.logger.debug(message)
-
-    def _health_evidence(self, summary: str) -> str:
-        """
-        Put together what a failed health gate shows the operator.
-
-        Args:
-            summary: What failed, in one line or a command's own output.
-
-        Returns:
-            The summary, every failed probe, and the last lines of the unit's
-            journal, which is where a process that crashed says why.
-        """
-        parts = [summary]
-        if self._health_attempts:
-            parts.append("\n".join(_collapse_attempts(self._health_attempts)))
-        if self.get_start_command() and self.app_name:
-            try:
-                journal = self.service_manager.logs(
-                    self.app_name, lines=HEALTH_GATE_JOURNAL_LINES
-                ).strip()
-            except WASMError as exc:
-                journal = f"(the journal could not be read: {exc})"
-            if journal:
-                parts.append(f"Last lines of the journal of {self.app_name}:\n{journal}")
-        return "\n\n".join(parts)
 
     def _abandon_release(self) -> None:
         """
@@ -1916,14 +1878,7 @@ class BaseDeployer(AppDeployer):
             store, logger and filesystem. One shared construction site, so the
             deploy and update paths cannot record differently.
         """
-        return DeploymentRecorder(
-            self.store,
-            self.domain,
-            self.trigger,
-            logger=self.logger,
-            fs=self.fs,
-            git_info=self._git_info,
-        )
+        return recorder_for(self, git_info=self._git_info)
 
     def _git_info(self) -> tuple[str | None, str | None]:
         """
@@ -1944,10 +1899,7 @@ class BaseDeployer(AppDeployer):
             if branch is None and reader is not None and (cache / ".git").is_dir():
                 branch = reader(cache).get("branch")
             return self._staged.short_commit, branch
-        if reader is None or not self.app_path:
-            return None, None
-        info = reader(self.app_path)
-        return info.get("commit"), info.get("branch")
+        return checkout_git_info(self.source_manager, self.app_path)()
 
     def update(self, on_step: StepReporter | None = None) -> UpdateResult:
         """
@@ -1980,19 +1932,14 @@ class BaseDeployer(AppDeployer):
         report = on_step or (lambda _message: None)
         releases = self.resolve_layout() == RELEASES
 
-        recorder = self._recorder()
-        recorder.start(git_branch=self.branch)
-        try:
-            result = self._update_release(report) if releases else self._update_in_place(report)
-        except Exception as exc:
-            # Not handling: the failure is recorded and re-raised unchanged.
+        with recording(
+            self._recorder(),
+            git_branch=self.branch,
+            on_failure=(lambda _exc: self._abandon_release()) if releases else None,
+        ):
             if releases:
-                self._abandon_release()
-            recorder.finish_failure(exc)
-            raise
-
-        recorder.finish_success()
-        return result
+                return self._update_release(report)
+            return self._update_in_place(report)
 
     def _update_in_place(self, report: StepReporter) -> UpdateResult:
         """
@@ -2144,22 +2091,24 @@ class BaseDeployer(AppDeployer):
                 ),
             )
 
-        recorder = self._recorder()
-        recorder.start(git_branch=self.branch)
-        try:
+        with recording(self._recorder(), git_branch=self.branch, on_failure=self._deploy_failed):
             run_pipeline(steps, self.logger)
-        except Exception as e:
-            if not is_new_deployment and self._app_record is not None:
-                # The rows survive a failed redeployment; mark them honestly.
-                self._app_record.status = AppStatus.FAILED.value
-                self.store.update_app(self._app_record)
-            self.logger.error(f"Deployment failed: {e}")
-            recorder.finish_failure(e)
-            raise
 
-        recorder.finish_success()
         self._report_result()
         return True
+
+    def _deploy_failed(self, error: BaseException) -> None:
+        """
+        Mark a failed deployment in the application's row and say so.
+
+        Args:
+            error: What the failing step raised.
+        """
+        if not self._is_new_deployment and self._app_record is not None:
+            # The rows survive a failed redeployment; mark them honestly.
+            self._app_record.status = AppStatus.FAILED.value
+            self.store.update_app(self._app_record)
+        self.logger.error(f"Deployment failed: {error}")
 
     def _report_result(self) -> None:
         """Print the summary, plus troubleshooting hints when unhealthy."""
@@ -2209,46 +2158,6 @@ class BaseDeployer(AppDeployer):
             layout=self._layout,
             persistent_paths=self._persistent_request,
         )
-
-
-#: How :func:`~wasm.deployers.helpers.health.wait_until_healthy` reports a
-#: failed attempt.
-_ATTEMPT = re.compile(r"^Health check attempt (\d+) failed: (.*)$", re.DOTALL)
-
-
-def _collapse_attempts(messages: Sequence[str]) -> list[str]:
-    """
-    Fold consecutive probe failures with the same cause into one line.
-
-    Fifteen identical "connection refused" lines say less than one line that
-    names the range, and push the journal, which says why, out of sight.
-
-    Args:
-        messages: Failed attempts, in order, as the probe reported them.
-
-    Returns:
-        The same information, one line per run of identical causes.
-    """
-    runs: list[tuple[str, str, str]] = []
-    for message in messages:
-        match = _ATTEMPT.match(message)
-        if match is None:
-            runs.append(("", "", message))
-            continue
-        number, cause = match.groups()
-        if runs and runs[-1][0] and runs[-1][2] == cause:
-            runs[-1] = (runs[-1][0], number, cause)
-        else:
-            runs.append((number, number, cause))
-    lines: list[str] = []
-    for first, last, cause in runs:
-        if not first:
-            lines.append(cause)
-        elif first == last:
-            lines.append(f"Health check attempt {first} failed: {cause}")
-        else:
-            lines.append(f"Health check attempts {first}-{last} failed: {cause}")
-    return lines
 
 
 def _dotenv_files(tree: Path) -> list[Path]:

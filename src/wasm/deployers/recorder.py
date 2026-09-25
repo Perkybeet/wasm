@@ -28,10 +28,11 @@ Two guarantees shape everything here:
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import TextIO
+from typing import Protocol, TextIO
 
 from wasm.core.exceptions import WASMError
 from wasm.core.fs import DryRunFileSystem, FileSystem, get_fs
@@ -464,3 +465,114 @@ class DeploymentRecorder:
         self._close_log()
         self._deployment_id = None
         self._log_path = None
+
+
+class Recordable(Protocol):
+    """What a deployer offers to be recorded: the attributes every deployer has."""
+
+    @property
+    def store(self) -> WASMStore:
+        """The store the history row goes to."""
+
+    @property
+    def domain(self) -> str:
+        """The domain being deployed."""
+
+    @property
+    def trigger(self) -> str:
+        """Who asked: ``cli``, ``panel`` or ``webhook``."""
+
+    @property
+    def logger(self) -> Logger:
+        """The logger the deployment reports through."""
+
+    @property
+    def fs(self) -> FileSystem:
+        """The filesystem the deployment changes the machine through."""
+
+
+def checkout_git_info(source_manager: object, path: Path) -> GitInfo:
+    """
+    Build the ``git_info`` of an application deployed in place.
+
+    Args:
+        source_manager: What reads the checkout: anything with the source
+            manager's ``get_repo_info``. Test doubles stand in for it without
+            implementing all of it, and one that cannot answer is "unknown",
+            not an error.
+        path: The checkout.
+
+    Returns:
+        A callable answering its short commit and branch, each None when the
+        tree is not a checkout or cannot say.
+    """
+
+    def read() -> tuple[str | None, str | None]:
+        reader = getattr(source_manager, "get_repo_info", None)
+        if reader is None or path == Path():
+            return None, None
+        info = reader(path)
+        return info.get("commit"), info.get("branch")
+
+    return read
+
+
+def recorder_for(deployer: Recordable, *, git_info: GitInfo | None = None) -> DeploymentRecorder:
+    """
+    Build the recorder for one deploy or update of a deployer.
+
+    The one construction site for every deployer: the base pipeline, the
+    monorepo and the docker-compose deployers record the same way because
+    they build their recorder here.
+
+    Args:
+        deployer: The deployer being recorded.
+        git_info: Answers the commit and branch that were deployed.
+
+    Returns:
+        A recorder wired to the deployer's store, logger and filesystem.
+    """
+    return DeploymentRecorder(
+        deployer.store,
+        deployer.domain,
+        deployer.trigger,
+        logger=deployer.logger,
+        fs=deployer.fs,
+        git_info=git_info,
+    )
+
+
+@contextmanager
+def recording(
+    recorder: DeploymentRecorder,
+    *,
+    git_branch: str | None = None,
+    on_failure: Callable[[BaseException], None] | None = None,
+) -> Iterator[DeploymentRecorder]:
+    """
+    Record whatever runs inside the block as one deployment attempt.
+
+    The row is opened on entry and closed with the outcome on the way out:
+    success when the block returns, failure with the error verbatim when it
+    raises, whatever it raises - an interrupted deploy is a failed one, not a
+    row left "running" for ever. The error is re-raised unchanged.
+
+    Args:
+        recorder: The recorder, as built by :func:`recorder_for`.
+        git_branch: Branch requested, when known.
+        on_failure: Cleanup to run before the failure is recorded, such as
+            abandoning a half-built release.
+
+    Yields:
+        The recorder, for the block to annotate.
+    """
+    recorder.start(git_branch=git_branch)
+    try:
+        yield recorder
+    except BaseException as exc:
+        # Not handling: the failure is recorded and re-raised unchanged.
+        if on_failure is not None:
+            on_failure(exc)
+        recorder.finish_failure(exc)
+        raise
+    recorder.finish_success()
