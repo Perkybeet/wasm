@@ -1,2 +1,0 @@
-const __vite__mapDeps=(i,m=__vite__mapDeps,d=(m.f||(m.f=["assets/environment-qDCiVB6M.js","assets/cx-DTdc60p7.js","assets/Placeholder-FAtRKP3j.js","assets/IconButton-0sjXDEC2.js","assets/useBaseUiId-DcK_QUde.js","assets/Button-Buluhrdh.js","assets/auth-DDbVHo9O.js","assets/documentTitle-BrEtSqbc.js"])))=>i.map(i=>d[i]);
-import{n as e,r as t,t as n}from"./preload-helper-8_AGbKZc.js";var r=t(`/_console/apps/$domain/environment`)({component:e(()=>n(()=>import(`./environment-qDCiVB6M.js`),__vite__mapDeps([0,1,2,3,4,5,6,7])),`component`)});export{r as t};

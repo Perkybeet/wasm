@@ -1,0 +1,1 @@
+import{r as e,t}from"./cx-DTdc60p7.js";var n=e();function r({className:e}){return(0,n.jsx)(`span`,{"aria-hidden":`true`,className:t(`block h-3.5 w-full animate-breathe rounded-[4px] bg-surface-active`,e)})}export{r as t};

@@ -1,1 +1,0 @@
-import{r as e}from"./cx-DTdc60p7.js";import{t}from"./Placeholder-FAtRKP3j.js";import{t as n}from"./info-BwWSrZ3q.js";var r=e();function i(){return(0,r.jsx)(t,{icon:(0,r.jsx)(n,{}),title:`Version and updates`,description:`The installed version of WASM and whether a newer one is available.`,command:`wasm --version`,documentTitle:`About settings`})}export{i as component};

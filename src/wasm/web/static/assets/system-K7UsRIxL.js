@@ -1,0 +1,1 @@
+import{c as e,p as t}from"./auth-DhE7TJDV.js";var n={all:[`system`],machine:[`system`,`machine`],info:[`system`,`info`],version:[`system`,`version`]},r=()=>t({queryKey:n.machine,queryFn:({signal:t})=>e(`get`,`/api/system/machine`,{signal:t}),staleTime:3e4});export{n,r as t};
