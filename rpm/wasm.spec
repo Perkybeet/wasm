@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        1.6.3
+Version:        1.6.4
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -222,6 +222,11 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
 fi
 
 %changelog
+* Fri Sep 25 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.6.4-1
+- Fix wasm update deleting everything an application wrote into its own tree (uploads included) when it was deployed from a local directory or an archive: the source is now copied over the tree instead of replacing it
+- Fix a forced git update running git clean, which deleted every untracked file that was not ignored
+- npm projects without a lockfile install with npm install instead of failing on npm ci
+- Regression tests pin these paths down; the bug was found by a new real-machine integration harness
 * Fri Sep 25 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.6.3-1
 - Fix data loss on panel and webhook updates: they re-ran the full deploy, whose fetch deletes the app directory, destroying the .env, uploaded files and generated secrets; every surface now runs one shared update (backup, git pull, rebuild, hand-over, restart)
 - Fix a read-scope API token being able to read every application .env in clear, through the API with unmask and through the panel reveal page, and to read unit files that inline secrets

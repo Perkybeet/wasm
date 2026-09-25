@@ -139,7 +139,10 @@ def test_streamed_build_output_is_captured_without_verbose(
 
     deployer = build_deployer(NodeJSDeployer, tmp_path)
     deployer._runner = fake
-    (tmp_path / "app").mkdir(parents=True, exist_ok=True)
+    deployer.app_path.mkdir(parents=True, exist_ok=True)
+    # npm ci is what runs when the project has a lockfile, which is the case
+    # this test is about.
+    (deployer.app_path / "package-lock.json").write_text("{}")
     deployer.fetch_source = lambda: True
     deployer.pre_install = lambda: True
     deployer.post_install = lambda: True

@@ -1177,7 +1177,7 @@ class SourceManager(BaseManager):
         """
         Force update a Git repository by fetching and resetting.
 
-        Preserves untracked files like .env.
+        Untracked files, ignored or not, are left exactly where they are.
 
         Args:
             url: Git repository URL.
@@ -1222,13 +1222,13 @@ class SourceManager(BaseManager):
             else:
                 target_ref = "origin/main"  # Fallback
 
-        # Reset to target (preserves untracked files)
+        # reset --hard rewrites tracked files only. There is deliberately no
+        # `git clean` after it: that deletes every untracked file that is not
+        # ignored, which in a deployed application is its uploads and whatever
+        # else it wrote into its own tree.
         result = self._git(["reset", "--hard", target_ref], cwd=destination)
         if not result.success:
             raise SourceError("Git reset failed", details=result.stderr)
-
-        # Clean tracked files only
-        self._git(["clean", "-fd"], cwd=destination)
 
         return True
 

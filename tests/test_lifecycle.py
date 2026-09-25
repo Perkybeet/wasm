@@ -97,8 +97,8 @@ def recorder(monkeypatch: pytest.MonkeyPatch) -> Recorder:
         "SourceManager",
         lambda verbose=False: SimpleNamespace(
             pull=lambda path, branch=None: rec.calls.append(("pull", path, branch)),
-            fetch=lambda source, path, branch=None, force=False: rec.calls.append(
-                ("fetch", source, path, force)
+            fetch=lambda source, path, branch=None, force=False, clean=True: rec.calls.append(
+                ("fetch", source, path, force, clean)
             ),
         ),
     )
@@ -198,9 +198,9 @@ def test_a_new_source_keeps_the_env_file_private(
     (app_path / ".env").write_text("SECRET=kept\n")
 
     def wiping_fetch(
-        source: str, path: Path, branch: str | None = None, force: bool = False
+        source: str, path: Path, branch: str | None = None, force: bool = False, clean: bool = True
     ) -> None:
-        recorder.calls.append(("fetch", source, path, force))
+        recorder.calls.append(("fetch", source, path, force, clean))
         (path / ".env").unlink()
 
     monkeypatch.setattr(
@@ -214,7 +214,7 @@ def test_a_new_source_keeps_the_env_file_private(
     env_file = app_path / ".env"
     assert env_file.read_text() == "SECRET=kept\n"
     assert stat.S_IMODE(env_file.stat().st_mode) == SECRET_MODE
-    assert ("fetch", "https://github.com/example/other.git", app_path, True) in recorder.calls
+    assert ("fetch", "https://github.com/example/other.git", app_path, True, True) in recorder.calls
 
 
 def test_a_static_application_is_not_restarted(
@@ -346,7 +346,8 @@ def test_a_tree_that_is_not_a_checkout_fetches_its_recorded_source(
     lifecycle.update_app(DOMAIN)
 
     assert not any(call[0] == "pull" for call in recorder.calls)
-    assert ("fetch", "https://github.com/example/app.git", app_path, True) in recorder.calls
+    # Copied over the tree, never wiping it: there is no checkout to reset.
+    assert ("fetch", "https://github.com/example/app.git", app_path, False, False) in recorder.calls
     assert (app_path / ".env").read_text() == "SECRET=kept\n"
 
 
@@ -378,3 +379,72 @@ def test_a_monorepo_with_a_unit_that_failed_to_restart_is_not_active(
 
     assert outcome.restarted == ("example-com-web",)
     assert outcome.active is False
+
+
+def test_updating_from_a_local_directory_keeps_what_the_app_wrote(
+    store: WASMStore,
+    recorder: Recorder,
+    tmp_path: Path,
+    real_fs: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The integration harness caught this: a re-fetch deleted every upload.
+
+    An app deployed from a directory has no checkout to pull, so the update
+    fetches the directory again. That fetch used to wipe the tree first; the
+    new source must be copied over it instead, leaving the app's own files.
+    """
+    from wasm.managers.source_manager import SourceManager
+
+    source = tmp_path / "src-app"
+    source.mkdir()
+    (source / "server.js").write_text("v2")
+    (source / ".env").write_text("DEV=1\n")
+    app_path = tmp_path / "apps" / "example-com"
+    app = make_app(store, app_path)
+    app.source = str(source)
+    store.update_app(app)
+    (app_path / ".git").rmdir()
+    (app_path / "server.js").write_text("v1")
+    (app_path / ".env").write_text("SECRET=prod\n")
+    upload = app_path / "uploads" / "photo.png"
+    upload.parent.mkdir()
+    upload.write_bytes(b"\x89PNG")
+    monkeypatch.setattr(lifecycle, "SourceManager", SourceManager)
+
+    lifecycle.update_app(DOMAIN)
+
+    assert (app_path / "server.js").read_text() == "v2"
+    assert upload.read_bytes() == b"\x89PNG"
+    assert (app_path / ".env").read_text() == "SECRET=prod\n"
+
+
+def test_a_forced_git_update_never_deletes_untracked_files(tmp_path: Path) -> None:
+    """git clean -fd removed every untracked, unignored file: the uploads."""
+    from wasm.core.runner import FakeRunner
+    from wasm.managers.source_manager import SourceManager
+
+    runner = FakeRunner()
+    repo = tmp_path / "app"
+    (repo / ".git").mkdir(parents=True)
+
+    SourceManager(runner=runner).fetch(
+        "https://github.com/example/app.git", repo, branch="main", force=True
+    )
+
+    assert any("reset" in call for call in runner.calls)
+    assert not any("clean" in call for call in runner.calls)
+
+
+def test_npm_without_a_lockfile_installs_instead_of_failing(tmp_path: Path) -> None:
+    """npm ci refuses to run without package-lock.json, with a useless message."""
+    from wasm.core.runner import FakeRunner
+    from wasm.deployers.helpers.package_manager import PackageManagerHelper
+
+    helper = PackageManagerHelper(runner=FakeRunner())
+
+    assert helper.get_install_command("npm", tmp_path) == ["npm", "install"]
+    (tmp_path / "package-lock.json").write_text("{}")
+    assert helper.get_install_command("npm", tmp_path) == ["npm", "ci"]
+    assert helper.get_install_command("pnpm", tmp_path) == ["pnpm", "install", "--frozen-lockfile"]

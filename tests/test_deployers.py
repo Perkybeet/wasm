@@ -453,7 +453,8 @@ def test_nextjs_commands_per_package_manager(
     install: list[str],
     run_build: list[str],
 ) -> None:
-    """The exact argv for install and build, per package manager."""
+    """The exact argv for install and build, per package manager, with a lockfile."""
+    (tmp_path / "package-lock.json").write_text("{}")
     deployer = NextJSDeployer()
     deployer.configure("app.example.com", "src", app_path=tmp_path)
     deployer.package_manager = package_manager
@@ -1015,6 +1016,7 @@ def test_install_and_build_are_streamed_with_finite_timeouts(
             )
 
     runner = StreamingRunner()
+    (tmp_path / "package-lock.json").write_text("{}")
     deployer = NodeJSDeployer(runner=runner)
     deployer.configure("app.example.com", "src", app_path=tmp_path)
     deployer.package_manager = "npm"

@@ -17,8 +17,9 @@ so the three surfaces cannot drift apart again.
 The sequence, and why it is in this order:
 
 1. A backup, so ``wasm rollback`` has somewhere to return to.
-2. A non-destructive ``git pull``. Only an explicit new source replaces the
-   tree, and then the ``.env`` is carried across it.
+2. A non-destructive ``git pull``, or, for a tree that is not a git checkout
+   or an explicit new source, a fetch that never deletes anything already in
+   the tree. The ``.env`` is carried across it.
 3. The type recorded at deploy time, not a fresh detection over a tree that
    now contains build output.
 4. The deployer's own ``update()``: install, build, and hand the tree back to
@@ -48,6 +49,7 @@ from wasm.managers.backup_manager import RollbackManager
 from wasm.managers.service_manager import ServiceManager
 from wasm.managers.source_manager import SourceManager
 from wasm.validators.domain import validate_domain
+from wasm.validators.source import validate_source
 
 #: Called as each phase begins, with its position, the total and a description.
 PhaseReporter = Callable[[int, int, str], None]
@@ -157,13 +159,13 @@ def update_app(
     if source:
         phase(2, PHASES, "Fetching from new source")
         log.substep(f"Source: {source}")
-        _fetch_keeping_env(source_manager, source, app_path, branch)
+        _refetch_without_deleting(source_manager, source, app_path, branch)
     elif not (app_path / ".git").exists() and recorded_source:
         # An archive or a local directory has nothing to pull from; the only
         # way to update it is to fetch it again.
         phase(2, PHASES, "Fetching the recorded source again")
         log.substep(f"Source: {recorded_source}")
-        _fetch_keeping_env(source_manager, recorded_source, app_path, branch)
+        _refetch_without_deleting(source_manager, recorded_source, app_path, branch)
     else:
         phase(2, PHASES, "Pulling latest changes")
         source_manager.pull(app_path, branch=branch)
@@ -208,24 +210,35 @@ def update_app(
     )
 
 
-def _fetch_keeping_env(
+def _refetch_without_deleting(
     source_manager: SourceManager, source: str, app_path: Path, branch: str | None
 ) -> None:
     """
-    Replace the tree with a new source, carrying the ``.env`` file across.
+    Bring the tree up to date with a source without deleting anything in it.
+
+    An update must never remove what the application wrote into its own tree:
+    uploaded images, generated files, anything outside version control. A git
+    checkout updated from a git source is reset to the new commit, which only
+    touches tracked files. Any other combination is copied over the existing
+    tree, so a file dropped from the source stays behind until a redeploy
+    instead of taking the application's data with it.
 
     Args:
         source_manager: Manager the fetch goes through.
-        source: The new source.
+        source: The source to fetch.
         app_path: The application's directory.
         branch: Git branch to fetch.
     """
-    # A forced fetch wipes the tree, and the environment file is the one thing
-    # in it that is not in version control.
+    # Carried across either way: a source that ships its own .env (a local
+    # development directory usually does) must not replace production's.
     env_file = app_path / ".env"
     env_backup = env_file.read_text() if env_file.is_file() else None
 
-    source_manager.fetch(source, app_path, branch=branch, force=True)
+    source_type, _ = validate_source(source)
+    if source_type == "git" and (app_path / ".git").exists():
+        source_manager.fetch(source, app_path, branch=branch, force=True)
+    else:
+        source_manager.fetch(source, app_path, branch=branch, clean=False)
 
     if env_backup is not None:
         fs = get_fs()
