@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -29,6 +29,7 @@ from wasm.core.store import App, Service, get_store
 from wasm.core.utils import domain_to_app_name
 from wasm.deployers.helpers.env_manager import EnvManager, redact_url_credentials
 from wasm.deployers.inspect import inspect_source
+from wasm.managers.backup_manager import RollbackManager
 from wasm.managers.service_manager import ServiceManager
 from wasm.validators.environment import EnvironmentValidationError, validate_environment
 from wasm.validators.port import find_available_port, validate_port
@@ -118,6 +119,11 @@ class CreateAppRequest(BaseModel):
     )
     compose_profiles: list[str] | None = Field(
         default=None, description="Docker Compose: profiles to activate"
+    )
+    layout: Literal["inplace", "releases"] | None = Field(
+        default=None,
+        description="Build every deploy as a release behind a health gate, or in place. "
+        "Omitted: the server's deploy.layout",
     )
 
 
@@ -358,6 +364,7 @@ def create_app(
             "skip_database": body.skip_database,
             "compose_file": body.compose_file,
             "compose_profiles": body.compose_profiles,
+            "layout": body.layout,
         },
         metadata={"domain": domain, "app_type": body.app_type, "port": port},
     )
@@ -776,3 +783,56 @@ def delete_app(
         message=f"Deletion queued for {validated}",
         job=job.to_dict(),
     )
+
+
+class RollbackPointOut(BaseModel):
+    """One backup an application can be rolled back to."""
+
+    id: str
+    created_at: str
+    description: str
+    size_bytes: int
+    git_commit: str | None = None
+
+
+class RollbackPointsResponse(BaseModel):
+    """The backups an application can return to, newest first."""
+
+    items: list[RollbackPointOut]
+    total: int
+
+
+@router.get("/{domain}/rollback-points", response_model=RollbackPointsResponse)
+def list_rollback_points(
+    domain: str, session: Annotated[dict, Depends(get_current_session)]
+) -> RollbackPointsResponse:
+    """
+    List the backups an application can be rolled back to.
+
+    Deliberately not gated on the application still being deployed: a backup
+    for a domain WASM no longer serves is still a rollback point until it is
+    pruned, the same reasoning that keeps deployment history around after an
+    application is deleted (see :mod:`wasm.web.views.deployments`).
+
+    Args:
+        domain: Domain whose rollback points are asked for.
+        session: The authenticated session.
+
+    Returns:
+        The points, newest first, from
+        :meth:`~wasm.managers.backup_manager.RollbackManager.list_rollback_points`
+        - the one implementation, shared with ``wasm backup rollback --list``.
+    """
+    validated = strict_domain(domain)
+    points = RollbackManager(verbose=False).list_rollback_points(validated)
+    items = [
+        RollbackPointOut(
+            id=point.id,
+            created_at=point.created_at,
+            description=point.description,
+            size_bytes=point.size_bytes,
+            git_commit=point.git_commit,
+        )
+        for point in points
+    ]
+    return RollbackPointsResponse(items=items, total=len(items))

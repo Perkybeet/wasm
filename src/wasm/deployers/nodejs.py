@@ -88,7 +88,7 @@ class NodeJSDeployer(BaseDeployer):
 
     def _analyze_package_json(self) -> None:
         """Analyze package.json for build and start scripts."""
-        package_json = self.app_path / "package.json"
+        package_json = self.build_path / "package.json"
         if package_json.exists():
             try:
                 with open(package_json) as f:

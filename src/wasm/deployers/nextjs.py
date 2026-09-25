@@ -81,7 +81,7 @@ class NextJSDeployer(BaseDeployer):
         config_files = ["next.config.js", "next.config.mjs", "next.config.ts"]
 
         for config_file in config_files:
-            config_path = self.app_path / config_file
+            config_path = self.build_path / config_file
             if config_path.exists():
                 try:
                     content = config_path.read_text()
@@ -138,13 +138,13 @@ class NextJSDeployer(BaseDeployer):
 
             # A standalone build ships only the server; the assets it serves
             # have to be copied in next to it or every page 404s its own CSS.
-            standalone_dir = self.app_path / ".next" / "standalone"
+            standalone_dir = self.build_path / ".next" / "standalone"
             if standalone_dir.exists():
-                static_src = self.app_path / ".next" / "static"
+                static_src = self.build_path / ".next" / "static"
                 if static_src.exists():
                     self.fs.copy_tree(static_src, standalone_dir / ".next" / "static")
 
-                public_src = self.app_path / "public"
+                public_src = self.build_path / "public"
                 if public_src.exists():
                     self.fs.copy_tree(public_src, standalone_dir / "public")
 

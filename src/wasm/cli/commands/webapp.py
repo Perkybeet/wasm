@@ -46,6 +46,7 @@ from wasm.core.store import DeploymentTrigger, get_store
 from wasm.core.utils import domain_to_app_name, remove_directory
 from wasm.deployers import get_deployer
 from wasm.deployers.docker_compose import DockerComposeDeployer
+from wasm.deployers.helpers.layout import CONFIGURED, LAYOUTS, choose_layout
 from wasm.deployers.lifecycle import update_app
 from wasm.deployers.monorepo import MonorepoDeployer
 from wasm.deployers.registry import available_types
@@ -53,6 +54,7 @@ from wasm.managers.apache_manager import ApacheManager
 from wasm.managers.cert_manager import CertManager
 from wasm.managers.nginx_manager import NginxManager
 from wasm.managers.service_manager import ServiceManager
+from wasm.managers.webserver import delete_site_completely
 from wasm.validators.domain import should_include_www, validate_domain
 from wasm.validators.port import find_available_port, validate_port
 
@@ -199,6 +201,8 @@ def _create_app(
     skip_database: bool = False,
     compose_file: str | None = None,
     compose_profiles: tuple[str, ...] = (),
+    layout: str | None = None,
+    persist: tuple[str, ...] = (),
 ) -> int:
     """
     Deploy an application.
@@ -220,6 +224,9 @@ def _create_app(
         skip_database: Skip database provisioning, for a monorepo.
         compose_file: Compose file to use, for a Docker Compose project.
         compose_profiles: Compose profiles to activate.
+        layout: ``inplace`` or ``releases``. None gives a new application
+            the server's configured layout (``deploy.layout``).
+        persist: Paths kept in ``shared/`` and linked into every release.
 
     Returns:
         Exit code.
@@ -228,6 +235,11 @@ def _create_app(
         WASMError: When validation or any deployment step fails.
     """
     domain = validate_domain(domain)
+
+    if app_type in ("monorepo", "docker-compose"):
+        # Refuses an explicit --layout releases for the types that have no
+        # release pipeline yet, with the same words the deployers use.
+        choose_layout(None, layout, app_type=app_type, supports_releases=False)
 
     if port:
         port = validate_port(port)
@@ -319,6 +331,10 @@ def _create_app(
         env_vars=env_vars,
         package_manager=package_manager,
         include_www=www,
+        # CONFIGURED rather than the configured value itself: an application
+        # that already exists keeps its layout unless one was asked for.
+        layout=layout or CONFIGURED,
+        persistent_paths=list(persist) if persist else None,
     )
     deployer.deploy()
 
@@ -792,30 +808,15 @@ def _delete_app(
         logger.warning(f"Failed to delete service: {e}")
 
     logger.step(2, total_steps, "Removing site configuration")
-    try:
-        nginx = NginxManager(verbose=logger.verbose)
-        if nginx.site_exists(domain):
-            nginx.delete_site(domain)
-            nginx.reload()
-    except WASMError as e:
-        logger.warning(f"Failed to remove nginx site configuration: {e}")
-
-    try:
-        apache = ApacheManager(verbose=logger.verbose)
-        if apache.site_exists(domain):
-            apache.delete_site(domain)
-            apache.reload()
-    except WASMError as e:
-        logger.warning(f"Failed to remove apache site configuration: {e}")
-
     logger.step(3, total_steps, "Removing SSL certificate")
-    cert_manager = CertManager(verbose=logger.verbose)
-    if cert_manager.is_installed() and cert_manager.cert_exists(domain):
-        try:
-            cert_manager.delete(domain)
-            logger.substep(f"Certificate deleted: {domain}")
-        except WASMError as e:
-            logger.warning(f"Failed to delete certificate: {e}")
+    deletion = delete_site_completely(
+        domain,
+        nginx=NginxManager(verbose=logger.verbose),
+        apache=ApacheManager(verbose=logger.verbose),
+        cert_manager=CertManager(verbose=logger.verbose),
+    )
+    if deletion.certificate_removed:
+        logger.substep(f"Certificate deleted: {domain}")
     else:
         logger.substep("No certificate found")
 
@@ -1068,6 +1069,8 @@ def _handle_create(args: Namespace) -> int:
         skip_database=getattr(args, "no_database", False),
         compose_file=getattr(args, "compose_file", None),
         compose_profiles=tuple(getattr(args, "compose_profiles", None) or ()),
+        layout=getattr(args, "layout", None),
+        persist=tuple(getattr(args, "persist", None) or ()),
     )
 
 
@@ -1385,6 +1388,18 @@ def cli() -> None:
     multiple=True,
     help="Activate this Docker Compose profile. Repeat to activate several.",
 )
+@click.option(
+    "--layout",
+    type=click.Choice(LAYOUTS),
+    help="Build every deploy as a release behind a health gate, or in place. "
+    "Defaults to the server's deploy.layout.",
+)
+@click.option(
+    "--persist",
+    metavar="PATH",
+    multiple=True,
+    help="Keep this path, relative to the app, in shared/ across releases. Repeat for several.",
+)
 @_global_flags
 @pass_context
 def create(
@@ -1404,6 +1419,8 @@ def create(
     no_database: bool,
     compose_file: str | None,
     compose_profiles: tuple[str, ...],
+    layout: str | None,
+    persist: tuple[str, ...],
 ) -> None:
     """
     Deploy a web application and put it online.
@@ -1429,6 +1446,8 @@ def create(
             skip_database=no_database,
             compose_file=compose_file,
             compose_profiles=compose_profiles,
+            layout=layout,
+            persist=persist,
         ),
     )
 

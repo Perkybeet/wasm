@@ -576,6 +576,176 @@ class TestSchemaV4Migration:
             assert cursor.fetchone() is not None
 
 
+#: The jobs table exactly as the 1.6.x releases shipped it, frozen here for the
+#: same reason V1_SCHEMA_SQL is.
+V4_JOBS_SQL = """
+CREATE TABLE IF NOT EXISTS jobs (
+    id TEXT PRIMARY KEY,
+    type TEXT NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL
+        CHECK (status IN ('pending', 'running', 'completed', 'failed', 'cancelled')),
+    progress INTEGER NOT NULL DEFAULT 0,
+    total_steps INTEGER NOT NULL DEFAULT 100,
+    domain TEXT,
+    error TEXT,
+    result_json TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    started_at TEXT,
+    finished_at TEXT,
+    log_path TEXT
+);
+"""
+
+
+class TestSchemaV5Migration:
+    """Schema v5 adds the release layout, and every existing app stays in place."""
+
+    def _create_v4_database(self, db_path: Path) -> None:
+        """
+        Create a real v4 database with rows, as a 1.6.x release left it.
+
+        Args:
+            db_path: Where the database file is created.
+        """
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.executescript(V1_SCHEMA_SQL)
+            conn.executescript(V2_DEPLOYMENTS_SQL)
+            conn.execute("ALTER TABLE apps ADD COLUMN webhook_secret TEXT")
+            conn.executescript(V4_JOBS_SQL)
+            for version in (1, 2, 3, 4):
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+            conn.execute(
+                "INSERT INTO apps (domain, app_type, app_path, webhook_secret) VALUES (?, ?, ?, ?)",
+                ("v4.example.com", "nextjs", "/var/www/apps/v4-example-com", "s3cret"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _columns(self, store: WASMStore, table: str) -> dict[str, tuple[str, int, str | None]]:
+        """
+        Args:
+            store: The store to inspect.
+            table: Table name.
+
+        Returns:
+            Column name to (declared type, NOT NULL, default).
+        """
+        with store._transaction() as cursor:
+            cursor.execute(f"PRAGMA table_info({table})")
+            return {
+                row["name"]: (row["type"], row["notnull"], row["dflt_value"])
+                for row in cursor.fetchall()
+            }
+
+    def _migrated(self, tmp_path: Path, name: str = "wasm.db") -> WASMStore:
+        """
+        Args:
+            tmp_path: Directory for the database.
+            name: File name of the database.
+
+        Returns:
+            A store opened over a v4 database, which migrates it.
+        """
+        db_path = tmp_path / name
+        self._create_v4_database(db_path)
+        return WASMStore(db_path, fs=RecordingFileSystem())
+
+    def test_a_v4_database_migrates_to_v5_keeping_every_row(self, fresh, tmp_path):
+        """A 1.6.x server keeps its inventory, and its apps stay in place."""
+        store = self._migrated(tmp_path)
+
+        with store._transaction() as cursor:
+            cursor.execute("SELECT MAX(version) FROM schema_version")
+            assert cursor.fetchone()[0] == SCHEMA_VERSION == 5
+        app = store.get_app("v4.example.com")
+        assert app is not None
+        assert app.layout == "inplace"
+        assert app.keep_releases == 5
+        assert app.persistent_paths == []
+        assert (app.memory_max_mb, app.cpu_quota_percent, app.tasks_max) == (None, None, None)
+        assert store.get_webhook_secret("v4.example.com") == "s3cret"
+
+    def test_the_fresh_schema_and_the_migration_agree(self, fresh, tmp_path):
+        """Both paths to v5 produce the same apps and releases tables."""
+        tables = ("apps", "releases")
+        migrated = self._migrated(tmp_path, "migrated.db")
+        upgraded = {table: self._columns(migrated, table) for table in tables}
+        WASMStore.reset_instance()
+
+        installed = WASMStore(tmp_path / "fresh.db", fs=RecordingFileSystem())
+
+        assert {table: self._columns(installed, table) for table in tables} == upgraded
+
+    def test_a_migrated_database_records_releases(self, fresh, tmp_path):
+        """The table works, keeps one active release, and refuses unknown statuses."""
+        store = self._migrated(tmp_path)
+        app = store.get_app("v4.example.com")
+
+        for release_id in ("20260925-100000-aaaaaaa", "20260925-110000-bbbbbbb"):
+            store.record_release(
+                store_module.ReleaseRecord(
+                    id=release_id,
+                    app_id=app.id,
+                    git_commit=release_id[-7:],
+                    created_at=f"2026-09-25T{release_id[9:11]}:00:00+00:00",
+                    path=f"/var/www/apps/v4-example-com/releases/{release_id}",
+                )
+            )
+        store.mark_release_active(app.id, "20260925-100000-aaaaaaa")
+        store.mark_release_active(app.id, "20260925-110000-bbbbbbb")
+
+        assert [(r.id, r.status) for r in store.list_releases(app.id)] == [
+            ("20260925-110000-bbbbbbb", "active"),
+            ("20260925-100000-aaaaaaa", "superseded"),
+        ]
+        with pytest.raises(StoreError, match="Invalid release status"):
+            store.set_release_status(app.id, "20260925-110000-bbbbbbb", "live")
+        with store._transaction() as cursor, pytest.raises(sqlite3.IntegrityError):
+            cursor.execute(
+                "UPDATE releases SET status = 'live' WHERE id = ?", ("20260925-110000-bbbbbbb",)
+            )
+
+    def test_releases_go_with_their_application(self, fresh, tmp_path):
+        """A release names a directory deleted with the app, so its row goes too."""
+        store = self._migrated(tmp_path)
+        app = store.get_app("v4.example.com")
+        store.record_release(
+            store_module.ReleaseRecord(
+                id="20260925-100000-aaaaaaa",
+                app_id=app.id,
+                created_at="2026-09-25T10:00:00+00:00",
+                path="/x",
+            )
+        )
+
+        store.delete_app("v4.example.com")
+
+        assert store.list_releases(app.id) == []
+
+    def test_the_new_columns_round_trip(self, temp_db):
+        """persistent_paths is a JSON list on disk and a list in the dataclass."""
+        temp_db.create_app(
+            App(
+                domain="rt.example.com",
+                app_path="/var/www/apps/rt",
+                layout="releases",
+                keep_releases=3,
+                persistent_paths=["uploads", "storage/app"],
+                memory_max_mb=512,
+            )
+        )
+
+        app = temp_db.get_app("rt.example.com")
+        assert app.layout == "releases"
+        assert app.keep_releases == 3
+        assert app.persistent_paths == ["uploads", "storage/app"]
+        assert app.memory_max_mb == 512
+
+
 class TestJobRecordCRUD:
     """The store's half of job persistence, independent of the job manager."""
 

@@ -22,7 +22,6 @@ from __future__ import annotations
 import json
 import logging
 import queue
-import shutil
 import sqlite3
 import threading
 import uuid
@@ -35,7 +34,6 @@ from typing import Any, TextIO
 
 from wasm.core.exceptions import (
     BackupError,
-    CertificateError,
     DeploymentError,
     RollbackError,
     WASMError,
@@ -848,6 +846,7 @@ def deploy_app_job(
     skip_database: bool = False,
     compose_file: str | None = None,
     compose_profiles: list[str] | None = None,
+    layout: str | None = None,
     job_context: JobContext | None = None,
 ) -> dict[str, Any]:
     """
@@ -872,6 +871,8 @@ def deploy_app_job(
         skip_database: Monorepo: skip database provisioning.
         compose_file: Docker Compose: compose file, relative to the project.
         compose_profiles: Docker Compose: profiles to activate.
+        layout: ``inplace`` or ``releases``; None for the server's
+            configured layout.
         job_context: Injected by the job manager.
 
     Returns:
@@ -881,6 +882,7 @@ def deploy_app_job(
         DeploymentError: When the deployer reports failure.
     """
     from wasm.deployers import get_deployer
+    from wasm.deployers.helpers.layout import CONFIGURED as CONFIGURED_LAYOUT
 
     context = _require_context(job_context)
     context.set_metadata("domain", domain)
@@ -902,6 +904,7 @@ def deploy_app_job(
         compose_file=compose_file,
         compose_profiles=compose_profiles,
         trigger="panel",
+        layout=layout or CONFIGURED_LAYOUT,
     )
 
     context.update("Deploying", 10)
@@ -1008,9 +1011,11 @@ def delete_app_job(
     Raises:
         DeploymentError: When the application is unknown.
     """
+    from wasm.managers.apache_manager import ApacheManager
     from wasm.managers.cert_manager import CertManager
     from wasm.managers.nginx_manager import NginxManager
     from wasm.managers.service_manager import ServiceManager
+    from wasm.managers.webserver import delete_site_completely
 
     context = _require_context(job_context)
     context.set_metadata("domain", domain)
@@ -1034,24 +1039,36 @@ def delete_app_job(
     except WASMError as exc:
         context.log(f"Service removal reported: {exc}", "warning")
 
-    context.update("Removing site configuration", 45)
-    try:
-        NginxManager(verbose=False).delete_site(domain)
-    except WASMError as exc:
-        context.log(f"Site removal reported: {exc}", "warning")
-
-    if remove_ssl:
-        context.update("Removing certificate", 65)
-        try:
-            CertManager(verbose=False).delete(domain)
-        except WASMError as exc:
-            context.log(f"Certificate removal reported: {exc}", "warning")
+    # Walks nginx and apache and, unless remove_ssl says otherwise, the
+    # certificate. This used to touch nginx only, so an app whose site had
+    # been recreated on apache - or migrated between the two - left a vhost
+    # behind that no delete request from the panel ever reached.
+    context.update("Removing site configuration and certificate", 55)
+    deletion = delete_site_completely(
+        domain,
+        nginx=NginxManager(verbose=False),
+        apache=ApacheManager(verbose=False),
+        cert_manager=CertManager(verbose=False),
+        delete_certificate=remove_ssl,
+    )
+    context.log(
+        f"Site removal: nginx={deletion.nginx_removed} apache={deletion.apache_removed} "
+        f"certificate={deletion.certificate_removed}",
+        "info",
+    )
 
     if remove_files and app.app_path:
         context.update("Removing files", 85)
         app_path = Path(app.app_path)
         if app_path.is_dir():
-            shutil.rmtree(app_path, ignore_errors=True)
+            # Through the filesystem seam, not shutil.rmtree directly: that is
+            # the one execution path --dry-run cannot make honest, and the
+            # seam is also what lets a test assert on the removal without
+            # touching a real directory.
+            try:
+                get_fs().remove_tree(app_path)
+            except OSError as exc:
+                context.log(f"Could not remove {app_path}: {exc}", "warning")
 
     store.delete_app(domain)
     context.update("Deletion complete", 100)
@@ -1071,6 +1088,9 @@ def backup_app_job(
     include_node_modules: bool = False,
     include_build: bool = False,
     include_databases: bool = False,
+    include_docker_volumes: bool = False,
+    schemas: list[str] | None = None,
+    redis_method: str = "rdb",
     tags: list[str] | None = None,
     job_context: JobContext | None = None,
 ) -> dict[str, Any]:
@@ -1084,6 +1104,12 @@ def backup_app_job(
         include_node_modules: Include ``node_modules``.
         include_build: Include build artefacts.
         include_databases: Include database dumps.
+        include_docker_volumes: Include the application's named Docker
+            volumes.
+        schemas: PostgreSQL schemas to dump instead of whole databases. Not
+            supported inside a self-contained backup; see
+            :meth:`~wasm.managers.backup_manager.BackupManager.create`.
+        redis_method: How to capture Redis, ``rdb`` or ``aof``.
         tags: Tags to store with the backup.
         job_context: Injected by the job manager.
 
@@ -1106,6 +1132,9 @@ def backup_app_job(
         include_node_modules=include_node_modules,
         include_build=include_build,
         include_databases=include_databases,
+        include_docker_volumes=include_docker_volumes,
+        schemas=schemas,
+        redis_method=redis_method,
         tags=tags or [],
     )
 
@@ -1121,6 +1150,8 @@ def backup_app_job(
 def restore_backup_job(
     backup_id: str,
     target_domain: str | None = None,
+    restore_env: bool = True,
+    verify: bool = True,
     job_context: JobContext | None = None,
 ) -> dict[str, Any]:
     """
@@ -1129,6 +1160,9 @@ def restore_backup_job(
     Args:
         backup_id: Identifier of the backup to restore.
         target_domain: Domain to restore into, defaulting to the backup's own.
+        restore_env: Restore the ``.env`` files from the archive.
+        verify: Check the archive against its recorded checksum before
+            restoring.
         job_context: Injected by the job manager.
 
     Returns:
@@ -1154,7 +1188,12 @@ def restore_backup_job(
     context.set_metadata("domain", domain)
     context.update("Restoring backup", 30)
 
-    if not manager.restore(backup_id=backup_id, target_domain=domain):
+    if not manager.restore(
+        backup_id=backup_id,
+        target_domain=domain,
+        restore_env=restore_env,
+        verify_checksum=verify,
+    ):
         raise BackupError(
             f"Restore failed for backup {backup_id}",
             details="Verify the archive with 'wasm backup verify' and retry.",
@@ -1260,18 +1299,37 @@ def database_engine_job(
 def cert_create_job(
     domain: str,
     email: str | None = None,
-    webserver: str = "nginx",
+    domains: list[str] | None = None,
+    method: str | None = None,
+    webroot: str | None = None,
     include_www: bool = False,
+    expand: bool = False,
     job_context: JobContext | None = None,
 ) -> dict[str, Any]:
     """
     Obtain a certificate for a domain.
 
+    Reaches :meth:`~wasm.managers.cert_manager.CertManager.obtain` exactly the
+    way ``wasm cert create`` does: this used to call the narrower ``.create()``
+    convenience wrapper, which has no ``standalone`` option and always forced
+    a webserver plugin, so a panel-issued certificate could not use the
+    webroot or standalone methods the CLI has always offered.
+
     Args:
         domain: Primary domain of the certificate.
         email: Registration email.
-        webserver: Web server whose certbot plugin to use.
+        domains: Extra domains (SANs) to cover, beyond ``domain`` and the
+            ``www`` alias ``include_www`` may add.
+        method: How to prove control of the domain: ``nginx``, ``apache``,
+            ``webroot`` or ``standalone``. None lets WASM pick the method
+            that suits the web server it finds running, the CLI's own
+            default when none of its method flags are given.
+        webroot: Webroot path. Used when ``method`` is ``webroot``, or
+            defaulted to :data:`~wasm.managers.cert_manager.DEFAULT_WEBROOT`
+            when ``method`` is ``webroot`` and no path was given.
         include_www: Also cover the ``www`` subdomain.
+        expand: Expand an existing certificate even when it already covers
+            every requested domain.
         job_context: Injected by the job manager.
 
     Returns:
@@ -1280,21 +1338,36 @@ def cert_create_job(
     Raises:
         CertificateError: When certbot fails.
     """
-    from wasm.managers.cert_manager import CertManager
+    from wasm.managers.cert_manager import DEFAULT_WEBROOT, CertManager
 
     context = _require_context(job_context)
     context.set_metadata("domain", domain)
     context.update("Requesting certificate", 20)
 
-    domains = [domain, f"www.{domain}"] if include_www else [domain]
-    if not CertManager(verbose=False).create(domains=domains, email=email, webserver=webserver):
-        raise CertificateError(
-            f"Certificate issuance failed for {domain}",
-            details="Check that the domain resolves to this host and port 80 is reachable.",
-        )
+    webroot_path: Path | None
+    if webroot:
+        webroot_path = Path(webroot)
+    elif method == "webroot":
+        webroot_path = DEFAULT_WEBROOT
+    else:
+        webroot_path = None
 
+    manager = CertManager(verbose=False)
+    manager.obtain(
+        domain,
+        email=email,
+        webroot=webroot_path,
+        standalone=method == "standalone",
+        nginx=method == "nginx",
+        apache=method == "apache",
+        additional_domains=list(domains) if domains else None,
+        expand=expand,
+        include_www=include_www,
+    )
+
+    covered = manager.certificate_domains(domain, domains, include_www)
     context.update("Certificate created", 100)
-    return {"domain": domain, "domains": domains, "status": "certificate_created"}
+    return {"domain": domain, "domains": covered, "status": "certificate_created"}
 
 
 def cert_renew_job(

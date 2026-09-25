@@ -71,8 +71,8 @@ class PythonDeployer(BaseDeployer):
 
     def _detect_framework(self) -> str:
         """Detect the Python framework used."""
-        requirements = self.app_path / "requirements.txt"
-        pyproject = self.app_path / "pyproject.toml"
+        requirements = self.build_path / "requirements.txt"
+        pyproject = self.build_path / "pyproject.toml"
 
         deps_content = ""
 
@@ -100,23 +100,23 @@ class PythonDeployer(BaseDeployer):
         # Check for common patterns
         if self.framework == "django":
             # Look for wsgi.py or asgi.py
-            for raw_root, _dirs, files in os.walk(self.app_path):
+            for raw_root, _dirs, files in os.walk(self.build_path):
                 root = Path(raw_root)
                 if "wsgi.py" in files:
                     # Get module path
-                    rel_path = root.relative_to(self.app_path)
+                    rel_path = root.relative_to(self.build_path)
                     module = str(rel_path).replace("/", ".")
                     wsgi_app = f"{module}.wsgi:application"
                 if "asgi.py" in files:
-                    rel_path = root.relative_to(self.app_path)
+                    rel_path = root.relative_to(self.build_path)
                     module = str(rel_path).replace("/", ".")
                     asgi_app = f"{module}.asgi:application"
 
         elif self.framework == "flask":
             # Check for app.py, main.py, or __init__.py
             for filename in ["app.py", "main.py", "application.py"]:
-                if (self.app_path / filename).exists():
-                    content = (self.app_path / filename).read_text()
+                if (self.build_path / filename).exists():
+                    content = (self.build_path / filename).read_text()
                     # Look for Flask app instance
                     match = re.search(r"(\w+)\s*=\s*Flask\(", content)
                     if match:
@@ -128,8 +128,8 @@ class PythonDeployer(BaseDeployer):
         elif self.framework == "fastapi":
             # Check for main.py or app.py
             for filename in ["main.py", "app.py", "application.py"]:
-                if (self.app_path / filename).exists():
-                    content = (self.app_path / filename).read_text()
+                if (self.build_path / filename).exists():
+                    content = (self.build_path / filename).read_text()
                     match = re.search(r"(\w+)\s*=\s*FastAPI\(", content)
                     if match:
                         app_var = match.group(1)
@@ -150,8 +150,8 @@ class PythonDeployer(BaseDeployer):
         Returns:
             Tuple of (uses_poetry, uses_pipenv).
         """
-        use_poetry = (self.app_path / "poetry.lock").exists()
-        use_pipenv = (self.app_path / "Pipfile.lock").exists()
+        use_poetry = (self.build_path / "poetry.lock").exists()
+        use_pipenv = (self.build_path / "Pipfile.lock").exists()
         return use_poetry, use_pipenv
 
     def get_install_command(self) -> list[str]:
@@ -161,8 +161,7 @@ class PythonDeployer(BaseDeployer):
         elif self.use_pipenv:
             return ["pipenv", "install", "--deploy"]
         else:
-            venv_pip = self.venv_path / "bin" / "pip"
-            return [str(venv_pip), "install", "-r", "requirements.txt"]
+            return [*self._pip(), "install", "-r", "requirements.txt"]
 
     def get_build_command(self) -> list[str]:
         """Get build command (collect static for Django)."""
@@ -171,9 +170,43 @@ class PythonDeployer(BaseDeployer):
             return [str(venv_python), "manage.py", "collectstatic", "--noinput"]
         return []
 
+    def _pip(self) -> list[str]:
+        """
+        Return the argv prefix that runs pip inside the virtual environment.
+
+        On releases pip runs as ``python -m pip``. A virtual environment's
+        scripts carry the absolute path of the interpreter it was created
+        with in their first line, and a venv reused from the previous release
+        still names that release: its ``bin/pip`` would install into the
+        release that is serving, not the one being built.
+
+        Returns:
+            The argv prefix.
+        """
+        if self.uses_releases:
+            return [str(self.venv_path / "bin" / "python"), "-m", "pip"]
+        return [str(self.venv_path / "bin" / "pip")]
+
+    def _gunicorn(self) -> str:
+        """
+        Return how the unit starts gunicorn.
+
+        On releases through ``current`` and as ``python -m gunicorn``, for the
+        reason :meth:`_pip` gives: the interpreter found through ``current``
+        resolves the venv of whichever release is active, and a script's
+        first line would pin the release it was installed in, which pruning
+        eventually deletes.
+
+        Returns:
+            The executable part of ExecStart.
+        """
+        if self.uses_releases:
+            return f"{self._at_runtime(self.venv_path / 'bin' / 'python')} -m gunicorn"
+        return str(self.venv_path / "bin" / "gunicorn")
+
     def get_start_command(self) -> str:
         """Get start command using Gunicorn."""
-        venv_gunicorn = self.venv_path / "bin" / "gunicorn"
+        venv_gunicorn = self._gunicorn()
 
         if self.asgi_app:
             # Use uvicorn workers for ASGI
@@ -197,13 +230,13 @@ class PythonDeployer(BaseDeployer):
         self.logger.debug(f"Poetry: {self.use_poetry}, Pipenv: {self.use_pipenv}")
 
         # Create virtual environment
-        self.venv_path = self.app_path / "venv"
+        self.venv_path = self.build_path / "venv"
 
         if not self.use_poetry and not self.use_pipenv:
             self.logger.substep("Creating virtual environment...")
             result = self._run(
                 ["python3", "-m", "venv", str(self.venv_path)],
-                cwd=self.app_path,
+                cwd=self.build_path,
             )
             if not result.success:
                 self.logger.warning("Failed to create virtual environment")
@@ -219,14 +252,13 @@ class PythonDeployer(BaseDeployer):
         self.logger.debug(f"ASGI app: {self.asgi_app}")
 
         # Install gunicorn
-        venv_pip = self.venv_path / "bin" / "pip"
         packages = ["gunicorn"]
 
         if self.asgi_app:
             packages.append("uvicorn")
 
         self.logger.substep("Installing gunicorn...")
-        result = self._run([str(venv_pip), "install", *packages])
+        result = self._run([*self._pip(), "install", *packages])
         if not result.success:
             self.logger.warning("Failed to install gunicorn")
 
@@ -239,7 +271,7 @@ class PythonDeployer(BaseDeployer):
             {
                 "is_python": True,
                 "framework": self.framework,
-                "venv_path": str(self.venv_path),
+                "venv_path": str(self._at_runtime(self.venv_path)),
             }
         )
         return context

@@ -25,9 +25,13 @@ from wasm.core.config import Config
 from wasm.core.exceptions import DeploymentError
 from wasm.core.fs import FileSystem
 from wasm.core.logger import Logger
+from wasm.core.store import App, get_store
 from wasm.core.utils import domain_to_app_name
+from wasm.deployers.helpers.layout import INPLACE, RELEASES, choose_layout
+from wasm.deployers.helpers.release_build import discard_release, stage_release
 from wasm.deployers.interface import AppDeployer
 from wasm.deployers.registry import DeployerRegistry
+from wasm.deployers.releases import ReleaseManager
 from wasm.managers.source_manager import SourceManager
 
 
@@ -173,11 +177,115 @@ class AutoDeployer(AppDeployer):
             )
 
         self.logger.substep(f"Source: {self.source}")
-        self.source_manager.fetch(self.source, self.app_path, branch=self.branch)
+        existing = get_store().get_app(self.domain)
+        # Whether *some* deployer could build releases here; the detected one
+        # is asked again below, once it is known.
+        layout = choose_layout(
+            existing,
+            self._options.get("layout"),
+            app_type=self.APP_TYPE,
+            supports_releases=True,
+        )
+        if layout == RELEASES:
+            return self._resolve_into_release(existing)
 
-        app_type = DeployerRegistry.detect(self.app_path, verbose=self.verbose)
+        self.source_manager.fetch(self.source, self.app_path, branch=self.branch)
+        deployer_class = self._detect(self.app_path)
+
+        delegate = deployer_class(verbose=self.verbose, fs=self._fs)
+        delegate.configure(self.domain, self.source, **self._options)
+        # The code is already on disk; re-fetching would clean the directory and
+        # clone it a second time.
+        delegate.source_already_fetched = True
+        self.delegate = delegate
+        return delegate
+
+    def _resolve_into_release(self, existing: App | None) -> AppDeployer:
+        """
+        Fetch the source into a new release, detect it there, and hand it over.
+
+        A type that cannot build releases yet (monorepo, docker-compose) makes
+        a new application fall back to the in-place layout, the same way the
+        server default does for it when the type is given explicitly; an
+        explicit request for releases, or an application already on them,
+        is an error instead.
+
+        Args:
+            existing: The application's store row, when it is already deployed.
+
+        Returns:
+            A configured deployer that builds the staged release.
+
+        Raises:
+            DeploymentError: If the source cannot be fetched, matches nothing,
+                or its type cannot use the layout required of it.
+        """
+        releases = ReleaseManager(self.app_path, fs=self._fs, logger=self.logger)
+        staged = stage_release(
+            self.source,
+            self.branch,
+            releases=releases,
+            source_manager=self.source_manager,
+            logger=self.logger,
+        )
+        try:
+            deployer_class = self._detect(staged.path)
+        except DeploymentError:
+            # Nothing was deployed: a new application leaves no directory
+            # behind, an existing one loses only the release just staged.
+            if existing is None and self.app_path.is_dir():
+                self.fs.remove_tree(self.app_path)
+            else:
+                discard_release(staged.path, releases=releases, logger=self.logger)
+            raise
+
+        if not getattr(deployer_class, "SUPPORTS_RELEASES", False):
+            # Asked again with the real type: raises for an explicit request
+            # or an existing release app, answers "inplace" otherwise.
+            choose_layout(
+                existing,
+                self._options.get("layout"),
+                app_type=deployer_class.APP_TYPE,
+                supports_releases=False,
+            )
+            # A new application: what was staged is all this deploy created,
+            # and the in-place fetch starts from a clean directory anyway.
+            self.logger.substep(f"{deployer_class.APP_TYPE} applications deploy in place")
+            if self.app_path.is_dir():
+                self.fs.remove_tree(self.app_path)
+            self._options["layout"] = INPLACE
+            self.source_manager.fetch(self.source, self.app_path, branch=self.branch)
+            delegate = deployer_class(verbose=self.verbose, fs=self._fs)
+            delegate.configure(self.domain, self.source, **self._options)
+            delegate.source_already_fetched = True
+            self.delegate = delegate
+            return delegate
+
+        delegate = deployer_class(verbose=self.verbose, fs=self._fs)
+        delegate.configure(self.domain, self.source, **{**self._options, "layout": RELEASES})
+        adopt = getattr(delegate, "adopt_release", None)
+        if adopt is None:  # pragma: no cover - SUPPORTS_RELEASES implies BaseDeployer
+            raise DeploymentError(f"{deployer_class.APP_TYPE} cannot build a staged release")
+        adopt(staged)
+        self.delegate = delegate
+        return delegate
+
+    def _detect(self, tree: Path) -> type[AppDeployer]:
+        """
+        Identify the fetched source and return the deployer class for it.
+
+        Args:
+            tree: Directory holding the fetched source.
+
+        Returns:
+            The deployer class.
+
+        Raises:
+            DeploymentError: If the tree is empty or names an unknown type.
+        """
+        app_type = DeployerRegistry.detect(tree, verbose=self.verbose)
         if app_type is None:
-            if not any(self.app_path.iterdir()):
+            if not tree.is_dir() or not any(tree.iterdir()):
                 raise DeploymentError(
                     f"Nothing to deploy at {self.source}",
                     details="The fetched source directory is empty.",
@@ -194,14 +302,7 @@ class AutoDeployer(AppDeployer):
         deployer_class = DeployerRegistry.get(app_type)
         if deployer_class is None:  # pragma: no cover - registry is populated above
             raise DeploymentError(f"Detected unknown application type: {app_type}")
-
-        delegate = deployer_class(verbose=self.verbose, fs=self._fs)
-        delegate.configure(self.domain, self.source, **self._options)
-        # The code is already on disk; re-fetching would clean the directory and
-        # clone it a second time.
-        delegate.source_already_fetched = True
-        self.delegate = delegate
-        return delegate
+        return deployer_class
 
     def deploy(self) -> bool:
         """

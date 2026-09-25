@@ -122,8 +122,10 @@ def parse_git_url(url: str) -> dict:
             result["repo"] = path_parts[0]
         return result
 
-    # HTTPS format
-    match = GIT_HTTPS_PATTERN.match(url)
+    # HTTPS and git:// share a shape. git:// used to fall through here with
+    # no host, so a transport is_git_url and the remote URL check accept was
+    # refused as "Could not determine Git host".
+    match = GIT_HTTPS_PATTERN.match(url) or GIT_PROTOCOL_PATTERN.match(url)
     if match:
         result["host"] = match.group("host")
         path_parts = match.group("path").rstrip(".git").split("/")

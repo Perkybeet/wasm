@@ -703,6 +703,10 @@ def test_create_configures_the_deployer_and_deploys(
         "env_vars": {"DATABASE_URL": "postgres://localhost/app"},
         "package_manager": "pnpm",
         "include_www": True,
+        # Not the configured layout itself: an existing application keeps its
+        # own, so the deployer resolves "default" against the store.
+        "layout": "default",
+        "persistent_paths": None,
     }
 
 

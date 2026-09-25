@@ -83,7 +83,7 @@ class ViteDeployer(BaseDeployer):
         config_files = ["vite.config.js", "vite.config.ts", "vite.config.mjs"]
 
         for config_file in config_files:
-            config_path = self.app_path / config_file
+            config_path = self.build_path / config_file
             if config_path.exists():
                 try:
                     content = config_path.read_text()
@@ -99,7 +99,7 @@ class ViteDeployer(BaseDeployer):
         config_files = ["vite.config.js", "vite.config.ts", "vite.config.mjs"]
 
         for config_file in config_files:
-            config_path = self.app_path / config_file
+            config_path = self.build_path / config_file
             if config_path.exists():
                 try:
                     content = config_path.read_text()
@@ -170,7 +170,7 @@ class ViteDeployer(BaseDeployer):
             {
                 "is_vite": True,
                 "is_static": not self.is_ssr,
-                "static_dir": str(self.app_path / self.output_dir),
+                "static_dir": str(self._at_runtime(self.build_path / self.output_dir)),
                 "output_dir": self.output_dir,
             }
         )
@@ -208,7 +208,7 @@ class ViteDeployer(BaseDeployer):
         """Check if the static site is accessible."""
         if not self.is_ssr:
             # For static sites, check if index.html exists
-            index_path = self.app_path / self.output_dir / "index.html"
+            index_path = self.build_path / self.output_dir / "index.html"
             if index_path.exists():
                 self.logger.debug("Static build verified")
                 return True

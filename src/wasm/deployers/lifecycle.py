@@ -26,6 +26,14 @@ The sequence, and why it is in this order:
    the service user.
 5. A restart only once the build succeeded, so a broken build leaves the
    previous one serving.
+
+That is the in-place layout, and an application on it is updated exactly that
+way until it is migrated explicitly. An application on the release layout is
+updated by its deployer as a whole: the source is fetched into a new release
+(through the repository cache for git), built there, activated behind the
+health gate and rolled back automatically when it does not answer. There is no
+backup first, because the release that was serving stays on disk and is what
+the rollback returns to.
 """
 
 from __future__ import annotations
@@ -39,12 +47,14 @@ from wasm.core.config import Config
 from wasm.core.exceptions import ServiceError, WASMError
 from wasm.core.fs import SECRET_MODE, get_fs
 from wasm.core.logger import Logger
-from wasm.core.store import DeploymentTrigger, get_store
+from wasm.core.store import App, DeploymentTrigger, get_store
 from wasm.core.utils import domain_to_app_name
 from wasm.deployers.docker_compose import DockerComposeDeployer
+from wasm.deployers.helpers.layout import INPLACE, RELEASES
 from wasm.deployers.interface import UpdateResult
 from wasm.deployers.monorepo import MonorepoDeployer
 from wasm.deployers.registry import detect_app_type, get_deployer
+from wasm.deployers.releases import CURRENT_LINK, ReleaseManager
 from wasm.managers.backup_manager import RollbackManager
 from wasm.managers.service_manager import ServiceManager
 from wasm.managers.source_manager import SourceManager
@@ -54,8 +64,12 @@ from wasm.validators.source import validate_source
 #: Called as each phase begins, with its position, the total and a description.
 PhaseReporter = Callable[[int, int, str], None]
 
-#: How many phases :func:`update_app` reports.
+#: How many phases :func:`update_app` reports for an in-place application.
 PHASES = 5
+
+#: How many phases it reports for an application on the release layout, where
+#: fetching, building, activating and checking are one deployer step.
+RELEASE_PHASES = 2
 
 #: systemd reports a unit active the instant it forks, so the process gets
 #: this long to fail before its state is believed.
@@ -109,7 +123,8 @@ def update_app(
         branch: Git branch to update from.
         package_manager: Node package manager, or ``auto``.
         trigger: Who asked for the update, recorded in the deployment history.
-        on_phase: Called as each of the :data:`PHASES` phases begins.
+        on_phase: Called as each phase begins, with its position and the
+            total: :data:`PHASES` in place, :data:`RELEASE_PHASES` on releases.
         on_step: Called as each step of the rebuild begins.
         logger: Logger for the details of each phase.
         verbose: Verbosity of the managers and the deployer.
@@ -140,6 +155,22 @@ def update_app(
         raise WASMError(
             f"Application not found: {domain}",
             details=f"Nothing is deployed at {app_path}. Deploy it with: wasm create -d {domain}",
+        )
+
+    # An application is updated in place unless its row says releases; a
+    # stand-in for a row that predates layouts says nothing, so in place.
+    if app is not None and getattr(app, "layout", INPLACE) == RELEASES:
+        return _update_release(
+            app,
+            app_path,
+            source=source,
+            branch=branch,
+            package_manager=package_manager,
+            trigger=trigger,
+            phase=phase,
+            on_step=on_step,
+            log=log,
+            verbose=verbose,
         )
 
     phase(1, PHASES, "Creating pre-update backup")
@@ -207,6 +238,95 @@ def update_app(
         is_static=result.is_static,
         restarted=restarted,
         active=active,
+    )
+
+
+def _update_release(
+    app: App,
+    app_path: Path,
+    *,
+    source: str | None,
+    branch: str | None,
+    package_manager: str,
+    trigger: str,
+    phase: PhaseReporter,
+    on_step: Callable[[str], None] | None,
+    log: Logger,
+    verbose: bool,
+) -> AppUpdate:
+    """
+    Update an application on the release layout.
+
+    Args:
+        app: The application's store row.
+        app_path: The application directory.
+        source: Fetch from this source instead of the recorded one.
+        branch: Git branch; the recorded one when None.
+        package_manager: Node package manager, or ``auto``.
+        trigger: Who asked for the update.
+        phase: Reporter for the :data:`RELEASE_PHASES` phases.
+        on_step: Called as each step of the release build begins.
+        log: Logger for the details of each phase.
+        verbose: Verbosity of the deployer.
+
+    Returns:
+        What was done.
+
+    Raises:
+        WASMError: When there is nothing to fetch from, the type cannot build
+            releases, or the release failed; a release that failed its
+            health check has been rolled back by then.
+    """
+    phase(1, RELEASE_PHASES, "Detecting application type")
+    app_type = _resolve_type(app.app_type, app_path / CURRENT_LINK, verbose)
+    log.substep(f"Type: {app_type}")
+
+    fetch_from = source or app.source
+    if not fetch_from:
+        raise WASMError(
+            f"{app.domain} has no recorded source to build a release from",
+            details=f"Pass one explicitly: wasm update {app.domain} --source <git URL or path>",
+        )
+
+    deployer = get_deployer(app_type, verbose=verbose)
+    if not getattr(deployer, "SUPPORTS_RELEASES", False):
+        raise WASMError(
+            f"{app.domain} is on the releases layout, which {app_type} applications do not support",
+            details="Redeploy it with the type it was created with.",
+        )
+
+    active = ReleaseManager(app_path).current()
+    phase(2, RELEASE_PHASES, "Building and activating a new release")
+    log.substep(
+        f"Release {active.id} stays on disk to fall back to"
+        if active is not None
+        else "There is no active release to fall back to"
+    )
+    deployer.configure(
+        domain=app.domain,
+        source=fetch_from,
+        # The health gate probes the port the application listens on; left
+        # out, it would ask the deployer's default port, which on a server
+        # with more than one application is somebody else's.
+        port=app.port,
+        app_path=app_path,
+        branch=branch or app.branch,
+        package_manager=package_manager,
+        trigger=trigger,
+    )
+    result = deployer.update(on_step=on_step)
+
+    # The deployer restarted the unit and saw the release answer before it
+    # returned; a release that did not is rolled back and raised above.
+    restarted = () if result.is_static else (app_path.name,)
+    return AppUpdate(
+        domain=app.domain,
+        app_type=app_type,
+        package_manager=result.package_manager,
+        prisma_updated=result.prisma_updated,
+        is_static=result.is_static,
+        restarted=restarted,
+        active=True,
     )
 
 

@@ -97,16 +97,16 @@ class StaticDeployer(BaseDeployer):
         static_dirs = ["public", "dist", "build", "www", "html", "."]
 
         for dir_name in static_dirs:
-            dir_path = self.app_path / dir_name
+            dir_path = self.build_path / dir_name
             if dir_name == ".":
-                dir_path = self.app_path
+                dir_path = self.build_path
 
             if (dir_path / "index.html").exists():
                 self.static_dir = dir_path
                 break
 
         if not self.static_dir:
-            self.static_dir = self.app_path
+            self.static_dir = self.build_path
 
         self.logger.debug(f"Static directory: {self.static_dir}")
         return True
@@ -117,7 +117,9 @@ class StaticDeployer(BaseDeployer):
         context.update(
             {
                 "is_static": True,
-                "static_dir": str(self.static_dir or self.app_path),
+                # The directory as the web server will see it: through
+                # ``current`` on releases, so activation needs no reload.
+                "static_dir": str(self._at_runtime(self.static_dir or self.build_path)),
             }
         )
         return context
@@ -137,7 +139,7 @@ class StaticDeployer(BaseDeployer):
 
     def health_check(self, retries: int = 5, delay: float = 2.0) -> bool:
         """Check if static site files exist."""
-        index_path = (self.static_dir or self.app_path) / "index.html"
+        index_path = (self.static_dir or self.build_path) / "index.html"
         if index_path.exists():
             self.logger.debug("Static site verified")
             return True
@@ -155,6 +157,13 @@ class StaticDeployer(BaseDeployer):
         Returns:
             The steps to execute, each with the undo that reverses it.
         """
+        prepare = DeployStep(
+            title="Preparing static files",
+            icon=Icons.FOLDER,
+            run=self.pre_install,
+        )
+        if self.uses_releases:
+            return self._release_pipeline([prepare], with_service=False)
         return [
             DeployStep(
                 title="Fetching source code",
@@ -162,11 +171,7 @@ class StaticDeployer(BaseDeployer):
                 run=self._step_fetch,
                 undo=self.remove_source,
             ),
-            DeployStep(
-                title="Preparing static files",
-                icon=Icons.FOLDER,
-                run=self.pre_install,
-            ),
+            prepare,
             DeployStep(
                 title="Creating site configuration",
                 icon=Icons.GLOBE,

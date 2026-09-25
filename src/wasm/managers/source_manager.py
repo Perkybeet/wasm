@@ -1232,6 +1232,154 @@ class SourceManager(BaseManager):
 
         return True
 
+    def sync_cache(self, source: str, cache: Path, branch: str | None = None) -> str | None:
+        """
+        Bring a repository cache up to date with a branch and name its commit.
+
+        The cache is an ordinary clone that releases are exported from, so a
+        deploy fetches what changed instead of cloning the whole repository
+        again. It is cloned on first use; afterwards it is fetched and reset
+        to the branch. There is deliberately no ``git clean``: nothing in the
+        cache belongs to the application, but cleaning is never what an
+        update of a checkout should do (see :meth:`_force_update_git`).
+
+        Args:
+            source: Git URL, optionally with ``#branch``.
+            cache: Directory of the clone.
+            branch: Branch to follow. None follows the branch the cache is
+                on, or the remote's default branch for a new cache.
+
+        Returns:
+            The full id of the commit the cache is at, or None when there is
+            no clone to ask, which only happens in a rehearsal.
+
+        Raises:
+            SourceError: If the source is not a git URL, the branch cannot be
+                determined, or git fails.
+        """
+        source_type, normalized = validate_source(source)
+        if source_type != "git":
+            raise SourceError(
+                f"Not a git source: {source}",
+                details="Only git sources have a repository cache; local directories "
+                "and archives are copied into each release instead.",
+            )
+        parsed = parse_git_url(normalized)
+        if parsed["branch"] and not branch:
+            branch = parsed["branch"]
+        url = normalized.split("#")[0]
+
+        if not (cache / ".git").is_dir():
+            # clean=True: a cache that is there but is not a clone is a
+            # half-finished one, and cloning into it would fail anyway.
+            self.fetch(url, cache, branch=branch)
+        else:
+            self._update_cache(url, cache, branch)
+
+        if not (cache / ".git").is_dir():
+            return None
+        result = self._git(["rev-parse", "HEAD"], cwd=cache)
+        if not result.success:
+            raise SourceError(f"Cannot read the commit of {cache}", details=result.stderr)
+        return result.stdout.strip()
+
+    def _update_cache(self, url: str, cache: Path, branch: str | None) -> None:
+        """
+        Fetch one branch into an existing cache and reset the cache to it.
+
+        Args:
+            url: Repository URL, without a ``#branch`` suffix.
+            cache: Directory of the clone.
+            branch: Branch to follow, or None for the branch checked out.
+
+        Raises:
+            SourceError: If the URL or branch is unsafe, the branch cannot be
+                determined, or git fails.
+        """
+        safe_url = validate_git_remote_url(url)
+        self._ensure_safe_directory(cache)
+
+        result = self._git(["remote", "get-url", "origin"], cwd=cache)
+        if not result.success or result.stdout.strip() != safe_url:
+            self.logger.debug(f"Updating remote URL to: {safe_url}")
+            self._git(["remote", "set-url", "origin", "--", safe_url], cwd=cache)
+
+        checked_out = self._git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=cache)
+        current = checked_out.stdout.strip() if checked_out.success else ""
+        target = branch or (current if current not in ("", "HEAD") else "")
+        if not target:
+            raise SourceError(
+                f"Cannot tell which branch {cache} should follow",
+                details="The cache is on a detached HEAD. Pass the branch to deploy.",
+            )
+        safe_branch = validate_git_ref(target)
+
+        # An explicit refspec rather than `fetch --all`: the cache is a
+        # single-branch clone, and a deploy of another branch must still find
+        # it on the remote.
+        result = self._git(
+            ["fetch", "origin", f"+refs/heads/{safe_branch}:refs/remotes/origin/{safe_branch}"],
+            cwd=cache,
+            timeout=GIT_NETWORK_TIMEOUT,
+        )
+        if not result.success:
+            raise SourceError(f"Git fetch of {safe_branch} failed", details=result.stderr)
+
+        if safe_branch != current:
+            result = self._git(
+                ["checkout", "--force", "-B", safe_branch, f"origin/{safe_branch}"], cwd=cache
+            )
+            if not result.success:
+                raise SourceError(f"Git checkout of {safe_branch} failed", details=result.stderr)
+
+        result = self._git(["reset", "--hard", f"origin/{safe_branch}"], cwd=cache)
+        if not result.success:
+            raise SourceError("Git reset failed", details=result.stderr)
+
+    def export_commit(self, repository: Path, commit: str, destination: Path) -> None:
+        """
+        Write the tree of one commit into a directory, without ``.git``.
+
+        ``git archive`` into a file, then ``tar`` out of it: two argv
+        commands through the runner rather than a shell pipe. The archive is
+        written next to the destination, on the same filesystem, and removed
+        afterwards whatever happened.
+
+        Args:
+            repository: The clone to export from.
+            commit: Commit id, as returned by :meth:`sync_cache`.
+            destination: Existing, empty directory to write the tree into.
+
+        Raises:
+            SourceError: If the commit is not a commit id, or either command
+                fails.
+        """
+        if not re.fullmatch(r"[0-9a-f]{7,64}", commit):
+            raise SourceError(
+                f"{commit!r} is not a commit id",
+                details="Export a commit named by its hash, as sync_cache returns it.",
+            )
+        archive = destination.parent / f".{destination.name}.tar"
+        result = self._git(
+            ["archive", "--format=tar", f"--output={archive}", commit],
+            cwd=repository,
+            timeout=GIT_CLONE_TIMEOUT,
+        )
+        try:
+            if not result.success:
+                raise SourceError(f"git archive of {commit} failed", details=result.stderr)
+            extract = self.runner.run(
+                ["tar", "-xf", str(archive), "-C", str(destination)],
+                timeout=GIT_CLONE_TIMEOUT,
+            )
+            if not extract.success:
+                raise SourceError(
+                    f"Extracting {commit} into {destination} failed",
+                    details=extract.stderr or extract.stdout,
+                )
+        finally:
+            self.fs.remove(archive, missing_ok=True)
+
     def clone_git(
         self,
         url: str,

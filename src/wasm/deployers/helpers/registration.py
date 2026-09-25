@@ -42,9 +42,16 @@ class StoreRegistrar:
         status: str,
         is_static: bool,
         env_vars: dict[str, str],
+        layout: str | None = None,
+        persistent_paths: list[str] | None = None,
     ) -> App:
         """
         Create or update the application row.
+
+        The row is rebuilt from what this deployment knows, so everything it
+        does not know is carried over from the existing row: the layout, the
+        release retention, the persistent paths and the resource limits are
+        the application's settings, not something a redeploy may reset.
 
         Args:
             domain: Natural key of the application.
@@ -58,6 +65,10 @@ class StoreRegistrar:
             status: Lifecycle status to record.
             is_static: Whether the app is served straight off disk.
             env_vars: Environment variables recorded with the app.
+            layout: ``inplace`` or ``releases``. None keeps the existing
+                row's, or the in-place default for a new one.
+            persistent_paths: Paths kept in ``shared/`` across releases. None
+                keeps the existing row's, or none for a new one.
 
         Returns:
             The stored application row.
@@ -77,6 +88,17 @@ class StoreRegistrar:
             is_static=is_static,
             env_vars=env_vars,
         )
+        if existing:
+            app.layout = existing.layout
+            app.keep_releases = existing.keep_releases
+            app.persistent_paths = list(existing.persistent_paths)
+            app.memory_max_mb = existing.memory_max_mb
+            app.cpu_quota_percent = existing.cpu_quota_percent
+            app.tasks_max = existing.tasks_max
+        if layout is not None:
+            app.layout = layout
+        if persistent_paths is not None:
+            app.persistent_paths = list(persistent_paths)
         if existing:
             # created_at belongs to the first deployment, not to this one.
             app.created_at = existing.created_at

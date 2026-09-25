@@ -94,6 +94,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "default_version": "3.11",
         "use_venv": True,
     },
+    "deploy": {
+        # Layout of applications created from now on: "releases" builds each
+        # deploy in its own directory behind a health gate; "inplace" is the
+        # 1.x layout. Applications that already exist keep the layout they
+        # have until they are migrated explicitly.
+        "layout": "releases",
+    },
     "monitor": {
         "enabled": False,
         "scan_interval": 30,  # Local pattern scan every 30 seconds

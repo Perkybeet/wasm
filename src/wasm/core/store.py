@@ -114,6 +114,39 @@ class DeploymentTrigger(str, Enum):
     WEBHOOK = "webhook"
 
 
+class AppLayout(str, Enum):
+    """
+    How an application's directory is organised.
+
+    ``inplace`` is the v1 layout: the tree the service runs is the tree every
+    update rebuilds. ``releases`` builds each deploy in its own directory under
+    ``releases/`` and points ``current`` at the active one (see
+    :mod:`wasm.deployers.releases`).
+    """
+
+    INPLACE = "inplace"
+    RELEASES = "releases"
+
+
+class ReleaseStatus(str, Enum):
+    """Lifecycle of one release of an application."""
+
+    #: Built, not activated yet.
+    BUILT = "built"
+    #: What ``current`` points at.
+    ACTIVE = "active"
+    #: Was active until a newer release replaced it.
+    SUPERSEDED = "superseded"
+    #: Its build or its health check failed; it never served traffic for long.
+    FAILED = "failed"
+    #: Was active until the operator rolled back to an earlier one.
+    ROLLED_BACK = "rolled_back"
+
+
+#: Releases kept on disk when the application does not say otherwise.
+DEFAULT_KEEP_RELEASES = 5
+
+
 @dataclass
 class App:
     """Application record."""
@@ -135,12 +168,23 @@ class App:
     created_at: str | None = None
     updated_at: str | None = None
     deployed_at: str | None = None
+    # Schema v5. The default is the v1 layout on purpose: a row that does not
+    # say otherwise was deployed in place, and treating it as a release app
+    # would point its unit at a ``current`` that does not exist.
+    layout: str = AppLayout.INPLACE.value
+    keep_releases: int = DEFAULT_KEEP_RELEASES
+    persistent_paths: list[str] = field(default_factory=list)
+    memory_max_mb: int | None = None
+    cpu_quota_percent: int | None = None
+    tasks_max: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         d = asdict(self)
         if isinstance(d.get("env_vars"), dict):
             d["env_vars"] = json.dumps(d["env_vars"])
+        if isinstance(d.get("persistent_paths"), list):
+            d["persistent_paths"] = json.dumps(d["persistent_paths"])
         return d
 
     @classmethod
@@ -161,7 +205,31 @@ class App:
                 data["env_vars"] = json.loads(data["env_vars"])
             except (json.JSONDecodeError, TypeError):
                 data["env_vars"] = {}
+        data["persistent_paths"] = _decode_paths(data.get("persistent_paths"))
         return cls(**data)
+
+
+def _decode_paths(raw: Any) -> list[str]:
+    """
+    Read the ``persistent_paths`` column.
+
+    Args:
+        raw: The column value: a JSON list, or NULL.
+
+    Returns:
+        The paths. A value that is not a JSON list of strings reads as no
+        paths rather than failing every read of the application: the list is
+        validated again, path by path, before anything is linked.
+    """
+    if not raw:
+        return []
+    try:
+        decoded = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(decoded, list):
+        return []
+    return [str(item) for item in decoded if isinstance(item, str)]
 
 
 @dataclass
@@ -305,6 +373,46 @@ class DeploymentRecord:
 
 
 @dataclass
+class ReleaseRecord:
+    """
+    One release of an application, as the store remembers it.
+
+    The directory is the truth about what exists;
+    :class:`wasm.deployers.releases.ReleaseManager` reads it. This row is what
+    the directory cannot say: when a release was activated and how it ended,
+    including the builds that failed and were removed.
+
+    Attributes:
+        id: Release id, the directory name under ``releases/``.
+        app_id: Application the release belongs to.
+        git_commit: Short commit it was built from, None for a source that is
+            not a git repository. Named like ``deployments.git_commit``
+            because COMMIT is an SQL keyword.
+        created_at: When the release was created, ISO 8601 in UTC.
+        activated_at: When it last became the active release.
+        status: One of :class:`ReleaseStatus`.
+        path: The release directory.
+    """
+
+    id: str = ""
+    app_id: int | None = None
+    git_commit: str | None = None
+    created_at: str | None = None
+    activated_at: str | None = None
+    status: str = ReleaseStatus.BUILT.value
+    path: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return asdict(self)
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "ReleaseRecord":
+        """Create from database row."""
+        return cls(**dict(row))
+
+
+@dataclass
 class JobRecord:
     """
     One background job the panel queued, kept so a restart does not erase it.
@@ -367,7 +475,7 @@ class MonorepoWorkspace:
 
 
 # Schema version for migrations
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _DEPLOYMENT_STATUSES_SQL = ", ".join(f"'{status.value}'" for status in DeploymentStatus)
 _DEPLOYMENT_TRIGGERS_SQL = ", ".join(f"'{trigger.value}'" for trigger in DeploymentTrigger)
@@ -442,6 +550,48 @@ CREATE INDEX IF NOT EXISTS idx_jobs_domain ON jobs(domain);
 CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC);
 """
 
+_RELEASE_STATUSES_SQL = ", ".join(f"'{status.value}'" for status in ReleaseStatus)
+
+# Schema v5: the columns every application gains for the release layout, with
+# the defaults that keep an existing row exactly what it was - in place, the
+# default retention, nothing persistent, no resource limits. Shared by the
+# fresh install path and the v4-to-v5 migration, which is why it is a list of
+# column definitions rather than two CREATE TABLE spellings that could drift.
+#
+# The limits are only columns for now; the unit template learns them later.
+APPS_V5_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("layout", f"TEXT NOT NULL DEFAULT '{AppLayout.INPLACE.value}'"),
+    ("keep_releases", f"INTEGER NOT NULL DEFAULT {DEFAULT_KEEP_RELEASES}"),
+    ("persistent_paths", "TEXT NOT NULL DEFAULT '[]'"),
+    ("memory_max_mb", "INTEGER"),
+    ("cpu_quota_percent", "INTEGER"),
+    ("tasks_max", "INTEGER"),
+)
+
+# Schema v5: one row per release of an application. Unlike the deployments
+# history, a release is state rather than history - the directory it names is
+# deleted with the application - so the rows go with the app row.
+RELEASES_SCHEMA_SQL = f"""
+-- Releases of applications on the release layout
+CREATE TABLE IF NOT EXISTS releases (
+    id TEXT NOT NULL,
+    app_id INTEGER NOT NULL,
+    git_commit TEXT,
+    created_at TEXT NOT NULL,
+    activated_at TEXT,
+    status TEXT NOT NULL CHECK (status IN ({_RELEASE_STATUSES_SQL})),
+    path TEXT NOT NULL,
+    PRIMARY KEY (app_id, id),
+    FOREIGN KEY (app_id) REFERENCES apps(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_releases_app_created ON releases(app_id, created_at DESC);
+"""
+
+_APPS_V5_COLUMNS_SQL = "".join(
+    f"    {name} {definition},\n" for name, definition in APPS_V5_COLUMNS
+)
+
 SCHEMA_SQL = (
     """
 -- Schema version tracking
@@ -470,7 +620,10 @@ CREATE TABLE IF NOT EXISTS apps (
     -- disabled. Stored in clear on purpose: see set_webhook_secret. The
     -- v2-to-v3 migration adds this same column with ALTER TABLE.
     webhook_secret TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    -- Schema v5: the release layout columns, from APPS_V5_COLUMNS.
+"""
+    + _APPS_V5_COLUMNS_SQL
+    + """    created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     deployed_at TEXT
 );
@@ -554,6 +707,7 @@ CREATE INDEX IF NOT EXISTS idx_databases_app_id ON databases(app_id);
 """
     + DEPLOYMENTS_SCHEMA_SQL
     + JOBS_SCHEMA_SQL
+    + RELEASES_SCHEMA_SQL
 )
 
 
@@ -877,6 +1031,7 @@ class WASMStore:
             2: self._migrate_v1_to_v2,
             3: self._migrate_v2_to_v3,
             4: self._migrate_v3_to_v4,
+            5: self._migrate_v4_to_v5,
         }
 
         for version in range(from_version + 1, SCHEMA_VERSION + 1):
@@ -913,6 +1068,21 @@ class WASMStore:
             cursor: Cursor the migration runs on.
         """
         cursor.executescript(JOBS_SCHEMA_SQL)
+
+    def _migrate_v4_to_v5(self, cursor: sqlite3.Cursor) -> None:
+        """
+        Add the release layout columns and the releases table (schema v5).
+
+        Every existing row becomes ``inplace``, which is what it is: an
+        application deployed by 1.x lives in its own tree, and only an
+        explicit migration may move it onto releases.
+
+        Args:
+            cursor: Cursor the migration runs on.
+        """
+        for name, definition in APPS_V5_COLUMNS:
+            cursor.execute(f"ALTER TABLE apps ADD COLUMN {name} {definition}")
+        cursor.executescript(RELEASES_SCHEMA_SQL)
 
     # =========================================================================
     # Application CRUD
@@ -1759,6 +1929,179 @@ class WASMStore:
                 (domain, domain, keep),
             )
             return cursor.rowcount
+
+    # =========================================================================
+    # Releases
+    # =========================================================================
+
+    def record_release(self, release: ReleaseRecord) -> ReleaseRecord:
+        """
+        Remember a release that was just created.
+
+        Args:
+            release: The release. ``app_id``, ``id``, ``created_at`` and
+                ``path`` are required; ``status`` is usually ``built``.
+
+        Returns:
+            The stored record.
+
+        Raises:
+            StoreError: If ``status`` is not an accepted value or the
+                application does not exist.
+        """
+        self._check_release_status(release.status)
+        try:
+            with self._transaction() as cursor:
+                cursor.execute(
+                    """INSERT INTO releases
+                       (id, app_id, git_commit, created_at, activated_at, status, path)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        release.id,
+                        release.app_id,
+                        release.git_commit,
+                        release.created_at,
+                        release.activated_at,
+                        release.status,
+                        release.path,
+                    ),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise StoreError(
+                f"Cannot record release {release.id}",
+                details=f"{exc}. The application must exist and the release id be new.",
+            ) from exc
+        return release
+
+    def mark_release_active(self, app_id: int, release_id: str) -> bool:
+        """
+        Record that a release is now the one ``current`` points at.
+
+        Whatever was active before becomes ``superseded`` in the same
+        transaction, so there is never a moment with two active rows.
+
+        Args:
+            app_id: The application.
+            release_id: The release now active.
+
+        Returns:
+            True if the release row exists and was updated.
+        """
+        now = datetime.now().isoformat()
+        with self._transaction() as cursor:
+            cursor.execute(
+                "UPDATE releases SET status = ? WHERE app_id = ? AND status = ? AND id != ?",
+                (
+                    ReleaseStatus.SUPERSEDED.value,
+                    app_id,
+                    ReleaseStatus.ACTIVE.value,
+                    release_id,
+                ),
+            )
+            cursor.execute(
+                "UPDATE releases SET status = ?, activated_at = ? WHERE app_id = ? AND id = ?",
+                (ReleaseStatus.ACTIVE.value, now, app_id, release_id),
+            )
+            return cursor.rowcount > 0
+
+    def set_release_status(self, app_id: int, release_id: str, status: str) -> bool:
+        """
+        Change the status of one release, and nothing else.
+
+        Args:
+            app_id: The application.
+            release_id: The release.
+            status: One of :class:`ReleaseStatus`.
+
+        Returns:
+            True if the row exists and was updated.
+
+        Raises:
+            StoreError: If ``status`` is not an accepted value.
+        """
+        self._check_release_status(status)
+        with self._transaction() as cursor:
+            cursor.execute(
+                "UPDATE releases SET status = ? WHERE app_id = ? AND id = ?",
+                (status, app_id, release_id),
+            )
+            return cursor.rowcount > 0
+
+    def get_release(self, app_id: int, release_id: str) -> ReleaseRecord | None:
+        """
+        Get one release of an application.
+
+        Args:
+            app_id: The application.
+            release_id: The release.
+
+        Returns:
+            The record, or None if not found.
+        """
+        with self._transaction() as cursor:
+            cursor.execute(
+                "SELECT * FROM releases WHERE app_id = ? AND id = ?", (app_id, release_id)
+            )
+            row = cursor.fetchone()
+            return ReleaseRecord.from_row(row) if row else None
+
+    def list_releases(self, app_id: int) -> list[ReleaseRecord]:
+        """
+        List the releases of an application, newest first.
+
+        Args:
+            app_id: The application.
+
+        Returns:
+            Records ordered by creation time, newest first. Release ids sort
+            in creation order, so they break ties within a second.
+        """
+        with self._transaction() as cursor:
+            cursor.execute(
+                "SELECT * FROM releases WHERE app_id = ? ORDER BY created_at DESC, id DESC",
+                (app_id,),
+            )
+            return [ReleaseRecord.from_row(row) for row in cursor.fetchall()]
+
+    def delete_releases(self, app_id: int, release_ids: list[str]) -> int:
+        """
+        Forget releases, usually because they were pruned from disk.
+
+        Args:
+            app_id: The application.
+            release_ids: Releases to forget.
+
+        Returns:
+            How many rows were deleted.
+        """
+        if not release_ids:
+            return 0
+        placeholders = ", ".join("?" for _ in release_ids)
+        with self._transaction() as cursor:
+            cursor.execute(
+                f"DELETE FROM releases WHERE app_id = ? AND id IN ({placeholders})",
+                [app_id, *release_ids],
+            )
+            return cursor.rowcount
+
+    @staticmethod
+    def _check_release_status(status: str) -> None:
+        """
+        Refuse a release status the table would refuse, with a readable error.
+
+        Args:
+            status: The status to check.
+
+        Raises:
+            StoreError: If it is not one of :class:`ReleaseStatus`.
+        """
+        try:
+            ReleaseStatus(status)
+        except ValueError as exc:
+            raise StoreError(
+                f"Invalid release status {status!r}",
+                details="Accepted statuses: " + ", ".join(member.value for member in ReleaseStatus),
+            ) from exc
 
     # =========================================================================
     # Job persistence

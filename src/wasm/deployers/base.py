@@ -11,24 +11,45 @@ Defines the interface and common functionality for all deployers.
 the manager that does the work and the undo that reverses it. Everything that
 belongs to a manager (nginx, systemd, certbot) or to the store lives there, not
 here.
+
+Three paths, because the release layout pulls apart what the in-place layout
+kept in one directory:
+
+- :attr:`BaseDeployer.app_path` is the application directory, the one the
+  store records. In place it is also where the code is built and run.
+- :attr:`BaseDeployer.build_path` is where the code being deployed is built:
+  the application directory in place, the new release directory on releases.
+  Everything that reads or builds the project uses it.
+- :attr:`BaseDeployer.runtime_path` is what the unit and the web server are
+  given: the application directory in place, ``current`` on releases, so the
+  same unit and site serve every release that is activated after them.
+
+In place, all three are the same directory, which is what keeps that layout
+exactly as it was.
 """
 
 from __future__ import annotations
 
+import re
+import sqlite3
 from abc import abstractmethod
 from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
 from wasm.core.config import Config
 from wasm.core.exceptions import BuildError, DeploymentError, OutOfMemoryError, WASMError
-from wasm.core.fs import FileSystem
+from wasm.core.fs import DryRunFileSystem, FileSystem
 from wasm.core.logger import Icons
 from wasm.core.runner import CommandResult, CommandRunner, get_runner
 from wasm.core.store import (
+    DEFAULT_KEEP_RELEASES,
     App,
     AppStatus,
     DeploymentTrigger,
+    ReleaseRecord,
+    ReleaseStatus,
     get_store,
 )
 from wasm.core.utils import domain_to_app_name
@@ -40,14 +61,23 @@ from wasm.deployers.helpers import (
     PrismaHelper,
     preflight,
 )
-from wasm.deployers.helpers.health import failure_output, wait_until_healthy
+from wasm.deployers.helpers.health import answers, failure_output, wait_until_healthy
+from wasm.deployers.helpers.layout import RELEASES, choose_layout
 from wasm.deployers.helpers.nginx_config import NginxAdvancedConfig
 from wasm.deployers.helpers.permissions import hand_over_tree
 from wasm.deployers.helpers.registration import StoreRegistrar
+from wasm.deployers.helpers.release_build import (
+    REPO_CACHE_DIR,
+    StagedRelease,
+    discard_release,
+    reuse_dependencies,
+    stage_release,
+)
 from wasm.deployers.helpers.summary import print_deployment_summary
 from wasm.deployers.interface import AppDeployer, StepReporter, UpdateResult
 from wasm.deployers.pipeline import DeployStep, run_pipeline
 from wasm.deployers.recorder import CapturingLogger, DeploymentRecorder
+from wasm.deployers.releases import CURRENT_LINK, ENV_FILE, ReleaseManager
 from wasm.managers.apache_manager import ApacheManager
 from wasm.managers.cert_manager import CertManager
 from wasm.managers.nginx_manager import NginxManager
@@ -66,6 +96,20 @@ BUILD_TIMEOUT = 2700
 
 #: Everything else in a deployer is a quick local command.
 COMMAND_TIMEOUT = 300
+
+#: How long a new release gets to answer before it is rolled back: attempts,
+#: and seconds between them. Longer than the post-deploy check, because a
+#: failed gate throws a good build away while a failed report only warns.
+HEALTH_GATE_ATTEMPTS = 15
+HEALTH_GATE_DELAY = 2.0
+
+#: Journal lines attached to a failed health gate, so the deployment record
+#: shows why the process did not come up, not only that it did not.
+HEALTH_GATE_JOURNAL_LINES = 40
+
+#: Failures while writing release bookkeeping. The release on disk is the
+#: truth; a row that could not be written is reported, never fatal.
+_RECORDING_ERRORS = (WASMError, sqlite3.Error)
 
 
 class BaseDeployer(AppDeployer):
@@ -89,6 +133,16 @@ class BaseDeployer(AppDeployer):
 
     # System dependencies
     SYSTEM_DEPS: ClassVar[list[str]] = []
+
+    #: Whether this deployer can build releases. Monorepo and docker-compose
+    #: do not derive from this class and do not have the attribute, which the
+    #: layout choice reads as False.
+    SUPPORTS_RELEASES: ClassVar[bool] = True
+
+    #: Class-level defaults for the layout state, so an instance assembled
+    #: without ``__init__`` (as some tests do) still behaves in place.
+    _layout: str | None = None
+    _staged: StagedRelease | None = None
 
     def __init__(
         self,
@@ -155,6 +209,19 @@ class BaseDeployer(AppDeployer):
         # Deployment progress, shared between pipeline steps
         self._ssl_obtained: bool = False
         self._app_record: App | None = None
+        self._is_new_deployment: bool = True
+
+        # Layout. The request is what configure() was told; the layout is
+        # decided once per deploy or update, against the store, by
+        # resolve_layout(). Until then everything behaves in place.
+        self._requested_layout: str | None = None
+        self._layout: str | None = None
+        self._persistent_request: list[str] | None = None
+        self._releases: ReleaseManager | None = None
+        self._staged: StagedRelease | None = None
+        self._health_attempts: list[str] = []
+        #: The release whose dependencies the last build reused, if any.
+        self.dependencies_reused_from: str | None = None
 
         # Advanced nginx config (detected from wasm.nginx.yaml)
         self._nginx_config_builder = NginxConfigBuilder(verbose=verbose)
@@ -240,6 +307,8 @@ class BaseDeployer(AppDeployer):
         package_manager: str = "auto",
         include_www: bool = False,
         trigger: str = DeploymentTrigger.CLI.value,
+        layout: str | None = None,
+        persistent_paths: Sequence[str] | None = None,
         **options: Any,
     ) -> None:
         """
@@ -258,6 +327,13 @@ class BaseDeployer(AppDeployer):
             include_www: Include www subdomain in certificate and web server config.
             trigger: What initiated this deployment, recorded in the history:
                 ``cli`` (the default), ``panel`` or ``webhook``.
+            layout: ``inplace`` or ``releases`` for a new application,
+                ``default`` for the server's configured layout, or None for
+                in place. An existing application always keeps its own; see
+                :func:`wasm.deployers.helpers.layout.choose_layout`.
+            persistent_paths: Paths, relative to the application, that live
+                in ``shared/`` and are linked into every release (uploads,
+                storage). None keeps what the application already has.
             **options: Accepted and ignored, so a caller can pass the union of
                 every deployer's settings without knowing which one it got.
         """
@@ -273,10 +349,105 @@ class BaseDeployer(AppDeployer):
         self.env_vars = env_vars or {}
         self.trigger = trigger
         self._package_manager = package_manager  # type: ignore[assignment]
+        self._requested_layout = layout
+        self._persistent_request = list(persistent_paths) if persistent_paths is not None else None
+        self._layout = None
+        self._releases = None
+        self._staged = None
 
         # Set app name and path
         self.app_name = domain_to_app_name(domain)
         self.app_path = app_path or (self.config.apps_directory / self.app_name)
+
+    # Layout and paths -----------------------------------------------------
+
+    def resolve_layout(self, existing: App | None = None) -> str:
+        """
+        Decide, once, whether this deployment builds a release or works in place.
+
+        Args:
+            existing: The application's store row, when the caller already
+                read it. Read here otherwise.
+
+        Returns:
+            ``inplace`` or ``releases``.
+
+        Raises:
+            DeploymentError: When the requested layout conflicts with the
+                application's, or this deployer cannot build releases.
+        """
+        if self._layout is None:
+            if existing is None and self.domain:
+                existing = self.store.get_app(self.domain)
+            self._layout = choose_layout(
+                existing,
+                self._requested_layout,
+                app_type=self.APP_TYPE,
+                supports_releases=self.SUPPORTS_RELEASES,
+                config=self.config,
+            )
+        return self._layout
+
+    @property
+    def uses_releases(self) -> bool:
+        """Whether this deployment builds a release. False until the layout is resolved."""
+        return self._layout == RELEASES
+
+    @property
+    def releases(self) -> ReleaseManager:
+        """The manager of this application's releases."""
+        if self._releases is None:
+            self._releases = ReleaseManager(
+                self.app_path, fs=self._fs, runner=self._runner, logger=self.logger
+            )
+        return self._releases
+
+    @property
+    def build_path(self) -> Path:
+        """Where the code being deployed is built: the new release, or the app itself."""
+        if self._staged is not None:
+            return self._staged.path
+        return self.app_path
+
+    @property
+    def runtime_path(self) -> Path:
+        """What the unit and the web server point at: ``current``, or the app itself."""
+        if self.uses_releases:
+            return self.app_path / CURRENT_LINK
+        return self.app_path
+
+    def _at_runtime(self, path: Path) -> Path:
+        """
+        Translate a path inside the build tree to the path the service will see.
+
+        Args:
+            path: A path at or below :attr:`build_path`.
+
+        Returns:
+            The same path below :attr:`runtime_path`. In place the two trees
+            are one, and the path comes back untouched.
+        """
+        if self.runtime_path == self.build_path:
+            return path
+        try:
+            return self.runtime_path / path.relative_to(self.build_path)
+        except ValueError:
+            return path
+
+    def adopt_release(self, staged: StagedRelease) -> None:
+        """
+        Build a release someone else already staged, instead of fetching one.
+
+        :class:`~wasm.deployers.auto.AutoDeployer` has to fetch the source to
+        know which deployer builds it; fetching again would clone twice and
+        leave an empty release behind.
+
+        Args:
+            staged: The release, with its source in place.
+        """
+        self._staged = staged
+        self._releases = staged.manager
+        self.source_already_fetched = True
 
     def _run(
         self,
@@ -311,14 +482,14 @@ class BaseDeployer(AppDeployer):
             result = self.runner.stream(
                 command,
                 on_line=self.logger.debug,
-                cwd=cwd or self.app_path,
+                cwd=cwd or self.build_path,
                 env=run_env or None,
                 timeout=timeout,
             )
         else:
             result = self.runner.run(
                 command,
-                cwd=cwd or self.app_path,
+                cwd=cwd or self.build_path,
                 env=run_env or None,
                 timeout=timeout,
             )
@@ -332,7 +503,7 @@ class BaseDeployer(AppDeployer):
         Returns:
             Detected package manager name.
         """
-        return self._pm_helper.detect(self.app_path, self._package_manager)
+        return self._pm_helper.detect(self.build_path, self._package_manager)
 
     def _verify_package_manager(self) -> None:
         """
@@ -351,7 +522,7 @@ class BaseDeployer(AppDeployer):
         Returns:
             True if Prisma is detected.
         """
-        return self._ensure_prisma_helper().detect(self.app_path)
+        return self._ensure_prisma_helper().detect(self.build_path)
 
     def _get_pm_install_command(self) -> list[str]:
         """
@@ -360,7 +531,7 @@ class BaseDeployer(AppDeployer):
         Returns:
             Install command as list.
         """
-        return self._pm_helper.get_install_command(self.package_manager, self.app_path)
+        return self._pm_helper.get_install_command(self.package_manager, self.build_path)
 
     def _get_pm_run_command(self, script: str) -> list[str]:
         """
@@ -428,7 +599,7 @@ class BaseDeployer(AppDeployer):
         if not self.has_prisma:
             return True
 
-        return self._ensure_prisma_helper().generate(self.app_path)
+        return self._ensure_prisma_helper().generate(self.build_path)
 
     def run_prisma_migrate(self, deploy: bool = True) -> bool:
         """
@@ -444,12 +615,12 @@ class BaseDeployer(AppDeployer):
             return True
 
         # Check if there's a migrations folder
-        migrations_dir = self.app_path / "prisma" / "migrations"
+        migrations_dir = self.build_path / "prisma" / "migrations"
         if not migrations_dir.exists():
             self.logger.debug("No Prisma migrations found")
             return True
 
-        return self._ensure_prisma_helper().migrate(self.app_path, deploy=deploy)
+        return self._ensure_prisma_helper().migrate(self.build_path, deploy=deploy)
 
     @abstractmethod
     def detect(self, path: Path) -> bool:
@@ -545,7 +716,7 @@ class BaseDeployer(AppDeployer):
                 self._nginx_advanced_config,
                 self.domain,
                 ssl=self.ssl,
-                app_path=str(self.app_path),
+                app_path=str(self.runtime_path),
             )
             ctx["server_names"] = server_names
             return ctx
@@ -554,7 +725,7 @@ class BaseDeployer(AppDeployer):
             "domain": self.domain,
             "server_names": server_names,
             "port": self.port,
-            "app_path": str(self.app_path),
+            "app_path": str(self.runtime_path),
             "app_name": self.app_name,
             "ssl": self.ssl,
             "health_check": self.get_health_check(),
@@ -566,10 +737,10 @@ class BaseDeployer(AppDeployer):
 
         Sets self._nginx_advanced_config if a valid config file is found.
         """
-        if not self.app_path or not self.app_path.exists():
+        if not self.build_path or not self.build_path.exists():
             return
 
-        config_path = self._nginx_config_builder.detect(self.app_path)
+        config_path = self._nginx_config_builder.detect(self.build_path)
         if config_path:
             self.logger.debug(f"Found advanced nginx config: {config_path}")
             self._nginx_advanced_config = self._nginx_config_builder.parse(config_path)
@@ -588,15 +759,20 @@ class BaseDeployer(AppDeployer):
         Returns:
             True if env configuration should be performed.
         """
-        if not self.app_path or not self.app_path.exists():
+        if not self.build_path or not self.build_path.exists():
             return False
 
         # Skip if user already provided env vars
         if self.env_vars:
             return False
 
+        # A release shares the .env every earlier release used; generating a
+        # new one would replace the secrets the application already runs on.
+        if self.uses_releases and (self.releases.shared_dir / ENV_FILE).exists():
+            return False
+
         # Check for .env.example
-        return (self.app_path / ".env.example").exists()
+        return (self.build_path / ".env.example").exists()
 
     def _configure_env(self) -> None:
         """
@@ -604,9 +780,10 @@ class BaseDeployer(AppDeployer):
 
         Discovers variables from .env.example, fills them
         non-interactively (defaults + auto-generated secrets),
-        and writes the .env file.
+        and writes the .env file: into the application directory in place,
+        into ``shared/`` on releases, from where every release links it.
         """
-        variables = self._env_manager.discover(self.app_path)
+        variables = self._env_manager.discover(self.build_path)
         if not variables:
             return
 
@@ -620,7 +797,8 @@ class BaseDeployer(AppDeployer):
             values[key] = val
 
         # Write .env file
-        self._env_manager.write_env_files(self.app_path, values)
+        env_dir = self.releases.shared_dir if self.uses_releases else self.app_path
+        self._env_manager.write_env_files(env_dir, values)
         self.logger.substep("Created .env from .env.example")
 
         # Update env_vars so they're available for systemd
@@ -988,7 +1166,7 @@ class BaseDeployer(AppDeployer):
             domain=self.domain,
             webserver=self.webserver,
             template=template,
-            app_path=self.app_path,
+            app_path=self.runtime_path,
             port=self.port,
             with_ssl=with_ssl,
         )
@@ -1030,7 +1208,7 @@ class BaseDeployer(AppDeployer):
         # from POST /api/apps, so it is validated before it can reach the unit.
         env = validate_environment(env)
         start_command = validate_unit_value(start_command, field="ExecStart")
-        working_directory = validate_unit_value(str(self.app_path), field="WorkingDirectory")
+        working_directory = validate_unit_value(str(self.runtime_path), field="WorkingDirectory")
         description = validate_unit_value(
             f"WASM: {self.domain} ({self.APP_TYPE})", field="Description"
         )
@@ -1050,7 +1228,7 @@ class BaseDeployer(AppDeployer):
             domain=self.domain,
             name=self.app_name,
             command=start_command,
-            working_directory=self.app_path,
+            working_directory=self.runtime_path,
             environment=env,
             port=self.port,
             user=self.config.service_user,
@@ -1147,6 +1325,8 @@ class BaseDeployer(AppDeployer):
         Returns:
             The steps to execute, each with the undo that reverses it.
         """
+        if self.uses_releases:
+            return self._release_pipeline()
         return [
             DeployStep(
                 title="Fetching source code",
@@ -1194,6 +1374,442 @@ class BaseDeployer(AppDeployer):
             ),
         ]
 
+    def _release_pipeline(
+        self,
+        build_steps: list[DeployStep] | None = None,
+        *,
+        with_service: bool = True,
+    ) -> list[DeployStep]:
+        """
+        Describe a deployment that builds a release and activates it behind a health gate.
+
+        The release is fetched, linked to ``shared/``, installed and built in
+        its own directory; the unit and the site are written against
+        ``current``; activation swaps ``current`` and restarts, and a release
+        that does not answer is rolled back to the one before it.
+
+        For a new application every step keeps its undo, so a failed first
+        deploy leaves nothing behind. For one that exists, the site and the
+        unit are left alone on failure: they point at ``current``, which the
+        rollback has already pointed back at a release that works.
+
+        Args:
+            build_steps: What turns the fetched source into something that
+                runs. Defaults to installing and building.
+            with_service: Whether the application runs as a unit.
+
+        Returns:
+            The steps to execute, each with the undo that reverses it.
+        """
+        new_app = self._is_new_deployment
+        steps = [
+            DeployStep(
+                title="Fetching source into a new release",
+                icon=Icons.DOWNLOAD,
+                run=self._step_fetch_release,
+                undo=self.remove_source if new_app else self._abandon_release,
+            ),
+        ]
+        steps += (
+            build_steps
+            if build_steps is not None
+            else [
+                DeployStep(
+                    title="Installing dependencies",
+                    icon=Icons.PACKAGE,
+                    run=self._install_release_dependencies,
+                ),
+                DeployStep(
+                    title="Building application",
+                    icon=Icons.BUILD,
+                    run=self.build,
+                ),
+            ]
+        )
+        steps += [
+            DeployStep(
+                title="Setting permissions",
+                icon=Icons.LOCK,
+                run=self._set_permissions,
+            ),
+            DeployStep(
+                title="Creating site configuration",
+                icon=Icons.GLOBE,
+                run=lambda: self.create_site(with_ssl=False),
+                undo=self.remove_site if new_app else None,
+            ),
+            DeployStep(
+                title="Obtaining SSL certificate",
+                icon=Icons.LOCK,
+                run=self._step_certificate,
+                skip_if=lambda: not self.ssl,
+            ),
+        ]
+        if with_service:
+            steps.append(
+                DeployStep(
+                    title="Creating systemd service",
+                    icon=Icons.GEAR,
+                    run=self.create_service,
+                    undo=self.remove_service if new_app else None,
+                )
+            )
+        steps.append(
+            DeployStep(
+                title="Activating release",
+                icon=Icons.ROCKET,
+                run=self._step_activate,
+            )
+        )
+        return steps
+
+    def _step_fetch_release(self) -> None:
+        """
+        Put the source in a new release and link it to what releases share.
+
+        The ``.env`` and the persistent paths are linked before anything is
+        installed or built, because both may need them: a build that reads
+        ``DATABASE_URL`` or a postinstall that writes into ``storage/``.
+        """
+        if self._staged is None:
+            self.logger.substep(f"Source: {self.source}")
+            self._staged = stage_release(
+                self.source,
+                self.branch,
+                releases=self.releases,
+                source_manager=self.source_manager,
+                logger=self.logger,
+            )
+        staged = self._staged
+        self._record_release_row(staged)
+
+        # Both describe the code that was just fetched.
+        self._detect_nginx_config()
+        if self._should_configure_env():
+            self._configure_env()
+
+        links = staged.manager.link_shared(staged.path, self._persistent_paths())
+        for path in links.linked:
+            self.logger.substep(f"Linked {path} to shared/{path}")
+
+    def _install_release_dependencies(self) -> None:
+        """
+        Install the release's dependencies, or take them from the active release.
+
+        The copy happens before :meth:`pre_install`, because the Python
+        deployer creates its virtual environment there and a copy into an
+        existing directory would nest inside it.
+        """
+        staged = self._require_staged()
+        self.dependencies_reused_from = reuse_dependencies(
+            staged.path,
+            staged.manager.current(),
+            runner=self.runner,
+            fs=self.fs,
+            logger=self.logger,
+        )
+        if self.dependencies_reused_from is None:
+            self.install_dependencies()
+            return
+
+        self.pre_install()
+        self.logger.substep(f"Dependencies reused from {self.dependencies_reused_from}")
+        self.post_install()
+
+    def _step_activate(self) -> None:
+        """Activate the release behind the health gate, then record that it runs."""
+        self._activate_release()
+        self._mark_running()
+
+    def _require_staged(self) -> StagedRelease:
+        """
+        Return the release being built.
+
+        Returns:
+            The staged release.
+
+        Raises:
+            DeploymentError: When no release was staged, which means a step
+                ran out of order.
+        """
+        if self._staged is None:
+            raise DeploymentError(
+                "No release is being built",
+                details="The fetch step stages the release; it has to run first.",
+            )
+        return self._staged
+
+    def _activate_release(self) -> None:
+        """
+        Point ``current`` at the new release, restart, and keep it only if it answers.
+
+        A release that does not pass the health check is recorded as failed
+        and the previous one is activated and restarted again, so the
+        application goes back to what served a moment ago. The deployment
+        then fails with the probe's and the journal's own output.
+
+        Raises:
+            DeploymentError: When the release did not pass the health check,
+                whether or not there was a release to go back to.
+        """
+        staged = self._require_staged()
+        previous = staged.manager.activate(staged.path)
+        if previous is None:
+            self.logger.substep(f"Activated release {staged.id}")
+        else:
+            self.logger.substep(f"Activated release {staged.id} (was {previous.id})")
+
+        healthy, evidence = self._restart_and_probe()
+        if healthy:
+            self._record_release_active(staged)
+            self._prune_releases(staged)
+            return
+
+        self._record_release_status(staged, ReleaseStatus.FAILED)
+        if previous is None:
+            raise DeploymentError(
+                f"Release {staged.id} did not pass its health check",
+                details=evidence,
+            )
+
+        self.logger.warning(f"Release {staged.id} did not pass its health check")
+        self.logger.substep(f"Going back to release {previous.id}")
+        staged.manager.activate(previous.path)
+        restored, _ = self._restart_and_probe()
+        state = "is active again" if restored else "is active again but is not answering either"
+        raise DeploymentError(
+            f"Release {staged.id} did not pass its health check; release {previous.id} {state}",
+            details=evidence,
+        )
+
+    def _restart_and_probe(self) -> tuple[bool, str]:
+        """
+        Restart the application on whatever ``current`` points at, and ask if it is up.
+
+        Returns:
+            Whether it is healthy, and when it is not, the evidence: the
+            failed probes and the unit's journal, verbatim.
+        """
+        self._health_attempts = []
+        try:
+            self.restart()
+        except WASMError as exc:
+            # str() of a WASMError carries its details: systemctl's own output.
+            return False, self._health_evidence(str(exc))
+
+        if self._release_is_healthy():
+            return True, ""
+        return False, self._health_evidence("The application did not answer the health check.")
+
+    def _release_is_healthy(self) -> bool:
+        """
+        Ask the release that was just activated whether it is up.
+
+        A service answers over HTTP: any response below 500 means the process
+        started and routes requests, redirects included. A site without a
+        service is checked by the deployer's own :meth:`health_check`, which
+        looks for the files it serves.
+
+        Returns:
+            True when it is up.
+        """
+        if not self.get_start_command():
+            return self.health_check()
+        url = f"http://127.0.0.1:{self.port}{self.get_health_check()}"
+        self.logger.substep(f"Checking: {url}")
+        return wait_until_healthy(
+            url,
+            retries=HEALTH_GATE_ATTEMPTS,
+            delay=HEALTH_GATE_DELAY,
+            on_attempt=self._note_health_attempt,
+            accept=answers,
+        )
+
+    def _note_health_attempt(self, message: str) -> None:
+        """
+        Keep a failed probe for the evidence, and log it like any other.
+
+        Args:
+            message: What the probe reported.
+        """
+        self._health_attempts.append(message)
+        self.logger.debug(message)
+
+    def _health_evidence(self, summary: str) -> str:
+        """
+        Put together what a failed health gate shows the operator.
+
+        Args:
+            summary: What failed, in one line or a command's own output.
+
+        Returns:
+            The summary, every failed probe, and the last lines of the unit's
+            journal, which is where a process that crashed says why.
+        """
+        parts = [summary]
+        if self._health_attempts:
+            parts.append("\n".join(_collapse_attempts(self._health_attempts)))
+        if self.get_start_command() and self.app_name:
+            try:
+                journal = self.service_manager.logs(
+                    self.app_name, lines=HEALTH_GATE_JOURNAL_LINES
+                ).strip()
+            except WASMError as exc:
+                journal = f"(the journal could not be read: {exc})"
+            if journal:
+                parts.append(f"Last lines of the journal of {self.app_name}:\n{journal}")
+        return "\n\n".join(parts)
+
+    def _abandon_release(self) -> None:
+        """
+        Throw away a release that failed before it could serve.
+
+        Recorded as failed and removed from disk, unless ``current`` points
+        at it: whatever went wrong, the release that is serving is never the
+        one deleted.
+        """
+        staged = self._staged
+        if staged is None:
+            return
+        self._record_release_status(staged, ReleaseStatus.FAILED)
+        discard_release(staged.path, releases=staged.manager, logger=self.logger)
+
+    def _persistent_paths(self) -> list[str]:
+        """
+        Return the paths every release shares through ``shared/``.
+
+        Returns:
+            What this deployment was configured with, or else what the
+            application has recorded.
+        """
+        if self._persistent_request is not None:
+            return list(self._persistent_request)
+        app = self._app_row()
+        return list(app.persistent_paths) if app is not None else []
+
+    def _keep_releases(self) -> int:
+        """
+        Return how many releases the application keeps on disk.
+
+        Returns:
+            The recorded retention, never less than 1.
+        """
+        app = self._app_row()
+        keep = app.keep_releases if app is not None else DEFAULT_KEEP_RELEASES
+        return max(1, keep or DEFAULT_KEEP_RELEASES)
+
+    def _app_row(self) -> App | None:
+        """
+        Return the application's store row.
+
+        Returns:
+            The row this deployment registered, or the stored one, or None.
+        """
+        if self._app_record is not None:
+            return self._app_record
+        return self.store.get_app(self.domain) if self.domain else None
+
+    def _records_releases(self) -> int | None:
+        """
+        Tell whether release rows can be written, and for which application.
+
+        Returns:
+            The application id, or None under ``--dry-run`` (the store rolls
+            the app row back, so a release row would point at nothing) and
+            when the application is not registered.
+        """
+        if isinstance(self.fs, DryRunFileSystem):
+            return None
+        app = self.store.get_app(self.domain) if self.domain else None
+        return app.id if app is not None else None
+
+    def _record_release_row(self, staged: StagedRelease) -> None:
+        """
+        Remember a release that was just staged.
+
+        Args:
+            staged: The release.
+        """
+        app_id = self._records_releases()
+        if app_id is None:
+            return
+        try:
+            if self.store.get_release(app_id, staged.id) is None:
+                self.store.record_release(
+                    ReleaseRecord(
+                        id=staged.id,
+                        app_id=app_id,
+                        git_commit=staged.short_commit,
+                        created_at=datetime.now(timezone.utc).isoformat(),
+                        status=ReleaseStatus.BUILT.value,
+                        path=str(staged.path),
+                    )
+                )
+        except _RECORDING_ERRORS as exc:
+            self.logger.warning(f"Could not record release {staged.id}: {exc}")
+
+    def _record_release_status(self, staged: StagedRelease, status: ReleaseStatus) -> None:
+        """
+        Record how a release ended up.
+
+        Args:
+            staged: The release.
+            status: Its new status.
+        """
+        app_id = self._records_releases()
+        if app_id is None:
+            return
+        try:
+            self.store.set_release_status(app_id, staged.id, status.value)
+        except _RECORDING_ERRORS as exc:
+            self.logger.warning(f"Could not record release {staged.id} as {status.value}: {exc}")
+
+    def _record_release_active(self, staged: StagedRelease) -> None:
+        """
+        Record that a release is now the active one.
+
+        Args:
+            staged: The release.
+        """
+        app_id = self._records_releases()
+        if app_id is None:
+            return
+        try:
+            self.store.mark_release_active(app_id, staged.id)
+        except _RECORDING_ERRORS as exc:
+            self.logger.warning(f"Could not record release {staged.id} as active: {exc}")
+
+    def _prune_releases(self, staged: StagedRelease) -> None:
+        """
+        Delete the releases beyond the application's retention, and forget them.
+
+        Rows of releases that failed and were removed are kept while they are
+        among the newest ``keep`` rows, so recent failures stay visible, and
+        forgotten after that.
+
+        Args:
+            staged: The release just activated.
+        """
+        keep = self._keep_releases()
+        removed = staged.manager.prune(keep)
+        for release in removed:
+            self.logger.substep(f"Pruned release {release.id}")
+
+        app_id = self._records_releases()
+        if app_id is None:
+            return
+        try:
+            on_disk = {release.id for release in staged.manager.list()}
+            removed_ids = {release.id for release in removed}
+            stale = [
+                row.id
+                for index, row in enumerate(self.store.list_releases(app_id))
+                if row.id not in on_disk and (row.id in removed_ids or index >= keep)
+            ]
+            self.store.delete_releases(app_id, stale)
+        except _RECORDING_ERRORS as exc:
+            self.logger.warning(f"Could not forget pruned releases: {exc}")
+
     def _step_fetch(self) -> None:
         """Fetch the source, then read the configuration that ships with it."""
         self.fetch_source()
@@ -1228,10 +1844,11 @@ class BaseDeployer(AppDeployer):
 
     def _step_start(self) -> None:
         """Start the service and record that the deployment succeeded."""
-        from datetime import datetime
-
         self.start()
+        self._mark_running()
 
+    def _mark_running(self) -> None:
+        """Record that the deployment succeeded and the application runs."""
         if self._app_record is not None:
             self._app_record.status = AppStatus.RUNNING.value
             self._app_record.ssl_enabled = self._ssl_obtained
@@ -1248,16 +1865,35 @@ class BaseDeployer(AppDeployer):
         The deployment ran as root, so without this step the service user
         cannot write into its own app directory and the unit fails at start
         with EACCES.
+
+        On releases that is the new release and ``shared/``, where uploads and
+        the ``.env`` live; the repository cache and the application directory
+        itself stay root's, because the service never writes there.
         """
-        hand_over_tree(
-            self.app_path,
-            user=self.config.service_user,
-            group=self.config.service_group,
-            runner=self.runner,
-            fs=self.fs,
-            logger=self.logger,
-            env_files=self._env_files(),
-        )
+        if not self.uses_releases:
+            hand_over_tree(
+                self.app_path,
+                user=self.config.service_user,
+                group=self.config.service_group,
+                runner=self.runner,
+                fs=self.fs,
+                logger=self.logger,
+                env_files=self._env_files(),
+            )
+            return
+
+        shared = self.releases.shared_dir
+        trees = [self.build_path] + ([shared] if shared.is_dir() else [])
+        for tree in trees:
+            hand_over_tree(
+                tree,
+                user=self.config.service_user,
+                group=self.config.service_group,
+                runner=self.runner,
+                fs=self.fs,
+                logger=self.logger,
+                env_files=_dotenv_files(tree),
+            )
 
     def _env_files(self) -> list[Path]:
         """
@@ -1300,6 +1936,14 @@ class BaseDeployer(AppDeployer):
             manager that cannot answer is treated as "unknown", not an error.
         """
         reader = getattr(self.source_manager, "get_repo_info", None)
+        if self._staged is not None:
+            # A release has no .git; its commit is part of what was staged,
+            # and the branch is whatever the repository cache follows.
+            branch = self.branch
+            cache = self.app_path / REPO_CACHE_DIR
+            if branch is None and reader is not None and (cache / ".git").is_dir():
+                branch = reader(cache).get("branch")
+            return self._staged.short_commit, branch
         if reader is None or not self.app_path:
             return None, None
         info = reader(self.app_path)
@@ -1307,12 +1951,18 @@ class BaseDeployer(AppDeployer):
 
     def update(self, on_step: StepReporter | None = None) -> UpdateResult:
         """
-        Rebuild this application in place, without a full redeploy.
+        Rebuild this application without a full redeploy.
 
         The sequence used to live in ``wasm.cli.commands.webapp``, which drove
         the deployer step by step and reached into ``_package_manager`` to do
         it. Keeping it here means the update path is the deployer's own, gets
         the same detection and error handling as a deploy, and can be tested.
+
+        In place, the tree is rebuilt where it is and the caller restarts the
+        unit. On releases, the source is fetched into a new release, built
+        there and activated behind the health gate; a release that does not
+        answer is rolled back before this raises, so the caller has nothing
+        left to restart.
 
         Like a deploy, an update is recorded in the deployment history with
         its build log captured; recording failures are reported and never
@@ -1328,46 +1978,117 @@ class BaseDeployer(AppDeployer):
             WASMError: When a step fails.
         """
         report = on_step or (lambda _message: None)
+        releases = self.resolve_layout() == RELEASES
 
         recorder = self._recorder()
         recorder.start(git_branch=self.branch)
         try:
-            report("Inspecting the project")
-            self.pre_install()
-
-            report("Installing dependencies")
-            self.install_dependencies()
-
-            prisma_updated = False
-            if self.has_prisma:
-                report("Updating Prisma")
-                self.generate_prisma()
-                self.run_prisma_migrate(deploy=True)
-                prisma_updated = True
-
-            report("Building")
-            self.build()
-
-            # The pull, the install and the build all ran as root, and the
-            # service writes into what they produced: Next.js creates
-            # .next/cache/images on the first optimised image, and uploads land
-            # in directories a pull may have just added.
-            self._set_permissions()
-
-            start_command = self.get_start_command()
-            result = UpdateResult(
-                package_manager=self.package_manager,
-                prisma_updated=prisma_updated,
-                is_static=not bool(start_command),
-                start_command=start_command,
-            )
+            result = self._update_release(report) if releases else self._update_in_place(report)
         except Exception as exc:
             # Not handling: the failure is recorded and re-raised unchanged.
+            if releases:
+                self._abandon_release()
             recorder.finish_failure(exc)
             raise
 
         recorder.finish_success()
         return result
+
+    def _update_in_place(self, report: StepReporter) -> UpdateResult:
+        """
+        Rebuild the application in the tree it runs from.
+
+        Args:
+            report: Called as each step begins.
+
+        Returns:
+            What was done.
+        """
+        report("Inspecting the project")
+        self.pre_install()
+
+        report("Installing dependencies")
+        self.install_dependencies()
+
+        prisma_updated = self._update_prisma(report)
+
+        report("Building")
+        self.build()
+
+        # The pull, the install and the build all ran as root, and the
+        # service writes into what they produced: Next.js creates
+        # .next/cache/images on the first optimised image, and uploads land
+        # in directories a pull may have just added.
+        self._set_permissions()
+
+        return self._update_result(prisma_updated)
+
+    def _update_release(self, report: StepReporter) -> UpdateResult:
+        """
+        Build the latest source as a new release and activate it behind the health gate.
+
+        Args:
+            report: Called as each step begins.
+
+        Returns:
+            What was done.
+
+        Raises:
+            DeploymentError: When the new release did not pass its health
+                check; the previous one is active and restarted by then.
+        """
+        report("Fetching into a new release")
+        self._step_fetch_release()
+
+        report("Installing dependencies")
+        self._install_release_dependencies()
+
+        prisma_updated = self._update_prisma(report)
+
+        report("Building")
+        self.build()
+
+        self._set_permissions()
+
+        report(f"Activating release {self._require_staged().id}")
+        self._activate_release()
+
+        return self._update_result(prisma_updated)
+
+    def _update_prisma(self, report: StepReporter) -> bool:
+        """
+        Regenerate the Prisma client and apply migrations, when the project uses Prisma.
+
+        Args:
+            report: Called when the step begins.
+
+        Returns:
+            Whether Prisma was updated.
+        """
+        if not self.has_prisma:
+            return False
+        report("Updating Prisma")
+        self.generate_prisma()
+        self.run_prisma_migrate(deploy=True)
+        return True
+
+    def _update_result(self, prisma_updated: bool) -> UpdateResult:
+        """
+        Describe what an update did.
+
+        Args:
+            prisma_updated: Whether Prisma was updated.
+
+        Returns:
+            The result for the caller.
+        """
+        start_command = self.get_start_command()
+        return UpdateResult(
+            package_manager=self.package_manager,
+            prisma_updated=prisma_updated,
+            is_static=not bool(start_command),
+            start_command=start_command,
+        )
 
     def deploy(self, total_steps: int = 7) -> bool:
         """
@@ -1405,7 +2126,10 @@ class BaseDeployer(AppDeployer):
 
         # A redeployment must not lose its app row just because this attempt
         # failed, so only a genuinely new app registers an undo for it.
-        is_new_deployment = self.store.get_app(self.domain) is None
+        existing = self.store.get_app(self.domain)
+        is_new_deployment = existing is None
+        self._is_new_deployment = is_new_deployment
+        self.resolve_layout(existing)
         self._app_record = self._register_app_in_store(AppStatus.DEPLOYING.value)
 
         steps = self.build_pipeline()
@@ -1439,7 +2163,9 @@ class BaseDeployer(AppDeployer):
 
     def _report_result(self) -> None:
         """Print the summary, plus troubleshooting hints when unhealthy."""
-        healthy = self.health_check()
+        # A release only becomes active after passing the health gate, so a
+        # second, stricter probe could only contradict what was just proven.
+        healthy = True if self.uses_releases else self.health_check()
         print_deployment_summary(
             self.logger,
             domain=self.domain or "",
@@ -1480,4 +2206,62 @@ class BaseDeployer(AppDeployer):
             status=status,
             is_static=not bool(self.get_start_command()),
             env_vars=self.env_vars,
+            layout=self._layout,
+            persistent_paths=self._persistent_request,
         )
+
+
+#: How :func:`~wasm.deployers.helpers.health.wait_until_healthy` reports a
+#: failed attempt.
+_ATTEMPT = re.compile(r"^Health check attempt (\d+) failed: (.*)$", re.DOTALL)
+
+
+def _collapse_attempts(messages: Sequence[str]) -> list[str]:
+    """
+    Fold consecutive probe failures with the same cause into one line.
+
+    Fifteen identical "connection refused" lines say less than one line that
+    names the range, and push the journal, which says why, out of sight.
+
+    Args:
+        messages: Failed attempts, in order, as the probe reported them.
+
+    Returns:
+        The same information, one line per run of identical causes.
+    """
+    runs: list[tuple[str, str, str]] = []
+    for message in messages:
+        match = _ATTEMPT.match(message)
+        if match is None:
+            runs.append(("", "", message))
+            continue
+        number, cause = match.groups()
+        if runs and runs[-1][0] and runs[-1][2] == cause:
+            runs[-1] = (runs[-1][0], number, cause)
+        else:
+            runs.append((number, number, cause))
+    lines: list[str] = []
+    for first, last, cause in runs:
+        if not first:
+            lines.append(cause)
+        elif first == last:
+            lines.append(f"Health check attempt {first} failed: {cause}")
+        else:
+            lines.append(f"Health check attempts {first}-{last} failed: {cause}")
+    return lines
+
+
+def _dotenv_files(tree: Path) -> list[Path]:
+    """
+    List the dotenv files that are really in a directory.
+
+    Args:
+        tree: A release, or ``shared/``.
+
+    Returns:
+        Regular ``.env*`` files at its top level. A release's ``.env`` is a
+        link into ``shared/`` and is left out: it is protected where it lives.
+    """
+    if not tree.is_dir():
+        return []
+    return sorted(path for path in tree.glob(".env*") if path.is_file() and not path.is_symlink())

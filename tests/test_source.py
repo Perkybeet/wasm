@@ -94,6 +94,14 @@ class TestParseGitUrl:
         assert result["branch"] == "develop"
         assert result["repo"] == "repo"
 
+    def test_git_protocol_url_parsing(self):
+        """git:// is an accepted transport, so it must parse like https://."""
+        result = parse_git_url("git://git.example.com/user/repo.git")
+        assert result["host"] == "git.example.com"
+        assert result["owner"] == "user"
+        assert result["repo"] == "repo"
+        assert validate_source("git://127.0.0.1/repo") == ("git", "git://127.0.0.1/repo")
+
 
 class TestValidateSource:
     """Tests for validate_source function."""
