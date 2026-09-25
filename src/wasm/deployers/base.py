@@ -360,7 +360,7 @@ class BaseDeployer(AppDeployer):
         Returns:
             Install command as list.
         """
-        return self._pm_helper.get_install_command(self.package_manager)
+        return self._pm_helper.get_install_command(self.package_manager, self.app_path)
 
     def _get_pm_run_command(self, script: str) -> list[str]:
         """

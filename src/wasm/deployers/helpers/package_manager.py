@@ -170,16 +170,27 @@ class PackageManagerHelper:
                 available.append(pm)
         return available
 
-    def get_install_command(self, package_manager: str) -> list[str]:
+    def get_install_command(self, package_manager: str, path: Path | None = None) -> list[str]:
         """
         Get the install command for the package manager.
 
         Args:
             package_manager: Package manager name.
+            path: The project directory. With npm and no lockfile in it the
+                command is ``npm install``: ``npm ci`` refuses to run without
+                one and fails with a usage error that says nothing useful.
 
         Returns:
             Install command as list.
         """
+        if (
+            package_manager == "npm"
+            and path is not None
+            and not (path / "package-lock.json").exists()
+            and not (path / "npm-shrinkwrap.json").exists()
+        ):
+            return ["npm", "install"]
+
         commands = {
             "pnpm": ["pnpm", "install", "--frozen-lockfile"],
             "bun": ["bun", "install", "--frozen-lockfile"],
