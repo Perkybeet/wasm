@@ -6,6 +6,8 @@ import type { ResponseOf } from "../client";
 export type BackupList = ResponseOf<"/api/backups", "get">;
 export type Backup = ResponseOf<"/api/backups/{backup_id}", "get">;
 export type BackupSchedules = ResponseOf<"/api/backup-schedules", "get">;
+export type BackupSchedule = BackupSchedules["schedules"][number];
+export type BackupStorage = ResponseOf<"/api/backups/storage", "get">;
 
 export const backupKeys = {
   all: ["backups"] as const,

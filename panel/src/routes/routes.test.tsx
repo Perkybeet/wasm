@@ -11,27 +11,27 @@ import { fakeBackend, signedInRoutes } from "../test/fakes";
 const PAGES: [path: string, heading: string, content: string][] = [
   ["/", "Overview", "Needs attention"],
   ["/apps", "Applications", "Applications"],
-  ["/apps/new", "New application", "Point at a repository to begin"],
+  ["/apps/new", "New application", "Source"],
   ["/apps/shop.example.com", "shop.example.com", "Runtime"],
-  ["/apps/shop.example.com/deployments", "shop.example.com", "Every deploy of this app"],
-  ["/apps/shop.example.com/deployments/42", "shop.example.com", "Deployment 42"],
-  ["/apps/shop.example.com/logs", "shop.example.com", "Live output of the app's service"],
-  ["/apps/shop.example.com/metrics", "shop.example.com", "CPU and memory over time"],
-  ["/apps/shop.example.com/environment", "shop.example.com", "Environment variables"],
-  ["/apps/shop.example.com/domains", "shop.example.com", "Domains and certificate"],
-  ["/apps/shop.example.com/diagnose", "shop.example.com", "Why this app is down"],
-  ["/apps/shop.example.com/settings", "shop.example.com", "Source, build and runtime"],
-  ["/databases", "Databases", "Engines, databases and users"],
+  ["/apps/shop.example.com/deployments", "shop.example.com", "History"],
+  ["/apps/shop.example.com/deployments/42", "shop.example.com", "No deployment 42"],
+  ["/apps/shop.example.com/logs", "shop.example.com", "Journal of shop.example.com"],
+  ["/apps/shop.example.com/metrics", "shop.example.com", "CPU and memory"],
+  ["/apps/shop.example.com/environment", "shop.example.com", "Variables"],
+  ["/apps/shop.example.com/domains", "shop.example.com", "Domains"],
+  ["/apps/shop.example.com/diagnose", "shop.example.com", "Diagnosis of shop.example.com"],
+  ["/apps/shop.example.com/settings", "shop.example.com", "Source and runtime"],
+  ["/databases", "Databases", "Engines"],
   ["/databases/postgresql/shop", "shop", "SQL console"],
-  ["/backups", "Backups", "Backups and schedules"],
-  ["/domains", "Domains and certificates", "Certificates and sites"],
-  ["/services", "Services", "Units and their state"],
-  ["/services/wasm-shop", "wasm-shop", "State, logs and unit file"],
-  ["/cron", "Cron", "Scheduled jobs"],
-  ["/activity", "Activity", "One timeline of jobs and the audit log"],
-  ["/server", "Server", "Health checks and system details"],
-  ["/settings", "Settings", "How WASM runs here"],
-  ["/settings/security", "Settings", "Sign-in and sessions"],
+  ["/backups", "Backups", "Schedules"],
+  ["/domains", "Domains and certificates", "Certificates"],
+  ["/services", "Services", "Services"],
+  ["/services/wasm-shop", "wasm-shop", "Overview"],
+  ["/cron", "Cron", "Cron jobs"],
+  ["/activity", "Activity", "Activity"],
+  ["/server", "Server", "Health"],
+  ["/settings", "Settings", "Applications directory"],
+  ["/settings/security", "Settings", "Two-factor authentication"],
   ["/settings/notifications", "Settings", "Where alerts go"],
   ["/settings/tokens", "Settings", "Tokens for automation"],
   ["/settings/about", "Settings", "Version and updates"],
@@ -53,7 +53,7 @@ describe("the route tree", () => {
   it("names the page in the browser tab, most specific first", async () => {
     fakeBackend(signedInRoutes());
     renderConsole("/apps/shop.example.com/logs");
-    await screen.findByText("Live output of the app's service");
+    await screen.findByRole("region", { name: "Journal of shop.example.com" });
     expect(document.title).toBe("Logs - shop.example.com - web-01 - WASM");
   });
 

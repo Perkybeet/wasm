@@ -58,6 +58,8 @@ cover/
 .env
 .venv
 env/
+# Not a virtualenv: the .env grammar fixtures both the console and EnvManager parse.
+!tests/fixtures/env/
 venv/
 ENV/
 env.bak/

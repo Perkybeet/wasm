@@ -1,19 +1,8 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { KeyRound } from "lucide-react";
 
-import { Placeholder } from "../../../app/Placeholder";
+import { TokensSettings } from "../../../features/settings/TokensSettings";
 
+/** Settings > API tokens: named, scoped tokens for CI and scripts. */
 export const Route = createFileRoute("/_console/settings/tokens")({
-  component: TokenSettings,
+  component: TokensSettings,
 });
-
-function TokenSettings() {
-  return (
-    <Placeholder
-      icon={<KeyRound />}
-      title="Tokens for automation"
-      description="Named tokens with a scope and an optional expiry, for CI and scripts. A new token is shown once."
-      documentTitle="API tokens"
-    />
-  );
-}

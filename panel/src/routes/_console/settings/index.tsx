@@ -1,20 +1,8 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { Settings2 } from "lucide-react";
 
-import { Placeholder } from "../../../app/Placeholder";
+import { GeneralSettings } from "../../../features/settings/GeneralSettings";
 
+/** Settings > General: the typed sections of config.yaml, each saved on its own. */
 export const Route = createFileRoute("/_console/settings/")({
   component: GeneralSettings,
 });
-
-function GeneralSettings() {
-  return (
-    <Placeholder
-      icon={<Settings2 />}
-      title="How WASM runs here"
-      description="The apps directory, the web server, the email for certificates and how long backups are kept."
-      command="wasm config show"
-      documentTitle="General settings"
-    />
-  );
-}

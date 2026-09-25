@@ -30,6 +30,7 @@
     "@tanstack/react-router": "1.170.39",
     "@tanstack/react-virtual": "3.14.13",
     "lucide-react": "1.48.0",
+    "qrcode-generator": "2.0.4",
     "react": "19.3.0",
     "react-dom": "19.3.0",
     "uplot": "1.6.32"

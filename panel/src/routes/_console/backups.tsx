@@ -1,26 +1,18 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { Archive } from "lucide-react";
 
-import { PageHeader } from "../../app/PageHeader";
-import { Placeholder } from "../../app/Placeholder";
+import { BackupsPage } from "../../features/backups/BackupsPage";
+import { validateBackupsSearch } from "../../features/backups/filters";
 
+/** Every backup on the machine. Filters are search params: `/backups?domain=shop.example.com`. */
 export const Route = createFileRoute("/_console/backups")({
-  component: BackupsPage,
+  validateSearch: validateBackupsSearch,
+  component: BackupsRoute,
 });
 
-function BackupsPage() {
+function BackupsRoute() {
+  const search = Route.useSearch();
+  const navigate = Route.useNavigate();
   return (
-    <>
-      <PageHeader
-        title="Backups"
-        description="Snapshots of your applications, their schedules and the storage they use."
-      />
-      <Placeholder
-        icon={<Archive />}
-        title="Backups and schedules"
-        description="Create, verify and restore app backups with or without their databases, and schedule them to run on their own."
-        command="wasm backup list"
-      />
-    </>
+    <BackupsPage search={search} onSearchChange={(next, options) => void navigate({ search: next, replace: options?.replace ?? false })} />
   );
 }

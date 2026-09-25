@@ -20,7 +20,7 @@ import { Spinner } from "../../components/ui/Spinner";
 import { StatusPill } from "../../components/ui/StatusPill";
 import type { StatusView } from "../../components/page/status";
 import { AppActions } from "./AppActions";
-import { findCertificate } from "./queries";
+import { findCertificate } from "./lookups";
 import { jobStep, jobWords, useAppJob } from "./useAppJob";
 import type { AppJob } from "./useAppJob";
 

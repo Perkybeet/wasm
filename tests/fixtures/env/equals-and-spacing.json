@@ -1,0 +1,10 @@
+{
+  "QUERY": "a=1&b=2",
+  "BASE64": "dGhpcyBpcyBiYXNlNjQ=",
+  "PADDED_KEY": "padded value",
+  "NO_SPACE_AFTER": "value",
+  "INLINE": "hola # not a comment",
+  "URL": "https://user:p4ss@example.com:8443/path?x=1#frag",
+  "TRAILING_EQUALS": "=",
+  "TABS": "value\twith\ttabs"
+}

@@ -15,13 +15,13 @@ import { Route as ConsoleIndexRouteImport } from "./routes/_console/index"
 import { Route as ConsoleActivityRouteImport } from "./routes/_console/activity"
 import { Route as ConsoleBackupsRouteImport } from "./routes/_console/backups"
 import { Route as ConsoleCronRouteImport } from "./routes/_console/cron"
-import { Route as ConsoleDomainsRouteImport } from "./routes/_console/domains"
 import { Route as ConsoleServerRouteImport } from "./routes/_console/server"
 import { Route as ConsoleSettingsRouteImport } from "./routes/_console/settings"
 import { Route as ConsoleAppsIndexRouteImport } from "./routes/_console/apps/index"
 import { Route as ConsoleAppsDomainRouteImport } from "./routes/_console/apps/$domain"
 import { Route as ConsoleAppsNewRouteImport } from "./routes/_console/apps/new"
 import { Route as ConsoleDatabasesIndexRouteImport } from "./routes/_console/databases/index"
+import { Route as ConsoleDomainsIndexRouteImport } from "./routes/_console/domains/index"
 import { Route as ConsoleServicesIndexRouteImport } from "./routes/_console/services/index"
 import { Route as ConsoleServicesNameRouteImport } from "./routes/_console/services/$name"
 import { Route as ConsoleSettingsIndexRouteImport } from "./routes/_console/settings/index"
@@ -37,6 +37,7 @@ import { Route as ConsoleAppsDomainLogsRouteImport } from "./routes/_console/app
 import { Route as ConsoleAppsDomainMetricsRouteImport } from "./routes/_console/apps/$domain/metrics"
 import { Route as ConsoleAppsDomainSettingsRouteImport } from "./routes/_console/apps/$domain/settings"
 import { Route as ConsoleDatabasesEngineNameRouteImport } from "./routes/_console/databases/$engine/$name"
+import { Route as ConsoleDomainsSitesSiteRouteImport } from "./routes/_console/domains/sites/$site"
 import { Route as ConsoleAppsDomainDeploymentsIndexRouteImport } from "./routes/_console/apps/$domain/deployments/index"
 import { Route as ConsoleAppsDomainDeploymentsIdRouteImport } from "./routes/_console/apps/$domain/deployments/$id"
 
@@ -69,11 +70,6 @@ const ConsoleCronRoute = ConsoleCronRouteImport.update({
   path: "/cron",
   getParentRoute: () => ConsoleRoute,
 } as any)
-const ConsoleDomainsRoute = ConsoleDomainsRouteImport.update({
-  id: "/domains",
-  path: "/domains",
-  getParentRoute: () => ConsoleRoute,
-} as any)
 const ConsoleServerRoute = ConsoleServerRouteImport.update({
   id: "/server",
   path: "/server",
@@ -102,6 +98,11 @@ const ConsoleAppsNewRoute = ConsoleAppsNewRouteImport.update({
 const ConsoleDatabasesIndexRoute = ConsoleDatabasesIndexRouteImport.update({
   id: "/databases/",
   path: "/databases/",
+  getParentRoute: () => ConsoleRoute,
+} as any)
+const ConsoleDomainsIndexRoute = ConsoleDomainsIndexRouteImport.update({
+  id: "/domains/",
+  path: "/domains/",
   getParentRoute: () => ConsoleRoute,
 } as any)
 const ConsoleServicesIndexRoute = ConsoleServicesIndexRouteImport.update({
@@ -186,6 +187,11 @@ const ConsoleDatabasesEngineNameRoute =
     path: "/databases/$engine/$name",
     getParentRoute: () => ConsoleRoute,
   } as any)
+const ConsoleDomainsSitesSiteRoute = ConsoleDomainsSitesSiteRouteImport.update({
+  id: "/domains/sites/$site",
+  path: "/domains/sites/$site",
+  getParentRoute: () => ConsoleRoute,
+} as any)
 const ConsoleAppsDomainDeploymentsIndexRoute =
   ConsoleAppsDomainDeploymentsIndexRouteImport.update({
     id: "/deployments/",
@@ -205,7 +211,6 @@ export interface FileRoutesByFullPath {
   "/activity": typeof ConsoleActivityRoute
   "/backups": typeof ConsoleBackupsRoute
   "/cron": typeof ConsoleCronRoute
-  "/domains": typeof ConsoleDomainsRoute
   "/server": typeof ConsoleServerRoute
   "/settings": typeof ConsoleSettingsRouteWithChildren
   "/apps/$domain": typeof ConsoleAppsDomainRouteWithChildren
@@ -217,6 +222,7 @@ export interface FileRoutesByFullPath {
   "/settings/tokens": typeof ConsoleSettingsTokensRoute
   "/apps/": typeof ConsoleAppsIndexRoute
   "/databases/": typeof ConsoleDatabasesIndexRoute
+  "/domains/": typeof ConsoleDomainsIndexRoute
   "/services/": typeof ConsoleServicesIndexRoute
   "/settings/": typeof ConsoleSettingsIndexRoute
   "/apps/$domain/diagnose": typeof ConsoleAppsDomainDiagnoseRoute
@@ -226,6 +232,7 @@ export interface FileRoutesByFullPath {
   "/apps/$domain/metrics": typeof ConsoleAppsDomainMetricsRoute
   "/apps/$domain/settings": typeof ConsoleAppsDomainSettingsRoute
   "/databases/$engine/$name": typeof ConsoleDatabasesEngineNameRoute
+  "/domains/sites/$site": typeof ConsoleDomainsSitesSiteRoute
   "/apps/$domain/": typeof ConsoleAppsDomainIndexRoute
   "/apps/$domain/deployments/$id": typeof ConsoleAppsDomainDeploymentsIdRoute
   "/apps/$domain/deployments/": typeof ConsoleAppsDomainDeploymentsIndexRoute
@@ -235,7 +242,6 @@ export interface FileRoutesByTo {
   "/activity": typeof ConsoleActivityRoute
   "/backups": typeof ConsoleBackupsRoute
   "/cron": typeof ConsoleCronRoute
-  "/domains": typeof ConsoleDomainsRoute
   "/server": typeof ConsoleServerRoute
   "/": typeof ConsoleIndexRoute
   "/apps/new": typeof ConsoleAppsNewRoute
@@ -246,6 +252,7 @@ export interface FileRoutesByTo {
   "/settings/tokens": typeof ConsoleSettingsTokensRoute
   "/apps": typeof ConsoleAppsIndexRoute
   "/databases": typeof ConsoleDatabasesIndexRoute
+  "/domains": typeof ConsoleDomainsIndexRoute
   "/services": typeof ConsoleServicesIndexRoute
   "/settings": typeof ConsoleSettingsIndexRoute
   "/apps/$domain/diagnose": typeof ConsoleAppsDomainDiagnoseRoute
@@ -255,6 +262,7 @@ export interface FileRoutesByTo {
   "/apps/$domain/metrics": typeof ConsoleAppsDomainMetricsRoute
   "/apps/$domain/settings": typeof ConsoleAppsDomainSettingsRoute
   "/databases/$engine/$name": typeof ConsoleDatabasesEngineNameRoute
+  "/domains/sites/$site": typeof ConsoleDomainsSitesSiteRoute
   "/apps/$domain": typeof ConsoleAppsDomainIndexRoute
   "/apps/$domain/deployments/$id": typeof ConsoleAppsDomainDeploymentsIdRoute
   "/apps/$domain/deployments": typeof ConsoleAppsDomainDeploymentsIndexRoute
@@ -266,7 +274,6 @@ export interface FileRoutesById {
   "/_console/activity": typeof ConsoleActivityRoute
   "/_console/backups": typeof ConsoleBackupsRoute
   "/_console/cron": typeof ConsoleCronRoute
-  "/_console/domains": typeof ConsoleDomainsRoute
   "/_console/server": typeof ConsoleServerRoute
   "/_console/settings": typeof ConsoleSettingsRouteWithChildren
   "/_console/": typeof ConsoleIndexRoute
@@ -279,6 +286,7 @@ export interface FileRoutesById {
   "/_console/settings/tokens": typeof ConsoleSettingsTokensRoute
   "/_console/apps/": typeof ConsoleAppsIndexRoute
   "/_console/databases/": typeof ConsoleDatabasesIndexRoute
+  "/_console/domains/": typeof ConsoleDomainsIndexRoute
   "/_console/services/": typeof ConsoleServicesIndexRoute
   "/_console/settings/": typeof ConsoleSettingsIndexRoute
   "/_console/apps/$domain/diagnose": typeof ConsoleAppsDomainDiagnoseRoute
@@ -288,6 +296,7 @@ export interface FileRoutesById {
   "/_console/apps/$domain/metrics": typeof ConsoleAppsDomainMetricsRoute
   "/_console/apps/$domain/settings": typeof ConsoleAppsDomainSettingsRoute
   "/_console/databases/$engine/$name": typeof ConsoleDatabasesEngineNameRoute
+  "/_console/domains/sites/$site": typeof ConsoleDomainsSitesSiteRoute
   "/_console/apps/$domain/": typeof ConsoleAppsDomainIndexRoute
   "/_console/apps/$domain/deployments/$id": typeof ConsoleAppsDomainDeploymentsIdRoute
   "/_console/apps/$domain/deployments/": typeof ConsoleAppsDomainDeploymentsIndexRoute
@@ -300,7 +309,6 @@ export interface FileRouteTypes {
     | "/activity"
     | "/backups"
     | "/cron"
-    | "/domains"
     | "/server"
     | "/settings"
     | "/apps/$domain"
@@ -312,6 +320,7 @@ export interface FileRouteTypes {
     | "/settings/tokens"
     | "/apps/"
     | "/databases/"
+    | "/domains/"
     | "/services/"
     | "/settings/"
     | "/apps/$domain/diagnose"
@@ -321,6 +330,7 @@ export interface FileRouteTypes {
     | "/apps/$domain/metrics"
     | "/apps/$domain/settings"
     | "/databases/$engine/$name"
+    | "/domains/sites/$site"
     | "/apps/$domain/"
     | "/apps/$domain/deployments/$id"
     | "/apps/$domain/deployments/"
@@ -330,7 +340,6 @@ export interface FileRouteTypes {
     | "/activity"
     | "/backups"
     | "/cron"
-    | "/domains"
     | "/server"
     | "/"
     | "/apps/new"
@@ -341,6 +350,7 @@ export interface FileRouteTypes {
     | "/settings/tokens"
     | "/apps"
     | "/databases"
+    | "/domains"
     | "/services"
     | "/settings"
     | "/apps/$domain/diagnose"
@@ -350,6 +360,7 @@ export interface FileRouteTypes {
     | "/apps/$domain/metrics"
     | "/apps/$domain/settings"
     | "/databases/$engine/$name"
+    | "/domains/sites/$site"
     | "/apps/$domain"
     | "/apps/$domain/deployments/$id"
     | "/apps/$domain/deployments"
@@ -360,7 +371,6 @@ export interface FileRouteTypes {
     | "/_console/activity"
     | "/_console/backups"
     | "/_console/cron"
-    | "/_console/domains"
     | "/_console/server"
     | "/_console/settings"
     | "/_console/"
@@ -373,6 +383,7 @@ export interface FileRouteTypes {
     | "/_console/settings/tokens"
     | "/_console/apps/"
     | "/_console/databases/"
+    | "/_console/domains/"
     | "/_console/services/"
     | "/_console/settings/"
     | "/_console/apps/$domain/diagnose"
@@ -382,6 +393,7 @@ export interface FileRouteTypes {
     | "/_console/apps/$domain/metrics"
     | "/_console/apps/$domain/settings"
     | "/_console/databases/$engine/$name"
+    | "/_console/domains/sites/$site"
     | "/_console/apps/$domain/"
     | "/_console/apps/$domain/deployments/$id"
     | "/_console/apps/$domain/deployments/"
@@ -436,13 +448,6 @@ declare module "@tanstack/react-router" {
       preLoaderRoute: typeof ConsoleCronRouteImport
       parentRoute: typeof ConsoleRoute
     }
-    "/_console/domains": {
-      id: "/_console/domains"
-      path: "/domains"
-      fullPath: "/domains"
-      preLoaderRoute: typeof ConsoleDomainsRouteImport
-      parentRoute: typeof ConsoleRoute
-    }
     "/_console/server": {
       id: "/_console/server"
       path: "/server"
@@ -483,6 +488,13 @@ declare module "@tanstack/react-router" {
       path: "/databases"
       fullPath: "/databases/"
       preLoaderRoute: typeof ConsoleDatabasesIndexRouteImport
+      parentRoute: typeof ConsoleRoute
+    }
+    "/_console/domains/": {
+      id: "/_console/domains/"
+      path: "/domains"
+      fullPath: "/domains/"
+      preLoaderRoute: typeof ConsoleDomainsIndexRouteImport
       parentRoute: typeof ConsoleRoute
     }
     "/_console/services/": {
@@ -590,6 +602,13 @@ declare module "@tanstack/react-router" {
       preLoaderRoute: typeof ConsoleDatabasesEngineNameRouteImport
       parentRoute: typeof ConsoleRoute
     }
+    "/_console/domains/sites/$site": {
+      id: "/_console/domains/sites/$site"
+      path: "/domains/sites/$site"
+      fullPath: "/domains/sites/$site"
+      preLoaderRoute: typeof ConsoleDomainsSitesSiteRouteImport
+      parentRoute: typeof ConsoleRoute
+    }
     "/_console/apps/$domain/deployments/": {
       id: "/_console/apps/$domain/deployments/"
       path: "/deployments"
@@ -659,7 +678,6 @@ interface ConsoleRouteChildren {
   ConsoleActivityRoute: typeof ConsoleActivityRoute
   ConsoleBackupsRoute: typeof ConsoleBackupsRoute
   ConsoleCronRoute: typeof ConsoleCronRoute
-  ConsoleDomainsRoute: typeof ConsoleDomainsRoute
   ConsoleServerRoute: typeof ConsoleServerRoute
   ConsoleSettingsRoute: typeof ConsoleSettingsRouteWithChildren
   ConsoleIndexRoute: typeof ConsoleIndexRoute
@@ -668,15 +686,16 @@ interface ConsoleRouteChildren {
   ConsoleServicesNameRoute: typeof ConsoleServicesNameRoute
   ConsoleAppsIndexRoute: typeof ConsoleAppsIndexRoute
   ConsoleDatabasesIndexRoute: typeof ConsoleDatabasesIndexRoute
+  ConsoleDomainsIndexRoute: typeof ConsoleDomainsIndexRoute
   ConsoleServicesIndexRoute: typeof ConsoleServicesIndexRoute
   ConsoleDatabasesEngineNameRoute: typeof ConsoleDatabasesEngineNameRoute
+  ConsoleDomainsSitesSiteRoute: typeof ConsoleDomainsSitesSiteRoute
 }
 
 const ConsoleRouteChildren: ConsoleRouteChildren = {
   ConsoleActivityRoute: ConsoleActivityRoute,
   ConsoleBackupsRoute: ConsoleBackupsRoute,
   ConsoleCronRoute: ConsoleCronRoute,
-  ConsoleDomainsRoute: ConsoleDomainsRoute,
   ConsoleServerRoute: ConsoleServerRoute,
   ConsoleSettingsRoute: ConsoleSettingsRouteWithChildren,
   ConsoleIndexRoute: ConsoleIndexRoute,
@@ -685,8 +704,10 @@ const ConsoleRouteChildren: ConsoleRouteChildren = {
   ConsoleServicesNameRoute: ConsoleServicesNameRoute,
   ConsoleAppsIndexRoute: ConsoleAppsIndexRoute,
   ConsoleDatabasesIndexRoute: ConsoleDatabasesIndexRoute,
+  ConsoleDomainsIndexRoute: ConsoleDomainsIndexRoute,
   ConsoleServicesIndexRoute: ConsoleServicesIndexRoute,
   ConsoleDatabasesEngineNameRoute: ConsoleDatabasesEngineNameRoute,
+  ConsoleDomainsSitesSiteRoute: ConsoleDomainsSitesSiteRoute,
 }
 
 const ConsoleRouteWithChildren =

@@ -136,7 +136,7 @@ describe("keyboard", () => {
     const { user } = await shellAt("/apps/shop.example.com");
     const logs = screen.getByRole("link", { name: "Logs" });
     await user.click(logs);
-    await screen.findByText("Live output of the app's service");
+    await screen.findByRole("region", { name: "Journal of shop.example.com" });
     expect(screen.getByRole("link", { name: "Logs" })).toHaveFocus();
     expect(screen.getByRole("link", { name: "Logs" })).toHaveAttribute("aria-current", "page");
   });

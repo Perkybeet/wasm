@@ -11,7 +11,7 @@ import { describeError } from "../../lib/errors";
 
 export interface AppActionOptions {
   /**
-   * Called with a job the API queued (update, rollback, delete). The app page tracks it in
+   * Called with a job the API queued (update, rollback). The app page tracks it in
    * its header; without one, a toast says the job was queued.
    */
   onJobQueued?: (job: Job) => void;
@@ -68,7 +68,7 @@ function useUnitAction(domain: string, verb: UnitVerb, refresh: () => void) {
 
 /**
  * The actions on one application, each the one API call that does it: restart, start and
- * stop the unit, queue an update, a rollback or the deletion. Elevation ("Confirm it's you")
+ * stop the unit, queue an update or a rollback, switch releases. Elevation ("Confirm it's you")
  * is handled by the API client, never here.
  *
  * Synchronous unit actions refresh the app when they return (the `app` server event does too;
@@ -120,22 +120,16 @@ export function useAppActions(domain: string, { onJobQueued }: AppActionOptions 
       request("post", "/api/apps/{domain}/releases/{release_id}/activate", { params: { domain, release_id: releaseId } }),
     onSuccess: (result) => {
       refresh();
-      if (result.rolled_back) {
-        toast.error(`Release ${result.release_id} failed its health check`, {
-          description: `${domain} was returned to ${result.previous_id ?? "the previous release"}.`,
-        });
-      } else {
-        toast.success(`Activated release ${result.release_id} of ${domain}`);
-      }
+      // `rolled_back` says the release is older than the one it replaced. A release that fails
+      // its health check never gets here: the API answers an error, after putting the
+      // previous release back.
+      if (!result.changed) toast.info(`Release ${result.release_id} is already serving ${domain}`);
+      else if (result.rolled_back) toast.success(`Rolled ${domain} back to release ${result.release_id}`);
+      else toast.success(`Activated release ${result.release_id} of ${domain}`);
     },
   });
 
-  const remove = useMutation({
-    mutationFn: () => request("post", "/api/jobs/delete", { body: { domain, remove_files: true, remove_ssl: true } }),
-    onSuccess: (result) => {
-      queued(result.job, "Deletion");
-    },
-  });
-
-  return { restart, start, stop, update, rollbackToBackup, activateRelease, remove };
+  // Deleting is not here: it goes through features/app/useDeleteApp, the endpoint behind sudo
+  // mode (DELETE /api/apps/{domain}), never POST /api/jobs/delete, which does not ask.
+  return { restart, start, stop, update, rollbackToBackup, activateRelease };
 }

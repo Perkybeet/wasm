@@ -1,0 +1,13 @@
+{
+  "\ufeffFIRST_AFTER_BOM": "kept with the mark",
+  "GREETING": "\u00a1Hola, caf\u00e9!",
+  "NBSP_AROUND": "value",
+  "EMOJI": "\ud83d\ude80 launch",
+  "SPLIT": "left",
+  "RIGHT": "right",
+  "NEXT_LINE": "a",
+  "AFTER": "b",
+  "SEPARATOR": "x",
+  "GROUP": "y",
+  "ZERO_WIDTH": "\u200bvisible\u200b"
+}

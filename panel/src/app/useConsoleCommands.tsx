@@ -3,7 +3,8 @@ import { useNavigate } from "@tanstack/react-router";
 import { Box, Keyboard, LogOut, Monitor, Moon, Plus, Sun } from "lucide-react";
 import { useMemo } from "react";
 
-import { appState, appsQuery } from "../api/queries/apps";
+import { appsQuery } from "../api/queries/apps";
+import { appStatus } from "../components/page/status";
 import { useSignOut } from "../features/auth/useSignOut";
 import type { Command } from "./CommandPalette";
 import { NAV_GROUPS, SETTINGS_ITEM, SETTINGS_TABS } from "./nav";
@@ -58,7 +59,7 @@ export function useConsoleCommands(open: boolean, openShortcuts: () => void): Co
       label: app.domain,
       icon: <Box />,
       keywords: [app.name, app.app_type ?? ""].join(" "),
-      status: appState(app.status),
+      status: appStatus(app.status).state,
       kind: "navigate",
       run: go("/apps/$domain", { domain: app.domain }),
     }));

@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { useId, useState } from "react";
 
+import { releasesQuery, rollbackPointsQuery } from "../../api/queries/apps";
 import type { Job } from "../../api/queries/jobs";
 import { ErrorBlock } from "../../components/page/QueryState";
 import { RelativeTime } from "../../components/page/RelativeTime";
@@ -10,7 +11,6 @@ import { Skeleton } from "../../components/ui/Skeleton";
 import { cx } from "../../lib/cx";
 import { formatBytes } from "../../lib/format";
 import { useAppActions } from "../apps/useAppActions";
-import { releasesQuery, rollbackPointsQuery } from "./queries";
 
 interface Target {
   id: string;
@@ -73,22 +73,31 @@ export interface RollbackDialogProps {
   layout: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onJobQueued: (job: Job) => void;
+  /** Follows the job a rollback from a backup queues; without it, a toast says it was queued. */
+  onJobQueued?: (job: Job) => void;
+  /** The target chosen when the dialog opens: a release id, or a backup id. */
+  preselect?: string | null;
 }
 
 /**
  * Puts an earlier version of the app back. An app on releases switches to a previous release
  * in seconds; an app deployed in place is restored from one of its backups, as a job.
  */
-export function RollbackDialog({ domain, layout, open, onOpenChange, onJobQueued }: RollbackDialogProps) {
+export function RollbackDialog({ domain, layout, open, onOpenChange, onJobQueued, preselect = null }: RollbackDialogProps) {
   const name = useId();
-  const [choice, setChoice] = useState<string | null>(null);
+  const [choice, setChoice] = useState<string | null>(preselect);
+  // Opening again starts from the preselected target, adjusted while rendering.
+  const [wasOpen, setWasOpen] = useState(open);
+  if (wasOpen !== open) {
+    setWasOpen(open);
+    if (open) setChoice(preselect);
+  }
   const onReleases = layout === "releases";
   const releases = useQuery({ ...releasesQuery(domain), enabled: open && onReleases });
   // The API also answers "no releases" for an app it finds in place, whatever it was listed as.
   const inPlace = !onReleases || releases.data === null;
   const points = useQuery({ ...rollbackPointsQuery(domain), enabled: open && inPlace });
-  const { activateRelease, rollbackToBackup } = useAppActions(domain, { onJobQueued });
+  const { activateRelease, rollbackToBackup } = useAppActions(domain, onJobQueued ? { onJobQueued } : {});
   const action = inPlace ? rollbackToBackup : activateRelease;
 
   const targets: Target[] | undefined = inPlace

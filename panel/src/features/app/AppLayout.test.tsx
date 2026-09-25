@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import { expectNoAxeViolations } from "../../test/axe";
 import { renderConsole } from "../../test/console";
-import { FakeEventSource, fakeBackend, json, problem, signedInRoutes } from "../../test/fakes";
+import { FakeEventSource, SESSION, fakeBackend, json, problem, signedInRoutes } from "../../test/fakes";
 import type { RouteHandler } from "../../test/fakes";
 
 const DOMAIN = "shop.example.com";
@@ -117,7 +117,10 @@ describe("an application's page", () => {
 
   it("deletes only once the domain is typed, then returns to the list", async () => {
     const { user, backend, location } = await appAt({
-      "POST /api/jobs/delete": () => json(202, { message: "Deletion job created", job: { ...JOB, type: "delete" } }),
+      // Already confirmed it's them: the typed confirmation opens straight away.
+      "GET /api/auth/session": () => json(200, { ...SESSION, elevated_until: "2999-01-01T00:00:00+00:00" }),
+      [`DELETE /api/apps/${DOMAIN}`]: () =>
+        json(202, { job_id: JOB.id, status: "pending", message: `Deletion queued for ${DOMAIN}`, job: { ...JOB, type: "delete" } }),
     });
     await user.click(await within(header()).findByRole("button", { name: "More actions" }));
     await user.click(await screen.findByRole("menuitem", { name: "Delete application" }));
@@ -130,7 +133,9 @@ describe("an application's page", () => {
     await waitFor(() => {
       expect(location().pathname).toBe("/apps");
     });
-    expect(backend.callsTo("POST /api/jobs/delete")[0]?.body).toEqual({ domain: DOMAIN, remove_files: true, remove_ssl: true });
+    const call = backend.callsTo(`DELETE /api/apps/${DOMAIN}`)[0];
+    expect(Object.fromEntries(call?.search ?? [])).toEqual({ remove_files: "true", remove_ssl: "true" });
+    expect(backend.callsTo("POST /api/jobs/delete")).toHaveLength(0);
   });
 
   it("asks before stopping", async () => {

@@ -1,26 +1,18 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { Cog } from "lucide-react";
 
-import { PageHeader } from "../../../app/PageHeader";
-import { Placeholder } from "../../../app/Placeholder";
+import { ServicesPage } from "../../../features/services/ServicesPage";
+import { validateServicesSearch } from "../../../features/services/data";
 
+/** Every systemd unit WASM manages. The search box is a search param: `/services?q=worker`. */
 export const Route = createFileRoute("/_console/services/")({
-  component: ServicesPage,
+  validateSearch: validateServicesSearch,
+  component: ServicesRoute,
 });
 
-function ServicesPage() {
+function ServicesRoute() {
+  const search = Route.useSearch();
+  const navigate = Route.useNavigate();
   return (
-    <>
-      <PageHeader
-        title="Services"
-        description="The systemd units on this machine, including the ones WASM manages."
-      />
-      <Placeholder
-        icon={<Cog />}
-        title="Units and their state"
-        description="Start, stop and restart units, follow their logs and edit unit files with a check before saving."
-        command="wasm service list"
-      />
-    </>
+    <ServicesPage search={search} onSearchChange={(next, options) => void navigate({ search: next, replace: options?.replace ?? false })} />
   );
 }

@@ -7,7 +7,7 @@
 
 import type { Page } from "@playwright/test";
 
-import { expect, expectNoA11yViolations, settle, signIn, test } from "./fixtures";
+import { expect, expectNoA11yViolations, settle, signIn, test, totpCode } from "./fixtures";
 
 const DOMAIN = "picconia.com";
 
@@ -136,6 +136,13 @@ test("Delete stays disabled until the domain is typed", async ({ page, consoleSe
   await header(page).getByRole("button", { name: "More actions" }).click();
   await page.getByRole("menuitem", { name: "Delete application" }).click();
 
+  // Deleting is a sudo-mode action: "Confirm it's you" comes first, never on top of the dialog.
+  const elevate = page.getByRole("dialog", { name: "Confirm it's you" });
+  await expect(elevate).toBeVisible();
+  await elevate.getByLabel("Authentication code").fill(totpCode(consoleServer.totpSecret ?? ""));
+  await elevate.getByRole("button", { name: "Confirm" }).click();
+  await expect(elevate).toBeHidden();
+
   const dialog = page.getByRole("alertdialog", { name: `Delete ${DOMAIN}` });
   await expect(dialog).toBeVisible();
   const confirm = dialog.getByRole("button", { name: "Delete application" });
@@ -171,7 +178,8 @@ test("the overview tab shows the deploys as dots that open each deploy, and the 
   const dots = page.getByRole("list", { name: /^Last \d+ deploys, oldest first$/ });
   const newest = dots.getByRole("link").last();
   await expect(newest).toHaveAccessibleName(/^Deploy \d+: Failed c07d5e3/);
-  await expect(pill(page)).toHaveAttribute("data-state", "stopped");
+  // Its unit is the one systemd gave up on.
+  await expect(pill(page)).toHaveAttribute("data-state", "failed");
 
   const runtime = page.getByRole("region", { name: "Runtime" });
   await expect(runtime.getByText("/var/www/apps/clientes.arennalabs.com")).toBeVisible();

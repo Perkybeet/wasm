@@ -2,6 +2,7 @@ import { useNavigate } from "@tanstack/react-router";
 import { CircleArrowUp, History, MoreHorizontal, Play, RotateCw, Square, Trash2 } from "lucide-react";
 import { useState } from "react";
 
+import { ElevationCancelledError } from "../../api/errors";
 import type { App } from "../../api/queries/apps";
 import type { Job } from "../../api/queries/jobs";
 import { appStatus } from "../../components/page/status";
@@ -12,8 +13,9 @@ import { IconButton } from "../../components/ui/IconButton";
 import { Menu, MenuItem, MenuSeparator } from "../../components/ui/Menu";
 import { toast } from "../../components/ui/toast";
 import { hasUnit } from "../apps/AppRowActions";
-import { useAppActions } from "../apps/useAppActions";
+import { reportActionError, useAppActions } from "../apps/useAppActions";
 import { RollbackDialog } from "./RollbackDialog";
+import { useConfirmItsYou, useDeleteApp } from "./useDeleteApp";
 
 export interface AppActionsProps {
   app: App;
@@ -31,7 +33,9 @@ export interface AppActionsProps {
 export function AppActions({ app, busy, onJobQueued }: AppActionsProps) {
   const domain = app.domain;
   const navigate = useNavigate();
-  const { restart, start, stop, update, remove } = useAppActions(domain, { onJobQueued });
+  const { restart, start, stop, update } = useAppActions(domain, { onJobQueued });
+  const remove = useDeleteApp(domain);
+  const confirmItsYou = useConfirmItsYou();
   const [confirmStop, setConfirmStop] = useState(false);
   const [rollbackOpen, setRollbackOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -57,7 +61,21 @@ export function AppActions({ app, busy, onJobQueued }: AppActionsProps) {
         Roll back
       </MenuItem>
       <MenuSeparator />
-      <MenuItem icon={<Trash2 />} destructive onClick={() => setDeleteOpen(true)}>
+      <MenuItem
+        icon={<Trash2 />}
+        destructive
+        onClick={() => {
+          // Sudo mode first, so "Confirm it's you" never opens on top of the typed confirmation.
+          confirmItsYou().then(
+            () => {
+              setDeleteOpen(true);
+            },
+            (error: unknown) => {
+              if (!(error instanceof ElevationCancelledError)) reportActionError(`Deletion of ${domain} could not start`, error);
+            },
+          );
+        }}
+      >
         Delete application
       </MenuItem>
     </>
@@ -139,7 +157,7 @@ export function AppActions({ app, busy, onJobQueued }: AppActionsProps) {
         confirmText={domain}
         actionLabel="Delete application"
         onConfirm={async () => {
-          await remove.mutateAsync();
+          await remove.mutateAsync({ removeFiles: true, removeSsl: true });
           // The page is about to go; the toast is what stays to say the job is on its way.
           toast.info(`Deletion of ${domain} queued`, { description: "You will be told when it finishes." });
           void navigate({ to: "/apps" });

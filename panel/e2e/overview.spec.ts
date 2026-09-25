@@ -54,7 +54,9 @@ test("the machine, the applications and the recent deploys fill in from the API"
   }
 
   const apps = page.getByRole("region", { name: "Applications on this machine" });
-  await expect(apps.getByRole("row")).toHaveCount(9);
+  // Every seeded app, and the header row.
+  const total = ((await (await page.request.get("/api/apps")).json()) as { total: number }).total;
+  await expect(apps.getByRole("row")).toHaveCount(total + 1);
   const failedRow = apps.getByRole("row").filter({ has: page.getByRole("link", { name: FAILED, exact: true }) });
   await expect(failedRow.getByText("Failed")).toHaveCount(1);
 
@@ -81,7 +83,8 @@ test("the chart range is part of the URL", async ({ page, consoleServer }) => {
 test("on a phone the page never scrolls sideways; wide tables scroll inside themselves", async ({ page, consoleServer }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await signIn(page, consoleServer);
-  await expect(page.getByRole("region", { name: "Applications on this machine" }).getByRole("row")).toHaveCount(9);
+  const total = ((await (await page.request.get("/api/apps")).json()) as { total: number }).total;
+  await expect(page.getByRole("region", { name: "Applications on this machine" }).getByRole("row")).toHaveCount(total + 1);
   await settle(page);
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
   expect(overflow).toBeLessThanOrEqual(0);

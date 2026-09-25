@@ -1,19 +1,8 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { Bell } from "lucide-react";
 
-import { Placeholder } from "../../../app/Placeholder";
+import { NotificationSettings } from "../../../features/settings/NotificationSettings";
 
+/** Settings > Notifications: channels with a test each, the events sent, private destinations. */
 export const Route = createFileRoute("/_console/settings/notifications")({
   component: NotificationSettings,
 });
-
-function NotificationSettings() {
-  return (
-    <Placeholder
-      icon={<Bell />}
-      title="Where alerts go"
-      description="Channels for deploy and monitor alerts, a test for each one, and which events are sent where."
-      documentTitle="Notifications settings"
-    />
-  );
-}

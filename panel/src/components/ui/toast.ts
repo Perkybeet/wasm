@@ -23,13 +23,20 @@ export interface ToastOptions {
  */
 export const toastManager = Toast.createToastManager();
 
+/** Failures interrupt a screen reader (assertive); everything else waits its turn (polite). */
+export function isUrgent(kind: string | undefined): boolean {
+  return kind === "error";
+}
+
 function add(kind: ToastKind, title: string, options: ToastOptions = {}): string {
   const { description, detail, action, timeout, id } = options;
   return toastManager.add<ToastData>({
     title,
     type: kind,
-    // Failures interrupt (assertive); everything else waits its turn (polite).
-    priority: kind === "error" ? "high" : "low",
+    // Always "low" for Base UI. Its "high" priority announces through a hidden alert copy and
+    // aria-hides the visible toast, whose buttons stay focusable (axe: aria-hidden-focus).
+    // Urgency is carried by the kind instead, and <ToastProvider> announces it (isUrgent).
+    priority: "low",
     timeout: timeout ?? (kind === "error" ? 0 : 5000),
     data: detail !== undefined ? { detail } : {},
     ...(description !== undefined ? { description } : {}),

@@ -1,20 +1,33 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { ChartLine } from "lucide-react";
 
-import { Placeholder } from "../../../../app/Placeholder";
+import { MetricsTab } from "../../../../features/app/metrics/MetricsTab";
+import { DEFAULT_RANGE, isRange } from "../../../../features/app/metrics/ranges";
+import type { MetricRange } from "../../../../features/app/metrics/ranges";
+
+interface MetricsSearch {
+  /** The charts' time range; the last 24 hours when absent. */
+  range?: MetricRange;
+}
+
+function validateSearch(search: Record<string, unknown>): MetricsSearch {
+  const range = search["range"];
+  return isRange(range) && range !== DEFAULT_RANGE ? { range } : {};
+}
 
 export const Route = createFileRoute("/_console/apps/$domain/metrics")({
+  validateSearch,
   component: AppMetricsTab,
 });
 
 function AppMetricsTab() {
   const { domain } = Route.useParams();
+  const { range = DEFAULT_RANGE } = Route.useSearch();
+  const navigate = Route.useNavigate();
   return (
-    <Placeholder
-      icon={<ChartLine />}
-      title="CPU and memory over time"
-      description="The last hour, day, week or month, with each deploy marked on the timeline and every chart also readable as a table."
-      documentTitle={`Metrics - ${domain}`}
+    <MetricsTab
+      domain={domain}
+      range={range}
+      onRangeChange={(next) => void navigate({ search: next === DEFAULT_RANGE ? {} : { range: next }, replace: true })}
     />
   );
 }

@@ -1,4 +1,4 @@
-import { queryOptions } from "@tanstack/react-query";
+import { infiniteQueryOptions, queryOptions } from "@tanstack/react-query";
 
 import { request } from "../client";
 import type { QueryOf, ResponseOf } from "../client";
@@ -17,6 +17,7 @@ export type DeploymentFilters = NonNullable<QueryOf<"/api/deployments", "get">>;
 export const deploymentKeys = {
   all: ["deployments"] as const,
   list: (filters: DeploymentFilters) => ["deployments", "list", filters] as const,
+  pages: (filters: Omit<DeploymentFilters, "before_id">) => ["deployments", "pages", filters] as const,
   detail: (id: number) => ["deployments", "detail", id] as const,
   log: (id: number, tail: number | null) => ["deployments", "detail", id, "log", { tail }] as const,
 };
@@ -42,4 +43,21 @@ export const deploymentLogQuery = (id: number, tail: number | null = null) =>
         query: tail === null ? {} : { tail },
         signal,
       }),
+  });
+
+/**
+ * The history a page at a time, newest first, for a "Load more" list. Keyset pagination: each
+ * page asks for the rows below the last id of the one before, so a deploy that starts while
+ * the operator reads never shifts or repeats a row.
+ */
+export const deploymentPagesQuery = (filters: Omit<DeploymentFilters, "before_id"> = {}) =>
+  infiniteQueryOptions({
+    queryKey: deploymentKeys.pages(filters),
+    queryFn: ({ signal, pageParam }) =>
+      request("get", "/api/deployments", {
+        query: pageParam === null ? filters : { ...filters, before_id: pageParam },
+        signal,
+      }),
+    initialPageParam: null as number | null,
+    getNextPageParam: (last) => last.next_before_id ?? null,
   });

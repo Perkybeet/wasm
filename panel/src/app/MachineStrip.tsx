@@ -9,18 +9,8 @@ import { Meter } from "../components/ui/Progress";
 import { Skeleton } from "../components/ui/Skeleton";
 import { StatusGlyph, StatusPill } from "../components/ui/StatusPill";
 import { cx } from "../lib/cx";
+import { formatDuration } from "../lib/format";
 import { useStreamStatus } from "../realtime/events";
-
-/** Seconds of uptime as the two largest units: "12d 4h", "3h 12m", "45m". */
-export function formatUptime(seconds: number): string {
-  const s = Math.max(0, Math.floor(seconds));
-  const days = Math.floor(s / 86_400);
-  const hours = Math.floor((s % 86_400) / 3_600);
-  const minutes = Math.floor((s % 3_600) / 60);
-  if (days > 0) return `${String(days)}d ${String(hours)}h`;
-  if (hours > 0) return `${String(hours)}h ${String(minutes)}m`;
-  return `${String(minutes)}m`;
-}
 
 /** The recent one-minute load as a line, scaled to its own peak (at least 1). */
 export function sparklinePath(samples: readonly number[], width: number, height: number): string {
@@ -121,7 +111,7 @@ export function MachineStrip({ className }: { className?: string }) {
           {machine ? " " : null}
           {machine ? (
             <span className="mono hidden shrink-0 text-12 text-fg-faint @min-[42rem]:inline">
-              up {formatUptime(machine.uptime_s)}
+              up {formatDuration(machine.uptime_s)}
             </span>
           ) : null}
         </Link>

@@ -3,7 +3,7 @@ import { Link } from "@tanstack/react-router";
 import { CircleCheck, TriangleAlert, Webhook, X } from "lucide-react";
 import type { ReactNode } from "react";
 
-import { appQuery } from "../../api/queries/apps";
+import { appQuery, releasesQuery, webhookDeliveriesQuery } from "../../api/queries/apps";
 import type { App } from "../../api/queries/apps";
 import { certsQuery } from "../../api/queries/certs";
 import type { Cert } from "../../api/queries/certs";
@@ -29,7 +29,7 @@ import { formatBytes, formatCount, formatDateTime, formatDuration, formatPercent
 import type { Deployment } from "../apps/data";
 import { appLimits, appReading, deployMoment, useLatestMetrics } from "../apps/data";
 import { CERT_WARNING_DAYS } from "../overview/attention";
-import { findCertificate, findSite, releasesQuery, webhookDeliveriesQuery } from "./queries";
+import { findCertificate, findSite } from "./lookups";
 
 const TONE_TEXT = { ok: "text-ok", warn: "text-warn", fail: "text-fail", idle: "text-idle" } as const;
 const LINK =

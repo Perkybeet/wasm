@@ -4,6 +4,7 @@ import { request } from "../client";
 import type { ResponseOf } from "../client";
 
 export type MonitorStatus = ResponseOf<"/api/monitor/status", "get">;
+export type MonitorSettings = ResponseOf<"/api/monitor/config", "get">;
 export type ObservationList = ResponseOf<"/api/monitor/observations", "get">;
 
 export const monitorKeys = {

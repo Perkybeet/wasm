@@ -1,0 +1,15 @@
+{
+  "DOUBLE": "hello world",
+  "SINGLE": "hello world",
+  "EMPTY_DOUBLE": "",
+  "EMPTY_SINGLE": "",
+  "MISMATCHED": "\"hello'",
+  "LONE_QUOTE": "\"",
+  "LONE_SINGLE": "'",
+  "INSIDE": "say \"hi\" to them",
+  "NESTED": "'kept'",
+  "ESCAPES": "a\\nb\\\"c",
+  "SPACED": "  padded  ",
+  "ONLY_OPENING": "\"starts but never ends",
+  "HASH": "#not a comment"
+}

@@ -7,6 +7,15 @@ export type SessionInfo = ResponseOf<"/api/auth/session", "get">;
 export type LoginBody = BodyOf<"/api/auth/login", "post">;
 export type ElevateBody = BodyOf<"/api/auth/elevate", "post">;
 
+export type TwoFactorStatus = ResponseOf<"/api/auth/2fa", "get">;
+export type TwoFactorEnrollment = ResponseOf<"/api/auth/2fa/enroll", "post">;
+export type ActiveSessions = ResponseOf<"/api/auth/sessions", "get">;
+export type ActiveSession = ActiveSessions["sessions"][number];
+export type ApiTokens = ResponseOf<"/api/auth/tokens", "get">;
+export type ApiToken = ApiTokens["tokens"][number];
+export type CreateTokenBody = BodyOf<"/api/auth/tokens", "post">;
+export type CreatedToken = ResponseOf<"/api/auth/tokens", "post">;
+
 export const authKeys = {
   all: ["auth"] as const,
   session: ["auth", "session"] as const,
@@ -65,3 +74,40 @@ export const apiTokensQuery = () =>
     queryKey: authKeys.tokens,
     queryFn: ({ signal }) => request("get", "/api/auth/tokens", { signal }),
   });
+
+/** Every live session: address, birth, last activity and expiry, the caller's own marked. */
+export const sessionsQuery = () =>
+  queryOptions({
+    queryKey: authKeys.sessions,
+    queryFn: ({ signal }) => request("get", "/api/auth/sessions", { signal }),
+  });
+
+/** Begins enrolment: a pending secret and its otpauth URI. The only answer carrying the secret. */
+export function enrollTwoFactor() {
+  return request("post", "/api/auth/2fa/enroll");
+}
+
+/** Activates the second factor with a code from the app; answers the backup codes, once. */
+export function confirmTwoFactor(code: string) {
+  return request("post", "/api/auth/2fa/confirm", { body: { code } });
+}
+
+/** Turns the second factor off. Needs a code and a recent "Confirm it's you". */
+export function disableTwoFactor(code: string) {
+  return request("post", "/api/auth/2fa/disable", { body: { code } });
+}
+
+/** Signs one other session out, named by the prefix the list shows. */
+export function revokeSession(sidPrefix: string) {
+  return request("delete", "/api/auth/sessions/{sid_prefix}", { params: { sid_prefix: sidPrefix } });
+}
+
+/** Issues a named, scoped token, returned in clear exactly once. Needs "Confirm it's you". */
+export function createApiToken(body: CreateTokenBody) {
+  return request("post", "/api/auth/tokens", { body });
+}
+
+/** Revokes a token: requests presenting it stop authenticating at once. */
+export function revokeApiToken(id: number) {
+  return request("delete", "/api/auth/tokens/{token_id}", { params: { token_id: id } });
+}

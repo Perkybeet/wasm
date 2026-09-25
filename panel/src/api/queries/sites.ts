@@ -5,6 +5,9 @@ import type { ResponseOf } from "../client";
 
 export type SiteList = ResponseOf<"/api/sites", "get">;
 export type Site = ResponseOf<"/api/sites/{domain}", "get">;
+/** One entry of the machine's list of sites. */
+export type SiteEntry = SiteList["sites"][number];
+export type SiteConfig = ResponseOf<"/api/sites/{domain}/config", "get">;
 
 export const siteKeys = {
   all: ["sites"] as const,

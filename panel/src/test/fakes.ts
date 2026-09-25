@@ -7,7 +7,11 @@
 import { vi } from "vitest";
 
 import type { SessionInfo } from "../api/queries/auth";
-import type { Machine } from "../api/queries/system";
+import type { CronJobList } from "../api/queries/cron";
+import type { JobList } from "../api/queries/jobs";
+import type { MonitorSettings, MonitorStatus, ObservationList } from "../api/queries/monitor";
+import type { ServiceList } from "../api/queries/services";
+import type { Machine, NetworkInfo, ProcessList, SystemHealth, SystemInfo } from "../api/queries/system";
 import type { EventSourceLike } from "../realtime/events";
 import type { SocketLike } from "../realtime/sockets";
 
@@ -112,6 +116,93 @@ export const APPS = [
   { domain: "admin.example.com", name: "admin", app_type: "python", status: "failed", active: false, enabled: true, port: 8000, layout: "inplace" },
 ] as const;
 
+/** The services of the fake machine, as GET /api/services lists them. */
+export const SERVICES: ServiceList["services"] = [
+  { name: "wasm-shop", description: "node /var/www/shop/server.js", active: true, enabled: true, status: "running", pid: 4821, uptime: "Thu 2026-09-25 08:00:00 UTC", memory: "58720256" },
+];
+
+/** The cron jobs of the fake machine, as GET /api/cron lists them. */
+export const CRON_JOBS: CronJobList["jobs"] = [
+  {
+    name: "nightly-backup",
+    command: "wasm backup create shop.example.com",
+    user: "wasm",
+    working_directory: "/var/www/shop",
+    app_domain: "shop.example.com",
+    schedule: "daily",
+    on_calendar: "*-*-* 02:00:00",
+    enabled: true,
+    next_run: "Fri 2026-09-26 02:00:00 UTC",
+    last_run: "Thu 2026-09-25 02:00:00 UTC",
+    last_exit_code: 0,
+    last_result: "success",
+  },
+];
+
+/** The jobs of the fake machine, as GET /api/jobs lists them. */
+export const JOBS: JobList["jobs"] = [
+  {
+    id: "a1b2c3d4",
+    type: "update",
+    name: "Update shop.example.com",
+    description: "Updating the application at shop.example.com",
+    status: "completed",
+    progress: 100,
+    total_steps: 100,
+    current_step: "",
+    created_at: "2026-09-25T09:00:00Z",
+    started_at: "2026-09-25T09:00:01Z",
+    completed_at: "2026-09-25T09:00:42Z",
+    result: null,
+    error: null,
+    logs: [],
+    metadata: { domain: "shop.example.com" },
+  },
+];
+
+export const MONITOR_STATUS: MonitorStatus = { installed: true, enabled: true, active: true, pid: 512, uptime: "Thu 2026-09-25 08:00:00 UTC", scope: ["reads /proc, never signals a process"] };
+
+export const MONITOR_CONFIG: MonitorSettings = {
+  scan_interval: 60,
+  cpu_threshold: 80,
+  memory_threshold: 80,
+  retention_days: 30,
+  max_observations: 500,
+  notify: false,
+  watch_units: [],
+};
+
+export const OBSERVATIONS: ObservationList["observations"] = [];
+
+export const SYSTEM_HEALTH: SystemHealth = {
+  verdict: "healthy",
+  checks: [
+    { name: "Disk Space", value: "61 GB of 78 GB used", status: "ok" },
+    { name: "Nginx", value: "active", status: "ok" },
+  ],
+  issues: [],
+  warnings: [],
+};
+
+export const SYSTEM_INFO: SystemInfo = {
+  hostname: "web-01",
+  os: "Ubuntu 24.04 LTS",
+  kernel: "6.8.0-generic",
+  uptime: "12d 4h 0m",
+  cpu: { cores: 4, percent: 18.5, load_1min: 0.42, load_5min: 0.38, load_15min: 0.31 },
+  memory: { total_gb: 8, used_gb: 3.38, free_gb: 4.62, available_gb: 4.9, percent_used: 42.3, swap_total_gb: 2, swap_used_gb: 0, swap_percent: 0 },
+  disks: [{ device: "/dev/sda1", mount_point: "/", total_gb: 78, used_gb: 61, free_gb: 17, percent_used: 78.2 }],
+};
+
+export const NETWORK: NetworkInfo = {
+  interfaces: [{ name: "eth0", addresses: [{ type: "IPv4", address: "10.0.0.5", netmask: "255.255.255.0" }], is_up: true, speed_mbps: 1000, bytes_sent: 128_000_000, bytes_recv: 512_000_000, packets_sent: 90_000, packets_recv: 210_000 }],
+};
+
+export const PROCESSES: ProcessList = {
+  total: 1,
+  processes: [{ pid: 4821, name: "node", cpu_percent: 2.1, memory_percent: 3.4, memory_mb: 210.5, status: "running", user: "wasm", command: "node server.js" }],
+};
+
 /** The routes every signed-in page needs. */
 export function signedInRoutes(session: SessionInfo = SESSION): Record<string, RouteHandler> {
   return {
@@ -120,6 +211,17 @@ export function signedInRoutes(session: SessionInfo = SESSION): Record<string, R
     "GET /api/apps": () => json(200, { total: APPS.length, apps: APPS }),
     // Each app's own page reads it by domain.
     ...Object.fromEntries(APPS.map((app) => [`GET /api/apps/${app.domain}`, () => json(200, app)])),
+    "GET /api/services": () => json(200, { services: SERVICES, total: SERVICES.length }),
+    ...Object.fromEntries(SERVICES.map((service) => [`GET /api/services/${service.name}`, () => json(200, service)])),
+    "GET /api/cron": () => json(200, { jobs: CRON_JOBS, total: CRON_JOBS.length }),
+    "GET /api/jobs": () => json(200, { jobs: JOBS, total: JOBS.length, active: 0 }),
+    "GET /api/monitor/status": () => json(200, MONITOR_STATUS),
+    "GET /api/monitor/config": () => json(200, MONITOR_CONFIG),
+    "GET /api/monitor/observations": () => json(200, { observations: OBSERVATIONS, count: OBSERVATIONS.length, stats: {} }),
+    "GET /api/system/health": () => json(200, SYSTEM_HEALTH),
+    "GET /api/system": () => json(200, SYSTEM_INFO),
+    "GET /api/system/network": () => json(200, NETWORK),
+    "GET /api/system/processes": () => json(200, PROCESSES),
   };
 }
 

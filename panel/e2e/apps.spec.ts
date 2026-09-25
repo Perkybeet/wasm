@@ -8,6 +8,12 @@ import type { Page } from "@playwright/test";
 
 import { expect, expectNoA11yViolations, settle, signIn, test } from "./fixtures";
 
+/** How many apps the seeded machine has, as the API counts them. */
+async function seeded(page: Page): Promise<number> {
+  const response = await page.request.get("/api/apps");
+  return ((await response.json()) as { total: number }).total;
+}
+
 /** Rows of the table, header excluded. */
 function rows(page: Page) {
   return page.getByRole("region", { name: /^Applications/ }).getByRole("row").filter({ hasNot: page.getByRole("columnheader") });
@@ -16,8 +22,9 @@ function rows(page: Page) {
 test("every seeded app is listed with its state, and the page passes axe", async ({ page, consoleServer }) => {
   await signIn(page, consoleServer, "/apps");
   await expect(page.getByRole("heading", { level: 1 })).toHaveText("Applications");
-  await expect(rows(page)).toHaveCount(8);
-  await expect(page.getByText("8 applications")).toBeVisible();
+  const total = await seeded(page);
+  await expect(rows(page)).toHaveCount(total);
+  await expect(page.getByText(`${String(total)} applications`)).toBeVisible();
 
   const picconia = rows(page).filter({ has: page.getByRole("link", { name: "picconia.com", exact: true }) });
   await expect(picconia.getByText("Running")).toBeVisible();
@@ -31,7 +38,8 @@ test("every seeded app is listed with its state, and the page passes axe", async
 
 test("/ focuses the search, and the search lives in the URL", async ({ page, consoleServer }) => {
   await signIn(page, consoleServer, "/apps");
-  await expect(rows(page)).toHaveCount(8);
+  const total = await seeded(page);
+  await expect(rows(page)).toHaveCount(total);
 
   await page.getByRole("heading", { level: 1 }).click();
   await page.keyboard.press("/");
@@ -40,19 +48,20 @@ test("/ focuses the search, and the search lives in the URL", async ({ page, con
   await search.fill("arennalabs");
   await expect(page).toHaveURL(/\/apps\?q=arennalabs$/);
   await expect(rows(page)).toHaveCount(4);
-  await expect(page.getByText("4 of 8 applications")).toBeVisible();
+  await expect(page.getByText(`4 of ${String(total)} applications`)).toBeVisible();
 
   // A shared link opens the same view.
   await page.goto("/apps?q=nothing-matches-this");
   await expect(page.getByText("No application matches")).toBeVisible();
   await page.getByRole("button", { name: "Clear filters" }).last().click();
   await expect(page).toHaveURL(/\/apps$/);
-  await expect(rows(page)).toHaveCount(8);
+  await expect(rows(page)).toHaveCount(total);
 });
 
 test("the state filter narrows the list and Back undoes it", async ({ page, consoleServer }) => {
   await signIn(page, consoleServer, "/apps");
-  await expect(rows(page)).toHaveCount(8);
+  const total = await seeded(page);
+  await expect(rows(page)).toHaveCount(total);
 
   await page.getByRole("combobox", { name: "State" }).click();
   await page.getByRole("option", { name: "Static" }).click();
@@ -62,12 +71,12 @@ test("the state filter narrows the list and Back undoes it", async ({ page, cons
 
   await page.goBack();
   await expect(page).toHaveURL(/\/apps$/);
-  await expect(rows(page)).toHaveCount(8);
+  await expect(rows(page)).toHaveCount(total);
 });
 
 test("a row's menu restarts the app and queues an update through the API", async ({ page, consoleServer }) => {
   await signIn(page, consoleServer, "/apps");
-  await expect(rows(page)).toHaveCount(8);
+  await expect(rows(page)).toHaveCount(await seeded(page));
 
   await page.getByRole("button", { name: "Actions for picconia.com" }).click();
   await expectNoA11yViolations(page, "a row's menu");
@@ -94,7 +103,7 @@ test("a static site has nothing to restart", async ({ page, consoleServer }) => 
 test("on a phone the table scrolls inside itself, never the page", async ({ page, consoleServer }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await signIn(page, consoleServer, "/apps");
-  await expect(rows(page)).toHaveCount(8);
+  await expect(rows(page)).toHaveCount(await seeded(page));
   await settle(page);
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
   expect(overflow).toBeLessThanOrEqual(0);
