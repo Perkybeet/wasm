@@ -1,25 +1,14 @@
-import { Outlet, createFileRoute } from "@tanstack/react-router";
+import { createFileRoute } from "@tanstack/react-router";
 
-import { LinkTabs } from "../../../app/LinkTabs";
-import { APP_TABS } from "../../../app/nav";
-import { PageHeader } from "../../../app/PageHeader";
+import { AppLayout } from "../../../features/app/AppLayout";
 
 /** One application: its header and the tabs that divide it. Each tab is a URL. */
 export const Route = createFileRoute("/_console/apps/$domain")({
-  component: AppLayout,
+  component: AppRoute,
 });
 
-function AppLayout() {
+function AppRoute() {
   const { domain } = Route.useParams();
-  return (
-    <>
-      <PageHeader title={domain} breadcrumbs={[{ label: "Applications", to: "/apps" }]} />
-      <LinkTabs
-        label="Application sections"
-        tabs={APP_TABS.map((tab) => ({ ...tab, params: { domain } }))}
-        className="-mt-4 mb-8"
-      />
-      <Outlet />
-    </>
-  );
+  // Keyed: another app is another page, with none of this one's tracked job or dialogs.
+  return <AppLayout key={domain} domain={domain} />;
 }

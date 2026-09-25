@@ -94,10 +94,12 @@ describe("keyboard", () => {
     const trigger = screen.getAllByRole("button", { name: "Search" }).find((button) => button.hasAttribute("aria-keyshortcuts"));
     if (!trigger) throw new Error("No search trigger");
     await user.click(trigger);
-    await screen.findByRole("combobox");
+    // Named: the applications page has comboboxes of its own (its filters).
+    const palette = { name: "Search pages, applications and actions" };
+    await screen.findByRole("combobox", palette);
     await user.keyboard("{Escape}");
     await waitFor(() => {
-      expect(screen.queryByRole("combobox")).toBeNull();
+      expect(screen.queryByRole("combobox", palette)).toBeNull();
     });
     await waitFor(() => {
       expect(trigger).toHaveFocus();

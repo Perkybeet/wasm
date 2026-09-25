@@ -58,6 +58,22 @@ function readPalette(host: HTMLElement): Palette {
   return { series, fill, grid, axis };
 }
 
+/** The narrowest the value axis gets, in CSS pixels; also its width before the first draw. */
+const VALUE_AXIS_MIN = 40;
+const VALUE_AXIS_PADDING = 12;
+
+/**
+ * Width of the value axis for the labels it is about to draw. uPlot asks with the formatted
+ * labels; the canvas measures them in the axis font (its pixels are device pixels).
+ */
+export function valueAxisSize(u: Pick<uPlot, "ctx">, values: readonly string[] | null | undefined): number {
+  const longest = (values ?? []).reduce((widest, label) => (label.length > widest.length ? label : widest), "");
+  if (longest === "") return VALUE_AXIS_MIN;
+  u.ctx.font = AXIS_FONT;
+  const width = u.ctx.measureText(longest).width;
+  return Math.max(VALUE_AXIS_MIN, Math.ceil(width + VALUE_AXIS_PADDING));
+}
+
 function formatTime(seconds: number): string {
   // 24-hour clock: shorter on the axis and the way server logs print time.
   return new Date(seconds * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
@@ -157,7 +173,8 @@ export function Chart({
           font: AXIS_FONT,
           grid: { stroke: () => palette.grid, width: 1 },
           ticks: { show: false },
-          size: 52,
+          // As wide as the widest label: a fixed width clipped "771 KB/s" to "77 KB/s".
+          size: (u, values) => valueAxisSize(u, values),
           gap: 6,
           values: (_u, splits) => splits.map((s) => formatRef.current(s)),
         },

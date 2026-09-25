@@ -133,4 +133,21 @@ describe("DataTable", () => {
     );
     await expectNoAxeViolations(container);
   });
+
+  it("contains its visually hidden labels, so they cannot widen the page past its scroll box", () => {
+    render(
+      <DataTable
+        caption="Applications"
+        columns={COLUMNS}
+        rows={ROWS}
+        getRowId={(r) => r.domain}
+        rowActions={(row) => <IconButton label={`Actions for ${row.domain}`} icon={<span />} tooltip={false} />}
+      />,
+    );
+    const region = screen.getByRole("region", { name: "Applications" });
+    // The "Actions" header is sr-only (absolutely positioned); its containing block must be
+    // the scrolling region itself.
+    expect(within(region).getByText("Actions")).toHaveClass("sr-only");
+    expect(region).toHaveClass("relative", "overflow-x-auto");
+  });
 });

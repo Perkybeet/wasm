@@ -146,8 +146,10 @@ export function DataTable<T>({
       role="region"
       aria-labelledby={captionId}
       {...(hasInteractive ? {} : { tabIndex: 0 })}
+      // `relative`: the containing block of the visually hidden labels in cells. Without it they
+      // are positioned against the page, escape this scroll box and widen the page on a phone.
       className={cx(
-        "min-w-0 overflow-x-auto rounded-card border border-border bg-surface shadow-raised scroll-thin",
+        "relative min-w-0 overflow-x-auto rounded-card border border-border bg-surface shadow-raised scroll-thin",
         "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus",
         className,
       )}

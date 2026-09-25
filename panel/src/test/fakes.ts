@@ -106,19 +106,20 @@ export function fakeBackend(routes: Record<string, RouteHandler> = {}): FakeBack
   };
 }
 
+/** The applications of the fake machine, as GET /api/apps lists them. */
+export const APPS = [
+  { domain: "shop.example.com", name: "shop", app_type: "nextjs", status: "running", active: true, enabled: true, port: 3000, layout: "inplace" },
+  { domain: "admin.example.com", name: "admin", app_type: "python", status: "failed", active: false, enabled: true, port: 8000, layout: "inplace" },
+] as const;
+
 /** The routes every signed-in page needs. */
 export function signedInRoutes(session: SessionInfo = SESSION): Record<string, RouteHandler> {
   return {
     "GET /api/auth/session": () => json(200, session),
     "GET /api/system/machine": () => json(200, MACHINE),
-    "GET /api/apps": () =>
-      json(200, {
-        total: 2,
-        apps: [
-          { domain: "shop.example.com", name: "shop", app_type: "nextjs", status: "running", active: true, enabled: true },
-          { domain: "admin.example.com", name: "admin", app_type: "python", status: "failed", active: false, enabled: true },
-        ],
-      }),
+    "GET /api/apps": () => json(200, { total: APPS.length, apps: APPS }),
+    // Each app's own page reads it by domain.
+    ...Object.fromEntries(APPS.map((app) => [`GET /api/apps/${app.domain}`, () => json(200, app)])),
   };
 }
 

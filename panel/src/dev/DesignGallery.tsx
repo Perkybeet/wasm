@@ -5,6 +5,7 @@ import type { ThemeChoice } from "../app/theme";
 import { Logo } from "../components/ui";
 import { Components } from "./Components";
 import { Foundations } from "./Foundations";
+import { PageKit } from "./PageKit";
 
 const NAV: { title: string; links: [string, string][] }[] = [
   {
@@ -32,6 +33,19 @@ const NAV: { title: string; links: [string, string][] }[] = [
       ["chart", "Chart"],
       ["logs", "Log viewer"],
       ["logo", "Logo"],
+    ],
+  },
+  {
+    title: "Page kit",
+    links: [
+      ["page-section", "Section"],
+      ["key-value", "Key-value list"],
+      ["time", "Time and numbers"],
+      ["query-state", "Query state"],
+      ["app-state", "App and deploy state"],
+      ["resources", "Tiles and meters"],
+      ["command", "Command hint"],
+      ["danger", "Danger zone"],
     ],
   },
 ];
@@ -101,6 +115,7 @@ export function DesignGallery() {
           </div>
           <Foundations />
           <Components />
+          <PageKit />
         </main>
       </div>
     </div>

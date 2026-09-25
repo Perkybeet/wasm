@@ -1,4 +1,4 @@
-import { screen } from "@testing-library/react";
+import { screen, waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
 import { renderConsole } from "../test/console";
@@ -9,10 +9,10 @@ import { fakeBackend, signedInRoutes } from "../test/fakes";
  * every path answers with its own page, headed by its title.
  */
 const PAGES: [path: string, heading: string, content: string][] = [
-  ["/", "Overview", "Problems first, then the rest"],
-  ["/apps", "Applications", "Your applications, in one table"],
+  ["/", "Overview", "Needs attention"],
+  ["/apps", "Applications", "Applications"],
   ["/apps/new", "New application", "Point at a repository to begin"],
-  ["/apps/shop.example.com", "shop.example.com", "Release, runtime and resources"],
+  ["/apps/shop.example.com", "shop.example.com", "Runtime"],
   ["/apps/shop.example.com/deployments", "shop.example.com", "Every deploy of this app"],
   ["/apps/shop.example.com/deployments/42", "shop.example.com", "Deployment 42"],
   ["/apps/shop.example.com/logs", "shop.example.com", "Live output of the app's service"],
@@ -42,7 +42,12 @@ describe("the route tree", () => {
     fakeBackend(signedInRoutes());
     renderConsole(path);
     expect(await screen.findByRole("heading", { level: 1, name: heading })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { level: 2, name: content })).toBeInTheDocument();
+    // A section heading, or for a page that is one table, the table's region.
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("heading", { level: 2, name: content }) ?? screen.queryByRole("region", { name: content }),
+      ).toBeInTheDocument();
+    });
   });
 
   it("names the page in the browser tab, most specific first", async () => {

@@ -1,26 +1,32 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { Gauge } from "lucide-react";
 
-import { PageHeader } from "../../app/PageHeader";
-import { Placeholder } from "../../app/Placeholder";
+import type { MetricWindow } from "../../api/queries/metrics";
+import { OverviewPage } from "../../features/overview/OverviewPage";
+
+const WINDOWS: readonly MetricWindow[] = ["1h", "24h", "30d"];
+
+interface OverviewSearch {
+  /** The machine charts' time range; the last hour when absent. */
+  window?: MetricWindow;
+}
+
+function validateSearch(search: Record<string, unknown>): OverviewSearch {
+  const window = search["window"];
+  return typeof window === "string" && (WINDOWS as readonly string[]).includes(window) ? { window: window as MetricWindow } : {};
+}
 
 export const Route = createFileRoute("/_console/")({
-  component: OverviewPage,
+  validateSearch,
+  component: OverviewRoute,
 });
 
-function OverviewPage() {
+function OverviewRoute() {
+  const { window = "1h" } = Route.useSearch();
+  const navigate = Route.useNavigate();
   return (
-    <>
-      <PageHeader
-        title="Overview"
-        description="The state of this machine and everything deployed on it."
-      />
-      <Placeholder
-        icon={<Gauge />}
-        title="Problems first, then the rest"
-        description="Failed apps and units, expiring certificates and monitor findings come first, followed by CPU, memory and disk charts, every application with its state, and the latest deploys."
-        command="wasm health"
-      />
-    </>
+    <OverviewPage
+      window={window}
+      onWindowChange={(next) => void navigate({ search: next === "1h" ? {} : { window: next }, replace: true })}
+    />
   );
 }

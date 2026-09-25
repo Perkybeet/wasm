@@ -1,33 +1,18 @@
-import { Link, createFileRoute } from "@tanstack/react-router";
-import { Boxes, Plus } from "lucide-react";
+import { createFileRoute } from "@tanstack/react-router";
 
-import { PageHeader } from "../../../app/PageHeader";
-import { Placeholder } from "../../../app/Placeholder";
-import { buttonClassName } from "../../../components/ui/Button";
+import { AppsPage } from "../../../features/apps/AppsPage";
+import { validateAppsSearch } from "../../../features/apps/filters";
 
+/** Every application on the machine. Filters are search params: `/apps?state=failed`. */
 export const Route = createFileRoute("/_console/apps/")({
-  component: ApplicationsPage,
+  validateSearch: validateAppsSearch,
+  component: ApplicationsRoute,
 });
 
-function ApplicationsPage() {
+function ApplicationsRoute() {
+  const search = Route.useSearch();
+  const navigate = Route.useNavigate();
   return (
-    <>
-      <PageHeader
-        title="Applications"
-        description="Every app deployed on this machine, its state and its last deploy."
-      />
-      <Placeholder
-        icon={<Boxes />}
-        title="Your applications, in one table"
-        description="Search and filter by state and type, and open, restart or update any app from its row."
-        command="wasm list"
-        action={
-          <Link to="/apps/new" className={buttonClassName("primary")}>
-            <Plus aria-hidden="true" />
-            New application
-          </Link>
-        }
-      />
-    </>
+    <AppsPage search={search} onSearchChange={(next, options) => void navigate({ search: next, replace: options?.replace ?? false })} />
   );
 }

@@ -169,7 +169,9 @@ test("a session that ends while the console is open returns to the same page aft
   problems,
 }) => {
   problems.expect(EXPIRED);
-  await signIn(page, consoleServer);
+  // Signed in on Databases, not the overview: the overview loads the applications, and the
+  // palette would answer from that fresh cache instead of making the request this refuses.
+  await signIn(page, consoleServer, "/databases");
   await page.getByRole("navigation", { name: "Main" }).getByRole("link", { name: /^Databases/ }).click();
   await expect(heading(page)).toHaveText("Databases");
 

@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { expectNoAxeViolations } from "../../test/axe";
-import { Chart } from "./Chart";
+import { Chart, valueAxisSize } from "./Chart";
 
 // uPlot draws on a canvas, which jsdom does not implement; the wrapper's contract is the
 // accessible summary, the table and the lifecycle of the plot, all testable without pixels.
@@ -79,5 +79,20 @@ describe("Chart", () => {
     await expectNoAxeViolations(container);
     await userEvent.click(screen.getByRole("button", { name: "View as table" }));
     await expectNoAxeViolations(container);
+  });
+});
+
+describe("valueAxisSize", () => {
+  // A canvas that measures 6.6px per character, like 11px JetBrains Mono.
+  const ctx = { font: "", measureText: (text: string) => ({ width: text.length * 6.6 }) } as unknown as CanvasRenderingContext2D;
+
+  it("fits the widest label, so a long unit is never clipped", () => {
+    expect(valueAxisSize({ ctx }, ["0 B/s", "386 KB/s", "771 KB/s"])).toBe(Math.ceil(8 * 6.6 + 12));
+    expect(ctx.font).toContain("JetBrains Mono");
+  });
+
+  it("keeps a minimum width for short labels and before the first draw", () => {
+    expect(valueAxisSize({ ctx }, ["0%", "50%"])).toBe(40);
+    expect(valueAxisSize({ ctx }, null)).toBe(40);
   });
 });
