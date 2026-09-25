@@ -21,6 +21,7 @@ from wasm.web.api.certs import router as certs_router
 from wasm.web.api.config import router as config_router
 from wasm.web.api.cron import router as cron_router
 from wasm.web.api.databases import router as databases_router
+from wasm.web.api.deployments import router as deployments_router
 from wasm.web.api.deps import install_error_handlers
 from wasm.web.api.jobs import router as jobs_router
 from wasm.web.api.metrics import router as metrics_router
@@ -50,3 +51,4 @@ router.include_router(
 )
 router.include_router(databases_router, prefix="/databases", tags=["Databases"])
 router.include_router(cron_router, prefix="/cron", tags=["Cron Jobs"])
+router.include_router(deployments_router, prefix="/deployments", tags=["Deployments"])

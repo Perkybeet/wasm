@@ -36,7 +36,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from wasm.core.exceptions import DeploymentError, DomainError
-from wasm.core.store import DeploymentTrigger, get_store
+from wasm.core.store import DeploymentRecord, DeploymentTrigger, StoreError, get_store
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import WASMErrorRoute, strict_domain
 from wasm.web.auth import get_audit_logger, get_client_ip, record_auth_failure
@@ -502,3 +502,84 @@ def delete_webhook_secret(
         )
 
     return WebhookDisabledResponse(domain=validated)
+
+
+class WebhookDeliveryOut(BaseModel):
+    """One webhook-triggered deployment attempt."""
+
+    deployment_id: int
+    status: str
+    started_at: str | None = None
+    git_commit: str | None = None
+    error: str | None = None
+
+
+class WebhookDeliveriesResponse(BaseModel):
+    """Webhook-triggered deployments for one application, newest first."""
+
+    items: list[WebhookDeliveryOut]
+    total: int
+
+
+#: Deployment rows fetched before filtering to webhook-triggered ones. History
+#: is pruned to twenty rows per domain (see
+#: :meth:`~wasm.core.store.WASMStore.prune_deployments`), so this comfortably
+#: covers every attempt the store still keeps, webhook-triggered or not.
+_DELIVERY_FETCH_LIMIT = 200
+
+
+def _to_delivery(record: DeploymentRecord) -> WebhookDeliveryOut:
+    """
+    Args:
+        record: A deployment row read from the store.
+
+    Returns:
+        The delivery shape of the row.
+    """
+    # Rows read back from the store always carry the id SQLite assigned them;
+    # only an unsaved DeploymentRecord() has None here.
+    if record.id is None:
+        raise StoreError(
+            "Deployment record has no id",
+            details="This should not happen for a row read back from the store.",
+        )
+    return WebhookDeliveryOut(
+        deployment_id=record.id,
+        status=record.status,
+        started_at=record.started_at,
+        git_commit=record.git_commit,
+        error=record.error,
+    )
+
+
+@admin_router.get("/{domain}/webhook/deliveries", response_model=WebhookDeliveriesResponse)
+def webhook_deliveries(
+    domain: str, session: Annotated[dict, Depends(get_current_session)]
+) -> WebhookDeliveriesResponse:
+    """
+    List webhook-triggered deployments for one application.
+
+    A view over the same deployment history every other surface reads, not a
+    delivery log of its own: :func:`deliver` records one row per accepted push
+    through the ordinary deployment recorder, tagged with the webhook trigger,
+    so this is the one implementation of "what did the webhook do" - the
+    deployment history already has it.
+
+    Args:
+        domain: Domain of the application.
+        session: The authenticated session.
+
+    Returns:
+        The webhook-triggered attempts, newest first.
+
+    Raises:
+        HTTPException: 404 when the application is unknown.
+    """
+    validated = _known_app_domain(domain)
+    records = get_store().list_deployments(domain=validated, limit=_DELIVERY_FETCH_LIMIT)
+    items = [
+        _to_delivery(record)
+        for record in records
+        if record.triggered_by == DeploymentTrigger.WEBHOOK.value
+    ]
+    return WebhookDeliveriesResponse(items=items, total=len(items))

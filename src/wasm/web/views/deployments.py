@@ -25,21 +25,18 @@ with rows but no app still gets its page rather than a 404.
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-from wasm.core.exceptions import SecurityError, ValidationError, WASMError
-from wasm.validators.names import resolve_within
+from wasm.core.exceptions import WASMError
+from wasm.deployers.logs import read_deployment_log
 
 if TYPE_CHECKING:
     from wasm.core.store import DeploymentRecord
 from wasm.web.views.rendering import duration, filesize, page, since
 from wasm.web.views.router import PageErrorRoute, _form_fields, require_page_session
-
-log = logging.getLogger(__name__)
 
 # Annotated explicitly: this module and router.py import each other, and inside
 # that cycle mypy cannot infer the type of a module-level variable another
@@ -65,10 +62,6 @@ _DEPLOYMENT_STATES: dict[str, str] = {
 #: How many deployments an application's own page lists. The full history is
 #: one click away on the domain's history page.
 APP_DEPLOYMENTS = 5
-
-#: How much of a large captured log the detail page shows. The full file stays
-#: on disk; the tail is where a build failure speaks.
-LOG_TAIL_BYTES = 512 * 1024
 
 
 def _history(domain: str | None, limit: int = 50) -> list[DeploymentRecord]:
@@ -190,65 +183,6 @@ def recent_deployments(domain: str, request: Request) -> HTMLResponse:
     )
 
 
-def _read_log(record: DeploymentRecord) -> tuple[str | None, str | None, bool]:
-    """
-    Read a deployment's captured build log from disk.
-
-    The stored path is data, not an instruction: it is only followed when it
-    resolves inside the deployment log directory next to the store's own
-    database, which is where the recorder writes. A row pointing anywhere else
-    is refused and reported, never read.
-
-    Args:
-        record: The history row whose log is being read.
-
-    Returns:
-        ``(text, absence, truncated)``. Exactly one of ``text`` and
-        ``absence`` is set: the log verbatim, or the honest reason there is
-        nothing to show. ``truncated`` says the text is the tail of a larger
-        file.
-    """
-    if not record.log_path:
-        return None, "No build log was captured for this deployment.", False
-
-    from wasm.core.store import get_store
-
-    root = get_store().db_path.parent / "deploy-logs"
-    try:
-        path = resolve_within(root, record.log_path)
-    except (SecurityError, ValidationError):
-        log.warning(
-            "Deployment %s records a log path outside %s; refusing to read it",
-            record.id,
-            root,
-        )
-        return (
-            None,
-            "The recorded log path is not under the deployment log directory, "
-            "so the panel will not read it.",
-            False,
-        )
-
-    if not path.is_file():
-        return None, "The captured log is no longer on disk.", False
-
-    try:
-        # read_bytes rather than an open() of our own: the presentation layer
-        # is audited against touching the filesystem, and a whole-name check
-        # cannot tell a read-only handle from a writable one. Logs are rotated
-        # at twenty per application, so the whole file fits in memory.
-        data = path.read_bytes()
-    except OSError as exc:
-        log.warning("Could not read the captured log for deployment %s: %s", record.id, exc)
-        return None, f"The captured log could not be read: {exc}", False
-
-    if len(data) > LOG_TAIL_BYTES:
-        text = data[-LOG_TAIL_BYTES:].decode("utf-8", errors="replace")
-        # Drop the partial line the cut landed inside.
-        return text.split("\n", 1)[-1], None, True
-    return data.decode("utf-8", errors="replace"), None, False
-
-
 @router.get("/deployments/{deployment_id}", response_class=HTMLResponse)
 def deployment_detail(deployment_id: int, request: Request) -> HTMLResponse:
     """
@@ -277,7 +211,9 @@ def deployment_detail(deployment_id: int, request: Request) -> HTMLResponse:
             status_code=404,
         )
 
-    log_text, log_absence, log_truncated = _read_log(record)
+    log_read = read_deployment_log(record)
+    log_text = log_read.content if log_read.missing_reason is None else None
+    log_absence, log_truncated = log_read.missing_reason, log_read.truncated
     detail = _shape_deployment(record)
     detail["branch"] = record.git_branch or "—"
     detail["log_path"] = record.log_path

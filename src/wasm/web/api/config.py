@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 from fastapi import APIRouter, Depends, HTTPException
@@ -33,6 +33,9 @@ from pydantic import BaseModel, Field
 from wasm.core.config import DEFAULT_CONFIG, Config, redact_secrets
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import WASMErrorRoute, require_elevated
+
+if TYPE_CHECKING:
+    from wasm.core.notifier import Notifier
 
 # The error boundary: Config.replace()/set() raise ConfigError (a WASMError)
 # for a rejected key, which used to crash with a bare 500 because this router
@@ -511,3 +514,58 @@ def get_defaults(session: dict = Depends(get_current_session)) -> dict[str, Any]
     """
     defaults: dict[str, Any] = redact_secrets(DEFAULT_CONFIG)
     return defaults
+
+
+class NotificationTestResult(BaseModel):
+    """Outcome of sending a test message through one notification channel."""
+
+    ok: bool
+    detail: str
+
+
+def _build_notifier() -> Notifier:
+    """
+    Build the notifier over the configuration as it stands on disk.
+
+    The same one-line construction :mod:`wasm.web.views.settings_editor` uses
+    for its own notifier - ``Notifier(config_api.load_config())``, reading
+    this module's :func:`load_config` - because the meaningful logic (the SSRF
+    guard, the redirect re-checking, never echoing a remote body) lives once
+    in :class:`~wasm.core.notifier.Notifier`, and both callers are thin wiring
+    over it. Module level so a test can stand in a notifier whose opener never
+    opens a socket.
+
+    Returns:
+        A notifier reading the freshly reloaded configuration.
+    """
+    from wasm.core.notifier import Notifier
+
+    return Notifier(load_config())
+
+
+@router.post("/notifications/{channel}/test", response_model=NotificationTestResult)
+def test_notification_channel(
+    channel: str, session: dict = Depends(get_current_session)
+) -> NotificationTestResult:
+    """
+    Send a test message through one notification channel.
+
+    Ignores the master switch and the per-event filters on purpose - the
+    button exists to try a channel before notifications are turned on - and
+    never echoes the remote server's response body back to the client:
+    :meth:`~wasm.core.notifier.Notifier.test_channel` already refuses a
+    private destination and scrubs configured secrets out of any failure it
+    reports.
+
+    Args:
+        channel: Channel name, one of the notifier's channels.
+        session: Authenticated session, injected by the dependency.
+
+    Returns:
+        ``ok=True`` with a confirmation, or ``ok=False`` with the failure in
+        the receiving server's own words.
+    """
+    error = _build_notifier().test_channel(channel)
+    if error is None:
+        return NotificationTestResult(ok=True, detail=f"Test message sent through {channel}.")
+    return NotificationTestResult(ok=False, detail=error)
