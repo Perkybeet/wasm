@@ -30,6 +30,7 @@ from wasm.core.exceptions import (
     DatabaseQueryError,
     DatabaseUserError,
 )
+from wasm.deployers.helpers.permissions import hand_over_file
 from wasm.managers.database.base import (
     QUERY_TIMEOUT,
     TRANSFER_TIMEOUT,
@@ -749,6 +750,7 @@ class RedisManager(BaseDatabaseManager):
 
         rdb_file = self.DATA_DIR / "dump.rdb"
         self.stop()
+        handed_over = False
         try:
             if backup_path.suffix == ".gz":
                 result = self.runner.capture_to_file(
@@ -765,12 +767,24 @@ class RedisManager(BaseDatabaseManager):
                     "Failed to install the backup file",
                     details=result.stderr.strip() or f"Could not write {rdb_file}.",
                 )
-            self._exec(["chown", f"{self.DATA_OWNER}:{self.DATA_OWNER}", str(rdb_file)])
-            self._exec(["chmod", "660", str(rdb_file)])
+            handed_over = hand_over_file(
+                rdb_file,
+                user=self.DATA_OWNER,
+                group=self.DATA_OWNER,
+                mode=0o660,
+                runner=self.runner,
+                logger=self.logger,
+            )
         finally:
             self.start()
 
-        self.logger.info(f"Restored Redis from: {backup_path}")
+        # Redis is started either way: it may still read a file it does not
+        # own, or it may fail, and the operator needs the service logs for
+        # that, not a misleading success line here. What must not happen is
+        # "Restored" over a hand-over that hand_over_file already logged as
+        # failed.
+        if handed_over:
+            self.logger.info(f"Restored Redis from: {backup_path}")
 
     # ==================== Query Execution ====================
 

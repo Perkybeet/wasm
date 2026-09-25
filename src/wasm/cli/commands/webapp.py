@@ -821,7 +821,7 @@ def _delete_app(
 
     if not keep_files:
         logger.step(4, total_steps, "Removing application files")
-        remove_directory(app_path, sudo=True)
+        remove_directory(app_path)
     else:
         logger.step(4, total_steps, "Keeping application files")
 

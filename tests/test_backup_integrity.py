@@ -341,6 +341,28 @@ class TestSelfContainedBackup:
         assert (app_path / "src" / "index.js").read_text() == "console.log('hello')\n"
         assert [entry[0] for entry in FakeDatabaseManager.restored] == ["shop"]
 
+    def test_restore_hands_the_tree_to_the_configured_group(self, manager, monkeypatch):
+        """
+        restore() used to chown ``service_user:service_user`` and discard the
+        result, ignoring the operator's ``service_group`` setting entirely.
+        """
+        _use_store(monkeypatch, None, [])
+        previous_user = manager.config.get("service_user")
+        previous_group = manager.config.get("service_group")
+        manager.config.set("service_user", "wasm-app")
+        manager.config.set("service_group", "wasm-apps")
+        try:
+            metadata = manager.create("shop.example.com")
+            runner: FakeRunner = manager.runner
+
+            assert manager.restore(metadata.id) is True
+
+            app_path = manager.config.apps_directory / "shop-example-com"
+            assert ("chown", "-R", "wasm-app:wasm-apps", str(app_path)) in runner.calls
+        finally:
+            manager.config.set("service_user", previous_user)
+            manager.config.set("service_group", previous_group)
+
     def test_legacy_archive_without_manifest_still_restores_files(self, manager, tmp_path):
         """A 1.x archive, application tree at the top level, still comes back."""
         legacy_tree = tmp_path / "legacy" / "shop-example-com"

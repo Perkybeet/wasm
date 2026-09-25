@@ -38,6 +38,7 @@ import logging
 import os
 import re
 import stat
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -579,6 +580,15 @@ class Config:
     _instance: Config | None = None
     _config: dict[str, Any] = {}
     _fs: FileSystem | None = None
+    #: Guards the whole check-and-set below, the load included. Without it,
+    #: two threads racing to be first each pass the None check, each build
+    #: their own instance and each parse config.yaml, and whichever
+    #: assignment to ``_instance`` happens last is the one every later caller
+    #: gets - the other instance, and its redundant read of the file, are
+    #: simply discarded. Worse, the instance is published to ``_instance``
+    #: before ``_load_config`` runs, so without the lock a second caller can
+    #: receive a reference to it and read ``_config`` before it has been set.
+    _lock = threading.Lock()
 
     def __new__(cls, fs: FileSystem | None = None) -> Config:
         """
@@ -593,13 +603,14 @@ class Config:
         Returns:
             The configuration instance.
         """
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._fs = fs
-            cls._instance._load_config()
-        elif fs is not None:
-            cls._instance._fs = fs
-        return cls._instance
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._fs = fs
+                cls._instance._load_config()
+            elif fs is not None:
+                cls._instance._fs = fs
+            return cls._instance
 
     @property
     def fs(self) -> FileSystem:

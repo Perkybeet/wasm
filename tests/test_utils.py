@@ -142,23 +142,6 @@ def test_utils_does_not_import_subprocess() -> None:
     assert "shell=True" not in source
 
 
-# run_command_sudo ----------------------------------------------------------
-
-
-def test_run_command_sudo_does_not_prepend_sudo(runner: FakeRunner) -> None:
-    """WASM requires root (decision D6), so the sudo prefix is gone."""
-    utils.run_command_sudo(["systemctl", "daemon-reload"])
-
-    assert runner.calls[-1] == ("systemctl", "daemon-reload")
-    assert not any(call[0] == "sudo" for call in runner.calls)
-
-
-def test_run_command_sudo_rejects_a_string(runner: FakeRunner) -> None:
-    """The deprecated shim inherits the argv-only rule."""
-    with pytest.raises(ValueError):
-        utils.run_command_sudo("rm -rf /")
-
-
 # run_trusted_installer -----------------------------------------------------
 
 
@@ -197,17 +180,34 @@ def test_trusted_installer_stops_when_the_download_fails(runner: FakeRunner) -> 
 
 
 def test_file_helpers_never_shell_out(tmp_path: Path, runner: FakeRunner) -> None:
-    """``sudo=True`` used to mean cp/mv/rm/ln subprocesses; now it means nothing."""
+    """These are plain filesystem calls; a ``sudo`` shim never sat in front of them."""
     target = tmp_path / "nested" / "config"
 
-    assert utils.write_file(target, "server {}\n", sudo=True)
-    assert utils.read_file(target, sudo=True) == "server {}\n"
-    assert utils.copy_file(target, tmp_path / "copy", sudo=True)
-    assert utils.create_symlink(target, tmp_path / "link", sudo=True)
-    assert utils.remove_file(target, sudo=True)
-    assert utils.remove_directory(tmp_path / "nested", sudo=True)
+    assert utils.write_file(target, "server {}\n")
+    assert utils.read_file(target) == "server {}\n"
+    assert utils.copy_file(target, tmp_path / "copy")
+    assert utils.create_symlink(target, tmp_path / "link")
+    assert utils.remove_file(target)
+    assert utils.remove_directory(tmp_path / "nested")
 
     assert runner.calls == []
+
+
+def test_file_helpers_no_longer_accept_a_sudo_argument(tmp_path: Path) -> None:
+    """The no-op ``sudo`` parameter is gone, not just ignored."""
+    target = tmp_path / "config"
+    target.write_text("x")
+
+    for helper, args in (
+        (utils.write_file, (target, "x")),
+        (utils.read_file, (target,)),
+        (utils.copy_file, (target, tmp_path / "copy")),
+        (utils.create_symlink, (target, tmp_path / "link")),
+        (utils.remove_file, (target,)),
+        (utils.remove_directory, (tmp_path,)),
+    ):
+        with pytest.raises(TypeError):
+            helper(*args, sudo=True)
 
 
 def test_create_symlink_replaces_an_existing_link(tmp_path: Path) -> None:

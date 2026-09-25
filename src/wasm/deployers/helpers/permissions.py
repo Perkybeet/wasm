@@ -82,3 +82,55 @@ def hand_over_tree(
     for env_file in env_files:
         if env_file.exists():
             fs.chmod(env_file, SECRET_MODE)
+
+
+def hand_over_file(
+    path: Path,
+    *,
+    user: str,
+    group: str,
+    mode: int,
+    runner: CommandRunner,
+    logger: Logger,
+) -> bool:
+    """
+    Make ``user:group`` the owner of a single file and set its mode.
+
+    Unlike :func:`hand_over_tree`, a failure here is not something the caller
+    can shrug off: a restore that goes on to report "restored" over a file
+    still owned by root, or a database engine that reports success while its
+    own account cannot read the snapshot it was just handed, is the silent
+    failure CLAUDE.md rule 2 exists to remove. So this returns whether it
+    actually worked instead of only logging a warning, and the chmod does not
+    run at all when the chown failed - changing the mode of a file still
+    owned by the wrong account would not make it usable and would bury the
+    real failure under a second, unrelated-looking log line.
+
+    Args:
+        path: File to hand over.
+        user: Account that must own it.
+        group: Group that must own it.
+        mode: Permission bits to apply.
+        runner: Runner the chown and chmod execute through.
+        logger: Logger for the failure, when there is one.
+
+    Returns:
+        True if both the chown and the chmod succeeded.
+    """
+    chown = runner.run(
+        ["chown", f"{user}:{group}", str(path)],
+        timeout=_PERMISSIONS_TIMEOUT,
+    )
+    if not chown.success:
+        logger.warning(f"Could not hand {path} over to {user}:{group}: {chown.stderr.strip()}")
+        return False
+
+    chmod = runner.run(
+        ["chmod", f"{mode:o}", str(path)],
+        timeout=_PERMISSIONS_TIMEOUT,
+    )
+    if not chmod.success:
+        logger.warning(f"Could not set permissions on {path}: {chmod.stderr.strip()}")
+        return False
+
+    return True

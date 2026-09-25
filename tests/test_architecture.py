@@ -182,7 +182,9 @@ class TestErrorHandling:
     """
 
     #: Current count. Lower it when you fix some; never raise it.
-    MAX_BLIND_EXCEPTS = 66
+    #: validators/ssh.py's generate_ssh_key() no longer swallows a chmod
+    #: failure with ``except Exception: pass``.
+    MAX_BLIND_EXCEPTS = 65
 
     def test_blind_excepts_do_not_grow(self):
         found: list[str] = []

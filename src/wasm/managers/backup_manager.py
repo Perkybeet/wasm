@@ -88,6 +88,7 @@ from wasm.core.logger import Logger
 from wasm.core.runner import DEFAULT_TIMEOUT, CommandResult, CommandRunner, get_runner
 from wasm.core.store import DeploymentTrigger, get_store
 from wasm.core.utils import domain_to_app_name
+from wasm.deployers.helpers.permissions import hand_over_tree
 from wasm.deployers.recorder import CapturingLogger, DeploymentRecorder
 from wasm.managers.service_manager import ServiceManager
 from wasm.managers.source_manager import SourceError, extract_archive
@@ -108,9 +109,6 @@ __all__ = [
 
 #: Docker has to pull alpine the first time a volume is backed up.
 _DOCKER_TIMEOUT = 600
-
-#: Deadline for chown over a restored tree.
-_OWNERSHIP_TIMEOUT = 300
 
 #: Deadline for a user-supplied hook.
 _HOOK_TIMEOUT = 600
@@ -1207,10 +1205,20 @@ class BackupManager:
                 self.logger.debug("Restoring the previously deployed .env file")
                 self.fs.write_text(env_file, env_backup, mode=SECRET_MODE)
 
-            service_user = self.config.service_user
-            self._exec(
-                ["chown", "-R", f"{service_user}:{service_user}", str(app_path)],
-                timeout=_OWNERSHIP_TIMEOUT,
+            # The tree was just rebuilt as root; the unit runs as the
+            # configured service account. This used to chown it to
+            # service_user:service_user and discard the result, which left a
+            # restored app unwritable by its own service whenever the
+            # operator's service_group differed from service_user, silently -
+            # the chown's exit code was never checked.
+            hand_over_tree(
+                app_path,
+                user=self.config.service_user,
+                group=self.config.service_group,
+                runner=self.runner,
+                fs=self.fs,
+                logger=self.logger,
+                env_files=(env_file,),
             )
 
             # Putting only the files back was silent data loss for every

@@ -37,7 +37,14 @@ from typing import Any, Optional
 from urllib.parse import quote
 
 from wasm.core.exceptions import WASMError
-from wasm.core.fs import SECRET_DIR_MODE, SECRET_MODE, FileSystem, get_fs, is_rehearsal
+from wasm.core.fs import (
+    SECRET_DIR_MODE,
+    SECRET_MODE,
+    DryRunFileSystem,
+    FileSystem,
+    get_fs,
+    is_rehearsal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -504,14 +511,22 @@ class WASMStore:
                 ``--dry-run`` and the test doubles work without every call site
                 knowing about them.
         """
-        if self._initialized:
-            return
+        # __new__ only guarantees one Python object exists; __init__ still runs
+        # once per call to WASMStore(...), on that same object, uncoordinated.
+        # Without the lock here, every thread that arrives while the first is
+        # still inside _ensure_schema() reads _initialized as False and runs
+        # the migrations again itself - harmless by accident (CREATE TABLE IF
+        # NOT EXISTS), but the general shape is not: it is the same
+        # check-and-set race __new__ already had to be given a lock for.
+        with self._lock:
+            if self._initialized:
+                return
 
-        self._fs = fs
-        self._db_path = self._resolve_db_path(db_path)
-        self._local = threading.local()
-        self._ensure_schema()
-        self._initialized = True
+            self._fs = fs
+            self._db_path = self._resolve_db_path(db_path)
+            self._local = threading.local()
+            self._ensure_schema()
+            self._initialized = True
 
     @property
     def fs(self) -> FileSystem:
@@ -631,6 +646,22 @@ class WASMStore:
 
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
+        # The CLI and the panel open the database from separate processes at
+        # once. The default rollback journal takes an exclusive lock for the
+        # whole duration of a write and fails the second writer immediately
+        # with "database is locked"; WAL lets readers and a writer coexist,
+        # and busy_timeout makes a second concurrent writer wait for the first
+        # to finish instead of failing on contention that would clear in
+        # milliseconds.
+        #
+        # Switching an existing database's journal mode is itself a write to
+        # its first page - it happens the moment the pragma runs, independent
+        # of any transaction - so it is skipped under a rehearsal: opening the
+        # store to read it must not be how a database on a real server gets
+        # rewritten out from under ``--dry-run``.
+        if not isinstance(self.fs, DryRunFileSystem):
+            connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA busy_timeout = 5000")
         return connection
 
     @contextmanager

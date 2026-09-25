@@ -4,12 +4,15 @@ SSH configuration validation and setup helpers for WASM.
 Validates SSH keys, connectivity, and provides setup guidance.
 """
 
+import logging
 import os
 import re
 from pathlib import Path
 
 from wasm.core.exceptions import SSHError
 from wasm.core.utils import run_command
+
+logger = logging.getLogger(__name__)
 
 # Default SSH key paths
 DEFAULT_SSH_DIR = Path.home() / ".ssh"
@@ -137,14 +140,24 @@ def generate_ssh_key(
     result = run_command(cmd)
 
     if result.success:
-        # Set proper permissions
+        # ssh-keygen already writes the private key 0600 and the public key
+        # 0644, but that depends on the umask in effect when it ran; forcing
+        # the mode here is what makes the guarantee independent of it. A
+        # failure must not be reported as success: a private key left
+        # world-readable while the caller is told "generated successfully" is
+        # exactly the silent failure CLAUDE.md rule 2 exists to remove.
         try:
             key_path.chmod(0o600)
-            pub_key_path = Path(str(key_path) + ".pub")
-            if pub_key_path.exists():
+        except OSError as exc:
+            logger.warning(f"Generated {key_path} but could not restrict its permissions: {exc}")
+            return False, key_path, f"Key written but could not be made private: {exc}"
+
+        pub_key_path = Path(str(key_path) + ".pub")
+        if pub_key_path.exists():
+            try:
                 pub_key_path.chmod(0o644)
-        except Exception:
-            pass
+            except OSError as exc:
+                logger.warning(f"Could not set permissions on {pub_key_path}: {exc}")
 
         return True, key_path, "SSH key generated successfully"
     else:

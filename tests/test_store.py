@@ -1073,6 +1073,42 @@ class TestThreadSafety:
         apps = temp_db.list_apps()
         assert len(apps) == 30
 
+    def test_connections_use_wal_and_wait_for_locks(self, fresh, tmp_path: Path) -> None:
+        """The panel and the CLI write at once; the default journal fails the second writer."""
+        store = WASMStore(tmp_path / "wasm.db")
+        conn = store._get_connection()
+
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] >= 5000
+
+    def test_concurrent_first_use_initialises_once(
+        self, fresh, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two threads calling get_store() first must not both run the migrations."""
+        import threading
+
+        calls: list[int] = []
+        original = WASMStore._ensure_schema
+
+        def counting(self) -> None:
+            calls.append(1)
+            return original(self)
+
+        monkeypatch.setattr(WASMStore, "_ensure_schema", counting)
+        barrier = threading.Barrier(8)
+
+        def worker() -> None:
+            barrier.wait()
+            WASMStore(tmp_path / "wasm.db")
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(calls) == 1
+
 
 class TestEdgeCases:
     """Tests for edge cases."""
@@ -1186,6 +1222,11 @@ class TestStoreUnderADryRun:
         db_path = tmp_path / "wasm.db"
         real = WASMStore(db_path, fs=RecordingFileSystem())
         real.create_app(App(domain="keep.com", app_type="nodejs", app_path="/keep"))
+        # WAL keeps a committed write in wasm.db-wal until the last connection
+        # closes; snapshotting the main file before that checkpoint would
+        # compare against a file that was never a complete, settled state to
+        # begin with, unrelated to anything the rehearsal below does.
+        real.close()
         before = db_path.read_bytes()
         WASMStore.reset_instance()
 

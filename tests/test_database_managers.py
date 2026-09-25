@@ -367,8 +367,9 @@ def test_postgres_restore_stages_the_dump_for_the_postgres_account(
     postgres.restore("shop", dump)
 
     staged = str(postgres.BACKUP_DIR / ".staging" / "postgresql-restore-shop.sql")
-    assert runner.calls[-3] == ("cp", str(dump), staged)
-    assert runner.calls[-2] == ("chown", "postgres", staged)
+    assert runner.calls[-4] == ("cp", str(dump), staged)
+    assert runner.calls[-3] == ("chown", "postgres:postgres", staged)
+    assert runner.calls[-2] == ("chmod", "600", staged)
     assert runner.calls[-1] == (
         "sudo",
         "-u",
@@ -419,7 +420,7 @@ def test_postgres_gzipped_restore_decompresses_without_a_pipe(
     postgres.restore("shop", dump)
 
     staged = str(postgres.BACKUP_DIR / ".staging" / "postgresql-restore-shop.sql")
-    assert runner.calls[-3] == ("gzip", "-dc", str(dump))
+    assert runner.calls[-4] == ("gzip", "-dc", str(dump))
     assert runner.calls[-1][-1] == staged
 
 
@@ -595,6 +596,25 @@ def test_redis_restore_installs_the_snapshot_and_fixes_ownership(
     assert runner.calls[1] == ("cp", str(snapshot), rdb)
     assert runner.calls[2] == ("chown", "redis:redis", rdb)
     assert runner.calls[-1] == ("systemctl", "start", "redis-server")
+
+
+def test_redis_restore_does_not_claim_success_when_ownership_fails(
+    redis: RedisManager, runner: FakeRunner, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """
+    The chown and chmod used to run with their results discarded, so a
+    restore that left dump.rdb owned by root was still logged as "Restored".
+    """
+    snapshot = tmp_path / "snapshot.rdb"
+    snapshot.write_bytes(b"\x00\x01binary")
+    runner.script(["chown"], exit_code=1, stderr="chown: invalid user: 'redis:redis'")
+
+    redis.restore("all", snapshot)
+
+    assert "Restored Redis from" not in capsys.readouterr().out
+    assert runner.ran("systemctl", "start", "redis-server"), (
+        "the service must still be started even when the hand-over failed"
+    )
 
 
 # ==================== Privilege whitelist ====================

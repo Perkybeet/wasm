@@ -42,7 +42,9 @@ from wasm.core.exceptions import (
     DatabaseError,
     DatabaseUserError,
 )
+from wasm.core.fs import SECRET_MODE
 from wasm.core.runner import CommandResult, CommandRunner, get_runner
+from wasm.deployers.helpers.permissions import hand_over_file
 from wasm.managers.base_manager import BaseManager
 
 #: Deadline for a query or any other short-lived client invocation.
@@ -1171,8 +1173,21 @@ class BaseDatabaseManager(BaseManager):
                     f"Failed to stage the backup {source}",
                     details=result.stderr.strip() or "Check free space in the backup directory.",
                 )
-            if owner:
-                self._exec(["chown", owner, str(staged)], timeout=SERVICE_TIMEOUT)
+            if owner and not hand_over_file(
+                staged,
+                user=owner,
+                group=owner,
+                mode=SECRET_MODE,
+                runner=self.runner,
+                logger=self.logger,
+            ):
+                raise DatabaseBackupError(
+                    f"Could not hand the staged backup over to {owner}",
+                    details=(
+                        f"{staged} may still be owned by root; {owner} would not be "
+                        "able to read it."
+                    ),
+                )
             yield staged
         finally:
             staged.unlink(missing_ok=True)

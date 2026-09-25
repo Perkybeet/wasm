@@ -93,37 +93,6 @@ def run_command(
     return active.run(list(command), cwd=cwd, env=env, timeout=timeout)
 
 
-def run_command_sudo(
-    command: Sequence[str],
-    cwd: Path | None = None,
-    env: Mapping[str, str] | None = None,
-    timeout: int = DEFAULT_COMMAND_TIMEOUT,
-) -> CommandResult:
-    """
-    Deprecated. Execute a command as the current (root) account.
-
-    Decision D6 of the v1 design is that WASM requires root, so prefixing
-    argument vectors with ``sudo`` bought nothing and hid the requirement: on a
-    root shell it forked an extra process, and on a non-root shell it produced a
-    password prompt in the middle of a deploy. This shim survives only so that
-    call sites outside this module keep importing; it no longer adds ``sudo``.
-    New code must call :func:`run_command` or the runner directly.
-
-    Args:
-        command: Program and arguments.
-        cwd: Working directory for the command.
-        env: Extra environment variables.
-        timeout: Deadline in seconds.
-
-    Returns:
-        The command outcome.
-
-    Raises:
-        ValueError: If ``command`` is a string or an empty sequence.
-    """
-    return run_command(command, cwd=cwd, env=env, timeout=timeout)
-
-
 # Whitelist of trusted installer URLs
 TRUSTED_INSTALLER_URLS = frozenset(
     [
@@ -259,40 +228,13 @@ def ensure_directory(path: Path, mode: int = 0o755) -> bool:
         return False
 
 
-def ensure_directory_sudo(path: Path, owner: str = "www-data", group: str = "www-data") -> bool:
-    """
-    Ensure a directory exists and belongs to the given account.
-
-    Args:
-        path: Directory path.
-        owner: Owner user name.
-        group: Owner group name.
-
-    Returns:
-        True if the directory exists and ownership was applied.
-    """
-    import grp
-    import pwd
-
-    try:
-        path.mkdir(parents=True, exist_ok=True)
-        uid = pwd.getpwnam(owner).pw_uid
-        gid = grp.getgrnam(group).gr_gid
-        os.chown(path, uid, gid)
-        return True
-    except (OSError, KeyError):
-        return False
-
-
-def copy_file(src: Path, dest: Path, sudo: bool = False) -> bool:
+def copy_file(src: Path, dest: Path) -> bool:
     """
     Copy a file.
 
     Args:
         src: Source file path.
         dest: Destination file path.
-        sudo: Ignored. WASM already runs as root, so shelling out to ``sudo cp``
-            only added a process and a PATH dependency.
 
     Returns:
         True if successful.
@@ -304,14 +246,13 @@ def copy_file(src: Path, dest: Path, sudo: bool = False) -> bool:
         return False
 
 
-def write_file(path: Path, content: str, sudo: bool = False, mode: int = 0o644) -> bool:
+def write_file(path: Path, content: str, mode: int = 0o644) -> bool:
     """
     Write content to a file.
 
     Args:
         path: File path.
         content: Content to write.
-        sudo: Ignored. See :func:`copy_file`.
         mode: File permission mode.
 
     Returns:
@@ -326,13 +267,12 @@ def write_file(path: Path, content: str, sudo: bool = False, mode: int = 0o644) 
         return False
 
 
-def read_file(path: Path, sudo: bool = False) -> str | None:
+def read_file(path: Path) -> str | None:
     """
     Read content from a file.
 
     Args:
         path: File path.
-        sudo: Ignored. See :func:`copy_file`.
 
     Returns:
         File content or None if it could not be read.
@@ -343,13 +283,12 @@ def read_file(path: Path, sudo: bool = False) -> str | None:
         return None
 
 
-def remove_file(path: Path, sudo: bool = False) -> bool:
+def remove_file(path: Path) -> bool:
     """
     Remove a file.
 
     Args:
         path: File path.
-        sudo: Ignored. See :func:`copy_file`.
 
     Returns:
         True if successful.
@@ -361,13 +300,12 @@ def remove_file(path: Path, sudo: bool = False) -> bool:
         return False
 
 
-def remove_directory(path: Path, sudo: bool = False) -> bool:
+def remove_directory(path: Path) -> bool:
     """
     Remove a directory recursively.
 
     Args:
         path: Directory path.
-        sudo: Ignored. See :func:`copy_file`.
 
     Returns:
         True if successful.
@@ -379,14 +317,13 @@ def remove_directory(path: Path, sudo: bool = False) -> bool:
         return False
 
 
-def create_symlink(source: Path, link: Path, sudo: bool = False) -> bool:
+def create_symlink(source: Path, link: Path) -> bool:
     """
     Create a symbolic link, replacing any existing one.
 
     Args:
         source: Source path.
         link: Link path.
-        sudo: Ignored. See :func:`copy_file`.
 
     Returns:
         True if successful.

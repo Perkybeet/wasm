@@ -3,7 +3,12 @@
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
+from wasm.core.runner import FakeRunner
+from wasm.validators import ssh as ssh_module
 from wasm.validators.ssh import (
+    generate_ssh_key,
     get_host_from_git_url,
     is_ssh_url,
     validate_ssh_setup_for_url,
@@ -81,3 +86,26 @@ class TestValidateSSHSetupForUrl:
         assert result["valid"] is True
         assert result["has_ssh_key"] is True
         assert result["connection_success"] is True
+
+
+class TestGenerateSSHKey:
+    """generate_ssh_key must not claim success over a key it could not secure."""
+
+    def test_a_chmod_failure_is_not_reported_as_a_generated_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runner: FakeRunner
+    ) -> None:
+        """
+        ssh-keygen can exit 0 while the follow-up chmod fails, which used to be
+        swallowed by a bare ``except Exception: pass`` and reported as "SSH key
+        generated successfully" - a private key left at umask permissions,
+        readable by every local account, with the caller told it is safe.
+        """
+        ssh_dir = tmp_path / ".ssh"
+        monkeypatch.setattr(ssh_module, "get_ssh_directory", lambda: ssh_dir)
+        runner.script(["ssh-keygen"], exit_code=0)
+
+        success, key_path, message = generate_ssh_key(key_type="ed25519")
+
+        assert success is False
+        assert key_path == ssh_dir / "id_ed25519"
+        assert "chmod" in message.lower() or "private" in message.lower()
