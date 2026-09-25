@@ -443,12 +443,15 @@ def test_a_failed_config_test_blocks_the_reload_inline(client, store, site_dirs,
     """A broken live configuration refuses the reload and keeps what runs."""
     make_site(client)
     runner.script(["nginx", "-t"], stderr="nginx: configuration file test failed", exit_code=1)
+    # Creating the site tests and reloads legitimately; only what the reload
+    # button does after the configuration broke is under test here.
+    before = len(runner.calls)
 
     response = client.post("/sites/panel.example.com/reload")
 
     assert response.status_code == 200, response.text
     assert "the running config was kept" in response.text
-    assert ("systemctl", "reload", "nginx") not in runner.calls, (
+    assert ("systemctl", "reload", "nginx") not in runner.calls[before:], (
         "a failed test must never be followed by a reload"
     )
 

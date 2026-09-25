@@ -662,7 +662,11 @@ def _rollback_app(
     rebuild: bool = True,
 ) -> int:
     """
-    Roll an application back to a backup, taking a safety backup first.
+    Roll an application back to a backup.
+
+    ``RollbackManager.rollback`` takes its own safety backup of the current
+    state before restoring, so the CLI and the panel both get one; this used
+    to be a step only the CLI performed itself.
 
     Args:
         logger: Logger to report through.
@@ -688,23 +692,13 @@ def _rollback_app(
             if backups[0].description:
                 logger.info(f"  Description: {backups[0].description}")
 
-        logger.step(1, 3, "Creating safety backup")
-        try:
-            rollback_manager.create_pre_deploy_backup(
-                domain=domain, description="Pre-rollback safety backup"
-            )
-        except WASMError as exc:
-            # A missing safety net is worth a warning, not an abort: the
-            # operator asked to go back and already has a reason to.
-            logger.warning(f"Could not create safety backup: {exc}")
-
-        logger.step(2, 3, "Restoring from backup")
+        logger.step(1, 2, "Restoring from backup")
         rollback_manager.rollback(domain=domain, backup_id=backup_id, rebuild=rebuild)
     except WASMError as exc:
         logger.error(f"Rollback failed: {exc}")
         return 1
 
-    logger.step(3, 3, "Rollback complete")
+    logger.step(2, 2, "Rollback complete")
     logger.success(f"Successfully rolled back {domain}")
     return 0
 

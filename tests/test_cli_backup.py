@@ -1136,7 +1136,10 @@ def test_rollback_uses_the_latest_backup_and_rebuilds(
         "backup_id": None,
         "rebuild": True,
     }
-    assert _call(rollbacks.calls, "create_pre_deploy_backup")["domain"] == "example.com"
+    # The safety backup is RollbackManager.rollback's own responsibility now
+    # (see TestRollbackManager in test_backup.py), so the CLI no longer calls
+    # create_pre_deploy_backup itself.
+    assert not _called(rollbacks.calls, "create_pre_deploy_backup")
 
 
 def test_rollback_no_rebuild_and_explicit_backup(

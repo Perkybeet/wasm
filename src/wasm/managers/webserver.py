@@ -34,6 +34,7 @@ Four rules the old code broke and this one keeps:
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import sqlite3
@@ -56,6 +57,7 @@ from wasm.core.config import (
 )
 from wasm.core.exceptions import (
     ApacheError,
+    CertificateError,
     DomainError,
     NginxError,
     SiteError,
@@ -67,8 +69,14 @@ from wasm.core.fs import FileSystem
 from wasm.core.runner import CommandRunner
 from wasm.core.store import Site, WASMStore, WebServer, get_store
 from wasm.managers.base_manager import BaseManager, MappingRecord
-from wasm.validators.domain import is_valid_domain
+from wasm.managers.cert_manager import CertManager
+from wasm.validators.domain import is_valid_domain, should_include_www
 from wasm.validators.names import resolve_within, validate_filename
+
+#: Module logger for the orchestration functions below. They are not manager
+#: methods, so they have no ``self.logger``; this is the same standard-library
+#: logger the job system uses for the same reason.
+_logger = logging.getLogger(__name__)
 
 #: A reload or a syntax check is a local operation; anything slower than this
 #: means the web server is wedged and the caller needs to know now.
@@ -1136,3 +1144,271 @@ class WebServerManager(BaseManager):
 
         self.logger.debug(f"Replaced site configuration: {config_path}")
         return config_path
+
+
+# -- Cross-backend orchestration -------------------------------------------
+#
+# The two functions below are the chokepoints for "delete a site" and
+# "create a secured site". Each used to be written once per caller - the CLI's
+# ``site delete``, the CLI's application delete, the panel's site delete - and
+# only one of the three checked both nginx and apache, so a site created on
+# the backend a given path did not check outlived every deletion path that
+# was not the one it happened to use. Same story for "create with SSL": the
+# panel rendered ``ssl_certificate`` into the vhost before any certificate had
+# been asked for, because writing the vhost and obtaining the certificate were
+# two separate call sites that had drifted apart.
+#
+# Both functions take already-built managers rather than constructing their
+# own from scratch: every caller already builds its managers through names it
+# owns and that its own tests patch (the CLI through module-level imports, the
+# web API through its ``MANAGERS`` registry), and building fresh managers here
+# instead would silently stop honouring that.
+
+
+@dataclass(frozen=True)
+class SiteDeletion(MappingRecord):
+    """
+    What deleting a site actually found and removed.
+
+    Attributes:
+        domain: Domain that was targeted.
+        nginx_removed: Whether an nginx vhost was found and removed.
+        apache_removed: Whether an apache vhost was found and removed.
+        certificate_removed: Whether a certificate was found and removed.
+    """
+
+    domain: str
+    nginx_removed: bool = False
+    apache_removed: bool = False
+    certificate_removed: bool = False
+
+    @property
+    def removed_anything(self) -> bool:
+        """True when at least one vhost or the certificate was removed."""
+        return self.nginx_removed or self.apache_removed or self.certificate_removed
+
+
+def delete_site_completely(
+    domain: str,
+    *,
+    nginx: WebServerManager | None = None,
+    apache: WebServerManager | None = None,
+    cert_manager: CertManager | None = None,
+    delete_certificate: bool = True,
+    verbose: bool = False,
+) -> SiteDeletion:
+    """
+    Remove a domain's virtual host from every backend, and its certificate.
+
+    Each step is independent and best-effort: a web server or certbot failure
+    on one step is logged and does not stop the others from being attempted,
+    the same tolerance :meth:`ServiceManager.delete_service` already applies
+    to stopping and disabling a unit before removing its file. A deletion that
+    aborted on the first failure used to leave the other backend's vhost, or
+    the certificate, behind.
+
+    Args:
+        domain: Domain to remove.
+        nginx: Nginx-backed manager to use. Defaults to a fresh one bound to
+            the real configuration tree; callers under test inject one bound
+            to a sandbox.
+        apache: Apache-backed manager to use, same default rule.
+        cert_manager: Certificate manager to use, same default rule.
+        delete_certificate: Also remove the certificate. False leaves it in
+            place, for a caller that only wants the vhosts gone.
+        verbose: Enable verbose logging on any manager built by default.
+
+    Returns:
+        What was actually found and removed.
+    """
+    nginx = nginx or WebServerManager(NGINX_BACKEND, verbose=verbose)
+    apache = apache or WebServerManager(APACHE_BACKEND, verbose=verbose)
+    cert_manager = cert_manager or CertManager(verbose=verbose)
+
+    nginx_removed = False
+    if nginx.site_exists(domain):
+        try:
+            nginx.delete_site(domain)
+            nginx.reload()
+            nginx_removed = True
+        except SiteError as exc:
+            _logger.warning("Could not remove the nginx site for %s: %s", domain, exc)
+
+    apache_removed = False
+    if apache.site_exists(domain):
+        try:
+            apache.delete_site(domain)
+            apache.reload()
+            apache_removed = True
+        except SiteError as exc:
+            _logger.warning("Could not remove the apache site for %s: %s", domain, exc)
+
+    certificate_removed = False
+    if delete_certificate and cert_manager.is_installed() and cert_manager.cert_exists(domain):
+        try:
+            cert_manager.delete(domain)
+            certificate_removed = True
+        except CertificateError as exc:
+            _logger.warning("Could not remove the certificate for %s: %s", domain, exc)
+
+    return SiteDeletion(
+        domain=domain,
+        nginx_removed=nginx_removed,
+        apache_removed=apache_removed,
+        certificate_removed=certificate_removed,
+    )
+
+
+@dataclass(frozen=True)
+class SecuredSite(MappingRecord):
+    """
+    What :func:`create_secured_site` wrote and whether TLS ended up enabled.
+
+    Attributes:
+        domain: Domain that was configured.
+        webserver: Backend that now serves it.
+        site_existed: Whether the vhost already existed and was updated
+            rather than created.
+        ssl_requested: Whether TLS was asked for.
+        ssl_enabled: Whether the site ended up serving TLS. False whenever
+            ``ssl_requested`` is False, and also when it was requested but
+            issuance failed - the site still exists, over plain HTTP.
+        certificate_reused: Whether an existing, valid certificate already
+            covered every requested domain, so nothing was issued.
+        certificate_error: Why TLS was not enabled, when it was requested and
+            did not end up enabled. None otherwise.
+    """
+
+    domain: str
+    webserver: str
+    site_existed: bool = False
+    ssl_requested: bool = False
+    ssl_enabled: bool = False
+    certificate_reused: bool = False
+    certificate_error: str | None = None
+
+
+def create_secured_site(
+    domain: str,
+    *,
+    manager: WebServerManager,
+    webserver: str,
+    cert_manager: CertManager | None = None,
+    template: str = "proxy",
+    port: int = DEFAULT_PROXY_PORT,
+    www: bool = False,
+    ssl: bool = True,
+    enable: bool = True,
+) -> SecuredSite:
+    """
+    Create or update a virtual host and, unless told not to, secure it with TLS.
+
+    The vhost is always written without TLS first: certbot's nginx and apache
+    plugins, and the webroot fallback, all need a plain HTTP vhost in place to
+    validate the domain against. Only once a certificate is confirmed - reused
+    or freshly obtained - is the vhost rewritten with the certificate paths
+    and reloaded. ``POST /api/sites`` used to render ``ssl_certificate`` into
+    the vhost from the request's ``ssl`` flag alone, before any certificate
+    had been asked for, which is a config nginx then refused to reload.
+
+    Args:
+        domain: Domain to serve.
+        manager: Web server manager to write the vhost through.
+        webserver: Name of the backend ``manager`` drives (``nginx`` or
+            ``apache``), used to pick the matching certbot plugin. Not read
+            off ``manager`` itself, so a caller's own manager double does not
+            need to carry a ``backend`` attribute.
+        cert_manager: Certificate manager to use when ``ssl`` is true.
+            Defaults to a fresh one.
+        template: Template name, without the ``.conf.j2`` suffix.
+        port: Port the application listens on behind the proxy.
+        www: Also serve and certify ``www.<domain>``.
+        ssl: Secure the site with a certificate. False writes a plain HTTP
+            vhost and does nothing else.
+        enable: Enable the site once written, when it did not already exist.
+
+    Returns:
+        What was written and whether TLS ended up enabled.
+
+    Raises:
+        DomainError: When the domain is not a valid domain name.
+        NginxError: When the nginx configuration cannot be written.
+        ApacheError: When the apache configuration cannot be written.
+        TemplateError: When the template is missing or fails to render.
+    """
+    include_www = www and should_include_www(domain)
+    server_names = f"{domain} www.{domain}" if include_www else domain
+    context: dict[str, Any] = {"port": port, "ssl": False, "server_names": server_names}
+
+    site_existed = manager.site_exists(domain)
+    if site_existed:
+        manager.update_site(domain, template=template, context=context)
+    else:
+        manager.create_site(domain, template=template, context=context)
+        if enable:
+            manager.enable_site(domain)
+    manager.reload()
+
+    if not ssl:
+        return SecuredSite(
+            domain=domain,
+            webserver=webserver,
+            site_existed=site_existed,
+            ssl_requested=False,
+        )
+
+    cert_manager = cert_manager or CertManager()
+    if not cert_manager.is_installed():
+        return SecuredSite(
+            domain=domain,
+            webserver=webserver,
+            site_existed=site_existed,
+            ssl_requested=True,
+            certificate_error="certbot is not installed",
+        )
+
+    additional_domains = [f"www.{domain}"] if include_www else None
+    required_domains = [domain, *(additional_domains or [])]
+
+    certificate_reused = False
+    if cert_manager.cert_exists(domain):
+        test = cert_manager.test_cert(domain)
+        if test.get("valid") and cert_manager.cert_covers_domains(domain, required_domains):
+            certificate_reused = True
+
+    certificate_error: str | None = None
+    if not certificate_reused:
+        try:
+            cert_manager.obtain(
+                domain,
+                nginx=webserver == "nginx",
+                apache=webserver == "apache",
+                additional_domains=additional_domains,
+            )
+        except WASMError as exc:
+            certificate_error = str(exc)
+
+    if certificate_error is not None:
+        return SecuredSite(
+            domain=domain,
+            webserver=webserver,
+            site_existed=site_existed,
+            ssl_requested=True,
+            certificate_error=certificate_error,
+        )
+
+    cert_paths = cert_manager.get_cert_path(domain)
+    context["ssl"] = True
+    context["ssl_certificate"] = str(cert_paths["fullchain"])
+    context["ssl_certificate_key"] = str(cert_paths["privkey"])
+    manager.update_site(domain, template=template, context=context)
+    manager.reload()
+
+    return SecuredSite(
+        domain=domain,
+        webserver=webserver,
+        site_existed=site_existed,
+        ssl_requested=True,
+        ssl_enabled=True,
+        certificate_reused=certificate_reused,
+    )

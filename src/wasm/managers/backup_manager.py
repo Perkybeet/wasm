@@ -2463,6 +2463,18 @@ class RollbackManager:
         recorder.annotate(git_commit=metadata.git_commit, git_branch=metadata.git_branch)
 
         try:
+            # A safety backup of the current state, taken here so that both
+            # the CLI and the panel get one: this used to be the CLI's own
+            # extra step before calling rollback(), which meant a rollback
+            # triggered from the panel had no way back if the restore itself
+            # went wrong. A missing safety net is worth a warning, not an
+            # abort - the operator already has a reason to go back.
+            self.logger.info("Creating a safety backup of the current state")
+            try:
+                self.create_pre_deploy_backup(domain, description="Pre-rollback safety backup")
+            except WASMError as exc:
+                self.logger.warning(f"Could not create safety backup: {exc}")
+
             self.logger.info(f"Rolling back to: {metadata.id}")
             self.logger.info(f"  Created: {metadata.age}")
             if metadata.git_commit:

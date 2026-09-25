@@ -92,6 +92,17 @@ class CreateBackupRequest(BaseModel):
     include_node_modules: bool = Field(default=False, description="Include node_modules (large)")
     include_build: bool = Field(default=False, description="Include build artefacts")
     include_database: bool = Field(default=False, description="Include database dumps")
+    include_docker_volumes: bool = Field(
+        default=False, description="Include the app's named Docker volumes"
+    )
+    schemas: list[str] = Field(
+        default_factory=list,
+        description=(
+            "PostgreSQL schemas to dump instead of whole databases. Not supported inside a "
+            "self-contained backup; BackupManager.create refuses the request when given any."
+        ),
+    )
+    redis_method: str = Field(default="rdb", description="How to capture Redis, 'rdb' or 'aof'")
     tags: list[str] = Field(default_factory=list, description="Tags for the backup")
 
 
@@ -99,6 +110,10 @@ class RestoreBackupRequest(BaseModel):
     """Request to restore a backup."""
 
     target_domain: str | None = Field(default=None, description="Domain to restore into")
+    restore_env: bool = Field(default=True, description="Restore the .env files from the archive")
+    verify: bool = Field(
+        default=True, description="Check the archive against its recorded checksum first"
+    )
 
 
 class BackupActionResponse(BaseModel):
@@ -268,6 +283,9 @@ def create_backup(
             "include_node_modules": data.include_node_modules,
             "include_build": data.include_build,
             "include_databases": data.include_database,
+            "include_docker_volumes": data.include_docker_volumes,
+            "schemas": data.schemas or None,
+            "redis_method": data.redis_method,
             "tags": data.tags,
         },
         metadata={"domain": domain},
@@ -347,13 +365,20 @@ def restore_backup(
 
     requested = data.target_domain if data else None
     target_domain = strict_domain(requested) if requested else backup.domain
+    restore_env = data.restore_env if data else True
+    verify = data.verify if data else True
 
     job = get_job_manager().create_job(
         job_type=JobType.RESTORE,
         name=f"Restore {backup.id}",
         description=f"Restoring {backup.id} into {target_domain}",
         func=restore_backup_job,
-        kwargs={"backup_id": backup.id, "target_domain": target_domain},
+        kwargs={
+            "backup_id": backup.id,
+            "target_domain": target_domain,
+            "restore_env": restore_env,
+            "verify": verify,
+        },
         metadata={"domain": target_domain, "backup_id": backup.id},
     )
 

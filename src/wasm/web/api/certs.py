@@ -25,8 +25,9 @@ from datetime import date, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from wasm.core.exceptions import ValidationError
 from wasm.managers.cert_manager import CertificateInfo, CertManager
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import JobAcceptedResponse, WASMErrorRoute, strict_domain
@@ -75,19 +76,35 @@ class CertActionResponse(BaseModel):
     domain: str
 
 
+#: Ways to prove control of a domain, matching the CLI's --nginx/--apache/
+#: --webroot/--standalone flags. None (the default, when the field is
+#: omitted) lets WASM pick the method that suits the web server it finds
+#: running, same as passing none of the CLI's flags.
+CERT_METHODS = frozenset({"nginx", "apache", "webroot", "standalone"})
+
+
 class CreateCertRequest(BaseModel):
     """
     Request to obtain a certificate.
 
     Attributes:
         email: Registration and expiry-notice address.
-        webserver: Web server whose certbot plugin should be used.
+        domains: Extra domains (SANs) to cover, beyond the primary domain in
+            the path and the ``www`` alias ``include_www`` may add.
+        method: How to prove control of the domain. One of "nginx", "apache",
+            "webroot" or "standalone". Omitted lets WASM pick.
+        webroot: Webroot path, used when ``method`` is "webroot".
         include_www: Also cover the ``www`` subdomain.
+        expand: Expand an existing certificate even when it already covers
+            every requested domain.
     """
 
     email: str | None = None
-    webserver: str = "nginx"
+    domains: list[str] = Field(default_factory=list)
+    method: str | None = None
+    webroot: str | None = None
     include_www: bool = False
+    expand: bool = False
 
 
 class RenewCertRequest(BaseModel):
@@ -233,9 +250,20 @@ def create_certificate(
 
     Returns:
         The queued job.
+
+    Raises:
+        ValidationError: When ``method`` is not one of the methods certbot
+            offers, or a domain in ``domains`` is not a valid domain name.
     """
     validated = strict_domain(domain)
     options = data or CreateCertRequest()
+
+    if options.method is not None and options.method not in CERT_METHODS:
+        raise ValidationError(
+            f"Unknown certificate method: {options.method!r}",
+            details=f"Use one of: {', '.join(sorted(CERT_METHODS))}.",
+        )
+    domains = [strict_domain(extra) for extra in options.domains]
 
     job = get_job_manager().create_job(
         job_type=JobType.CERT_CREATE,
@@ -245,8 +273,11 @@ def create_certificate(
         kwargs={
             "domain": validated,
             "email": options.email,
-            "webserver": options.webserver,
+            "domains": domains or None,
+            "method": options.method,
+            "webroot": options.webroot,
             "include_www": options.include_www,
+            "expand": options.expand,
         },
         metadata={"domain": validated},
     )

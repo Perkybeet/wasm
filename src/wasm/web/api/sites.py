@@ -35,7 +35,7 @@ from wasm.core.exceptions import ValidationError
 from wasm.core.store import get_store
 from wasm.managers.apache_manager import ApacheManager
 from wasm.managers.nginx_manager import NginxManager
-from wasm.managers.webserver import WebServerManager
+from wasm.managers.webserver import WebServerManager, create_secured_site, delete_site_completely
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import WASMErrorRoute, require_elevated, strict_domain
 
@@ -264,18 +264,32 @@ def create_site(
     if manager.site_exists(domain):
         raise HTTPException(status_code=409, detail=f"Site already exists: {domain}")
 
-    manager.create_site(
-        domain, template=data.template, context={"port": data.port, "ssl": data.ssl}
+    # Routed through create_secured_site so that a request with ssl=true never
+    # renders certificate paths into the vhost before a certificate exists.
+    # This endpoint used to set the ssl flag and render once, which is why an
+    # SSL site created from the panel failed nginx's own config test: the
+    # certificate files it pointed at had never been requested.
+    outcome = create_secured_site(
+        domain,
+        manager=manager,
+        webserver=webserver,
+        template=data.template,
+        port=data.port,
+        ssl=data.ssl,
+        enable=data.enable,
     )
 
-    if data.enable:
-        manager.enable_site(domain)
+    if outcome.ssl_requested and not outcome.ssl_enabled:
+        message = (
+            f"Site created: {domain}. TLS was requested but not enabled"
+            f"{f': {outcome.certificate_error}' if outcome.certificate_error else ''}."
+        )
+    elif outcome.ssl_enabled:
+        message = f"Site created with SSL: {domain}."
+    else:
+        message = f"Site created: {domain}. Reload {webserver} to serve it."
 
-    return SiteActionResponse(
-        success=True,
-        message=f"Site created: {domain}. Reload {webserver} to serve it.",
-        site=domain,
-    )
+    return SiteActionResponse(success=True, message=message, site=domain)
 
 
 @router.post("/reload", response_model=ReloadResponse)
@@ -490,7 +504,8 @@ def delete_site(
     domain: str, session: Annotated[dict, Depends(require_elevated)]
 ) -> SiteActionResponse:
     """
-    Delete a site configuration.
+    Delete a site's virtual host on every web server backend, and its
+    certificate.
 
     Args:
         domain: Domain of the site.
@@ -500,16 +515,19 @@ def delete_site(
         The action outcome.
 
     Raises:
-        HTTPException: 404 when no such site exists.
-        SiteError: When the manager refuses the operation.
+        HTTPException: 404 when nothing was found for the domain on either
+            backend, and no certificate either.
         DomainError: When the domain is not acceptable.
     """
     validated = strict_domain(domain)
-    _, manager = _manager_for(None)
 
-    if not manager.site_exists(validated):
+    # delete_site_completely walks both nginx and apache and the certificate.
+    # This endpoint used to ask only the detected backend, so a site created
+    # on the other one - or a certificate left behind after a manual web
+    # server switch - outlived every delete request that reached this route.
+    deletion = delete_site_completely(validated)
+
+    if not deletion.removed_anything:
         raise HTTPException(status_code=404, detail=f"Site not found: {validated}")
-
-    manager.delete_site(validated)
 
     return SiteActionResponse(success=True, message=f"Site deleted: {validated}", site=validated)

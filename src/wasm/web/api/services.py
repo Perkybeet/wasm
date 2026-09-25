@@ -147,6 +147,14 @@ def _resolve_unit(name: str) -> tuple[str, Path]:
     but against :data:`SYSTEMD_UNIT_DIR` instead of a hardcoded directory, so the
     API and its tests agree on where units live.
 
+    This is not the same duplicate ``delete_service`` used to be: it goes
+    through :func:`wasm.validators.names.resolve_within`, which refuses a name
+    that resolves through a symlink planted inside the unit directory to a
+    file outside it. ``ServiceManager.inspect_unit`` does not perform that
+    check - it trusts its own directory - so this stays as the request's own
+    containment guard, independent of whatever manager ends up doing the
+    write.
+
     Args:
         name: Service name as supplied by the client.
 
@@ -556,16 +564,14 @@ def delete_service(name: str, request: Request, session: dict = Depends(require_
     if not service_path.is_file():
         raise HTTPException(status_code=404, detail=f"Service not found: {service_name}")
 
-    service_manager = ServiceManager(verbose=False)
-    service_manager.stop(service_name)
-    service_manager.disable(service_name)
-
-    try:
-        service_path.unlink()
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to delete service: {exc}") from exc
-
-    service_manager.daemon_reload()
+    # Deletion goes through the manager, the one place that checks ownership,
+    # unlinks through the filesystem seam (which --dry-run can refuse) and
+    # removes the store row. This endpoint used to stop/disable the unit and
+    # unlink the file itself, straight past the ownership guard and past the
+    # store: a service deleted from the panel kept showing up in
+    # 'wasm service list' until something else happened to notice the file
+    # was gone.
+    ServiceManager(verbose=False).delete_service(service_name)
 
     return ServiceActionResponse(
         success=True, message=f"Service deleted: {service_name}", service=service_name
