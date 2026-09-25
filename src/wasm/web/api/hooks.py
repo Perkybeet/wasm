@@ -41,6 +41,7 @@ from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import WASMErrorRoute, strict_domain
 from wasm.web.auth import get_audit_logger, get_client_ip, record_auth_failure
 from wasm.web.jobs import JobContext, JobType, get_job_manager, run_update
+from wasm.web.pydantic_compat import iso_offset_validator
 
 #: The unauthenticated delivery surface, mounted at ``/hooks``.
 router = APIRouter(route_class=WASMErrorRoute)
@@ -512,6 +513,8 @@ class WebhookDeliveryOut(BaseModel):
     started_at: str | None = None
     git_commit: str | None = None
     error: str | None = None
+
+    _iso_timestamps = iso_offset_validator("started_at")
 
 
 class WebhookDeliveriesResponse(BaseModel):

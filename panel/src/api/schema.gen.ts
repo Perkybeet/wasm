@@ -15,6 +15,12 @@ export interface paths {
          * List Apps
          * @description List every deployed application.
          *
+         *     Every application's service record, webhook flag and last deployment
+         *     come from one store query each, and every application's systemd status
+         *     is read concurrently through :func:`~wasm.core.app_state.resolve_states_with_status`
+         *     - so this endpoint costs a handful of queries and one round of systemctl
+         *     calls, not four times the number of applications deployed.
+         *
          *     Args:
          *         session: The authenticated session.
          *
@@ -4627,7 +4633,7 @@ export interface components {
          *         kind: ``primary`` (the domain the application was deployed as),
          *             ``alias`` (served the same) or ``redirect`` (sent permanently to
          *             the primary).
-         *         created_at: When it was added, ISO 8601.
+         *         created_at: When it was added, ISO 8601 with an explicit UTC offset.
          */
         AppDomain: {
             /** Created At */
@@ -4724,7 +4730,14 @@ export interface components {
          *     Attributes:
          *         name: Application name, which is its domain.
          *         domain: Domain the application is served on.
-         *         status: ``running``, ``stopped`` or ``static``.
+         *         status: What is true about it right now, resolved by
+         *             :func:`wasm.core.app_state.resolve_state` - the one place the CLI
+         *             and the panel agree on this: ``running``, ``restarting`` (systemd
+         *             is crash-looping the unit), ``no_answer`` (the unit is up but
+         *             nothing accepts connections on its port), ``stopped``, ``failed``
+         *             (systemd gave up on it), ``static`` (served directly by the web
+         *             server, there is no unit) or ``unknown`` (systemd could not be
+         *             asked).
          *         active: Whether the unit is active.
          *         enabled: Whether the unit starts on boot.
          *         pid: Main PID when running.
@@ -4736,6 +4749,14 @@ export interface components {
          *         memory_max_mb: Memory limit of its unit, in MB, or None.
          *         cpu_quota_percent: CPU quota of its unit, in percent of one CPU, or None.
          *         tasks_max: Task limit of its unit, or None.
+         *         webhook_enabled: Whether a webhook secret is set for it. The secret
+         *             itself is never part of this or any other response; it is set
+         *             through ``POST /api/apps/{domain}/webhook-secret`` and cleared
+         *             through the ``DELETE`` of the same path.
+         *         unit: The systemd unit that runs it, or None for a static site.
+         *         run_as: The account its unit runs as, or None for a static site.
+         *         last_deployment: Its most recent deployment attempt, or None when
+         *             nothing has ever been recorded for it.
          */
         AppInfo: {
             /** Active */
@@ -4748,6 +4769,7 @@ export interface components {
             domain: string;
             /** Enabled */
             enabled: boolean;
+            last_deployment?: components["schemas"]["LastDeploymentOut"] | null;
             /**
              * Layout
              * @default inplace
@@ -4763,12 +4785,21 @@ export interface components {
             pid?: number | null;
             /** Port */
             port?: number | null;
+            /** Run As */
+            run_as?: string | null;
             /** Status */
             status: string;
             /** Tasks Max */
             tasks_max?: number | null;
+            /** Unit */
+            unit?: string | null;
             /** Uptime */
             uptime?: string | null;
+            /**
+             * Webhook Enabled
+             * @default false
+             */
+            webhook_enabled: boolean;
         };
         /**
          * AppListResponse
@@ -6242,6 +6273,28 @@ export interface components {
             type: string;
         };
         /**
+         * LastDeploymentOut
+         * @description An application's most recent deployment attempt.
+         *
+         *     Attributes:
+         *         id: Deployment id, the store's own primary key.
+         *         status: One of :class:`~wasm.core.store.DeploymentStatus`: ``queued``,
+         *             ``running``, ``success``, ``failed`` or ``rolled_back``.
+         *         finished_at: When it finished, ISO 8601 with an explicit UTC offset;
+         *             None while it is still running.
+         *         git_commit: Short commit it deployed, when the source is git.
+         */
+        LastDeploymentOut: {
+            /** Finished At */
+            finished_at?: string | null;
+            /** Git Commit */
+            git_commit?: string | null;
+            /** Id */
+            id: number;
+            /** Status */
+            status: string;
+        };
+        /**
          * LimitsResponse
          * @description The limits an application has now.
          *
@@ -6912,7 +6965,7 @@ export interface components {
          *     Attributes:
          *         id: Release id, the directory name under ``releases/``.
          *         commit: Short commit it was built from; None for a non-git source.
-         *         created_at: When it was created, ISO 8601 in UTC.
+         *         created_at: When it was created, ISO 8601 with an explicit UTC offset.
          *         activated_at: When it last became active, if it ever did.
          *         status: ``active``, ``superseded``, ``rolled_back``, ``failed`` or
          *             ``built``.

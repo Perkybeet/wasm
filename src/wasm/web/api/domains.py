@@ -38,6 +38,7 @@ from wasm.deployers.domains import (
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import WASMErrorRoute, require_elevated, strict_domain
 from wasm.web.jobs import JobContext, JobType, get_job_manager
+from wasm.web.pydantic_compat import iso_offset_validator
 
 router = APIRouter(route_class=WASMErrorRoute)
 
@@ -51,12 +52,14 @@ class AppDomain(BaseModel):
         kind: ``primary`` (the domain the application was deployed as),
             ``alias`` (served the same) or ``redirect`` (sent permanently to
             the primary).
-        created_at: When it was added, ISO 8601.
+        created_at: When it was added, ISO 8601 with an explicit UTC offset.
     """
 
     domain: str
     kind: str
     created_at: str | None = None
+
+    _iso_timestamps = iso_offset_validator("created_at")
 
 
 class AppDomainList(BaseModel):

@@ -23,8 +23,10 @@ from typing import Annotated, Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
+from wasm.core import app_state
+from wasm.core.app_state import AppState, resolve_state_with_status, resolve_states_with_status
 from wasm.core.config import REDACTED, redact_secrets
-from wasm.core.store import App, DeploymentTrigger, Service, get_store
+from wasm.core.store import App, DeploymentRecord, DeploymentTrigger, Service, get_store
 from wasm.core.utils import domain_to_app_name
 from wasm.deployers.helpers.app_env import read_app_env, write_app_env
 from wasm.deployers.helpers.env_manager import EnvManager, redact_url_credentials
@@ -47,11 +49,47 @@ from wasm.web.api.deps import (
 )
 from wasm.web.auth import ensure_scope, get_audit_logger, get_client_ip
 from wasm.web.jobs import JobType, delete_app_job, deploy_app_job, get_job_manager
+from wasm.web.pydantic_compat import iso_offset_validator
+
+#: app_state's display labels, translated to the fixed API vocabulary.
+#: Decoupled from AppState.label on purpose: that string is for a terminal
+#: column and free to reword, this one is a public contract every client
+#: parses.
+_STATUS_LABELS: dict[str, str] = {
+    app_state.RUNNING: "running",
+    app_state.RESTARTING: "restarting",
+    app_state.NOT_RESPONDING: "no_answer",
+    app_state.STOPPED: "stopped",
+    app_state.FAILED: "failed",
+    app_state.STATIC: "static",
+    app_state.UNKNOWN: "unknown",
+}
 
 router = APIRouter(route_class=WASMErrorRoute)
 
 #: Port preferred when the client does not pick one.
 DEFAULT_PORT = 3000
+
+
+class LastDeploymentOut(BaseModel):
+    """
+    An application's most recent deployment attempt.
+
+    Attributes:
+        id: Deployment id, the store's own primary key.
+        status: One of :class:`~wasm.core.store.DeploymentStatus`: ``queued``,
+            ``running``, ``success``, ``failed`` or ``rolled_back``.
+        finished_at: When it finished, ISO 8601 with an explicit UTC offset;
+            None while it is still running.
+        git_commit: Short commit it deployed, when the source is git.
+    """
+
+    id: int
+    status: str
+    finished_at: str | None = None
+    git_commit: str | None = None
+
+    _iso_timestamps = iso_offset_validator("finished_at")
 
 
 class AppInfo(BaseModel):
@@ -61,7 +99,14 @@ class AppInfo(BaseModel):
     Attributes:
         name: Application name, which is its domain.
         domain: Domain the application is served on.
-        status: ``running``, ``stopped`` or ``static``.
+        status: What is true about it right now, resolved by
+            :func:`wasm.core.app_state.resolve_state` - the one place the CLI
+            and the panel agree on this: ``running``, ``restarting`` (systemd
+            is crash-looping the unit), ``no_answer`` (the unit is up but
+            nothing accepts connections on its port), ``stopped``, ``failed``
+            (systemd gave up on it), ``static`` (served directly by the web
+            server, there is no unit) or ``unknown`` (systemd could not be
+            asked).
         active: Whether the unit is active.
         enabled: Whether the unit starts on boot.
         pid: Main PID when running.
@@ -73,6 +118,14 @@ class AppInfo(BaseModel):
         memory_max_mb: Memory limit of its unit, in MB, or None.
         cpu_quota_percent: CPU quota of its unit, in percent of one CPU, or None.
         tasks_max: Task limit of its unit, or None.
+        webhook_enabled: Whether a webhook secret is set for it. The secret
+            itself is never part of this or any other response; it is set
+            through ``POST /api/apps/{domain}/webhook-secret`` and cleared
+            through the ``DELETE`` of the same path.
+        unit: The systemd unit that runs it, or None for a static site.
+        run_as: The account its unit runs as, or None for a static site.
+        last_deployment: Its most recent deployment attempt, or None when
+            nothing has ever been recorded for it.
     """
 
     name: str
@@ -89,6 +142,10 @@ class AppInfo(BaseModel):
     memory_max_mb: int | None = None
     cpu_quota_percent: int | None = None
     tasks_max: int | None = None
+    webhook_enabled: bool = False
+    unit: str | None = None
+    run_as: str | None = None
+    last_deployment: LastDeploymentOut | None = None
 
 
 class AppListResponse(BaseModel):
@@ -197,41 +254,58 @@ class AppEnvUpdateResponse(BaseModel):
     restart_required: bool = True
 
 
-def _service_status(store_service: Service | None, manager: ServiceManager) -> dict[str, Any]:
+def _last_deployment_out(record: DeploymentRecord | None) -> LastDeploymentOut | None:
     """
-    Read the live systemd state of an application's unit.
+    Translate a store deployment row to its API model.
 
     Args:
-        store_service: The service record, when the application has one.
-        manager: Service manager used to query systemd.
+        record: The application's newest deployment, when it has one.
 
     Returns:
-        The status mapping, empty when the application has no unit.
+        None when there is no history, or the row has no id (never
+        persisted); otherwise the API model.
     """
-    if store_service is None:
-        return {}
-    return manager.get_status(store_service.name)
+    if record is None or record.id is None:
+        return None
+    return LastDeploymentOut(
+        id=record.id,
+        status=record.status,
+        finished_at=record.finished_at,
+        git_commit=record.git_commit,
+    )
 
 
-def _to_app_info(app: App, status: dict[str, Any], has_service: bool) -> AppInfo:
+def _to_app_info(
+    app: App,
+    state: AppState,
+    status: dict[str, Any],
+    service: Service | None,
+    *,
+    webhook_enabled: bool,
+    last_deployment: DeploymentRecord | None,
+) -> AppInfo:
     """
-    Combine a stored application with its live service status.
+    Combine a stored application with its resolved state and live status.
 
     Args:
         app: The stored application.
-        status: Live systemd status, empty when there is no unit.
-        has_service: Whether a unit is registered for the application.
+        state: What :func:`wasm.core.app_state.resolve_state` decided is
+            true about it.
+        status: The systemd status ``state`` was resolved from, empty for a
+            static application, which is never queried.
+        service: The application's service record, when it has one.
+        webhook_enabled: Whether a webhook secret is set for it.
+        last_deployment: Its most recent deployment history row, if any.
 
     Returns:
         The API representation.
     """
     pid = status.get("pid")
-    active = bool(status.get("active", False))
     return AppInfo(
         name=app.domain,
         domain=app.domain,
-        status="running" if active else ("stopped" if has_service else "static"),
-        active=active,
+        status=_STATUS_LABELS.get(state.label, state.label.lower()),
+        active=bool(status.get("active", False)),
         enabled=bool(status.get("enabled", False)),
         pid=int(pid) if pid and str(pid) != "0" else None,
         uptime=str(status["uptime"]) if status.get("uptime") else None,
@@ -242,6 +316,10 @@ def _to_app_info(app: App, status: dict[str, Any], has_service: bool) -> AppInfo
         memory_max_mb=app.memory_max_mb,
         cpu_quota_percent=app.cpu_quota_percent,
         tasks_max=app.tasks_max,
+        webhook_enabled=webhook_enabled,
+        unit=service.name if service is not None else None,
+        run_as=service.user if service is not None else None,
+        last_deployment=_last_deployment_out(last_deployment),
     )
 
 
@@ -312,6 +390,12 @@ def list_apps(session: Annotated[dict, Depends(get_current_session)]) -> AppList
     """
     List every deployed application.
 
+    Every application's service record, webhook flag and last deployment
+    come from one store query each, and every application's systemd status
+    is read concurrently through :func:`~wasm.core.app_state.resolve_states_with_status`
+    - so this endpoint costs a handful of queries and one round of systemctl
+    calls, not four times the number of applications deployed.
+
     Args:
         session: The authenticated session.
 
@@ -321,12 +405,32 @@ def list_apps(session: Annotated[dict, Depends(get_current_session)]) -> AppList
     store = get_store()
     manager = ServiceManager(verbose=False)
 
-    apps = []
-    for app in store.list_apps():
-        service = store.get_service_by_app_id(app.id) if app.id else None
-        apps.append(_to_app_info(app, _service_status(service, manager), service is not None))
+    apps = store.list_apps()
+    domains = [app.domain for app in apps]
 
-    return AppListResponse(apps=apps, total=len(apps))
+    services_by_app_id = {
+        service.app_id: service for service in store.list_services() if service.app_id is not None
+    }
+    webhook_flags = store.list_webhook_flags(domains)
+    last_deployments = store.get_latest_deployments(domains)
+    states = resolve_states_with_status(apps, manager)
+
+    result = []
+    for app in apps:
+        state, status = states[app.domain]
+        service = services_by_app_id.get(app.id) if app.id is not None else None
+        result.append(
+            _to_app_info(
+                app,
+                state,
+                status,
+                service,
+                webhook_enabled=webhook_flags.get(app.domain, False),
+                last_deployment=last_deployments.get(app.domain),
+            )
+        )
+
+    return AppListResponse(apps=result, total=len(result))
 
 
 @router.post("", response_model=JobAcceptedResponse, status_code=202)
@@ -521,8 +625,18 @@ def get_app(domain: str, session: Annotated[dict, Depends(get_current_session)])
 
     service = store.get_service_by_app_id(app.id) if app.id else None
     manager = ServiceManager(verbose=False)
+    state, status = resolve_state_with_status(app, manager)
 
-    return _to_app_info(app, _service_status(service, manager), service is not None)
+    recent = store.list_deployments(domain=app.domain, limit=1)
+
+    return _to_app_info(
+        app,
+        state,
+        status,
+        service,
+        webhook_enabled=store.get_webhook_secret(app.domain) is not None,
+        last_deployment=recent[0] if recent else None,
+    )
 
 
 def _service_action(domain: str, action: str, past_tense: str) -> AppActionResponse:
@@ -806,6 +920,8 @@ class RollbackPointOut(BaseModel):
     size_bytes: int
     git_commit: str | None = None
 
+    _iso_timestamps = iso_offset_validator("created_at")
+
 
 class RollbackPointsResponse(BaseModel):
     """The backups an application can return to, newest first."""
@@ -862,7 +978,7 @@ class ReleaseOut(BaseModel):
     Attributes:
         id: Release id, the directory name under ``releases/``.
         commit: Short commit it was built from; None for a non-git source.
-        created_at: When it was created, ISO 8601 in UTC.
+        created_at: When it was created, ISO 8601 with an explicit UTC offset.
         activated_at: When it last became active, if it ever did.
         status: ``active``, ``superseded``, ``rolled_back``, ``failed`` or
             ``built``.
@@ -878,6 +994,8 @@ class ReleaseOut(BaseModel):
     status: str
     active: bool
     on_disk: bool
+
+    _iso_timestamps = iso_offset_validator("created_at", "activated_at")
 
 
 class ReleasesResponse(BaseModel):

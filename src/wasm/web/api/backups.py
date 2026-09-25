@@ -34,6 +34,7 @@ from wasm.web.jobs import (
     get_job_manager,
     restore_backup_job,
 )
+from wasm.web.pydantic_compat import iso_offset_validator
 
 router = APIRouter(route_class=WASMErrorRoute)
 
@@ -64,6 +65,8 @@ class BackupInfo(BaseModel):
     git_commit: str | None = None
     git_branch: str | None = None
     tags: list[str] = Field(default_factory=list)
+
+    _iso_timestamps = iso_offset_validator("timestamp")
 
 
 class BackupListResponse(BaseModel):

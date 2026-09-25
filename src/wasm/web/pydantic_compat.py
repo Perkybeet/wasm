@@ -79,6 +79,41 @@ else:
         return _v1_validator(field, *fields, **kwargs)
 
 
+def iso_offset_validator(*fields: str) -> Any:
+    """
+    A field_validator, bound to one or more fields, that attaches a UTC
+    offset to a stored timestamp.
+
+    Every response model that carries a timestamp applies this once, as a
+    class attribute, instead of writing its own conversion:
+
+    .. code-block:: python
+
+        class DeploymentOut(BaseModel):
+            started_at: str | None = None
+            finished_at: str | None = None
+
+            _iso_timestamps = iso_offset_validator("started_at", "finished_at")
+
+    See :func:`wasm.core.timeutil.to_iso_offset` for what the conversion
+    does. The import is local to this function, not module level: core must
+    not depend on the web layer, and nothing here should tempt it to.
+
+    Args:
+        *fields: Names of the fields to convert.
+
+    Returns:
+        The validator, ready for assignment to a class attribute exactly as
+        a hand-written ``@field_validator`` would be.
+    """
+    from wasm.core.timeutil import to_iso_offset
+
+    def _convert(cls: Any, value: Any) -> Any:
+        return to_iso_offset(value)
+
+    return field_validator(*fields, mode="before")(_convert)
+
+
 def dump_model(model: BaseModel) -> dict[str, Any]:
     """
     Serialise a model to a plain dict, whichever pydantic is installed.

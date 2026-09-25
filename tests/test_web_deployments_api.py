@@ -32,6 +32,7 @@ What is defended:
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -278,6 +279,21 @@ class TestListDeployments:
         by_id = {item["id"]: item["has_log"] for item in response.json()["items"]}
         assert by_id[without_log] is False
         assert by_id[with_log] is True
+
+    def test_timestamps_carry_an_explicit_utc_offset(
+        self, client: TestClient, store: WASMStore
+    ) -> None:
+        """
+        The store writes ``started_at``/``finished_at`` as naive local
+        timestamps; the console cannot know which zone those are in unless
+        the response says so.
+        """
+        seed_deployment(store, DOMAIN)
+
+        item = client.get(f"/api/deployments?domain={DOMAIN}").json()["items"][0]
+
+        assert datetime.fromisoformat(item["started_at"]).tzinfo is not None
+        assert datetime.fromisoformat(item["finished_at"]).tzinfo is not None
 
 
 class TestGetDeployment:
@@ -545,6 +561,16 @@ class TestWebhookDeliveries:
     def test_an_unknown_domain_is_404(self, client: TestClient) -> None:
         response = client.get(f"/api/apps/{DOMAIN}/webhook/deliveries")
         assert response.status_code == 404
+
+    def test_started_at_carries_an_explicit_utc_offset(
+        self, client: TestClient, store: WASMStore
+    ) -> None:
+        seed_app(store)
+        seed_deployment(store, DOMAIN, trigger=DeploymentTrigger.WEBHOOK.value)
+
+        item = client.get(f"/api/apps/{DOMAIN}/webhook/deliveries").json()["items"][0]
+
+        assert datetime.fromisoformat(item["started_at"]).tzinfo is not None
 
 
 # --------------------------------------------------------------- notification test

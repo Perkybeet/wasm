@@ -128,14 +128,60 @@ def resolve_state(
     Returns:
         The state, ready to be shown or counted.
     """
+    return resolve_state_with_status(app, service_manager, probe=probe)[0]
+
+
+def resolve_state_with_status(
+    app: App,
+    service_manager: ServiceManager,
+    *,
+    probe: bool = True,
+) -> tuple[AppState, dict[str, Any]]:
+    """
+    Work out an application's state, keeping the systemd status it read.
+
+    :func:`resolve_state` throws the status mapping away once it has decided
+    the label. A caller that also wants the fields systemd reported - the
+    PID, whether the unit is enabled, its uptime - would otherwise have to
+    query systemd a second time for the same unit, doubling the subprocess
+    calls this module exists to keep down to one round trip per application.
+    This is the one place both come out of a single query.
+
+    Args:
+        app: The application record.
+        service_manager: Used to ask systemd about the unit.
+        probe: Whether to check that the port answers.
+
+    Returns:
+        The state, and the raw mapping ``ServiceManager.get_status`` returned
+        - empty for a static application, which is never queried.
+    """
     if app.is_static:
-        return AppState(STATIC, healthy=True, detail="served directly by the web server")
+        return (
+            AppState(STATIC, healthy=True, detail="served directly by the web server"),
+            {},
+        )
 
     try:
         status = service_manager.get_status(domain_to_app_name(app.domain))
     except (WASMError, ValidationError) as error:
-        return AppState(UNKNOWN, healthy=False, detail=str(error))
+        return AppState(UNKNOWN, healthy=False, detail=str(error)), {}
 
+    return _state_from_status(app, status, probe=probe), status
+
+
+def _state_from_status(app: App, status: dict[str, Any], *, probe: bool) -> AppState:
+    """
+    Decide an application's state from a status mapping already read.
+
+    Args:
+        app: The application record.
+        status: What ``ServiceManager.get_status`` returned for its unit.
+        probe: Whether to check that the port answers.
+
+    Returns:
+        The state.
+    """
     active_state = str(status.get("active_state", "")).strip()
     sub_state = str(status.get("sub_state", "")).strip()
     restarts = _restart_count(status)
@@ -199,6 +245,39 @@ def resolve_states(
 
     def one(app: App) -> tuple[str, AppState]:
         return app.domain, resolve_state(app, service_manager, probe=probe)
+
+    workers = min(8, len(apps))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return dict(pool.map(one, apps))
+
+
+def resolve_states_with_status(
+    apps: list[App],
+    service_manager: ServiceManager,
+    *,
+    probe: bool = True,
+) -> dict[str, tuple[AppState, dict[str, Any]]]:
+    """
+    Resolve several applications at once, keeping the status each read from.
+
+    The batch counterpart of :func:`resolve_state_with_status`, for a caller
+    that lists many applications and needs both the state and the raw fields
+    systemd reported for each - ``GET /api/apps`` costs one round of
+    concurrent systemctl calls this way, not two.
+
+    Args:
+        apps: The applications to resolve.
+        service_manager: Used to ask systemd about the units.
+        probe: Whether to check that the ports answer.
+
+    Returns:
+        The state and status of each application, keyed by domain.
+    """
+    if not apps:
+        return {}
+
+    def one(app: App) -> tuple[str, tuple[AppState, dict[str, Any]]]:
+        return app.domain, resolve_state_with_status(app, service_manager, probe=probe)
 
     workers = min(8, len(apps))
     with ThreadPoolExecutor(max_workers=workers) as pool:

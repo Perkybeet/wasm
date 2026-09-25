@@ -987,6 +987,96 @@ def test_a_successful_start_publishes_the_application(
     ]
 
 
+def test_a_service_restart_of_a_units_app_publishes_it(
+    store: Any, listening: ListeningHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Starting, stopping or restarting a unit from the services page is the
+    same systemctl call the applications page makes; only the page differs.
+    Without this, a restart issued from /api/services left every open
+    console showing the application as whatever it was before.
+
+    Args:
+        store: The sandboxed store, holding the app and its unit.
+        listening: A listener on the hub, so publishing is not skipped.
+        monkeypatch: Runs the publication inline and fakes the snapshot.
+    """
+    from wasm.core.store import App, Service
+
+    app = store.create_app(
+        App(domain="shop.example.com", app_type="nodejs", app_path="/var/www/apps/shop")
+    )
+    store.create_service(
+        Service(
+            app_id=app.id,
+            name="shop-example-com",
+            unit_file="/etc/systemd/system/shop-example-com.service",
+        )
+    )
+    monkeypatch.setattr(events_module, "_in_thread", events_module.publish_app_state)
+    monkeypatch.setattr(
+        events_module, "app_snapshot", lambda domain: {"domain": domain, "status": "running"}
+    )
+
+    events_module.announce_app_mutation("POST", "/api/services/shop-example-com/restart", 200)
+
+    assert listening.frames == [
+        'event: app\ndata: {"domain":"shop.example.com","status":"running"}\n\n'
+    ]
+
+
+def test_a_service_action_for_a_unit_owned_by_no_application_publishes_nothing(
+    store: Any, listening: ListeningHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A unit made with ``wasm service create`` was never tied to a deployment.
+
+    Args:
+        store: The sandboxed store, with no service registered.
+        listening: A listener on the hub.
+        monkeypatch: Records any attempt to publish.
+    """
+    attempts: list[str] = []
+    monkeypatch.setattr(events_module, "_in_thread", attempts.append)
+
+    events_module.announce_app_mutation("POST", "/api/services/standalone-cron/restart", 200)
+
+    assert attempts == []
+
+
+def test_a_service_action_outside_start_stop_restart_publishes_nothing(
+    store: Any, listening: ListeningHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Enabling, disabling, reconfiguring or deleting a unit is not application
+    state changing hands; only the three actions the apps page also exposes
+    are announced.
+
+    Args:
+        store: The sandboxed store, holding the app and its unit.
+        listening: A listener on the hub.
+        monkeypatch: Records any attempt to publish.
+    """
+    from wasm.core.store import App, Service
+
+    app = store.create_app(
+        App(domain="shop.example.com", app_type="nodejs", app_path="/var/www/apps/shop")
+    )
+    store.create_service(
+        Service(
+            app_id=app.id,
+            name="shop-example-com",
+            unit_file="/etc/systemd/system/shop-example-com.service",
+        )
+    )
+    attempts: list[str] = []
+    monkeypatch.setattr(events_module, "_in_thread", attempts.append)
+
+    events_module.announce_app_mutation("POST", "/api/services/shop-example-com/enable", 200)
+
+    assert attempts == []
+
+
 @pytest.mark.parametrize("status_code", [202, 400, 403, 404, 500])
 def test_a_refused_or_queued_mutation_publishes_nothing(
     listening: ListeningHub, monkeypatch: pytest.MonkeyPatch, status_code: int

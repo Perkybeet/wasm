@@ -44,6 +44,7 @@ from wasm.web.jobs import (
     rollback_app_job,
     update_app_job,
 )
+from wasm.web.pydantic_compat import iso_offset_validator
 
 router = APIRouter(prefix="/jobs", tags=["jobs"], route_class=WASMErrorRoute)
 
@@ -109,6 +110,8 @@ class JobResponse(BaseModel):
     error: str | None = None
     logs: list[dict[str, Any]] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    _iso_timestamps = iso_offset_validator("created_at", "started_at", "completed_at")
 
 
 class JobListResponse(BaseModel):

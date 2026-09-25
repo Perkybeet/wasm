@@ -60,6 +60,7 @@ from wasm.web.api.deps import (
     require_elevated,
 )
 from wasm.web.jobs import JobType, database_engine_job, get_job_manager
+from wasm.web.pydantic_compat import iso_offset_validator
 
 router = APIRouter(route_class=WASMErrorRoute)
 
@@ -205,6 +206,8 @@ class BackupInfoResponse(BaseModel):
     size_human: str
     created: str
     compressed: bool
+
+    _iso_timestamps = iso_offset_validator("created")
 
 
 class BackupListResponse(BaseModel):

@@ -1215,6 +1215,36 @@ class TestWebhookSecret:
         assert "webhook_secret" not in app.to_dict()
         assert "s3cret-value" not in str(app.to_dict())
 
+    def test_list_webhook_flags_reveals_only_whether_a_secret_is_set(self, temp_db):
+        """
+        GET /api/apps must show a webhook indicator without ever putting the
+        secret itself on the wire, and without one query per application.
+        """
+        self._seed(temp_db)
+        temp_db.create_app(
+            App(
+                domain="bare.example.com",
+                app_type=AppType.NODEJS.value,
+                app_path="/var/www/apps/bare-example-com",
+            )
+        )
+        temp_db.set_webhook_secret("hooked.example.com", "s3cret-value")
+
+        flags = temp_db.list_webhook_flags(["hooked.example.com", "bare.example.com"])
+
+        assert flags == {"hooked.example.com": True, "bare.example.com": False}
+
+    def test_list_webhook_flags_defaults_to_every_application(self, temp_db):
+        self._seed(temp_db)
+        temp_db.set_webhook_secret("hooked.example.com", "s3cret-value")
+
+        assert temp_db.list_webhook_flags() == {"hooked.example.com": True}
+
+    def test_list_webhook_flags_of_no_domains_costs_no_rows(self, temp_db):
+        self._seed(temp_db)
+
+        assert temp_db.list_webhook_flags([]) == {}
+
 
 class TestAppCRUD:
     """Tests for App CRUD operations."""
@@ -1622,6 +1652,48 @@ class TestDeploymentHistory:
         record = store.get_deployment(deployment_id)
         assert record is not None
         assert record.error == "unit failed to start"
+
+
+class TestLatestDeployments:
+    """
+    GET /api/apps shows every application's last deployment. Asking
+    list_deployments once per row would cost as many queries as there are
+    applications; this is the one query that answers the whole list at once.
+    """
+
+    def test_reads_back_the_newest_row_per_domain(self, temp_db):
+        first = temp_db.record_deployment_start("a.example.com", "cli")
+        temp_db.finish_deployment(first, "success")
+        second = temp_db.record_deployment_start("a.example.com", "panel")
+        temp_db.finish_deployment(second, "failed", error="boom")
+        only = temp_db.record_deployment_start("b.example.com", "webhook")
+
+        latest = temp_db.get_latest_deployments(["a.example.com", "b.example.com"])
+
+        assert latest["a.example.com"].id == second
+        assert latest["a.example.com"].status == "failed"
+        assert latest["b.example.com"].id == only
+
+    def test_a_domain_with_no_deployments_is_absent(self, temp_db):
+        temp_db.record_deployment_start("a.example.com", "cli")
+
+        latest = temp_db.get_latest_deployments(["a.example.com", "never-deployed.example.com"])
+
+        assert "never-deployed.example.com" not in latest
+
+    def test_an_empty_list_of_domains_costs_no_rows(self, temp_db):
+        temp_db.record_deployment_start("a.example.com", "cli")
+
+        assert temp_db.get_latest_deployments([]) == {}
+
+    def test_only_the_asked_domains_come_back(self, temp_db):
+        """A domain not in the request must not leak into the answer."""
+        temp_db.record_deployment_start("a.example.com", "cli")
+        temp_db.record_deployment_start("b.example.com", "cli")
+
+        latest = temp_db.get_latest_deployments(["a.example.com"])
+
+        assert set(latest) == {"a.example.com"}
 
 
 class TestRelations:

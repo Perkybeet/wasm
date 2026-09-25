@@ -223,7 +223,7 @@
         "type": "object"
       },
       "AppDomain": {
-        "description": "One domain an application answers on.\n\nAttributes:\n    domain: The domain.\n    kind: ``primary`` (the domain the application was deployed as),\n        ``alias`` (served the same) or ``redirect`` (sent permanently to\n        the primary).\n    created_at: When it was added, ISO 8601.",
+        "description": "One domain an application answers on.\n\nAttributes:\n    domain: The domain.\n    kind: ``primary`` (the domain the application was deployed as),\n        ``alias`` (served the same) or ``redirect`` (sent permanently to\n        the primary).\n    created_at: When it was added, ISO 8601 with an explicit UTC offset.",
         "properties": {
           "created_at": {
             "anyOf": [
@@ -366,7 +366,7 @@
         "type": "object"
       },
       "AppInfo": {
-        "description": "A deployed application and the live state of its service.\n\nAttributes:\n    name: Application name, which is its domain.\n    domain: Domain the application is served on.\n    status: ``running``, ``stopped`` or ``static``.\n    active: Whether the unit is active.\n    enabled: Whether the unit starts on boot.\n    pid: Main PID when running.\n    uptime: How long the unit has been up.\n    port: Upstream port.\n    app_type: Deployer that owns it.\n    path: Application directory.\n    layout: ``inplace`` or ``releases``.\n    memory_max_mb: Memory limit of its unit, in MB, or None.\n    cpu_quota_percent: CPU quota of its unit, in percent of one CPU, or None.\n    tasks_max: Task limit of its unit, or None.",
+        "description": "A deployed application and the live state of its service.\n\nAttributes:\n    name: Application name, which is its domain.\n    domain: Domain the application is served on.\n    status: What is true about it right now, resolved by\n        :func:`wasm.core.app_state.resolve_state` - the one place the CLI\n        and the panel agree on this: ``running``, ``restarting`` (systemd\n        is crash-looping the unit), ``no_answer`` (the unit is up but\n        nothing accepts connections on its port), ``stopped``, ``failed``\n        (systemd gave up on it), ``static`` (served directly by the web\n        server, there is no unit) or ``unknown`` (systemd could not be\n        asked).\n    active: Whether the unit is active.\n    enabled: Whether the unit starts on boot.\n    pid: Main PID when running.\n    uptime: How long the unit has been up.\n    port: Upstream port.\n    app_type: Deployer that owns it.\n    path: Application directory.\n    layout: ``inplace`` or ``releases``.\n    memory_max_mb: Memory limit of its unit, in MB, or None.\n    cpu_quota_percent: CPU quota of its unit, in percent of one CPU, or None.\n    tasks_max: Task limit of its unit, or None.\n    webhook_enabled: Whether a webhook secret is set for it. The secret\n        itself is never part of this or any other response; it is set\n        through ``POST /api/apps/{domain}/webhook-secret`` and cleared\n        through the ``DELETE`` of the same path.\n    unit: The systemd unit that runs it, or None for a static site.\n    run_as: The account its unit runs as, or None for a static site.\n    last_deployment: Its most recent deployment attempt, or None when\n        nothing has ever been recorded for it.",
         "properties": {
           "active": {
             "title": "Active",
@@ -401,6 +401,16 @@
           "enabled": {
             "title": "Enabled",
             "type": "boolean"
+          },
+          "last_deployment": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LastDeploymentOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "layout": {
             "default": "inplace",
@@ -455,6 +465,17 @@
             ],
             "title": "Port"
           },
+          "run_as": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run As"
+          },
           "status": {
             "title": "Status",
             "type": "string"
@@ -470,6 +491,17 @@
             ],
             "title": "Tasks Max"
           },
+          "unit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit"
+          },
           "uptime": {
             "anyOf": [
               {
@@ -480,6 +512,11 @@
               }
             ],
             "title": "Uptime"
+          },
+          "webhook_enabled": {
+            "default": false,
+            "title": "Webhook Enabled",
+            "type": "boolean"
           }
         },
         "required": [
@@ -3193,6 +3230,47 @@
         "title": "JobResponse",
         "type": "object"
       },
+      "LastDeploymentOut": {
+        "description": "An application's most recent deployment attempt.\n\nAttributes:\n    id: Deployment id, the store's own primary key.\n    status: One of :class:`~wasm.core.store.DeploymentStatus`: ``queued``,\n        ``running``, ``success``, ``failed`` or ``rolled_back``.\n    finished_at: When it finished, ISO 8601 with an explicit UTC offset;\n        None while it is still running.\n    git_commit: Short commit it deployed, when the source is git.",
+        "properties": {
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "git_commit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Git Commit"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "status"
+        ],
+        "title": "LastDeploymentOut",
+        "type": "object"
+      },
       "LimitsResponse": {
         "description": "The limits an application has now.\n\nAttributes:\n    domain: The application's domain.\n    memory_max_mb: Memory limit in MB, or None.\n    cpu_quota_percent: CPU quota in percent of one CPU, or None.\n    tasks_max: Task limit, or None.\n    units: The units rewritten.\n    restarted: Whether they were restarted.\n    restart_required: Whether the running processes still have the old\n        limits until they are restarted.",
         "properties": {
@@ -4423,7 +4501,7 @@
         "type": "object"
       },
       "ReleaseOut": {
-        "description": "One release of an application on the release layout.\n\nAttributes:\n    id: Release id, the directory name under ``releases/``.\n    commit: Short commit it was built from; None for a non-git source.\n    created_at: When it was created, ISO 8601 in UTC.\n    activated_at: When it last became active, if it ever did.\n    status: ``active``, ``superseded``, ``rolled_back``, ``failed`` or\n        ``built``.\n    active: Whether it is the one serving.\n    on_disk: Whether it can be activated. A failed release is listed for\n        a while after its directory was removed.",
+        "description": "One release of an application on the release layout.\n\nAttributes:\n    id: Release id, the directory name under ``releases/``.\n    commit: Short commit it was built from; None for a non-git source.\n    created_at: When it was created, ISO 8601 with an explicit UTC offset.\n    activated_at: When it last became active, if it ever did.\n    status: ``active``, ``superseded``, ``rolled_back``, ``failed`` or\n        ``built``.\n    active: Whether it is the one serving.\n    on_disk: Whether it can be activated. A failed release is listed for\n        a while after its directory was removed.",
         "properties": {
           "activated_at": {
             "anyOf": [
@@ -6307,7 +6385,7 @@
   "paths": {
     "/api/apps": {
       "get": {
-        "description": "List every deployed application.\n\nArgs:\n    session: The authenticated session.\n\nReturns:\n    The applications, each with the live state of its service.",
+        "description": "List every deployed application.\n\nEvery application's service record, webhook flag and last deployment\ncome from one store query each, and every application's systemd status\nis read concurrently through :func:`~wasm.core.app_state.resolve_states_with_status`\n- so this endpoint costs a handful of queries and one round of systemctl\ncalls, not four times the number of applications deployed.\n\nArgs:\n    session: The authenticated session.\n\nReturns:\n    The applications, each with the live state of its service.",
         "operationId": "list_apps_api_apps_get",
         "responses": {
           "200": {

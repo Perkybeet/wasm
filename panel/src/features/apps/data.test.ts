@@ -43,7 +43,7 @@ describe("appReading", () => {
 });
 
 describe("appLimits", () => {
-  const base: AppInfo = { domain: "a.com", name: "a.com", status: "running", active: true, enabled: true, layout: "releases" };
+  const base: AppInfo = { domain: "a.com", name: "a.com", status: "running", active: true, enabled: true, layout: "releases", webhook_enabled: false };
 
   it("reads the unit's limits in bytes and percent", () => {
     expect(appLimits({ ...base, memory_max_mb: 512, cpu_quota_percent: 50, tasks_max: 256 })).toEqual({

@@ -305,6 +305,12 @@ _IN_PROGRESS_TYPES = frozenset({"deploy", "update", "restore"})
 #: Path segments directly under ``/api/apps/`` that are not a domain.
 _NON_DOMAIN_SEGMENTS = frozenset({"inspect"})
 
+#: Service actions that are also exposed under ``/api/apps/{domain}/...`` and
+#: change what the applications page shows. Enabling, disabling, rewriting a
+#: unit's config or deleting it are unit administration, not the running
+#: state a deploy, an update or this trio also change.
+_SERVICE_APP_ACTIONS = frozenset({"start", "stop", "restart"})
+
 #: Most job ids whose last seen status is remembered by the job publisher.
 _SEEN_JOBS_LIMIT = 512
 
@@ -462,12 +468,75 @@ def app_domain_of(method: str, path: str) -> str | None:
     return segment
 
 
+def _domain_owning_unit(unit_name: str) -> str | None:
+    """
+    Look up the application a systemd unit belongs to.
+
+    This is an error boundary: it runs inside the response path of every
+    service mutation while a console is open, and a store that cannot be
+    read must cost this one lookup, not the request.
+
+    Args:
+        unit_name: The unit's name, without the ``.service`` suffix.
+
+    Returns:
+        Its application's domain, or None when the unit is not registered,
+        or belongs to no application - a unit ``wasm service create`` made
+        by hand, never tied to a deployment.
+    """
+    from wasm.core.store import get_store
+
+    try:
+        store = get_store()
+        service = store.get_service(unit_name)
+        if service is None or service.app_id is None:
+            return None
+        app = store.get_app_by_id(service.app_id)
+    except WASMError:
+        log.exception("could not resolve which application owns unit %s", unit_name)
+        return None
+    return app.domain if app is not None else None
+
+
+def service_domain_of(method: str, path: str) -> str | None:
+    """
+    Name the application a successful ``/api/services/`` mutation acted on.
+
+    Starting, stopping and restarting a unit from the services page issues
+    exactly the systemctl call ``POST /api/apps/{domain}/start`` and its
+    siblings do; the only difference is which page the operator used. Without
+    this, a restart issued from the services page left every other open
+    console showing the application as whatever it was before, until
+    something else refetched it.
+
+    Args:
+        method: The request method.
+        path: The request path.
+
+    Returns:
+        The domain of the application the unit belongs to, for an unsafe
+        method against one of :data:`_SERVICE_APP_ACTIONS`; None otherwise,
+        or when the unit belongs to no application.
+    """
+    if method.upper() in SAFE_METHODS:
+        return None
+    parts = path.split("/")
+    # ["", "api", "services", "<name>", "<action>"]
+    if len(parts) != 5 or parts[1] != "api" or parts[2] != "services":
+        return None
+    if not parts[3] or parts[4] not in _SERVICE_APP_ACTIONS:
+        return None
+    return _domain_owning_unit(parts[3])
+
+
 def announce_app_mutation(method: str, path: str, status_code: int) -> None:
     """
     Publish the state of an application a successful API call changed.
 
     A 202 is skipped: it queued a job, and :class:`AppStatePublisher` reports
-    the job's progress and outcome.
+    the job's progress and outcome. Covers both ``/api/apps/{domain}/...``
+    and, through :func:`service_domain_of`, the same start, stop and restart
+    actions issued against the unit directly under ``/api/services/{name}``.
 
     Args:
         method: The request method.
@@ -476,7 +545,7 @@ def announce_app_mutation(method: str, path: str, status_code: int) -> None:
     """
     if not 200 <= status_code < 300 or status_code == 202 or not hub.listening:
         return
-    domain = app_domain_of(method, path)
+    domain = app_domain_of(method, path) or service_domain_of(method, path)
     if domain is not None:
         _in_thread(domain)
 

@@ -24,7 +24,9 @@ from wasm.core.app_state import (
     STOPPED,
     UNKNOWN,
     resolve_state,
+    resolve_state_with_status,
     resolve_states,
+    resolve_states_with_status,
 )
 from wasm.core.exceptions import ServiceError
 from wasm.core.store import App
@@ -249,4 +251,86 @@ def test_no_applications_asks_nothing() -> None:
     services = _Services({})
 
     assert resolve_states([], services) == {}
+    assert services.asked == []
+
+
+# ---------------------------------------------------------------------------
+# resolve_state_with_status / resolve_states_with_status
+#
+# A caller that also wants the fields systemd reported - the PID, whether the
+# unit is enabled - would otherwise have to query systemd a second time,
+# doubling the subprocess calls the docstring on resolve_states promises not
+# to cost. These are the one place both come out of a single query.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_state_with_status_returns_the_same_label_as_resolve_state() -> None:
+    services = _Services({"example-com": _active()})
+
+    state, status = resolve_state_with_status(_app(), services)
+
+    assert state.label == RUNNING
+    assert state.healthy
+
+
+def test_resolve_state_with_status_hands_back_the_raw_status_mapping() -> None:
+    """The status dict is exactly what ServiceManager.get_status returned."""
+    services = _Services({"example-com": _active(pid="4242")})
+
+    _, status = resolve_state_with_status(_app(), services)
+
+    assert status["pid"] == "4242"
+    assert status["active"] is True
+
+
+def test_resolve_state_with_status_queries_systemd_exactly_once() -> None:
+    services = _Services({"example-com": _active()})
+
+    resolve_state_with_status(_app(), services)
+
+    assert services.asked == ["example-com"]
+
+
+def test_resolve_state_with_status_of_a_static_app_asks_nothing() -> None:
+    services = _Services({})
+
+    state, status = resolve_state_with_status(_app(is_static=True), services)
+
+    assert state.label == STATIC
+    assert status == {}
+    assert services.asked == []
+
+
+def test_resolve_state_with_status_of_an_unqueryable_unit_is_unknown() -> None:
+    services = _Services({}, failing=("example-com",))
+
+    state, status = resolve_state_with_status(_app(), services)
+
+    assert state.label == UNKNOWN
+    assert status == {}
+
+
+def test_resolve_state_is_a_thin_wrapper_over_resolve_state_with_status() -> None:
+    """The public, single-value function must not duplicate the decision."""
+    services = _Services({"example-com": _active(active_state="failed", sub_state="failed")})
+
+    assert resolve_state(_app(), services).label == FAILED
+
+
+def test_resolve_states_with_status_resolves_several_applications() -> None:
+    apps = [_app("one.example.com"), _app("two.example.com", is_static=True)]
+    services = _Services({"one-example-com": _active()})
+
+    results = resolve_states_with_status(apps, services)
+
+    assert results["one.example.com"][0].label == RUNNING
+    assert results["one.example.com"][1]["active"] is True
+    assert results["two.example.com"][0].label == STATIC
+    assert results["two.example.com"][1] == {}
+
+
+def test_resolve_states_with_status_of_no_applications_asks_nothing() -> None:
+    services = _Services({})
+
+    assert resolve_states_with_status([], services) == {}
     assert services.asked == []

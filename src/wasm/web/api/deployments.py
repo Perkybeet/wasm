@@ -38,6 +38,7 @@ from wasm.core.store import (
 from wasm.deployers.logs import read_deployment_log
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import WASMErrorRoute, strict_domain
+from wasm.web.pydantic_compat import iso_offset_validator
 
 router = APIRouter(route_class=WASMErrorRoute)
 
@@ -67,6 +68,8 @@ class DeploymentOut(BaseModel):
     duration_s: float | None = None
     error: str | None = None
     has_log: bool
+
+    _iso_timestamps = iso_offset_validator("started_at", "finished_at")
 
 
 class DeploymentListResponse(BaseModel):

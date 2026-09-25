@@ -16,6 +16,7 @@ describe("appStatus", () => {
     ["Running", "running", "Running", false],
     ["Restarting", "deploying", "Restarting", true],
     ["No answer", "failed", "No answer", true],
+    ["no_answer", "failed", "No answer", true],
     ["Stopped", "stopped", "Stopped", false],
     ["Failed", "failed", "Failed", true],
     ["Static", "static", "Static", false],

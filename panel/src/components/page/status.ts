@@ -14,8 +14,9 @@ export interface StatusView {
  * Every word the backend uses for an application's state, from three sources that grew
  * separately:
  *
- * - `GET /api/apps` and the `app` event: `running`, `stopped`, `static`, and `deploying`
- *   while a deploy or update job runs;
+ * - `GET /api/apps` and the `app` event: `running`, `restarting`, `no_answer`, `stopped`,
+ *   `failed`, `static`, `unknown` (resolved from systemd), and `deploying` while a deploy or
+ *   update job runs;
  * - the store's `AppStatus`: `deploying`, `running`, `stopped`, `failed`, `unknown`;
  * - `wasm.core.app_state` (what `wasm list` and `wasm health` print): `Running`,
  *   `Restarting`, `No answer`, `Stopped`, `Failed`, `Static`, `Unknown`.
@@ -35,6 +36,7 @@ const APP_STATES: Readonly<Record<string, StatusView>> = {
   inactive: { state: "stopped", label: "Stopped", attention: false },
   failed: { state: "failed", label: "Failed", attention: true },
   "no answer": { state: "failed", label: "No answer", attention: true },
+  no_answer: { state: "failed", label: "No answer", attention: true },
   unknown: { state: "unknown", label: "Unknown", attention: true },
 };
 

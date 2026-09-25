@@ -27,7 +27,7 @@ import os
 import sqlite3
 import stat
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -1413,6 +1413,37 @@ class WASMStore:
             row = cursor.fetchone()
             return row["webhook_secret"] if row else None
 
+    def list_webhook_flags(self, domains: Iterable[str] | None = None) -> dict[str, bool]:
+        """
+        Read which of several applications have a webhook secret set.
+
+        Reveals only whether a secret is set, never the secret itself, so
+        ``GET /api/apps`` can show a webhook indicator on every row without
+        putting a credential on the wire and without one query per
+        application.
+
+        Args:
+            domains: Restrict to these domains; every application when None.
+                An explicit empty sequence returns no rows and runs no query.
+
+        Returns:
+            Domain to whether its webhook secret is set (not NULL).
+        """
+        query = "SELECT domain, webhook_secret FROM apps"
+        params: list[Any] = []
+
+        if domains is not None:
+            unique = list(dict.fromkeys(domains))
+            if not unique:
+                return {}
+            placeholders = ",".join("?" * len(unique))
+            query += f" WHERE domain IN ({placeholders})"
+            params.extend(unique)
+
+        with self._transaction() as cursor:
+            cursor.execute(query, params)
+            return {row["domain"]: row["webhook_secret"] is not None for row in cursor.fetchall()}
+
     # =========================================================================
     # Domains
     # =========================================================================
@@ -2298,6 +2329,47 @@ class WASMStore:
         with self._transaction() as cursor:
             cursor.execute(query, params)
             return [DeploymentRecord.from_row(row) for row in cursor.fetchall()]
+
+    def get_latest_deployments(self, domains: Iterable[str]) -> dict[str, DeploymentRecord]:
+        """
+        Read the most recent deployment of each of several domains, one query.
+
+        ``GET /api/apps`` shows every application's last deployment.
+        :meth:`list_deployments` only takes a flat ``limit`` across every
+        domain, so asking it once per row would cost as many queries as
+        there are applications, and a generous limit still truncates before
+        an application late in the list is ever seen. A window function
+        ranks each domain's own rows instead, so this costs one round trip
+        regardless of how many applications are asked about.
+
+        Args:
+            domains: Domains to look up. Duplicates are ignored; empty
+                returns no rows and runs no query.
+
+        Returns:
+            Domain to its newest deployment record (by ``started_at``, ties
+            broken by ``id``), for domains that have at least one.
+        """
+        unique = list(dict.fromkeys(domains))
+        if not unique:
+            return {}
+
+        placeholders = ",".join("?" * len(unique))
+        query = f"""
+            SELECT id, domain, status, triggered_by, git_commit, git_branch,
+                   started_at, finished_at, duration_s, log_path, error
+            FROM (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY domain ORDER BY started_at DESC, id DESC
+                ) AS rn
+                FROM deployments
+                WHERE domain IN ({placeholders})
+            )
+            WHERE rn = 1
+        """
+        with self._transaction() as cursor:
+            cursor.execute(query, unique)
+            return {row["domain"]: DeploymentRecord.from_row(row) for row in cursor.fetchall()}
 
     def prune_deployments(self, domain: str, keep: int = 20) -> int:
         """

@@ -5,7 +5,7 @@ import type { AppInfo, Deployment } from "../apps/data";
 import { collectAttention } from "./attention";
 
 function app(domain: string, status: string): AppInfo {
-  return { domain, name: domain, status, active: status === "running", enabled: true, app_type: "nextjs", layout: "inplace" };
+  return { domain, name: domain, status, active: status === "running", enabled: true, app_type: "nextjs", layout: "inplace", webhook_enabled: false };
 }
 
 function deploy(id: number, domain: string, status: string, error: string | null = null): Deployment {
