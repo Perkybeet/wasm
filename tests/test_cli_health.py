@@ -29,6 +29,7 @@ from wasm.cli.commands import health as cli_health
 from wasm.core.exceptions import ServiceError
 from wasm.core.logger import Logger
 from wasm.core.store import App
+from wasm.managers import health as health_module
 
 #: Flags that belong to the root command and to no other.
 GLOBAL_FLAGS = frozenset({"-v", "--verbose", "--dry-run", "--json", "--no-color"})
@@ -147,28 +148,30 @@ def server(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
         },
     )()
 
+    # The check itself lives in wasm.managers.health, shared with the panel's
+    # GET /api/system/health; that is the module whose names this patches.
     monkeypatch.setattr(
-        cli_health,
+        health_module,
         "Config",
         lambda *a, **kw: type("FakeConfig", (), {"apps_directory": tmp_path})(),
     )
     # Disk and memory come from the machine running the suite, which would make
     # every assertion below depend on how full the developer's laptop is.
     monkeypatch.setattr(
-        cli_health.shutil,
+        health_module.shutil,
         "disk_usage",
         lambda path: SimpleNamespace(total=200 * _GB, used=50 * _GB, free=150 * _GB),
     )
     monkeypatch.setattr(
-        cli_health,
+        health_module,
         "_read_meminfo",
         lambda: {"MemTotal": 16 * 1024 * 1024, "MemAvailable": 12 * 1024 * 1024},
     )
-    monkeypatch.setattr(cli_health, "NginxManager", lambda *a, **kw: state.nginx)
-    monkeypatch.setattr(cli_health, "ApacheManager", lambda *a, **kw: state.apache)
-    monkeypatch.setattr(cli_health, "ServiceManager", lambda *a, **kw: state.services)
-    monkeypatch.setattr(cli_health, "CertManager", lambda *a, **kw: state.certs)
-    monkeypatch.setattr(cli_health, "get_store", lambda: state.store)
+    monkeypatch.setattr(health_module, "NginxManager", lambda *a, **kw: state.nginx)
+    monkeypatch.setattr(health_module, "ApacheManager", lambda *a, **kw: state.apache)
+    monkeypatch.setattr(health_module, "ServiceManager", lambda *a, **kw: state.services)
+    monkeypatch.setattr(health_module, "CertManager", lambda *a, **kw: state.certs)
+    monkeypatch.setattr(health_module, "get_store", lambda: state.store)
     return state
 
 

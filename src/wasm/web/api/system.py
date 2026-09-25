@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 
 from wasm import __version__
 from wasm.core.exceptions import DependencyError
+from wasm.managers.health import collect_health_report
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import WASMErrorRoute
 from wasm.web.machine import read_machine
@@ -193,6 +194,29 @@ class MachineOut(BaseModel):
     disk: MachineDisk
     units: MachineUnits
     apps: MachineApps
+
+
+class HealthCheckOut(BaseModel):
+    """One item of the health report - disk, a web server, apps, certs, memory."""
+
+    name: str
+    value: str
+    status: str
+
+
+class SystemHealthOut(BaseModel):
+    """
+    The same verdict and checks ``wasm health`` prints, as JSON.
+
+    :func:`wasm.managers.health.collect_health_report` is the one
+    implementation this and the CLI command both read; this model only
+    describes its shape for the OpenAPI contract.
+    """
+
+    verdict: str
+    checks: list[HealthCheckOut]
+    issues: list[str]
+    warnings: list[str]
 
 
 def _psutil() -> Any:
@@ -582,4 +606,31 @@ def check_version(session: Annotated[dict, Depends(get_current_session)]) -> Upd
         has_update=has_update,
         update_command=update_command,
         release_url=release_url,
+    )
+
+
+@router.get("/health", response_model=SystemHealthOut)
+def get_system_health(session: Annotated[dict, Depends(get_current_session)]) -> SystemHealthOut:
+    """
+    Report the same health verdict and checks as ``wasm health``.
+
+    Calls :func:`wasm.managers.health.collect_health_report`, the function the
+    CLI command itself calls, so the server card in the console can never
+    disagree with what an operator sees at the terminal.
+
+    Args:
+        session: The authenticated session.
+
+    Returns:
+        The verdict, every check that ran, and the issues and warnings behind it.
+    """
+    report = collect_health_report(verbose=False)
+    return SystemHealthOut(
+        verdict=report.verdict,
+        checks=[
+            HealthCheckOut(name=check.name, value=check.value, status=check.status)
+            for check in report.checks
+        ],
+        issues=report.issues,
+        warnings=report.warnings,
     )

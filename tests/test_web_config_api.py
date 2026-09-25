@@ -21,6 +21,7 @@ Three defect classes are pinned here:
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,7 @@ from fastapi.testclient import TestClient
 from wasm.core.config import DEFAULT_CONFIG, REDACTED, Config
 from wasm.web.api import config as config_api
 from wasm.web.api.auth import get_current_session
+from wasm.web.auth import AuditLogger, set_audit_logger
 
 #: Secrets planted in the stored configuration; none may reach a response.
 PLANTED_SECRETS = {
@@ -81,6 +83,40 @@ def client(config_path: Path) -> TestClient:
     app.include_router(config_api.router, prefix="/api/config")
     app.dependency_overrides[get_current_session] = lambda: {"session_id": "test"}
     return TestClient(app, raise_server_exceptions=False)
+
+
+@pytest.fixture
+def audit_log(tmp_path: Path) -> Iterator[Path]:
+    """
+    Install a real audit logger for the duration of a test.
+
+    Args:
+        tmp_path: Per-test temporary directory.
+
+    Yields:
+        Path the audit entries are appended to.
+    """
+    path = tmp_path / "web-audit.log"
+    set_audit_logger(AuditLogger(path))
+    try:
+        yield path
+    finally:
+        set_audit_logger(None)
+
+
+def read_audit(path: Path) -> list[dict[str, Any]]:
+    """
+    Read the audit log written during a test.
+
+    Args:
+        path: Path of the audit log file.
+
+    Returns:
+        One dict per audit line, oldest first. Empty when nothing was written.
+    """
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
 @pytest.fixture
@@ -441,3 +477,120 @@ class TestWriteFailures:
         response = client.put("/api/config/webserver", json={"webserver": "apache"})
 
         assert response.status_code == 403
+
+
+class TestSavesAreAudited:
+    """
+    Every way of saving settings leaves a record of what changed, not what to.
+
+    The server-rendered settings page this API replaced did both; losing that
+    on the way to the panel would mean an operator has no way to answer "who
+    changed the web server" or "who pointed the apps directory somewhere new".
+    """
+
+    def test_full_update_is_audited_with_the_changed_top_level_keys(
+        self, client: TestClient, audit_log: Path
+    ) -> None:
+        response = client.put("/api/config", json={"config": {"webserver": "apache"}})
+
+        assert response.status_code == 200, response.text
+        updates = [e for e in read_audit(audit_log) if e["action"] == "config.update"]
+        assert updates, "a full configuration write must be audited"
+        assert updates[0]["result"] == "success"
+        assert updates[0]["resource"] == "/api/config"
+        assert "webserver" in updates[0]["detail"]
+
+    def test_patch_is_audited_with_the_top_level_key_of_the_dotted_path(
+        self, client: TestClient, audit_log: Path
+    ) -> None:
+        response = client.patch("/api/config", json={"path": "web.port", "value": 9090})
+
+        assert response.status_code == 200, response.text
+        updates = [e for e in read_audit(audit_log) if e["action"] == "config.update"]
+        assert updates, "a patch must be audited"
+        assert updates[0]["detail"] == "changed keys: web"
+
+    @pytest.mark.parametrize(
+        ("endpoint", "payload", "expected_key"),
+        [
+            ("/apps-directory", {"apps_directory": "/srv/apps"}, "apps_directory"),
+            ("/webserver", {"webserver": "apache"}, "webserver"),
+            ("/backup", {"directory": "/var/backups/wasm", "max_per_app": 5}, "backup"),
+            ("/ssl", {"enabled": True, "provider": "certbot", "email": "a@b.c"}, "ssl"),
+            ("/web", {"host": "127.0.0.1", "port": 8081, "session_timeout": 600}, "web"),
+        ],
+    )
+    def test_every_typed_section_put_is_audited(
+        self,
+        client: TestClient,
+        audit_log: Path,
+        endpoint: str,
+        payload: dict[str, Any],
+        expected_key: str,
+    ) -> None:
+        response = client.put(f"/api/config{endpoint}", json=payload)
+
+        assert response.status_code == 200, response.text
+        updates = [e for e in read_audit(audit_log) if e["action"] == "config.update"]
+        assert updates, f"PUT {endpoint} must be audited"
+        assert expected_key in updates[0]["detail"]
+
+    def test_audit_entry_never_carries_a_secret_value(
+        self, client: TestClient, audit_log: Path, stored_secrets: dict[str, str]
+    ) -> None:
+        """The changed key name is recorded; what it changed to is not."""
+        response = client.patch(
+            "/api/config", json={"path": "monitor.openai.api_key", "value": "sk-rotated"}
+        )
+
+        assert response.status_code == 200, response.text
+        raw = audit_log.read_text()
+        assert "sk-rotated" not in raw
+        for secret in stored_secrets.values():
+            assert secret not in raw
+
+    def test_a_refused_write_is_not_reported_as_a_change(
+        self, client: TestClient, audit_log: Path
+    ) -> None:
+        """A value that never reached disk must not appear as a successful update."""
+        response = client.put("/api/config/webserver", json={"webserver": "iis"})
+
+        assert response.status_code == 400
+        assert [e for e in read_audit(audit_log) if e["action"] == "config.update"] == []
+
+
+class TestRelativeAppsDirectoryIsRefused:
+    """A relative apps directory resolves against whatever CWD a caller has."""
+
+    def test_the_typed_endpoint_refuses_a_relative_path(
+        self, client: TestClient, config_path: Path
+    ) -> None:
+        response = client.put("/api/config/apps-directory", json={"apps_directory": "var/www/apps"})
+
+        assert response.status_code == 400
+        assert "absolute path" in response.text
+        assert not config_path.exists()
+
+    def test_patch_refuses_a_relative_path(self, client: TestClient, config_path: Path) -> None:
+        response = client.patch(
+            "/api/config", json={"path": "apps_directory", "value": "relative/apps"}
+        )
+
+        assert response.status_code == 400
+        assert "absolute path" in response.text
+
+    def test_full_replace_refuses_a_relative_path(
+        self, client: TestClient, config_path: Path
+    ) -> None:
+        response = client.put("/api/config", json={"config": {"apps_directory": "relative/apps"}})
+
+        assert response.status_code == 400
+        assert "absolute path" in response.text
+        assert not config_path.exists()
+
+    def test_an_absolute_path_is_accepted(self, client: TestClient, config_path: Path) -> None:
+        """The guard rejects relative paths, not the directory setting itself."""
+        response = client.put("/api/config/apps-directory", json={"apps_directory": "/srv/apps"})
+
+        assert response.status_code == 200, response.text
+        assert client.get("/api/config/apps-directory").json()["apps_directory"] == "/srv/apps"

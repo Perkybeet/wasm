@@ -249,7 +249,7 @@
         "type": "object"
       },
       "AppInfo": {
-        "description": "A deployed application and the live state of its service.\n\nAttributes:\n    name: Application name, which is its domain.\n    domain: Domain the application is served on.\n    status: ``running``, ``stopped`` or ``static``.\n    active: Whether the unit is active.\n    enabled: Whether the unit starts on boot.\n    pid: Main PID when running.\n    uptime: How long the unit has been up.\n    port: Upstream port.\n    app_type: Deployer that owns it.\n    path: Application directory.",
+        "description": "A deployed application and the live state of its service.\n\nAttributes:\n    name: Application name, which is its domain.\n    domain: Domain the application is served on.\n    status: ``running``, ``stopped`` or ``static``.\n    active: Whether the unit is active.\n    enabled: Whether the unit starts on boot.\n    pid: Main PID when running.\n    uptime: How long the unit has been up.\n    port: Upstream port.\n    app_type: Deployer that owns it.\n    path: Application directory.\n    layout: ``inplace`` or ``releases``.\n    memory_max_mb: Memory limit of its unit, in MB, or None.\n    cpu_quota_percent: CPU quota of its unit, in percent of one CPU, or None.\n    tasks_max: Task limit of its unit, or None.",
         "properties": {
           "active": {
             "title": "Active",
@@ -266,6 +266,17 @@
             ],
             "title": "App Type"
           },
+          "cpu_quota_percent": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cpu Quota Percent"
+          },
           "domain": {
             "title": "Domain",
             "type": "string"
@@ -273,6 +284,22 @@
           "enabled": {
             "title": "Enabled",
             "type": "boolean"
+          },
+          "layout": {
+            "default": "inplace",
+            "title": "Layout",
+            "type": "string"
+          },
+          "memory_max_mb": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Max Mb"
           },
           "name": {
             "title": "Name",
@@ -314,6 +341,17 @@
           "status": {
             "title": "Status",
             "type": "string"
+          },
+          "tasks_max": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tasks Max"
           },
           "uptime": {
             "anyOf": [
@@ -396,6 +434,39 @@
           "apps_directory"
         ],
         "title": "AppsDirConfig",
+        "type": "object"
+      },
+      "AppsDirectoryResponse": {
+        "description": "The configured applications directory.",
+        "properties": {
+          "apps_directory": {
+            "title": "Apps Directory",
+            "type": "string"
+          }
+        },
+        "required": [
+          "apps_directory"
+        ],
+        "title": "AppsDirectoryResponse",
+        "type": "object"
+      },
+      "AppsDirectoryUpdateResponse": {
+        "description": "Confirmation for an applications directory update.",
+        "properties": {
+          "apps_directory": {
+            "title": "Apps Directory",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message",
+          "apps_directory"
+        ],
+        "title": "AppsDirectoryUpdateResponse",
         "type": "object"
       },
       "BackupActionResponse": {
@@ -692,6 +763,25 @@
         "title": "BackupScheduleInfo",
         "type": "object"
       },
+      "BackupSettingsResponse": {
+        "description": "The configured backup directory and retention.",
+        "properties": {
+          "directory": {
+            "title": "Directory",
+            "type": "string"
+          },
+          "max_per_app": {
+            "title": "Max Per App",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "directory",
+          "max_per_app"
+        ],
+        "title": "BackupSettingsResponse",
+        "type": "object"
+      },
       "BackupStorageResponse": {
         "description": "Response describing how much disk the backups take.",
         "properties": {
@@ -935,6 +1025,54 @@
         "title": "ConfigPatchRequest",
         "type": "object"
       },
+      "ConfigPatchResponse": {
+        "description": "Confirmation for a single-key update, echoing the value that was stored.",
+        "properties": {
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "value": {
+            "title": "Value"
+          }
+        },
+        "required": [
+          "message",
+          "path",
+          "value"
+        ],
+        "title": "ConfigPatchResponse",
+        "type": "object"
+      },
+      "ConfigReloadResponse": {
+        "description": "Configuration re-read from disk.",
+        "properties": {
+          "config": {
+            "additionalProperties": true,
+            "title": "Config",
+            "type": "object"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message",
+          "path",
+          "config"
+        ],
+        "title": "ConfigReloadResponse",
+        "type": "object"
+      },
       "ConfigResponse": {
         "description": "Response containing full configuration, with secrets redacted.",
         "properties": {
@@ -974,6 +1112,25 @@
           "config"
         ],
         "title": "ConfigUpdateRequest",
+        "type": "object"
+      },
+      "ConfigUpdateResponse": {
+        "description": "Confirmation for a full configuration replacement.",
+        "properties": {
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message",
+          "path"
+        ],
+        "title": "ConfigUpdateResponse",
         "type": "object"
       },
       "ConnectionStringRequest": {
@@ -1119,6 +1276,22 @@
             "title": "Env Vars",
             "type": "object"
           },
+          "layout": {
+            "anyOf": [
+              {
+                "enum": [
+                  "inplace",
+                  "releases"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Build every deploy as a release behind a health gate, or in place. Omitted: the server's deploy.layout",
+            "title": "Layout"
+          },
           "port": {
             "anyOf": [
               {
@@ -1186,8 +1359,15 @@
         "type": "object"
       },
       "CreateCertRequest": {
-        "description": "Request to obtain a certificate.\n\nAttributes:\n    email: Registration and expiry-notice address.\n    webserver: Web server whose certbot plugin should be used.\n    include_www: Also cover the ``www`` subdomain.",
+        "description": "Request to obtain a certificate.\n\nAttributes:\n    email: Registration and expiry-notice address.\n    domains: Extra domains (SANs) to cover, beyond the primary domain in\n        the path and the ``www`` alias ``include_www`` may add.\n    method: How to prove control of the domain. One of \"nginx\", \"apache\",\n        \"webroot\" or \"standalone\". Omitted lets WASM pick.\n    webroot: Webroot path, used when ``method`` is \"webroot\".\n    include_www: Also cover the ``www`` subdomain.\n    expand: Expand an existing certificate even when it already covers\n        every requested domain.",
         "properties": {
+          "domains": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Domains",
+            "type": "array"
+          },
           "email": {
             "anyOf": [
               {
@@ -1199,15 +1379,37 @@
             ],
             "title": "Email"
           },
+          "expand": {
+            "default": false,
+            "title": "Expand",
+            "type": "boolean"
+          },
           "include_www": {
             "default": false,
             "title": "Include Www",
             "type": "boolean"
           },
-          "webserver": {
-            "default": "nginx",
-            "title": "Webserver",
-            "type": "string"
+          "method": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Method"
+          },
+          "webroot": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webroot"
           }
         },
         "title": "CreateCertRequest",
@@ -2046,6 +2248,74 @@
         "title": "DeploymentTrigger",
         "type": "string"
       },
+      "DiagnoseCheck": {
+        "description": "One diagnostic probe's result.\n\nMirrors :class:`wasm.managers.diagnose.Check` field for field: this module\nonly translates it to HTTP, it does not reinterpret it.\n\nAttributes:\n    name: Stable identifier for the probe, such as ``\"unit\"`` or ``\"port\"``.\n    status: ``\"ok\"``, ``\"warn\"``, ``\"fail\"`` or ``\"skip\"``.\n    summary: One line, in WASM's own words.\n    evidence: Raw output the probe collected, verbatim.",
+        "properties": {
+          "evidence": {
+            "default": "",
+            "title": "Evidence",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "status",
+          "summary"
+        ],
+        "title": "DiagnoseCheck",
+        "type": "object"
+      },
+      "DiagnoseResponse": {
+        "description": "The full answer to \"why is this app down\".\n\nMirrors :class:`wasm.managers.diagnose.Diagnosis`, which is also what\n``wasm diagnose --json`` prints - the console and the CLI read the same\nshape.\n\nAttributes:\n    domain: The domain that was diagnosed.\n    verdict: ``\"healthy\"``, ``\"degraded\"`` or ``\"down\"``.\n    probable_cause: One sentence naming the most likely explanation, or\n        ``None`` when the checks disagree with each other or are all clean.\n    checks: Every probe that ran, in the order it ran in.",
+        "properties": {
+          "checks": {
+            "items": {
+              "$ref": "#/components/schemas/DiagnoseCheck"
+            },
+            "title": "Checks",
+            "type": "array"
+          },
+          "domain": {
+            "title": "Domain",
+            "type": "string"
+          },
+          "probable_cause": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Probable Cause"
+          },
+          "verdict": {
+            "title": "Verdict",
+            "type": "string"
+          }
+        },
+        "required": [
+          "domain",
+          "verdict",
+          "probable_cause",
+          "checks"
+        ],
+        "title": "DiagnoseResponse",
+        "type": "object"
+      },
       "DiskEntry": {
         "description": "Capacity of one filesystem.\n\nAttributes:\n    mountpoint: Where it is mounted.\n    device: Backing device.\n    fstype: Filesystem type.\n    total_bytes: Size.\n    used_bytes: Bytes in use.\n    free_bytes: Bytes available.\n    percent: Percentage used.",
         "properties": {
@@ -2409,6 +2679,30 @@
         "title": "HTTPValidationError",
         "type": "object"
       },
+      "HealthCheckOut": {
+        "description": "One item of the health report - disk, a web server, apps, certs, memory.",
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "value": {
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "value",
+          "status"
+        ],
+        "title": "HealthCheckOut",
+        "type": "object"
+      },
       "InspectSourceRequest": {
         "description": "Request to preview what a repository is before deploying it.",
         "properties": {
@@ -2747,6 +3041,71 @@
         "title": "JobResponse",
         "type": "object"
       },
+      "LimitsResponse": {
+        "description": "The limits an application has now.\n\nAttributes:\n    domain: The application's domain.\n    memory_max_mb: Memory limit in MB, or None.\n    cpu_quota_percent: CPU quota in percent of one CPU, or None.\n    tasks_max: Task limit, or None.\n    units: The units rewritten.\n    restarted: Whether they were restarted.\n    restart_required: Whether the running processes still have the old\n        limits until they are restarted.",
+        "properties": {
+          "cpu_quota_percent": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cpu Quota Percent"
+          },
+          "domain": {
+            "title": "Domain",
+            "type": "string"
+          },
+          "memory_max_mb": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Max Mb"
+          },
+          "restart_required": {
+            "title": "Restart Required",
+            "type": "boolean"
+          },
+          "restarted": {
+            "title": "Restarted",
+            "type": "boolean"
+          },
+          "tasks_max": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tasks Max"
+          },
+          "units": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Units",
+            "type": "array"
+          }
+        },
+        "required": [
+          "domain",
+          "units",
+          "restarted",
+          "restart_required"
+        ],
+        "title": "LimitsResponse",
+        "type": "object"
+      },
       "LoginRequest": {
         "description": "Login request body.\n\nAttributes:\n    token: The master access token.\n    bearer: Whether to also return the session token in the response, for\n        clients without a cookie jar.\n    totp_code: Second factor - a six-digit authenticator code or a backup\n        code. Required when two-factor authentication is enabled.",
         "properties": {
@@ -3028,6 +3387,82 @@
         "title": "MemoryInfo",
         "type": "object"
       },
+      "MessageResponse": {
+        "description": "A bare confirmation, for a write with nothing else to report back.",
+        "properties": {
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "title": "MessageResponse",
+        "type": "object"
+      },
+      "MetricHistoryResponse": {
+        "description": "One metric's points over a window, oldest first.",
+        "properties": {
+          "metric": {
+            "title": "Metric",
+            "type": "string"
+          },
+          "points": {
+            "items": {
+              "maxItems": 2,
+              "minItems": 2,
+              "prefixItems": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "number"
+                }
+              ],
+              "type": "array"
+            },
+            "title": "Points",
+            "type": "array"
+          },
+          "window": {
+            "title": "Window",
+            "type": "string"
+          }
+        },
+        "required": [
+          "metric",
+          "window",
+          "points"
+        ],
+        "title": "MetricHistoryResponse",
+        "type": "object"
+      },
+      "MetricsListResponse": {
+        "description": "Every metric name the store has data for, and the windows it can be read over.",
+        "properties": {
+          "metrics": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Metrics",
+            "type": "array"
+          },
+          "windows": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Windows",
+            "type": "array"
+          }
+        },
+        "required": [
+          "metrics",
+          "windows"
+        ],
+        "title": "MetricsListResponse",
+        "type": "object"
+      },
       "MetricsResponse": {
         "description": "A point-in-time reading of machine resources.\n\nAttributes:\n    collected_at: When the reading was taken, ISO 8601.\n    cpu_percent: System-wide CPU usage.\n    cpu_count: Logical CPU count.\n    load_average: One, five and fifteen minute load averages.\n    memory_total_bytes: Total RAM.\n    memory_used_bytes: RAM in use.\n    memory_percent: RAM usage percentage.\n    swap_percent: Swap usage percentage.\n    disks: Capacity of each real filesystem.\n    net_bytes_sent: Bytes sent since boot.\n    net_bytes_recv: Bytes received since boot.\n    process_count: Number of processes.\n    uptime_seconds: Seconds since boot.",
         "properties": {
@@ -3106,6 +3541,226 @@
           "uptime_seconds"
         ],
         "title": "MetricsResponse",
+        "type": "object"
+      },
+      "MigrateRequest": {
+        "description": "Request to migrate an application to the release layout.",
+        "properties": {
+          "persist": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Paths to keep in shared/, relative to the application. Omitted: what git does not track, or the usual upload directories",
+            "title": "Persist"
+          }
+        },
+        "title": "MigrateRequest",
+        "type": "object"
+      },
+      "MigrationPlanOut": {
+        "description": "What migrating an in-place application to releases would do.\n\nAttributes:\n    domain: The application's domain.\n    app_path: Its directory.\n    release_id: The name the first release would get (a forecast).\n    commit: The commit the tree is at, when it is a git checkout.\n    persistent: Paths that move to ``shared/`` and are linked into every\n        release from now on.\n    persistent_source: ``git`` (what git does not track), ``explicit``\n        (as named) or ``common`` (the usual upload directories).\n    env_files: Environment files that move to ``shared/``.\n    unit: The unit that runs it, or None for a site.\n    unit_rewrite: Whether the unit is rewritten to run from ``current``.\n    site_rewrite: Whether the site is rewritten to serve ``current``.\n    untracked_files: Files that stay in the first release only.\n    warnings: What the operator should read before going ahead.\n    files: Regular files the directory holds; all of them are kept.\n    bytes: Their total size.",
+        "properties": {
+          "app_path": {
+            "title": "App Path",
+            "type": "string"
+          },
+          "bytes": {
+            "title": "Bytes",
+            "type": "integer"
+          },
+          "commit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Commit"
+          },
+          "domain": {
+            "title": "Domain",
+            "type": "string"
+          },
+          "env_files": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Env Files",
+            "type": "array"
+          },
+          "files": {
+            "title": "Files",
+            "type": "integer"
+          },
+          "persistent": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Persistent",
+            "type": "array"
+          },
+          "persistent_source": {
+            "title": "Persistent Source",
+            "type": "string"
+          },
+          "release_id": {
+            "title": "Release Id",
+            "type": "string"
+          },
+          "site_rewrite": {
+            "title": "Site Rewrite",
+            "type": "boolean"
+          },
+          "unit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit"
+          },
+          "unit_rewrite": {
+            "title": "Unit Rewrite",
+            "type": "boolean"
+          },
+          "untracked_files": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Untracked Files",
+            "type": "array"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Warnings",
+            "type": "array"
+          }
+        },
+        "required": [
+          "domain",
+          "app_path",
+          "release_id",
+          "persistent",
+          "persistent_source",
+          "env_files",
+          "unit_rewrite",
+          "site_rewrite",
+          "untracked_files",
+          "warnings",
+          "files",
+          "bytes"
+        ],
+        "title": "MigrationPlanOut",
+        "type": "object"
+      },
+      "MigrationResultOut": {
+        "description": "What a migration did.\n\nAttributes:\n    domain: The application's domain.\n    release_id: The first release, now active.\n    persistent: What is kept in ``shared/``.\n    env_files: Environment files moved to ``shared/``.\n    files_before: Regular files before.\n    files_after: Regular files after, ``shared/`` included; always equal.\n    bytes_before: Their size before.\n    bytes_after: Their size after.\n    unit_rewritten: Whether the unit was rewritten.\n    site_rewritten: Whether the site was rewritten.\n    deployment_id: The deployment history row that records it.",
+        "properties": {
+          "bytes_after": {
+            "title": "Bytes After",
+            "type": "integer"
+          },
+          "bytes_before": {
+            "title": "Bytes Before",
+            "type": "integer"
+          },
+          "deployment_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deployment Id"
+          },
+          "domain": {
+            "title": "Domain",
+            "type": "string"
+          },
+          "env_files": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Env Files",
+            "type": "array"
+          },
+          "files_after": {
+            "title": "Files After",
+            "type": "integer"
+          },
+          "files_before": {
+            "title": "Files Before",
+            "type": "integer"
+          },
+          "persistent": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Persistent",
+            "type": "array"
+          },
+          "release_id": {
+            "title": "Release Id",
+            "type": "string"
+          },
+          "site_rewritten": {
+            "title": "Site Rewritten",
+            "type": "boolean"
+          },
+          "unit_rewritten": {
+            "title": "Unit Rewritten",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "domain",
+          "release_id",
+          "persistent",
+          "env_files",
+          "files_before",
+          "files_after",
+          "bytes_before",
+          "bytes_after",
+          "unit_rewritten",
+          "site_rewritten"
+        ],
+        "title": "MigrationResultOut",
+        "type": "object"
+      },
+      "MonitorActionResponse": {
+        "description": "Outcome of a systemd action against the monitor unit, or of acknowledging\nan observation - every handler below answers exactly these two fields.",
+        "properties": {
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "success": {
+            "title": "Success",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success",
+          "message"
+        ],
+        "title": "MonitorActionResponse",
         "type": "object"
       },
       "MonitorSettings": {
@@ -3564,6 +4219,140 @@
         "title": "QueryResponse",
         "type": "object"
       },
+      "ReleaseActivationResponse": {
+        "description": "The outcome of activating a release.\n\nAttributes:\n    domain: The application's domain.\n    release_id: The release now serving.\n    previous_id: The release that served before, if any.\n    changed: False when the release was already active and nothing was done.\n    rolled_back: Whether the release activated is older than the one it\n        replaced.\n    deployment_id: The deployment history row that records it.",
+        "properties": {
+          "changed": {
+            "title": "Changed",
+            "type": "boolean"
+          },
+          "deployment_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deployment Id"
+          },
+          "domain": {
+            "title": "Domain",
+            "type": "string"
+          },
+          "previous_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Previous Id"
+          },
+          "release_id": {
+            "title": "Release Id",
+            "type": "string"
+          },
+          "rolled_back": {
+            "title": "Rolled Back",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "domain",
+          "release_id",
+          "changed",
+          "rolled_back"
+        ],
+        "title": "ReleaseActivationResponse",
+        "type": "object"
+      },
+      "ReleaseOut": {
+        "description": "One release of an application on the release layout.\n\nAttributes:\n    id: Release id, the directory name under ``releases/``.\n    commit: Short commit it was built from; None for a non-git source.\n    created_at: When it was created, ISO 8601 in UTC.\n    activated_at: When it last became active, if it ever did.\n    status: ``active``, ``superseded``, ``rolled_back``, ``failed`` or\n        ``built``.\n    active: Whether it is the one serving.\n    on_disk: Whether it can be activated. A failed release is listed for\n        a while after its directory was removed.",
+        "properties": {
+          "activated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Activated At"
+          },
+          "active": {
+            "title": "Active",
+            "type": "boolean"
+          },
+          "commit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Commit"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "on_disk": {
+            "title": "On Disk",
+            "type": "boolean"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "status",
+          "active",
+          "on_disk"
+        ],
+        "title": "ReleaseOut",
+        "type": "object"
+      },
+      "ReleasesResponse": {
+        "description": "The releases of an application, newest first.",
+        "properties": {
+          "domain": {
+            "title": "Domain",
+            "type": "string"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ReleaseOut"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "domain",
+          "items",
+          "total"
+        ],
+        "title": "ReleasesResponse",
+        "type": "object"
+      },
       "ReloadResponse": {
         "description": "Response for a web server reload.",
         "properties": {
@@ -3598,6 +4387,25 @@
           }
         },
         "title": "RenewCertRequest",
+        "type": "object"
+      },
+      "RevokedResponse": {
+        "description": "Confirmation that one record - a session or an API token - was revoked.",
+        "properties": {
+          "revoked": {
+            "title": "Revoked",
+            "type": "string"
+          },
+          "success": {
+            "title": "Success",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success",
+          "revoked"
+        ],
+        "title": "RevokedResponse",
         "type": "object"
       },
       "RollbackPointOut": {
@@ -3714,6 +4522,30 @@
         "title": "SSLConfig",
         "type": "object"
       },
+      "SSLSettingsResponse": {
+        "description": "The configured SSL/TLS settings.",
+        "properties": {
+          "email": {
+            "title": "Email",
+            "type": "string"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "provider": {
+            "title": "Provider",
+            "type": "string"
+          }
+        },
+        "required": [
+          "enabled",
+          "provider",
+          "email"
+        ],
+        "title": "SSLSettingsResponse",
+        "type": "object"
+      },
       "ScanResponse": {
         "description": "Result of a single scan.\n\nAttributes:\n    scanned: How many processes were inspected.\n    observations: What stood out, warnings first.\n    count: Number of observations.\n    scope: What the scan did not do.",
         "properties": {
@@ -3824,6 +4656,30 @@
         "title": "ServiceActionResponse",
         "type": "object"
       },
+      "ServiceConfigResponse": {
+        "description": "Response for reading a service's unit file.\n\nA separate class from :class:`UpdateServiceConfigRequest`, even though the\n``config`` field is the same string in both directions: sharing one model\nbetween a request and a response body makes FastAPI generate distinct\ninput and output schemas for it, and a field with a default would then\ncome out optional to send but required to receive - correct for neither\ndirection. ``path`` has no default either way, so this stays simple, but\nthe module keeps every read-only body in its own class for that reason.",
+        "properties": {
+          "config": {
+            "title": "Config",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "service": {
+            "title": "Service",
+            "type": "string"
+          }
+        },
+        "required": [
+          "service",
+          "config",
+          "path"
+        ],
+        "title": "ServiceConfigResponse",
+        "type": "object"
+      },
       "ServiceInfo": {
         "description": "Service information.",
         "properties": {
@@ -3919,6 +4775,69 @@
         "title": "ServiceListResponse",
         "type": "object"
       },
+      "ServiceLogsResponse": {
+        "description": "Response for reading a service's journal.",
+        "properties": {
+          "lines": {
+            "title": "Lines",
+            "type": "integer"
+          },
+          "logs": {
+            "title": "Logs",
+            "type": "string"
+          },
+          "service": {
+            "title": "Service",
+            "type": "string"
+          }
+        },
+        "required": [
+          "service",
+          "logs",
+          "lines"
+        ],
+        "title": "ServiceLogsResponse",
+        "type": "object"
+      },
+      "SessionEntry": {
+        "description": "One live session, with no usable identifier in it.\n\nAttributes:\n    sid_prefix: Leading characters of the session id - enough to name a\n        row for revocation, useless for forging the cookie it belongs to.\n    client_ip: Address the session was issued to.\n    created_at: When the session was issued, as a UNIX timestamp.\n    last_seen: Most recent activity, as a UNIX timestamp.\n    expires_at: When the session stops being valid, as a UNIX timestamp.\n    is_current: Whether this is the session the caller is using now.",
+        "properties": {
+          "client_ip": {
+            "title": "Client Ip",
+            "type": "string"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "number"
+          },
+          "expires_at": {
+            "title": "Expires At",
+            "type": "number"
+          },
+          "is_current": {
+            "title": "Is Current",
+            "type": "boolean"
+          },
+          "last_seen": {
+            "title": "Last Seen",
+            "type": "number"
+          },
+          "sid_prefix": {
+            "title": "Sid Prefix",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sid_prefix",
+          "client_ip",
+          "created_at",
+          "last_seen",
+          "expires_at",
+          "is_current"
+        ],
+        "title": "SessionEntry",
+        "type": "object"
+      },
       "SessionInfo": {
         "description": "Bootstrap information the console reads before it knows anything else.\n\nAnswered for an anonymous caller too, with ``authenticated=False``, so the\nconsole can decide between the sign-in screen and the shell from one\nrequest instead of treating a 401 as \"maybe not logged in yet\".\n\nAttributes:\n    authenticated: Whether a usable credential was presented.\n    scope: The credential's scope, or None when unauthenticated.\n    expires_at: Session expiry, ISO 8601, or None.\n    elevated_until: End of the sudo-mode confirmation window, ISO 8601,\n        or None when the session is not currently elevated.\n    totp_enabled: Whether logins require a second factor.\n    hostname: This machine's hostname, so an operator with several panels\n        open can tell them apart.\n    version: The installed WASM version.\n    csrf_header: Header name a mutation must echo the CSRF cookie in.\n    csrf_cookie: Name of the readable CSRF cookie.",
         "properties": {
@@ -3989,6 +4908,40 @@
           "version"
         ],
         "title": "SessionInfo",
+        "type": "object"
+      },
+      "SessionsListResponse": {
+        "description": "Every active session.\n\nAttributes:\n    active_sessions: Count of live sessions.\n    current_session: The caller's own session id, unmasked - it is\n        already the credential proving the request, unlike every other\n        session's id, which only ever leaves as a prefix.\n    sessions: One entry per live session, newest activity first.",
+        "properties": {
+          "active_sessions": {
+            "title": "Active Sessions",
+            "type": "integer"
+          },
+          "current_session": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Session"
+          },
+          "sessions": {
+            "items": {
+              "$ref": "#/components/schemas/SessionEntry"
+            },
+            "title": "Sessions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "active_sessions",
+          "current_session",
+          "sessions"
+        ],
+        "title": "SessionsListResponse",
         "type": "object"
       },
       "SiteActionResponse": {
@@ -4181,6 +5134,63 @@
           "commit"
         ],
         "title": "SourceInspectionResponse",
+        "type": "object"
+      },
+      "SuccessResponse": {
+        "description": "A bare confirmation, for an action with nothing else to report back.",
+        "properties": {
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "success": {
+            "title": "Success",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success",
+          "message"
+        ],
+        "title": "SuccessResponse",
+        "type": "object"
+      },
+      "SystemHealthOut": {
+        "description": "The same verdict and checks ``wasm health`` prints, as JSON.\n\n:func:`wasm.managers.health.collect_health_report` is the one\nimplementation this and the CLI command both read; this model only\ndescribes its shape for the OpenAPI contract.",
+        "properties": {
+          "checks": {
+            "items": {
+              "$ref": "#/components/schemas/HealthCheckOut"
+            },
+            "title": "Checks",
+            "type": "array"
+          },
+          "issues": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Issues",
+            "type": "array"
+          },
+          "verdict": {
+            "title": "Verdict",
+            "type": "string"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Warnings",
+            "type": "array"
+          }
+        },
+        "required": [
+          "verdict",
+          "checks",
+          "issues",
+          "warnings"
+        ],
+        "title": "SystemHealthOut",
         "type": "object"
       },
       "SystemInfo": {
@@ -4410,6 +5420,55 @@
         "title": "UpdateInfo",
         "type": "object"
       },
+      "UpdateLimitsRequest": {
+        "description": "The memory, CPU and task limits an application's unit must have.\n\nThe three are set together: a field left out or null removes that limit.",
+        "properties": {
+          "cpu_quota_percent": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "CPUQuota, in percent of one CPU (200 is two CPUs); 1 to 100 per CPU. Null: no limit",
+            "title": "Cpu Quota Percent"
+          },
+          "memory_max_mb": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "MemoryMax, in MB; at least 64. Null: no limit",
+            "title": "Memory Max Mb"
+          },
+          "restart": {
+            "default": false,
+            "description": "Restart now, so the processes run under the new limits",
+            "title": "Restart",
+            "type": "boolean"
+          },
+          "tasks_max": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "TasksMax, processes and threads; at least 16. Null: no limit",
+            "title": "Tasks Max"
+          }
+        },
+        "title": "UpdateLimitsRequest",
+        "type": "object"
+      },
       "UpdateRequest": {
         "description": "Request to update an application.",
         "properties": {
@@ -4625,6 +5684,30 @@
         "title": "WebConfig",
         "type": "object"
       },
+      "WebSettingsResponse": {
+        "description": "The configured web interface settings.",
+        "properties": {
+          "host": {
+            "title": "Host",
+            "type": "string"
+          },
+          "port": {
+            "title": "Port",
+            "type": "integer"
+          },
+          "session_timeout": {
+            "title": "Session Timeout",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "host",
+          "port",
+          "session_timeout"
+        ],
+        "title": "WebSettingsResponse",
+        "type": "object"
+      },
       "WebSocketTicket": {
         "description": "Single-use credential for opening a WebSocket.\n\nAttributes:\n    ticket: The ticket value.\n    expires_in: Ticket lifetime in seconds.",
         "properties": {
@@ -4774,6 +5857,39 @@
           "webserver"
         ],
         "title": "WebserverConfig",
+        "type": "object"
+      },
+      "WebserverResponse": {
+        "description": "The configured web server.",
+        "properties": {
+          "webserver": {
+            "title": "Webserver",
+            "type": "string"
+          }
+        },
+        "required": [
+          "webserver"
+        ],
+        "title": "WebserverResponse",
+        "type": "object"
+      },
+      "WebserverUpdateResponse": {
+        "description": "Confirmation for a web server update.",
+        "properties": {
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "webserver": {
+            "title": "Webserver",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message",
+          "webserver"
+        ],
+        "title": "WebserverUpdateResponse",
         "type": "object"
       },
       "wasm__web__api__backups__BackupListResponse": {
@@ -5245,9 +6361,52 @@
         ]
       }
     },
+    "/api/apps/{domain}/diagnose": {
+      "get": {
+        "description": "Correlate everything WASM can read about a domain into one diagnosis.\n\nRuns the same probes as ``wasm diagnose <domain>``: the systemd unit, the\nport, an HTTP probe direct to the app and through the web server, its last\njournal lines, the web server's own error log, its certificate, its last\ndeployment, OOM kills and disk space - and reports the most likely cause\nfirst. Every probe only reads; nothing here changes the machine. An\nunknown domain is not a 404: the probes report it as the most likely\ncause instead, exactly as the CLI does.\n\nArgs:\n    domain: Domain to diagnose.\n    session: Authenticated session, injected.\n\nReturns:\n    Every probe's result and the verdict derived from them.",
+        "operationId": "diagnose_app_api_apps__domain__diagnose_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "domain",
+            "required": true,
+            "schema": {
+              "title": "Domain",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiagnoseResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Diagnose App",
+        "tags": [
+          "Applications"
+        ]
+      }
+    },
     "/api/apps/{domain}/env": {
       "get": {
-        "description": "Read an application's environment from its ``.env`` file.\n\nThis reads the file :mod:`wasm.deployers.helpers.env_manager` writes, the\nsame one ``wasm env show`` reads on the terminal - not the snapshot the\nstore recorded at deploy time, which can drift the moment anyone edits\nthe file by hand.\n\nArgs:\n    domain: Domain of the application.\n    request: The incoming request, for the audit record.\n    session: The authenticated session.\n    unmask: When true, values are returned in clear instead of redacted.\n        Every such read is audited, naming the caller but never a value.\n\nReturns:\n    The stored variables, redacted unless unmask was asked for.\n\nRaises:\n    HTTPException: 403 when unmasking with less than an admin credential,\n        404 when the application is unknown.",
+        "description": "Read an application's environment from its ``.env`` file.\n\nThis reads the file :mod:`wasm.deployers.helpers.app_env` writes, the\nsame one ``wasm env show`` reads on the terminal - not the snapshot the\nstore recorded at deploy time, which can drift the moment anyone edits\nthe file by hand. On the release layout that is ``shared/.env``.\n\nArgs:\n    domain: Domain of the application.\n    request: The incoming request, for the audit record.\n    session: The authenticated session.\n    unmask: When true, values are returned in clear instead of redacted.\n        Every such read is audited, naming the caller but never a value.\n\nReturns:\n    The stored variables, redacted unless unmask was asked for.\n\nRaises:\n    HTTPException: 403 when unmasking with less than an admin credential,\n        404 when the application is unknown.",
         "operationId": "get_app_env_api_apps__domain__env_get",
         "parameters": [
           {
@@ -5298,7 +6457,7 @@
         ]
       },
       "put": {
-        "description": "Replace an application's ``.env`` file wholesale.\n\nEvery name and value is validated against what can safely reach a\nsystemd unit (:mod:`wasm.validators.environment`) before anything is\nwritten, so a rejected variable leaves the file on disk untouched. The\nwrite goes through :class:`~wasm.deployers.helpers.env_manager.EnvManager`,\nthe same seam ``wasm env configure`` uses, so the file lands 0600 either\nway.\n\nThe application is not restarted: a process already running keeps the\nenvironment it started with until it is, so the caller is told a restart\nis required rather than one being queued silently underneath it.\n\nArgs:\n    domain: Domain of the application.\n    body: The complete name to value mapping to write.\n    request: The incoming request, for the audit record.\n    session: The authenticated session.\n\nReturns:\n    Confirmation that a restart is required to pick up the change.\n\nRaises:\n    HTTPException: 404 when the application is unknown, 422 when a name\n        or a value is not safe to write into a systemd unit.",
+        "description": "Replace an application's ``.env`` file wholesale.\n\nEvery name and value is validated against what can safely reach a\nsystemd unit (:mod:`wasm.validators.environment`) before anything is\nwritten, so a rejected variable leaves the file on disk untouched. The\nwrite goes through :func:`~wasm.deployers.helpers.app_env.write_app_env`,\nthe same function ``wasm env configure`` uses, so the file lands 0600,\nowned by the service account, in ``shared/`` on the release layout.\n\nThe application is not restarted: a process already running keeps the\nenvironment it started with until it is, so the caller is told a restart\nis required rather than one being queued silently underneath it.\n\nArgs:\n    domain: Domain of the application.\n    body: The complete name to value mapping to write.\n    request: The incoming request, for the audit record.\n    session: The authenticated session.\n\nReturns:\n    Confirmation that a restart is required to pick up the change.\n\nRaises:\n    HTTPException: 404 when the application is unknown, 422 when a name\n        or a value is not safe to write into a systemd unit.",
         "operationId": "update_app_env_api_apps__domain__env_put",
         "parameters": [
           {
@@ -5344,6 +6503,59 @@
           }
         },
         "summary": "Update App Env",
+        "tags": [
+          "Applications"
+        ]
+      }
+    },
+    "/api/apps/{domain}/limits": {
+      "patch": {
+        "description": "Set the memory, CPU and task limits of an application's unit.\n\nRewrites the unit (every unit, for a monorepo) and reloads systemd, which\nis a change to what runs as root's configuration, so it needs sudo mode\nlike editing a unit by hand does. The values are validated where every\ncaller's are, in the service manager.\n\nArgs:\n    domain: Domain of the application.\n    body: The limits, and whether to restart now.\n    session: The authenticated, elevated session.\n\nReturns:\n    The limits the application has now.\n\nRaises:\n    HTTPException: 404 when the application is unknown.\n    ValidationError: A limit is out of range (400, with the range).\n    DeploymentError: Nothing runs as a unit for it.",
+        "operationId": "update_app_limits_api_apps__domain__limits_patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "domain",
+            "required": true,
+            "schema": {
+              "title": "Domain",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateLimitsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LimitsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update App Limits",
         "tags": [
           "Applications"
         ]
@@ -5399,6 +6611,216 @@
           }
         },
         "summary": "Get App Logs",
+        "tags": [
+          "Applications"
+        ]
+      }
+    },
+    "/api/apps/{domain}/migrate": {
+      "post": {
+        "description": "Move an in-place application onto the release layout.\n\nRewrites the unit and the site and moves the whole application tree, so\nit needs sudo mode. The plan is worked out again here rather than taken\nfrom the client: what is executed is what is on disk now.\n\nArgs:\n    domain: Domain of the application.\n    body: Paths to keep in ``shared/``, if the detection is not wanted.\n    session: The authenticated, elevated session.\n\nReturns:\n    What was done.\n\nRaises:\n    HTTPException: 404 when the application is unknown, 409 when it is on\n        releases already.\n    ValidationError: A path in ``persist`` is not inside the application.\n    DeploymentError: A step failed or the application did not answer on\n        the new layout; everything was put back, and the details carry\n        the health check's own output.",
+        "operationId": "migrate_app_api_apps__domain__migrate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "domain",
+            "required": true,
+            "schema": {
+              "title": "Domain",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MigrateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MigrationResultOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Migrate App",
+        "tags": [
+          "Applications"
+        ]
+      }
+    },
+    "/api/apps/{domain}/migrate/plan": {
+      "get": {
+        "description": "Show what migrating an in-place application to releases would do. Changes nothing.\n\nArgs:\n    domain: Domain of the application.\n    session: The authenticated session.\n    persist: Paths to keep in ``shared/``; repeat the parameter for each.\n\nReturns:\n    The plan, from :func:`wasm.deployers.migrate.plan_migration`.\n\nRaises:\n    HTTPException: 404 when the application is unknown, 409 when it is on\n        releases already.\n    ValidationError: A path in ``persist`` is not inside the application.\n    DeploymentError: Its type cannot use releases.",
+        "operationId": "get_migration_plan_api_apps__domain__migrate_plan_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "domain",
+            "required": true,
+            "schema": {
+              "title": "Domain",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "persist",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Persist"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MigrationPlanOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Migration Plan",
+        "tags": [
+          "Applications"
+        ]
+      }
+    },
+    "/api/apps/{domain}/releases": {
+      "get": {
+        "description": "List an application's releases, newest first.\n\nArgs:\n    domain: Domain of the application.\n    session: The authenticated session.\n\nReturns:\n    The releases, from :func:`wasm.deployers.lifecycle.list_releases`,\n    the same listing ``wasm releases list`` prints.\n\nRaises:\n    HTTPException: 404 when the application is unknown, 409 when it is\n        deployed in place.",
+        "operationId": "get_app_releases_api_apps__domain__releases_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "domain",
+            "required": true,
+            "schema": {
+              "title": "Domain",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReleasesResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get App Releases",
+        "tags": [
+          "Applications"
+        ]
+      }
+    },
+    "/api/apps/{domain}/releases/{release_id}/activate": {
+      "post": {
+        "description": "Make a release the one that serves: an instant rollback, or a roll forward.\n\nNeeds the ``deploy`` scope, like queueing an update: it changes what code\nruns, and nothing else. The release passes the same health gate as a\ndeploy; one that does not is recorded as failed and the release that was\nserving is put back before this answers.\n\nArgs:\n    domain: Domain of the application.\n    release_id: The release to activate.\n    session: The authenticated session.\n\nReturns:\n    What was done.\n\nRaises:\n    HTTPException: 400 for something that is not a release id, 404 for an\n        unknown application or a release that is not on disk, 409 for an\n        application deployed in place.\n    DeploymentError: The release did not pass its health check; the\n        details carry the probe's and the journal's own output.",
+        "operationId": "activate_app_release_api_apps__domain__releases__release_id__activate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "domain",
+            "required": true,
+            "schema": {
+              "title": "Domain",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "release_id",
+            "required": true,
+            "schema": {
+              "title": "Release Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReleaseActivationResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Activate App Release",
         "tags": [
           "Applications"
         ]
@@ -5786,9 +7208,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Two Factor Disable Api Auth 2Fa Disable Post",
-                  "type": "object"
+                  "$ref": "#/components/schemas/SuccessResponse"
                 }
               }
             },
@@ -5926,9 +7346,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Logout Api Auth Logout Post",
-                  "type": "object"
+                  "$ref": "#/components/schemas/SuccessResponse"
                 }
               }
             },
@@ -5972,9 +7390,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Get Sessions Api Auth Sessions Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/SessionsListResponse"
                 }
               }
             },
@@ -5996,9 +7412,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Revoke All Sessions Api Auth Sessions Revoke All Post",
-                  "type": "object"
+                  "$ref": "#/components/schemas/SuccessResponse"
                 }
               }
             },
@@ -6031,9 +7445,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Revoke One Session Api Auth Sessions  Sid Prefix  Delete",
-                  "type": "object"
+                  "$ref": "#/components/schemas/RevokedResponse"
                 }
               }
             },
@@ -6138,9 +7550,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Revoke Api Token Api Auth Tokens  Token Id  Delete",
-                  "type": "object"
+                  "$ref": "#/components/schemas/RevokedResponse"
                 }
               }
             },
@@ -6780,7 +8190,7 @@
         ]
       },
       "post": {
-        "description": "Obtain a certificate for a domain.\n\nArgs:\n    domain: Primary domain of the certificate.\n    data: Issuance options.\n    session: The authenticated session.\n\nReturns:\n    The queued job.",
+        "description": "Obtain a certificate for a domain.\n\nArgs:\n    domain: Primary domain of the certificate.\n    data: Issuance options.\n    session: The authenticated session.\n\nReturns:\n    The queued job.\n\nRaises:\n    ValidationError: When ``method`` is not one of the methods certbot\n        offers, or a domain in ``domains`` is not a valid domain name.",
         "operationId": "create_certificate_api_certs__domain__post",
         "parameters": [
           {
@@ -6963,7 +8373,7 @@
         ]
       },
       "patch": {
-        "description": "Update a single configuration value addressed by a dotted path.\n\nThe stored value is echoed back redacted, so a secret does not travel twice.\n\nArgs:\n    request: Body carrying the dotted path and the new value.\n    session: Authenticated session, injected by the dependency.\n\nReturns:\n    Confirmation message, the path written and the resulting value.\n\nRaises:\n    HTTPException: If the configuration cannot be written.",
+        "description": "Update a single configuration value addressed by a dotted path.\n\nThe stored value is echoed back redacted, so a secret does not travel twice.\n\nArgs:\n    body: Body carrying the dotted path and the new value.\n    request: The incoming request, for the audit record.\n    session: Authenticated session, injected by the dependency.\n\nReturns:\n    Confirmation message, the path written and the resulting value.\n\nRaises:\n    HTTPException: If the configuration cannot be written.",
         "operationId": "patch_config_api_config_patch",
         "requestBody": {
           "content": {
@@ -6980,9 +8390,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Patch Config Api Config Patch",
-                  "type": "object"
+                  "$ref": "#/components/schemas/ConfigPatchResponse"
                 }
               }
             },
@@ -7005,7 +8413,7 @@
         ]
       },
       "put": {
-        "description": "Replace the full configuration.\n\nPlaceholders sent back for secrets keep the stored value, and settings the\ncode no longer honours are dropped.\n\nArgs:\n    request: Body carrying the new configuration.\n    session: Authenticated session, injected by the dependency.\n\nReturns:\n    Confirmation message and the path that was written.\n\nRaises:\n    HTTPException: If the configuration cannot be written.",
+        "description": "Replace the full configuration.\n\nPlaceholders sent back for secrets keep the stored value, and settings the\ncode no longer honours are dropped. ``Config.replace`` refuses a value that\n``wasm config set`` or the typed endpoints below would also refuse - an\nunsupported web server, a relative apps directory - so a whole-config body\nis not a back door around either.\n\nArgs:\n    body: Body carrying the new configuration.\n    request: The incoming request, for the audit record.\n    session: Authenticated session, injected by the dependency.\n\nReturns:\n    Confirmation message and the path that was written.\n\nRaises:\n    HTTPException: If the configuration cannot be written.",
         "operationId": "update_config_api_config_put",
         "requestBody": {
           "content": {
@@ -7022,11 +8430,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": {
-                    "type": "string"
-                  },
-                  "title": "Response Update Config Api Config Put",
-                  "type": "object"
+                  "$ref": "#/components/schemas/ConfigUpdateResponse"
                 }
               }
             },
@@ -7058,9 +8462,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Get Apps Directory Api Config Apps Directory Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/AppsDirectoryResponse"
                 }
               }
             },
@@ -7073,7 +8475,7 @@
         ]
       },
       "put": {
-        "description": "Update the applications directory.\n\nArgs:\n    request: Body carrying the new directory.\n    session: Authenticated session, injected by the dependency.\n\nReturns:\n    Confirmation message and the stored directory.\n\nRaises:\n    HTTPException: If the configuration cannot be written.",
+        "description": "Update the applications directory.\n\nArgs:\n    body: Body carrying the new directory.\n    request: The incoming request, for the audit record.\n    session: Authenticated session, injected by the dependency.\n\nReturns:\n    Confirmation message and the stored directory.\n\nRaises:\n    HTTPException: If the configuration cannot be written.\n    ConfigError: 400, through the error boundary, when the directory is\n        not an absolute path.",
         "operationId": "update_apps_directory_api_config_apps_directory_put",
         "requestBody": {
           "content": {
@@ -7090,11 +8492,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": {
-                    "type": "string"
-                  },
-                  "title": "Response Update Apps Directory Api Config Apps Directory Put",
-                  "type": "object"
+                  "$ref": "#/components/schemas/AppsDirectoryUpdateResponse"
                 }
               }
             },
@@ -7126,9 +8524,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Get Backup Config Api Config Backup Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/BackupSettingsResponse"
                 }
               }
             },
@@ -7141,7 +8537,7 @@
         ]
       },
       "put": {
-        "description": "Update backup configuration.\n\nArgs:\n    request: Body carrying the backup directory and retention limit.\n    session: Authenticated session, injected by the dependency.\n\nReturns:\n    Confirmation message.\n\nRaises:\n    HTTPException: If the configuration cannot be written.",
+        "description": "Update backup configuration.\n\nArgs:\n    body: Body carrying the backup directory and retention limit.\n    request: The incoming request, for the audit record.\n    session: Authenticated session, injected by the dependency.\n\nReturns:\n    Confirmation message.\n\nRaises:\n    HTTPException: If the configuration cannot be written.",
         "operationId": "update_backup_config_api_config_backup_put",
         "requestBody": {
           "content": {
@@ -7158,11 +8554,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": {
-                    "type": "string"
-                  },
-                  "title": "Response Update Backup Config Api Config Backup Put",
-                  "type": "object"
+                  "$ref": "#/components/schemas/MessageResponse"
                 }
               }
             },
@@ -7261,9 +8653,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Reload Config Api Config Reload Post",
-                  "type": "object"
+                  "$ref": "#/components/schemas/ConfigReloadResponse"
                 }
               }
             },
@@ -7285,9 +8675,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Get Ssl Config Api Config Ssl Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/SSLSettingsResponse"
                 }
               }
             },
@@ -7300,7 +8688,7 @@
         ]
       },
       "put": {
-        "description": "Update SSL configuration.\n\nArgs:\n    request: Body carrying the SSL settings.\n    session: Authenticated session, injected by the dependency.\n\nReturns:\n    Confirmation message.\n\nRaises:\n    HTTPException: If the configuration cannot be written.",
+        "description": "Update SSL configuration.\n\nArgs:\n    body: Body carrying the SSL settings.\n    request: The incoming request, for the audit record.\n    session: Authenticated session, injected by the dependency.\n\nReturns:\n    Confirmation message.\n\nRaises:\n    HTTPException: If the configuration cannot be written.",
         "operationId": "update_ssl_config_api_config_ssl_put",
         "requestBody": {
           "content": {
@@ -7317,11 +8705,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": {
-                    "type": "string"
-                  },
-                  "title": "Response Update Ssl Config Api Config Ssl Put",
-                  "type": "object"
+                  "$ref": "#/components/schemas/MessageResponse"
                 }
               }
             },
@@ -7353,9 +8737,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Get Web Config Api Config Web Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/WebSettingsResponse"
                 }
               }
             },
@@ -7368,7 +8750,7 @@
         ]
       },
       "put": {
-        "description": "Update web interface configuration.\n\nOnly the three exposed keys are touched; the security settings that live in\nthe same block are left alone.\n\nArgs:\n    request: Body carrying the web interface settings.\n    session: Authenticated session, injected by the dependency.\n\nReturns:\n    Confirmation message.\n\nRaises:\n    HTTPException: If the configuration cannot be written.",
+        "description": "Update web interface configuration.\n\nOnly the three exposed keys are touched; the security settings that live in\nthe same block are left alone.\n\nArgs:\n    body: Body carrying the web interface settings.\n    request: The incoming request, for the audit record.\n    session: Authenticated session, injected by the dependency.\n\nReturns:\n    Confirmation message.\n\nRaises:\n    HTTPException: If the configuration cannot be written.",
         "operationId": "update_web_config_api_config_web_put",
         "requestBody": {
           "content": {
@@ -7385,11 +8767,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": {
-                    "type": "string"
-                  },
-                  "title": "Response Update Web Config Api Config Web Put",
-                  "type": "object"
+                  "$ref": "#/components/schemas/MessageResponse"
                 }
               }
             },
@@ -7421,9 +8799,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Get Webserver Api Config Webserver Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/WebserverResponse"
                 }
               }
             },
@@ -7436,7 +8812,7 @@
         ]
       },
       "put": {
-        "description": "Update the web server setting.\n\nArgs:\n    request: Body carrying the web server name.\n    session: Authenticated session, injected by the dependency.\n\nReturns:\n    Confirmation message and the stored web server.\n\nRaises:\n    HTTPException: 400 for an unsupported web server, or a write failure.",
+        "description": "Update the web server setting.\n\nArgs:\n    body: Body carrying the web server name.\n    request: The incoming request, for the audit record.\n    session: Authenticated session, injected by the dependency.\n\nReturns:\n    Confirmation message and the stored web server.\n\nRaises:\n    HTTPException: 400 for an unsupported web server, or a write failure.",
         "operationId": "update_webserver_api_config_webserver_put",
         "requestBody": {
           "content": {
@@ -7453,11 +8829,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": {
-                    "type": "string"
-                  },
-                  "title": "Response Update Webserver Api Config Webserver Put",
-                  "type": "object"
+                  "$ref": "#/components/schemas/WebserverUpdateResponse"
                 }
               }
             },
@@ -9535,9 +10907,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response List Metrics Api Metrics Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/MetricsListResponse"
                 }
               }
             },
@@ -9585,9 +10955,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Metric History Api Metrics  Metric  Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/MetricHistoryResponse"
                 }
               }
             },
@@ -9641,9 +11009,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Disable Monitor Api Monitor Disable Post",
-                  "type": "object"
+                  "$ref": "#/components/schemas/MonitorActionResponse"
                 }
               }
             },
@@ -9665,9 +11031,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Enable Monitor Api Monitor Enable Post",
-                  "type": "object"
+                  "$ref": "#/components/schemas/MonitorActionResponse"
                 }
               }
             },
@@ -9689,9 +11053,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Install Monitor Api Monitor Install Post",
-                  "type": "object"
+                  "$ref": "#/components/schemas/MonitorActionResponse"
                 }
               }
             },
@@ -9819,9 +11181,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Acknowledge Observation Api Monitor Observations  Observation Id  Acknowledge Post",
-                  "type": "object"
+                  "$ref": "#/components/schemas/MonitorActionResponse"
                 }
               }
             },
@@ -9932,9 +11292,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Start Monitor Api Monitor Start Post",
-                  "type": "object"
+                  "$ref": "#/components/schemas/MonitorActionResponse"
                 }
               }
             },
@@ -9978,9 +11336,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Stop Monitor Api Monitor Stop Post",
-                  "type": "object"
+                  "$ref": "#/components/schemas/MonitorActionResponse"
                 }
               }
             },
@@ -10002,9 +11358,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Test Email Api Monitor Test Email Post",
-                  "type": "object"
+                  "$ref": "#/components/schemas/MonitorActionResponse"
                 }
               }
             },
@@ -10026,9 +11380,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Uninstall Monitor Api Monitor Uninstall Post",
-                  "type": "object"
+                  "$ref": "#/components/schemas/MonitorActionResponse"
                 }
               }
             },
@@ -10038,6 +11390,30 @@
         "summary": "Uninstall Monitor",
         "tags": [
           "Monitor"
+        ]
+      }
+    },
+    "/api/openapi.json": {
+      "get": {
+        "description": "Serve the application's own OpenAPI document.\n\nArgs:\n    request: The incoming request, used to reach the application that\n        owns the route table ``app.openapi()`` walks.\n    session: Authenticated session, injected. Any credential that clears\n        ``require_auth`` may read this; the schema names endpoints and\n        shapes, not secrets.\n\nReturns:\n    The OpenAPI document, the same one ``scripts/export_openapi.py``\n    writes to ``panel/openapi.json``.",
+        "operationId": "get_openapi_schema_api_openapi_json_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Openapi Schema Api Openapi Json Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Openapi Schema",
+        "tags": [
+          "OpenAPI"
         ]
       }
     },
@@ -10230,7 +11606,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceConfigResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -10420,7 +11798,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceLogsResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -10989,6 +12369,28 @@
         ]
       }
     },
+    "/api/system/health": {
+      "get": {
+        "description": "Report the same health verdict and checks as ``wasm health``.\n\nCalls :func:`wasm.managers.health.collect_health_report`, the function the\nCLI command itself calls, so the server card in the console can never\ndisagree with what an operator sees at the terminal.\n\nArgs:\n    session: The authenticated session.\n\nReturns:\n    The verdict, every check that ran, and the issues and warnings behind it.",
+        "operationId": "get_system_health_api_system_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SystemHealthOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get System Health",
+        "tags": [
+          "System"
+        ]
+      }
+    },
     "/api/system/machine": {
       "get": {
         "description": "Snapshot the host for the console's topbar.\n\nThe same read the ``machine`` SSE event pushes every five seconds, so a\nfreshly opened console has numbers before the first push, and a client\nthat only ever polls this endpoint never disagrees with one that streams.\n\nArgs:\n    session: The authenticated session.\n\nReturns:\n    The machine snapshot.",
@@ -11195,40 +12597,6 @@
         "tags": [
           "Webhooks"
         ]
-      }
-    },
-    "/login": {
-      "get": {
-        "description": "Serve the sign-in page.\n\nArgs:\n    request: The incoming request.\n\nReturns:\n    The sign-in page.",
-        "operationId": "login_page_login_get",
-        "responses": {
-          "200": {
-            "content": {
-              "text/html": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            },
-            "description": "Successful Response"
-          }
-        },
-        "summary": "Login Page"
-      },
-      "post": {
-        "description": "Exchange a token typed into the form for a session cookie.\n\nArgs:\n    request: The incoming request.\n\nReturns:\n    A redirect to the panel, or the form again with the reason.",
-        "operationId": "login_submit_login_post",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          }
-        },
-        "summary": "Login Submit"
       }
     }
   }

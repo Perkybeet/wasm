@@ -23,16 +23,18 @@ that I/O would run on the event loop and stall every other request.
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import yaml
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from wasm.core.config import DEFAULT_CONFIG, Config, redact_secrets
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import WASMErrorRoute, require_elevated
+from wasm.web.auth import get_audit_logger, get_client_ip
 
 if TYPE_CHECKING:
     from wasm.core.notifier import Notifier
@@ -84,6 +86,33 @@ def persist(config: Config) -> Path:
         ) from exc
     except (OSError, yaml.YAMLError) as exc:
         raise HTTPException(status_code=500, detail=f"Failed to save configuration: {exc}") from exc
+
+
+def _audit_write(request: Request, session: dict[str, Any], *, changed: Sequence[str]) -> None:
+    """
+    Record a configuration write in the audit trail.
+
+    Only the names of the top-level keys that changed are recorded, never a
+    value: this file is where the MySQL root password and the SMTP account
+    live, and the audit log is append-only and kept far longer than a single
+    settings screen.
+
+    Args:
+        request: The incoming request, for the client address and the path.
+        session: The authenticated session, for the actor.
+        changed: Top-level configuration keys the write touched.
+    """
+    audit = get_audit_logger()
+    if not audit:
+        return
+    audit.record(
+        action="config.update",
+        result="success",
+        client_ip=get_client_ip(request),
+        actor=str(session.get("sid")),
+        resource=request.url.path,
+        detail=f"changed keys: {', '.join(changed)}" if changed else "no keys changed",
+    )
 
 
 def public_config(config: Config) -> dict[str, Any]:
@@ -186,6 +215,96 @@ class WebConfig(BaseModel):
     session_timeout: int = Field(3600, ge=300, le=86400, description="Session timeout in seconds")
 
 
+# ============ Response-only models ============
+#
+# Every model below answers a GET or confirms a write. None of them is also
+# a request body, even where the fields exactly match one above (compare
+# AppsDirConfig and AppsDirectoryResponse): a model FastAPI sees used as both
+# a request and a response gets separate input and output schemas, and a
+# field with a default becomes optional to send but required to receive -
+# right for a PUT body, wrong for what a GET always returns. Two small
+# classes are cheaper than that inconsistency showing up in the exported
+# contract.
+
+
+class MessageResponse(BaseModel):
+    """A bare confirmation, for a write with nothing else to report back."""
+
+    message: str
+
+
+class ConfigUpdateResponse(BaseModel):
+    """Confirmation for a full configuration replacement."""
+
+    message: str
+    path: str
+
+
+class ConfigPatchResponse(BaseModel):
+    """Confirmation for a single-key update, echoing the value that was stored."""
+
+    message: str
+    path: str
+    value: Any
+
+
+class ConfigReloadResponse(BaseModel):
+    """Configuration re-read from disk."""
+
+    message: str
+    path: str
+    config: dict
+
+
+class AppsDirectoryResponse(BaseModel):
+    """The configured applications directory."""
+
+    apps_directory: str
+
+
+class AppsDirectoryUpdateResponse(BaseModel):
+    """Confirmation for an applications directory update."""
+
+    message: str
+    apps_directory: str
+
+
+class WebserverResponse(BaseModel):
+    """The configured web server."""
+
+    webserver: str
+
+
+class WebserverUpdateResponse(BaseModel):
+    """Confirmation for a web server update."""
+
+    message: str
+    webserver: str
+
+
+class BackupSettingsResponse(BaseModel):
+    """The configured backup directory and retention."""
+
+    directory: str
+    max_per_app: int
+
+
+class SSLSettingsResponse(BaseModel):
+    """The configured SSL/TLS settings."""
+
+    enabled: bool
+    provider: str
+    email: str
+
+
+class WebSettingsResponse(BaseModel):
+    """The configured web interface settings."""
+
+    host: str
+    port: int
+    session_timeout: int
+
+
 # ============ Endpoints ============
 
 
@@ -208,18 +327,24 @@ def get_config(session: dict = Depends(get_current_session)) -> ConfigResponse:
     )
 
 
-@router.put("")
+@router.put("", response_model=ConfigUpdateResponse)
 def update_config(
-    request: ConfigUpdateRequest, session: dict = Depends(require_elevated)
-) -> dict[str, str]:
+    body: ConfigUpdateRequest,
+    request: Request,
+    session: dict = Depends(require_elevated),
+) -> ConfigUpdateResponse:
     """
     Replace the full configuration.
 
     Placeholders sent back for secrets keep the stored value, and settings the
-    code no longer honours are dropped.
+    code no longer honours are dropped. ``Config.replace`` refuses a value that
+    ``wasm config set`` or the typed endpoints below would also refuse - an
+    unsupported web server, a relative apps directory - so a whole-config body
+    is not a back door around either.
 
     Args:
-        request: Body carrying the new configuration.
+        body: Body carrying the new configuration.
+        request: The incoming request, for the audit record.
         session: Authenticated session, injected by the dependency.
 
     Returns:
@@ -229,22 +354,31 @@ def update_config(
         HTTPException: If the configuration cannot be written.
     """
     config = load_config()
-    config.replace(request.config)
+    before = config.to_dict()
+    config.replace(body.config)
     path = persist(config)
-    return {"message": "Configuration updated", "path": str(path)}
+
+    after = config.to_dict()
+    changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+    _audit_write(request, session, changed=changed)
+
+    return ConfigUpdateResponse(message="Configuration updated", path=str(path))
 
 
-@router.patch("")
+@router.patch("", response_model=ConfigPatchResponse)
 def patch_config(
-    request: ConfigPatchRequest, session: dict = Depends(require_elevated)
-) -> dict[str, Any]:
+    body: ConfigPatchRequest,
+    request: Request,
+    session: dict = Depends(require_elevated),
+) -> ConfigPatchResponse:
     """
     Update a single configuration value addressed by a dotted path.
 
     The stored value is echoed back redacted, so a secret does not travel twice.
 
     Args:
-        request: Body carrying the dotted path and the new value.
+        body: Body carrying the dotted path and the new value.
+        request: The incoming request, for the audit record.
         session: Authenticated session, injected by the dependency.
 
     Returns:
@@ -254,19 +388,20 @@ def patch_config(
         HTTPException: If the configuration cannot be written.
     """
     config = load_config()
-    config.set(request.path, request.value)
+    config.set(body.path, body.value)
     path = persist(config)
+    _audit_write(request, session, changed=[body.path.split(".", 1)[0]])
 
-    leaf = request.path.rsplit(".", 1)[-1]
-    return {
-        "message": f"Configuration '{request.path}' updated",
-        "path": str(path),
-        "value": redact_secrets({leaf: request.value})[leaf],
-    }
+    leaf = body.path.rsplit(".", 1)[-1]
+    return ConfigPatchResponse(
+        message=f"Configuration '{body.path}' updated",
+        path=str(path),
+        value=redact_secrets({leaf: body.value})[leaf],
+    )
 
 
-@router.get("/apps-directory")
-def get_apps_directory(session: dict = Depends(get_current_session)) -> dict[str, Any]:
+@router.get("/apps-directory", response_model=AppsDirectoryResponse)
+def get_apps_directory(session: dict = Depends(get_current_session)) -> AppsDirectoryResponse:
     """
     Get the applications directory configuration.
 
@@ -277,18 +412,23 @@ def get_apps_directory(session: dict = Depends(get_current_session)) -> dict[str
         The configured applications directory.
     """
     config = load_config()
-    return {"apps_directory": config.get("apps_directory", str(DEFAULT_CONFIG["apps_directory"]))}
+    return AppsDirectoryResponse(
+        apps_directory=config.get("apps_directory", str(DEFAULT_CONFIG["apps_directory"]))
+    )
 
 
-@router.put("/apps-directory")
+@router.put("/apps-directory", response_model=AppsDirectoryUpdateResponse)
 def update_apps_directory(
-    request: AppsDirConfig, session: dict = Depends(get_current_session)
-) -> dict[str, str]:
+    body: AppsDirConfig,
+    request: Request,
+    session: dict = Depends(get_current_session),
+) -> AppsDirectoryUpdateResponse:
     """
     Update the applications directory.
 
     Args:
-        request: Body carrying the new directory.
+        body: Body carrying the new directory.
+        request: The incoming request, for the audit record.
         session: Authenticated session, injected by the dependency.
 
     Returns:
@@ -296,18 +436,21 @@ def update_apps_directory(
 
     Raises:
         HTTPException: If the configuration cannot be written.
+        ConfigError: 400, through the error boundary, when the directory is
+            not an absolute path.
     """
     config = load_config()
-    config.set("apps_directory", request.apps_directory)
+    config.set("apps_directory", body.apps_directory)
     persist(config)
-    return {
-        "message": "Applications directory updated",
-        "apps_directory": request.apps_directory,
-    }
+    _audit_write(request, session, changed=["apps_directory"])
+    return AppsDirectoryUpdateResponse(
+        message="Applications directory updated",
+        apps_directory=body.apps_directory,
+    )
 
 
-@router.get("/webserver")
-def get_webserver(session: dict = Depends(get_current_session)) -> dict[str, Any]:
+@router.get("/webserver", response_model=WebserverResponse)
+def get_webserver(session: dict = Depends(get_current_session)) -> WebserverResponse:
     """
     Get the web server configuration.
 
@@ -318,18 +461,21 @@ def get_webserver(session: dict = Depends(get_current_session)) -> dict[str, Any
         The configured web server.
     """
     config = load_config()
-    return {"webserver": config.get("webserver", DEFAULT_CONFIG["webserver"])}
+    return WebserverResponse(webserver=config.get("webserver", DEFAULT_CONFIG["webserver"]))
 
 
-@router.put("/webserver")
+@router.put("/webserver", response_model=WebserverUpdateResponse)
 def update_webserver(
-    request: WebserverConfig, session: dict = Depends(get_current_session)
-) -> dict[str, str]:
+    body: WebserverConfig,
+    request: Request,
+    session: dict = Depends(get_current_session),
+) -> WebserverUpdateResponse:
     """
     Update the web server setting.
 
     Args:
-        request: Body carrying the web server name.
+        body: Body carrying the web server name.
+        request: The incoming request, for the audit record.
         session: Authenticated session, injected by the dependency.
 
     Returns:
@@ -338,17 +484,18 @@ def update_webserver(
     Raises:
         HTTPException: 400 for an unsupported web server, or a write failure.
     """
-    if request.webserver not in SUPPORTED_WEBSERVERS:
+    if body.webserver not in SUPPORTED_WEBSERVERS:
         raise HTTPException(status_code=400, detail="Webserver must be 'nginx' or 'apache'")
 
     config = load_config()
-    config.set("webserver", request.webserver)
+    config.set("webserver", body.webserver)
     persist(config)
-    return {"message": "Web server updated", "webserver": request.webserver}
+    _audit_write(request, session, changed=["webserver"])
+    return WebserverUpdateResponse(message="Web server updated", webserver=body.webserver)
 
 
-@router.get("/backup")
-def get_backup_config(session: dict = Depends(get_current_session)) -> dict[str, Any]:
+@router.get("/backup", response_model=BackupSettingsResponse)
+def get_backup_config(session: dict = Depends(get_current_session)) -> BackupSettingsResponse:
     """
     Get backup configuration.
 
@@ -359,21 +506,24 @@ def get_backup_config(session: dict = Depends(get_current_session)) -> dict[str,
         The backup directory and the retention limit.
     """
     config = load_config()
-    return {
-        "directory": config.get("backup.directory", "/var/backups/wasm"),
-        "max_per_app": config.get("backup.max_per_app", 10),
-    }
+    return BackupSettingsResponse(
+        directory=config.get("backup.directory", "/var/backups/wasm"),
+        max_per_app=config.get("backup.max_per_app", 10),
+    )
 
 
-@router.put("/backup")
+@router.put("/backup", response_model=MessageResponse)
 def update_backup_config(
-    request: BackupConfig, session: dict = Depends(get_current_session)
-) -> dict[str, str]:
+    body: BackupConfig,
+    request: Request,
+    session: dict = Depends(get_current_session),
+) -> MessageResponse:
     """
     Update backup configuration.
 
     Args:
-        request: Body carrying the backup directory and retention limit.
+        body: Body carrying the backup directory and retention limit.
+        request: The incoming request, for the audit record.
         session: Authenticated session, injected by the dependency.
 
     Returns:
@@ -383,14 +533,15 @@ def update_backup_config(
         HTTPException: If the configuration cannot be written.
     """
     config = load_config()
-    config.set("backup.directory", request.directory)
-    config.set("backup.max_per_app", request.max_per_app)
+    config.set("backup.directory", body.directory)
+    config.set("backup.max_per_app", body.max_per_app)
     persist(config)
-    return {"message": "Backup configuration updated"}
+    _audit_write(request, session, changed=["backup"])
+    return MessageResponse(message="Backup configuration updated")
 
 
-@router.get("/ssl")
-def get_ssl_config(session: dict = Depends(get_current_session)) -> dict[str, Any]:
+@router.get("/ssl", response_model=SSLSettingsResponse)
+def get_ssl_config(session: dict = Depends(get_current_session)) -> SSLSettingsResponse:
     """
     Get SSL configuration.
 
@@ -402,22 +553,25 @@ def get_ssl_config(session: dict = Depends(get_current_session)) -> dict[str, An
     """
     config = load_config()
     ssl_defaults: dict[str, Any] = DEFAULT_CONFIG["ssl"]
-    return {
-        "enabled": config.get("ssl.enabled", ssl_defaults["enabled"]),
-        "provider": config.get("ssl.provider", ssl_defaults["provider"]),
-        "email": config.get("ssl.email", ssl_defaults["email"]),
-    }
+    return SSLSettingsResponse(
+        enabled=config.get("ssl.enabled", ssl_defaults["enabled"]),
+        provider=config.get("ssl.provider", ssl_defaults["provider"]),
+        email=config.get("ssl.email", ssl_defaults["email"]),
+    )
 
 
-@router.put("/ssl")
+@router.put("/ssl", response_model=MessageResponse)
 def update_ssl_config(
-    request: SSLConfig, session: dict = Depends(get_current_session)
-) -> dict[str, str]:
+    body: SSLConfig,
+    request: Request,
+    session: dict = Depends(get_current_session),
+) -> MessageResponse:
     """
     Update SSL configuration.
 
     Args:
-        request: Body carrying the SSL settings.
+        body: Body carrying the SSL settings.
+        request: The incoming request, for the audit record.
         session: Authenticated session, injected by the dependency.
 
     Returns:
@@ -427,15 +581,16 @@ def update_ssl_config(
         HTTPException: If the configuration cannot be written.
     """
     config = load_config()
-    config.set("ssl.enabled", request.enabled)
-    config.set("ssl.provider", request.provider)
-    config.set("ssl.email", request.email)
+    config.set("ssl.enabled", body.enabled)
+    config.set("ssl.provider", body.provider)
+    config.set("ssl.email", body.email)
     persist(config)
-    return {"message": "SSL configuration updated"}
+    _audit_write(request, session, changed=["ssl"])
+    return MessageResponse(message="SSL configuration updated")
 
 
-@router.get("/web")
-def get_web_config(session: dict = Depends(get_current_session)) -> dict[str, Any]:
+@router.get("/web", response_model=WebSettingsResponse)
+def get_web_config(session: dict = Depends(get_current_session)) -> WebSettingsResponse:
     """
     Get web interface configuration.
 
@@ -447,17 +602,19 @@ def get_web_config(session: dict = Depends(get_current_session)) -> dict[str, An
     """
     config = load_config()
     web_defaults: dict[str, Any] = DEFAULT_CONFIG["web"]
-    return {
-        "host": config.get("web.host", web_defaults["host"]),
-        "port": config.get("web.port", web_defaults["port"]),
-        "session_timeout": config.get("web.session_timeout", 3600),
-    }
+    return WebSettingsResponse(
+        host=config.get("web.host", web_defaults["host"]),
+        port=config.get("web.port", web_defaults["port"]),
+        session_timeout=config.get("web.session_timeout", 3600),
+    )
 
 
-@router.put("/web")
+@router.put("/web", response_model=MessageResponse)
 def update_web_config(
-    request: WebConfig, session: dict = Depends(get_current_session)
-) -> dict[str, str]:
+    body: WebConfig,
+    request: Request,
+    session: dict = Depends(get_current_session),
+) -> MessageResponse:
     """
     Update web interface configuration.
 
@@ -465,7 +622,8 @@ def update_web_config(
     the same block are left alone.
 
     Args:
-        request: Body carrying the web interface settings.
+        body: Body carrying the web interface settings.
+        request: The incoming request, for the audit record.
         session: Authenticated session, injected by the dependency.
 
     Returns:
@@ -475,15 +633,16 @@ def update_web_config(
         HTTPException: If the configuration cannot be written.
     """
     config = load_config()
-    config.set("web.host", request.host)
-    config.set("web.port", request.port)
-    config.set("web.session_timeout", request.session_timeout)
+    config.set("web.host", body.host)
+    config.set("web.port", body.port)
+    config.set("web.session_timeout", body.session_timeout)
     persist(config)
-    return {"message": "Web configuration updated (restart required)"}
+    _audit_write(request, session, changed=["web"])
+    return MessageResponse(message="Web configuration updated (restart required)")
 
 
-@router.post("/reload")
-def reload_config(session: dict = Depends(get_current_session)) -> dict[str, Any]:
+@router.post("/reload", response_model=ConfigReloadResponse)
+def reload_config(session: dict = Depends(get_current_session)) -> ConfigReloadResponse:
     """
     Reload configuration from disk.
 
@@ -494,14 +653,14 @@ def reload_config(session: dict = Depends(get_current_session)) -> dict[str, Any
         The redacted configuration and the path it came from.
     """
     config = load_config()
-    return {
-        "message": "Configuration reloaded",
-        "path": str(config.path),
-        "config": public_config(config),
-    }
+    return ConfigReloadResponse(
+        message="Configuration reloaded",
+        path=str(config.path),
+        config=public_config(config),
+    )
 
 
-@router.get("/defaults")
+@router.get("/defaults", response_model=dict[str, Any])
 def get_defaults(session: dict = Depends(get_current_session)) -> dict[str, Any]:
     """
     Get default configuration values.

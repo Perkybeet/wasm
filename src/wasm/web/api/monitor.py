@@ -52,6 +52,16 @@ router = APIRouter(route_class=WASMErrorRoute)
 MAX_PAGE_SIZE = 500
 
 
+class MonitorActionResponse(BaseModel):
+    """
+    Outcome of a systemd action against the monitor unit, or of acknowledging
+    an observation - every handler below answers exactly these two fields.
+    """
+
+    success: bool
+    message: str
+
+
 class MonitorStatus(BaseModel):
     """
     State of the monitor systemd unit.
@@ -538,11 +548,11 @@ def _row_to_entry(row: dict[str, Any]) -> ObservationEntry:
     )
 
 
-@router.post("/observations/{observation_id}/acknowledge")
+@router.post("/observations/{observation_id}/acknowledge", response_model=MonitorActionResponse)
 def acknowledge_observation(
     observation_id: int,
     session: Session,
-) -> dict[str, Any]:
+) -> MonitorActionResponse:
     """
     Mark an observation as seen.
 
@@ -571,10 +581,10 @@ def acknowledge_observation(
     if not acknowledged:
         raise HTTPException(status_code=404, detail=f"Observation {observation_id} not found")
 
-    return {"success": True, "message": f"Observation {observation_id} acknowledged"}
+    return MonitorActionResponse(success=True, message=f"Observation {observation_id} acknowledged")
 
 
-def _service_action(action: str) -> dict[str, Any]:
+def _service_action(action: str) -> MonitorActionResponse:
     """
     Run one systemd action against the monitor unit.
 
@@ -602,11 +612,11 @@ def _service_action(action: str) -> dict[str, Any]:
 
     methods[action]()
 
-    return {"success": True, "message": f"Monitor service {action} completed"}
+    return MonitorActionResponse(success=True, message=f"Monitor service {action} completed")
 
 
-@router.post("/install")
-def install_monitor(session: Session) -> dict[str, Any]:
+@router.post("/install", response_model=MonitorActionResponse)
+def install_monitor(session: Session) -> MonitorActionResponse:
     """
     Write the systemd unit.
 
@@ -619,8 +629,8 @@ def install_monitor(session: Session) -> dict[str, Any]:
     return _service_action("install")
 
 
-@router.post("/uninstall")
-def uninstall_monitor(session: Session) -> dict[str, Any]:
+@router.post("/uninstall", response_model=MonitorActionResponse)
+def uninstall_monitor(session: Session) -> MonitorActionResponse:
     """
     Remove the systemd unit WASM wrote.
 
@@ -633,8 +643,8 @@ def uninstall_monitor(session: Session) -> dict[str, Any]:
     return _service_action("uninstall")
 
 
-@router.post("/enable")
-def enable_monitor(session: Session) -> dict[str, Any]:
+@router.post("/enable", response_model=MonitorActionResponse)
+def enable_monitor(session: Session) -> MonitorActionResponse:
     """
     Enable the unit and start it now.
 
@@ -647,8 +657,8 @@ def enable_monitor(session: Session) -> dict[str, Any]:
     return _service_action("enable")
 
 
-@router.post("/disable")
-def disable_monitor(session: Session) -> dict[str, Any]:
+@router.post("/disable", response_model=MonitorActionResponse)
+def disable_monitor(session: Session) -> MonitorActionResponse:
     """
     Disable the unit and stop it now.
 
@@ -661,8 +671,8 @@ def disable_monitor(session: Session) -> dict[str, Any]:
     return _service_action("disable")
 
 
-@router.post("/start")
-def start_monitor(session: Session) -> dict[str, Any]:
+@router.post("/start", response_model=MonitorActionResponse)
+def start_monitor(session: Session) -> MonitorActionResponse:
     """
     Start the unit without enabling it at boot.
 
@@ -675,8 +685,8 @@ def start_monitor(session: Session) -> dict[str, Any]:
     return _service_action("start")
 
 
-@router.post("/stop")
-def stop_monitor(session: Session) -> dict[str, Any]:
+@router.post("/stop", response_model=MonitorActionResponse)
+def stop_monitor(session: Session) -> MonitorActionResponse:
     """
     Stop the unit without disabling it at boot.
 
@@ -689,8 +699,8 @@ def stop_monitor(session: Session) -> dict[str, Any]:
     return _service_action("stop")
 
 
-@router.post("/test-email")
-def test_email(session: Session) -> dict[str, Any]:
+@router.post("/test-email", response_model=MonitorActionResponse)
+def test_email(session: Session) -> MonitorActionResponse:
     """
     Send a test message through the configured SMTP relay.
 
@@ -721,4 +731,4 @@ def test_email(session: Session) -> dict[str, Any]:
     except EmailError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    return {"success": True, "message": "Test email sent"}
+    return MonitorActionResponse(success=True, message="Test email sent")

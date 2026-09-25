@@ -135,6 +135,41 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/apps/{domain}/diagnose": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Diagnose App
+         * @description Correlate everything WASM can read about a domain into one diagnosis.
+         *
+         *     Runs the same probes as ``wasm diagnose <domain>``: the systemd unit, the
+         *     port, an HTTP probe direct to the app and through the web server, its last
+         *     journal lines, the web server's own error log, its certificate, its last
+         *     deployment, OOM kills and disk space - and reports the most likely cause
+         *     first. Every probe only reads; nothing here changes the machine. An
+         *     unknown domain is not a 404: the probes report it as the most likely
+         *     cause instead, exactly as the CLI does.
+         *
+         *     Args:
+         *         domain: Domain to diagnose.
+         *         session: Authenticated session, injected.
+         *
+         *     Returns:
+         *         Every probe's result and the verdict derived from them.
+         */
+        get: operations["diagnose_app_api_apps__domain__diagnose_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/apps/{domain}/env": {
         parameters: {
             query?: never;
@@ -146,10 +181,10 @@ export interface paths {
          * Get App Env
          * @description Read an application's environment from its ``.env`` file.
          *
-         *     This reads the file :mod:`wasm.deployers.helpers.env_manager` writes, the
+         *     This reads the file :mod:`wasm.deployers.helpers.app_env` writes, the
          *     same one ``wasm env show`` reads on the terminal - not the snapshot the
          *     store recorded at deploy time, which can drift the moment anyone edits
-         *     the file by hand.
+         *     the file by hand. On the release layout that is ``shared/.env``.
          *
          *     Args:
          *         domain: Domain of the application.
@@ -173,9 +208,9 @@ export interface paths {
          *     Every name and value is validated against what can safely reach a
          *     systemd unit (:mod:`wasm.validators.environment`) before anything is
          *     written, so a rejected variable leaves the file on disk untouched. The
-         *     write goes through :class:`~wasm.deployers.helpers.env_manager.EnvManager`,
-         *     the same seam ``wasm env configure`` uses, so the file lands 0600 either
-         *     way.
+         *     write goes through :func:`~wasm.deployers.helpers.app_env.write_app_env`,
+         *     the same function ``wasm env configure`` uses, so the file lands 0600,
+         *     owned by the service account, in ``shared/`` on the release layout.
          *
          *     The application is not restarted: a process already running keeps the
          *     environment it started with until it is, so the caller is told a restart
@@ -202,6 +237,44 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/apps/{domain}/limits": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Update App Limits
+         * @description Set the memory, CPU and task limits of an application's unit.
+         *
+         *     Rewrites the unit (every unit, for a monorepo) and reloads systemd, which
+         *     is a change to what runs as root's configuration, so it needs sudo mode
+         *     like editing a unit by hand does. The values are validated where every
+         *     caller's are, in the service manager.
+         *
+         *     Args:
+         *         domain: Domain of the application.
+         *         body: The limits, and whether to restart now.
+         *         session: The authenticated, elevated session.
+         *
+         *     Returns:
+         *         The limits the application has now.
+         *
+         *     Raises:
+         *         HTTPException: 404 when the application is unknown.
+         *         ValidationError: A limit is out of range (400, with the range).
+         *         DeploymentError: Nothing runs as a unit for it.
+         */
+        patch: operations["update_app_limits_api_apps__domain__limits_patch"];
+        trace?: never;
+    };
     "/api/apps/{domain}/logs": {
         parameters: {
             query?: never;
@@ -224,6 +297,152 @@ export interface paths {
         get: operations["get_app_logs_api_apps__domain__logs_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/apps/{domain}/migrate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Migrate App
+         * @description Move an in-place application onto the release layout.
+         *
+         *     Rewrites the unit and the site and moves the whole application tree, so
+         *     it needs sudo mode. The plan is worked out again here rather than taken
+         *     from the client: what is executed is what is on disk now.
+         *
+         *     Args:
+         *         domain: Domain of the application.
+         *         body: Paths to keep in ``shared/``, if the detection is not wanted.
+         *         session: The authenticated, elevated session.
+         *
+         *     Returns:
+         *         What was done.
+         *
+         *     Raises:
+         *         HTTPException: 404 when the application is unknown, 409 when it is on
+         *             releases already.
+         *         ValidationError: A path in ``persist`` is not inside the application.
+         *         DeploymentError: A step failed or the application did not answer on
+         *             the new layout; everything was put back, and the details carry
+         *             the health check's own output.
+         */
+        post: operations["migrate_app_api_apps__domain__migrate_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/apps/{domain}/migrate/plan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Migration Plan
+         * @description Show what migrating an in-place application to releases would do. Changes nothing.
+         *
+         *     Args:
+         *         domain: Domain of the application.
+         *         session: The authenticated session.
+         *         persist: Paths to keep in ``shared/``; repeat the parameter for each.
+         *
+         *     Returns:
+         *         The plan, from :func:`wasm.deployers.migrate.plan_migration`.
+         *
+         *     Raises:
+         *         HTTPException: 404 when the application is unknown, 409 when it is on
+         *             releases already.
+         *         ValidationError: A path in ``persist`` is not inside the application.
+         *         DeploymentError: Its type cannot use releases.
+         */
+        get: operations["get_migration_plan_api_apps__domain__migrate_plan_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/apps/{domain}/releases": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get App Releases
+         * @description List an application's releases, newest first.
+         *
+         *     Args:
+         *         domain: Domain of the application.
+         *         session: The authenticated session.
+         *
+         *     Returns:
+         *         The releases, from :func:`wasm.deployers.lifecycle.list_releases`,
+         *         the same listing ``wasm releases list`` prints.
+         *
+         *     Raises:
+         *         HTTPException: 404 when the application is unknown, 409 when it is
+         *             deployed in place.
+         */
+        get: operations["get_app_releases_api_apps__domain__releases_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/apps/{domain}/releases/{release_id}/activate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Activate App Release
+         * @description Make a release the one that serves: an instant rollback, or a roll forward.
+         *
+         *     Needs the ``deploy`` scope, like queueing an update: it changes what code
+         *     runs, and nothing else. The release passes the same health gate as a
+         *     deploy; one that does not is recorded as failed and the release that was
+         *     serving is put back before this answers.
+         *
+         *     Args:
+         *         domain: Domain of the application.
+         *         release_id: The release to activate.
+         *         session: The authenticated session.
+         *
+         *     Returns:
+         *         What was done.
+         *
+         *     Raises:
+         *         HTTPException: 400 for something that is not a release id, 404 for an
+         *             unknown application or a release that is not on disk, 409 for an
+         *             application deployed in place.
+         *         DeploymentError: The release did not pass its health check; the
+         *             details carry the probe's and the journal's own output.
+         */
+        post: operations["activate_app_release_api_apps__domain__releases__release_id__activate_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1261,6 +1480,10 @@ export interface paths {
          *
          *     Returns:
          *         The queued job.
+         *
+         *     Raises:
+         *         ValidationError: When ``method`` is not one of the methods certbot
+         *             offers, or a domain in ``domains`` is not a valid domain name.
          */
         post: operations["create_certificate_api_certs__domain__post"];
         /**
@@ -1367,10 +1590,14 @@ export interface paths {
          * @description Replace the full configuration.
          *
          *     Placeholders sent back for secrets keep the stored value, and settings the
-         *     code no longer honours are dropped.
+         *     code no longer honours are dropped. ``Config.replace`` refuses a value that
+         *     ``wasm config set`` or the typed endpoints below would also refuse - an
+         *     unsupported web server, a relative apps directory - so a whole-config body
+         *     is not a back door around either.
          *
          *     Args:
-         *         request: Body carrying the new configuration.
+         *         body: Body carrying the new configuration.
+         *         request: The incoming request, for the audit record.
          *         session: Authenticated session, injected by the dependency.
          *
          *     Returns:
@@ -1391,7 +1618,8 @@ export interface paths {
          *     The stored value is echoed back redacted, so a secret does not travel twice.
          *
          *     Args:
-         *         request: Body carrying the dotted path and the new value.
+         *         body: Body carrying the dotted path and the new value.
+         *         request: The incoming request, for the audit record.
          *         session: Authenticated session, injected by the dependency.
          *
          *     Returns:
@@ -1426,7 +1654,8 @@ export interface paths {
          * @description Update the applications directory.
          *
          *     Args:
-         *         request: Body carrying the new directory.
+         *         body: Body carrying the new directory.
+         *         request: The incoming request, for the audit record.
          *         session: Authenticated session, injected by the dependency.
          *
          *     Returns:
@@ -1434,6 +1663,8 @@ export interface paths {
          *
          *     Raises:
          *         HTTPException: If the configuration cannot be written.
+         *         ConfigError: 400, through the error boundary, when the directory is
+         *             not an absolute path.
          */
         put: operations["update_apps_directory_api_config_apps_directory_put"];
         post?: never;
@@ -1466,7 +1697,8 @@ export interface paths {
          * @description Update backup configuration.
          *
          *     Args:
-         *         request: Body carrying the backup directory and retention limit.
+         *         body: Body carrying the backup directory and retention limit.
+         *         request: The incoming request, for the audit record.
          *         session: Authenticated session, injected by the dependency.
          *
          *     Returns:
@@ -1593,7 +1825,8 @@ export interface paths {
          * @description Update SSL configuration.
          *
          *     Args:
-         *         request: Body carrying the SSL settings.
+         *         body: Body carrying the SSL settings.
+         *         request: The incoming request, for the audit record.
          *         session: Authenticated session, injected by the dependency.
          *
          *     Returns:
@@ -1636,7 +1869,8 @@ export interface paths {
          *     the same block are left alone.
          *
          *     Args:
-         *         request: Body carrying the web interface settings.
+         *         body: Body carrying the web interface settings.
+         *         request: The incoming request, for the audit record.
          *         session: Authenticated session, injected by the dependency.
          *
          *     Returns:
@@ -1676,7 +1910,8 @@ export interface paths {
          * @description Update the web server setting.
          *
          *     Args:
-         *         request: Body carrying the web server name.
+         *         body: Body carrying the web server name.
+         *         request: The incoming request, for the audit record.
          *         session: Authenticated session, injected by the dependency.
          *
          *     Returns:
@@ -3366,6 +3601,37 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/openapi.json": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Openapi Schema
+         * @description Serve the application's own OpenAPI document.
+         *
+         *     Args:
+         *         request: The incoming request, used to reach the application that
+         *             owns the route table ``app.openapi()`` walks.
+         *         session: Authenticated session, injected. Any credential that clears
+         *             ``require_auth`` may read this; the schema names endpoints and
+         *             shapes, not secrets.
+         *
+         *     Returns:
+         *         The OpenAPI document, the same one ``scripts/export_openapi.py``
+         *         writes to ``panel/openapi.json``.
+         */
+        get: operations["get_openapi_schema_api_openapi_json_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/services": {
         parameters: {
             query?: never;
@@ -3888,6 +4154,36 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/system/health": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get System Health
+         * @description Report the same health verdict and checks as ``wasm health``.
+         *
+         *     Calls :func:`wasm.managers.health.collect_health_report`, the function the
+         *     CLI command itself calls, so the server card in the console can never
+         *     disagree with what an operator sees at the terminal.
+         *
+         *     Args:
+         *         session: The authenticated session.
+         *
+         *     Returns:
+         *         The verdict, every check that ran, and the issues and warnings behind it.
+         */
+        get: operations["get_system_health_api_system_health_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/system/machine": {
         parameters: {
             query?: never;
@@ -4088,42 +4384,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/login": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Login Page
-         * @description Serve the sign-in page.
-         *
-         *     Args:
-         *         request: The incoming request.
-         *
-         *     Returns:
-         *         The sign-in page.
-         */
-        get: operations["login_page_login_get"];
-        put?: never;
-        /**
-         * Login Submit
-         * @description Exchange a token typed into the form for a session cookie.
-         *
-         *     Args:
-         *         request: The incoming request.
-         *
-         *     Returns:
-         *         A redirect to the panel, or the form again with the reason.
-         */
-        post: operations["login_submit_login_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -4291,16 +4551,29 @@ export interface components {
          *         port: Upstream port.
          *         app_type: Deployer that owns it.
          *         path: Application directory.
+         *         layout: ``inplace`` or ``releases``.
+         *         memory_max_mb: Memory limit of its unit, in MB, or None.
+         *         cpu_quota_percent: CPU quota of its unit, in percent of one CPU, or None.
+         *         tasks_max: Task limit of its unit, or None.
          */
         AppInfo: {
             /** Active */
             active: boolean;
             /** App Type */
             app_type?: string | null;
+            /** Cpu Quota Percent */
+            cpu_quota_percent?: number | null;
             /** Domain */
             domain: string;
             /** Enabled */
             enabled: boolean;
+            /**
+             * Layout
+             * @default inplace
+             */
+            layout: string;
+            /** Memory Max Mb */
+            memory_max_mb?: number | null;
             /** Name */
             name: string;
             /** Path */
@@ -4311,6 +4584,8 @@ export interface components {
             port?: number | null;
             /** Status */
             status: string;
+            /** Tasks Max */
+            tasks_max?: number | null;
             /** Uptime */
             uptime?: string | null;
         };
@@ -4346,6 +4621,24 @@ export interface components {
              * @description Directory for deployed applications
              */
             apps_directory: string;
+        };
+        /**
+         * AppsDirectoryResponse
+         * @description The configured applications directory.
+         */
+        AppsDirectoryResponse: {
+            /** Apps Directory */
+            apps_directory: string;
+        };
+        /**
+         * AppsDirectoryUpdateResponse
+         * @description Confirmation for an applications directory update.
+         */
+        AppsDirectoryUpdateResponse: {
+            /** Apps Directory */
+            apps_directory: string;
+            /** Message */
+            message: string;
         };
         /**
          * BackupActionResponse
@@ -4508,6 +4801,16 @@ export interface components {
             timer: string;
         };
         /**
+         * BackupSettingsResponse
+         * @description The configured backup directory and retention.
+         */
+        BackupSettingsResponse: {
+            /** Directory */
+            directory: string;
+            /** Max Per App */
+            max_per_app: number;
+        };
+        /**
          * BackupStorageResponse
          * @description Response describing how much disk the backups take.
          */
@@ -4638,6 +4941,32 @@ export interface components {
             value: unknown;
         };
         /**
+         * ConfigPatchResponse
+         * @description Confirmation for a single-key update, echoing the value that was stored.
+         */
+        ConfigPatchResponse: {
+            /** Message */
+            message: string;
+            /** Path */
+            path: string;
+            /** Value */
+            value: unknown;
+        };
+        /**
+         * ConfigReloadResponse
+         * @description Configuration re-read from disk.
+         */
+        ConfigReloadResponse: {
+            /** Config */
+            config: {
+                [key: string]: unknown;
+            };
+            /** Message */
+            message: string;
+            /** Path */
+            path: string;
+        };
+        /**
          * ConfigResponse
          * @description Response containing full configuration, with secrets redacted.
          */
@@ -4663,6 +4992,16 @@ export interface components {
             config: {
                 [key: string]: unknown;
             };
+        };
+        /**
+         * ConfigUpdateResponse
+         * @description Confirmation for a full configuration replacement.
+         */
+        ConfigUpdateResponse: {
+            /** Message */
+            message: string;
+            /** Path */
+            path: string;
         };
         /**
          * ConnectionStringRequest
@@ -4756,6 +5095,11 @@ export interface components {
                 [key: string]: string;
             };
             /**
+             * Layout
+             * @description Build every deploy as a release behind a health gate, or in place. Omitted: the server's deploy.layout
+             */
+            layout?: ("inplace" | "releases") | null;
+            /**
              * Port
              * @description Application port
              */
@@ -4802,22 +5146,34 @@ export interface components {
          *
          *     Attributes:
          *         email: Registration and expiry-notice address.
-         *         webserver: Web server whose certbot plugin should be used.
+         *         domains: Extra domains (SANs) to cover, beyond the primary domain in
+         *             the path and the ``www`` alias ``include_www`` may add.
+         *         method: How to prove control of the domain. One of "nginx", "apache",
+         *             "webroot" or "standalone". Omitted lets WASM pick.
+         *         webroot: Webroot path, used when ``method`` is "webroot".
          *         include_www: Also cover the ``www`` subdomain.
+         *         expand: Expand an existing certificate even when it already covers
+         *             every requested domain.
          */
         CreateCertRequest: {
+            /** Domains */
+            domains?: string[];
             /** Email */
             email?: string | null;
+            /**
+             * Expand
+             * @default false
+             */
+            expand: boolean;
             /**
              * Include Www
              * @default false
              */
             include_www: boolean;
-            /**
-             * Webserver
-             * @default nginx
-             */
-            webserver: string;
+            /** Method */
+            method?: string | null;
+            /** Webroot */
+            webroot?: string | null;
         };
         /**
          * CreateCronJobRequest
@@ -5262,6 +5618,57 @@ export interface components {
          */
         DeploymentTrigger: "panel" | "cli" | "webhook";
         /**
+         * DiagnoseCheck
+         * @description One diagnostic probe's result.
+         *
+         *     Mirrors :class:`wasm.managers.diagnose.Check` field for field: this module
+         *     only translates it to HTTP, it does not reinterpret it.
+         *
+         *     Attributes:
+         *         name: Stable identifier for the probe, such as ``"unit"`` or ``"port"``.
+         *         status: ``"ok"``, ``"warn"``, ``"fail"`` or ``"skip"``.
+         *         summary: One line, in WASM's own words.
+         *         evidence: Raw output the probe collected, verbatim.
+         */
+        DiagnoseCheck: {
+            /**
+             * Evidence
+             * @default
+             */
+            evidence: string;
+            /** Name */
+            name: string;
+            /** Status */
+            status: string;
+            /** Summary */
+            summary: string;
+        };
+        /**
+         * DiagnoseResponse
+         * @description The full answer to "why is this app down".
+         *
+         *     Mirrors :class:`wasm.managers.diagnose.Diagnosis`, which is also what
+         *     ``wasm diagnose --json`` prints - the console and the CLI read the same
+         *     shape.
+         *
+         *     Attributes:
+         *         domain: The domain that was diagnosed.
+         *         verdict: ``"healthy"``, ``"degraded"`` or ``"down"``.
+         *         probable_cause: One sentence naming the most likely explanation, or
+         *             ``None`` when the checks disagree with each other or are all clean.
+         *         checks: Every probe that ran, in the order it ran in.
+         */
+        DiagnoseResponse: {
+            /** Checks */
+            checks: components["schemas"]["DiagnoseCheck"][];
+            /** Domain */
+            domain: string;
+            /** Probable Cause */
+            probable_cause: string | null;
+            /** Verdict */
+            verdict: string;
+        };
+        /**
          * DiskEntry
          * @description Capacity of one filesystem.
          *
@@ -5449,6 +5856,18 @@ export interface components {
             detail?: components["schemas"]["ValidationError"][];
         };
         /**
+         * HealthCheckOut
+         * @description One item of the health report - disk, a web server, apps, certs, memory.
+         */
+        HealthCheckOut: {
+            /** Name */
+            name: string;
+            /** Status */
+            status: string;
+            /** Value */
+            value: string;
+        };
+        /**
          * InspectSourceRequest
          * @description Request to preview what a repository is before deploying it.
          */
@@ -5622,6 +6041,36 @@ export interface components {
             type: string;
         };
         /**
+         * LimitsResponse
+         * @description The limits an application has now.
+         *
+         *     Attributes:
+         *         domain: The application's domain.
+         *         memory_max_mb: Memory limit in MB, or None.
+         *         cpu_quota_percent: CPU quota in percent of one CPU, or None.
+         *         tasks_max: Task limit, or None.
+         *         units: The units rewritten.
+         *         restarted: Whether they were restarted.
+         *         restart_required: Whether the running processes still have the old
+         *             limits until they are restarted.
+         */
+        LimitsResponse: {
+            /** Cpu Quota Percent */
+            cpu_quota_percent?: number | null;
+            /** Domain */
+            domain: string;
+            /** Memory Max Mb */
+            memory_max_mb?: number | null;
+            /** Restart Required */
+            restart_required: boolean;
+            /** Restarted */
+            restarted: boolean;
+            /** Tasks Max */
+            tasks_max?: number | null;
+            /** Units */
+            units: string[];
+        };
+        /**
          * LoginRequest
          * @description Login request body.
          *
@@ -5764,6 +6213,39 @@ export interface components {
             used_gb: number;
         };
         /**
+         * MessageResponse
+         * @description A bare confirmation, for a write with nothing else to report back.
+         */
+        MessageResponse: {
+            /** Message */
+            message: string;
+        };
+        /**
+         * MetricHistoryResponse
+         * @description One metric's points over a window, oldest first.
+         */
+        MetricHistoryResponse: {
+            /** Metric */
+            metric: string;
+            /** Points */
+            points: [
+                number,
+                number
+            ][];
+            /** Window */
+            window: string;
+        };
+        /**
+         * MetricsListResponse
+         * @description Every metric name the store has data for, and the windows it can be read over.
+         */
+        MetricsListResponse: {
+            /** Metrics */
+            metrics: string[];
+            /** Windows */
+            windows: string[];
+        };
+        /**
          * MetricsResponse
          * @description A point-in-time reading of machine resources.
          *
@@ -5809,6 +6291,121 @@ export interface components {
             swap_percent: number;
             /** Uptime Seconds */
             uptime_seconds: number;
+        };
+        /**
+         * MigrateRequest
+         * @description Request to migrate an application to the release layout.
+         */
+        MigrateRequest: {
+            /**
+             * Persist
+             * @description Paths to keep in shared/, relative to the application. Omitted: what git does not track, or the usual upload directories
+             */
+            persist?: string[] | null;
+        };
+        /**
+         * MigrationPlanOut
+         * @description What migrating an in-place application to releases would do.
+         *
+         *     Attributes:
+         *         domain: The application's domain.
+         *         app_path: Its directory.
+         *         release_id: The name the first release would get (a forecast).
+         *         commit: The commit the tree is at, when it is a git checkout.
+         *         persistent: Paths that move to ``shared/`` and are linked into every
+         *             release from now on.
+         *         persistent_source: ``git`` (what git does not track), ``explicit``
+         *             (as named) or ``common`` (the usual upload directories).
+         *         env_files: Environment files that move to ``shared/``.
+         *         unit: The unit that runs it, or None for a site.
+         *         unit_rewrite: Whether the unit is rewritten to run from ``current``.
+         *         site_rewrite: Whether the site is rewritten to serve ``current``.
+         *         untracked_files: Files that stay in the first release only.
+         *         warnings: What the operator should read before going ahead.
+         *         files: Regular files the directory holds; all of them are kept.
+         *         bytes: Their total size.
+         */
+        MigrationPlanOut: {
+            /** App Path */
+            app_path: string;
+            /** Bytes */
+            bytes: number;
+            /** Commit */
+            commit?: string | null;
+            /** Domain */
+            domain: string;
+            /** Env Files */
+            env_files: string[];
+            /** Files */
+            files: number;
+            /** Persistent */
+            persistent: string[];
+            /** Persistent Source */
+            persistent_source: string;
+            /** Release Id */
+            release_id: string;
+            /** Site Rewrite */
+            site_rewrite: boolean;
+            /** Unit */
+            unit?: string | null;
+            /** Unit Rewrite */
+            unit_rewrite: boolean;
+            /** Untracked Files */
+            untracked_files: string[];
+            /** Warnings */
+            warnings: string[];
+        };
+        /**
+         * MigrationResultOut
+         * @description What a migration did.
+         *
+         *     Attributes:
+         *         domain: The application's domain.
+         *         release_id: The first release, now active.
+         *         persistent: What is kept in ``shared/``.
+         *         env_files: Environment files moved to ``shared/``.
+         *         files_before: Regular files before.
+         *         files_after: Regular files after, ``shared/`` included; always equal.
+         *         bytes_before: Their size before.
+         *         bytes_after: Their size after.
+         *         unit_rewritten: Whether the unit was rewritten.
+         *         site_rewritten: Whether the site was rewritten.
+         *         deployment_id: The deployment history row that records it.
+         */
+        MigrationResultOut: {
+            /** Bytes After */
+            bytes_after: number;
+            /** Bytes Before */
+            bytes_before: number;
+            /** Deployment Id */
+            deployment_id?: number | null;
+            /** Domain */
+            domain: string;
+            /** Env Files */
+            env_files: string[];
+            /** Files After */
+            files_after: number;
+            /** Files Before */
+            files_before: number;
+            /** Persistent */
+            persistent: string[];
+            /** Release Id */
+            release_id: string;
+            /** Site Rewritten */
+            site_rewritten: boolean;
+            /** Unit Rewritten */
+            unit_rewritten: boolean;
+        };
+        /**
+         * MonitorActionResponse
+         * @description Outcome of a systemd action against the monitor unit, or of acknowledging
+         *     an observation - every handler below answers exactly these two fields.
+         */
+        MonitorActionResponse: {
+            /** Message */
+            message: string;
+            /** Success */
+            success: boolean;
         };
         /**
          * MonitorSettings
@@ -6081,6 +6678,76 @@ export interface components {
             truncated: boolean;
         };
         /**
+         * ReleaseActivationResponse
+         * @description The outcome of activating a release.
+         *
+         *     Attributes:
+         *         domain: The application's domain.
+         *         release_id: The release now serving.
+         *         previous_id: The release that served before, if any.
+         *         changed: False when the release was already active and nothing was done.
+         *         rolled_back: Whether the release activated is older than the one it
+         *             replaced.
+         *         deployment_id: The deployment history row that records it.
+         */
+        ReleaseActivationResponse: {
+            /** Changed */
+            changed: boolean;
+            /** Deployment Id */
+            deployment_id?: number | null;
+            /** Domain */
+            domain: string;
+            /** Previous Id */
+            previous_id?: string | null;
+            /** Release Id */
+            release_id: string;
+            /** Rolled Back */
+            rolled_back: boolean;
+        };
+        /**
+         * ReleaseOut
+         * @description One release of an application on the release layout.
+         *
+         *     Attributes:
+         *         id: Release id, the directory name under ``releases/``.
+         *         commit: Short commit it was built from; None for a non-git source.
+         *         created_at: When it was created, ISO 8601 in UTC.
+         *         activated_at: When it last became active, if it ever did.
+         *         status: ``active``, ``superseded``, ``rolled_back``, ``failed`` or
+         *             ``built``.
+         *         active: Whether it is the one serving.
+         *         on_disk: Whether it can be activated. A failed release is listed for
+         *             a while after its directory was removed.
+         */
+        ReleaseOut: {
+            /** Activated At */
+            activated_at?: string | null;
+            /** Active */
+            active: boolean;
+            /** Commit */
+            commit?: string | null;
+            /** Created At */
+            created_at: string;
+            /** Id */
+            id: string;
+            /** On Disk */
+            on_disk: boolean;
+            /** Status */
+            status: string;
+        };
+        /**
+         * ReleasesResponse
+         * @description The releases of an application, newest first.
+         */
+        ReleasesResponse: {
+            /** Domain */
+            domain: string;
+            /** Items */
+            items: components["schemas"]["ReleaseOut"][];
+            /** Total */
+            total: number;
+        };
+        /**
          * ReloadResponse
          * @description Response for a web server reload.
          */
@@ -6102,6 +6769,16 @@ export interface components {
              * @default false
              */
             force: boolean;
+        };
+        /**
+         * RevokedResponse
+         * @description Confirmation that one record - a session or an API token - was revoked.
+         */
+        RevokedResponse: {
+            /** Revoked */
+            revoked: string;
+            /** Success */
+            success: boolean;
         };
         /**
          * RollbackPointOut
@@ -6170,6 +6847,18 @@ export interface components {
             provider: string;
         };
         /**
+         * SSLSettingsResponse
+         * @description The configured SSL/TLS settings.
+         */
+        SSLSettingsResponse: {
+            /** Email */
+            email: string;
+            /** Enabled */
+            enabled: boolean;
+            /** Provider */
+            provider: string;
+        };
+        /**
          * ScanResponse
          * @description Result of a single scan.
          *
@@ -6226,6 +6915,26 @@ export interface components {
             success: boolean;
         };
         /**
+         * ServiceConfigResponse
+         * @description Response for reading a service's unit file.
+         *
+         *     A separate class from :class:`UpdateServiceConfigRequest`, even though the
+         *     ``config`` field is the same string in both directions: sharing one model
+         *     between a request and a response body makes FastAPI generate distinct
+         *     input and output schemas for it, and a field with a default would then
+         *     come out optional to send but required to receive - correct for neither
+         *     direction. ``path`` has no default either way, so this stays simple, but
+         *     the module keeps every read-only body in its own class for that reason.
+         */
+        ServiceConfigResponse: {
+            /** Config */
+            config: string;
+            /** Path */
+            path: string;
+            /** Service */
+            service: string;
+        };
+        /**
          * ServiceInfo
          * @description Service information.
          */
@@ -6256,6 +6965,45 @@ export interface components {
             services: components["schemas"]["ServiceInfo"][];
             /** Total */
             total: number;
+        };
+        /**
+         * ServiceLogsResponse
+         * @description Response for reading a service's journal.
+         */
+        ServiceLogsResponse: {
+            /** Lines */
+            lines: number;
+            /** Logs */
+            logs: string;
+            /** Service */
+            service: string;
+        };
+        /**
+         * SessionEntry
+         * @description One live session, with no usable identifier in it.
+         *
+         *     Attributes:
+         *         sid_prefix: Leading characters of the session id - enough to name a
+         *             row for revocation, useless for forging the cookie it belongs to.
+         *         client_ip: Address the session was issued to.
+         *         created_at: When the session was issued, as a UNIX timestamp.
+         *         last_seen: Most recent activity, as a UNIX timestamp.
+         *         expires_at: When the session stops being valid, as a UNIX timestamp.
+         *         is_current: Whether this is the session the caller is using now.
+         */
+        SessionEntry: {
+            /** Client Ip */
+            client_ip: string;
+            /** Created At */
+            created_at: number;
+            /** Expires At */
+            expires_at: number;
+            /** Is Current */
+            is_current: boolean;
+            /** Last Seen */
+            last_seen: number;
+            /** Sid Prefix */
+            sid_prefix: string;
         };
         /**
          * SessionInfo
@@ -6303,6 +7051,25 @@ export interface components {
             totp_enabled: boolean;
             /** Version */
             version: string;
+        };
+        /**
+         * SessionsListResponse
+         * @description Every active session.
+         *
+         *     Attributes:
+         *         active_sessions: Count of live sessions.
+         *         current_session: The caller's own session id, unmasked - it is
+         *             already the credential proving the request, unlike every other
+         *             session's id, which only ever leaves as a prefix.
+         *         sessions: One entry per live session, newest activity first.
+         */
+        SessionsListResponse: {
+            /** Active Sessions */
+            active_sessions: number;
+            /** Current Session */
+            current_session: string | null;
+            /** Sessions */
+            sessions: components["schemas"]["SessionEntry"][];
         };
         /**
          * SiteActionResponse
@@ -6413,6 +7180,34 @@ export interface components {
             package_manager: string | null;
             /** Start Command */
             start_command: string;
+        };
+        /**
+         * SuccessResponse
+         * @description A bare confirmation, for an action with nothing else to report back.
+         */
+        SuccessResponse: {
+            /** Message */
+            message: string;
+            /** Success */
+            success: boolean;
+        };
+        /**
+         * SystemHealthOut
+         * @description The same verdict and checks ``wasm health`` prints, as JSON.
+         *
+         *     :func:`wasm.managers.health.collect_health_report` is the one
+         *     implementation this and the CLI command both read; this model only
+         *     describes its shape for the OpenAPI contract.
+         */
+        SystemHealthOut: {
+            /** Checks */
+            checks: components["schemas"]["HealthCheckOut"][];
+            /** Issues */
+            issues: string[];
+            /** Verdict */
+            verdict: string;
+            /** Warnings */
+            warnings: string[];
         };
         /**
          * SystemInfo
@@ -6536,6 +7331,35 @@ export interface components {
             update_command?: string | null;
         };
         /**
+         * UpdateLimitsRequest
+         * @description The memory, CPU and task limits an application's unit must have.
+         *
+         *     The three are set together: a field left out or null removes that limit.
+         */
+        UpdateLimitsRequest: {
+            /**
+             * Cpu Quota Percent
+             * @description CPUQuota, in percent of one CPU (200 is two CPUs); 1 to 100 per CPU. Null: no limit
+             */
+            cpu_quota_percent?: number | null;
+            /**
+             * Memory Max Mb
+             * @description MemoryMax, in MB; at least 64. Null: no limit
+             */
+            memory_max_mb?: number | null;
+            /**
+             * Restart
+             * @description Restart now, so the processes run under the new limits
+             * @default false
+             */
+            restart: boolean;
+            /**
+             * Tasks Max
+             * @description TasksMax, processes and threads; at least 16. Null: no limit
+             */
+            tasks_max?: number | null;
+        };
+        /**
          * UpdateRequest
          * @description Request to update an application.
          */
@@ -6647,6 +7471,18 @@ export interface components {
             session_timeout: number;
         };
         /**
+         * WebSettingsResponse
+         * @description The configured web interface settings.
+         */
+        WebSettingsResponse: {
+            /** Host */
+            host: string;
+            /** Port */
+            port: number;
+            /** Session Timeout */
+            session_timeout: number;
+        };
+        /**
          * WebSocketTicket
          * @description Single-use credential for opening a WebSocket.
          *
@@ -6730,6 +7566,24 @@ export interface components {
              * Webserver
              * @description Web server to use (nginx or apache)
              */
+            webserver: string;
+        };
+        /**
+         * WebserverResponse
+         * @description The configured web server.
+         */
+        WebserverResponse: {
+            /** Webserver */
+            webserver: string;
+        };
+        /**
+         * WebserverUpdateResponse
+         * @description Confirmation for a web server update.
+         */
+        WebserverUpdateResponse: {
+            /** Message */
+            message: string;
+            /** Webserver */
             webserver: string;
         };
         /**
@@ -7079,6 +7933,37 @@ export interface operations {
             };
         };
     };
+    diagnose_app_api_apps__domain__diagnose_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DiagnoseResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_app_env_api_apps__domain__env_get: {
         parameters: {
             query?: {
@@ -7147,6 +8032,41 @@ export interface operations {
             };
         };
     };
+    update_app_limits_api_apps__domain__limits_patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateLimitsRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LimitsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_app_logs_api_apps__domain__logs_get: {
         parameters: {
             query?: {
@@ -7167,6 +8087,137 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AppLogsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    migrate_app_api_apps__domain__migrate_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MigrateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MigrationResultOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_migration_plan_api_apps__domain__migrate_plan_get: {
+        parameters: {
+            query?: {
+                persist?: string[] | null;
+            };
+            header?: never;
+            path: {
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MigrationPlanOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_app_releases_api_apps__domain__releases_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReleasesResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    activate_app_release_api_apps__domain__releases__release_id__activate_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                domain: string;
+                release_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReleaseActivationResponse"];
                 };
             };
             /** @description Validation Error */
@@ -7469,9 +8520,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["SuccessResponse"];
                 };
             };
             /** @description Validation Error */
@@ -7586,9 +8635,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["SuccessResponse"];
                 };
             };
         };
@@ -7628,9 +8675,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["SessionsListResponse"];
                 };
             };
         };
@@ -7650,9 +8695,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["SuccessResponse"];
                 };
             };
         };
@@ -7674,9 +8717,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["RevokedResponse"];
                 };
             };
             /** @description Validation Error */
@@ -7760,9 +8801,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["RevokedResponse"];
                 };
             };
             /** @description Validation Error */
@@ -8369,9 +9408,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: string;
-                    };
+                    "application/json": components["schemas"]["ConfigUpdateResponse"];
                 };
             };
             /** @description Validation Error */
@@ -8404,9 +9441,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["ConfigPatchResponse"];
                 };
             };
             /** @description Validation Error */
@@ -8435,9 +9470,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["AppsDirectoryResponse"];
                 };
             };
         };
@@ -8461,9 +9494,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: string;
-                    };
+                    "application/json": components["schemas"]["AppsDirectoryUpdateResponse"];
                 };
             };
             /** @description Validation Error */
@@ -8492,9 +9523,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["BackupSettingsResponse"];
                 };
             };
         };
@@ -8518,9 +9547,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: string;
-                    };
+                    "application/json": components["schemas"]["MessageResponse"];
                 };
             };
             /** @description Validation Error */
@@ -8602,9 +9629,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["ConfigReloadResponse"];
                 };
             };
         };
@@ -8624,9 +9649,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["SSLSettingsResponse"];
                 };
             };
         };
@@ -8650,9 +9673,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: string;
-                    };
+                    "application/json": components["schemas"]["MessageResponse"];
                 };
             };
             /** @description Validation Error */
@@ -8681,9 +9702,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["WebSettingsResponse"];
                 };
             };
         };
@@ -8707,9 +9726,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: string;
-                    };
+                    "application/json": components["schemas"]["MessageResponse"];
                 };
             };
             /** @description Validation Error */
@@ -8738,9 +9755,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["WebserverResponse"];
                 };
             };
         };
@@ -8764,9 +9779,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: string;
-                    };
+                    "application/json": components["schemas"]["WebserverUpdateResponse"];
                 };
             };
             /** @description Validation Error */
@@ -10160,9 +11173,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["MetricsListResponse"];
                 };
             };
         };
@@ -10186,9 +11197,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["MetricHistoryResponse"];
                 };
             };
             /** @description Validation Error */
@@ -10237,9 +11246,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["MonitorActionResponse"];
                 };
             };
         };
@@ -10259,9 +11266,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["MonitorActionResponse"];
                 };
             };
         };
@@ -10281,9 +11286,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["MonitorActionResponse"];
                 };
             };
         };
@@ -10358,9 +11361,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["MonitorActionResponse"];
                 };
             };
             /** @description Validation Error */
@@ -10441,9 +11442,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["MonitorActionResponse"];
                 };
             };
         };
@@ -10483,9 +11482,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["MonitorActionResponse"];
                 };
             };
         };
@@ -10505,14 +11502,32 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["MonitorActionResponse"];
                 };
             };
         };
     };
     uninstall_monitor_api_monitor_uninstall_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MonitorActionResponse"];
+                };
+            };
+        };
+    };
+    get_openapi_schema_api_openapi_json_get: {
         parameters: {
             query?: never;
             header?: never;
@@ -10678,7 +11693,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["ServiceConfigResponse"];
                 };
             };
             /** @description Validation Error */
@@ -10808,7 +11823,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["ServiceLogsResponse"];
                 };
             };
             /** @description Validation Error */
@@ -11238,6 +12253,26 @@ export interface operations {
             };
         };
     };
+    get_system_health_api_system_health_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SystemHealthOut"];
+                };
+            };
+        };
+    };
     get_machine_api_system_machine_get: {
         parameters: {
             query?: never;
@@ -11399,46 +12434,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    login_page_login_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/html": string;
-                };
-            };
-        };
-    };
-    login_submit_login_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
                 };
             };
         };

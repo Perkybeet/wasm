@@ -631,8 +631,7 @@ def _notifier_with(opener: CapturingOpener):
 
     Returns:
         A notifier over the current sandboxed configuration - the same
-        one-line construction :mod:`wasm.web.views.settings_editor` and
-        :mod:`wasm.web.api.config` both use.
+        one-line construction :mod:`wasm.web.api.config` uses.
     """
     from wasm.core.config import Config
     from wasm.core.notifier import Notifier

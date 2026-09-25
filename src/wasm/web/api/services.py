@@ -96,6 +96,32 @@ class ServiceActionResponse(BaseModel):
     service: str
 
 
+class ServiceLogsResponse(BaseModel):
+    """Response for reading a service's journal."""
+
+    service: str
+    logs: str
+    lines: int
+
+
+class ServiceConfigResponse(BaseModel):
+    """
+    Response for reading a service's unit file.
+
+    A separate class from :class:`UpdateServiceConfigRequest`, even though the
+    ``config`` field is the same string in both directions: sharing one model
+    between a request and a response body makes FastAPI generate distinct
+    input and output schemas for it, and a field with a default would then
+    come out optional to send but required to receive - correct for neither
+    direction. ``path`` has no default either way, so this stays simple, but
+    the module keeps every read-only body in its own class for that reason.
+    """
+
+    service: str
+    config: str
+    path: str
+
+
 class CreateServiceRequest(BaseModel):
     """
     Request to create a new service.
@@ -430,13 +456,13 @@ def disable_service(name: str, request: Request, session: dict = Depends(get_cur
     return _run_service_action(name, "disable", "disabled")
 
 
-@router.get("/{name}/logs")
+@router.get("/{name}/logs", response_model=ServiceLogsResponse)
 def get_service_logs(
     name: str,
     request: Request,
     lines: int = Query(default=100, ge=1, le=1000),
     session: dict = Depends(get_current_session),
-):
+) -> ServiceLogsResponse:
     """
     Get service logs from journalctl.
     """
@@ -448,11 +474,13 @@ def get_service_logs(
     except WASMError as exc:
         logs = f"Error retrieving logs: {exc}"
 
-    return {"service": service_name, "logs": logs, "lines": lines}
+    return ServiceLogsResponse(service=service_name, logs=logs, lines=lines)
 
 
-@router.get("/{name}/config")
-def get_service_config(name: str, request: Request, session: dict = Depends(get_current_session)):
+@router.get("/{name}/config", response_model=ServiceConfigResponse)
+def get_service_config(
+    name: str, request: Request, session: dict = Depends(get_current_session)
+) -> ServiceConfigResponse:
     """
     Get the systemd unit file content for a service.
 
@@ -471,7 +499,7 @@ def get_service_config(name: str, request: Request, session: dict = Depends(get_
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"Error reading config: {exc}") from exc
 
-    return {"service": service_name, "config": content, "path": str(service_path)}
+    return ServiceConfigResponse(service=service_name, config=content, path=str(service_path))
 
 
 @router.put("/{name}/config", response_model=ServiceActionResponse)

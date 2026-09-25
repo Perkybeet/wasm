@@ -94,6 +94,59 @@ class TokenInfo(BaseModel):
     session_id: str | None = None
 
 
+class SuccessResponse(BaseModel):
+    """A bare confirmation, for an action with nothing else to report back."""
+
+    success: bool
+    message: str
+
+
+class RevokedResponse(BaseModel):
+    """Confirmation that one record - a session or an API token - was revoked."""
+
+    success: bool
+    revoked: str
+
+
+class SessionEntry(BaseModel):
+    """
+    One live session, with no usable identifier in it.
+
+    Attributes:
+        sid_prefix: Leading characters of the session id - enough to name a
+            row for revocation, useless for forging the cookie it belongs to.
+        client_ip: Address the session was issued to.
+        created_at: When the session was issued, as a UNIX timestamp.
+        last_seen: Most recent activity, as a UNIX timestamp.
+        expires_at: When the session stops being valid, as a UNIX timestamp.
+        is_current: Whether this is the session the caller is using now.
+    """
+
+    sid_prefix: str
+    client_ip: str
+    created_at: float
+    last_seen: float
+    expires_at: float
+    is_current: bool
+
+
+class SessionsListResponse(BaseModel):
+    """
+    Every active session.
+
+    Attributes:
+        active_sessions: Count of live sessions.
+        current_session: The caller's own session id, unmasked - it is
+            already the credential proving the request, unlike every other
+            session's id, which only ever leaves as a prefix.
+        sessions: One entry per live session, newest activity first.
+    """
+
+    active_sessions: int
+    current_session: str | None
+    sessions: list[SessionEntry]
+
+
 class WebSocketTicket(BaseModel):
     """
     Single-use credential for opening a WebSocket.
@@ -437,10 +490,10 @@ async def elevate(
     return ElevateResponse(elevated_until=_iso(elevated_until) or "")
 
 
-@router.post("/logout")
+@router.post("/logout", response_model=SuccessResponse)
 async def logout(
     request: Request, response: Response, session: dict[str, Any] = Depends(require_auth)
-) -> dict[str, Any]:
+) -> SuccessResponse:
     """
     Revoke the current session and clear its cookies.
 
@@ -471,7 +524,7 @@ async def logout(
             resource="/api/auth/logout",
         )
 
-    return {"success": True, "message": "Logged out successfully"}
+    return SuccessResponse(success=True, message="Logged out successfully")
 
 
 @router.get("/verify", response_model=TokenInfo)
@@ -527,8 +580,8 @@ async def create_ws_ticket(
     return WebSocketTicket(ticket=ticket, expires_in=expires_in)
 
 
-@router.get("/sessions")
-async def get_sessions(session: dict[str, Any] = Depends(require_auth)) -> dict[str, Any]:
+@router.get("/sessions", response_model=SessionsListResponse)
+async def get_sessions(session: dict[str, Any] = Depends(require_auth)) -> SessionsListResponse:
     """
     Report the active sessions.
 
@@ -545,20 +598,20 @@ async def get_sessions(session: dict[str, Any] = Depends(require_auth)) -> dict[
     """
     token_manager = get_token_manager()
     current = session.get("sid") if session.get("type") == "session" else None
-    return {
-        "active_sessions": token_manager.get_active_session_count(),
-        "current_session": session.get("sid"),
-        "sessions": token_manager.list_sessions(current),
-    }
+    return SessionsListResponse(
+        active_sessions=token_manager.get_active_session_count(),
+        current_session=session.get("sid"),
+        sessions=[SessionEntry(**entry) for entry in token_manager.list_sessions(current)],
+    )
 
 
 # Synchronous so the settings screen's "Sign out everywhere" adapter can call
 # it directly; FastAPI runs it in a threadpool either way. Declared before the
 # parametrised sibling, the way every router here orders its routes.
-@router.post("/sessions/revoke-all")
+@router.post("/sessions/revoke-all", response_model=SuccessResponse)
 def revoke_all_sessions(
     request: Request, response: Response, session: dict[str, Any] = Depends(require_auth)
-) -> dict[str, Any]:
+) -> SuccessResponse:
     """
     Revoke every session, including the caller's.
 
@@ -586,13 +639,13 @@ def revoke_all_sessions(
             resource="/api/auth/sessions/revoke-all",
         )
 
-    return {"success": True, "message": "All sessions revoked"}
+    return SuccessResponse(success=True, message="All sessions revoked")
 
 
-@router.delete("/sessions/{sid_prefix}")
+@router.delete("/sessions/{sid_prefix}", response_model=RevokedResponse)
 def revoke_one_session(
     sid_prefix: str, request: Request, session: dict[str, Any] = Depends(require_auth)
-) -> dict[str, Any]:
+) -> RevokedResponse:
     """
     Revoke exactly one session, named by a unique prefix of its id.
 
@@ -635,7 +688,7 @@ def revoke_one_session(
             detail=f"revoked session {revoked}",
         )
 
-    return {"success": True, "revoked": revoked}
+    return RevokedResponse(success=True, revoked=revoked)
 
 
 class TwoFactorStatus(BaseModel):
@@ -810,10 +863,10 @@ def two_factor_confirm(
     return TwoFactorConfirmed(success=True, backup_codes=codes)
 
 
-@router.post("/2fa/disable")
+@router.post("/2fa/disable", response_model=SuccessResponse)
 def two_factor_disable(
     request: Request, body: TwoFactorCode, session: dict[str, Any] = Depends(require_elevated)
-) -> dict[str, Any]:
+) -> SuccessResponse:
     """
     Turn the second factor off, on presentation of a current code.
 
@@ -853,7 +906,7 @@ def two_factor_disable(
             resource="/api/auth/2fa/disable",
         )
 
-    return {"success": True, "message": "Two-factor authentication disabled"}
+    return SuccessResponse(success=True, message="Two-factor authentication disabled")
 
 
 class ApiTokenRequest(BaseModel):
@@ -997,10 +1050,10 @@ def create_api_token(
     return ApiTokenCreated(**issued)
 
 
-@router.delete("/tokens/{token_id}")
+@router.delete("/tokens/{token_id}", response_model=RevokedResponse)
 def revoke_api_token(
     token_id: int, request: Request, session: dict[str, Any] = Depends(require_scope("admin"))
-) -> dict[str, Any]:
+) -> RevokedResponse:
     """
     Revoke one API token. Requests presenting it stop authenticating at once.
 
@@ -1030,4 +1083,4 @@ def revoke_api_token(
             detail=f"revoked token '{name}'",
         )
 
-    return {"success": True, "revoked": name}
+    return RevokedResponse(success=True, revoked=name)

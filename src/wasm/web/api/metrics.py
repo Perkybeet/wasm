@@ -18,9 +18,10 @@ honour would come back misleadingly sparse, so it cannot be asked for.
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
 
 from wasm.web import metrics_collector
 from wasm.web.api.auth import get_current_session
@@ -40,8 +41,23 @@ WINDOWS: dict[str, int] = {
 Session = Annotated[dict, Depends(get_current_session)]
 
 
-@router.get("")
-def list_metrics(session: Session) -> dict[str, Any]:
+class MetricsListResponse(BaseModel):
+    """Every metric name the store has data for, and the windows it can be read over."""
+
+    metrics: list[str]
+    windows: list[str]
+
+
+class MetricHistoryResponse(BaseModel):
+    """One metric's points over a window, oldest first."""
+
+    metric: str
+    window: str
+    points: list[tuple[int, float]]
+
+
+@router.get("", response_model=MetricsListResponse)
+def list_metrics(session: Session) -> MetricsListResponse:
     """
     Name every metric that has data.
 
@@ -52,15 +68,15 @@ def list_metrics(session: Session) -> dict[str, Any]:
         The metric names and the windows they can be asked over.
     """
     store = metrics_collector.get_metrics_store()
-    return {"metrics": store.list_metrics(), "windows": sorted(WINDOWS)}
+    return MetricsListResponse(metrics=store.list_metrics(), windows=sorted(WINDOWS))
 
 
-@router.get("/{metric:path}")
+@router.get("/{metric:path}", response_model=MetricHistoryResponse)
 def metric_history(
     metric: str,
     session: Session,
     window: Annotated[Literal["1h", "24h", "30d"], Query()] = "1h",
-) -> dict[str, Any]:
+) -> MetricHistoryResponse:
     """
     Read one metric over a named window, oldest point first.
 
@@ -78,8 +94,6 @@ def metric_history(
     """
     store = metrics_collector.get_metrics_store()
     points = store.query(metric, window_s=WINDOWS[window])
-    return {
-        "metric": metric,
-        "window": window,
-        "points": [[ts, value] for ts, value in points],
-    }
+    return MetricHistoryResponse(
+        metric=metric, window=window, points=[(ts, value) for ts, value in points]
+    )
