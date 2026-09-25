@@ -288,11 +288,34 @@ class TestRedactSecrets:
 
         assert result == data
 
-    def test_empty_secret_values_are_still_redacted(self) -> None:
-        """An empty password must not reveal that no password is configured."""
-        result = redact_secrets({"password": ""})
+    def test_a_set_secret_value_is_redacted(self) -> None:
+        """A configured password must never be served in clear."""
+        result = redact_secrets({"password": "hunter2"})
 
         assert result["password"] == "***"
+
+    def test_an_empty_secret_value_is_left_empty(self) -> None:
+        """
+        An unconfigured secret reads back empty, not "***".
+
+        "***" and "" used to be the same value for every unset secret, which
+        left the console unable to tell "nothing is configured" from "there
+        is a value, go type the placeholder to keep it" - the SMTP password
+        field and the OpenAI key field looked identically filled-in whether
+        or not either notification channel actually worked. An empty string
+        carries no credential either way, so leaving it as "" costs nothing
+        `restore_redacted` does not already handle: unmodified round trips
+        of "" already stored "" before this changed.
+        """
+        result = redact_secrets({"password": ""})
+
+        assert result["password"] == ""
+
+    def test_none_secret_value_is_left_as_none(self) -> None:
+        """A secret that was never set at all is no more revealing than empty."""
+        result = redact_secrets({"api_key": None})
+
+        assert result["api_key"] is None
 
     def test_webhook_urls_are_redacted_wholesale(self) -> None:
         """
@@ -443,14 +466,27 @@ class TestSecretInventory:
             "notifications.channels.telegram.bot_token",
         }
 
-    def test_redaction_touches_the_credentials_and_nothing_else(self) -> None:
-        """A false positive turns a numeric setting into "***" in the panel."""
+    def test_unconfigured_secrets_are_left_alone(self) -> None:
+        """
+        Every secret ships unset (empty) in DEFAULT_CONFIG, so redacting it
+        fresh must change nothing: "***" everywhere would be as uninformative
+        as "" everywhere, and this is the case that used to hide which.
+        """
         redacted = redact_secrets(DEFAULT_CONFIG)
 
+        assert redacted == DEFAULT_CONFIG
+
+    def test_redaction_touches_the_credentials_and_nothing_else(self, config_path: Path) -> None:
+        """A false positive turns a numeric setting into "***" in the panel."""
+        config = Config()
+        for index, path in enumerate(secret_paths(DEFAULT_CONFIG)):
+            config.set(path, f"configured-{index}")
+        filled = config.to_dict()
+
+        redacted = redact_secrets(filled)
+
         changed = {
-            path
-            for path in _flat_paths(DEFAULT_CONFIG)
-            if _lookup(redacted, path) != _lookup(DEFAULT_CONFIG, path)
+            path for path in _flat_paths(filled) if _lookup(redacted, path) != _lookup(filled, path)
         }
         assert changed == {
             "monitor.openai.api_key",
@@ -464,6 +500,7 @@ class TestSecretInventory:
             "notifications.channels.discord.webhook_url",
             "notifications.channels.telegram.bot_token",
         }
+        assert all(_lookup(redacted, path) == "***" for path in changed)
 
     def test_no_secret_survives_a_full_tree_redaction(self, config_path: Path) -> None:
         """Filling every secret in the tree and redacting must leak nothing."""

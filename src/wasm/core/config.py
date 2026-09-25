@@ -435,12 +435,20 @@ def redact_secrets(config: Any) -> Any:
     """
     Return a copy of a configuration structure with secrets replaced.
 
-    Walks dictionaries and lists recursively and replaces the value of every key
-    whose name matches :data:`SECRET_KEY_MARKERS` with :data:`REDACTED`, empty
-    values included, so the result never reveals whether a secret is set. A
-    container behind such a key is walked instead of being replaced wholesale,
-    so a ``credentials`` block keeps its user names and loses only its
-    passwords. The input is not modified.
+    Walks dictionaries and lists recursively and replaces the value of every
+    key whose name matches :data:`SECRET_KEY_MARKERS` with :data:`REDACTED` -
+    unless the value is already empty (``""`` or ``None``), which is left as
+    it is. A client reading ``***`` for every unset secret alongside every
+    configured one could not tell "the SMTP password is set" from "it never
+    was", which is exactly the distinction a settings screen needs to show
+    whether a notification channel is actually usable. An empty value is not
+    a credential either way, so leaving it empty costs nothing: a save that
+    does not touch the field round-trips the same empty string it was shown,
+    the same as it always has.
+
+    A container behind a secret key is walked instead of being replaced
+    wholesale, so a ``credentials`` block keeps its user names and loses only
+    its passwords. The input is not modified.
 
     Args:
         config: Configuration mapping, sequence or scalar to redact.
@@ -450,7 +458,7 @@ def redact_secrets(config: Any) -> Any:
     """
     if isinstance(config, dict):
         return {
-            key: REDACTED
+            key: (REDACTED if value not in ("", None) else value)
             if _is_secret_key(str(key)) and not isinstance(value, (dict, list, tuple))
             else redact_secrets(value)
             for key, value in config.items()

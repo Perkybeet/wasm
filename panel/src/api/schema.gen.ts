@@ -762,6 +762,37 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/audit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Audit Entries
+         * @description List audit entries, newest first, with keyset pagination.
+         *
+         *     Args:
+         *         limit: Maximum entries to return.
+         *         before: Cursor from a previous page's ``next_before``.
+         *         action: Only entries with this exact action.
+         *         result: Only entries with this exact result.
+         *         actor: Only entries with this exact actor.
+         *         session: The authenticated session; admin scope is required.
+         *
+         *     Returns:
+         *         The matching entries and the cursor for the next page.
+         */
+        get: operations["list_audit_entries_api_audit_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/auth/2fa": {
         parameters: {
             query?: never;
@@ -1079,6 +1110,43 @@ export interface paths {
          *         A confirmation payload.
          */
         post: operations["revoke_all_sessions_api_auth_sessions_revoke_all_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/auth/sessions/revoke-others": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Revoke Other Sessions
+         * @description Revoke every session except the caller's, leaving it signed in.
+         *
+         *     The counterpart to "Sign out everywhere": an operator who notices an
+         *     unrecognised session in the list wants every other session gone without
+         *     also being signed out of the tab they are looking at the list from.
+         *
+         *     Args:
+         *         request: The incoming request.
+         *         session: The authenticated session.
+         *
+         *     Returns:
+         *         A confirmation payload naming how many sessions were revoked.
+         *
+         *     Raises:
+         *         HTTPException: 400 when the caller's own credential is not a session
+         *             (a Bearer token or the master token) - there is no "other
+         *             session" concept for a credential that never had a browser tab
+         *             of its own.
+         */
+        post: operations["revoke_other_sessions_api_auth_sessions_revoke_others_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1429,9 +1497,13 @@ export interface paths {
          * Delete Backup
          * @description Delete a backup and everything that belongs to it.
          *
+         *     Deletion is irreversible - D5's sudo mode list treats it the same as
+         *     deleting an application - so a cookie session has to confirm itself
+         *     first; an admin-scoped Bearer credential is exempt.
+         *
          *     Args:
          *         backup_id: Backup identifier.
-         *         session: The authenticated session.
+         *         session: The authenticated, elevated session.
          *
          *     Returns:
          *         The action outcome.
@@ -1458,10 +1530,15 @@ export interface paths {
          * Restore Backup
          * @description Queue a restore of an application from a backup.
          *
+         *     Restoring overwrites whatever the target domain currently has running -
+         *     D5's sudo mode list treats it the same as deleting an application, so a
+         *     cookie session has to confirm itself first; an admin-scoped Bearer
+         *     credential is exempt, per :func:`wasm.web.api.deps.ensure_elevated`.
+         *
          *     Args:
          *         backup_id: Backup identifier.
          *         data: Restore options.
-         *         session: The authenticated session.
+         *         session: The authenticated, elevated session.
          *
          *     Returns:
          *         The queued job.
@@ -2081,6 +2158,41 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/cron/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Preview Schedule
+         * @description Preview a schedule's next five runs before it is saved as a job.
+         *
+         *     Declared before ``/{name}`` on purpose, the same reason ``/{name}/run``
+         *     and friends are: a parametrised route registered first would match
+         *     ``preview`` as a job name.
+         *
+         *     Args:
+         *         data: The preview request. Its calendar expression was already
+         *             checked against the manager's own rules by the request model.
+         *         session: The authenticated session.
+         *
+         *     Returns:
+         *         The normalised calendar and its next runs.
+         *
+         *     Raises:
+         *         ServiceError: When systemd itself refuses the expression.
+         */
+        post: operations["preview_schedule_api_cron_preview_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/cron/{name}": {
         parameters: {
             query?: never;
@@ -2506,6 +2618,38 @@ export interface paths {
          *         The log output.
          */
         get: operations["get_engine_logs_api_databases_engines__engine__logs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/databases/engines/{engine}/privileges": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Engine Privileges
+         * @description List the privileges an engine's grant dialog may offer.
+         *
+         *     The manager's own whitelist is the one definition of what WASM will
+         *     grant - see :data:`wasm.managers.database.base.BaseDatabaseManager.VALID_PRIVILEGES` -
+         *     so the console reads it from here instead of keeping its own copy that
+         *     could drift.
+         *
+         *     Args:
+         *         engine: Engine name.
+         *         session: The authenticated session.
+         *
+         *     Returns:
+         *         The engine's valid privileges, sorted for a stable listing.
+         */
+        get: operations["get_engine_privileges_api_databases_engines__engine__privileges_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -3752,7 +3896,13 @@ export interface paths {
         };
         /**
          * List Services
-         * @description List all services (or only WASM services).
+         * @description List services.
+         *
+         *     ``wasm_only`` (the default) scopes the listing to what the store
+         *     tracks - the units WASM itself created. Set it to false for a full
+         *     inventory of every unit on the host, each flagged ``managed``, which is
+         *     how a diagnostics view tells a foreign unit's own crash loop from one of
+         *     WASM's own.
          */
         get: operations["list_services_api_services_get"];
         put?: never;
@@ -3761,6 +3911,30 @@ export interface paths {
          * @description Create a new systemd service.
          */
         post: operations["create_service_api_services_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/services/verify": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Verify Unit
+         * @description Check a candidate unit file with systemd-analyze, without saving it.
+         *
+         *     Declared before ``/{name}`` on purpose: a parametrised route registered
+         *     first would match ``verify`` as a service name. Used by the unit editor
+         *     to catch a mistake before "save" ever reaches a real unit file.
+         */
+        post: operations["verify_unit_api_services_verify_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4853,6 +5027,50 @@ export interface components {
             message: string;
         };
         /**
+         * AuditEntry
+         * @description One audit log line.
+         *
+         *     Attributes:
+         *         timestamp: When the action was attempted, with its UTC offset.
+         *         action: What was attempted, for example ``apps.delete``.
+         *         result: Outcome, for example ``success`` or ``denied``.
+         *         actor: Session id, API token name, ``master`` or ``anonymous``.
+         *         client_ip: Address the request came from.
+         *         resource: Target of the action, such as an API path.
+         *         detail: Extra context. Never a credential.
+         */
+        AuditEntry: {
+            /** Action */
+            action: string;
+            /** Actor */
+            actor: string;
+            /** Client Ip */
+            client_ip?: string | null;
+            /** Detail */
+            detail?: string | null;
+            /** Resource */
+            resource?: string | null;
+            /** Result */
+            result: string;
+            /** Timestamp */
+            timestamp: string;
+        };
+        /**
+         * AuditListResponse
+         * @description Response for ``GET /api/audit``.
+         *
+         *     Attributes:
+         *         items: The matching entries, newest first.
+         *         next_before: Pass as ``before`` to fetch the next page, or None when
+         *             this page reached the end of the log.
+         */
+        AuditListResponse: {
+            /** Items */
+            items: components["schemas"]["AuditEntry"][];
+            /** Next Before */
+            next_before?: string | null;
+        };
+        /**
          * BackupActionResponse
          * @description Response for a backup action that completed immediately.
          */
@@ -4885,6 +5103,12 @@ export interface components {
         /**
          * BackupInfo
          * @description One backup as the manager records it.
+         *
+         *     Attributes:
+         *         last_verified_at: When ``POST /{backup_id}/verify`` last checked this
+         *             archive. None when nothing ever has.
+         *         verified_ok: That check's own verdict. None until the first check;
+         *             reflects the most recent one after that, whichever way it went.
          */
         BackupInfo: {
             /** Age */
@@ -4928,6 +5152,8 @@ export interface components {
              * @default false
              */
             includes_node_modules: boolean;
+            /** Last Verified At */
+            last_verified_at?: string | null;
             /** Size */
             size: number;
             /** Size Human */
@@ -4936,6 +5162,8 @@ export interface components {
             tags?: string[];
             /** Timestamp */
             timestamp: string;
+            /** Verified Ok */
+            verified_ok?: boolean | null;
         };
         /**
          * BackupInfoResponse
@@ -5672,6 +5900,34 @@ export interface components {
             total: number;
         };
         /**
+         * CronPreviewRequest
+         * @description Request to preview a schedule before it is saved as a job.
+         */
+        CronPreviewRequest: {
+            /**
+             * Schedule
+             * @description hourly, daily, weekly, monthly or a systemd OnCalendar expression
+             * @default daily
+             */
+            schedule: string;
+        };
+        /**
+         * CronPreviewResponse
+         * @description Response for ``POST /api/cron/preview``.
+         *
+         *     Attributes:
+         *         calendar: The normalised ``OnCalendar`` expression the job would be
+         *             created with.
+         *         next_runs: Up to five future runs, as ISO 8601 timestamps with a UTC
+         *             offset - fewer when the schedule has no further run to report.
+         */
+        CronPreviewResponse: {
+            /** Calendar */
+            calendar: string;
+            /** Next Runs */
+            next_runs: string[];
+        };
+        /**
          * CronRunInfo
          * @description One recorded execution of a cron job.
          *
@@ -5707,6 +5963,12 @@ export interface components {
         /**
          * DatabaseInfoResponse
          * @description One database.
+         *
+         *     Attributes:
+         *         owner: The role or account that owns it. Null when the engine has no
+         *             such concept - MySQL/MariaDB and Redis have none, and MongoDB
+         *             grants roles to users rather than owning a database with one; see
+         *             each manager's ``list_databases`` docstring for why.
          */
         DatabaseInfoResponse: {
             /** Encoding */
@@ -6235,6 +6497,8 @@ export interface components {
          * @description One job, as the queue records it.
          */
         JobResponse: {
+            /** Actor */
+            actor?: string | null;
             /** Completed At */
             completed_at?: string | null;
             /** Created At */
@@ -6804,6 +7068,16 @@ export interface components {
             } | null;
         };
         /**
+         * PrivilegesResponse
+         * @description Response for ``GET /api/databases/engines/{engine}/privileges``.
+         */
+        PrivilegesResponse: {
+            /** Engine */
+            engine: string;
+            /** Privileges */
+            privileges: string[];
+        };
+        /**
          * ProcessEntry
          * @description One row of the process table.
          *
@@ -6910,10 +7184,23 @@ export interface components {
          *         success: Whether the engine accepted the statement.
          *         output: The engine's output, truncated to ``max_rows`` lines.
          *         mode: The mode the statement ran in.
-         *         truncated: Whether output was cut.
-         *         returned_rows: How many lines the response carries.
+         *         truncated: Whether ``output`` or ``rows`` was cut.
+         *         returned_rows: How many lines ``output`` carries.
+         *         columns: Column names, in the order the engine returned them. Empty
+         *             for an engine with no tabular client output to parse (Redis,
+         *             MongoDB) or a statement with no result set.
+         *         rows: Data rows, each cell a string exactly as the client printed it.
+         *         row_count: Number of rows in ``rows``, after truncation.
+         *         duration_ms: Wall-clock time the query's own client invocation took.
          */
         QueryResponse: {
+            /** Columns */
+            columns?: string[];
+            /**
+             * Duration Ms
+             * @default 0
+             */
+            duration_ms: number;
             /** Mode */
             mode: string;
             /** Output */
@@ -6923,6 +7210,13 @@ export interface components {
              * @default 0
              */
             returned_rows: number;
+            /**
+             * Row Count
+             * @default 0
+             */
+            row_count: number;
+            /** Rows */
+            rows?: string[][];
             /** Success */
             success: boolean;
             /**
@@ -7191,22 +7485,46 @@ export interface components {
         /**
          * ServiceInfo
          * @description Service information.
+         *
+         *     Attributes:
+         *         managed: Whether this unit was created by WASM. Always true for a
+         *             service reached through the store; may be false when listing
+         *             with ``wasm_only=false``, which walks every unit on the host.
+         *         active_state: Systemd's own ``ActiveState`` (``active``, ``failed``,
+         *             ``activating``, ...). Distinguishes a unit systemd is repeatedly
+         *             restarting from one that is cleanly stopped, which ``active``
+         *             alone cannot: both report ``active=false`` between attempts.
+         *         sub_state: Systemd's own ``SubState`` (``running``, ``dead``,
+         *             ``auto-restart``, ...), the finer-grained half of the same story.
+         *         result: Systemd's own ``Result`` for the last run (``success``,
+         *             ``exit-code``, ``signal``, ...).
          */
         ServiceInfo: {
             /** Active */
             active: boolean;
+            /** Active State */
+            active_state?: string | null;
             /** Description */
             description?: string | null;
             /** Enabled */
             enabled: boolean;
+            /**
+             * Managed
+             * @default true
+             */
+            managed: boolean;
             /** Memory */
             memory?: string | null;
             /** Name */
             name: string;
             /** Pid */
             pid?: number | null;
+            /** Result */
+            result?: string | null;
             /** Status */
             status: string;
+            /** Sub State */
+            sub_state?: string | null;
             /** Uptime */
             uptime?: string | null;
         };
@@ -7699,6 +8017,28 @@ export interface components {
             valid: boolean;
             /** Warnings */
             warnings?: string[];
+        };
+        /**
+         * VerifyUnitRequest
+         * @description Request to check a candidate unit file before it is saved.
+         */
+        VerifyUnitRequest: {
+            /** Content */
+            content: string;
+        };
+        /**
+         * VerifyUnitResponse
+         * @description Result of checking a candidate unit file.
+         *
+         *     Attributes:
+         *         success: Whether systemd-analyze accepted it.
+         *         output: Its own explanation, verbatim - empty on a clean pass.
+         */
+        VerifyUnitResponse: {
+            /** Output */
+            output: string;
+            /** Success */
+            success: boolean;
         };
         /**
          * WebConfig
@@ -8832,6 +9172,45 @@ export interface operations {
             };
         };
     };
+    list_audit_entries_api_audit_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+                /** @description Only entries older than this cursor */
+                before?: string | null;
+                /** @description Filter by exact action */
+                action?: string | null;
+                /** @description Filter by exact result */
+                result?: string | null;
+                /** @description Filter by exact actor */
+                actor?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuditListResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     two_factor_status_api_auth_2fa_get: {
         parameters: {
             query?: never;
@@ -9065,6 +9444,26 @@ export interface operations {
         };
     };
     revoke_all_sessions_api_auth_sessions_revoke_all_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SuccessResponse"];
+                };
+            };
+        };
+    };
+    revoke_other_sessions_api_auth_sessions_revoke_others_post: {
         parameters: {
             query?: never;
             header?: never;
@@ -10230,6 +10629,39 @@ export interface operations {
             };
         };
     };
+    preview_schedule_api_cron_preview_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CronPreviewRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CronPreviewResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     delete_job_api_cron__name__delete: {
         parameters: {
             query?: never;
@@ -10723,6 +11155,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["EngineLogsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_engine_privileges_api_databases_engines__engine__privileges_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                engine: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrivilegesResponse"];
                 };
             };
             /** @description Validation Error */
@@ -11985,6 +12448,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ServiceActionResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    verify_unit_api_services_verify_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["VerifyUnitRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VerifyUnitResponse"];
                 };
             };
             /** @description Validation Error */

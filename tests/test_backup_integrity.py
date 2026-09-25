@@ -467,6 +467,51 @@ class TestVerify:
         assert result["valid"] is False
         assert any("corrupt" in error.lower() for error in result["errors"])
 
+    def test_a_sound_verification_is_recorded_on_the_backup(self, manager, monkeypatch):
+        """The verdict outlives the call: it is written back to the metadata."""
+        _use_store(monkeypatch, None, [])
+        metadata = manager.create("shop.example.com")
+        assert manager.get_backup(metadata.id).verified_ok is None
+        assert manager.get_backup(metadata.id).last_verified_at is None
+
+        manager.verify(metadata.id)
+
+        reloaded = manager.get_backup(metadata.id)
+        assert reloaded.verified_ok is True
+        assert reloaded.last_verified_at is not None
+
+    def test_a_failed_verification_is_also_recorded(self, manager, monkeypatch):
+        """A corrupt archive's own verdict is what gets persisted, not a stale pass."""
+        _use_store(monkeypatch, None, [])
+        metadata = manager.create("shop.example.com")
+        archive = manager.backup_dir / "shop-example-com" / f"{metadata.id}.tar.gz"
+        raw = bytearray(archive.read_bytes())
+        raw[len(raw) // 2] ^= 0xFF
+        archive.write_bytes(bytes(raw))
+
+        manager.verify(metadata.id)
+
+        assert manager.get_backup(metadata.id).verified_ok is False
+
+    def test_a_later_verification_overwrites_the_recorded_one(self, manager, monkeypatch):
+        """The console shows the most recent check, not the first one."""
+        _use_store(monkeypatch, None, [])
+        metadata = manager.create("shop.example.com")
+        archive = manager.backup_dir / "shop-example-com" / f"{metadata.id}.tar.gz"
+
+        manager.verify(metadata.id)
+        first = manager.get_backup(metadata.id).last_verified_at
+
+        raw = bytearray(archive.read_bytes())
+        raw[len(raw) // 2] ^= 0xFF
+        archive.write_bytes(bytes(raw))
+        manager.verify(metadata.id)
+
+        reloaded = manager.get_backup(metadata.id)
+        assert reloaded.verified_ok is False
+        assert reloaded.last_verified_at is not None
+        assert reloaded.last_verified_at >= first
+
 
 class TestRetention:
     """Deleting a backup deletes everything that belongs to it."""

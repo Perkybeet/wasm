@@ -346,6 +346,12 @@ class RedisManager(BaseDatabaseManager):
         """
         List the slots that hold keys, plus slot 0.
 
+        ``owner`` and ``size`` stay unset: a Redis "database" is a numbered
+        keyspace slot inside one server process, not an object with a
+        catalog entry - there is no owner to report, and INFO's per-slot
+        stats give a key count, not the memory a slot itself accounts for
+        (that is server-wide, from :meth:`get_status`).
+
         Returns:
             One entry per listed slot, with its key count.
         """
@@ -515,6 +521,12 @@ class RedisManager(BaseDatabaseManager):
     def list_users(self) -> list[UserInfo]:
         """
         List the ACL users.
+
+        ``databases`` stays empty: an ACL rule selects keys by pattern
+        (``~app:*``), not by the numbered slot a client happens to ``SELECT``
+        into, so there is no per-slot grant to report the way a SQL engine's
+        per-database privilege can be. The rule text itself, in
+        ``privileges``, is the accurate answer.
 
         Returns:
             One entry per user, with its rules.

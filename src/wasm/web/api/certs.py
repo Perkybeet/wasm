@@ -31,6 +31,7 @@ from wasm.core.exceptions import ValidationError
 from wasm.managers.cert_manager import CertificateInfo, CertManager
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import JobAcceptedResponse, WASMErrorRoute, strict_domain
+from wasm.web.auth import actor_label
 from wasm.web.jobs import JobType, cert_create_job, cert_renew_job, get_job_manager
 
 router = APIRouter(route_class=WASMErrorRoute)
@@ -199,6 +200,7 @@ def renew_all_certificates(
         func=cert_renew_job,
         kwargs={"domain": None, "force": force},
         metadata={"domain": "all", "force": force},
+        actor=actor_label(session),
     )
     return JobAcceptedResponse(
         job_id=job.id,
@@ -280,6 +282,7 @@ def create_certificate(
             "expand": options.expand,
         },
         metadata={"domain": validated},
+        actor=actor_label(session),
     )
     return JobAcceptedResponse(
         job_id=job.id,
@@ -323,6 +326,7 @@ def renew_certificate(
         func=cert_renew_job,
         kwargs={"domain": validated, "force": force},
         metadata={"domain": validated, "force": force},
+        actor=actor_label(session),
     )
     return JobAcceptedResponse(
         job_id=job.id,

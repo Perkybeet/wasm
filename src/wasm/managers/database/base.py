@@ -24,10 +24,13 @@ Three rules are enforced in this module and must not be relaxed by subclasses:
 
 from __future__ import annotations
 
+import csv
+import io
 import os
 import re
 import secrets
 import string
+import time
 from abc import abstractmethod
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -49,6 +52,11 @@ from wasm.managers.base_manager import BaseManager
 
 #: Deadline for a query or any other short-lived client invocation.
 QUERY_TIMEOUT = 120
+
+#: Rows kept in a structured console result before it is reported truncated.
+#: The SQL console renders these into a table; an unbounded result would turn
+#: one accidental ``SELECT *`` into megabytes of JSON in a browser tab.
+DEFAULT_STRUCTURED_ROW_CAP = 1000
 
 #: Deadline for a systemctl verb. Stopping a busy engine can take a while.
 SERVICE_TIMEOUT = 120
@@ -342,6 +350,71 @@ def format_size(size: float) -> str:
     return f"{size:.1f} PB"
 
 
+@dataclass
+class StructuredQueryResult:
+    """
+    Result of a console query, as :meth:`BaseDatabaseManager.execute_query_structured`
+    hands it back.
+
+    Attributes:
+        output: The client's own output, verbatim - what the legacy plain-text
+            console field has always shown.
+        columns: Column names, in order. Empty when the engine has no tabular
+            client output to parse (see the method's own docstring).
+        rows: Data rows, each cell already a string exactly as the client
+            printed it - no type coercion, so a NULL and an empty string stay
+            distinguishable to whoever reads the raw client output too.
+        row_count: Number of rows in ``rows``, after any truncation.
+        duration_ms: Wall-clock time the client invocation took.
+        truncated: Whether rows beyond :data:`DEFAULT_STRUCTURED_ROW_CAP` (or
+            the caller's own ``max_rows``) were dropped.
+    """
+
+    output: str = ""
+    columns: list[str] = field(default_factory=list)
+    rows: list[list[str]] = field(default_factory=list)
+    row_count: int = 0
+    duration_ms: float = 0.0
+    truncated: bool = False
+
+
+def parse_tabular_query_output(
+    text: str, *, delimiter: str, max_rows: int = DEFAULT_STRUCTURED_ROW_CAP
+) -> tuple[list[str], list[list[str]], bool]:
+    """
+    Parse a database client's header-plus-rows output into columns and rows.
+
+    One implementation for every engine that can be asked to print its result
+    with a header row and a fixed delimiter - PostgreSQL's ``psql --csv`` and
+    MySQL's ``mysql --batch`` (with ``-N`` dropped) both qualify, with
+    different delimiters, which is the only thing that differs between them.
+
+    Args:
+        text: The client's stdout: a header line followed by data lines.
+        delimiter: Field separator the client used (``,`` for psql's CSV,
+            ``\\t`` for mysql's batch mode).
+        max_rows: Data rows kept before the rest are dropped.
+
+    Returns:
+        Column names, the (possibly truncated) rows, and whether rows were
+        dropped to respect ``max_rows``. Empty column and row lists when the
+        client printed nothing - a statement with no result set, such as a
+        bare ``COMMIT``.
+    """
+    stripped = text.strip("\n")
+    if not stripped:
+        return [], [], False
+
+    reader = csv.reader(io.StringIO(stripped), delimiter=delimiter)
+    lines = list(reader)
+    if not lines:
+        return [], [], False
+
+    columns, data = lines[0], lines[1:]
+    truncated = len(data) > max_rows
+    return columns, data[:max_rows], truncated
+
+
 class BaseDatabaseManager(BaseManager):
     """
     Base class for database engine managers.
@@ -378,6 +451,9 @@ class BaseDatabaseManager(BaseManager):
     VALID_PRIVILEGES: frozenset[str] = frozenset()
     #: Privileges used when the caller names none.
     DEFAULT_PRIVILEGES: tuple[str, ...] = ()
+    #: Whether execute_query_structured() has been overridden with a real
+    #: parser for this engine's client output, rather than the base fallback.
+    SUPPORTS_STRUCTURED_QUERY: bool = False
 
     #: Where backups are written when the caller gives no path.
     BACKUP_DIR = Path("/var/backups/wasm/databases")
@@ -1318,6 +1394,45 @@ class BaseDatabaseManager(BaseManager):
         Raises:
             DatabaseQueryError: When the statement fails.
         """
+
+    def execute_query_structured(
+        self,
+        database: str,
+        query: str,
+        *,
+        read_only: bool = False,
+        max_rows: int = DEFAULT_STRUCTURED_ROW_CAP,
+    ) -> StructuredQueryResult:
+        """
+        Execute a statement and, where the engine's client supports it, parse
+        its result into columns and rows.
+
+        The default falls back to :meth:`execute_query`'s plain text and
+        leaves ``columns``/``rows`` empty: Redis and MongoDB have no tabular
+        client output to parse from a generic invocation the way ``psql
+        --csv`` or ``mysql --batch`` do, so the SQL consoles override this and
+        those two engines document the gap by leaving it at the default. This
+        never runs the query a second time - :meth:`execute_query` already is
+        the one execution - so a write statement is never applied twice.
+
+        Args:
+            database: Database name.
+            query: Statement to execute.
+            read_only: Whether the statement must be refused if it writes.
+            max_rows: Most rows kept in ``rows`` before truncation. Unused
+                here: the fallback has no rows to cap.
+
+        Returns:
+            The plain output wrapped in :class:`StructuredQueryResult`, timed
+            around the one call this makes.
+
+        Raises:
+            DatabaseQueryError: When the statement fails.
+        """
+        start = time.perf_counter()
+        _, output = self.execute_query(database, query, read_only=read_only)
+        duration_ms = (time.perf_counter() - start) * 1000
+        return StructuredQueryResult(output=output, duration_ms=duration_ms)
 
     @abstractmethod
     def get_connection_string(

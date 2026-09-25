@@ -37,6 +37,7 @@ from wasm.deployers.domains import (
 )
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import WASMErrorRoute, require_elevated, strict_domain
+from wasm.web.auth import actor_label
 from wasm.web.jobs import JobContext, JobType, get_job_manager
 from wasm.web.pydantic_compat import iso_offset_validator
 
@@ -253,6 +254,7 @@ def post_domain(
             func=certificate_job,
             kwargs={"app_domain": validated},
             metadata={"domain": validated},
+            actor=actor_label(session),
         )
         job_id = job.id
     return _changed(change, job_id)

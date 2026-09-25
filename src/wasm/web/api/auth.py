@@ -642,6 +642,58 @@ def revoke_all_sessions(
     return SuccessResponse(success=True, message="All sessions revoked")
 
 
+# Declared before the parametrised sibling, like revoke-all above it.
+@router.post("/sessions/revoke-others", response_model=SuccessResponse)
+def revoke_other_sessions(
+    request: Request, session: dict[str, Any] = Depends(require_auth)
+) -> SuccessResponse:
+    """
+    Revoke every session except the caller's, leaving it signed in.
+
+    The counterpart to "Sign out everywhere": an operator who notices an
+    unrecognised session in the list wants every other session gone without
+    also being signed out of the tab they are looking at the list from.
+
+    Args:
+        request: The incoming request.
+        session: The authenticated session.
+
+    Returns:
+        A confirmation payload naming how many sessions were revoked.
+
+    Raises:
+        HTTPException: 400 when the caller's own credential is not a session
+            (a Bearer token or the master token) - there is no "other
+            session" concept for a credential that never had a browser tab
+            of its own.
+    """
+    current = session.get("sid") if session.get("type") == "session" else None
+    if current is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This credential is not a browser session; there is no other "
+                "session to leave signed in."
+            ),
+        )
+
+    token_manager = get_token_manager()
+    revoked = token_manager.revoke_other_sessions(current)
+
+    audit = get_audit_logger()
+    if audit:
+        audit.record(
+            action="auth.revoke_others",
+            result="success",
+            client_ip=get_client_ip(request),
+            actor=str(session.get("sid")),
+            resource="/api/auth/sessions/revoke-others",
+            detail=f"revoked {revoked} session(s)",
+        )
+
+    return SuccessResponse(success=True, message=f"Revoked {revoked} other session(s)")
+
+
 @router.delete("/sessions/{sid_prefix}", response_model=RevokedResponse)
 def revoke_one_session(
     sid_prefix: str, request: Request, session: dict[str, Any] = Depends(require_auth)

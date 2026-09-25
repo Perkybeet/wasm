@@ -118,7 +118,7 @@ export const APPS = [
 
 /** The services of the fake machine, as GET /api/services lists them. */
 export const SERVICES: ServiceList["services"] = [
-  { name: "wasm-shop", description: "node /var/www/shop/server.js", active: true, enabled: true, status: "running", pid: 4821, uptime: "Thu 2026-09-25 08:00:00 UTC", memory: "58720256" },
+  { name: "wasm-shop", description: "node /var/www/shop/server.js", active: true, enabled: true, status: "running", pid: 4821, uptime: "Thu 2026-09-25 08:00:00 UTC", memory: "58720256", managed: true },
 ];
 
 /** The cron jobs of the fake machine, as GET /api/cron lists them. */

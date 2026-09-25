@@ -388,6 +388,7 @@ async def deliver(domain: str, request: Request) -> JSONResponse:
             "branch": branch,
             "delivery": delivery,
         },
+        actor="webhook",
     )
 
     _record(

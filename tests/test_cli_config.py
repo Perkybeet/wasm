@@ -451,6 +451,20 @@ def test_get_redacts_a_secret(wasm: Wasm, real_config_path: Path) -> None:
     assert "***" in result.output
 
 
+def test_get_of_an_unset_secret_shows_it_is_empty_not_placeholdered(
+    wasm: Wasm, real_config_path: Path
+) -> None:
+    """
+    An operator checking why a notification channel is silent needs to see
+    that its password was never set, not the same "***" a configured one
+    would show - the two used to be indistinguishable.
+    """
+    result = wasm("config", "get", "monitor.smtp.password")
+
+    assert result.exit_code == 0, result.output
+    assert "***" not in result.output
+
+
 def test_set_writes_the_value_and_it_can_be_read_back(wasm: Wasm, real_config_path: Path) -> None:
     """A round trip through set then get returns exactly what was written."""
     result = wasm("config", "set", "ssl.email", "ops@example.com")

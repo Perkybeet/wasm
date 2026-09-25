@@ -34,7 +34,8 @@ from fastapi.testclient import TestClient
 from wasm.core.config import DEFAULT_CONFIG, REDACTED, Config
 from wasm.web.api import config as config_api
 from wasm.web.api.auth import get_current_session
-from wasm.web.auth import AuditLogger, set_audit_logger
+from wasm.web.auth import CSRF_HEADER_NAME, AuditLogger, SecurityConfig, set_audit_logger
+from wasm.web.server import create_app, get_token_manager
 
 #: Secrets planted in the stored configuration; none may reach a response.
 PLANTED_SECRETS = {
@@ -181,6 +182,18 @@ class TestSecretsNeverLeave:
         assert config["databases"]["credentials"]["mysql"]["password"] == REDACTED
         assert config["databases"]["credentials"]["mysql"]["user"] == "root"
         assert config["webserver"] == "nginx"
+
+    def test_an_unset_secret_reads_back_empty_not_redacted(self, client: TestClient) -> None:
+        """
+        Nothing planted a secret here, so the console must see "not
+        configured", not the same ``***`` a real password would show -
+        Settings > Notifications needs this to grey out a channel's "test"
+        button honestly.
+        """
+        config = client.get("/api/config").json()["config"]
+
+        assert config["monitor"]["smtp"]["password"] == ""
+        assert config["monitor"]["openai"]["api_key"] == ""
 
     def test_reload_redacts_too(self, client: TestClient, stored_secrets: dict[str, str]) -> None:
         """The reload endpoint returns the same dump and must redact it."""
@@ -594,3 +607,93 @@ class TestRelativeAppsDirectoryIsRefused:
 
         assert response.status_code == 200, response.text
         assert client.get("/api/config/apps-directory").json()["apps_directory"] == "/srv/apps"
+
+
+class TestTypedSectionsNeedElevation:
+    """
+    The five typed section saves need sudo mode exactly like ``PUT``/``PATCH
+    /api/config`` already do: a config write is as destructive as anything
+    else on D5's list, and ``config.set("apps_directory", ...)`` is no less
+    dangerous for arriving through the typed endpoint than through the raw
+    one.
+
+    Unlike the rest of this file, these use a real application and a real
+    cookie session - the fake session the ``client`` fixture installs has no
+    ``source``, which trivially satisfies :func:`ensure_elevated` and would
+    prove nothing about the guard under test.
+    """
+
+    @pytest.fixture
+    def real_app(self, config_path: Path) -> FastAPI:
+        """
+        Args:
+            config_path: Fixture redirecting configuration writes into the
+                sandbox; also provides the sandboxed state dir this needs.
+
+        Returns:
+            The full application, not just the config router.
+        """
+        state_dir = config_path.parent.parent / "web-state"
+        return create_app(SecurityConfig(state_dir=state_dir, rate_limit_requests=5000))
+
+    @pytest.fixture
+    def master_token(self, real_app: FastAPI) -> str:
+        """
+        Returns:
+            A freshly generated master token for ``real_app``.
+        """
+        return get_token_manager().generate_master_token()
+
+    @pytest.fixture
+    def cookie_client(self, real_app: FastAPI, master_token: str) -> TestClient:
+        """
+        Args:
+            real_app: The application.
+            master_token: The credential to log in with.
+
+        Returns:
+            A client signed in with the master token, not yet elevated.
+        """
+        signed_in = TestClient(real_app, client=("testclient", 50000), follow_redirects=False)
+        response = signed_in.post("/api/auth/login", json={"token": master_token})
+        assert response.status_code == 200, response.text
+        signed_in.headers[CSRF_HEADER_NAME] = response.json()["csrf_token"]
+        return signed_in
+
+    @pytest.mark.parametrize(
+        ("path", "body"),
+        [
+            ("/api/config/apps-directory", {"apps_directory": "/srv/apps"}),
+            ("/api/config/webserver", {"webserver": "nginx"}),
+            ("/api/config/backup", {"directory": "/var/backups/wasm", "max_per_app": 5}),
+            ("/api/config/ssl", {"enabled": True, "provider": "certbot", "email": "ops@x.com"}),
+            ("/api/config/web", {"host": "127.0.0.1", "port": 8080, "session_timeout": 3600}),
+        ],
+    )
+    def test_a_fresh_cookie_session_is_refused(
+        self, cookie_client: TestClient, path: str, body: dict
+    ) -> None:
+        response = cookie_client.put(path, json=body)
+
+        assert response.status_code == 403, response.text
+        assert response.json()["error"] == "elevation_required"
+
+    @pytest.mark.parametrize(
+        ("path", "body"),
+        [
+            ("/api/config/apps-directory", {"apps_directory": "/srv/apps"}),
+            ("/api/config/webserver", {"webserver": "nginx"}),
+            ("/api/config/backup", {"directory": "/var/backups/wasm", "max_per_app": 5}),
+            ("/api/config/ssl", {"enabled": True, "provider": "certbot", "email": "ops@x.com"}),
+            ("/api/config/web", {"host": "127.0.0.1", "port": 8080, "session_timeout": 3600}),
+        ],
+    )
+    def test_an_elevated_cookie_session_may_write(
+        self, cookie_client: TestClient, master_token: str, path: str, body: dict
+    ) -> None:
+        elevate_response = cookie_client.post("/api/auth/elevate", json={"token": master_token})
+        assert elevate_response.status_code == 200, elevate_response.text
+
+        response = cookie_client.put(path, json=body)
+
+        assert response.status_code == 200, response.text

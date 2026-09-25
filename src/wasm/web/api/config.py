@@ -421,7 +421,7 @@ def get_apps_directory(session: dict = Depends(get_current_session)) -> AppsDire
 def update_apps_directory(
     body: AppsDirConfig,
     request: Request,
-    session: dict = Depends(get_current_session),
+    session: dict = Depends(require_elevated),
 ) -> AppsDirectoryUpdateResponse:
     """
     Update the applications directory.
@@ -468,7 +468,7 @@ def get_webserver(session: dict = Depends(get_current_session)) -> WebserverResp
 def update_webserver(
     body: WebserverConfig,
     request: Request,
-    session: dict = Depends(get_current_session),
+    session: dict = Depends(require_elevated),
 ) -> WebserverUpdateResponse:
     """
     Update the web server setting.
@@ -516,7 +516,7 @@ def get_backup_config(session: dict = Depends(get_current_session)) -> BackupSet
 def update_backup_config(
     body: BackupConfig,
     request: Request,
-    session: dict = Depends(get_current_session),
+    session: dict = Depends(require_elevated),
 ) -> MessageResponse:
     """
     Update backup configuration.
@@ -564,7 +564,7 @@ def get_ssl_config(session: dict = Depends(get_current_session)) -> SSLSettingsR
 def update_ssl_config(
     body: SSLConfig,
     request: Request,
-    session: dict = Depends(get_current_session),
+    session: dict = Depends(require_elevated),
 ) -> MessageResponse:
     """
     Update SSL configuration.
@@ -613,7 +613,7 @@ def get_web_config(session: dict = Depends(get_current_session)) -> WebSettingsR
 def update_web_config(
     body: WebConfig,
     request: Request,
-    session: dict = Depends(get_current_session),
+    session: dict = Depends(require_elevated),
 ) -> MessageResponse:
     """
     Update web interface configuration.

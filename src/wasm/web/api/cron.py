@@ -168,6 +168,52 @@ class CronRunsResponse(BaseModel):
     total: int
 
 
+class CronPreviewRequest(BaseModel):
+    """Request to preview a schedule before it is saved as a job."""
+
+    schedule: str = Field(
+        default="daily",
+        description="hourly, daily, weekly, monthly or a systemd OnCalendar expression",
+    )
+
+    @field_validator("schedule")
+    @classmethod
+    def _schedule_the_manager_accepts(cls, value: str) -> str:
+        """
+        Refuse here what the manager would refuse, in the manager's words.
+
+        Args:
+            value: The alias or calendar expression as it arrived.
+
+        Returns:
+            The value unchanged; the manager expands the alias itself.
+
+        Raises:
+            ValueError: When the manager would not write this into a unit
+                file. FastAPI answers it as a 422 with the message as detail.
+        """
+        try:
+            validate_cron_calendar(value)
+        except ServiceError as exc:
+            raise ValueError(f"{exc}. {exc.details}".strip()) from exc
+        return value
+
+
+class CronPreviewResponse(BaseModel):
+    """
+    Response for ``POST /api/cron/preview``.
+
+    Attributes:
+        calendar: The normalised ``OnCalendar`` expression the job would be
+            created with.
+        next_runs: Up to five future runs, as ISO 8601 timestamps with a UTC
+            offset - fewer when the schedule has no further run to report.
+    """
+
+    calendar: str
+    next_runs: list[str]
+
+
 def _to_info(entry: dict[str, Any]) -> CronJobInfo:
     """
     Convert one of the manager's listing entries into the API model.
@@ -253,6 +299,32 @@ def create_job(
         message=f"Cron job {created.name} created",
         job=_to_info(entry) if entry else None,
     )
+
+
+@router.post("/preview", response_model=CronPreviewResponse)
+def preview_schedule(
+    data: CronPreviewRequest, session: Annotated[dict, Depends(get_current_session)]
+) -> CronPreviewResponse:
+    """
+    Preview a schedule's next five runs before it is saved as a job.
+
+    Declared before ``/{name}`` on purpose, the same reason ``/{name}/run``
+    and friends are: a parametrised route registered first would match
+    ``preview`` as a job name.
+
+    Args:
+        data: The preview request. Its calendar expression was already
+            checked against the manager's own rules by the request model.
+        session: The authenticated session.
+
+    Returns:
+        The normalised calendar and its next runs.
+
+    Raises:
+        ServiceError: When systemd itself refuses the expression.
+    """
+    calendar, next_runs = CronManager(verbose=False).preview_calendar(data.schedule)
+    return CronPreviewResponse(calendar=calendar, next_runs=next_runs)
 
 
 @router.delete("/{name}", response_model=CronActionResponse)

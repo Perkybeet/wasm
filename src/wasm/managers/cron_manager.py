@@ -93,6 +93,25 @@ _BARE_TOKEN = re.compile(r"^[A-Za-z0-9_@:,./=+-]+$")
 #: chatty job cannot make the history endpoint read the whole journal.
 _JOURNAL_ENTRIES = 500
 
+#: Deadline for systemd-analyze. It only parses the expression, it does not
+#: touch systemd's own state, but the runner still requires a deadline.
+_ANALYZE_TIMEOUT = 15
+
+#: Runs a calendar preview reports by default: enough to show a weekly
+#: pattern without the dialog scrolling.
+PREVIEW_ITERATIONS = 5
+
+#: What systemd-analyze calls the expanded form of the expression it verified.
+_NORMALIZED_FORM = re.compile(r"^Normalized form:\s*(.+)$", re.MULTILINE)
+
+#: Every elapse line systemd-analyze prints for --iterations: the first run is
+#: "Next elapse", each one after is "Iter. #N".
+_ELAPSE_LINE = re.compile(r"^\s*(?:Next elapse|Iter\.\s*#\d+):\s*(.+)$", re.MULTILINE)
+
+#: The weekday-prefixed timestamp on an elapse line, once TZ=UTC pins every
+#: run to the zone the console displays in: "Thu 2026-01-01 00:00:00 UTC".
+_ELAPSE_TIMESTAMP = re.compile(r"^\w+\s+(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s+UTC$")
+
 
 @dataclass
 class CronJob:
@@ -997,3 +1016,76 @@ class CronManager:
             )
         # The journal prints oldest first; the operator wants newest first.
         return list(reversed(shaped))[:limit]
+
+    def preview_calendar(
+        self, schedule: str, *, iterations: int = PREVIEW_ITERATIONS
+    ) -> tuple[str, list[str]]:
+        """
+        Expand a schedule and report when it would next fire.
+
+        Used by the job dialog to show "next 5 runs" before anything is
+        written: the expression is validated first, the same way
+        :meth:`create_job` validates it, so a schedule that would be refused
+        at creation is refused here too, before a single process runs.
+
+        Args:
+            schedule: Alias from :data:`SCHEDULE_ALIASES` or a systemd
+                calendar expression.
+            iterations: How many future runs to report.
+
+        Returns:
+            The normalised calendar expression, and up to ``iterations``
+            future runs as ISO 8601 timestamps with a UTC offset.
+
+        Raises:
+            ServiceError: When the expression fails WASM's own validation, or
+                systemd itself refuses it.
+        """
+        calendar = validate_cron_calendar(schedule)
+
+        result = self.runner.run(
+            ["systemd-analyze", "calendar", f"--iterations={iterations}", calendar],
+            timeout=_ANALYZE_TIMEOUT,
+            # Pinned so every run in the preview is reported in the same zone
+            # the console displays it in, regardless of the host's own.
+            env={"TZ": "UTC"},
+        )
+        if not result.success:
+            raise ServiceError(
+                f"systemd rejected the schedule: {calendar!r}",
+                details=(result.stderr or result.stdout).strip(),
+            )
+
+        normalized_match = _NORMALIZED_FORM.search(result.stdout)
+        normalized = normalized_match.group(1).strip() if normalized_match else calendar
+
+        next_runs: list[str] = []
+        for match in _ELAPSE_LINE.finditer(result.stdout):
+            timestamp = self._parse_elapse_timestamp(match.group(1).strip())
+            if timestamp is not None:
+                next_runs.append(timestamp)
+            if len(next_runs) >= iterations:
+                break
+
+        return normalized, next_runs
+
+    @staticmethod
+    def _parse_elapse_timestamp(value: str) -> str | None:
+        """
+        Parse one of systemd-analyze's own timestamps into an ISO 8601 string.
+
+        Args:
+            value: A timestamp as printed after an elapse line's colon, for
+                example ``"Thu 2026-01-01 00:00:00 UTC"``.
+
+        Returns:
+            The moment in ISO 8601 with a UTC offset, or None when the text
+            is not that shape - "never", most notably, for a schedule with no
+            future run.
+        """
+        match = _ELAPSE_TIMESTAMP.match(value)
+        if not match:
+            return None
+        date_part, time_part = match.groups()
+        moment = dt.datetime.fromisoformat(f"{date_part}T{time_part}+00:00")
+        return moment.isoformat()

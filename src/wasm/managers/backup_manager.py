@@ -170,6 +170,10 @@ class BackupMetadata:
     git_branch: str | None = None
     checksum: str | None = None
     tags: list[str] = field(default_factory=list)
+    #: When :meth:`BackupManager.verify` last checked this backup, and
+    #: whether it passed. None for a backup nothing has verified yet.
+    last_verified_at: str | None = None
+    verified_ok: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """
@@ -199,6 +203,8 @@ class BackupMetadata:
             "git_branch": self.git_branch,
             "checksum": self.checksum,
             "tags": self.tags,
+            "last_verified_at": self.last_verified_at,
+            "verified_ok": self.verified_ok,
         }
 
     @classmethod
@@ -233,6 +239,8 @@ class BackupMetadata:
             git_branch=data.get("git_branch"),
             checksum=data.get("checksum"),
             tags=data.get("tags", []),
+            last_verified_at=data.get("last_verified_at"),
+            verified_ok=data.get("verified_ok"),
         )
 
     @property
@@ -2270,6 +2278,56 @@ class BackupManager:
     # -- verification -----------------------------------------------------
 
     def verify(self, backup_id: str, *, deep: bool = True) -> dict[str, Any]:
+        """
+        Verify a backup's integrity and record the verdict on it.
+
+        A thin wrapper around :meth:`_verify_impl`: the check itself has
+        several early exits (metadata missing, archive missing, corrupted),
+        and every one of them is still a verdict worth remembering, so the
+        persistence happens once, here, rather than before each of that
+        method's returns.
+
+        Args:
+            backup_id: Backup identifier.
+            deep: Passed through to :meth:`_verify_impl`.
+
+        Returns:
+            The verification result; see :meth:`_verify_impl`.
+        """
+        results = self._verify_impl(backup_id, deep=deep)
+        self._persist_verification(backup_id, results)
+        return results
+
+    def _persist_verification(self, backup_id: str, results: dict[str, Any]) -> None:
+        """
+        Record a verification's own outcome on the backup it checked.
+
+        Written back to the same JSON sidecar :meth:`create` writes - the one
+        place a backup's metadata already lives, not a second table that
+        could drift from it. A backup :meth:`_verify_impl` could not even
+        find metadata for has nothing to write to.
+
+        Args:
+            backup_id: Backup identifier.
+            results: The verification's own result dict.
+        """
+        metadata = self.get_backup(backup_id)
+        if metadata is None:
+            return
+
+        metadata.verified_ok = bool(results.get("valid", False))
+        metadata.last_verified_at = datetime.now().isoformat()
+
+        app_name = domain_to_app_name(metadata.domain)
+        metadata_file = self._get_app_backup_dir(app_name) / f"{backup_id}.json"
+        try:
+            self.fs.write_text(
+                metadata_file, json.dumps(metadata.to_dict(), indent=2), mode=SECRET_MODE
+            )
+        except OSError as exc:
+            self.logger.warning(f"Could not record the verification result for {backup_id}: {exc}")
+
+    def _verify_impl(self, backup_id: str, *, deep: bool = True) -> dict[str, Any]:
         """
         Verify a backup's integrity, by reading it and by unpacking it.
 

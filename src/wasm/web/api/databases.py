@@ -50,6 +50,7 @@ from wasm.managers.database import (
     DatabaseRegistry,
     get_db_manager,
 )
+from wasm.managers.database.base import DEFAULT_STRUCTURED_ROW_CAP
 from wasm.managers.service_manager import ServiceManager
 from wasm.validators.names import resolve_within, validate_filename
 from wasm.web.api.auth import get_current_session
@@ -59,6 +60,7 @@ from wasm.web.api.deps import (
     ensure_elevated,
     require_elevated,
 )
+from wasm.web.auth import actor_label
 from wasm.web.jobs import JobType, database_engine_job, get_job_manager
 from wasm.web.pydantic_compat import iso_offset_validator
 
@@ -118,8 +120,23 @@ class EngineLogsResponse(BaseModel):
     lines: int
 
 
+class PrivilegesResponse(BaseModel):
+    """Response for ``GET /api/databases/engines/{engine}/privileges``."""
+
+    engine: str
+    privileges: list[str]
+
+
 class DatabaseInfoResponse(BaseModel):
-    """One database."""
+    """
+    One database.
+
+    Attributes:
+        owner: The role or account that owns it. Null when the engine has no
+            such concept - MySQL/MariaDB and Redis have none, and MongoDB
+            grants roles to users rather than owning a database with one; see
+            each manager's ``list_databases`` docstring for why.
+    """
 
     name: str
     engine: str
@@ -272,8 +289,14 @@ class QueryResponse(BaseModel):
         success: Whether the engine accepted the statement.
         output: The engine's output, truncated to ``max_rows`` lines.
         mode: The mode the statement ran in.
-        truncated: Whether output was cut.
-        returned_rows: How many lines the response carries.
+        truncated: Whether ``output`` or ``rows`` was cut.
+        returned_rows: How many lines ``output`` carries.
+        columns: Column names, in the order the engine returned them. Empty
+            for an engine with no tabular client output to parse (Redis,
+            MongoDB) or a statement with no result set.
+        rows: Data rows, each cell a string exactly as the client printed it.
+        row_count: Number of rows in ``rows``, after truncation.
+        duration_ms: Wall-clock time the query's own client invocation took.
     """
 
     success: bool
@@ -281,6 +304,10 @@ class QueryResponse(BaseModel):
     mode: str
     truncated: bool = False
     returned_rows: int = 0
+    columns: list[str] = Field(default_factory=list)
+    rows: list[list[str]] = Field(default_factory=list)
+    row_count: int = 0
+    duration_ms: float = 0.0
 
 
 class ConnectionStringRequest(BaseModel):
@@ -540,6 +567,31 @@ def get_engine_status(
     )
 
 
+@router.get("/engines/{engine}/privileges", response_model=PrivilegesResponse)
+def get_engine_privileges(
+    engine: str, session: Annotated[dict, Depends(get_current_session)]
+) -> PrivilegesResponse:
+    """
+    List the privileges an engine's grant dialog may offer.
+
+    The manager's own whitelist is the one definition of what WASM will
+    grant - see :data:`wasm.managers.database.base.BaseDatabaseManager.VALID_PRIVILEGES` -
+    so the console reads it from here instead of keeping its own copy that
+    could drift.
+
+    Args:
+        engine: Engine name.
+        session: The authenticated session.
+
+    Returns:
+        The engine's valid privileges, sorted for a stable listing.
+    """
+    manager = get_manager(engine)
+    return PrivilegesResponse(
+        engine=manager.ENGINE_NAME, privileges=sorted(manager.VALID_PRIVILEGES)
+    )
+
+
 @router.get("/engines/{engine}/logs", response_model=EngineLogsResponse)
 def get_engine_logs(
     engine: str,
@@ -593,6 +645,7 @@ def install_engine(
         func=database_engine_job,
         kwargs={"engine": manager.ENGINE_NAME, "action": "install"},
         metadata={"engine": manager.ENGINE_NAME},
+        actor=actor_label(session),
     )
     return JobAcceptedResponse(
         job_id=job.id,
@@ -628,6 +681,7 @@ def uninstall_engine(
         func=database_engine_job,
         kwargs={"engine": manager.ENGINE_NAME, "action": "uninstall", "purge": purge},
         metadata={"engine": manager.ENGINE_NAME, "purge": purge},
+        actor=actor_label(session),
     )
     return JobAcceptedResponse(
         job_id=job.id,
@@ -1243,15 +1297,31 @@ def execute_query(
     # the guarantee. The guarantee is the server's own read-only transaction,
     # because a leading keyword does not tell you what a statement does:
     # WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x begins with WITH.
-    success, output = manager.execute_query(database=database, query=statement, read_only=read_only)
-    text, truncated, rows = _truncate(output, request.max_rows)
+    #
+    # One execution, through execute_query_structured() alone: calling
+    # execute_query() as well to also get its plain-text shape would run a
+    # write statement twice. Every engine answers it - the base
+    # implementation falls back to execute_query() and leaves the tabular
+    # fields empty for one that has no client output to parse (Redis,
+    # MongoDB) - so there is exactly one call here for every engine.
+    structured = manager.execute_query_structured(
+        database=database,
+        query=statement,
+        read_only=read_only,
+        max_rows=DEFAULT_STRUCTURED_ROW_CAP,
+    )
+    text, truncated, rows = _truncate(structured.output, request.max_rows)
 
     return QueryResponse(
-        success=success,
+        success=True,
         output=text,
         mode=request.mode,
-        truncated=truncated,
+        truncated=truncated or structured.truncated,
         returned_rows=rows,
+        columns=structured.columns,
+        rows=structured.rows,
+        row_count=structured.row_count,
+        duration_ms=structured.duration_ms,
     )
 
 

@@ -543,6 +543,47 @@ def test_the_full_pipeline_persists_a_job_queued_through_the_http_api(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Jobs record who queued them
+# ---------------------------------------------------------------------------
+
+
+def test_a_job_queued_through_the_api_records_its_actor(client: TestClient, store: Any) -> None:
+    """
+    The cookie session queuing a job is recorded, not lost.
+
+    The client fixture signs in through ``POST /api/auth/login``, which
+    issues a cookie session with its own opaque id - see
+    :func:`wasm.web.auth.actor_label` for why a job records a 12 character
+    prefix of it rather than the id in full.
+    """
+    response = client.post("/api/jobs/update", json={"domain": "nope.example.com"})
+    assert response.status_code == 202, response.text
+    actor = response.json()["job"]["actor"]
+    assert actor is not None
+    assert len(actor) == 12
+
+    record = store.get_job(response.json()["job"]["id"])
+    assert record is not None
+    assert record.actor == actor
+
+
+def test_a_job_fetched_after_a_restart_still_carries_its_actor(
+    client: TestClient, store: Any
+) -> None:
+    """A restart reads the job from the store; the actor must not be lost with it."""
+    store.create_job(
+        JobRecord(
+            id="ac704811", type="backup", name="Backup", status="completed", actor="a1b2c3d4e5f6"
+        )
+    )
+
+    response = client.get("/api/jobs/ac704811")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["actor"] == "a1b2c3d4e5f6"
+
+
 def test_post_jobs_deploy_is_gone(client: TestClient) -> None:
     """
     POST /api/apps is the one route that queues a deployment now.

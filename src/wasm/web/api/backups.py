@@ -27,7 +27,8 @@ from pydantic import BaseModel, Field
 from wasm.managers.backup_manager import BackupManager, BackupMetadata
 from wasm.validators.names import validate_filename
 from wasm.web.api.auth import get_current_session
-from wasm.web.api.deps import JobAcceptedResponse, WASMErrorRoute, strict_domain
+from wasm.web.api.deps import JobAcceptedResponse, WASMErrorRoute, require_elevated, strict_domain
+from wasm.web.auth import actor_label
 from wasm.web.jobs import (
     JobType,
     backup_app_job,
@@ -47,7 +48,15 @@ _SIZE_UNITS: tuple[tuple[int, str], ...] = (
 
 
 class BackupInfo(BaseModel):
-    """One backup as the manager records it."""
+    """
+    One backup as the manager records it.
+
+    Attributes:
+        last_verified_at: When ``POST /{backup_id}/verify`` last checked this
+            archive. None when nothing ever has.
+        verified_ok: That check's own verdict. None until the first check;
+            reflects the most recent one after that, whichever way it went.
+    """
 
     backup_id: str
     domain: str
@@ -65,8 +74,10 @@ class BackupInfo(BaseModel):
     git_commit: str | None = None
     git_branch: str | None = None
     tags: list[str] = Field(default_factory=list)
+    last_verified_at: str | None = None
+    verified_ok: bool | None = None
 
-    _iso_timestamps = iso_offset_validator("timestamp")
+    _iso_timestamps = iso_offset_validator("timestamp", "last_verified_at")
 
 
 class BackupListResponse(BaseModel):
@@ -181,6 +192,8 @@ def _to_backup_info(backup: BackupMetadata) -> BackupInfo:
         git_commit=backup.git_commit,
         git_branch=backup.git_branch,
         tags=backup.tags,
+        last_verified_at=backup.last_verified_at,
+        verified_ok=backup.verified_ok,
     )
 
 
@@ -292,6 +305,7 @@ def create_backup(
             "tags": data.tags,
         },
         metadata={"domain": domain},
+        actor=actor_label(session),
     )
 
     return JobAcceptedResponse(
@@ -350,16 +364,21 @@ def verify_backup(
 @router.post("/{backup_id}/restore", response_model=JobAcceptedResponse, status_code=202)
 def restore_backup(
     backup_id: str,
-    session: Annotated[dict, Depends(get_current_session)],
+    session: Annotated[dict, Depends(require_elevated)],
     data: RestoreBackupRequest | None = None,
 ) -> JobAcceptedResponse:
     """
     Queue a restore of an application from a backup.
 
+    Restoring overwrites whatever the target domain currently has running -
+    D5's sudo mode list treats it the same as deleting an application, so a
+    cookie session has to confirm itself first; an admin-scoped Bearer
+    credential is exempt, per :func:`wasm.web.api.deps.ensure_elevated`.
+
     Args:
         backup_id: Backup identifier.
         data: Restore options.
-        session: The authenticated session.
+        session: The authenticated, elevated session.
 
     Returns:
         The queued job.
@@ -383,6 +402,7 @@ def restore_backup(
             "verify": verify,
         },
         metadata={"domain": target_domain, "backup_id": backup.id},
+        actor=actor_label(session),
     )
 
     return JobAcceptedResponse(
@@ -395,14 +415,18 @@ def restore_backup(
 
 @router.delete("/{backup_id}", response_model=BackupActionResponse)
 def delete_backup(
-    backup_id: str, session: Annotated[dict, Depends(get_current_session)]
+    backup_id: str, session: Annotated[dict, Depends(require_elevated)]
 ) -> BackupActionResponse:
     """
     Delete a backup and everything that belongs to it.
 
+    Deletion is irreversible - D5's sudo mode list treats it the same as
+    deleting an application - so a cookie session has to confirm itself
+    first; an admin-scoped Bearer credential is exempt.
+
     Args:
         backup_id: Backup identifier.
-        session: The authenticated session.
+        session: The authenticated, elevated session.
 
     Returns:
         The action outcome.

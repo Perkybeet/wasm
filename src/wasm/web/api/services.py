@@ -69,7 +69,22 @@ ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class ServiceInfo(BaseModel):
-    """Service information."""
+    """
+    Service information.
+
+    Attributes:
+        managed: Whether this unit was created by WASM. Always true for a
+            service reached through the store; may be false when listing
+            with ``wasm_only=false``, which walks every unit on the host.
+        active_state: Systemd's own ``ActiveState`` (``active``, ``failed``,
+            ``activating``, ...). Distinguishes a unit systemd is repeatedly
+            restarting from one that is cleanly stopped, which ``active``
+            alone cannot: both report ``active=false`` between attempts.
+        sub_state: Systemd's own ``SubState`` (``running``, ``dead``,
+            ``auto-restart``, ...), the finer-grained half of the same story.
+        result: Systemd's own ``Result`` for the last run (``success``,
+            ``exit-code``, ``signal``, ...).
+    """
 
     name: str
     description: str | None = None
@@ -79,6 +94,10 @@ class ServiceInfo(BaseModel):
     pid: int | None = None
     uptime: str | None = None
     memory: str | None = None
+    managed: bool = True
+    active_state: str | None = None
+    sub_state: str | None = None
+    result: str | None = None
 
 
 class ServiceListResponse(BaseModel):
@@ -144,6 +163,25 @@ class UpdateServiceConfigRequest(BaseModel):
     """Request to update service configuration."""
 
     config: str
+
+
+class VerifyUnitRequest(BaseModel):
+    """Request to check a candidate unit file before it is saved."""
+
+    content: str
+
+
+class VerifyUnitResponse(BaseModel):
+    """
+    Result of checking a candidate unit file.
+
+    Attributes:
+        success: Whether systemd-analyze accepted it.
+        output: Its own explanation, verbatim - empty on a clean pass.
+    """
+
+    success: bool
+    output: str
 
 
 def _unit_path(service_name: str) -> Path:
@@ -313,6 +351,41 @@ WantedBy=multi-user.target
 """
 
 
+def _service_info(name: str, description: str | None, live_status: dict) -> ServiceInfo:
+    """
+    Build the API model from a manager status dict.
+
+    Args:
+        name: Unit name, used when the status dict did not resolve one (it
+            always does, but a scripted test double is not obliged to).
+        description: What the store records as the unit's command, or None
+            for a unit the store has never heard of.
+        live_status: As :meth:`ServiceManager.get_status` returns it.
+
+    Returns:
+        The API representation.
+    """
+    # systemctl show reports MainPID as a string, "0" for a stopped unit and
+    # "" from a status a scripted test double left blank; neither is a pid.
+    raw_pid = live_status.get("pid")
+    pid = int(raw_pid) if raw_pid not in (None, "", "0") else None
+
+    return ServiceInfo(
+        name=live_status.get("name") or name,
+        description=description,
+        active=live_status.get("active", False),
+        enabled=live_status.get("enabled", False),
+        status="running" if live_status.get("active") else "stopped",
+        pid=pid,
+        uptime=live_status.get("uptime"),
+        memory=live_status.get("memory"),
+        managed=bool(live_status.get("managed", True)),
+        active_state=live_status.get("active_state") or None,
+        sub_state=live_status.get("sub_state") or None,
+        result=live_status.get("result") or None,
+    )
+
+
 @router.get("", response_model=ServiceListResponse)
 def list_services(
     request: Request,
@@ -320,33 +393,49 @@ def list_services(
     session: dict = Depends(get_current_session),
 ):
     """
-    List all services (or only WASM services).
+    List services.
+
+    ``wasm_only`` (the default) scopes the listing to what the store
+    tracks - the units WASM itself created. Set it to false for a full
+    inventory of every unit on the host, each flagged ``managed``, which is
+    how a diagnostics view tells a foreign unit's own crash loop from one of
+    WASM's own.
     """
-    store = get_store()
     service_manager = ServiceManager(verbose=False)
 
-    # Get services from store
-    stored_services = store.list_services()
-
-    result = []
-    for svc in stored_services:
-        # Get live status from systemd (ServiceManager resolves name automatically)
-        live_status = service_manager.get_status(svc.name)
-
-        result.append(
-            ServiceInfo(
-                name=svc.name,
-                description=svc.command,
-                active=live_status.get("active", False),
-                enabled=live_status.get("enabled", False),
-                status="running" if live_status.get("active") else "stopped",
-                pid=live_status.get("pid"),
-                uptime=live_status.get("uptime"),
-                memory=live_status.get("memory"),
+    if not wasm_only:
+        entries = service_manager.list_services(all_services=True)
+        result = [
+            _service_info(
+                entry["name"],
+                None,
+                service_manager.get_status(entry["name"], require_managed=False),
             )
-        )
+            for entry in entries
+        ]
+        return ServiceListResponse(services=result, total=len(result))
 
+    stored_services = get_store().list_services()
+    result = [
+        _service_info(svc.name, svc.command, service_manager.get_status(svc.name))
+        for svc in stored_services
+    ]
     return ServiceListResponse(services=result, total=len(result))
+
+
+@router.post("/verify", response_model=VerifyUnitResponse)
+def verify_unit(
+    data: VerifyUnitRequest, request: Request, session: dict = Depends(get_current_session)
+) -> VerifyUnitResponse:
+    """
+    Check a candidate unit file with systemd-analyze, without saving it.
+
+    Declared before ``/{name}`` on purpose: a parametrised route registered
+    first would match ``verify`` as a service name. Used by the unit editor
+    to catch a mistake before "save" ever reaches a real unit file.
+    """
+    success, output = ServiceManager(verbose=False).verify_unit(data.content)
+    return VerifyUnitResponse(success=success, output=output)
 
 
 @router.get("/{name}", response_model=ServiceInfo)
@@ -370,16 +459,7 @@ def get_service(name: str, request: Request, session: dict = Depends(get_current
     # Get live status from systemd (ServiceManager resolves name automatically)
     live_status = service_manager.get_status(svc.name)
 
-    return ServiceInfo(
-        name=svc.name,
-        description=svc.command,
-        active=live_status.get("active", False),
-        enabled=live_status.get("enabled", False),
-        status="running" if live_status.get("active") else "stopped",
-        pid=live_status.get("pid"),
-        uptime=live_status.get("uptime"),
-        memory=live_status.get("memory"),
-    )
+    return _service_info(svc.name, svc.command, live_status)
 
 
 def _run_service_action(name: str, action: str, past_tense: str) -> ServiceActionResponse:

@@ -4,7 +4,7 @@ import type { ServiceInfo } from "./data";
 import { filterServices, isFiltered, serviceState, validateServicesSearch } from "./data";
 
 function service(name: string, active: boolean, description: string | null = null): ServiceInfo {
-  return { name, active, enabled: true, status: active ? "running" : "stopped", description, pid: null, uptime: null, memory: null };
+  return { name, active, enabled: true, status: active ? "running" : "stopped", description, pid: null, uptime: null, memory: null, managed: true };
 }
 
 describe("serviceState", () => {

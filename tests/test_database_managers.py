@@ -21,6 +21,7 @@ import pytest
 from wasm.core.exceptions import (
     DatabaseBackupError,
     DatabaseError,
+    DatabaseQueryError,
     DatabaseUserError,
 )
 from wasm.core.runner import FakeRunner, SubprocessRunner, set_runner
@@ -1337,3 +1338,218 @@ class TestReadOnlyEnforcement:
         sent = runner.inputs[-1]
         assert sent.startswith("START TRANSACTION READ ONLY;")
         assert sent.rstrip().endswith("COMMIT;")
+
+
+class TestStructuredQuery:
+    """
+    The SQL console's structured result: one execution, parsed into columns
+    and rows, never a second run of the same statement.
+    """
+
+    def test_postgres_parses_csv_output_into_columns_and_rows(self, postgres, runner):
+        runner.script(["runuser", "-u", "postgres", "--", "psql"], stdout="1\n")
+        runner.script(
+            [
+                "runuser",
+                "-u",
+                "postgres",
+                "--",
+                "psql",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-d",
+                "app",
+                "--csv",
+            ],
+            stdout="id,name\n1,Alice\n2,Bob\n",
+        )
+
+        result = postgres.execute_query_structured(
+            database="app", query="SELECT * FROM users", read_only=False
+        )
+
+        assert result.columns == ["id", "name"]
+        assert result.rows == [["1", "Alice"], ["2", "Bob"]]
+        assert result.row_count == 2
+        assert result.truncated is False
+        assert result.output == "id,name\n1,Alice\n2,Bob\n"
+        # Exactly one psql invocation carried the query itself: the existence
+        # check is a separate, cheap SELECT 1 against a different database.
+        csv_calls = [call for call in runner.calls if "--csv" in call]
+        assert len(csv_calls) == 1
+
+    def test_postgres_structured_read_only_still_wraps_in_a_read_only_transaction(
+        self, postgres, runner
+    ):
+        runner.script(["runuser", "-u", "postgres", "--", "psql"], stdout="1\n")
+        runner.script(
+            [
+                "runuser",
+                "-u",
+                "postgres",
+                "--",
+                "psql",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-d",
+                "app",
+                "--csv",
+            ],
+            stdout="n\n1\n",
+        )
+
+        postgres.execute_query_structured(database="app", query="SELECT 1", read_only=True)
+
+        sent = runner.inputs[-1]
+        assert sent.startswith("BEGIN READ ONLY;")
+        assert "SET ROLE" in sent
+        assert sent.rstrip().endswith("COMMIT;")
+
+    def test_postgres_caps_rows_and_reports_truncation(self, postgres, runner):
+        runner.script(["runuser", "-u", "postgres", "--", "psql"], stdout="1\n")
+        rows = "\n".join(str(n) for n in range(5))
+        runner.script(
+            [
+                "runuser",
+                "-u",
+                "postgres",
+                "--",
+                "psql",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-d",
+                "app",
+                "--csv",
+            ],
+            stdout=f"n\n{rows}\n",
+        )
+
+        result = postgres.execute_query_structured(
+            database="app", query="SELECT n FROM t", read_only=False, max_rows=3
+        )
+
+        assert result.row_count == 3
+        assert result.truncated is True
+
+    def test_mysql_parses_batch_output_with_headers_into_columns_and_rows(self, mysql, runner):
+        runner.script(["mysql"], stdout="app\n")
+        runner.script(["mysql", "-B", "-D", "app"], stdout="id\tname\n1\tAlice\n2\tBob\n")
+
+        result = mysql.execute_query_structured(
+            database="app", query="SELECT * FROM users", read_only=False
+        )
+
+        assert result.columns == ["id", "name"]
+        assert result.rows == [["1", "Alice"], ["2", "Bob"]]
+        assert result.row_count == 2
+        assert result.truncated is False
+
+    def test_mysql_structured_drops_dash_n_to_keep_headers(self, mysql, runner):
+        runner.script(["mysql"], stdout="app\n")
+        runner.script(["mysql", "-B", "-D", "app"], stdout="n\n1\n")
+
+        mysql.execute_query_structured(database="app", query="SELECT 1", read_only=False)
+
+        argv = next(call for call in runner.calls if "-D" in call)
+        assert "-N" not in argv
+        assert "-B" in argv
+
+    def test_a_failed_structured_query_raises_with_the_engines_own_words(self, postgres, runner):
+        runner.script(["runuser", "-u", "postgres", "--", "psql"], stdout="1\n")
+        runner.script(
+            [
+                "runuser",
+                "-u",
+                "postgres",
+                "--",
+                "psql",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-d",
+                "app",
+                "--csv",
+            ],
+            exit_code=1,
+            stderr='ERROR: syntax error at or near "SELCT"\n',
+        )
+
+        with pytest.raises(DatabaseQueryError, match="syntax error"):
+            postgres.execute_query_structured(database="app", query="SELCT 1", read_only=False)
+
+    def test_redis_falls_back_to_plain_output_with_empty_columns(self, redis, runner):
+        runner.script(["redis-cli"], stdout="PONG\n")
+
+        result = redis.execute_query_structured(database="0", query="PING")
+
+        assert result.columns == []
+        assert result.rows == []
+        assert result.output.strip() == "PONG"
+        assert RedisManager.SUPPORTS_STRUCTURED_QUERY is False
+
+
+class TestOwnerAndGrantsInListings:
+    """
+    Owner and size filled where a manager can do it in the listing's own
+    query, and a user's databases filled where the engine can list grants
+    without a call per user.
+    """
+
+    def test_postgres_list_databases_fills_owner_in_the_same_query(self, postgres, runner):
+        runner.script(
+            ["runuser", "-u", "postgres", "--", "psql"],
+            stdout="appdb|UTF8|8192|app\n",
+        )
+
+        databases = postgres.list_databases()
+
+        assert len(runner.calls) == 1, "owner must come from the listing's own query"
+        assert databases[0].name == "appdb"
+        assert databases[0].owner == "app"
+        assert databases[0].size is not None
+
+    def test_postgres_list_users_fills_databases_in_the_same_query(self, postgres, runner):
+        runner.script(
+            ["runuser", "-u", "postgres", "--", "psql"],
+            stdout="app|f|f|f|appdb,reports\n",
+        )
+
+        users = postgres.list_users()
+
+        assert len(runner.calls) == 1, "grants must come from the listing's own query"
+        assert users[0].username == "app"
+        assert users[0].databases == ["appdb", "reports"]
+
+    def test_postgres_list_users_reports_no_databases_without_a_second_call(self, postgres, runner):
+        runner.script(["runuser", "-u", "postgres", "--", "psql"], stdout="app|f|f|f|\n")
+
+        users = postgres.list_users()
+
+        assert users[0].databases == []
+
+    def test_mysql_list_databases_fills_size_in_the_same_query(self, mysql, runner):
+        runner.script(["mysql"], stdout="appdb\tutf8mb4\t16384\n")
+
+        databases = mysql.list_databases()
+
+        assert len(runner.calls) == 1, "size must come from the listing's own query"
+        assert databases[0].name == "appdb"
+        assert databases[0].size is not None
+        # MySQL has no catalog concept of a database owner; only per-user
+        # grants, which list_users() reports instead.
+        assert databases[0].owner is None
+
+    def test_mysql_list_users_fills_databases_in_the_same_query(self, mysql, runner):
+        runner.script(["mysql"], stdout="app\tlocalhost\tappdb,reports\n")
+
+        users = mysql.list_users()
+
+        assert len(runner.calls) == 1, "grants must come from the listing's own query"
+        assert users[0].username == "app"
+        assert users[0].databases == ["appdb", "reports"]
+
+    def test_mysql_list_users_reports_no_databases_without_a_second_call(self, mysql, runner):
+        runner.script(["mysql"], stdout="app\tlocalhost\t\n")
+
+        users = mysql.list_users()
+
+        assert users[0].databases == []

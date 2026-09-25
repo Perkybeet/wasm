@@ -1623,6 +1623,24 @@ def test_an_ambiguous_or_malformed_prefix_is_refused(sandbox: Path) -> None:
     manager.sessions.close()
 
 
+def test_revoke_other_sessions_leaves_only_the_named_one(sandbox: Path) -> None:
+    """The manager-level operation the endpoint is a thin wrapper over."""
+    manager = TokenManager(make_config(sandbox))
+    expires = time.time() + 3600
+    keep = "keep00" + "0" * 26
+    manager.sessions.create(keep, "csrf-keep", "10.0.0.1", expires)
+    manager.sessions.create("gone001" + "1" * 25, "csrf-1", "10.0.0.2", expires)
+    manager.sessions.create("gone002" + "2" * 25, "csrf-2", "10.0.0.3", expires)
+
+    revoked = manager.revoke_other_sessions(keep)
+
+    assert revoked == 2
+    assert manager.sessions.get(keep) is not None
+    assert manager.sessions.get("gone001" + "1" * 25) is None
+    assert manager.sessions.get("gone002" + "2" * 25) is None
+    manager.sessions.close()
+
+
 def test_revoke_all_sessions_signs_out_every_session_including_the_caller_s(
     sandbox: Path,
 ) -> None:
@@ -1650,6 +1668,43 @@ def test_revoke_all_sessions_signs_out_every_session_including_the_caller_s(
 
     entries = read_audit(sandbox)
     assert any(e["action"] == "auth.revoke_all" and e["result"] == "success" for e in entries)
+
+
+def test_revoke_other_sessions_keeps_the_caller_signed_in(sandbox: Path) -> None:
+    """
+    ``POST /api/auth/sessions/revoke-others`` is "sign out everywhere else":
+    the button an operator reaches for after noticing a session they do not
+    recognise in the list, without also signing themselves out to do it.
+    """
+    app = create_app(make_config(sandbox))
+    first = TestClient(app, client=("10.0.0.1", 50000))
+    second = TestClient(app, client=("10.0.0.2", 50000))
+    master = get_token_manager().generate_master_token()
+    csrf = login(first, master)["csrf_token"]
+    login(second, master)
+
+    others = first.post("/api/auth/sessions/revoke-others", headers={CSRF_HEADER_NAME: csrf})
+
+    assert others.status_code == 200, others.text
+    assert others.json()["success"] is True
+    assert first.get("/api/auth/verify").status_code == 200
+    assert second.get("/api/auth/verify").status_code == 401
+
+    entries = read_audit(sandbox)
+    assert any(e["action"] == "auth.revoke_others" and e["result"] == "success" for e in entries)
+
+
+def test_revoke_other_sessions_with_only_the_caller_revokes_nothing(sandbox: Path) -> None:
+    """A lone session has no others to revoke, and reports that honestly."""
+    app = create_app(make_config(sandbox))
+    client = TestClient(app, client=("10.0.0.1", 50000))
+    master = get_token_manager().generate_master_token()
+    csrf = login(client, master)["csrf_token"]
+
+    response = client.post("/api/auth/sessions/revoke-others", headers={CSRF_HEADER_NAME: csrf})
+
+    assert response.status_code == 200, response.text
+    assert client.get("/api/auth/verify").status_code == 200
 
 
 def test_rate_limiter_does_not_grow_without_bound() -> None:

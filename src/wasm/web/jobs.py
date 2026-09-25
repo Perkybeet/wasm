@@ -153,6 +153,9 @@ class Job:
         error: Error message when the job failed.
         logs: Everything the job reported.
         metadata: Free-form context, such as the domain being deployed.
+        actor: Who queued the job - a session id prefix, an API token name,
+            or ``master`` - never a secret. None for a job the system queued
+            on its own, such as a webhook-triggered deploy.
     """
 
     id: str
@@ -170,6 +173,7 @@ class Job:
     error: str | None = None
     logs: list[JobLogEntry] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    actor: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """
@@ -194,6 +198,7 @@ class Job:
             "error": self.error,
             "logs": [log.to_dict() for log in self.logs[-MAX_SERIALISED_LOGS:]],
             "metadata": self.metadata,
+            "actor": self.actor,
         }
 
     def add_log(self, message: str, level: str = "info", step: int | None = None) -> None:
@@ -445,6 +450,7 @@ class JobManager:
         kwargs: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
         total_steps: int = 100,
+        actor: str | None = None,
     ) -> Job:
         """
         Create and queue a background job.
@@ -458,6 +464,8 @@ class JobManager:
             kwargs: Keyword arguments for the function.
             metadata: Additional job metadata.
             total_steps: Denominator for progress reporting.
+            actor: Who queued the job, as recorded by the endpoint that
+                called this - see :attr:`Job.actor`.
 
         Returns:
             The queued job.
@@ -471,6 +479,7 @@ class JobManager:
             description=description,
             total_steps=total_steps,
             metadata=metadata or {},
+            actor=actor,
         )
 
         self._jobs[job_id] = job
@@ -667,6 +676,7 @@ class JobManager:
                         started_at=started_at,
                         finished_at=finished_at,
                         log_path=log_path,
+                        actor=job.actor,
                     )
                 )
         except _RECORDING_ERRORS as exc:

@@ -76,20 +76,45 @@ def app(tmp_path: Path, store: Any, runner: object) -> FastAPI:
 
 
 @pytest.fixture
-def client(app: FastAPI) -> TestClient:
+def master_token(app: FastAPI) -> str:
     """
     Args:
         app: The application.
 
     Returns:
-        A signed-in client carrying the CSRF header.
+        A freshly generated master token for the application under test.
+    """
+    return get_token_manager().generate_master_token()
+
+
+@pytest.fixture
+def client(app: FastAPI, master_token: str) -> TestClient:
+    """
+    Args:
+        app: The application.
+        master_token: The credential to log in with.
+
+    Returns:
+        A signed-in client carrying the CSRF header, not yet elevated.
     """
     signed_in = TestClient(app, client=("testclient", 50000), follow_redirects=False)
-    token = get_token_manager().generate_master_token()
-    response = signed_in.post("/api/auth/login", json={"token": token})
+    response = signed_in.post("/api/auth/login", json={"token": master_token})
     assert response.status_code == 200, response.text
     signed_in.headers[CSRF_HEADER_NAME] = response.json()["csrf_token"]
     return signed_in
+
+
+def elevate(client: TestClient, master_token: str) -> None:
+    """
+    Confirm sudo mode on an already signed-in client.
+
+    Args:
+        client: A signed-in client.
+        master_token: The same credential the client logged in with; two-factor
+            authentication is never enabled in a test that calls this.
+    """
+    response = client.post("/api/auth/elevate", json={"token": master_token})
+    assert response.status_code == 200, response.text
 
 
 @pytest.fixture
@@ -248,6 +273,118 @@ def test_a_corrupt_archive_is_reported_as_invalid(
     assert body["checksum_ok"] is False
     assert body["backup_id"] == "example-com_20260101_120000"
     assert "checksum mismatch" in body["errors"]
+
+
+def backup_manager_stub(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, ...]]:
+    """
+    Install a fake BackupManager for the restore/delete elevation tests.
+
+    Args:
+        monkeypatch: Patching helper, scoped to the test.
+
+    Returns:
+        The calls the fake manager's mutating methods recorded.
+    """
+    calls: list[tuple[str, ...]] = []
+
+    class FakeBackup:
+        """Stands in for the metadata :meth:`get_backup` would load."""
+
+        def __init__(self, backup_id: str) -> None:
+            self.id = backup_id
+            self.domain = "example.com"
+
+    class FakeManager:
+        """Stands in for the manager, so no real archive has to exist on disk."""
+
+        def __init__(self, verbose: bool = False) -> None:
+            pass
+
+        def get_backup(self, backup_id: str) -> FakeBackup:
+            return FakeBackup(backup_id)
+
+        def delete(self, backup_id: str) -> None:
+            calls.append(("delete", backup_id))
+
+    monkeypatch.setattr("wasm.web.api.backups.BackupManager", FakeManager)
+    return calls
+
+
+# ---------------------------------------------------------------------------
+# Restoring and deleting need sudo mode from a cookie session
+# ---------------------------------------------------------------------------
+
+
+def test_restore_from_a_fresh_cookie_session_is_refused(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, queued: list[dict[str, Any]]
+) -> None:
+    """Restoring overwrites the target app: D5 treats it like deleting one."""
+    backup_manager_stub(monkeypatch)
+
+    response = client.post("/api/backups/example-com_20260101_120000/restore")
+
+    assert response.status_code == 403, response.text
+    assert response.json()["error"] == "elevation_required"
+    assert queued == []
+
+
+def test_restore_after_elevation_is_queued(
+    client: TestClient,
+    master_token: str,
+    monkeypatch: pytest.MonkeyPatch,
+    queued: list[dict[str, Any]],
+) -> None:
+    """Once confirmed, the same cookie session may queue the restore."""
+    backup_manager_stub(monkeypatch)
+    elevate(client, master_token)
+
+    response = client.post("/api/backups/example-com_20260101_120000/restore")
+
+    assert response.status_code == 202, response.text
+    assert len(queued) == 1
+
+
+def test_delete_from_a_fresh_cookie_session_is_refused(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deletion is irreversible: it needs the same confirmation as restoring."""
+    calls = backup_manager_stub(monkeypatch)
+
+    response = client.delete("/api/backups/example-com_20260101_120000")
+
+    assert response.status_code == 403, response.text
+    assert response.json()["error"] == "elevation_required"
+    assert calls == []
+
+
+def test_delete_after_elevation_succeeds(
+    client: TestClient, master_token: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once confirmed, the same cookie session may delete the backup."""
+    calls = backup_manager_stub(monkeypatch)
+    elevate(client, master_token)
+
+    response = client.delete("/api/backups/example-com_20260101_120000")
+
+    assert response.status_code == 200, response.text
+    assert ("delete", "example-com_20260101_120000") in calls
+
+
+def test_an_admin_api_token_is_not_asked_to_elevate_to_restore(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch, queued: list[dict[str, Any]]
+) -> None:
+    """An explicit automation credential is exempt, the same as everywhere else."""
+    backup_manager_stub(monkeypatch)
+    admin_token = get_token_manager().create_api_token("automation", "admin")["token"]
+    bearer = TestClient(app, client=("testclient", 50000), follow_redirects=False)
+
+    response = bearer.post(
+        "/api/backups/example-com_20260101_120000/restore",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+
+    assert response.status_code == 202, response.text
+    assert len(queued) == 1
 
 
 def test_an_archive_with_only_warnings_is_still_reported_as_invalid(

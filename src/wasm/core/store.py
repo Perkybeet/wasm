@@ -491,6 +491,7 @@ class JobRecord:
     started_at: str | None = None
     finished_at: str | None = None
     log_path: str | None = None
+    actor: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -529,7 +530,7 @@ class MonorepoWorkspace:
 
 
 # Schema version for migrations
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 _DEPLOYMENT_STATUSES_SQL = ", ".join(f"'{status.value}'" for status in DeploymentStatus)
 _DEPLOYMENT_TRIGGERS_SQL = ", ".join(f"'{trigger.value}'" for trigger in DeploymentTrigger)
@@ -596,7 +597,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     started_at TEXT,
     finished_at TEXT,
-    log_path TEXT
+    log_path TEXT,
+    actor TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
@@ -1111,6 +1113,7 @@ class WASMStore:
             4: self._migrate_v3_to_v4,
             5: self._migrate_v4_to_v5,
             6: self._migrate_v5_to_v6,
+            7: self._migrate_v6_to_v7,
         }
 
         for version in range(from_version + 1, SCHEMA_VERSION + 1):
@@ -1187,6 +1190,28 @@ class WASMStore:
             "SELECT id, domain, ?, created_at FROM apps",
             (DomainKind.PRIMARY.value,),
         )
+
+    def _migrate_v6_to_v7(self, cursor: sqlite3.Cursor) -> None:
+        """
+        Give every job row who queued it (schema v7).
+
+        NULL, which every existing row gets, means "unknown": a job queued
+        before this column existed has no actor to reconstruct, and the
+        alternative - inventing one - would put a false name in an audit
+        trail.
+
+        Args:
+            cursor: Cursor the migration runs on.
+        """
+        # A database that never ran an older release - walking every
+        # migration from v1 in one opening, as a fresh test database does -
+        # created the jobs table at step 4 from the schema this module
+        # ships today, which already has this column. The check makes the
+        # step idempotent for that path without a second, frozen copy of
+        # JOBS_SCHEMA_SQL to keep in sync.
+        columns = {row[1] for row in cursor.execute("PRAGMA table_info(jobs)").fetchall()}
+        if "actor" not in columns:
+            cursor.execute("ALTER TABLE jobs ADD COLUMN actor TEXT")
 
     # =========================================================================
     # Application CRUD

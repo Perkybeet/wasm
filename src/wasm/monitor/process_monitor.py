@@ -14,18 +14,22 @@ fixed path, and only when an operator runs ``wasm monitor install``.
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
 from wasm.core.config import SYSTEMD_DIR, Config
 from wasm.core.exceptions import MonitorError, WASMError
+from wasm.core.fs import SECRET_MODE, get_fs
 from wasm.core.logger import Logger
 from wasm.core.notifier import NotificationEvent, Notifier
 from wasm.core.runner import CommandRunner, get_runner
 from wasm.core.utils import remove_file, write_file
+from wasm.managers.cert_manager import CertManager
 from wasm.monitor.email_notifier import EmailNotifier
 from wasm.monitor.metrics import (
     SYSTEMCTL_TIMEOUT,
@@ -66,6 +70,19 @@ PURGE_INTERVAL_SECONDS = 3_600
 #: at debug level. Past this, a full disk is a matter of days.
 DISK_ALERT_PERCENT = 90.0
 
+#: A certificate with fewer days than this left is worth an email; Let's
+#: Encrypt itself starts warning at 30 days and certbot's own renewal cron
+#: runs from 30 days out, so 14 catches a renewal that has been silently
+#: failing for two weeks while still leaving time to fix it by hand.
+CERT_EXPIRY_WARNING_DAYS = 14
+
+#: Sidecar recording the last calendar day each certificate was warned about,
+#: next to the observation database. A JSON file, not a store table: this is
+#: the one piece of monitor state that has to survive a restart without a
+#: schema migration of its own, and it is small enough that "read it, replace
+#: it" is the whole implementation.
+CERT_STATE_FILE_NAME = "cert-notifications.json"
+
 #: What this package will not do, in the words used to check it. The CLI and the
 #: web panel print these, and tests assert them against the package source.
 MONITOR_SCOPE: tuple[str, ...] = (
@@ -74,6 +91,30 @@ MONITOR_SCOPE: tuple[str, ...] = (
     "Never sends data about the machine anywhere except the configured SMTP relay.",
     "Never inspects a process command line to decide anything.",
 )
+
+
+def _days_until_expiry(expiry: str | None, today: date) -> int | None:
+    """
+    Compute how many days remain until a certificate's recorded expiry.
+
+    Args:
+        expiry: ``CertificateInfo.expiry``, a ``YYYY-MM-DD`` date or None
+            when certbot's own output could not be parsed.
+        today: The current date, injected so a test does not depend on when
+            it runs.
+
+    Returns:
+        The number of days remaining, negative for a certificate already
+        expired, or None when ``expiry`` is absent or unparsable - certbot
+        not saying is not the same as certbot saying "soon".
+    """
+    if not expiry:
+        return None
+    try:
+        expiry_date = datetime.strptime(expiry, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    return (expiry_date - today).days
 
 
 @dataclass
@@ -130,6 +171,8 @@ class ProcessMonitor:
         notifier: Any | None = None,
         runner: CommandRunner | None = None,
         event_notifier: Any | None = None,
+        cert_manager: Any | None = None,
+        cert_state_path: Path | None = None,
     ) -> None:
         """
         Args:
@@ -140,6 +183,11 @@ class ProcessMonitor:
             runner: Command runner. Defaults to the process-wide one.
             event_notifier: Multi-channel notifier for unit and disk events.
                 Created on first use if None; tests inject a capture.
+            cert_manager: Certificate manager, for the expiry check. Created
+                on first use if None.
+            cert_state_path: Where the per-certificate last-notified date is
+                recorded. Defaults to a sidecar next to the observation
+                store; tests point it at a sandbox.
         """
         self.verbose = verbose
         self.logger = Logger(verbose=verbose)
@@ -150,6 +198,8 @@ class ProcessMonitor:
         self._store = store
         self._notifier = notifier
         self._event_notifier = event_notifier
+        self._cert_manager = cert_manager
+        self._cert_state_path = cert_state_path
         self._running = False
         # Far enough in the past that the first loop iteration purges once.
         self._last_purge = float("-inf")
@@ -202,6 +252,13 @@ class ProcessMonitor:
         if self._event_notifier is None:
             self._event_notifier = Notifier(self.global_config)
         return self._event_notifier
+
+    @property
+    def cert_manager(self) -> Any:
+        """The certificate manager, built on first use."""
+        if self._cert_manager is None:
+            self._cert_manager = CertManager(verbose=self.verbose, runner=self.runner)
+        return self._cert_manager
 
     def _publish_event(self, kind: str, title: str, body: str) -> None:
         """
@@ -365,6 +422,99 @@ class ProcessMonitor:
             )
         self._alerted_disks = {disk.mountpoint for disk in full_disks}
 
+    def _cert_notification_state_path(self) -> Path:
+        """
+        Where the last calendar day each certificate was warned about lives.
+
+        Returns:
+            The injected override, or a sidecar next to the observation
+            database.
+        """
+        if self._cert_state_path is not None:
+            return self._cert_state_path
+        return Path(self.store.db_path).parent / CERT_STATE_FILE_NAME
+
+    def _read_cert_notification_state(self) -> dict[str, str]:
+        """
+        Read which certificates were already warned about today.
+
+        A read, not routed through the filesystem seam: nothing here changes
+        a file, and the seam exists for mutations `--dry-run` might need to
+        refuse.
+
+        Returns:
+            Certificate name to the ISO date it was last warned about. Empty
+            when the file has never been written or cannot be parsed - a
+            corrupt sidecar means "warn again", not "never warn again".
+        """
+        path = self._cert_notification_state_path()
+        try:
+            raw = path.read_text()
+        except FileNotFoundError:
+            return {}
+        except OSError as exc:
+            self.logger.debug(f"Could not read certificate notification state {path}: {exc}")
+            return {}
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _write_cert_notification_state(self, state: dict[str, str]) -> None:
+        """
+        Persist which certificates were warned about today.
+
+        Args:
+            state: Certificate name to the ISO date it was last warned about.
+        """
+        path = self._cert_notification_state_path()
+        try:
+            get_fs().write_text(path, json.dumps(state), mode=SECRET_MODE)
+        except OSError as exc:
+            self.logger.warning(f"Could not persist certificate notification state {path}: {exc}")
+
+    def _check_certificates(self) -> None:
+        """
+        Publish ``cert_expiring`` for a certificate under the warning window.
+
+        At most once per certificate per calendar day: the day a warning last
+        went out for a given certificate is kept in a small sidecar (see
+        :meth:`_cert_notification_state_path`), so restarting the daemon
+        twice in one day does not resend the same warning twice, and a
+        certificate still short on time the next day is warned about again.
+        A renewal that succeeds removes the certificate from the expiring
+        set on its own; nothing here has to notice the renewal happened.
+        """
+        try:
+            certificates = self.cert_manager.list_certificates()
+        except WASMError as exc:
+            self.logger.debug(f"Could not list certificates for the expiry check: {exc}")
+            return
+
+        today = date.today()
+        state = self._read_cert_notification_state()
+        changed = False
+
+        for cert in certificates:
+            days_left = _days_until_expiry(cert.expiry, today)
+            if days_left is None or days_left >= CERT_EXPIRY_WARNING_DAYS:
+                continue
+            if state.get(cert.name) == today.isoformat():
+                continue
+
+            covers = ", ".join(cert.domains) if cert.domains else cert.name
+            self._publish_event(
+                "cert_expiring",
+                f"Certificate for {cert.name} expires in {days_left} day(s)",
+                (f"{covers} expires on {cert.expiry}. Renew it with: wasm cert renew {cert.name}"),
+            )
+            state[cert.name] = today.isoformat()
+            changed = True
+
+        if changed:
+            self._write_cert_notification_state(state)
+
     def _report_services(self) -> None:
         """
         Log any watched unit that is not active, and announce the transition.
@@ -406,6 +556,7 @@ class ProcessMonitor:
             try:
                 self._log_metrics()
                 self._report_services()
+                self._check_certificates()
                 self.scan_once()
             except WASMError as exc:
                 self.logger.error(f"Scan failed: {exc}")

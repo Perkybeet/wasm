@@ -32,8 +32,10 @@ from wasm.managers.database.base import (
     BackupInfo,
     BaseDatabaseManager,
     DatabaseInfo,
+    StructuredQueryResult,
     UserInfo,
     format_size,
+    parse_tabular_query_output,
     quote_identifier,
     validate_name,
 )
@@ -120,6 +122,7 @@ class PostgresManager(BaseDatabaseManager):
     MAX_USER_NAME_LENGTH = 63
     VALID_PRIVILEGES = DATABASE_PRIVILEGES | TABLE_PRIVILEGES
     DEFAULT_PRIVILEGES = ("ALL PRIVILEGES",)
+    SUPPORTS_STRUCTURED_QUERY = True
 
     #: The account that owns the cluster and can authenticate by peer.
     SUPERUSER = "postgres"
@@ -322,12 +325,17 @@ class PostgresManager(BaseDatabaseManager):
         """
         List the databases that do not belong to the cluster itself.
 
+        Owner comes from the same round trip as size and encoding - the
+        ``pg_roles`` join :meth:`get_database_info` already uses for one
+        database, applied here to every row instead of a call per database.
+
         Returns:
             One entry per user database.
         """
         success, output = self._execute_sql(
-            "SELECT datname, pg_encoding_to_char(encoding), pg_database_size(datname) "
-            "FROM pg_database WHERE datistemplate = false;"
+            "SELECT datname, pg_encoding_to_char(encoding), pg_database_size(datname), r.rolname "
+            "FROM pg_database d JOIN pg_roles r ON d.datdba = r.oid "
+            "WHERE datistemplate = false;"
         )
         if not success:
             return []
@@ -351,6 +359,7 @@ class PostgresManager(BaseDatabaseManager):
                     engine=self.ENGINE_NAME,
                     encoding=parts[1] if len(parts) > 1 else None,
                     size=size,
+                    owner=parts[3] if len(parts) > 3 else None,
                 )
             )
         return databases
@@ -507,12 +516,24 @@ class PostgresManager(BaseDatabaseManager):
         """
         List the roles that are not internal to PostgreSQL.
 
+        Which databases a role can connect to comes from the same query, one
+        row per role rather than one query per role: ``has_database_privilege``
+        is evaluated for every role/database pair and folded into a single
+        comma-separated column with ``array_agg`` ... ``FILTER``, so a cluster
+        with a hundred roles still costs one round trip, not a hundred.
+
         Returns:
-            One entry per role, with its cluster-wide attributes.
+            One entry per role, with its cluster-wide attributes and the
+            databases it may connect to.
         """
         success, output = self._execute_sql(
-            "SELECT rolname, rolsuper, rolcreatedb, rolcreaterole FROM pg_roles "
-            "WHERE rolname NOT LIKE 'pg\\_%' ORDER BY rolname;"
+            "SELECT r.rolname, r.rolsuper, r.rolcreatedb, r.rolcreaterole, "
+            "COALESCE(array_to_string(array_agg(d.datname) "
+            "FILTER (WHERE has_database_privilege(r.rolname, d.datname, 'CONNECT')), ','), '') "
+            "FROM pg_roles r CROSS JOIN pg_database d "
+            "WHERE r.rolname NOT LIKE 'pg\\_%' AND d.datistemplate = false "
+            "GROUP BY r.rolname, r.rolsuper, r.rolcreatedb, r.rolcreaterole "
+            "ORDER BY r.rolname;"
         )
         if not success:
             return []
@@ -526,8 +547,14 @@ class PostgresManager(BaseDatabaseManager):
             for index, name in ((1, "SUPERUSER"), (2, "CREATEDB"), (3, "CREATEROLE")):
                 if len(parts) > index and parts[index] == "t":
                     attributes.append(name)
+            databases = parts[4].split(",") if len(parts) > 4 and parts[4] else []
             users.append(
-                UserInfo(username=parts[0], engine=self.ENGINE_NAME, privileges=attributes)
+                UserInfo(
+                    username=parts[0],
+                    engine=self.ENGINE_NAME,
+                    privileges=attributes,
+                    databases=databases,
+                )
             )
         return users
 
@@ -948,6 +975,90 @@ class PostgresManager(BaseDatabaseManager):
         if not success:
             raise DatabaseQueryError("Query failed", details=output.strip())
         return success, output
+
+    def _psql_csv_argv(self, database: str, *tail: str) -> list[str]:
+        """
+        Build a psql invocation that prints CSV with a header row.
+
+        Every other invocation in this module uses :meth:`_psql_argv`'s
+        ``-t -A`` (tuples only, unaligned): headerless, which is exactly
+        wrong for the console's structured result - it needs the header
+        ``--csv`` prints to know what to call each column.
+
+        Args:
+            database: Database to connect to.
+            *tail: Arguments describing where the SQL comes from.
+
+        Returns:
+            The argument vector.
+        """
+        return ["psql", "-v", "ON_ERROR_STOP=1", "-d", database, "--csv", "-q", *tail]
+
+    def execute_query_structured(
+        self,
+        database: str,
+        query: str,
+        *,
+        read_only: bool = False,
+        max_rows: int = 1000,
+    ) -> StructuredQueryResult:
+        """
+        Run a statement once and parse its CSV output into columns and rows.
+
+        One execution, not two: the plain-text ``output`` this returns is the
+        same client invocation's stdout, in CSV form. Running the query a
+        second time to also produce the older unaligned format would apply a
+        write statement twice, which is not a trade a console is allowed to
+        make for a nicer legacy text field.
+
+        Args:
+            database: Database name.
+            query: The statement.
+            read_only: Same enforcement as :meth:`execute_query`: a
+                least-privilege role via ``SET ROLE`` inside a read-only
+                transaction, provisioned by :meth:`_ensure_read_only_role`.
+            max_rows: Data rows kept before the rest are dropped.
+
+        Returns:
+            The parsed result.
+
+        Raises:
+            DatabaseNotFoundError: When the database does not exist.
+            DatabaseQueryError: When the statement fails.
+        """
+        if not self.database_exists(database):
+            raise DatabaseNotFoundError(f"Database '{database}' does not exist")
+
+        if read_only:
+            role = self._ensure_read_only_role(database)
+            sql = f"BEGIN READ ONLY;\nSET ROLE {self._escape_identifier(role)};\n{query}\nCOMMIT;\n"
+            env = {"PGOPTIONS": "-c default_transaction_read_only=on"}
+        else:
+            sql, env = query, None
+
+        result = self._exec(
+            self._psql_csv_argv(database, "-f", "-"),
+            input=sql,
+            timeout=QUERY_TIMEOUT,
+            env=env,
+            user=self.SUPERUSER,
+        )
+        if not result.success:
+            raise DatabaseQueryError(
+                "Query failed", details=(result.stderr or result.stdout).strip()
+            )
+
+        columns, rows, truncated = parse_tabular_query_output(
+            result.stdout, delimiter=",", max_rows=max_rows
+        )
+        return StructuredQueryResult(
+            output=result.stdout,
+            columns=columns,
+            rows=rows,
+            row_count=len(rows),
+            duration_ms=result.duration * 1000,
+            truncated=truncated,
+        )
 
     def _ensure_read_only_role(self, database: str) -> str:
         """

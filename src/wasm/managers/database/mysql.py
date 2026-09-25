@@ -40,8 +40,10 @@ from wasm.managers.database.base import (
     BackupInfo,
     BaseDatabaseManager,
     DatabaseInfo,
+    StructuredQueryResult,
     UserInfo,
     format_size,
+    parse_tabular_query_output,
     quote_identifier,
     validate_name,
     validate_path,
@@ -192,6 +194,7 @@ class MySQLManager(BaseDatabaseManager):
     MAX_USER_NAME_LENGTH = 32
     VALID_PRIVILEGES = MYSQL_PRIVILEGES
     DEFAULT_PRIVILEGES = ("ALL PRIVILEGES",)
+    SUPPORTS_STRUCTURED_QUERY = True
 
     #: Schemas that belong to the server, not to a user.
     SYSTEM_DATABASES = frozenset({"information_schema", "mysql", "performance_schema", "sys"})
@@ -413,18 +416,27 @@ class MySQLManager(BaseDatabaseManager):
         finally:
             Path(path).unlink(missing_ok=True)
 
-    def _client_argv(self, credentials: Sequence[str], database: str | None = None) -> list[str]:
+    def _client_argv(
+        self, credentials: Sequence[str], database: str | None = None, *, headers: bool = False
+    ) -> list[str]:
         """
         Build a mysql invocation that prints machine readable output.
 
         Args:
             credentials: Arguments from :meth:`_credentials`.
             database: Database to select.
+            headers: Keep the column name header row ``-B`` alone prints.
+                Every caller except the structured console query drops it
+                with ``-N``, because they parse a single value or a line at a
+                time and a header would be just another line to skip.
 
         Returns:
             The argument vector.
         """
-        argv = ["mysql", *credentials, "-N", "-B"]
+        argv = ["mysql", *credentials]
+        if not headers:
+            argv.append("-N")
+        argv.append("-B")
         if database:
             argv.extend(["-D", database])
         return argv
@@ -560,11 +572,25 @@ class MySQLManager(BaseDatabaseManager):
         """
         List the schemas that do not belong to the server.
 
+        Size comes from the same query, one row per schema rather than one
+        query per database: ``INFORMATION_SCHEMA.TABLES`` is joined and
+        summed per schema instead of :meth:`get_database_info`'s separate
+        call, so a server with a hundred databases still costs one round
+        trip.
+
+        Owner is not filled: MySQL and MariaDB have no catalog concept of a
+        database owner, only per-account grants, which :meth:`list_users`
+        reports instead.
+
         Returns:
             One entry per user database.
         """
         success, output = self._execute_sql(
-            "SELECT SCHEMA_NAME, DEFAULT_CHARACTER_SET_NAME FROM INFORMATION_SCHEMA.SCHEMATA;"
+            "SELECT s.SCHEMA_NAME, s.DEFAULT_CHARACTER_SET_NAME, "
+            "SUM(t.DATA_LENGTH + t.INDEX_LENGTH) "
+            "FROM INFORMATION_SCHEMA.SCHEMATA s "
+            "LEFT JOIN INFORMATION_SCHEMA.TABLES t ON t.TABLE_SCHEMA = s.SCHEMA_NAME "
+            "GROUP BY s.SCHEMA_NAME, s.DEFAULT_CHARACTER_SET_NAME;"
         )
         if not success:
             return []
@@ -577,11 +603,15 @@ class MySQLManager(BaseDatabaseManager):
             name = parts[0]
             if name in self.SYSTEM_DATABASES:
                 continue
+            size = None
+            if len(parts) > 2 and parts[2].isdigit():
+                size = format_size(int(parts[2]))
             databases.append(
                 DatabaseInfo(
                     name=name,
                     engine=self.ENGINE_NAME,
                     encoding=parts[1] if len(parts) > 1 else None,
+                    size=size,
                 )
             )
         return databases
@@ -729,11 +759,27 @@ class MySQLManager(BaseDatabaseManager):
         """
         List the server's users.
 
+        Databases come from the same query, one row per user rather than one
+        query per user: ``mysql.db`` (database-level grants) is left-joined
+        and aggregated with ``GROUP_CONCAT`` per account, so a server with a
+        hundred users still costs one round trip. Table- and column-level
+        grants (``mysql.tables_priv``, ``mysql.columns_priv``) are not
+        included - they would need a second join per privilege scope for
+        information this listing does not otherwise need, so
+        :meth:`grant_privileges` remains the source of truth for exactly
+        what an account can do.
+
         Returns:
-            One entry per user and host pair.
+            One entry per user and host pair, with the databases it has
+            database-level grants on.
         """
         success, output = self._execute_sql(
-            "SELECT User, Host FROM mysql.user WHERE User != '' ORDER BY User;"
+            "SELECT u.User, u.Host, COALESCE(GROUP_CONCAT(DISTINCT d.Db SEPARATOR ','), '') "
+            "FROM mysql.user u "
+            "LEFT JOIN mysql.db d ON d.User = u.User AND d.Host = u.Host "
+            "WHERE u.User != '' "
+            "GROUP BY u.User, u.Host "
+            "ORDER BY u.User;"
         )
         if not success:
             return []
@@ -742,7 +788,15 @@ class MySQLManager(BaseDatabaseManager):
         for line in output.strip().splitlines():
             parts = line.split("\t")
             if len(parts) >= 2:
-                users.append(UserInfo(username=parts[0], engine=self.ENGINE_NAME, host=parts[1]))
+                databases = parts[2].split(",") if len(parts) > 2 and parts[2] else []
+                users.append(
+                    UserInfo(
+                        username=parts[0],
+                        engine=self.ENGINE_NAME,
+                        host=parts[1],
+                        databases=databases,
+                    )
+                )
         return users
 
     def grant_privileges(
@@ -965,6 +1019,74 @@ class MySQLManager(BaseDatabaseManager):
         if not success:
             raise DatabaseQueryError("Query failed", details=output.strip())
         return success, output
+
+    def execute_query_structured(
+        self,
+        database: str,
+        query: str,
+        *,
+        read_only: bool = False,
+        max_rows: int = 1000,
+    ) -> StructuredQueryResult:
+        """
+        Run a statement once and parse its batch output into columns and rows.
+
+        One execution, not two, for the reason :meth:`PostgresManager
+        <wasm.managers.database.postgres.PostgresManager.execute_query_structured>`
+        gives: a second run to also produce the older headerless format
+        would apply a write statement twice.
+
+        Args:
+            database: Database name.
+            query: The statement.
+            read_only: Same enforcement as :meth:`execute_query`: a
+                dedicated, least-privilege account provisioned by
+                :meth:`_ensure_read_only_user`.
+            max_rows: Data rows kept before the rest are dropped.
+
+        Returns:
+            The parsed result.
+
+        Raises:
+            DatabaseNotFoundError: When the database does not exist.
+            DatabaseQueryError: When the statement fails, or the read-only
+                account cannot be provisioned.
+        """
+        if not self.database_exists(database):
+            raise DatabaseNotFoundError(f"Database '{database}' does not exist")
+
+        if read_only:
+            sql = f"START TRANSACTION READ ONLY;\n{query}\nCOMMIT;\n"
+            with self._read_only_credentials(database) as credentials:
+                result = self._exec(
+                    self._client_argv(credentials, database, headers=True),
+                    input=sql,
+                    timeout=QUERY_TIMEOUT,
+                )
+        else:
+            with self._credentials() as credentials:
+                result = self._exec(
+                    self._client_argv(credentials, database, headers=True),
+                    input=query,
+                    timeout=QUERY_TIMEOUT,
+                )
+
+        if not result.success:
+            raise DatabaseQueryError(
+                "Query failed", details=(result.stderr or result.stdout).strip()
+            )
+
+        columns, rows, truncated = parse_tabular_query_output(
+            result.stdout, delimiter="\t", max_rows=max_rows
+        )
+        return StructuredQueryResult(
+            output=result.stdout,
+            columns=columns,
+            rows=rows,
+            row_count=len(rows),
+            duration_ms=result.duration * 1000,
+            truncated=truncated,
+        )
 
     def get_connection_string(
         self,

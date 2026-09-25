@@ -33,6 +33,7 @@ from wasm.core.store import JobRecord, get_store
 from wasm.validators.names import validate_filename
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import WASMErrorRoute, strict_domain
+from wasm.web.auth import actor_label
 from wasm.web.jobs import (
     Job,
     JobStatus,
@@ -110,6 +111,7 @@ class JobResponse(BaseModel):
     error: str | None = None
     logs: list[dict[str, Any]] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    actor: str | None = None
 
     _iso_timestamps = iso_offset_validator("created_at", "started_at", "completed_at")
 
@@ -204,6 +206,7 @@ def _from_record(record: JobRecord) -> JobResponse:
         error=record.error,
         logs=[],
         metadata={"domain": record.domain} if record.domain else {},
+        actor=record.actor,
     )
 
 
@@ -321,6 +324,7 @@ def create_update_job(
         func=update_app_job,
         kwargs={"domain": domain},
         metadata={"domain": domain},
+        actor=actor_label(session),
     )
     return _queued("Update job created", job)
 
@@ -351,6 +355,7 @@ def create_delete_job(
             "remove_ssl": request.remove_ssl,
         },
         metadata={"domain": domain},
+        actor=actor_label(session),
     )
     return _queued("Deletion job created", job)
 
@@ -377,6 +382,7 @@ def create_backup_job(
         func=backup_app_job,
         kwargs={"domain": domain, "description": request.description},
         metadata={"domain": domain},
+        actor=actor_label(session),
     )
     return _queued("Backup job created", job)
 
@@ -405,6 +411,7 @@ def create_rollback_job(
         func=rollback_app_job,
         kwargs={"domain": domain, "backup_id": backup_id},
         metadata={"domain": domain, "backup_id": backup_id},
+        actor=actor_label(session),
     )
     return _queued("Rollback job created", job)
 
@@ -436,6 +443,7 @@ def create_cert_job(
             "include_www": request.include_www,
         },
         metadata={"domain": domain},
+        actor=actor_label(session),
     )
     return _queued("Certificate job created", job)
 

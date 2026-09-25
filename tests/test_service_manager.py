@@ -561,6 +561,50 @@ def test_status_of_an_unknown_unit_reports_absence(
     assert mutating_calls(runner) == []
 
 
+def test_status_of_an_owned_unit_says_it_is_managed(
+    manager: ServiceManager, runner: FakeRunner, unit_dirs: dict[str, Path]
+) -> None:
+    """The status dict carries WASM's own ownership verdict."""
+    owned_unit(unit_dirs)
+    runner.script(["systemctl", "is-active"], stdout="active\n")
+    runner.script(["systemctl", "is-enabled"], stdout="enabled\n")
+    runner.script(["systemctl", "show", "wasm-example.service"], stdout="MainPID=42\n")
+
+    status = manager.get_status("wasm-example")
+
+    assert status["managed"] is True
+
+
+def test_status_of_a_foreign_unit_is_refused_by_default(
+    manager: ServiceManager, foreign_ssh: Path
+) -> None:
+    """The default keeps the ownership guard every other read applies."""
+    with pytest.raises(ServiceError):
+        manager.get_status("ssh")
+
+
+def test_status_of_a_foreign_unit_is_readable_when_ownership_is_not_required(
+    manager: ServiceManager, runner: FakeRunner, foreign_ssh: Path
+) -> None:
+    """
+    A full-host listing needs a foreign unit's real state, not a refusal.
+
+    ``require_managed=False`` is the read-only listing's opt-out of the
+    ownership guard: it still reports the truth (``managed`` is false), it
+    just does not raise over it.
+    """
+    runner.script(["systemctl", "is-active"], stdout="active\n")
+    runner.script(["systemctl", "is-enabled"], stdout="enabled\n")
+    runner.script(["systemctl", "show", "ssh.service"], stdout="MainPID=7\nActiveState=active\n")
+
+    status = manager.get_status("ssh", require_managed=False)
+
+    assert status["managed"] is False
+    assert status["active"] is True
+    assert status["active_state"] == "active"
+    assert mutating_calls(runner) == []
+
+
 def test_stop_of_an_unknown_unit_is_a_no_op(manager: ServiceManager, runner: FakeRunner) -> None:
     """Teardown paths call stop before knowing whether the unit was created."""
     assert manager.stop("wasm-missing") is True
@@ -769,6 +813,58 @@ def test_the_process_wide_filesystem_is_honoured_without_injection(
 
     assert unit.exists()
     assert dry.skipped
+
+
+# ---------------------------------------------------------------------------
+# Verifying a candidate unit before it is saved
+# ---------------------------------------------------------------------------
+
+
+def test_verify_unit_stages_the_content_and_runs_systemd_analyze(
+    manager: ServiceManager, runner: FakeRunner
+) -> None:
+    """The candidate never becomes a real unit; it is staged and checked."""
+    runner.script(["systemd-analyze", "verify"], stdout="")
+
+    success, output = manager.verify_unit("[Service]\nExecStart=/usr/bin/true\n")
+
+    assert success is True
+    assert output == ""
+    calls = [call for call in runner.calls if call[:2] == ("systemd-analyze", "verify")]
+    assert len(calls) == 1
+    staged_path = Path(calls[0][2])
+    assert staged_path.name == "wasm-verify.service"
+    # The scratch directory is gone once the check is done.
+    assert not staged_path.parent.exists()
+
+
+def test_verify_unit_reports_the_checkers_own_words_on_failure(
+    manager: ServiceManager, runner: FakeRunner
+) -> None:
+    """A rejected unit's own explanation reaches the caller, verbatim."""
+    runner.script(
+        ["systemd-analyze", "verify"],
+        exit_code=1,
+        stderr="Failed to parse Exec syntax: bad-directive.service\n",
+    )
+
+    success, output = manager.verify_unit("[Service]\nExecStart=\n")
+
+    assert success is False
+    assert "Failed to parse Exec syntax" in output
+
+
+def test_verify_unit_cleans_up_even_when_systemd_analyze_is_missing(
+    manager: ServiceManager, runner: FakeRunner
+) -> None:
+    """The scratch directory is removed whatever the check's outcome."""
+    runner.script(["systemd-analyze", "verify"], exit_code=127, stderr="not found")
+
+    manager.verify_unit("[Service]\nExecStart=/usr/bin/true\n")
+
+    calls = [call for call in runner.calls if call[:2] == ("systemd-analyze", "verify")]
+    staged_path = Path(calls[0][2])
+    assert not staged_path.parent.exists()
 
 
 # ---------------------------------------------------------------------------

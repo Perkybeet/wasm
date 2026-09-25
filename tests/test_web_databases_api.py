@@ -506,6 +506,88 @@ def test_the_console_writes_once_elevated(client: TestClient, db) -> None:
     assert ("query", "appdb", "DELETE FROM t", False) in db.calls
 
 
+def test_an_engine_with_no_structured_client_answers_with_empty_columns(
+    client: TestClient, db
+) -> None:
+    """
+    An engine that never overrode execute_query_structured() falls back
+    cleanly: the legacy output is unchanged and the new fields are just empty.
+    """
+    response = client.post(
+        "/api/databases/query",
+        json={"database": "appdb", "engine": "postgresql", "query": "SELECT 1"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert "42" in body["output"]
+    assert body["columns"] == []
+    assert body["rows"] == []
+    assert body["row_count"] == 0
+
+
+def test_a_structured_engine_returns_columns_and_rows(client: TestClient, db) -> None:
+    """An engine that parses its own client output exposes it structured."""
+
+    def execute_query_structured(self, database, query, *, read_only=False, max_rows=1000):
+        from wasm.managers.database.base import StructuredQueryResult
+
+        type(self).calls.append(("query_structured", database, query, read_only))
+        return StructuredQueryResult(
+            output="id,name\n1,Alice\n",
+            columns=["id", "name"],
+            rows=[["1", "Alice"]],
+            row_count=1,
+            duration_ms=4.2,
+            truncated=False,
+        )
+
+    db.SUPPORTS_STRUCTURED_QUERY = True
+    db.execute_query_structured = execute_query_structured
+
+    response = client.post(
+        "/api/databases/query",
+        json={"database": "appdb", "engine": "postgresql", "query": "SELECT * FROM users"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["columns"] == ["id", "name"]
+    assert body["rows"] == [["1", "Alice"]]
+    assert body["row_count"] == 1
+    assert body["duration_ms"] == 4.2
+    assert ("query_structured", "appdb", "SELECT * FROM users", True) in db.calls
+    # Never falls back to the plain execute_query() as well: one execution.
+    assert not [call for call in db.calls if call[0] == "query"]
+
+
+# ------------------------------------------------------------- privileges
+
+
+def test_engine_privileges_lists_the_managers_own_whitelist(client: TestClient, db) -> None:
+    """The console's grant dialog reads its options from the manager, not a copy."""
+    response = client.get("/api/databases/engines/postgresql/privileges")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["engine"] == "postgresql"
+    assert set(body["privileges"]) == {"ALL PRIVILEGES", "DELETE", "INSERT", "SELECT", "UPDATE"}
+
+
+def test_engine_privileges_for_an_unknown_engine_is_refused(client: TestClient) -> None:
+    """
+    The allowlist is the registry, same as every other engine endpoint.
+
+    Not pinned to a specific status: every ``/engines/{engine}/...`` route in
+    this module refuses an unknown name through the same ``get_manager()``,
+    and this endpoint is a client of it like the rest, not a special case.
+    """
+    response = client.get("/api/databases/engines/nosuchengine/privileges")
+
+    assert response.status_code >= 400, response.text
+    assert "nosuchengine" in response.text
+
+
 # ---------------------------------------------------------------------- users
 
 

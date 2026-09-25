@@ -56,6 +56,7 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,7 +67,7 @@ from jinja2 import TemplateError as JinjaTemplateError
 
 from wasm.core.config import SYSTEMD_DIR
 from wasm.core.exceptions import ServiceError, TemplateError, ValidationError, WASMError
-from wasm.core.fs import FileSystem
+from wasm.core.fs import SECRET_DIR_MODE, SECRET_MODE, FileSystem
 from wasm.core.runner import DEFAULT_TIMEOUT, CommandResult, CommandRunner
 from wasm.core.store import App, Service, get_store
 from wasm.managers.base_manager import BaseManager
@@ -89,6 +90,10 @@ _FOLLOW_TIMEOUT = 3600
 #: Unit files are not secret - systemd reads them as root and users need to be
 #: able to inspect them - but nothing outside root may rewrite one.
 UNIT_FILE_MODE = 0o644
+
+#: systemd-analyze verify parses the unit and, for a .service, resolves its
+#: ExecStart binary; both are fast, but a deadline is still mandatory.
+VERIFY_TIMEOUT = 15
 
 
 #: The smallest memory limit accepted. Below it a Node or Python process is
@@ -768,12 +773,17 @@ class ServiceManager(BaseManager):
 
         return services
 
-    def get_status(self, name: str) -> dict:
+    def get_status(self, name: str, *, require_managed: bool = True) -> dict:
         """
         Get service status.
 
         Args:
             name: Service name.
+            require_managed: Refuse a unit WASM does not own, exactly like
+                every other operation here. False is for read-only listings
+                across every unit on the host (``all_services=True``), where
+                the point is precisely to describe a foreign unit rather than
+                refuse it.
 
         Returns:
             Dictionary with status information. A unit that does not exist is
@@ -781,10 +791,15 @@ class ServiceManager(BaseManager):
             decide whether they still have to create it.
 
         Raises:
-            ServiceError: When the unit exists but WASM does not manage it.
+            ServiceError: When ``require_managed`` is true and the unit
+                exists but WASM does not manage it.
             ValidationError: When the name is not a safe unit name.
         """
-        info = self._require_managed(name, operation="inspect", missing_ok=True)
+        info = (
+            self._require_managed(name, operation="inspect", missing_ok=True)
+            if require_managed
+            else self.inspect_unit(name)
+        )
 
         # A unit this process cannot see a file for is still queried: the three
         # probes below only read, systemd is the authority on what is running,
@@ -821,6 +836,10 @@ class ServiceManager(BaseManager):
             "sub_state": details.get("SubState", ""),
             "restarts": details.get("NRestarts", "0"),
             "result": details.get("Result", ""),
+            # Whether WASM owns this unit, independent of require_managed:
+            # a caller that skipped the guard to list a foreign unit still
+            # needs to say so in the response.
+            "managed": info.managed,
         }
 
     # Creation -------------------------------------------------------------
@@ -1398,3 +1417,47 @@ class ServiceManager(BaseManager):
         except OSError as exc:
             self.logger.debug(f"Could not read unit file {info.path}: {exc}")
             return None
+
+    def verify_unit(self, content: str) -> tuple[bool, str]:
+        """
+        Check a candidate unit file with systemd-analyze, without installing it.
+
+        Used by the unit editor to catch a mistake before it ever reaches a
+        unit WASM or systemd has to reload. The candidate never touches the
+        managed directory: it is staged into a private scratch directory,
+        the same containment ``WebServerBackend.validate_config`` uses for
+        an nginx or apache snippet, and removed once the check is done,
+        success or failure alike.
+
+        Args:
+            content: Candidate unit file content, verbatim.
+
+        Returns:
+            Whether it verified cleanly, and the checker's own output,
+            verbatim - empty on a clean pass, since systemd-analyze says
+            nothing when there is nothing to say.
+
+        Raises:
+            ServiceError: When the scratch directory or file cannot be
+                staged.
+        """
+        staging = Path(tempfile.gettempdir()) / f"wasm-verify-{os.urandom(6).hex()}"
+        candidate = staging / "wasm-verify.service"
+        try:
+            try:
+                self.fs.make_dir(staging, mode=SECRET_DIR_MODE, parents=True, exist_ok=False)
+                self.fs.write_text(candidate, content, mode=SECRET_MODE)
+            except OSError as exc:
+                raise ServiceError(
+                    "Could not stage the unit file for verification", details=str(exc)
+                ) from exc
+
+            result = self._exec(
+                ["systemd-analyze", "verify", str(candidate)], timeout=VERIFY_TIMEOUT
+            )
+        finally:
+            if staging.exists():
+                self.fs.remove_tree(staging)
+
+        output = "\n".join(stream for stream in (result.stderr, result.stdout) if stream.strip())
+        return result.success, output

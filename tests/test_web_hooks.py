@@ -300,6 +300,7 @@ def test_a_valid_github_signature_queues_a_webhook_update(
     assert queued[0]["job_type"] == JobType.UPDATE
     assert queued[0]["metadata"]["trigger"] == "webhook"
     assert queued[0]["metadata"]["provider"] == "github"
+    assert queued[0]["actor"] == "webhook"
 
 
 def test_a_valid_gitlab_token_queues_a_webhook_update(

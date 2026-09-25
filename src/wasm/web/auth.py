@@ -46,7 +46,7 @@ import secrets
 import sqlite3
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -932,6 +932,23 @@ class SessionStore:
             self._conn.execute("UPDATE sessions SET revoked = 1")
             self._conn.execute("DELETE FROM ws_tickets")
 
+    def revoke_all_except(self, keep_sid: str) -> int:
+        """
+        Revoke every session but one, and drop every pending ticket but its own.
+
+        Args:
+            keep_sid: Session identifier to leave untouched.
+
+        Returns:
+            Number of sessions revoked.
+        """
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "UPDATE sessions SET revoked = 1 WHERE sid != ? AND revoked = 0", (keep_sid,)
+            )
+            self._conn.execute("DELETE FROM ws_tickets WHERE sid != ?", (keep_sid,))
+        return cursor.rowcount
+
     def active_count(self) -> int:
         """
         Count sessions that are still usable.
@@ -1264,6 +1281,94 @@ class AuditLogger:
             if self.path.exists():
                 self.path.rename(self.path.with_name(f"{self.path.name}.1"))
         self._size = 0
+
+    def _files_newest_first(self) -> list[Path]:
+        """
+        List every log file this logger has written, most recent first.
+
+        Returns:
+            The current file, then each rotated backup in age order, for
+            whichever of them actually exist.
+        """
+        files = [self.path]
+        for index in range(1, self.backups + 1):
+            candidate = self.path.with_name(f"{self.path.name}.{index}")
+            if candidate.exists():
+                files.append(candidate)
+        return files
+
+    def _iter_entries(self) -> Iterator[dict[str, Any]]:
+        """
+        Yield every recorded entry, newest first, across rotated files.
+
+        A file's own lines are already chronological, so reading each file
+        backwards and reading the files themselves in rotation order (current,
+        then ``.1``, then ``.2``, ...) gives a single newest-first stream
+        without loading the whole log into memory to sort it.
+
+        Yields:
+            Each entry as the dict :meth:`record` wrote, malformed lines
+            skipped rather than failing the whole read.
+        """
+        for path in self._files_newest_first():
+            try:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            for line in reversed(lines):
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(entry, dict):
+                    yield entry
+
+    def read(
+        self,
+        *,
+        limit: int = 50,
+        before: str | None = None,
+        action: str | None = None,
+        result: str | None = None,
+        actor: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Read audit entries, newest first, with keyset pagination.
+
+        Args:
+            limit: Maximum number of entries to return.
+            before: Only entries strictly older than this ``ts`` value - the
+                timestamp of the last entry from a previous call, so the next
+                page picks up exactly where it left off even as new entries
+                keep being appended between calls.
+            action: Only entries with this exact action, when given.
+            result: Only entries with this exact result, when given.
+            actor: Only entries with this exact actor, when given.
+
+        Returns:
+            Up to ``limit`` matching entries, newest first. Empty when
+            auditing is disabled.
+        """
+        if not self.enabled:
+            return []
+
+        matched: list[dict[str, Any]] = []
+        for entry in self._iter_entries():
+            timestamp = entry.get("ts", "")
+            if before is not None and not (str(timestamp) < before):
+                continue
+            if action is not None and entry.get("action") != action:
+                continue
+            if result is not None and entry.get("result") != result:
+                continue
+            if actor is not None and entry.get("actor") != actor:
+                continue
+            matched.append(entry)
+            if len(matched) >= limit:
+                break
+        return matched
 
 
 @dataclass(frozen=True)
@@ -2156,6 +2261,23 @@ class TokenManager:
         """Revoke every session."""
         self.sessions.revoke_all()
 
+    def revoke_other_sessions(self, keep_sid: str) -> int:
+        """
+        Revoke every session except the one named, leaving it signed in.
+
+        The "sign out everywhere else" button: an operator who spots a
+        session they do not recognise in the list wants every *other*
+        session gone without also being signed out of the tab that told
+        them, which :meth:`revoke_all_sessions` cannot do.
+
+        Args:
+            keep_sid: The session id to leave untouched.
+
+        Returns:
+            Number of sessions revoked.
+        """
+        return self.sessions.revoke_all_except(keep_sid)
+
     def get_active_session_count(self) -> int:
         """
         Count usable sessions.
@@ -2527,6 +2649,33 @@ def scope_satisfies(granted: str, required: str) -> bool:
     if wanted is None:
         return False
     return SCOPE_RANK.get(granted, -1) >= wanted
+
+
+def actor_label(session: Mapping[str, Any]) -> str:
+    """
+    A short, non-secret label naming who is behind a session payload.
+
+    Used wherever an action records who did it: the audit log's call sites
+    already read ``session["sid"]`` directly, and jobs reuse the same source
+    of identity through this helper. An API token's payload already carries
+    a human name (``token:<name>``, set by
+    :meth:`TokenManager.verify_api_token`); the master token's is the literal
+    ``master``; a cookie session's id is an opaque, non-secret identifier -
+    the credential is the signed cookie value, not the id alone - shortened
+    here to keep a jobs list readable.
+
+    Args:
+        session: The authenticated session payload, as :func:`require_auth`
+            builds it.
+
+    Returns:
+        ``"master"``, ``"token:<name>"``, or the first 12 characters of a
+        cookie session's id.
+    """
+    sid = str(session.get("sid", "unknown"))
+    if sid in ("master", "unknown") or sid.startswith("token:"):
+        return sid
+    return sid[:12]
 
 
 def required_scope(method: str, path: str) -> str:

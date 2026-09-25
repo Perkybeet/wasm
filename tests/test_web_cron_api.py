@@ -229,6 +229,81 @@ def test_the_json_api_reports_history(
     assert "<b>boom-11</b>" in run["output"]
 
 
+#: What ``systemd-analyze calendar --iterations=5`` prints for a daily schedule.
+CALENDAR_PREVIEW_OUTPUT = (
+    "  Original form: daily\n"
+    "Normalized form: *-*-* 00:00:00\n"
+    "    Next elapse: Thu 2026-01-01 00:00:00 UTC\n"
+    "       (in UTC): Thu 2026-01-01 00:00:00 UTC\n"
+    "       From now: 10h left\n"
+    "\n"
+    "      Iter. #2: Fri 2026-01-02 00:00:00 UTC\n"
+    "       (in UTC): Fri 2026-01-02 00:00:00 UTC\n"
+    "       From now: 1 day 10h left\n"
+    "\n"
+    "      Iter. #3: Sat 2026-01-03 00:00:00 UTC\n"
+    "       (in UTC): Sat 2026-01-03 00:00:00 UTC\n"
+    "       From now: 2 days 10h left\n"
+    "\n"
+    "      Iter. #4: Sun 2026-01-04 00:00:00 UTC\n"
+    "       (in UTC): Sun 2026-01-04 00:00:00 UTC\n"
+    "       From now: 3 days 10h left\n"
+    "\n"
+    "      Iter. #5: Mon 2026-01-05 00:00:00 UTC\n"
+    "       (in UTC): Mon 2026-01-05 00:00:00 UTC\n"
+    "       From now: 4 days 10h left\n"
+)
+
+
+def test_preview_returns_the_normalised_calendar_and_five_next_runs(
+    client: TestClient, runner: FakeRunner
+) -> None:
+    """The preview the new-job dialog shows before anything is written."""
+    runner.script(
+        ["systemd-analyze", "calendar", "--iterations=5", "*-*-* 02:00:00"],
+        stdout=CALENDAR_PREVIEW_OUTPUT,
+    )
+
+    response = client.post("/api/cron/preview", json={"schedule": "daily"})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["calendar"] == "*-*-* 00:00:00"
+    assert body["next_runs"] == [
+        "2026-01-01T00:00:00+00:00",
+        "2026-01-02T00:00:00+00:00",
+        "2026-01-03T00:00:00+00:00",
+        "2026-01-04T00:00:00+00:00",
+        "2026-01-05T00:00:00+00:00",
+    ]
+
+
+def test_preview_runs_systemd_analyze_with_the_expanded_calendar(
+    client: TestClient, runner: FakeRunner
+) -> None:
+    """An alias is expanded before it reaches systemd-analyze, like the manager itself."""
+    runner.script(
+        ["systemd-analyze", "calendar", "--iterations=5", "*-*-* 02:00:00"],
+        stdout=CALENDAR_PREVIEW_OUTPUT.replace("00:00:00", "02:00:00"),
+    )
+
+    response = client.post("/api/cron/preview", json={"schedule": "daily"})
+
+    assert response.status_code == 200, response.text
+    assert runner.ran("systemd-analyze", "calendar", "--iterations=5", "*-*-* 02:00:00")
+
+
+def test_preview_refuses_an_injected_calendar_before_running_anything(
+    client: TestClient, runner: FakeRunner
+) -> None:
+    """The existing validator runs first, exactly like job creation."""
+    response = client.post("/api/cron/preview", json={"schedule": INJECTED_CALENDAR})
+
+    assert response.status_code == 422
+    assert "Invalid cron schedule" in response.text
+    assert runner.calls == []
+
+
 def test_an_injected_calendar_answers_422_with_the_managers_refusal(
     client: TestClient, runner: FakeRunner, systemd_dir: Path
 ) -> None:

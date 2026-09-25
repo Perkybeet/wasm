@@ -623,6 +623,96 @@
         "title": "AppsDirectoryUpdateResponse",
         "type": "object"
       },
+      "AuditEntry": {
+        "description": "One audit log line.\n\nAttributes:\n    timestamp: When the action was attempted, with its UTC offset.\n    action: What was attempted, for example ``apps.delete``.\n    result: Outcome, for example ``success`` or ``denied``.\n    actor: Session id, API token name, ``master`` or ``anonymous``.\n    client_ip: Address the request came from.\n    resource: Target of the action, such as an API path.\n    detail: Extra context. Never a credential.",
+        "properties": {
+          "action": {
+            "title": "Action",
+            "type": "string"
+          },
+          "actor": {
+            "title": "Actor",
+            "type": "string"
+          },
+          "client_ip": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Client Ip"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "resource": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resource"
+          },
+          "result": {
+            "title": "Result",
+            "type": "string"
+          },
+          "timestamp": {
+            "title": "Timestamp",
+            "type": "string"
+          }
+        },
+        "required": [
+          "timestamp",
+          "action",
+          "result",
+          "actor"
+        ],
+        "title": "AuditEntry",
+        "type": "object"
+      },
+      "AuditListResponse": {
+        "description": "Response for ``GET /api/audit``.\n\nAttributes:\n    items: The matching entries, newest first.\n    next_before: Pass as ``before`` to fetch the next page, or None when\n        this page reached the end of the log.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AuditEntry"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_before": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Before"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "AuditListResponse",
+        "type": "object"
+      },
       "BackupActionResponse": {
         "description": "Response for a backup action that completed immediately.",
         "properties": {
@@ -675,7 +765,7 @@
         "type": "object"
       },
       "BackupInfo": {
-        "description": "One backup as the manager records it.",
+        "description": "One backup as the manager records it.\n\nAttributes:\n    last_verified_at: When ``POST /{backup_id}/verify`` last checked this\n        archive. None when nothing ever has.\n    verified_ok: That check's own verdict. None until the first check;\n        reflects the most recent one after that, whichever way it went.",
         "properties": {
           "age": {
             "title": "Age",
@@ -755,6 +845,17 @@
             "title": "Includes Node Modules",
             "type": "boolean"
           },
+          "last_verified_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Verified At"
+          },
           "size": {
             "title": "Size",
             "type": "integer"
@@ -773,6 +874,17 @@
           "timestamp": {
             "title": "Timestamp",
             "type": "string"
+          },
+          "verified_ok": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Verified Ok"
           }
         },
         "required": [
@@ -2041,6 +2153,41 @@
         "title": "CronJobListResponse",
         "type": "object"
       },
+      "CronPreviewRequest": {
+        "description": "Request to preview a schedule before it is saved as a job.",
+        "properties": {
+          "schedule": {
+            "default": "daily",
+            "description": "hourly, daily, weekly, monthly or a systemd OnCalendar expression",
+            "title": "Schedule",
+            "type": "string"
+          }
+        },
+        "title": "CronPreviewRequest",
+        "type": "object"
+      },
+      "CronPreviewResponse": {
+        "description": "Response for ``POST /api/cron/preview``.\n\nAttributes:\n    calendar: The normalised ``OnCalendar`` expression the job would be\n        created with.\n    next_runs: Up to five future runs, as ISO 8601 timestamps with a UTC\n        offset - fewer when the schedule has no further run to report.",
+        "properties": {
+          "calendar": {
+            "title": "Calendar",
+            "type": "string"
+          },
+          "next_runs": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Next Runs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "calendar",
+          "next_runs"
+        ],
+        "title": "CronPreviewResponse",
+        "type": "object"
+      },
       "CronRunInfo": {
         "description": "One recorded execution of a cron job.\n\nAttributes:\n    started: When the run started, in UTC, or empty when the journal did\n        not say.\n    exit_code: The run's exit code, or None while it is unknown.\n    success: Whether the run succeeded, or None while it is unknown.\n    output: The job's own output for this run, verbatim.",
         "properties": {
@@ -2112,7 +2259,7 @@
         "type": "object"
       },
       "DatabaseInfoResponse": {
-        "description": "One database.",
+        "description": "One database.\n\nAttributes:\n    owner: The role or account that owns it. Null when the engine has no\n        such concept - MySQL/MariaDB and Redis have none, and MongoDB\n        grants roles to users rather than owning a database with one; see\n        each manager's ``list_databases`` docstring for why.",
         "properties": {
           "encoding": {
             "anyOf": [
@@ -3121,6 +3268,17 @@
       "JobResponse": {
         "description": "One job, as the queue records it.",
         "properties": {
+          "actor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor"
+          },
           "completed_at": {
             "anyOf": [
               {
@@ -4271,6 +4429,28 @@
         "title": "ObservationListResponse",
         "type": "object"
       },
+      "PrivilegesResponse": {
+        "description": "Response for ``GET /api/databases/engines/{engine}/privileges``.",
+        "properties": {
+          "engine": {
+            "title": "Engine",
+            "type": "string"
+          },
+          "privileges": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Privileges",
+            "type": "array"
+          }
+        },
+        "required": [
+          "engine",
+          "privileges"
+        ],
+        "title": "PrivilegesResponse",
+        "type": "object"
+      },
       "ProcessEntry": {
         "description": "One row of the process table.\n\nAttributes:\n    pid: Process identifier.\n    name: Executable name.\n    user: Account the process runs as.\n    cpu_percent: CPU usage percentage.\n    memory_percent: Resident memory percentage.\n    command: Command line, already truncated by the collector.\n    status: Kernel process state.",
         "properties": {
@@ -4416,8 +4596,20 @@
         "type": "object"
       },
       "QueryResponse": {
-        "description": "Result of a statement.\n\nAttributes:\n    success: Whether the engine accepted the statement.\n    output: The engine's output, truncated to ``max_rows`` lines.\n    mode: The mode the statement ran in.\n    truncated: Whether output was cut.\n    returned_rows: How many lines the response carries.",
+        "description": "Result of a statement.\n\nAttributes:\n    success: Whether the engine accepted the statement.\n    output: The engine's output, truncated to ``max_rows`` lines.\n    mode: The mode the statement ran in.\n    truncated: Whether ``output`` or ``rows`` was cut.\n    returned_rows: How many lines ``output`` carries.\n    columns: Column names, in the order the engine returned them. Empty\n        for an engine with no tabular client output to parse (Redis,\n        MongoDB) or a statement with no result set.\n    rows: Data rows, each cell a string exactly as the client printed it.\n    row_count: Number of rows in ``rows``, after truncation.\n    duration_ms: Wall-clock time the query's own client invocation took.",
         "properties": {
+          "columns": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Columns",
+            "type": "array"
+          },
+          "duration_ms": {
+            "default": 0.0,
+            "title": "Duration Ms",
+            "type": "number"
+          },
           "mode": {
             "title": "Mode",
             "type": "string"
@@ -4430,6 +4622,21 @@
             "default": 0,
             "title": "Returned Rows",
             "type": "integer"
+          },
+          "row_count": {
+            "default": 0,
+            "title": "Row Count",
+            "type": "integer"
+          },
+          "rows": {
+            "items": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "title": "Rows",
+            "type": "array"
           },
           "success": {
             "title": "Success",
@@ -4911,11 +5118,22 @@
         "type": "object"
       },
       "ServiceInfo": {
-        "description": "Service information.",
+        "description": "Service information.\n\nAttributes:\n    managed: Whether this unit was created by WASM. Always true for a\n        service reached through the store; may be false when listing\n        with ``wasm_only=false``, which walks every unit on the host.\n    active_state: Systemd's own ``ActiveState`` (``active``, ``failed``,\n        ``activating``, ...). Distinguishes a unit systemd is repeatedly\n        restarting from one that is cleanly stopped, which ``active``\n        alone cannot: both report ``active=false`` between attempts.\n    sub_state: Systemd's own ``SubState`` (``running``, ``dead``,\n        ``auto-restart``, ...), the finer-grained half of the same story.\n    result: Systemd's own ``Result`` for the last run (``success``,\n        ``exit-code``, ``signal``, ...).",
         "properties": {
           "active": {
             "title": "Active",
             "type": "boolean"
+          },
+          "active_state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active State"
           },
           "description": {
             "anyOf": [
@@ -4930,6 +5148,11 @@
           },
           "enabled": {
             "title": "Enabled",
+            "type": "boolean"
+          },
+          "managed": {
+            "default": true,
+            "title": "Managed",
             "type": "boolean"
           },
           "memory": {
@@ -4958,9 +5181,31 @@
             ],
             "title": "Pid"
           },
+          "result": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result"
+          },
           "status": {
             "title": "Status",
             "type": "string"
+          },
+          "sub_state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sub State"
           },
           "uptime": {
             "anyOf": [
@@ -5883,6 +6128,39 @@
           "files_ok"
         ],
         "title": "VerifyBackupResponse",
+        "type": "object"
+      },
+      "VerifyUnitRequest": {
+        "description": "Request to check a candidate unit file before it is saved.",
+        "properties": {
+          "content": {
+            "title": "Content",
+            "type": "string"
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "title": "VerifyUnitRequest",
+        "type": "object"
+      },
+      "VerifyUnitResponse": {
+        "description": "Result of checking a candidate unit file.\n\nAttributes:\n    success: Whether systemd-analyze accepted it.\n    output: Its own explanation, verbatim - empty on a clean pass.",
+        "properties": {
+          "output": {
+            "title": "Output",
+            "type": "string"
+          },
+          "success": {
+            "title": "Success",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success",
+          "output"
+        ],
+        "title": "VerifyUnitResponse",
         "type": "object"
       },
       "WebConfig": {
@@ -7553,6 +7831,124 @@
         ]
       }
     },
+    "/api/audit": {
+      "get": {
+        "description": "List audit entries, newest first, with keyset pagination.\n\nArgs:\n    limit: Maximum entries to return.\n    before: Cursor from a previous page's ``next_before``.\n    action: Only entries with this exact action.\n    result: Only entries with this exact result.\n    actor: Only entries with this exact actor.\n    session: The authenticated session; admin scope is required.\n\nReturns:\n    The matching entries and the cursor for the next page.",
+        "operationId": "list_audit_entries_api_audit_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Only entries older than this cursor",
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only entries older than this cursor",
+              "title": "Before"
+            }
+          },
+          {
+            "description": "Filter by exact action",
+            "in": "query",
+            "name": "action",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by exact action",
+              "title": "Action"
+            }
+          },
+          {
+            "description": "Filter by exact result",
+            "in": "query",
+            "name": "result",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by exact result",
+              "title": "Result"
+            }
+          },
+          {
+            "description": "Filter by exact actor",
+            "in": "query",
+            "name": "actor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by exact actor",
+              "title": "Actor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Audit Entries",
+        "tags": [
+          "Audit"
+        ]
+      }
+    },
     "/api/auth/2fa": {
       "get": {
         "description": "Report the two-factor state.\n\nArgs:\n    session: The authenticated session.\n\nReturns:\n    The state, never including any secret.",
@@ -7848,6 +8244,28 @@
           }
         },
         "summary": "Revoke All Sessions",
+        "tags": [
+          "Authentication"
+        ]
+      }
+    },
+    "/api/auth/sessions/revoke-others": {
+      "post": {
+        "description": "Revoke every session except the caller's, leaving it signed in.\n\nThe counterpart to \"Sign out everywhere\": an operator who notices an\nunrecognised session in the list wants every other session gone without\nalso being signed out of the tab they are looking at the list from.\n\nArgs:\n    request: The incoming request.\n    session: The authenticated session.\n\nReturns:\n    A confirmation payload naming how many sessions were revoked.\n\nRaises:\n    HTTPException: 400 when the caller's own credential is not a session\n        (a Bearer token or the master token) - there is no \"other\n        session\" concept for a credential that never had a browser tab\n        of its own.",
+        "operationId": "revoke_other_sessions_api_auth_sessions_revoke_others_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Revoke Other Sessions",
         "tags": [
           "Authentication"
         ]
@@ -8278,7 +8696,7 @@
     },
     "/api/backups/{backup_id}": {
       "delete": {
-        "description": "Delete a backup and everything that belongs to it.\n\nArgs:\n    backup_id: Backup identifier.\n    session: The authenticated session.\n\nReturns:\n    The action outcome.\n\nRaises:\n    BackupError: When the manager cannot delete the backup.",
+        "description": "Delete a backup and everything that belongs to it.\n\nDeletion is irreversible - D5's sudo mode list treats it the same as\ndeleting an application - so a cookie session has to confirm itself\nfirst; an admin-scoped Bearer credential is exempt.\n\nArgs:\n    backup_id: Backup identifier.\n    session: The authenticated, elevated session.\n\nReturns:\n    The action outcome.\n\nRaises:\n    BackupError: When the manager cannot delete the backup.",
         "operationId": "delete_backup_api_backups__backup_id__delete",
         "parameters": [
           {
@@ -8362,7 +8780,7 @@
     },
     "/api/backups/{backup_id}/restore": {
       "post": {
-        "description": "Queue a restore of an application from a backup.\n\nArgs:\n    backup_id: Backup identifier.\n    data: Restore options.\n    session: The authenticated session.\n\nReturns:\n    The queued job.",
+        "description": "Queue a restore of an application from a backup.\n\nRestoring overwrites whatever the target domain currently has running -\nD5's sudo mode list treats it the same as deleting an application, so a\ncookie session has to confirm itself first; an admin-scoped Bearer\ncredential is exempt, per :func:`wasm.web.api.deps.ensure_elevated`.\n\nArgs:\n    backup_id: Backup identifier.\n    data: Restore options.\n    session: The authenticated, elevated session.\n\nReturns:\n    The queued job.",
         "operationId": "restore_backup_api_backups__backup_id__restore_post",
         "parameters": [
           {
@@ -9342,6 +9760,48 @@
         ]
       }
     },
+    "/api/cron/preview": {
+      "post": {
+        "description": "Preview a schedule's next five runs before it is saved as a job.\n\nDeclared before ``/{name}`` on purpose, the same reason ``/{name}/run``\nand friends are: a parametrised route registered first would match\n``preview`` as a job name.\n\nArgs:\n    data: The preview request. Its calendar expression was already\n        checked against the manager's own rules by the request model.\n    session: The authenticated session.\n\nReturns:\n    The normalised calendar and its next runs.\n\nRaises:\n    ServiceError: When systemd itself refuses the expression.",
+        "operationId": "preview_schedule_api_cron_preview_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CronPreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CronPreviewResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Preview Schedule",
+        "tags": [
+          "Cron Jobs"
+        ]
+      }
+    },
     "/api/cron/{name}": {
       "delete": {
         "description": "Remove a cron job's timer and service units.\n\nArgs:\n    name: Job name.\n    session: The authenticated session.\n\nReturns:\n    The action outcome.\n\nRaises:\n    HTTPException: 404 when no owned job exists for the name, so deleting\n        a job that was never created does not report success.\n    ServiceError: When the units are not WASM's.",
@@ -10084,6 +10544,49 @@
           }
         },
         "summary": "Get Engine Logs",
+        "tags": [
+          "Databases"
+        ]
+      }
+    },
+    "/api/databases/engines/{engine}/privileges": {
+      "get": {
+        "description": "List the privileges an engine's grant dialog may offer.\n\nThe manager's own whitelist is the one definition of what WASM will\ngrant - see :data:`wasm.managers.database.base.BaseDatabaseManager.VALID_PRIVILEGES` -\nso the console reads it from here instead of keeping its own copy that\ncould drift.\n\nArgs:\n    engine: Engine name.\n    session: The authenticated session.\n\nReturns:\n    The engine's valid privileges, sorted for a stable listing.",
+        "operationId": "get_engine_privileges_api_databases_engines__engine__privileges_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "engine",
+            "required": true,
+            "schema": {
+              "title": "Engine",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrivilegesResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Engine Privileges",
         "tags": [
           "Databases"
         ]
@@ -11847,7 +12350,7 @@
     },
     "/api/services": {
       "get": {
-        "description": "List all services (or only WASM services).",
+        "description": "List services.\n\n``wasm_only`` (the default) scopes the listing to what the store\ntracks - the units WASM itself created. Set it to false for a full\ninventory of every unit on the host, each flagged ``managed``, which is\nhow a diagnostics view tells a foreign unit's own crash loop from one of\nWASM's own.",
         "operationId": "list_services_api_services_get",
         "parameters": [
           {
@@ -11926,6 +12429,48 @@
           }
         },
         "summary": "Create Service",
+        "tags": [
+          "Services"
+        ]
+      }
+    },
+    "/api/services/verify": {
+      "post": {
+        "description": "Check a candidate unit file with systemd-analyze, without saving it.\n\nDeclared before ``/{name}`` on purpose: a parametrised route registered\nfirst would match ``verify`` as a service name. Used by the unit editor\nto catch a mistake before \"save\" ever reaches a real unit file.",
+        "operationId": "verify_unit_api_services_verify_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerifyUnitRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerifyUnitResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Verify Unit",
         "tags": [
           "Services"
         ]

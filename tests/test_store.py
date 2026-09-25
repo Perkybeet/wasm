@@ -828,7 +828,7 @@ class TestSchemaV6Migration:
 
         with store._transaction() as cursor:
             cursor.execute("SELECT MAX(version) FROM schema_version")
-            assert cursor.fetchone()[0] == SCHEMA_VERSION == 6
+            assert cursor.fetchone()[0] == SCHEMA_VERSION
 
         shop = store.list_domains("shop.example.com")
         assert [(d.domain, d.kind) for d in shop] == [("shop.example.com", "primary")]
@@ -853,6 +853,84 @@ class TestSchemaV6Migration:
 
         assert installed == upgraded
         assert "idx_domains_one_primary" in installed["indexes"]
+
+
+class TestSchemaV7Migration:
+    """Schema v7 gives every job row who queued it."""
+
+    def _create_v6_database(self, db_path: Path) -> None:
+        """
+        Create a real v6 database with one job, as 2.0 pre-releases left it.
+
+        Args:
+            db_path: Where the database file is created.
+        """
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.executescript(V1_SCHEMA_SQL)
+            conn.executescript(V2_DEPLOYMENTS_SQL)
+            conn.execute("ALTER TABLE apps ADD COLUMN webhook_secret TEXT")
+            conn.executescript(V4_JOBS_SQL)
+            for name, definition in store_module.APPS_V5_COLUMNS:
+                conn.execute(f"ALTER TABLE apps ADD COLUMN {name} {definition}")
+            conn.executescript(store_module.RELEASES_SCHEMA_SQL)
+            conn.executescript(store_module.DOMAINS_SCHEMA_SQL)
+            for version in (1, 2, 3, 4, 5, 6):
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+            conn.execute(
+                "INSERT INTO jobs (id, type, name, status) VALUES (?, ?, ?, ?)",
+                ("old-job", "update", "Update old.example.com", "completed"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_existing_jobs_keep_no_actor(self, fresh, tmp_path):
+        """A job queued before this column existed has nothing to backfill it with."""
+        db_path = tmp_path / "wasm.db"
+        self._create_v6_database(db_path)
+
+        store = WASMStore(db_path, fs=RecordingFileSystem())
+
+        with store._transaction() as cursor:
+            cursor.execute("SELECT MAX(version) FROM schema_version")
+            assert cursor.fetchone()[0] == SCHEMA_VERSION
+
+        job = store.get_job("old-job")
+        assert job is not None
+        assert job.actor is None
+
+    def test_a_migrated_database_can_record_a_job_with_an_actor(self, fresh, tmp_path):
+        """The column is usable immediately after migrating, not just present."""
+        db_path = tmp_path / "wasm.db"
+        self._create_v6_database(db_path)
+        store = WASMStore(db_path, fs=RecordingFileSystem())
+
+        store.create_job(
+            store_module.JobRecord(
+                id="new-job", type="deploy", name="Deploy", status="pending", actor="master"
+            )
+        )
+
+        assert store.get_job("new-job").actor == "master"
+
+    def test_the_fresh_schema_and_the_migration_agree(self, fresh, tmp_path):
+        """Both paths to v7 give the jobs table the same actor column."""
+        db_path = tmp_path / "migrated.db"
+        self._create_v6_database(db_path)
+        migrated = WASMStore(db_path, fs=RecordingFileSystem())
+        with migrated._transaction() as cursor:
+            cursor.execute("PRAGMA table_info(jobs)")
+            upgraded_columns = {row["name"] for row in cursor.fetchall()}
+        WASMStore.reset_instance()
+
+        fresh_store = WASMStore(tmp_path / "fresh.db", fs=RecordingFileSystem())
+        with fresh_store._transaction() as cursor:
+            cursor.execute("PRAGMA table_info(jobs)")
+            fresh_columns = {row["name"] for row in cursor.fetchall()}
+
+        assert "actor" in upgraded_columns
+        assert upgraded_columns == fresh_columns
 
 
 class TestDomains:

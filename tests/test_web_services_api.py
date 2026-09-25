@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient
 
 from wasm.core.config import Config
 from wasm.core.exceptions import SecurityError, ValidationError
+from wasm.core.store import Service, WASMStore
 from wasm.managers.service_manager import WASM_UNIT_MARKER, ServiceManager
 from wasm.validators.names import (
     MAX_SERVICE_NAME_LENGTH,
@@ -66,6 +67,14 @@ class FakeServiceManager:
     """Stand-in for ServiceManager that records calls instead of running systemctl."""
 
     instances: ClassVar[list[FakeServiceManager]] = []
+    #: Scripted answers for get_status(), keyed by unit name. Reset per test
+    #: by the fake_manager fixture.
+    statuses: ClassVar[dict[str, dict]] = {}
+    #: Scripted answer for list_services(all_services=True): every unit on
+    #: the host, as ServiceManager.list_services would report it.
+    all_units: ClassVar[list[dict]] = []
+    #: Scripted (success, output) answer for verify_unit().
+    verify_result: ClassVar[tuple[bool, str]] = (True, "")
 
     def __init__(self, verbose: bool = False):
         """
@@ -74,6 +83,51 @@ class FakeServiceManager:
         """
         self.calls: list[tuple[str, ...]] = []
         FakeServiceManager.instances.append(self)
+
+    def get_status(self, name: str, *, require_managed: bool = True) -> dict:
+        """
+        Return the scripted status for a unit, recording the call.
+
+        Args:
+            name: Unit name.
+            require_managed: Recorded, but this stub never raises for a
+                foreign unit - the real ownership guard is exercised in
+                tests/test_service_manager.py.
+
+        Returns:
+            The scripted dict, or a bland "exists but stopped" default.
+        """
+        self.calls.append(("get_status", name, require_managed))
+        return FakeServiceManager.statuses.get(
+            name,
+            {
+                "name": name,
+                "exists": True,
+                "active": False,
+                "enabled": False,
+                "pid": "",
+                "memory": "",
+                "uptime": "",
+                "active_state": "",
+                "sub_state": "",
+                "restarts": "0",
+                "result": "",
+                "managed": True,
+            },
+        )
+
+    def list_services(self, all_services: bool = False) -> list[dict]:
+        """
+        Return the scripted unit listing, recording the call.
+
+        Args:
+            all_services: Recorded for assertions.
+
+        Returns:
+            The scripted list.
+        """
+        self.calls.append(("list_services", all_services))
+        return FakeServiceManager.all_units
 
     def daemon_reload(self) -> bool:
         """Record a daemon-reload request."""
@@ -99,6 +153,11 @@ class FakeServiceManager:
         """Return canned log output."""
         self.calls.append(("logs", name))
         return f"logs for {name}"
+
+    def verify_unit(self, content: str) -> tuple[bool, str]:
+        """Record the candidate content and return the scripted verdict."""
+        self.calls.append(("verify_unit", content))
+        return FakeServiceManager.verify_result
 
 
 @pytest.fixture
@@ -131,8 +190,32 @@ def fake_manager(monkeypatch: pytest.MonkeyPatch) -> type[FakeServiceManager]:
         The stub class, whose ``instances`` list holds every manager built.
     """
     FakeServiceManager.instances = []
+    FakeServiceManager.statuses = {}
+    FakeServiceManager.all_units = []
+    FakeServiceManager.verify_result = (True, "")
     monkeypatch.setattr(services_api, "ServiceManager", FakeServiceManager, raising=False)
     return FakeServiceManager
+
+
+@pytest.fixture
+def store(tmp_path: Path):
+    """
+    Give the listing endpoint a store of its own, so ``wasm_only=true`` has
+    something real to read.
+
+    Args:
+        tmp_path: Per-test temporary directory.
+
+    Yields:
+        The store.
+    """
+    WASMStore.reset_instance()
+    instance = WASMStore(tmp_path / "services.db")
+    try:
+        yield instance
+    finally:
+        instance.close()
+        WASMStore.reset_instance()
 
 
 @pytest.fixture
@@ -181,6 +264,133 @@ def _units_outside(unit_dir: Path, root: Path) -> list[Path]:
         Offending paths, empty when containment held.
     """
     return [p for p in root.rglob("*.service") if unit_dir not in p.parents]
+
+
+class TestListServices:
+    """GET /api/services: WASM's own units by default, every unit on request."""
+
+    def test_wasm_only_lists_stored_services_with_the_live_state_fields(
+        self, client: TestClient, fake_manager, store
+    ) -> None:
+        """A WASM-tracked unit's crash-loop state reaches the API."""
+        store.create_service(Service(name="wasm-shop", command="node server.js"))
+        FakeServiceManager.statuses["wasm-shop"] = {
+            "name": "wasm-shop",
+            "exists": True,
+            "active": False,
+            "enabled": True,
+            "pid": "",
+            "memory": "",
+            "uptime": "",
+            "active_state": "activating",
+            "sub_state": "auto-restart",
+            "restarts": "12",
+            "result": "exit-code",
+            "managed": True,
+        }
+
+        response = client.get("/api/services")
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["total"] == 1
+        svc = body["services"][0]
+        assert svc["name"] == "wasm-shop"
+        assert svc["managed"] is True
+        assert svc["active_state"] == "activating"
+        assert svc["sub_state"] == "auto-restart"
+        assert svc["result"] == "exit-code"
+
+    def test_wasm_only_false_lists_every_unit_including_foreign_ones(
+        self, client: TestClient, fake_manager, store
+    ) -> None:
+        """``wasm_only=false`` reaches every unit systemd knows about, flagged."""
+        FakeServiceManager.all_units = [
+            {"name": "wasm-shop", "load": "loaded", "active": "active", "sub": "running"},
+            {"name": "sshd", "load": "loaded", "active": "active", "sub": "running"},
+        ]
+        FakeServiceManager.statuses = {
+            "wasm-shop": {
+                "name": "wasm-shop",
+                "exists": True,
+                "active": True,
+                "enabled": True,
+                "pid": "1",
+                "memory": "",
+                "uptime": "",
+                "active_state": "active",
+                "sub_state": "running",
+                "restarts": "0",
+                "result": "success",
+                "managed": True,
+            },
+            "sshd": {
+                "name": "sshd",
+                "exists": True,
+                "active": True,
+                "enabled": True,
+                "pid": "2",
+                "memory": "",
+                "uptime": "",
+                "active_state": "active",
+                "sub_state": "running",
+                "restarts": "0",
+                "result": "success",
+                "managed": False,
+            },
+        }
+
+        response = client.get("/api/services", params={"wasm_only": "false"})
+
+        assert response.status_code == 200, response.text
+        services = {svc["name"]: svc for svc in response.json()["services"]}
+        assert set(services) == {"wasm-shop", "sshd"}
+        assert services["sshd"]["managed"] is False
+        assert services["wasm-shop"]["managed"] is True
+
+        manager = FakeServiceManager.instances[-1]
+        assert ("list_services", True) in manager.calls
+        assert ("get_status", "sshd", False) in manager.calls
+
+    def test_wasm_only_true_is_the_default_and_never_asks_for_all_units(
+        self, client: TestClient, fake_manager, store
+    ) -> None:
+        """The default stays scoped to WASM's own inventory."""
+        response = client.get("/api/services")
+
+        assert response.status_code == 200, response.text
+        manager = FakeServiceManager.instances[-1]
+        assert ("list_services", True) not in manager.calls
+
+
+class TestVerifyUnit:
+    """POST /api/services/verify: the unit editor's pre-save check."""
+
+    def test_a_clean_unit_verifies_successfully(self, client: TestClient, fake_manager) -> None:
+        """systemd-analyze's silence on success reaches the client as such."""
+        FakeServiceManager.verify_result = (True, "")
+
+        response = client.post(
+            "/api/services/verify", json={"content": "[Service]\nExecStart=/usr/bin/true\n"}
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"success": True, "output": ""}
+        manager = FakeServiceManager.instances[-1]
+        assert manager.calls == [("verify_unit", "[Service]\nExecStart=/usr/bin/true\n")]
+
+    def test_a_rejected_unit_carries_the_checkers_words_verbatim(
+        self, client: TestClient, fake_manager
+    ) -> None:
+        """The editor shows systemd's own explanation, not a generic failure."""
+        FakeServiceManager.verify_result = (False, "Failed to parse Exec syntax: bad\n")
+
+        response = client.post("/api/services/verify", json={"content": "[Service]\nExecStart=\n"})
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["success"] is False
+        assert "Failed to parse Exec syntax" in body["output"]
 
 
 class TestCreateServiceTraversal:

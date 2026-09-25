@@ -15,12 +15,14 @@ code path.
 from __future__ import annotations
 
 import ast
+import json
 import os
 import shutil
 import smtplib
 import tempfile
 import time
 import types
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -959,3 +961,174 @@ def test_a_process_that_keeps_misbehaving_is_reported_once_per_window(
 
     assert store.stats()["total"] == 1
     assert len(notifier.sent) == 1, "the same process was mailed about on every scan"
+
+
+class _FakeEventNotifier:
+    """Records every multi-channel event instead of delivering it."""
+
+    def __init__(self) -> None:
+        self.events: list[Any] = []
+
+    def notify(self, event: Any) -> None:
+        self.events.append(event)
+
+
+class _FakeCertManager:
+    """Stands in for CertManager, reporting a fixed certificate list."""
+
+    def __init__(self, certificates: list[Any]) -> None:
+        self._certificates = certificates
+
+    def list_certificates(self) -> list[Any]:
+        return self._certificates
+
+
+class TestCertificateExpiryNotifications:
+    """
+    ``cert_expiring`` used to be a name in ``EVENT_KINDS`` that nothing ever
+    published: renewal failures were silent until an operator noticed the
+    site was down. The monitor's periodic loop is where every other
+    condition (a full disk, a down unit) already turns into a notification,
+    so the certificate check joins it there.
+    """
+
+    def _monitor(
+        self, state_path: Path, certificates: list[Any], event_notifier: Any = None
+    ) -> tuple[Any, Any]:
+        """
+        Args:
+            state_path: Where the per-certificate last-notified date lives.
+            certificates: What the fake certificate manager reports.
+            event_notifier: Notifier to inject; a fresh recorder by default.
+
+        Returns:
+            The monitor and the event notifier it was built with.
+        """
+        from wasm.monitor.process_monitor import MonitorConfig, ProcessMonitor
+
+        notifier = event_notifier or _FakeEventNotifier()
+        monitor = ProcessMonitor(
+            config=MonitorConfig(),
+            event_notifier=notifier,
+            cert_manager=_FakeCertManager(certificates),
+            cert_state_path=state_path,
+        )
+        return monitor, notifier
+
+    def _cert(self, name: str, days: int) -> Any:
+        """
+        Args:
+            name: Certificate (lineage) name.
+            days: Days from today until it expires; negative for already
+                expired.
+
+        Returns:
+            A CertificateInfo expiring on that day.
+        """
+        from wasm.managers.cert_manager import CertificateInfo
+
+        expiry = date.today() + timedelta(days=days)
+        return CertificateInfo(name=name, domains=[name], expiry=expiry.isoformat())
+
+    def test_a_certificate_inside_the_warning_window_is_published(self, tmp_path: Path) -> None:
+        monitor, notifier = self._monitor(
+            tmp_path / "cert-notifications.json", [self._cert("example.com", days=5)]
+        )
+
+        monitor._check_certificates()
+
+        assert len(notifier.events) == 1
+        event = notifier.events[0]
+        assert event.kind == "cert_expiring"
+        assert "example.com" in event.title
+        assert "5 day" in event.title
+
+    def test_a_certificate_far_from_expiry_is_left_alone(self, tmp_path: Path) -> None:
+        monitor, notifier = self._monitor(
+            tmp_path / "cert-notifications.json", [self._cert("example.com", days=60)]
+        )
+
+        monitor._check_certificates()
+
+        assert notifier.events == []
+
+    def test_a_certificate_with_no_parsable_expiry_is_left_alone(self, tmp_path: Path) -> None:
+        from wasm.managers.cert_manager import CertificateInfo
+
+        broken = CertificateInfo(name="example.com", domains=["example.com"], expiry=None)
+        monitor, notifier = self._monitor(tmp_path / "cert-notifications.json", [broken])
+
+        monitor._check_certificates()
+
+        assert notifier.events == []
+
+    def test_the_same_certificate_is_not_warned_about_twice_in_one_day(
+        self, tmp_path: Path
+    ) -> None:
+        monitor, notifier = self._monitor(
+            tmp_path / "cert-notifications.json", [self._cert("example.com", days=5)]
+        )
+
+        monitor._check_certificates()
+        monitor._check_certificates()
+
+        assert len(notifier.events) == 1
+
+    def test_a_restarted_daemon_still_does_not_repeat_the_same_days_warning(
+        self, tmp_path: Path
+    ) -> None:
+        """The state survives across ProcessMonitor instances, not just scans."""
+        state_path = tmp_path / "cert-notifications.json"
+        cert = self._cert("example.com", days=5)
+
+        first, first_notifier = self._monitor(state_path, [cert])
+        first._check_certificates()
+
+        second, second_notifier = self._monitor(state_path, [cert])
+        second._check_certificates()
+
+        assert len(first_notifier.events) == 1
+        assert second_notifier.events == []
+
+    def test_a_certificate_still_expiring_the_next_day_is_warned_again(
+        self, tmp_path: Path
+    ) -> None:
+        """Persistence remembers "today", not "forever"."""
+        state_path = tmp_path / "cert-notifications.json"
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        state_path.write_text(json.dumps({"example.com": yesterday}))
+
+        monitor, notifier = self._monitor(state_path, [self._cert("example.com", days=5)])
+        monitor._check_certificates()
+
+        assert len(notifier.events) == 1
+
+    def test_two_certificates_are_tracked_independently(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "cert-notifications.json"
+        expiring = self._cert("soon.example.com", days=3)
+        healthy = self._cert("fine.example.com", days=90)
+
+        monitor, notifier = self._monitor(state_path, [expiring, healthy])
+        monitor._check_certificates()
+
+        assert [event.title for event in notifier.events] == [
+            "Certificate for soon.example.com expires in 3 day(s)"
+        ]
+
+    def test_the_state_file_is_written_through_the_filesystem_seam(self, tmp_path: Path) -> None:
+        """A DryRunFileSystem must be able to refuse this write like any other."""
+        from wasm.core.fs import DryRunFileSystem, set_fs
+
+        state_path = tmp_path / "cert-notifications.json"
+        monitor, notifier = self._monitor(state_path, [self._cert("example.com", days=5)])
+
+        dry_fs = DryRunFileSystem()
+        set_fs(dry_fs)
+        try:
+            monitor._check_certificates()
+        finally:
+            set_fs(None)
+
+        assert len(notifier.events) == 1, "the event still fires even though nothing was saved"
+        assert not state_path.exists()
+        assert any("cert-notifications.json" in skipped for skipped in dry_fs.skipped)

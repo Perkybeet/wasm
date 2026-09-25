@@ -357,6 +357,11 @@ class MongoDBManager(BaseDatabaseManager):
         """
         List the databases that do not belong to the deployment itself.
 
+        ``owner`` stays unset: MongoDB grants roles scoped to a database to
+        any number of users (see :meth:`list_users`), it does not record a
+        single owning account on the database itself the way a filesystem or
+        a single-owner SQL catalog would.
+
         Returns:
             One entry per user database.
         """

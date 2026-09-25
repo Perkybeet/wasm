@@ -47,7 +47,7 @@ from wasm.web.api.deps import (
     require_elevated,
     strict_domain,
 )
-from wasm.web.auth import ensure_scope, get_audit_logger, get_client_ip
+from wasm.web.auth import actor_label, ensure_scope, get_audit_logger, get_client_ip
 from wasm.web.jobs import JobType, delete_app_job, deploy_app_job, get_job_manager
 from wasm.web.pydantic_compat import iso_offset_validator
 
@@ -487,6 +487,7 @@ def create_app(
             "layout": body.layout,
         },
         metadata={"domain": domain, "app_type": body.app_type, "port": port},
+        actor=actor_label(session),
     )
 
     return JobAcceptedResponse(
@@ -901,6 +902,7 @@ def delete_app(
             "remove_ssl": remove_ssl,
         },
         metadata={"domain": validated},
+        actor=actor_label(session),
     )
 
     return JobAcceptedResponse(

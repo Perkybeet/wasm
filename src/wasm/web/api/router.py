@@ -14,6 +14,7 @@ route, such as in a dependency.
 from fastapi import APIRouter
 
 from wasm.web.api.apps import router as apps_router
+from wasm.web.api.audit import router as audit_router
 from wasm.web.api.auth import router as auth_router
 from wasm.web.api.backup_schedules import router as backup_schedules_router
 from wasm.web.api.backups import router as backups_router
@@ -38,6 +39,7 @@ __all__ = ["install_error_handlers", "router"]
 router = APIRouter()
 
 router.include_router(auth_router, prefix="/auth", tags=["Authentication"])
+router.include_router(audit_router, prefix="/audit", tags=["Audit"])
 router.include_router(apps_router, prefix="/apps", tags=["Applications"])
 router.include_router(services_router, prefix="/services", tags=["Services"])
 router.include_router(sites_router, prefix="/sites", tags=["Sites"])
