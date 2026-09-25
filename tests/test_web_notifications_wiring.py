@@ -33,6 +33,7 @@ from datetime import datetime
 from tests.test_notifier import (  # noqa: F401  (pytest resolves fixtures by name)
     CapturingOpener,
     config,
+    public_dns,
 )
 from wasm.core.config import Config
 from wasm.core.notifier import NotificationEvent, Notifier

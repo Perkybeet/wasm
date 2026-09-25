@@ -39,7 +39,7 @@ from wasm.core.exceptions import DeploymentError, DomainError
 from wasm.core.store import DeploymentTrigger, get_store
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import WASMErrorRoute, strict_domain
-from wasm.web.auth import get_audit_logger, get_client_ip
+from wasm.web.auth import get_audit_logger, get_client_ip, record_auth_failure
 from wasm.web.jobs import JobContext, JobType, get_job_manager, run_update
 
 #: The unauthenticated delivery surface, mounted at ``/hooks``.
@@ -347,6 +347,15 @@ async def deliver(domain: str, request: Request) -> JSONResponse:
     provider = _verify_provider(secret, body, request)
     if provider is None:
         _record(request, validated, "denied", "signature verification failed")
+        # A wrong webhook signature is a credential guess exactly as much as a
+        # wrong master token is: it is the one thing this endpoint checks,
+        # and it can be brute forced the same way. Feeding it into the same
+        # lockout the login form uses means an attacker cannot use the
+        # deliberately unauthenticated hook surface as a side channel that
+        # never counts against them.
+        record_auth_failure(
+            get_client_ip(request), f"/hooks/deploy/{validated}", "webhook_signature"
+        )
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     delivery = _delivery_id(request)

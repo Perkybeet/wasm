@@ -177,15 +177,17 @@ def started(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """
     captured: dict[str, Any] = {}
 
-    def foreground(config: Any) -> int:
+    def foreground(config: Any, *, insecure_http: bool = False) -> int:
         captured["config"] = config
         captured["mode"] = "foreground"
+        captured["insecure_http"] = insecure_http
         return 0
 
-    def daemon(config: Any, verbose: bool) -> int:
+    def daemon(config: Any, verbose: bool, *, insecure_http: bool = False) -> int:
         captured["config"] = config
         captured["mode"] = "daemon"
         captured["verbose"] = verbose
+        captured["insecure_http"] = insecure_http
         return 0
 
     monkeypatch.setattr(web, "_start_foreground", foreground)
@@ -705,6 +707,36 @@ def test_the_insecure_opt_out_opens_the_panel_and_keeps_the_whitelist(
     assert started["config"].require_https is False
     assert started["config"].ip_whitelist == ["10.0.0.0/24", "10.1.0.1"]
     assert started["config"].allowed_hosts == []
+
+
+def test_the_insecure_opt_out_reaches_the_chokepoint_that_binds_the_socket(
+    cli_runner: CliRunner, deps_present: None, pid_file: Path, started: dict[str, Any]
+) -> None:
+    """
+    ``run_server`` refuses the same exposure on its own; it has to be told.
+
+    The CLI already refused this combination once, in _build_security_config.
+    run_server refuses it again, because it - not this command - is what
+    actually binds the socket. If --insecure-http stopped here, every panel
+    started this way would immediately refuse itself.
+    """
+    result = cli_runner.invoke(web.cli, ["start", "--host", ALL_INTERFACES, "--insecure-http"])
+
+    assert result.exit_code == 0, result.output
+    assert started["insecure_http"] is True
+
+
+def test_a_daemon_started_insecurely_also_reaches_the_chokepoint(
+    cli_runner: CliRunner, deps_present: None, pid_file: Path, started: dict[str, Any]
+) -> None:
+    """The daemon front door threads the same flag through."""
+    result = cli_runner.invoke(
+        web.cli, ["start", "--host", ALL_INTERFACES, "--insecure-http", "--daemon"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert started["mode"] == "daemon"
+    assert started["insecure_http"] is True
 
 
 def test_the_insecure_opt_out_names_what_travels_in_cleartext(

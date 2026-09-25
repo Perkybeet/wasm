@@ -38,7 +38,7 @@ from starlette.requests import HTTPConnection
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from wasm.core.exceptions import SecurityError, WASMError
-from wasm.core.net import host_addresses, local_address, loopback_access_lines
+from wasm.core.net import host_addresses, is_loopback_host, local_address, loopback_access_lines
 from wasm.core.notifier import NotificationEvent
 from wasm.web.auth import (
     SAFE_METHODS,
@@ -104,6 +104,35 @@ CONTENT_SECURITY_POLICY = (
 )
 
 HSTS_VALUE = "max-age=31536000; includeSubDomains"
+
+#: The build's hashed static assets: Vite names every file
+#: ``<name>.<content-hash>.<ext>``, so a stale copy of one is a filename that
+#: no longer exists in the manifest rather than an old version of a page
+#: quietly served again. Everything else - the SPA shell, the API, the event
+#: stream - carries a session and must be revalidated on every request, or a
+#: shared proxy caching one operator's dashboard would hand it to the next
+#: visitor on the same connection.
+_IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
+
+#: What every response gets whose path is not under ``/assets/``.
+_NO_STORE_CACHE_CONTROL = "no-store"
+
+
+def _cache_control_for(path: str) -> str:
+    """
+    Decide the ``Cache-Control`` an outgoing response carries.
+
+    Args:
+        path: The request path.
+
+    Returns:
+        :data:`_IMMUTABLE_CACHE_CONTROL` for a hashed build asset under
+        ``/assets/``, :data:`_NO_STORE_CACHE_CONTROL` for everything else.
+    """
+    if path.startswith("/assets/"):
+        return _IMMUTABLE_CACHE_CONTROL
+    return _NO_STORE_CACHE_CONTROL
+
 
 #: Endpoints that exist to be given a credential by an anonymous client, and
 #: are therefore the ones a lockout has to guard even before authentication.
@@ -1011,7 +1040,7 @@ class SecurityMiddleware:
         headers["Referrer-Policy"] = "no-referrer"
         headers["Cross-Origin-Opener-Policy"] = "same-origin"
         headers["Cross-Origin-Resource-Policy"] = "same-origin"
-        headers["Cache-Control"] = "no-store"
+        headers["Cache-Control"] = _cache_control_for(connection.url.path)
         headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
 
         if self.config.require_https or is_secure_request(connection, self.config):
@@ -1215,19 +1244,33 @@ def run_server(
     port: int = 8080,
     config: SecurityConfig | None = None,
     show_token: bool = True,
+    insecure_http: bool = False,
 ) -> None:
     """
     Run the WASM web server.
+
+    ``wasm web start`` already refuses this combination before it gets here -
+    see ``_build_security_config`` in ``wasm.cli.commands.web`` - but that is
+    a rule enforced in one caller, and this function is the chokepoint that
+    actually binds the socket. Checking again here is what keeps a second
+    caller (a test, a future in-process restart, a script that imports this
+    function directly) from serving a root panel's access token and session
+    cookie in cleartext to anyone on the network just by skipping the CLI.
 
     Args:
         host: Host to bind to.
         port: Port to bind to.
         config: Security configuration.
         show_token: Whether to print a freshly generated access token.
+        insecure_http: Whether cleartext beyond loopback was accepted in so
+            many words. Only ever True when the CLI's ``--insecure-http``
+            flag was given.
 
     Raises:
         SecurityError: When HTTPS is required but no usable certificate is
-            configured, or when persistent state cannot be written.
+            configured, when persistent state cannot be written, or when the
+            bind address is reachable from another machine without TLS and
+            without ``insecure_http``.
     """
     import uvicorn
 
@@ -1236,6 +1279,20 @@ def run_server(
     else:
         config.host = host
         config.port = port
+
+    if not config.require_https and not insecure_http and not is_loopback_host(config.host):
+        raise SecurityError(
+            f"Refusing to bind the WASM panel to {config.host} without TLS",
+            details=(
+                "The panel drives systemd, nginx and certbot as root, and over plain HTTP "
+                "its access token and session cookie cross the network readable by anyone "
+                "on the path.\n"
+                "Pick one:\n"
+                "  - keep it local: wasm web start --host 127.0.0.1\n"
+                "  - bring a certificate: --tls-cert CERT --tls-key KEY, or --self-signed\n"
+                "  - accept cleartext in so many words: --insecure-http"
+            ),
+        )
 
     ssl_certfile: str | None = None
     ssl_keyfile: str | None = None

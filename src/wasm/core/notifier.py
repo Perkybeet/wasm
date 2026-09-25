@@ -31,15 +31,41 @@ Three rules hold everywhere:
   URL and urllib quotes the URL in some of its errors, so error text is
   scrubbed before it is logged or returned.
 
-Tests inject ``opener`` instead of opening sockets; the suite never talks to
-the network.
+A fourth rule is enforced by :func:`_require_public_destination` rather than
+by convention: a notification channel is *configured* by whoever can write to
+``/etc/wasm/config.yaml``, but *delivering* one means this process making an
+outbound request with attacker-influenced content, from the same machine that
+runs systemd as root. A webhook URL of ``http://169.254.169.254/latest/...``
+or ``http://127.0.0.1:8080/api/...`` would turn "send a notification" into a
+way to reach the cloud metadata service or the panel's own loopback-only
+surface, so every destination is resolved and checked against
+:data:`_FORBIDDEN_NETWORKS` before a request is built - and every redirect
+hop is checked again by :class:`_SafeRedirectHandler`, because a destination
+that starts out public and then answers with a 302 would otherwise reach this
+guard exactly once. An operator who genuinely wants to notify a private
+address (a webhook on the same network) lists the host under
+``notifications.allow_private_hosts``.
+
+:meth:`Notifier.test_channel` additionally never returns the remote response
+body, only the status: unlike :func:`_describe_error`\\ 's use in
+:meth:`Notifier.notify` (whose result only ever reaches a log an operator
+already trusts), the test button's answer is rendered straight into the
+settings page, and reflecting an arbitrary response body there is a second
+way for a reachable-but-not-quite-blocked destination to hand content back to
+whoever is looking at the panel.
+
+Tests inject ``opener`` instead of opening sockets, and monkeypatch
+:func:`_resolve_host` instead of resolving a real name; the suite never talks
+to the network.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import re
+import socket
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -118,6 +144,173 @@ _SETTING_HINTS = {
 #: returning a closeable response. Tests inject one; the suite never opens a
 #: real socket.
 Opener = Callable[..., Any]
+
+#: Address family alias, matching wasm.core.net's.
+_IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
+
+#: Networks a notification destination must not resolve into, unless the host
+#: is explicitly trusted through ``notifications.allow_private_hosts``. Not
+#: the full IANA special-purpose registry - just the ranges that turn a
+#: notification into a way to reach the panel's own network: this machine
+#: (loopback), private networks (RFC 1918), carrier-grade NAT (RFC 6598,
+#: what a cloud metadata endpoint typically sits behind), link-local (which
+#: is also where 169.254.169.254, the cloud metadata address itself, lives),
+#: "this network" (0.0.0.0/8) and IPv6's loopback, unique-local and
+#: link-local equivalents.
+_FORBIDDEN_NETWORKS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = tuple(
+    ipaddress.ip_network(cidr)
+    for cidr in (
+        "0.0.0.0/8",
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "::1/128",
+        "fc00::/7",
+        "fe80::/10",
+    )
+)
+
+
+def _resolve_host(host: str) -> tuple[str, ...]:
+    """
+    Resolve a destination host to the literal addresses it points at.
+
+    A module-level function rather than a method, so a test can replace it
+    with :func:`pytest.MonkeyPatch.setattr` instead of opening a real socket:
+    DNS is nondeterministic, reaches outside the sandbox, and would make this
+    guard's own tests as slow and flaky as the network they exist to avoid a
+    dependency on.
+
+    Args:
+        host: Hostname or address literal from the destination URL.
+
+    Returns:
+        Every address the name resolves to. A literal address resolves to
+        itself without a lookup.
+
+    Raises:
+        OSError: When the name cannot be resolved.
+    """
+    try:
+        return (str(ipaddress.ip_address(host)),)
+    except ValueError:
+        pass
+    infos = socket.getaddrinfo(host, None)
+    # A link-local sockaddr carries a %scope suffix ipaddress refuses.
+    return tuple(sorted({str(info[4][0]).split("%", 1)[0] for info in infos}))
+
+
+def _is_forbidden(address: _IPAddress) -> bool:
+    """
+    Report whether an address falls inside :data:`_FORBIDDEN_NETWORKS`.
+
+    Args:
+        address: A resolved destination address.
+
+    Returns:
+        True when the address is not one a notification may be sent to.
+    """
+    return any(
+        address.version == network.version and address in network for network in _FORBIDDEN_NETWORKS
+    )
+
+
+def _require_public_destination(url: str, config: Config) -> None:
+    """
+    Refuse a destination that resolves inside the machine's own networks.
+
+    This is the SSRF guard: see the module docstring for the attack it
+    closes. It is called once for the destination a request is built for, and
+    again - by :class:`_SafeRedirectHandler` - for every redirect the
+    endpoint answers with, so a public host that 302s to a private one is
+    refused exactly as if it had been configured that way from the start.
+
+    Args:
+        url: The destination URL, already scheme-checked.
+        config: Configuration to read ``notifications.allow_private_hosts``
+            from.
+
+    Raises:
+        ValueError: When the URL carries no host, the host cannot be
+            resolved, or every address it resolves to is inside a forbidden
+            network and the host is not on the allowlist.
+    """
+    host = urlparse(url).hostname
+    if not host:
+        raise ValueError(f"{url!r} has no host to validate")
+
+    allowed = {
+        str(entry).lower() for entry in (config.get("notifications.allow_private_hosts") or [])
+    }
+    if host.lower() in allowed:
+        return
+
+    try:
+        addresses = _resolve_host(host)
+    except OSError as exc:
+        raise ValueError(f"Could not resolve notification destination {host!r}: {exc}") from exc
+    if not addresses:
+        raise ValueError(f"Notification destination {host!r} did not resolve to any address")
+
+    for raw in addresses:
+        address = ipaddress.ip_address(raw)
+        if _is_forbidden(address):
+            raise ValueError(
+                f"Refusing to notify {host!r}: resolves to {address}, inside a private or "
+                "internal network. List it under notifications.allow_private_hosts to allow it."
+            )
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """
+    Re-applies the SSRF guard to every redirect a destination answers with.
+
+    ``urlopen`` follows redirects transparently, so a webhook endpoint that
+    starts out public and 302s to ``http://169.254.169.254/`` would meet
+    :func:`_require_public_destination` exactly once, at the address that
+    passed. Every hop is validated again here before urllib is allowed to
+    follow it.
+    """
+
+    def __init__(self, config: Config) -> None:
+        """
+        Args:
+            config: Configuration to read the allowlist from, forwarded to
+                every redirect check.
+        """
+        self._config = config
+
+    def redirect_request(
+        self,
+        req: Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> Request | None:
+        """
+        Validate a redirect target before deciding whether to follow it.
+
+        Args:
+            req: The request that received the redirect.
+            fp: The response file object.
+            code: The redirect's HTTP status.
+            msg: The redirect's reason phrase.
+            headers: The redirect's response headers.
+            newurl: Where the redirect points.
+
+        Returns:
+            The next request to send, exactly as the base class builds it.
+
+        Raises:
+            ValueError: When the redirect target is not a public destination.
+        """
+        _require_public_destination(newurl, self._config)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 @dataclass
@@ -301,28 +494,37 @@ def _telegram_request(bot_token: str, chat_id: str, event: NotificationEvent) ->
     return _json_request(url, {"chat_id": chat_id, "text": _message_text(event)})
 
 
-def _describe_error(exc: BaseException) -> str:
+def _describe_error(exc: BaseException, *, include_body: bool = True) -> str:
     """
     Return a failure in the server's own words.
 
     A system error is never paraphrased: the response body of an HTTP
     rejection is what Slack or Telegram actually said, and it is the message
-    the operator can act on.
+    the operator can act on - in a log they already trust. ``test_channel``
+    answers the settings page instead, which renders whatever string comes
+    back, so it asks for ``include_body=False``: the destination's response
+    is not this endpoint's data to repeat, especially once the SSRF guard's
+    allowlist has let through a host that is private but not entirely
+    untrusted.
 
     Args:
         exc: The exception delivery raised.
+        include_body: Whether to read and include the response body of an
+            HTTP rejection. Only :meth:`Notifier.notify`'s log line does.
 
     Returns:
         Human-readable failure text.
     """
     if isinstance(exc, HTTPError):
+        status = f"HTTP {exc.code} {exc.reason}"
+        if not include_body:
+            return status
         try:
             # Bounded read: the error page of a misbehaving endpoint must not
             # be buffered wholesale into a log line.
             body = exc.read(2048).decode("utf-8", "replace").strip()
         except (OSError, ValueError):
             body = ""
-        status = f"HTTP {exc.code} {exc.reason}"
         return f"{status}: {body}" if body else status
     if isinstance(exc, URLError):
         return str(exc.reason)
@@ -354,7 +556,13 @@ class Notifier:
                 monitor's :class:`EmailNotifier`, created on first use.
         """
         self._config = config or Config()
-        self._opener: Opener = opener or urllib.request.urlopen
+        # The default opener carries its own redirect handler, so a
+        # destination that answers with a 302 is re-checked by
+        # _require_public_destination at every hop instead of only at the
+        # address that was configured.
+        self._opener: Opener = (
+            opener or urllib.request.build_opener(_SafeRedirectHandler(self._config)).open
+        )
         self._email_notifier = email_notifier
 
     def notify(self, event: NotificationEvent) -> None:
@@ -418,7 +626,9 @@ class Notifier:
         try:
             sent = self._dispatch(name, event, channels)
         except _DELIVERY_ERRORS as exc:
-            return _scrub(_describe_error(exc), channels)
+            # include_body=False: this string is rendered on the settings
+            # page, and the endpoint's response body is not ours to repeat.
+            return _scrub(_describe_error(exc, include_body=False), channels)
         if not sent:
             return f"Channel {name} is not configured; set {_SETTING_HINTS[name]} first."
         return None
@@ -448,7 +658,8 @@ class Notifier:
 
         Raises:
             OSError: When the endpoint is unreachable or rejects the message.
-            ValueError: When the configured URL or token is malformed.
+            ValueError: When the configured URL or token is malformed, or the
+                destination resolves inside a forbidden network.
             WASMError: When the email transport reports a problem.
         """
         if name == "email":
@@ -457,6 +668,10 @@ class Notifier:
         request = self._request_for(name, event, channels)
         if request is None:
             return False
+        # The SSRF guard: see the module docstring. Checked here, once, for
+        # every HTTP channel, rather than in each _*_request builder - one
+        # chokepoint a new channel cannot forget to pass through.
+        _require_public_destination(request.full_url, self._config)
         # urlopen raises HTTPError for any non-2xx answer, so reaching close()
         # means the endpoint accepted the message; the body is not our data.
         self._opener(request, timeout=NOTIFY_TIMEOUT).close()

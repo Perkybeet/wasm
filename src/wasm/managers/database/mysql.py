@@ -18,7 +18,9 @@ documents as the way to authenticate without a command line password.
 
 from __future__ import annotations
 
+import hashlib
 import os
+import secrets as secrets_module
 import tempfile
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -139,6 +141,39 @@ def escape_option_file_value(value: str) -> str:
             ),
         )
     return '"' + value.translate(OPTION_FILE_ESCAPES) + '"'
+
+
+#: Prefix of the least-privilege account the read-only console connects as.
+_READ_ONLY_USER_PREFIX = "wasm_ro_"
+
+#: MySQL and MariaDB both cap a user name at 32 characters.
+_USER_NAME_MAX_LENGTH = 32
+
+
+def _read_only_user_name(database: str) -> str:
+    """
+    Build the deterministic, length-safe user name for a database's console.
+
+    A name assembled by simple concatenation collides silently once it
+    overflows the 32-character limit MySQL and MariaDB both enforce: two
+    long, similarly prefixed database names could end up sharing one
+    read-only account. A short hash of the full name keeps every account
+    distinct even when it has to be shortened.
+
+    Args:
+        database: The database the account is scoped to.
+
+    Returns:
+        ``wasm_ro_<database>``, unchanged when it fits within the limit;
+        otherwise truncated and suffixed with an 8-character digest of the
+        full database name.
+    """
+    candidate = f"{_READ_ONLY_USER_PREFIX}{database}"
+    if len(candidate) <= _USER_NAME_MAX_LENGTH:
+        return candidate
+    digest = hashlib.sha256(database.encode()).hexdigest()[:8]
+    budget = _USER_NAME_MAX_LENGTH - len(_READ_ONLY_USER_PREFIX) - len(digest) - 1
+    return f"{_READ_ONLY_USER_PREFIX}{database[:budget]}_{digest}"
 
 
 class MySQLManager(BaseDatabaseManager):
@@ -296,6 +331,84 @@ class MySQLManager(BaseDatabaseManager):
             with os.fdopen(fd, "w") as handle:
                 handle.write(content)
             # This option is only honoured as the client's first argument.
+            yield [f"--defaults-extra-file={path}"]
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def _ensure_read_only_user(self, database: str) -> tuple[str, str]:
+        """
+        Create, idempotently, the account the read-only console connects as.
+
+        Closes ``SELECT LOAD_FILE('/etc/shadow')`` and
+        ``SELECT ... INTO OUTFILE`` being reachable from a "read-only"
+        console query: ``START TRANSACTION READ ONLY`` refuses a write to a
+        table, but not a call to ``LOAD_FILE`` or a clause that writes to the
+        filesystem instead of a table, and the account the write path
+        connects as typically carries ``FILE`` (needed for restores) and
+        often more. ``wasm_ro_<database>`` is a dedicated account, granted
+        nothing but ``SELECT`` on this one database - no ``FILE``, no
+        ``SUPER``, no ``PROCESS``, no access to any other schema - with a
+        password rotated on every call and never persisted.
+        ``REVOKE ALL PRIVILEGES, GRANT OPTION FROM`` is the one MySQL and
+        MariaDB statement that succeeds even when the account already holds
+        nothing, which is what keeps this idempotent and also keeps a
+        privilege granted by an older version of this method from surviving
+        an upgrade.
+
+        Args:
+            database: The database the account is scoped to.
+
+        Returns:
+            The user name and a freshly generated password.
+
+        Raises:
+            DatabaseQueryError: When the account cannot be provisioned.
+        """
+        username = _read_only_user_name(database)
+        password = secrets_module.token_urlsafe(24)
+        account = f"{self._escape_literal(username)}@{self._escape_literal('localhost')}"
+        provision = (
+            f"CREATE USER IF NOT EXISTS {account} IDENTIFIED BY "
+            f"{self._escape_literal(password)};\n"
+            f"ALTER USER {account} IDENTIFIED BY {self._escape_literal(password)};\n"
+            f"REVOKE ALL PRIVILEGES, GRANT OPTION FROM {account};\n"
+            f"GRANT SELECT ON {self._escape_identifier(database)}.* TO {account};\n"
+            "FLUSH PRIVILEGES;\n"
+        )
+        success, output = self._execute_sql(provision, secrets=(password,))
+        if not success:
+            raise DatabaseQueryError(
+                f"Could not provision the read-only console account for '{database}'",
+                details=output.strip(),
+            )
+        return username, password
+
+    @contextmanager
+    def _read_only_credentials(self, database: str) -> Iterator[list[str]]:
+        """
+        Provision and hand back the read-only console's own credentials.
+
+        Args:
+            database: The database the account is scoped to.
+
+        Yields:
+            Arguments to place immediately after the program name, exactly
+            like :meth:`_credentials`.
+
+        Raises:
+            DatabaseQueryError: When the account cannot be provisioned.
+        """
+        username, password = self._ensure_read_only_user(database)
+
+        content = (
+            "[client]\n"
+            f"user={escape_option_file_value(username)}\n"
+            f"password={escape_option_file_value(password)}\n"
+        )
+        fd, path = tempfile.mkstemp(prefix="wasm_mysql_ro_", suffix=".cnf")
+        try:
+            with os.fdopen(fd, "w") as handle:
+                handle.write(content)
             yield [f"--defaults-extra-file={path}"]
         finally:
             Path(path).unlink(missing_ok=True)
@@ -822,7 +935,9 @@ class MySQLManager(BaseDatabaseManager):
             query: The statement.
             read_only: Refuse anything that would change data. The server
                 enforces it, not a keyword allowlist, because a leading
-                keyword does not tell you what a statement does.
+                keyword does not tell you what a statement does. Enforced by
+                connecting as a dedicated, least-privilege account: see
+                :meth:`_ensure_read_only_user`.
             **kwargs: Unused.
 
         Returns:
@@ -830,13 +945,23 @@ class MySQLManager(BaseDatabaseManager):
 
         Raises:
             DatabaseNotFoundError: When the database does not exist.
-            DatabaseQueryError: When the statement fails.
+            DatabaseQueryError: When the statement fails, or the read-only
+                account cannot be provisioned.
         """
         if not self.database_exists(database):
             raise DatabaseNotFoundError(f"Database '{database}' does not exist")
 
-        sql = f"START TRANSACTION READ ONLY;\n{query}\nCOMMIT;\n" if read_only else query
-        success, output = self._execute_sql(sql, database=database)
+        if read_only:
+            sql = f"START TRANSACTION READ ONLY;\n{query}\nCOMMIT;\n"
+            with self._read_only_credentials(database) as credentials:
+                result = self._exec(
+                    self._client_argv(credentials, database),
+                    input=sql,
+                    timeout=QUERY_TIMEOUT,
+                )
+            success, output = result.success, result.stdout if result.success else result.stderr
+        else:
+            success, output = self._execute_sql(query, database=database)
         if not success:
             raise DatabaseQueryError("Query failed", details=output.strip())
         return success, output

@@ -33,7 +33,10 @@ from urllib.error import URLError
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.test_notifier import CapturingOpener
+from tests.test_notifier import (  # noqa: F401  (pytest resolves fixtures by name)
+    CapturingOpener,
+    public_dns,
+)
 from tests.test_web_views import (  # noqa: F401  (pytest resolves fixtures by name)
     MISSING_MARKER,
     anonymous,

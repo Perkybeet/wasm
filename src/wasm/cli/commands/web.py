@@ -1000,16 +1000,20 @@ def _start(options: StartOptions, verbose: bool, *, dry_run: bool = False) -> in
         return 0
 
     if options.daemon:
-        return _start_daemon(config, verbose)
-    return _start_foreground(config)
+        return _start_daemon(config, verbose, insecure_http=options.insecure_http)
+    return _start_foreground(config, insecure_http=options.insecure_http)
 
 
-def _start_foreground(config: SecurityConfig) -> int:
+def _start_foreground(config: SecurityConfig, *, insecure_http: bool = False) -> int:
     """
     Start the web server in the foreground.
 
     Args:
         config: The security configuration to serve with.
+        insecure_http: Whether cleartext beyond loopback was accepted in so
+            many words, forwarded to :func:`wasm.web.server.run_server` - the
+            chokepoint that actually binds the socket, and which refuses the
+            exposure again on its own if this is not passed through.
 
     Returns:
         Exit code.
@@ -1023,19 +1027,27 @@ def _start_foreground(config: SecurityConfig) -> int:
     fs.write_text(pid_file, str(os.getpid()))
 
     try:
-        run_server(host=config.host, port=config.port, config=config, show_token=True)
+        run_server(
+            host=config.host,
+            port=config.port,
+            config=config,
+            show_token=True,
+            insecure_http=insecure_http,
+        )
         return 0
     finally:
         fs.remove(pid_file, missing_ok=True)
 
 
-def _start_daemon(config: SecurityConfig, verbose: bool) -> int:
+def _start_daemon(config: SecurityConfig, verbose: bool, *, insecure_http: bool = False) -> int:
     """
     Start the web server as a daemon.
 
     Args:
         config: The security configuration to serve with.
         verbose: Whether to log verbosely.
+        insecure_http: Whether cleartext beyond loopback was accepted in so
+            many words, forwarded to :func:`wasm.web.server.run_server`.
 
     Returns:
         Exit code.
@@ -1085,7 +1097,13 @@ def _start_daemon(config: SecurityConfig, verbose: bool) -> int:
     try:
         from wasm.web.server import run_server
 
-        run_server(host=config.host, port=config.port, config=config, show_token=False)
+        run_server(
+            host=config.host,
+            port=config.port,
+            config=config,
+            show_token=False,
+            insecure_http=insecure_http,
+        )
     finally:
         fs.remove(pid_file, missing_ok=True)
 

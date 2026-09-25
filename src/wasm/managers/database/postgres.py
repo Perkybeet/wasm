@@ -13,6 +13,7 @@ arrives intact.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -67,6 +68,39 @@ TABLE_PRIVILEGES = frozenset(
 
 #: pg_dump output formats that can be streamed to stdout. "directory" cannot.
 DUMP_FORMATS = frozenset({"plain", "custom", "tar"})
+
+#: Prefix of the least-privilege role the read-only console connects as.
+_READ_ONLY_ROLE_PREFIX = "wasm_ro_"
+
+#: PostgreSQL's NAMEDATALEN limit for an identifier, minus the terminator.
+_IDENTIFIER_MAX_LENGTH = 63
+
+
+def _read_only_role_name(database: str) -> str:
+    """
+    Build the deterministic, length-safe role name for a database's console.
+
+    A role assembled by simple concatenation collides silently once it
+    overflows PostgreSQL's 63-character identifier limit: the server accepts
+    the CREATE ROLE statement and truncates, so two long, similarly prefixed
+    database names could end up sharing one read-only role without either
+    creation failing. A short hash of the full name keeps every role
+    distinct even when it has to be shortened.
+
+    Args:
+        database: The database the role is scoped to.
+
+    Returns:
+        ``wasm_ro_<database>``, unchanged when it fits within the limit;
+        otherwise truncated and suffixed with an 8-character digest of the
+        full database name.
+    """
+    candidate = f"{_READ_ONLY_ROLE_PREFIX}{database}"
+    if len(candidate) <= _IDENTIFIER_MAX_LENGTH:
+        return candidate
+    digest = hashlib.sha256(database.encode()).hexdigest()[:8]
+    budget = _IDENTIFIER_MAX_LENGTH - len(_READ_ONLY_ROLE_PREFIX) - len(digest) - 1
+    return f"{_READ_ONLY_ROLE_PREFIX}{database[:budget]}_{digest}"
 
 
 class PostgresManager(BaseDatabaseManager):
@@ -894,8 +928,15 @@ class PostgresManager(BaseDatabaseManager):
             # A read-only transaction rejects INSERT, UPDATE, DELETE, DDL and
             # data-modifying CTEs alike, and it cannot be escalated from inside
             # because SET TRANSACTION READ WRITE is refused once the session
-            # default is read-only.
-            sql = f"BEGIN READ ONLY;\n{query}\nCOMMIT;\n"
+            # default is read-only. It does not, by itself, stop a read: the
+            # cluster superuser this connects as can still run
+            # SELECT pg_read_file('/etc/shadow') or SELECT * FROM
+            # pg_ls_dir('/') inside a read-only transaction, because those
+            # are reads as far as the transaction mode is concerned. SET ROLE
+            # closes that: it drops every superuser privilege for the rest of
+            # the session, leaving only what wasm_ro_<database> was granted.
+            role = self._ensure_read_only_role(database)
+            sql = f"BEGIN READ ONLY;\nSET ROLE {self._escape_identifier(role)};\n{query}\nCOMMIT;\n"
             env = {"PGOPTIONS": "-c default_transaction_read_only=on"}
         else:
             sql, env = query, None
@@ -904,6 +945,72 @@ class PostgresManager(BaseDatabaseManager):
         if not success:
             raise DatabaseQueryError("Query failed", details=output.strip())
         return success, output
+
+    def _ensure_read_only_role(self, database: str) -> str:
+        """
+        Create, idempotently, the role the read-only console runs as.
+
+        Closes ``SELECT pg_read_file('/etc/shadow')``,
+        ``SELECT * FROM pg_ls_dir('/')`` and every other
+        ``pg_read_server_files``-gated function or superuser-only catalog
+        being reachable from a "read-only" console query: the role is
+        ``NOSUPERUSER`` and is never logged into directly - the console
+        always authenticates as :data:`SUPERUSER` over the local peer
+        socket, the same as every other operation here, and only reaches
+        this role with ``SET ROLE`` inside the read-only transaction, which
+        a superuser may do to any role regardless of membership and which
+        drops every superuser privilege for the rest of the session. The
+        role itself holds nothing but ``CONNECT`` on this database,
+        ``USAGE`` on its schemas and ``SELECT`` on its tables - re-granted on
+        every call, so a table created after the role's first use is covered
+        by the next read instead of needing a separate migration step.
+
+        Args:
+            database: The database the role is scoped to.
+
+        Returns:
+            The role name.
+
+        Raises:
+            DatabaseQueryError: When the role cannot be created or granted.
+        """
+        role = _read_only_role_name(database)
+        role_literal = self._escape_literal(role)
+        role_identifier = self._escape_identifier(role)
+        provision = (
+            "DO $wasm_ro_role$\n"  # noqa: S608 - quoted literal, not interpolated data
+            "BEGIN\n"
+            f"  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = {role_literal}) "
+            "THEN\n"
+            f"    CREATE ROLE {role_identifier} "
+            "NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOLOGIN;\n"
+            "  END IF;\n"
+            "END\n"
+            "$wasm_ro_role$;\n"
+            f"GRANT CONNECT ON DATABASE {self._escape_identifier(database)} TO {role_identifier};\n"
+            "DO $wasm_ro_grants$\n"
+            "DECLARE\n"
+            "  schema_name text;\n"
+            "BEGIN\n"
+            "  FOR schema_name IN\n"
+            "    SELECT nspname FROM pg_catalog.pg_namespace\n"
+            "    WHERE nspname NOT IN ('pg_catalog', 'information_schema')\n"
+            "      AND nspname NOT LIKE 'pg\\_%'\n"
+            "  LOOP\n"
+            f"    EXECUTE format('GRANT USAGE ON SCHEMA %I TO %I', schema_name, {role_literal});\n"
+            "    EXECUTE format('GRANT SELECT ON ALL TABLES IN SCHEMA %I TO %I', "
+            f"schema_name, {role_literal});\n"
+            "  END LOOP;\n"
+            "END\n"
+            "$wasm_ro_grants$;\n"
+        )
+        success, output = self._execute_sql(provision, database=database)
+        if not success:
+            raise DatabaseQueryError(
+                f"Could not provision the read-only console role for '{database}'",
+                details=output.strip(),
+            )
+        return role
 
     def get_connection_string(
         self,

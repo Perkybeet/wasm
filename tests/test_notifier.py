@@ -32,6 +32,7 @@ from urllib.request import Request
 
 import pytest
 
+import wasm.core.notifier as notifier_module
 from wasm.core.config import DEFAULT_CONFIG, Config
 from wasm.core.notifier import (
     CHANNELS,
@@ -70,6 +71,20 @@ def config(sandbox: Path, monkeypatch: pytest.MonkeyPatch) -> Config:
         yield Config()
     finally:
         Config.reset_instance()
+
+
+@pytest.fixture(autouse=True)
+def public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Resolve every hostname to a public address instead of a real one.
+
+    The SSRF guard in wasm.core.notifier resolves every destination before
+    dispatch; the suite never opens a real socket, so every test that
+    dispatches a notification needs a deterministic stand-in for DNS. Tests
+    of the guard itself, in TestSSRFGuard below, override this per test to
+    point a host at a forbidden address instead.
+    """
+    monkeypatch.setattr(notifier_module, "_resolve_host", lambda host: ("93.184.216.34",))
 
 
 class CapturingOpener:
