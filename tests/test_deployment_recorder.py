@@ -606,3 +606,17 @@ def test_mark_deployment_rolled_back_preserves_timing(store: WASMStore) -> None:
     assert after.finished_at == before.finished_at
     assert after.duration_s == before.duration_s
     assert store.mark_deployment_rolled_back(999_999) is False
+
+
+def test_a_captured_step_leaves_its_terminal_icon_out() -> None:
+    """
+    The icon is a terminal decoration; the captured log is read in a browser, a file or an
+    email, where no emoji font is promised and it rendered as an empty box.
+    """
+    lines: list[str] = []
+    logger = CapturingLogger()
+    logger.attach_sink(lines.append)
+
+    logger.step(3, 9, "Building application", "\N{HAMMER}")
+
+    assert lines == ["[3/9] Building application..."]

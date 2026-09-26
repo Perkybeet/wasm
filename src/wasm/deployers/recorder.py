@@ -120,6 +120,28 @@ class CapturingLogger(Logger):
             self._sink(self._strip_ansi(message))
         super()._write(message, newline)
 
+    def step(self, current: int, total: int, message: str, icon: str = "") -> None:
+        """
+        Log a step, capturing it without its icon.
+
+        The icon decorates a terminal; the captured log is read in a browser, a file or
+        an email, where no emoji font is promised and it rendered as an empty box.
+
+        Args:
+            current: Current step number.
+            total: Total number of steps.
+            message: Step description.
+            icon: Icon for the terminal only.
+        """
+        sink = self._sink
+        self._sink = None
+        try:
+            super().step(current, total, message, icon)
+        finally:
+            self._sink = sink
+        if sink is not None:
+            sink(f"[{current}/{total}] {message}...")
+
     def debug(self, message: str) -> None:
         """
         Log a debug message, capturing it even when the console drops it.

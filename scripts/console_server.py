@@ -1851,7 +1851,7 @@ def _tabs_release_log(
         The lines with their offsets in seconds, and the error text or None.
     """
     lines: list[tuple[float, str]] = [
-        (0, "[1/9] 📥 Fetching source into a new release..."),
+        (0, "[1/9] Fetching source into a new release..."),
         (0.4, f"      → Source: {source} (main)"),
         (2.1, f"      → HEAD is now at {commit}"),
         (2.3, f"      → Release: {release_id}"),
@@ -1860,20 +1860,20 @@ def _tabs_release_log(
     ]
     if kind == "reused":
         lines += [
-            (2.6, "[2/9] 📦 Installing dependencies..."),
+            (2.6, "[2/9] Installing dependencies..."),
             (3.9, f"      → Dependencies reused from {previous}: the lockfile did not change"),
         ]
         at = 4.0
     else:
         lines += [
-            (2.6, "[2/9] 📦 Installing dependencies..."),
+            (2.6, "[2/9] Installing dependencies..."),
             (2.7, "      → Running: npm ci"),
             (15.8, "added 812 packages, and audited 813 packages in 13s"),
             (15.9, "found 0 vulnerabilities"),
         ]
         at = 16.0
     lines += [
-        (at, "[3/9] 🔨 Building application..."),
+        (at, "[3/9] Building application..."),
         (at + 0.1, "      → Running: npm run build"),
         (at + 1.4, "   ▲ Next.js 15.2.4"),
         (at + 1.5, "   Creating an optimized production build ..."),
@@ -1899,12 +1899,12 @@ def _tabs_release_log(
     lines += [
         (at - 5.6, " ✓ Compiled successfully in 21.4s"),
         (at - 1.2, " ✓ Generating static pages (38/38)"),
-        (at, "[4/9] 🔒 Setting permissions..."),
-        (at + 0.8, "[5/9] 🌐 Creating site configuration..."),
-        (at + 1.0, "[6/9] 🔒 Obtaining SSL certificate..."),
+        (at, "[4/9] Setting permissions..."),
+        (at + 0.8, "[5/9] Creating site configuration..."),
+        (at + 1.0, "[6/9] Obtaining SSL certificate..."),
         (at + 1.1, "      → The existing certificate keeps serving what it covers"),
-        (at + 1.3, "[7/9] ⚙️ Creating systemd service..."),
-        (at + 1.6, "[8/9] 🚀 Activating release..."),
+        (at + 1.3, "[7/9] Creating systemd service..."),
+        (at + 1.6, "[8/9] Activating release..."),
         (
             at + 1.7,
             f"      → Activated release {release_id}"
@@ -1927,7 +1927,7 @@ def _tabs_release_log(
             "tienda-cittek-es.service: Main process exited, code=exited, status=1/FAILURE"
         )
     lines += [
-        (at + 3.9, "[9/9] 🩺 Health check..."),
+        (at + 3.9, "[9/9] Health check..."),
         (at + 4.0, f"✓ Release {release_id} answered 200 in 84 ms"),
         (at + 4.1, "✓ Deployed tienda.cittek.es"),
     ]
@@ -1950,21 +1950,21 @@ def _tabs_inplace_log(
         The lines with their offsets in seconds.
     """
     return [
-        (0, "[1/8] 📥 Fetching source code..."),
+        (0, "[1/8] Fetching source code..."),
         (0.3, f"      → Source: {source}"),
         (1.8, f"      → HEAD is now at {commit}"),
-        (2.0, "[2/8] 📦 Installing dependencies..."),
+        (2.0, "[2/8] Installing dependencies..."),
         (2.1, "      → Running: npm ci"),
         (9.4, "added 214 packages, and audited 215 packages in 7s"),
-        (9.6, "[3/8] 🔨 Building application..."),
+        (9.6, "[3/8] Building application..."),
         (9.7, "      → Running: npm run build"),
         (14.1, "Build finished in 4.2s"),
-        (14.2, "[4/8] 🔒 Setting permissions..."),
-        (14.9, "[5/8] 🌐 Creating site configuration..."),
-        (15.1, "[6/8] 🔒 Obtaining SSL certificate..."),
+        (14.2, "[4/8] Setting permissions..."),
+        (14.9, "[5/8] Creating site configuration..."),
+        (15.1, "[6/8] Obtaining SSL certificate..."),
         (15.2, "      → The existing certificate keeps serving what it covers"),
-        (15.4, "[7/8] ⚙️ Creating systemd service..."),
-        (15.9, "[8/8] 🚀 Starting application..."),
+        (15.4, "[7/8] Creating systemd service..."),
+        (15.9, "[8/8] Starting application..."),
         (18.2, f"      → Checking: http://127.0.0.1:{port}/"),
         (18.4, f"✓ Deployed {domain}"),
     ]
