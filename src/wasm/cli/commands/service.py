@@ -17,12 +17,13 @@ while the migration is in flight.
 
 from __future__ import annotations
 
+import json
 import sys
 from argparse import Namespace
 
 import click
 
-from wasm.cli.app import Context, pass_context
+from wasm.cli.app import Context, WasmGroup, json_option, pass_context
 from wasm.core.exceptions import WASMError
 from wasm.core.logger import Logger
 from wasm.managers.service_manager import ServiceManager
@@ -44,7 +45,7 @@ DEFAULT_USER = "www-data"
 DEFAULT_LINES = 50
 
 
-class ServiceGroup(click.Group):
+class ServiceGroup(WasmGroup):
     """A group that also answers to the historical subcommand spellings."""
 
     def get_command(self, ctx: click.Context, name: str) -> click.Command | None:
@@ -118,13 +119,14 @@ def _create(
     return 0
 
 
-def _list(all_services: bool, *, verbose: bool) -> int:
+def _list(all_services: bool, *, verbose: bool, json_output: bool = False) -> int:
     """
     Print the services WASM manages.
 
     Args:
         all_services: Include units WASM does not manage.
         verbose: Show the detail of each step.
+        json_output: Print the list as JSON instead of a table.
 
     Returns:
         Exit code.
@@ -132,16 +134,37 @@ def _list(all_services: bool, *, verbose: bool) -> int:
     logger = Logger(verbose=verbose)
     manager = ServiceManager(verbose=verbose)
 
-    logger.header("Managed Services")
-
     services = manager.list_services(all_services=all_services)
+
+    if json_output:
+        click.echo(
+            json.dumps(
+                [
+                    {
+                        "name": svc["name"],
+                        "status": "running"
+                        if manager.state_is_running(svc["active"])
+                        else "stopped",
+                        "state": svc["sub"],
+                    }
+                    for svc in services
+                ]
+            )
+        )
+        return 0
+
+    logger.header("Managed Services")
 
     if not services:
         logger.info("No services found")
         return 0
 
     rows = [
-        [svc["name"], "running" if svc["active"] == "active" else "stopped", svc["sub"]]
+        [
+            svc["name"],
+            "running" if manager.state_is_running(svc["active"]) else "stopped",
+            svc["sub"],
+        ]
         for svc in services
     ]
     logger.table(["Name", "Status", "State"], rows)
@@ -149,13 +172,16 @@ def _list(all_services: bool, *, verbose: bool) -> int:
     return 0
 
 
-def _status(name: str, *, verbose: bool) -> int:
+def _status(name: str, *, verbose: bool, json_output: bool = False) -> int:
     """
     Print what systemd reports about one service.
 
     Args:
         name: Service name.
         verbose: Show the detail of each step.
+        json_output: Print the status as JSON, the same shape
+            :meth:`~wasm.managers.service_manager.ServiceManager.get_status`
+            returns and ``GET /api/services/{name}`` builds its response from.
 
     Returns:
         Exit code, 1 when the service does not exist.
@@ -168,6 +194,12 @@ def _status(name: str, *, verbose: bool) -> int:
     manager = ServiceManager(verbose=verbose)
 
     status = manager.get_status(name)
+
+    if json_output:
+        if not status["exists"]:
+            raise WASMError(f"Service not found: {name}")
+        click.echo(json.dumps(status))
+        return 0
 
     logger.header(f"Service: {name}")
 
@@ -362,18 +394,20 @@ def create_command(
 
 @cli.command(name="list")
 @click.option("--all", "-a", "all_services", is_flag=True, help="Include units WASM does not own.")
+@json_option("Print the service list as JSON.")
 @pass_context
 def list_command(ctx: Context, all_services: bool) -> None:
     """List services and whether they are running."""
-    _finish(_list(all_services, verbose=ctx.verbose))
+    _finish(_list(all_services, verbose=ctx.verbose, json_output=ctx.json_output))
 
 
 @cli.command(name="status")
 @click.argument("name")
+@json_option("Print the status as JSON.")
 @pass_context
 def status_command(ctx: Context, name: str) -> None:
     """Show whether a service is running and enabled."""
-    _finish(_status(name, verbose=ctx.verbose))
+    _finish(_status(name, verbose=ctx.verbose, json_output=ctx.json_output))
 
 
 @cli.command(name="start")

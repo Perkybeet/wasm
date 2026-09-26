@@ -27,7 +27,7 @@ from typing import Any
 
 import click
 
-from wasm.cli.app import Context, json_option, pass_context
+from wasm.cli.app import Context, WasmGroup, json_option, pass_context
 from wasm.web.auth import SecurityConfig, TokenManager
 
 #: Scopes ``POST /api/auth/tokens`` accepts, in the order shown by --help.
@@ -61,7 +61,7 @@ def _fmt(timestamp: float | None) -> str:
     return datetime.fromtimestamp(timestamp).isoformat(sep=" ", timespec="seconds")
 
 
-@click.group("token")
+@click.group("token", cls=WasmGroup)
 def cli() -> None:
     """Manage API tokens: named, scoped credentials for scripts and automation."""
 
@@ -136,7 +136,15 @@ def create_command(ctx: Context, name: str, scope: str, expires_hours: int | Non
     logger.blank()
     click.echo(f"Token: {issued['token']}")
     logger.blank()
-    logger.warning("This is the only time the token is shown. Store it now.")
+    if ctx.dry_run:
+        # A dry run opens the session database as a private in-memory copy
+        # (wasm.web.auth.SessionStore._rehearsal_copy), so this token was
+        # never written to the one WASM actually authenticates against. It
+        # looks real and is not: printing it without saying so is how an
+        # operator pastes a credential into a script that then never works.
+        logger.warning("Rehearsal: this token was not saved and will not authenticate.")
+    else:
+        logger.warning("This is the only time the token is shown. Store it now.")
 
 
 @cli.command("revoke")

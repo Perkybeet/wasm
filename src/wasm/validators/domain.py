@@ -14,17 +14,6 @@ DOMAIN_PATTERN = re.compile(
     r"(?:\.[a-zA-Z]{2,})?$"  # TLD (optional for localhost)
 )
 
-# Reserved/invalid domains
-RESERVED_DOMAINS = [
-    "localhost",
-    "example.com",
-    "example.org",
-    "example.net",
-    "test",
-    "invalid",
-    "local",
-]
-
 
 def is_valid_domain(domain: str) -> tuple[bool, str]:
     """
@@ -79,13 +68,12 @@ def check_domain(domain: str) -> bool:
     return is_valid
 
 
-def validate_domain(domain: str, allow_reserved: bool = False) -> str:
+def validate_domain(domain: str) -> str:
     """
     Validate a domain name and return the normalized form.
 
     Args:
         domain: Domain name to validate.
-        allow_reserved: Allow reserved domains like localhost.
 
     Returns:
         Normalized domain name.
@@ -118,14 +106,6 @@ def validate_domain(domain: str, allow_reserved: bool = False) -> str:
     is_valid, error = is_valid_domain(domain)
     if not is_valid:
         raise DomainError(f"Invalid domain '{domain}': {error}")
-
-    # Check reserved domains
-    if not allow_reserved:
-        base_domain = domain.split(".")[-1] if "." in domain else domain
-        if base_domain in RESERVED_DOMAINS or domain in RESERVED_DOMAINS:
-            # Allow subdomains of localhost for development
-            if domain != "localhost" and not domain.endswith(".localhost"):
-                pass  # Allow most reserved-looking domains in production tool
 
     return domain
 

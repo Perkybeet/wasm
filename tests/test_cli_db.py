@@ -388,7 +388,11 @@ class TestSurface:
             declared = {
                 opt
                 for param in command.params
-                if isinstance(param, click.Option)
+                # expose_value=False (json_option's own contract) means the
+                # option can only ever switch the shared Context on and can
+                # never bind - and so overwrite - a value on the command
+                # function, which is the defect this guard exists to catch.
+                if isinstance(param, click.Option) and param.expose_value
                 for opt in param.opts + param.secondary_opts
             }
             assert not declared & GLOBAL_FLAGS, (

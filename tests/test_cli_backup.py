@@ -526,7 +526,11 @@ def test_no_command_redeclares_a_global_flag() -> None:
         declared = {
             spelling
             for param in command.params
-            if isinstance(param, click.Option)
+            # expose_value=False (json_option's own contract) means the
+            # option can only ever switch the shared Context on and can
+            # never bind - and so overwrite - a value on the command
+            # function, which is the defect this guard exists to catch.
+            if isinstance(param, click.Option) and param.expose_value
             for spelling in param.opts + param.secondary_opts
         }
         shadowed = sorted(declared & GLOBAL_FLAGS)

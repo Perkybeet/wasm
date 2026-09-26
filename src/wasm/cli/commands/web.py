@@ -45,6 +45,8 @@ Two structural notes about the Click migration:
 from __future__ import annotations
 
 import importlib.util
+import json
+import logging
 import os
 import signal
 import socket
@@ -59,11 +61,11 @@ from typing import TYPE_CHECKING, Any, NoReturn, TypeVar
 
 import click
 
-from wasm.cli.app import Context, enable_dry_run, pass_context
+from wasm.cli.app import Context, WasmGroup, global_flags, json_option, pass_context
 from wasm.core.config import Config
 from wasm.core.exceptions import SecurityError, WASMError
 from wasm.core.fs import get_fs
-from wasm.core.logger import Logger, set_colors_disabled
+from wasm.core.logger import Logger
 from wasm.core.net import (
     ALL_INTERFACES,
     host_addresses,
@@ -75,6 +77,8 @@ from wasm.core.runner import get_runner
 
 if TYPE_CHECKING:
     from wasm.web.auth import SecurityConfig
+
+log = logging.getLogger(__name__)
 
 # PID file location
 PID_FILE = Path("/var/run/wasm-web.pid")
@@ -112,97 +116,6 @@ def get_pid_file() -> Path:
     if os.geteuid() == 0:
         return PID_FILE
     return PID_FILE_USER
-
-
-# ---------------------------------------------------------------------------
-# Global flags, re-exposed rather than redeclared
-# ---------------------------------------------------------------------------
-
-
-def _adopt_global_flag(attribute: str) -> Callable[[click.Context, click.Parameter, bool], None]:
-    """
-    Build the callback that folds a global flag into the shared context.
-
-    Args:
-        attribute: Name of the :class:`~wasm.cli.app.Context` field to set.
-
-    Returns:
-        A Click option callback.
-    """
-
-    def callback(ctx: click.Context, param: click.Parameter, value: bool) -> None:
-        if not value:
-            return
-        state = ctx.ensure_object(Context)
-        setattr(state, attribute, True)
-
-        # The root callback has already run by the time a subcommand's options
-        # are parsed, so a flag typed after the subcommand name has to apply
-        # its own side effects. Nothing here is a per-command decision: it is
-        # the same global effect, reached late.
-        if attribute == "verbose":
-            # The cached logger was built with the old verbosity.
-            state._logger = None
-        elif attribute == "no_color":
-            set_colors_disabled(True)
-        elif attribute == "dry_run":
-            # Both seams are swapped by the one helper. Wiring the runner here
-            # by hand is what left the filesystem seam untouched, so a
-            # rehearsal still wrote PID files and rotated tokens for real.
-            enable_dry_run(state)
-
-    return callback
-
-
-#: Applied in declaration order, so verbosity is adopted before anything that
-#: logs during parsing.
-_GLOBAL_FLAGS = (
-    click.option(
-        "-v",
-        "--verbose",
-        is_flag=True,
-        expose_value=False,
-        is_eager=True,
-        callback=_adopt_global_flag("verbose"),
-        help="Show the detail of each step.",
-    ),
-    click.option(
-        "--dry-run",
-        is_flag=True,
-        expose_value=False,
-        is_eager=True,
-        callback=_adopt_global_flag("dry_run"),
-        help="Rehearse without changing anything. Read-only checks still run.",
-    ),
-    click.option(
-        "--no-color",
-        is_flag=True,
-        expose_value=False,
-        is_eager=True,
-        callback=_adopt_global_flag("no_color"),
-        help="Never emit colour.",
-    ),
-)
-
-
-def global_flags(command: F) -> F:
-    """
-    Accept the global flags after this command's name.
-
-    ``wasm web start --verbose`` has always worked and is in scripts, so the
-    flags stay spellable here. They carry ``expose_value=False``: the value goes
-    to the shared context and never reaches the command as a parameter, which is
-    what stops a subcommand from overwriting what the user typed before it.
-
-    Args:
-        command: The command function being decorated.
-
-    Returns:
-        The same function, with the global options attached.
-    """
-    for option in reversed(_GLOBAL_FLAGS):
-        command = option(command)
-    return command
 
 
 def _exit(code: int) -> NoReturn:
@@ -588,8 +501,13 @@ def _get_install_instructions(missing_apt: list[str], missing_pip: list[str]) ->
             with open("/etc/os-release") as f:
                 if "opensuse" in f.read().lower():
                     instructions.append(f"sudo zypper install {' '.join(missing_apt)}")
-        except Exception:
-            pass
+        except OSError as exc:
+            # /etc/os-release existing does not guarantee it stays readable;
+            # this is only ever a nicety (naming zypper), so a stale or
+            # permission-denied file falls back to the pip line below rather
+            # than crashing the whole install-instructions report. Anything
+            # that is not a read failure is a bug and must not land here.
+            log.debug("Could not read /etc/os-release to detect openSUSE: %s", exc)
 
     # Always add pip as fallback option
     instructions.append(f"pip install {' '.join(missing_pip)}")
@@ -1181,24 +1099,33 @@ def _stop(verbose: bool, *, dry_run: bool = False) -> int:
         return 1
 
 
-def _status(verbose: bool) -> int:
+def _status(verbose: bool, *, json_output: bool = False) -> int:
     """
     Report whether the panel is running.
 
     Args:
         verbose: Whether to log verbosely.
+        json_output: Print the status as JSON instead of a report.
 
     Returns:
         Exit code.
+
+    Raises:
+        WASMError: The PID file exists but does not hold a PID, and JSON was
+            asked for - the ordinary error path, not an invalid JSON body.
     """
     logger = Logger(verbose=verbose)
 
     pid_file = get_pid_file()
 
-    logger.header("WASM Web Interface Status")
+    if not json_output:
+        logger.header("WASM Web Interface Status")
 
     if not pid_file.exists():
-        logger.key_value("Status", "not running")
+        if json_output:
+            click.echo(json.dumps({"status": "not running"}))
+        else:
+            logger.key_value("Status", "not running")
         return 0
 
     try:
@@ -1207,27 +1134,47 @@ def _status(verbose: bool) -> int:
         # Check if process is running
         os.kill(pid, 0)
 
-        logger.key_value("Status", "running")
-        logger.key_value("PID", str(pid))
+        payload: dict[str, Any] = {"status": "running", "pid": pid}
 
         # Extra detail is a nicety; psutil may be missing or the process may
-        # have exited between the signal and the query.
+        # have exited between the signal and the query. Either is expected
+        # and reported at debug level; anything else is a bug in this
+        # function and must not be reported as a cosmetic warning.
         try:
             import psutil
+        except ImportError:
+            log.debug("psutil is not installed; skipping extra process detail")
+        else:
+            try:
+                proc = psutil.Process(pid)
+                payload["memory_mb"] = round(proc.memory_info().rss / 1024 / 1024, 1)
+                payload["started"] = proc.create_time()
+            except psutil.Error as exc:
+                log.debug("Could not read extra process detail for pid %s: %s", pid, exc)
 
-            proc = psutil.Process(pid)
-            logger.key_value("Memory", f"{proc.memory_info().rss / 1024 / 1024:.1f} MB")
-            logger.key_value("Started", str(proc.create_time()))
-        except Exception:
-            pass
+        if json_output:
+            click.echo(json.dumps(payload))
+            return 0
+
+        logger.key_value("Status", "running")
+        logger.key_value("PID", str(pid))
+        if "memory_mb" in payload:
+            logger.key_value("Memory", f"{payload['memory_mb']:.1f} MB")
+        if "started" in payload:
+            logger.key_value("Started", str(payload["started"]))
 
         return 0
 
     except ProcessLookupError:
-        logger.key_value("Status", "not running (stale PID)")
+        if json_output:
+            click.echo(json.dumps({"status": "not running (stale PID)"}))
+        else:
+            logger.key_value("Status", "not running (stale PID)")
         get_fs().remove(pid_file, missing_ok=True)
         return 0
     except ValueError:
+        if json_output:
+            raise WASMError("Invalid PID file") from None
         logger.error("Invalid PID file")
         return 1
 
@@ -1282,7 +1229,9 @@ def _confirm_token_change(config: SecurityConfig, regenerate: bool) -> None:
     if regenerate:
         message = (
             f"Rotate the signing key in {config.secret_file} and issue a new access token? "
-            "Every open panel session is logged out and the current token stops working"
+            "Every open panel session is logged out, the current token stops working, and "
+            "every API token and TOTP backup code - hashed with the key being replaced - "
+            "stops verifying too"
         )
     else:
         message = (
@@ -1343,8 +1292,9 @@ def _token(
     So it takes ``--new`` (or ``--regenerate``) and a confirmation.
 
     Args:
-        regenerate: Also rotate the signing key, revoking every session.
-            Implies issuing a new token.
+        regenerate: Also rotate the signing key, revoking every session and
+            invalidating every API token and TOTP backup code, all of which
+            are hashed with it. Implies issuing a new token.
         confirm: Ask before invalidating credentials that are already in use.
         verbose: Whether to log verbosely.
         issue: Issue a new access token, replacing the one in use.
@@ -1409,6 +1359,11 @@ def _token(
         logger.warning(
             "All existing sessions have been revoked, and the token issued previously "
             "no longer works, including in a console that is already running"
+        )
+        logger.warning(
+            "Every API token and TOTP backup code was hashed with the signing key just "
+            "replaced and no longer verifies. Issue new ones with 'wasm token create NAME' "
+            "and 'wasm 2fa backup-codes'."
         )
     else:
         logger.warning(
@@ -1595,7 +1550,7 @@ def _exposure_options(command: F) -> F:
     return command
 
 
-@click.group(name="web")
+@click.group(name="web", cls=WasmGroup)
 @global_flags
 def cli() -> None:
     """
@@ -1649,10 +1604,11 @@ def stop_command(ctx: Context) -> NoReturn:
 
 @cli.command("status")
 @global_flags
+@json_option("Print the status as JSON.")
 @pass_context
 def status_command(ctx: Context) -> NoReturn:
     """Show whether the panel is running."""
-    _exit(_status(ctx.verbose))
+    _exit(_status(ctx.verbose, json_output=ctx.json_output))
 
 
 @cli.command("restart")
@@ -1700,7 +1656,10 @@ def restart_command(
     "-r",
     "--regenerate",
     is_flag=True,
-    help="Issue a new token and rotate the signing key, logging out every open session.",
+    help=(
+        "Issue a new token and rotate the signing key, logging out every open session "
+        "and invalidating every API token and TOTP backup code."
+    ),
 )
 @click.option("-y", "--yes", "assume_yes", is_flag=True, help="Do not ask for confirmation.")
 @global_flags

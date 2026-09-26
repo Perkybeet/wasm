@@ -22,14 +22,14 @@ does for the panel.
 
 from __future__ import annotations
 
+import json
 from argparse import Namespace
-from collections.abc import Callable
 from typing import Any, NoReturn
 
 import click
 import yaml
 
-from wasm.cli.app import Context, enable_dry_run, pass_context
+from wasm.cli.app import Context, WasmGroup, global_flags, json_option, pass_context
 from wasm.core.config import (
     DEFAULT_CONFIG_PATH,
     NO_DEFAULT,
@@ -38,7 +38,7 @@ from wasm.core.config import (
     redact_secrets,
 )
 from wasm.core.exceptions import ConfigError
-from wasm.core.logger import Logger, set_colors_disabled
+from wasm.core.logger import Logger
 
 #: Marks "no default and no stored value" apart from a key genuinely holding
 #: None, since Config.get(key, default) cannot otherwise tell the two apart.
@@ -49,81 +49,6 @@ _MISSING = NO_DEFAULT
 
 #: How many added keys the upgrade lists before summarising the rest.
 MAX_LISTED_KEYS = 10
-
-
-def _fold_into_context(attribute: str) -> Callable[[click.Context, click.Parameter, bool], bool]:
-    """
-    Build the callback that records a global flag on the shared context.
-
-    Args:
-        attribute: Name of the :class:`~wasm.cli.app.Context` attribute to set.
-
-    Returns:
-        A Click option callback.
-    """
-
-    def fold(ctx: click.Context, param: click.Parameter, value: bool) -> bool:
-        if not value:
-            return value
-        state = ctx.ensure_object(Context)
-        setattr(state, attribute, True)
-        if attribute == "no_color":
-            set_colors_disabled(True)
-        elif attribute == "dry_run":
-            enable_dry_run(state)
-        return value
-
-    return fold
-
-
-def global_flags(command: Callable[..., Any]) -> Callable[..., Any]:
-    """
-    Re-offer the root group's flags on a subcommand.
-
-    ``wasm config show --verbose`` is in scripts, in the published documentation
-    and in muscle memory, so the flags have to keep parsing after the subcommand
-    name. None of these options owns a value: they are eager, they do not reach
-    the command function, and their callbacks only ever switch the shared
-    context on. A subcommand therefore cannot undo a flag the user set before
-    the subcommand name, which is exactly how ``wasm --dry-run monitor scan``
-    used to run for real.
-
-    Args:
-        command: The function being decorated into a Click command.
-
-    Returns:
-        The decorated function.
-    """
-    options = [
-        click.option(
-            "-v",
-            "--verbose",
-            is_flag=True,
-            is_eager=True,
-            expose_value=False,
-            callback=_fold_into_context("verbose"),
-            help="Show the detail of each step.",
-        ),
-        click.option(
-            "--dry-run",
-            is_flag=True,
-            is_eager=True,
-            expose_value=False,
-            callback=_fold_into_context("dry_run"),
-            help="Rehearse without changing anything.",
-        ),
-        click.option(
-            "--no-color",
-            is_flag=True,
-            is_eager=True,
-            expose_value=False,
-            callback=_fold_into_context("no_color"),
-            help="Never emit colour.",
-        ),
-    ]
-    for option in reversed(options):
-        command = option(command)
-    return command
 
 
 def _exit(code: int) -> NoReturn:
@@ -178,7 +103,7 @@ def _run_upgrade(logger: Logger, quiet: bool) -> int:
     return 0
 
 
-def _run_show(logger: Logger) -> int:
+def _run_show(logger: Logger, *, json_output: bool = False) -> int:
     """
     Print the configuration WASM is actually running with.
 
@@ -190,12 +115,20 @@ def _run_show(logger: Logger) -> int:
 
     Args:
         logger: Logger used to report progress.
+        json_output: Print the configuration as JSON instead of YAML. Same
+            "config"/"path" envelope as ``GET /api/config``'s
+            ``ConfigResponse``, secrets redacted exactly the same way.
 
     Returns:
         Exit code.
     """
-    logger.header("Current Configuration")
     redacted = redact_secrets(Config().to_dict())
+
+    if json_output:
+        click.echo(json.dumps({"config": redacted, "path": str(DEFAULT_CONFIG_PATH)}))
+        return 0
+
+    logger.header("Current Configuration")
     click.echo(yaml.dump(redacted, default_flow_style=False, sort_keys=False))
     return 0
 
@@ -395,7 +328,7 @@ def handle_config(args: Namespace) -> int:
     return 0
 
 
-@click.group("config")
+@click.group("config", cls=WasmGroup)
 @global_flags
 def cli() -> None:
     """Read and upgrade WASM's configuration file."""
@@ -421,6 +354,7 @@ def upgrade(ctx: Context, quiet: bool) -> None:
 
 @cli.command("show")
 @global_flags
+@json_option("Print the configuration as JSON.")
 @pass_context
 def show(ctx: Context) -> None:
     """
@@ -429,7 +363,7 @@ def show(ctx: Context) -> None:
     This is the merge of the defaults, the file and any WASM_* environment
     variable, which is what WASM actually reads.
     """
-    _exit(_run_show(ctx.logger))
+    _exit(_run_show(ctx.logger, json_output=ctx.json_output))
 
 
 @cli.command("path")

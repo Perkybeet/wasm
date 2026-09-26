@@ -23,6 +23,7 @@ production anymore; it is kept, and tested directly, for the same reason.
 
 from __future__ import annotations
 
+import json
 from argparse import Namespace
 from collections.abc import Mapping
 from pathlib import Path
@@ -30,7 +31,7 @@ from typing import Any
 
 import click
 
-from wasm.cli.app import Context, pass_context
+from wasm.cli.app import Context, WasmGroup, json_option, pass_context
 from wasm.core.config import REDACTED, redact_secrets
 from wasm.core.exceptions import EnvConfigError, WASMError
 from wasm.core.logger import Logger
@@ -49,7 +50,7 @@ ENV_ALIASES: dict[str, str] = {
 }
 
 
-class AliasedGroup(click.Group):
+class AliasedGroup(WasmGroup):
     """
     A group that also answers to the previous names of its commands.
 
@@ -211,7 +212,7 @@ def _env_configure(domain: str, verbose: bool) -> int:
     return 0
 
 
-def _env_show(domain: str, unmask: bool, verbose: bool) -> int:
+def _env_show(domain: str, unmask: bool, verbose: bool, *, json_output: bool = False) -> int:
     """
     Print the variables currently set for an application.
 
@@ -219,6 +220,9 @@ def _env_show(domain: str, unmask: bool, verbose: bool) -> int:
         domain: Domain the application is served on.
         unmask: Print secret values in clear.
         verbose: Print the detail of each step.
+        json_output: Print the variables as JSON instead of a report. Secrets
+            are redacted exactly as they are for a human, unless ``unmask``
+            says otherwise.
 
     Returns:
         Exit code.
@@ -229,6 +233,12 @@ def _env_show(domain: str, unmask: bool, verbose: bool) -> int:
     logger = Logger(verbose=verbose)
     values = read_app_env(_app(domain), manager=EnvManager(verbose=verbose))
 
+    shown = dict(values) if unmask else _redact(values)
+
+    if json_output:
+        click.echo(json.dumps({"domain": domain, "variables": shown, "redacted": not unmask}))
+        return 0
+
     if not values:
         logger.info(f"No environment variables found for {domain}")
         return 0
@@ -237,9 +247,6 @@ def _env_show(domain: str, unmask: bool, verbose: bool) -> int:
 
     if unmask:
         logger.warning("Printing secrets in clear. Check who can see this terminal.")
-        shown = dict(values)
-    else:
-        shown = _redact(values)
 
     for key in sorted(shown):
         logger.key_value(f"  {key}", shown[key])
@@ -313,10 +320,11 @@ def configure(state: Context, domain: str) -> None:
     default=False,
     help="Print secret values in clear instead of hiding them.",
 )
+@json_option("Print the variables as JSON.")
 @pass_context
 def show(state: Context, domain: str, unmask: bool) -> None:
     """List the variables an application runs with, secrets hidden."""
-    _env_show(domain, unmask, state.verbose)
+    _env_show(domain, unmask, state.verbose, json_output=state.json_output)
 
 
 @cli.command("export")

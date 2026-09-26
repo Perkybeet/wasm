@@ -255,6 +255,12 @@ def test_no_store_command_redeclares_a_global_flag() -> None:
         for param in command.params:
             if not isinstance(param, click.Option):
                 continue
+            # expose_value=False (json_option's own contract) means the
+            # option can only ever switch the shared Context on and can
+            # never bind - and so overwrite - a value on the command
+            # function, which is the defect this guard exists to catch.
+            if not param.expose_value:
+                continue
             clash = GLOBAL_FLAGS.intersection(param.opts + param.secondary_opts)
             if clash:
                 offenders.append(f"{name}: {sorted(clash)}")

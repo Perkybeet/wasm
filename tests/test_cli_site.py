@@ -557,7 +557,16 @@ def test_no_command_redeclares_a_global_flag() -> None:
 
     for command in commands:
         assert command is not None
-        declared = {opt for param in command.params for opt in param.opts + param.secondary_opts}
+        declared = {
+            opt
+            for param in command.params
+            # expose_value=False (json_option's own contract) means the
+            # option can only ever switch the shared Context on and can
+            # never bind - and so overwrite - a value on the command
+            # function, which is the defect this guard exists to catch.
+            if getattr(param, "expose_value", True)
+            for opt in param.opts + param.secondary_opts
+        }
         assert not declared & GLOBAL_FLAGS, f"{command.name} redeclares a global flag"
 
 
@@ -826,6 +835,29 @@ def test_list_of_an_empty_server_is_not_an_error(
 
     assert result.exit_code == 0
     assert "No sites found" in result.output
+
+
+def test_list_json_reports_both_web_servers(webservers: dict[str, Any], runner: FakeRunner) -> None:
+    """The payload carries the same facts the table shows, for every backend."""
+    write_site(webservers["nginx"], "nginx-site.com")
+    write_site(webservers["apache"], "apache-site.com")
+
+    result = invoke(["list", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["total"] == 2
+    assert payload["webserver"] == "all"
+    names = {site["name"] for site in payload["sites"]}
+    assert names == {"nginx-site.com", "apache-site.com"}
+
+
+def test_list_json_reports_an_empty_machine(webservers: dict[str, Any], runner: FakeRunner) -> None:
+    """No sites is {"sites": [], "total": 0}, not the human 'No sites found' text."""
+    result = invoke(["list", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == {"sites": [], "total": 0, "webserver": "all"}
 
 
 def test_show_prints_the_configuration_file(webservers: dict[str, Any], runner: FakeRunner) -> None:

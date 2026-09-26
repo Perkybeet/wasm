@@ -19,6 +19,7 @@ touched.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -285,7 +286,11 @@ def test_no_command_redeclares_a_global_flag() -> None:
         declared = {
             opt
             for param in command.params
-            if isinstance(param, click.Option)
+            # expose_value=False (json_option's own contract) means the
+            # option can only ever switch the shared Context on and can
+            # never bind - and so overwrite - a value on the command
+            # function, which is the defect this guard exists to catch.
+            if isinstance(param, click.Option) and param.expose_value
             for opt in param.opts + param.secondary_opts
         }
         assert not declared & GLOBAL_FLAGS, f"{command.name} redeclares a global flag"
@@ -473,6 +478,31 @@ def test_list_says_so_when_there_is_nothing(
     assert any("No certificates found" in line for line in log)
 
 
+def test_list_json_reports_name_domains_and_expiry(live_dir: Path, runner: FakeRunner) -> None:
+    """The payload carries the same facts the table shows."""
+    runner.script(["certbot", "certificates"], stdout=CERTBOT_OUTPUT)
+
+    result = _invoke(["cert", "list", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["total"] == 1
+    cert = payload["certificates"][0]
+    assert cert["name"] == "shop.tld"
+    assert cert["domains"] == ["shop.tld", "www.shop.tld"]
+    assert "2026-11-30" in cert["expiry"]
+
+
+def test_list_json_reports_an_empty_machine(live_dir: Path, runner: FakeRunner) -> None:
+    """No certificates is {"certificates": [], "total": 0}, not the human text."""
+    runner.script(["certbot", "certificates"], stdout="No certificates found.\n")
+
+    result = _invoke(["cert", "list", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == {"certificates": [], "total": 0}
+
+
 def test_list_open_prints_the_configured_panel_url_without_a_display(
     live_dir: Path,
     runner: FakeRunner,
@@ -548,6 +578,27 @@ def test_info_reports_the_domains_and_the_validity_window(
     assert result.exit_code == 0
     assert any("www.shop.tld" in line for line in log)
     assert any("Nov 30 10:00:00 2026 GMT" in line for line in log)
+
+
+def test_info_json_reports_the_certificate_and_its_validity(
+    live_dir: Path, runner: FakeRunner
+) -> None:
+    """The payload carries what the key/value report shows."""
+    _put_certificate_on_disk(live_dir, "shop.tld")
+    runner.script(["certbot", "certificates"], stdout=CERTBOT_OUTPUT)
+    runner.script(
+        ["openssl", "x509"],
+        stdout="notBefore=Sep  1 10:00:00 2026 GMT\nnotAfter=Nov 30 10:00:00 2026 GMT\n",
+    )
+
+    result = _invoke(["cert", "show", "shop.tld", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["name"] == "shop.tld"
+    assert "www.shop.tld" in payload["domains"]
+    assert payload["valid"] is True
+    assert payload["not_after"] == "Nov 30 10:00:00 2026 GMT"
 
 
 def test_info_on_an_unknown_domain_fails_without_issuing(

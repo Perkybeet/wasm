@@ -221,3 +221,59 @@ class TestGlobalFlags:
             assert seen.get("dry_run") is True
         finally:
             cli.commands.pop("probe-dry-run", None)
+
+
+class TestErrorBoundary:
+    """
+    ``main()`` is the one place a ``WASMError`` becomes an exit code, so a
+    field it drops is invisible everywhere the CLI is the front end.
+
+    A tool's own words - psql's, nginx's or systemd's - explain a failure
+    better than any paraphrase, which is why ``WASMError`` carries them in a
+    separate ``output`` field rather than folding them into ``details``. The
+    web API already prints it verbatim in ``ErrorResponse``
+    (:func:`wasm.web.api.deps.error_response`); the CLI boundary has to as
+    well, or an operator at a terminal sees less than a script hitting the
+    same failure over the API.
+    """
+
+    def test_the_tools_own_output_is_printed_verbatim(self, capsys: pytest.CaptureFixture[str]):
+        from wasm.cli.app import main
+        from wasm.core.exceptions import WASMError
+
+        @cli.command("probe-error-output", hidden=True)
+        def probe() -> None:
+            raise WASMError(
+                "the command failed",
+                details="try again with --force",
+                output='nginx: [emerg] unexpected "}" in /etc/nginx/nginx.conf:12',
+            )
+
+        try:
+            exit_code = main(["probe-error-output"])
+        finally:
+            cli.commands.pop("probe-error-output", None)
+
+        captured = capsys.readouterr()
+        assert exit_code == 1
+        assert "the command failed" in captured.out
+        assert "try again with --force" in captured.out
+        assert 'nginx: [emerg] unexpected "}" in /etc/nginx/nginx.conf:12' in captured.out
+
+    def test_no_output_field_prints_no_extra_block(self, capsys: pytest.CaptureFixture[str]):
+        """A WASMError with nothing to show verbatim adds nothing extra."""
+        from wasm.cli.app import main
+        from wasm.core.exceptions import WASMError
+
+        @cli.command("probe-error-no-output", hidden=True)
+        def probe() -> None:
+            raise WASMError("the command failed")
+
+        try:
+            exit_code = main(["probe-error-no-output"])
+        finally:
+            cli.commands.pop("probe-error-no-output", None)
+
+        captured = capsys.readouterr()
+        assert exit_code == 1
+        assert "the command failed" in captured.out

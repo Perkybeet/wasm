@@ -15,6 +15,7 @@ only reason this group needs care at all.
 from __future__ import annotations
 
 import io
+import json
 import os
 import stat
 from argparse import Namespace
@@ -221,6 +222,12 @@ def test_no_env_command_redeclares_a_global_flag() -> None:
         for param in command.params:
             if not isinstance(param, click.Option):
                 continue
+            # expose_value=False (json_option's own contract) means the
+            # option can only ever switch the shared Context on and can
+            # never bind - and so overwrite - a value on the command
+            # function, which is the defect this guard exists to catch.
+            if not param.expose_value:
+                continue
             clash = GLOBAL_FLAGS.intersection(param.opts + param.secondary_opts)
             if clash:
                 offenders.append(f"{name}: {sorted(clash)}")
@@ -294,6 +301,35 @@ def test_show_reveals_only_when_asked_and_says_so(deployed: Path, logged: io.Str
     output = logged.getvalue()
     assert "ak_live_9f3c" in output
     assert "clear" in output.lower()
+
+
+def test_show_json_redacts_the_same_way_as_the_human_report(deployed: Path) -> None:
+    """The payload hides a secret exactly as the human report does, by default."""
+    (deployed / ".env").write_text("API_KEY=ak_live_9f3c\nPORT=3000\n", encoding="utf-8")
+
+    result = CliRunner().invoke(app_module.cli, ["env", "show", "example.com", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["domain"] == "example.com"
+    assert payload["redacted"] is True
+    assert payload["variables"]["PORT"] == "3000"
+    assert payload["variables"]["API_KEY"] == REDACTED
+    assert "ak_live_9f3c" not in result.output
+
+
+def test_show_json_with_unmask_prints_the_real_values(deployed: Path) -> None:
+    """--unmask reaches the JSON payload too, not only the human report."""
+    (deployed / ".env").write_text("API_KEY=ak_live_9f3c\n", encoding="utf-8")
+
+    result = CliRunner().invoke(
+        app_module.cli, ["env", "show", "example.com", "--unmask", "--json"]
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["redacted"] is False
+    assert payload["variables"]["API_KEY"] == "ak_live_9f3c"
 
 
 def test_redact_hides_whether_a_secret_is_set() -> None:
@@ -527,7 +563,9 @@ def test_show_command_reaches_the_handler(
     monkeypatch.setattr(
         env_module,
         "_env_show",
-        lambda domain, unmask, verbose: seen.append((domain, unmask, verbose)) or 0,
+        lambda domain, unmask, verbose, json_output=False: (
+            seen.append((domain, unmask, verbose)) or 0
+        ),
     )
 
     result = cli_runner.invoke(

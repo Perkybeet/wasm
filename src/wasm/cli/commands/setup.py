@@ -35,14 +35,13 @@ from __future__ import annotations
 import os
 import sys
 from argparse import Namespace
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
 
 import click
 
-from wasm.cli.app import Context, enable_dry_run, pass_context
+from wasm.cli.app import Context, WasmGroup, global_flags, pass_context
 from wasm.core.config import (
     DEFAULT_APPS_DIR,
     DEFAULT_CONFIG_PATH,
@@ -52,7 +51,7 @@ from wasm.core.config import (
 )
 from wasm.core.exceptions import WASMError
 from wasm.core.fs import FileSystem, get_fs
-from wasm.core.logger import Logger, set_colors_disabled
+from wasm.core.logger import Logger
 from wasm.core.utils import command_exists, run_command, run_trusted_installer
 
 if TYPE_CHECKING:
@@ -71,92 +70,6 @@ COMPLETE_VAR = "_WASM_COMPLETE"
 
 class SetupError(WASMError):
     """The machine cannot be prepared as asked."""
-
-
-# ---------------------------------------------------------------------------
-# Global flags
-# ---------------------------------------------------------------------------
-
-
-def _fold_into_context(attribute: str) -> Callable[[click.Context, click.Parameter, bool], bool]:
-    """
-    Build the callback that records a global flag on the shared context.
-
-    The root group turns ``--dry-run`` on when it comes before the subcommand.
-    When it comes after, the root callback has already run, so the flag is
-    turned on here through the same :func:`~wasm.cli.app.enable_dry_run`: a
-    second implementation is how ``wasm setup init --dry-run`` ended up swapping
-    the command runner and not the filesystem, and creating /etc/wasm anyway.
-
-    Args:
-        attribute: Name of the :class:`~wasm.cli.app.Context` attribute to set.
-
-    Returns:
-        A Click option callback.
-    """
-
-    def fold(ctx: click.Context, param: click.Parameter, value: bool) -> bool:
-        if not value:
-            return value
-        state = ctx.ensure_object(Context)
-        setattr(state, attribute, True)
-        if attribute == "no_color":
-            set_colors_disabled(True)
-        elif attribute == "dry_run":
-            enable_dry_run(state)
-        return value
-
-    return fold
-
-
-def global_flags(command: Callable[..., Any]) -> Callable[..., Any]:
-    """
-    Re-offer the root group's flags on a subcommand.
-
-    ``wasm setup init --verbose`` is in scripts, in the published documentation
-    and in muscle memory, so the flags have to keep parsing after the
-    subcommand name. None of these options owns a value: they are eager, they
-    do not reach the command function, and their callbacks only ever switch the
-    shared context on. A subcommand therefore cannot undo a flag the user set
-    before the subcommand name, which is exactly how ``wasm --dry-run monitor
-    scan`` used to run for real.
-
-    Args:
-        command: The function being decorated into a Click command.
-
-    Returns:
-        The decorated function.
-    """
-    options = [
-        click.option(
-            "-v",
-            "--verbose",
-            is_flag=True,
-            is_eager=True,
-            expose_value=False,
-            callback=_fold_into_context("verbose"),
-            help="Show the detail of each step.",
-        ),
-        click.option(
-            "--dry-run",
-            is_flag=True,
-            is_eager=True,
-            expose_value=False,
-            callback=_fold_into_context("dry_run"),
-            help="Rehearse without changing anything.",
-        ),
-        click.option(
-            "--no-color",
-            is_flag=True,
-            is_eager=True,
-            expose_value=False,
-            callback=_fold_into_context("no_color"),
-            help="Never emit colour.",
-        ),
-    ]
-    for option in reversed(options):
-        command = option(command)
-    return command
 
 
 def _exit(code: int) -> NoReturn:
@@ -1513,7 +1426,7 @@ def handle_setup(args: Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
-@click.group("setup")
+@click.group("setup", cls=WasmGroup)
 @global_flags
 def cli() -> None:
     """Prepare this server, and check that it stayed prepared."""

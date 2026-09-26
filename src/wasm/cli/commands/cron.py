@@ -20,11 +20,12 @@ how :mod:`wasm.cli.commands.db` is laid out.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import click
 
-from wasm.cli.app import Context, pass_context
+from wasm.cli.app import Context, WasmGroup, json_option, pass_context
 from wasm.core.exceptions import ServiceError
 from wasm.core.logger import Logger, state, styled
 from wasm.managers.backup_scheduler import SCHEDULE_ALIASES
@@ -66,17 +67,53 @@ def _schedule_label(on_calendar: str) -> str:
     return _ALIAS_BY_CALENDAR.get(on_calendar, on_calendar or "unknown")
 
 
-def _list(*, logger: Logger) -> int:
+def _job_as_dict(entry: dict[str, Any]) -> dict[str, Any]:
+    """
+    Build the JSON representation of one listed job.
+
+    Same fields, in the same words, as ``GET /api/cron``'s ``CronJobInfo``:
+    both start from :meth:`~wasm.managers.cron_manager.CronManager.list_jobs`,
+    so a script reading ``wasm cron list --json`` sees what the console does.
+
+    Args:
+        entry: One entry as ``list_jobs`` returns it.
+
+    Returns:
+        A JSON-serialisable mapping.
+    """
+    on_calendar = entry.get("on_calendar", "")
+    return {
+        "name": entry.get("name", ""),
+        "command": entry.get("command", ""),
+        "user": entry.get("user", ""),
+        "working_directory": entry.get("working_directory", ""),
+        "app_domain": entry.get("app_domain", ""),
+        "schedule": _ALIAS_BY_CALENDAR.get(on_calendar, "custom" if on_calendar else "unknown"),
+        "on_calendar": on_calendar,
+        "enabled": bool(entry.get("enabled")),
+        "next_run": entry.get("next_run", "pending"),
+        "last_run": entry.get("last_run", "never"),
+        "last_exit_code": entry.get("last_exit_code"),
+        "last_result": entry.get("last_result", "never ran"),
+    }
+
+
+def _list(*, logger: Logger, json_output: bool = False) -> int:
     """
     List every WASM cron job with its schedule, next run and last result.
 
     Args:
         logger: Logger for the table and the empty-state message.
+        json_output: Print the jobs as JSON instead of a table.
 
     Returns:
         Exit code.
     """
     jobs = CronManager(verbose=logger.verbose).list_jobs()
+
+    if json_output:
+        click.echo(json.dumps({"jobs": [_job_as_dict(job) for job in jobs], "total": len(jobs)}))
+        return 0
 
     if not jobs:
         logger.info("No cron jobs")
@@ -252,7 +289,7 @@ def _disable(name: str, *, logger: Logger) -> int:
     return 0
 
 
-def _runs(name: str, *, limit: int, logger: Logger) -> int:
+def _runs(name: str, *, limit: int, logger: Logger, json_output: bool = False) -> int:
     """
     Show a job's recent executions, reconstructed from the journal.
 
@@ -260,6 +297,7 @@ def _runs(name: str, *, limit: int, logger: Logger) -> int:
         name: Job name.
         limit: Most runs to show.
         logger: Logger for the report and errors.
+        json_output: Print the runs as JSON instead of a report.
 
     Returns:
         Exit code.
@@ -269,6 +307,28 @@ def _runs(name: str, *, limit: int, logger: Logger) -> int:
     except ServiceError as e:
         logger.error(str(e))
         return 1
+
+    if json_output:
+        # Same fields as GET /api/cron/{name}/runs's CronRunInfo: "output" is
+        # the job's own lines, joined, not the manager's per-line list.
+        click.echo(
+            json.dumps(
+                {
+                    "name": name,
+                    "runs": [
+                        {
+                            "started": run["started"],
+                            "exit_code": run["exit_code"],
+                            "success": run["success"],
+                            "output": "\n".join(run["lines"]),
+                        }
+                        for run in runs
+                    ],
+                    "total": len(runs),
+                }
+            )
+        )
+        return 0
 
     if not runs:
         logger.info(f"No recorded runs for {name}")
@@ -288,16 +348,17 @@ def _runs(name: str, *, limit: int, logger: Logger) -> int:
     return 0
 
 
-@click.group("cron")
+@click.group("cron", cls=WasmGroup)
 def cli() -> None:
     """Run commands on a schedule, as systemd timers."""
 
 
 @cli.command("list")
+@json_option("Print the jobs as JSON.")
 @pass_context
 def list_jobs(ctx: Context) -> None:
     """List every WASM cron job with its schedule and last result."""
-    _exit(_list(logger=ctx.logger))
+    _exit(_list(logger=ctx.logger, json_output=ctx.json_output))
 
 
 @cli.command("create")
@@ -397,7 +458,8 @@ def disable(ctx: Context, name: str) -> None:
     show_default=True,
     help="Most runs to show.",
 )
+@json_option("Print the runs as JSON.")
 @pass_context
 def runs(ctx: Context, name: str, limit: int) -> None:
     """Show a job's recent executions, reconstructed from the journal."""
-    _exit(_runs(name, limit=limit, logger=ctx.logger))
+    _exit(_runs(name, limit=limit, logger=ctx.logger, json_output=ctx.json_output))

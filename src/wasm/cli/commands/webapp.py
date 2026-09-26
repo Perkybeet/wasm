@@ -27,38 +27,35 @@ import json
 import os
 import sys
 from argparse import Namespace
-from collections.abc import Callable
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any
 
 import click
 
-from wasm.cli.app import Context, enable_dry_run, json_option, pass_context
+from wasm.cli.app import Context, WasmGroup, global_flags, json_option, pass_context
 from wasm.cli.panel_links import open_in_panel
 from wasm.core.app_state import RUNNING, STATIC, resolve_states
 from wasm.core.config import Config
 from wasm.core.dependencies import check_deployment_ready
 from wasm.core.exceptions import DeploymentError, ServiceError, WASMError
-from wasm.core.logger import Logger, set_colors_disabled, state, styled
+from wasm.core.logger import Logger, state, styled
 from wasm.core.runner import (
     CommandResult,
     get_runner,
 )
 from wasm.core.store import DeploymentTrigger, get_store
-from wasm.core.utils import domain_to_app_name, remove_directory
+from wasm.core.utils import domain_to_app_name
 from wasm.deployers import get_deployer
 from wasm.deployers.docker_compose import DockerComposeDeployer
 from wasm.deployers.helpers.env_manager import EnvManager
 from wasm.deployers.helpers.layout import CONFIGURED, LAYOUTS, choose_layout
 from wasm.deployers.helpers.package_manager import SUPPORTED_PACKAGE_MANAGERS
-from wasm.deployers.lifecycle import update_app
+from wasm.deployers.lifecycle import delete_app, update_app
 from wasm.deployers.monorepo import MonorepoDeployer
 from wasm.deployers.registry import available_types
 from wasm.managers.apache_manager import ApacheManager
-from wasm.managers.cert_manager import CertManager
 from wasm.managers.nginx_manager import NginxManager
 from wasm.managers.service_manager import ServiceManager
-from wasm.managers.webserver import delete_site_completely
 from wasm.validators.domain import should_include_www, validate_domain
 from wasm.validators.environment import is_valid_env_name
 from wasm.validators.port import find_available_port, validate_port
@@ -95,8 +92,6 @@ _SERVICE_VERBS: dict[str, tuple[str, str]] = {
     "stop": ("Stopping", "stopped"),
     "restart": ("Restarting", "restarted"),
 }
-
-_F = TypeVar("_F", bound=Callable[..., Any])
 
 
 def _follow(argv: list[str], cwd: Path | None = None) -> CommandResult | None:
@@ -198,6 +193,7 @@ def _create_app(
     compose_profiles: tuple[str, ...] = (),
     layout: str | None = None,
     persist: tuple[str, ...] = (),
+    replace_existing: bool = False,
 ) -> int:
     """
     Deploy an application.
@@ -223,6 +219,8 @@ def _create_app(
         layout: ``inplace`` or ``releases``. None gives a new application
             the server's configured layout (``deploy.layout``).
         persist: Paths kept in ``shared/`` and linked into every release.
+        replace_existing: Deploy into an application directory that already
+            holds files (``--force``); refused otherwise.
 
     Returns:
         Exit code.
@@ -301,6 +299,7 @@ def _create_app(
             subdomains=subdomains,
             workspaces=workspaces,
             skip_database=skip_database,
+            replace_existing=replace_existing,
         )
 
     if app_type == "docker-compose":
@@ -315,6 +314,7 @@ def _create_app(
             compose_file=compose_file,
             compose_profiles=compose_profiles,
             port=port,
+            replace_existing=replace_existing,
         )
 
     deployer = get_deployer(app_type, verbose=logger.verbose)
@@ -332,6 +332,7 @@ def _create_app(
         # that already exists keeps its layout unless one was asked for.
         layout=layout or CONFIGURED,
         persistent_paths=list(persist) if persist else None,
+        replace_existing=replace_existing,
     )
     deployer.deploy()
 
@@ -350,6 +351,7 @@ def _create_monorepo(
     subdomains: tuple[str, ...],
     workspaces: tuple[str, ...],
     skip_database: bool,
+    replace_existing: bool = False,
 ) -> int:
     """
     Deploy every deployable workspace of a monorepo.
@@ -365,6 +367,7 @@ def _create_monorepo(
         subdomains: ``app:subdomain`` mappings.
         workspaces: Workspaces to deploy; empty means all.
         skip_database: Skip database provisioning.
+        replace_existing: Deploy into a directory that already holds files.
 
     Returns:
         Exit code.
@@ -391,6 +394,7 @@ def _create_monorepo(
         subdomain_overrides=subdomain_overrides,
         workspace_filter=list(workspaces) or None,
         skip_database=skip_database,
+        replace_existing=replace_existing,
     )
     deployer.deploy()
 
@@ -409,6 +413,7 @@ def _create_docker_compose(
     compose_file: str | None,
     compose_profiles: tuple[str, ...],
     port: int | None,
+    replace_existing: bool = False,
 ) -> int:
     """
     Deploy a Docker Compose project.
@@ -424,6 +429,7 @@ def _create_docker_compose(
         compose_file: Compose file to use, relative to the project.
         compose_profiles: Compose profiles to activate.
         port: Port the proxy forwards to.
+        replace_existing: Deploy into a directory that already holds files.
 
     Returns:
         Exit code.
@@ -442,6 +448,7 @@ def _create_docker_compose(
         compose_file=compose_file,
         compose_profiles=list(compose_profiles) or None,
         port=port,
+        replace_existing=replace_existing,
     )
     deployer.deploy()
 
@@ -870,54 +877,21 @@ def _delete_app(
 
     logger.header(f"Deleting: {domain}")
 
-    total_steps = 6
-
-    if app and app.app_type == "docker-compose":
-        logger.step(1, total_steps, "Stopping Docker Compose containers")
-        for compose_name in ["docker-compose.prod.yml", "docker-compose.yml", "compose.yml"]:
-            compose_file = app_path / compose_name
-            if compose_file.exists():
-                get_runner().run(
-                    ["docker", "compose", "-f", str(compose_file), "down", "--remove-orphans"],
-                    cwd=app_path,
-                    timeout=_COMPOSE_TIMEOUT,
-                )
-                break
-    else:
-        logger.step(1, total_steps, "Stopping service")
-
-    service_manager = ServiceManager(verbose=logger.verbose)
-    try:
-        service_manager.delete_service(app_name)
-    except ServiceError as e:
-        logger.warning(f"Failed to delete service: {e}")
-
-    logger.step(2, total_steps, "Removing site configuration")
-    logger.step(3, total_steps, "Removing SSL certificate")
-    deletion = delete_site_completely(
+    # The one deletion, shared with the console's delete job: it takes a
+    # Compose stack down (volumes kept), removes every unit of the app, its
+    # site, certificate, files and rows, and holds the app's lock.
+    outcome = delete_app(
         domain,
-        nginx=NginxManager(verbose=logger.verbose),
-        apache=ApacheManager(verbose=logger.verbose),
-        cert_manager=CertManager(verbose=logger.verbose),
+        remove_files=not keep_files,
+        on_phase=lambda index, total, message: logger.step(index, total, message),
+        logger=logger,
     )
-    if deletion.certificate_removed:
-        logger.substep(f"Certificate deleted: {domain}")
-    else:
-        logger.substep("No certificate found")
-
-    if not keep_files:
-        logger.step(4, total_steps, "Removing application files")
-        remove_directory(app_path)
-    else:
-        logger.step(4, total_steps, "Keeping application files")
-
-    logger.step(5, total_steps, "Removing from database")
-    if app:
-        store.delete_site(domain)
-        store.delete_service(app_name)
-        store.delete_app(domain)
-
-    logger.step(6, total_steps, "Cleanup complete")
+    logger.substep(
+        f"Certificate deleted: {domain}" if outcome.certificate_removed else "No certificate found"
+    )
+    if outcome.warnings:
+        logger.warning("Deleted, except for what is listed above")
+        return 1
     logger.success(f"Application deleted: {domain}")
 
     return 0
@@ -1181,6 +1155,7 @@ def _handle_create(args: Namespace) -> int:
         compose_profiles=tuple(getattr(args, "compose_profiles", None) or ()),
         layout=getattr(args, "layout", None),
         persist=tuple(getattr(args, "persist", None) or ()),
+        replace_existing=getattr(args, "force", False),
     )
 
 
@@ -1313,109 +1288,6 @@ def _handle_logs(args: Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _fold_verbose(ctx: click.Context, param: click.Parameter, value: bool | None) -> None:
-    """
-    Record ``--verbose`` typed after the command name.
-
-    Args:
-        ctx: Click context.
-        param: The option being processed.
-        value: True when the flag was given, None when it was not.
-    """
-    if value:
-        ctx.ensure_object(Context).verbose = True
-
-
-def _fold_no_color(ctx: click.Context, param: click.Parameter, value: bool | None) -> None:
-    """
-    Record ``--no-color`` typed after the command name.
-
-    Args:
-        ctx: Click context.
-        param: The option being processed.
-        value: True when the flag was given, None when it was not.
-    """
-    if value:
-        ctx.ensure_object(Context).no_color = True
-        set_colors_disabled(True)
-
-
-def _fold_dry_run(ctx: click.Context, param: click.Parameter, value: bool | None) -> None:
-    """
-    Record ``--dry-run`` typed after the command name.
-
-    Both seams have to be swapped, not just the command runner: a deletion is
-    a filesystem call and never reaches a subprocess, which is how a rehearsal
-    came to announce that nothing would change and then delete the archive.
-    :func:`~wasm.cli.app.enable_dry_run` is the one place that knows what
-    "rehearsal" means, so this defers to it rather than repeating the wiring
-    and drifting from it.
-
-    Args:
-        ctx: Click context.
-        param: The option being processed.
-        value: True when the flag was given, None when it was not.
-    """
-    if not value:
-        return
-    state = ctx.ensure_object(Context)
-    state.dry_run = True
-    enable_dry_run(state)
-
-
-def _global_flags(command: _F) -> _F:
-    """
-    Accept the global flags after the command name as well as before it.
-
-    They are the same flags the root group declares and they end up in the same
-    place, :class:`wasm.cli.app.Context`. Nothing here binds a parameter of the
-    command function, so a late ``--verbose`` can only turn verbosity on and can
-    never overwrite what the user asked for before the command name, which is
-    the defect this migration exists to remove.
-
-    Args:
-        command: The command function being decorated.
-
-    Returns:
-        The decorated function.
-    """
-    for option in (
-        click.option(
-            "-v",
-            "--verbose",
-            is_flag=True,
-            default=None,
-            is_eager=True,
-            expose_value=False,
-            hidden=True,
-            callback=_fold_verbose,
-            help="Show the detail of each step.",
-        ),
-        click.option(
-            "--dry-run",
-            is_flag=True,
-            default=None,
-            is_eager=True,
-            expose_value=False,
-            hidden=True,
-            callback=_fold_dry_run,
-            help="Rehearse without changing anything.",
-        ),
-        click.option(
-            "--no-color",
-            is_flag=True,
-            default=None,
-            is_eager=True,
-            expose_value=False,
-            hidden=True,
-            callback=_fold_no_color,
-            help="Never emit colour.",
-        ),
-    ):
-        command = option(command)
-    return command
-
-
 def _exit(code: int) -> None:
     """
     End the command with a handler's exit code.
@@ -1430,7 +1302,7 @@ def _exit(code: int) -> None:
         click.get_current_context().exit(code)
 
 
-@click.group()
+@click.group(cls=WasmGroup)
 def cli() -> None:
     """Commands that act on a deployed application."""
 
@@ -1517,7 +1389,13 @@ def cli() -> None:
     multiple=True,
     help="Keep this path, relative to the app, in shared/ across releases. Repeat for several.",
 )
-@_global_flags
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Deploy into an app directory that already holds files: in place they are "
+    "replaced, .env included; on releases a release is added beside them.",
+)
+@global_flags
 @pass_context
 def create(
     ctx: Context,
@@ -1538,6 +1416,7 @@ def create(
     compose_profiles: tuple[str, ...],
     layout: str | None,
     persist: tuple[str, ...],
+    force: bool,
 ) -> None:
     """
     Deploy a web application and put it online.
@@ -1565,6 +1444,7 @@ def create(
             compose_profiles=compose_profiles,
             layout=layout,
             persist=persist,
+            replace_existing=force,
         ),
     )
 
@@ -1577,7 +1457,7 @@ def create(
     help="Print the panel URL for the app list, opening it if a display is available.",
 )
 @json_option("Print machine-readable JSON instead of a table.")
-@_global_flags
+@global_flags
 @pass_context
 def list_apps(ctx: Context, open_panel: bool) -> None:
     """List the applications deployed on this server."""
@@ -1598,7 +1478,7 @@ def list_apps(ctx: Context, open_panel: bool) -> None:
     help="Print the panel URL for this application, opening it if a display is available.",
 )
 @json_option("Print machine-readable JSON instead of a table.")
-@_global_flags
+@global_flags
 @pass_context
 def status(ctx: Context, domain: str, open_panel: bool) -> None:
     """Show how an application is configured and whether it is running."""
@@ -1612,7 +1492,7 @@ def status(ctx: Context, domain: str, open_panel: bool) -> None:
 
 @cli.command()
 @click.argument("domain")
-@_global_flags
+@global_flags
 @pass_context
 def start(ctx: Context, domain: str) -> None:
     """Start an application that is stopped."""
@@ -1621,7 +1501,7 @@ def start(ctx: Context, domain: str) -> None:
 
 @cli.command()
 @click.argument("domain")
-@_global_flags
+@global_flags
 @pass_context
 def stop(ctx: Context, domain: str) -> None:
     """Stop an application and leave it stopped."""
@@ -1630,7 +1510,7 @@ def stop(ctx: Context, domain: str) -> None:
 
 @cli.command()
 @click.argument("domain")
-@_global_flags
+@global_flags
 @pass_context
 def restart(ctx: Context, domain: str) -> None:
     """Restart an application, picking up its current build and environment."""
@@ -1650,7 +1530,7 @@ def restart(ctx: Context, domain: str) -> None:
     show_default=True,
     help="Node package manager. Detected from the lockfile when left on auto.",
 )
-@_global_flags
+@global_flags
 @pass_context
 def update(
     ctx: Context,
@@ -1684,7 +1564,7 @@ def update(
 @click.argument("domain")
 @click.option("-f", "-y", "--force", is_flag=True, help="Delete without asking for confirmation.")
 @click.option("--keep-files", is_flag=True, help="Leave the application directory on disk.")
-@_global_flags
+@global_flags
 @pass_context
 def delete(ctx: Context, domain: str, force: bool, keep_files: bool) -> None:
     """
@@ -1722,7 +1602,7 @@ def delete(ctx: Context, domain: str, force: bool, keep_files: bool) -> None:
     help="Print the panel URL for this application, opening it if a display is available.",
 )
 @json_option("Print machine-readable JSON instead of a table.")
-@_global_flags
+@global_flags
 @pass_context
 def logs(ctx: Context, domain: str, follow: bool, lines: int, open_panel: bool) -> None:
     """Show what an application has been writing to its log."""

@@ -1315,6 +1315,35 @@ def test_status_reports_a_stopped_panel(cli_runner: CliRunner, pid_file: Path) -
     assert "not running" in result.output
 
 
+def test_status_json_reports_a_stopped_panel(cli_runner: CliRunner, pid_file: Path) -> None:
+    """The payload says the same thing the human report does."""
+    result = cli_runner.invoke(web.cli, ["status", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == {"status": "not running"}
+
+
+def test_status_json_reports_a_running_panel(cli_runner: CliRunner, pid_file: Path) -> None:
+    """A running panel's payload carries its PID."""
+    pid_file.write_text(str(os.getpid()))
+
+    result = cli_runner.invoke(web.cli, ["status", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "running"
+    assert payload["pid"] == os.getpid()
+
+
+def test_status_without_json_still_prints_a_report(cli_runner: CliRunner, pid_file: Path) -> None:
+    """The default stays human-readable; --json is opt-in."""
+    result = cli_runner.invoke(web.cli, ["status"])
+
+    assert result.exit_code == 0
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(result.output)
+
+
 def test_restart_stops_then_starts(
     cli_runner: CliRunner,
     deps_present: None,
@@ -1532,6 +1561,25 @@ def test_regenerate_rotates_the_signing_key(
     assert (state_dir / "web-secret").read_text() != first_key
 
 
+def test_regenerate_warns_that_api_tokens_and_backup_codes_stop_verifying(
+    cli_runner: CliRunner, deps_present: None, state_dir: Path
+) -> None:
+    """
+    An API token and a TOTP backup code are hashed salted with the signing
+    key --regenerate replaces, so both stop verifying the moment it runs.
+    The operator has no way to know that unless the command says so.
+    """
+    cli_runner.invoke(web.cli, ["token", "--new", "--yes"])
+
+    result = cli_runner.invoke(web.cli, ["token", "--regenerate", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "API token" in result.output
+    assert "backup code" in result.output
+    assert "wasm token create" in result.output
+    assert "wasm 2fa backup-codes" in result.output
+
+
 def test_replacing_a_token_in_use_asks_first(
     cli_runner: CliRunner, deps_present: None, state_dir: Path
 ) -> None:
@@ -1558,6 +1606,8 @@ def test_regenerating_names_the_sessions_it_would_close(
 
     assert result.exit_code != 0
     assert "logged out" in result.output
+    assert "API token" in result.output
+    assert "backup code" in result.output
     assert (state_dir / "web-secret").read_text() == before
 
 
@@ -1661,3 +1711,110 @@ def test_the_module_does_not_reach_for_subprocess() -> None:
     source = Path(web.__file__).read_text(encoding="utf-8")
 
     assert "import subprocess" not in source
+
+
+# ---------------------------------------------------------------------------
+# except Exception: pass is a bare "this never happens" that turned five
+# AttributeErrors into cosmetic warnings for entire releases. These two spots
+# have to catch only the errors they are actually there for, and say
+# something when they do.
+# ---------------------------------------------------------------------------
+
+
+def test_install_instructions_does_not_swallow_a_bug_reading_os_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Only the real failure mode of reading /etc/os-release - it not being
+    readable - may be swallowed. Anything else (a bug in this function) has
+    to come out, or it will hide the way five AttributeErrors once did.
+    """
+    monkeypatch.setattr(web.Path, "exists", lambda self: str(self) == "/etc/os-release")
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise ValueError("not an I/O problem")
+
+    monkeypatch.setattr("builtins.open", boom)
+
+    with pytest.raises(ValueError):
+        web._get_install_instructions(["some-pkg"], ["some-pkg"])
+
+
+def test_install_instructions_logs_when_os_release_cannot_be_read(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    A real read failure (missing file, permission denied) is expected and
+    swallowed, but silently - the operator still gets the pip fallback - is
+    different from invisibly. It has to be logged.
+    """
+    import logging
+
+    monkeypatch.setattr(web.Path, "exists", lambda self: str(self) == "/etc/os-release")
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise PermissionError("denied")
+
+    monkeypatch.setattr("builtins.open", boom)
+
+    with caplog.at_level(logging.DEBUG, logger="wasm.cli.commands.web"):
+        instructions = web._get_install_instructions(["some-pkg"], ["some-pkg"])
+
+    assert instructions == ["pip install some-pkg"]
+    assert any("os-release" in record.message for record in caplog.records)
+
+
+def test_status_survives_psutil_reporting_the_process_already_gone(
+    cli_runner: CliRunner,
+    pid_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    The signal in _status confirms the process exists; by the time psutil
+    looks it up it may already be gone. That race is expected and reported,
+    not a crash and not silence.
+    """
+    import logging
+
+    import psutil
+
+    pid_file.write_text(str(os.getpid()))
+
+    class ExplodingProcess:
+        def __init__(self, pid: int) -> None:
+            raise psutil.NoSuchProcess(pid)
+
+    monkeypatch.setattr(psutil, "Process", ExplodingProcess)
+
+    with caplog.at_level(logging.DEBUG, logger="wasm.cli.commands.web"):
+        result = cli_runner.invoke(web.cli, ["status"])
+
+    assert result.exit_code == 0, result.output
+    assert "running" in result.output
+    assert any(
+        "psutil" in record.message or "process" in record.message.lower()
+        for record in caplog.records
+    )
+
+
+def test_status_does_not_swallow_a_bug_reading_process_detail(
+    cli_runner: CliRunner, pid_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Only psutil's own documented errors are the expected failure mode here.
+    Anything else is a bug in this function and must not be reported as a
+    cosmetic warning.
+    """
+    pid_file.write_text(str(os.getpid()))
+
+    class ExplodingProcess:
+        def __init__(self, pid: int) -> None:
+            raise RuntimeError("not a psutil error")
+
+    import psutil
+
+    monkeypatch.setattr(psutil, "Process", ExplodingProcess)
+
+    with pytest.raises(RuntimeError):
+        cli_runner.invoke(web.cli, ["status"], catch_exceptions=False)

@@ -24,7 +24,7 @@ from datetime import datetime
 
 import click
 
-from wasm.cli.app import Context, json_option, pass_context
+from wasm.cli.app import Context, WasmGroup, json_option, pass_context
 from wasm.web.auth import SecurityConfig, TokenManager
 
 
@@ -53,7 +53,7 @@ def _fmt(timestamp: float | None) -> str:
     return datetime.fromtimestamp(timestamp).isoformat(sep=" ", timespec="seconds")
 
 
-@click.group("sessions")
+@click.group("sessions", cls=WasmGroup)
 def cli() -> None:
     """Manage active panel sessions."""
 

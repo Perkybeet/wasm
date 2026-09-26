@@ -3,19 +3,28 @@
 # https://github.com/Perkybeet/wasm/blob/main/LICENSE
 
 """
-``--json`` for ``wasm list``, ``wasm status`` and ``wasm logs``.
+``--json`` across the whole command tree.
 
-These are the only three handlers that honour the flag: everything else in
-the CLI prints for a human, and pretending otherwise would be a payload no
-script could rely on. The flag has to work on either side of the command
-name, because that is true of every other global flag and a script that
-learned ``wasm --json list`` should not have to learn a second spelling for
-``wasm list --json``.
+``wasm list``, ``wasm status`` and ``wasm logs`` were once the only three
+handlers that honoured the flag: everything else in fourteen other modules
+accepted it before the subcommand name (the root group declares it
+unconditionally) and then silently printed for a human anyway, which is a
+payload no script could rely on. Every leaf command now does one of two
+things, enforced once by :class:`~wasm.cli.app.WasmCommand` rather than
+per command: it builds a real payload through :func:`~wasm.cli.app.json_option`,
+or it refuses with a usage error. :func:`test_every_leaf_command_handles_json`
+is the sweep that checks this holds for the entire tree, not only the
+commands exercised individually elsewhere in this file and in each module's
+own test file (``test_cli_cert.py``, ``test_cli_service.py``, ...).
 
-Fixtures and spies come from :mod:`tests.test_cli_webapp`, which already
-builds the store and service manager doubles these commands are exercised
-against; duplicating them here would be a second definition of the same
-fakes drifting from the first.
+The flag has to work on either side of the command name, because that is true
+of every other global flag and a script that learned ``wasm --json list``
+should not have to learn a second spelling for ``wasm list --json``.
+
+Fixtures and spies for ``list``/``status``/``logs`` come from
+:mod:`tests.test_cli_webapp`, which already builds the store and service
+manager doubles these commands are exercised against; duplicating them here
+would be a second definition of the same fakes drifting from the first.
 """
 
 from __future__ import annotations
@@ -24,10 +33,12 @@ import json
 from types import SimpleNamespace
 from typing import Any
 
+import click
 import pytest
 from click.testing import CliRunner
 
 from tests.test_cli_webapp import ServiceSpy, StoreSpy, console, make_app, services, store
+from wasm.cli.app import Context, WasmCommand
 from wasm.cli.app import cli as root_cli
 from wasm.cli.commands import webapp
 
@@ -245,3 +256,107 @@ def test_logs_json_after_the_domain_argument(
 
     assert result.exit_code == 0, result.output
     assert json.loads(result.output) == {"lines": ["one line"]}
+
+
+# ---------------------------------------------------------------------------
+# Every leaf command, not only the ones exercised above
+# ---------------------------------------------------------------------------
+
+
+def _leaf_commands() -> list[tuple[str, click.Command]]:
+    """
+    Walk the real command tree and collect every leaf (non-group) command.
+
+    Every module is imported through :class:`~wasm.cli.app.LazyGroup`, exactly
+    as a real invocation would, so this sees the tree as it is actually built,
+    aliases resolved to one canonical entry each.
+
+    Returns:
+        ``(space-separated path, command)`` pairs, in a stable order.
+    """
+    leaves: list[tuple[str, click.Command]] = []
+
+    def walk(command: click.Command, path: list[str], parent_ctx: click.Context) -> None:
+        if isinstance(command, click.Group):
+            ctx = click.Context(
+                command, parent=parent_ctx, info_name=command.name or path[-1:] or "cli"
+            )
+            for name in sorted(command.list_commands(ctx)):
+                sub = command.get_command(ctx, name)
+                if sub is not None:
+                    walk(sub, [*path, name], ctx)
+        else:
+            leaves.append((" ".join(path), command))
+
+    walk(root_cli, [], click.Context(root_cli))
+    return leaves
+
+
+LEAF_COMMANDS = _leaf_commands()
+
+
+def _declares_json_option(command: click.Command) -> bool:
+    """
+    Report whether a command opted into ``--json`` with :func:`json_option`.
+
+    Args:
+        command: The command to inspect.
+
+    Returns:
+        True when the option is declared, whether or not the command is a
+        :class:`~wasm.cli.app.WasmCommand` (``diagnose`` and ``health`` are
+        bare ``click.Command``\\ s that declare it directly).
+    """
+    from wasm.cli.app import _adopt_json
+
+    return any(
+        isinstance(param, click.Option) and param.callback is _adopt_json
+        for param in command.params
+    )
+
+
+@pytest.mark.parametrize(
+    "path", [path for path, _ in LEAF_COMMANDS], ids=[path for path, _ in LEAF_COMMANDS]
+)
+def test_every_leaf_command_handles_json(path: str) -> None:
+    """
+    Every leaf command either builds a JSON payload or refuses the flag.
+
+    A command that declares :func:`~wasm.cli.app.json_option` is trusted to
+    build a real payload - that behaviour is pinned for each one individually
+    above and in every module's own test file. Everything else has to refuse
+    ``--json`` outright: constructing the command's context with the shared
+    ``Context`` already carrying ``json_output=True`` (rather than parsing
+    ``["--json"]``, which would fail on a command's other required arguments
+    for a reason that has nothing to do with this) reaches
+    :meth:`~wasm.cli.app.WasmCommand.invoke`'s check before any argument
+    would ever be read, so this holds regardless of what else the command
+    needs.
+    """
+    command = dict(LEAF_COMMANDS)[path]
+
+    if _declares_json_option(command):
+        return
+
+    ctx = click.Context(command, info_name=path, obj=Context(json_output=True))
+    with pytest.raises(click.UsageError):
+        command.invoke(ctx)
+
+
+def test_every_leaf_command_without_json_support_is_a_wasm_command() -> None:
+    """
+    The refusal in the test above only fires through
+    :class:`~wasm.cli.app.WasmCommand`. A plain ``click.Command`` that does
+    not declare ``json_option`` would accept ``--json`` before its name
+    (the root group parses it unconditionally) and silently print for a
+    human anyway - the defect this whole file exists to catch. ``diagnose``
+    and ``health`` are the only two bare commands in the tree, and both
+    declare the option directly.
+    """
+    offenders = [
+        path
+        for path, command in LEAF_COMMANDS
+        if not _declares_json_option(command) and not isinstance(command, WasmCommand)
+    ]
+
+    assert offenders == []

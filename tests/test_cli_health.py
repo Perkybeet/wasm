@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import functools
 import io
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -268,7 +269,11 @@ def test_health_declares_no_global_flag() -> None:
     offenders = sorted(
         opt
         for param in cli_health.cli.params
-        if isinstance(param, click.Option)
+        # expose_value=False (json_option's own contract) means the option
+        # can only ever switch the shared Context on and can never bind -
+        # and so overwrite - a value on the command function, which is the
+        # defect this guard exists to catch.
+        if isinstance(param, click.Option) and param.expose_value
         for opt in param.opts
         if opt in GLOBAL_FLAGS
     )
@@ -298,6 +303,45 @@ def test_verbose_comes_from_the_context(server: Any, monkeypatch: pytest.MonkeyP
 
     assert result.return_value == 0, result.output
     assert asked == [True]
+
+
+# ---------------------------------------------------------------------------
+# --json
+# ---------------------------------------------------------------------------
+
+
+def test_json_reports_the_same_verdict_as_the_human_report(server: Any) -> None:
+    """The payload and the human report agree, because both come from one report."""
+    server.store = _FakeStore([_app("example.com")])
+    server.services = _FakeServices({"example-com": False})
+
+    result = invoke("--json", standalone_mode=False)
+
+    assert result.return_value == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["verdict"] == "warning"
+    assert payload["warnings"]
+    assert any(check["name"] == "Applications" for check in payload["checks"])
+
+
+def test_json_before_the_command_name(server: Any) -> None:
+    """The root's --json also drives 'wasm health'."""
+    from wasm.cli.app import cli as root_cli
+
+    result = CliRunner().invoke(root_cli, ["--json", "health"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["verdict"] == "healthy"
+
+
+def test_without_json_prints_for_a_human_not_a_payload(server: Any) -> None:
+    """The default stays human-readable; --json is opt-in."""
+    result = invoke(standalone_mode=False)
+
+    assert result.return_value == 0
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(result.output)
 
 
 # ---------------------------------------------------------------------------

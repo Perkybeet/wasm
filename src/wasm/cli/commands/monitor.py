@@ -23,13 +23,14 @@ kept, and tested directly, for the same reason.
 
 from __future__ import annotations
 
+import json
 from argparse import Namespace
 from collections.abc import Callable
 from typing import Any
 
 import click
 
-from wasm.cli.app import Context, pass_context
+from wasm.cli.app import Context, WasmGroup, json_option, pass_context
 from wasm.cli.panel_links import open_in_panel
 from wasm.core.config import Config
 from wasm.core.exceptions import EmailError, MonitorError, WASMError
@@ -135,18 +136,70 @@ def _print_observation(observation: ProcessObservation, logger: Logger) -> None:
     logger.key_value("Command", process.command or "-", indent=4)
 
 
-def _show_status(verbose: bool = False) -> int:
+def _status_as_dict(monitor: ProcessMonitor) -> dict[str, Any]:
+    """
+    Build the JSON payload for the monitor's status.
+
+    Same fields as ``GET /api/monitor/status``'s ``MonitorStatus`` and
+    ``GET /api/monitor/config``'s ``MonitorSettings``, both built from this
+    same :class:`ProcessMonitor`, so a script and the console's dashboard
+    card can never disagree about what is running or what it watches.
+
+    Args:
+        monitor: The monitor to read.
+
+    Returns:
+        A JSON-serialisable mapping.
+    """
+    status = monitor.get_service_status()
+    config = monitor.config
+
+    payload: dict[str, Any] = {
+        "installed": bool(status["installed"]),
+        "enabled": bool(status["enabled"]),
+        "active": bool(status["active"]),
+        "pid": status["pid"],
+        "uptime": status["uptime"],
+        "scope": list(MONITOR_SCOPE),
+        "settings": {
+            "scan_interval": config.scan_interval,
+            "cpu_threshold": config.cpu_threshold,
+            "memory_threshold": config.memory_threshold,
+            "retention_days": config.retention_days,
+            "max_observations": config.max_observations,
+            "notify": config.notify,
+            "watch_units": list(config.watch_units),
+        },
+    }
+
+    try:
+        stats = ObservationStore().stats()
+    except (WASMError, OSError):
+        payload["store"] = None
+    else:
+        payload["store"] = {"database": str(default_db_path()), **stats}
+
+    return payload
+
+
+def _show_status(verbose: bool = False, *, json_output: bool = False) -> int:
     """
     Show the state of the monitor service and what it is set to observe.
 
     Args:
         verbose: Print the detail of each step.
+        json_output: Print the status as JSON instead of a report.
 
     Returns:
         Exit code.
     """
     logger = Logger(verbose=verbose)
     monitor = ProcessMonitor(verbose=verbose)
+
+    if json_output:
+        click.echo(json.dumps(_status_as_dict(monitor)))
+        return 0
+
     status = monitor.get_service_status()
 
     logger.header("WASM monitor")
@@ -472,7 +525,7 @@ ACTIONS: dict[str, Callable[..., int]] = {
 }
 
 
-class MonitorGroup(click.Group):
+class MonitorGroup(WasmGroup):
     """
     A group that answers to the alternative spellings of its own actions.
 
@@ -531,10 +584,11 @@ def cli() -> None:
     is_flag=True,
     help="Print the panel URL for the dashboard, opening it if a display is available.",
 )
+@json_option("Print the status as JSON.")
 @pass_context
 def status(ctx: Context, open_panel: bool) -> int:
     """Show whether the monitor is running and what it is watching."""
-    code = _show_status(verbose=ctx.verbose)
+    code = _show_status(verbose=ctx.verbose, json_output=ctx.json_output)
     if open_panel and code == 0:
         # A fresh Logger, like every other action in this module, rather than
         # ctx.logger: this file never reads the shared context's logger, and

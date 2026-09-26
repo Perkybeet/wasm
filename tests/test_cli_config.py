@@ -233,13 +233,20 @@ def test_no_subcommand_owns_a_global_flag() -> None:
     assert offenders == []
 
 
-def test_no_config_command_offers_json(wasm: Wasm) -> None:
-    """--json is not offered where nothing builds a structured payload."""
+def test_no_config_command_offers_json_except_show(wasm: Wasm) -> None:
+    """
+    --json is not offered where nothing builds a structured payload.
+
+    'show' is the exception: it prints the whole redacted tree, the same
+    thing GET /api/config answers, so a script has a use for the payload
+    'get', 'set', 'path' and 'upgrade' have no equivalent of.
+    """
     ctx = click.Context(config_cmd.cli)
     for name in config_cmd.cli.list_commands(ctx):
         command = config_cmd.cli.get_command(ctx, name)
         assert command is not None
-        assert "--json" not in {opt for param in command.params for opt in param.opts}
+        offers_json = "--json" in {opt for param in command.params for opt in param.opts}
+        assert offers_json == (name == "show"), f"config {name}: --json offered = {offers_json}"
 
 
 def test_unknown_option_is_a_usage_error(wasm: Wasm) -> None:
@@ -391,6 +398,32 @@ def test_show_redacts_a_secret(wasm: Wasm, fake_config: dict[str, Any]) -> None:
     assert "https://hooks/secret" not in result.output
     assert "smtp.example.com" in result.output
     assert "***" in result.output
+
+
+def test_show_json_redacts_the_same_way(wasm: Wasm, fake_config: dict[str, Any]) -> None:
+    """The payload hides a secret exactly as the YAML dump does."""
+    fake_config["values"] = {
+        "webserver": "nginx",
+        "monitor": {"smtp": {"host": "smtp.example.com", "password": "hunter2"}},
+    }
+
+    result = wasm("config", "show", "--json")
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["config"]["webserver"] == "nginx"
+    assert payload["config"]["monitor"]["smtp"]["host"] == "smtp.example.com"
+    assert payload["config"]["monitor"]["smtp"]["password"] != "hunter2"
+    assert "hunter2" not in result.output
+
+
+def test_show_without_json_still_prints_yaml(wasm: Wasm, fake_config: dict[str, Any]) -> None:
+    """The default stays YAML; --json is opt-in."""
+    result = wasm("config", "show")
+
+    assert result.exit_code == 0
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(result.output)
 
 
 def test_path_reports_where_the_file_is(wasm: Wasm, fake_config: dict[str, Any]) -> None:

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ast
 import io
+import json
 from argparse import Namespace
 from pathlib import Path
 
@@ -256,7 +257,11 @@ def test_no_subcommand_redeclares_a_global_flag() -> None:
         clashes = [
             opt
             for param in command.params
-            if isinstance(param, click.Option)
+            # expose_value=False (json_option's own contract) means the
+            # option can only ever switch the shared Context on and can
+            # never bind - and so overwrite - a value on the command
+            # function, which is the defect this guard exists to catch.
+            if isinstance(param, click.Option) and param.expose_value
             for opt in param.opts + param.secondary_opts
             if opt in GLOBAL_FLAGS
         ]
@@ -352,6 +357,50 @@ def test_list_all_opts_into_the_whole_system(runner: FakeRunner, unit_dir: Path)
     assert runner.calls_to("systemctl")[0][-1] == "*"
 
 
+def test_list_reports_running_and_stopped_from_every_active_state(
+    runner: FakeRunner, unit_dir: Path, logged: io.StringIO
+) -> None:
+    """
+    'active' on a list-units row is one of several values (active, failed,
+    activating...); only 'active' itself means running, same as
+    ServiceManager.get_status's own is-active probe decides for
+    ``wasm service status`` and for the web API.
+    """
+    runner.script(
+        ["systemctl", "list-units"],
+        stdout=(
+            "UNIT LOAD ACTIVE SUB DESCRIPTION\n"
+            "wasm-up.service loaded active running WASM managed service\n"
+            "wasm-crashed.service loaded failed failed WASM managed service\n"
+            "wasm-restarting.service loaded activating auto-restart WASM managed service\n"
+        ),
+    )
+
+    result = invoke("service", "list", "--all")
+
+    assert result.exit_code == 0, result.output
+    output = logged.getvalue()
+    assert "wasm-up" in output and "running" in output
+    assert "wasm-crashed" in output and "stopped" in output
+    assert "wasm-restarting" in output and "stopped" in output
+
+
+def test_list_does_not_reimplement_the_active_state_check() -> None:
+    """
+    'active' means a raw systemd state string on the dict list_services
+    returns but a plain bool on the dict get_status returns; a second
+    ``== "active"`` spelled out here, instead of calling the one place that
+    already makes this decision for ``wasm service status`` and the web API,
+    is exactly how the two were free to drift apart.
+    """
+    import inspect
+
+    source = inspect.getsource(service_module._list)
+
+    assert '== "active"' not in source
+    assert "state_is_running" in source
+
+
 def test_status_of_a_missing_service_exits_non_zero(
     runner: FakeRunner, unit_dir: Path, logged: io.StringIO
 ) -> None:
@@ -371,6 +420,51 @@ def test_status_reports_a_running_service(
 
     assert result.exit_code == 0
     assert "4242" in logged.getvalue()
+
+
+def test_status_json_reports_the_same_shape_get_status_returns(
+    runner: FakeRunner, owned: str, logged: io.StringIO
+) -> None:
+    """The payload is exactly what get_status returns - what the web API reads too."""
+    runner.script(["systemctl", "is-active", f"{owned}.service"], stdout="active\n")
+    runner.script(["systemctl", "is-enabled", f"{owned}.service"], stdout="enabled\n")
+    runner.script(["systemctl", "show", f"{owned}.service"], stdout="MainPID=4242\n")
+
+    result = invoke("service", "status", owned, "--json")
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["active"] is True
+    assert payload["enabled"] is True
+    assert payload["pid"] == "4242"
+
+
+def test_status_json_of_a_missing_service_is_a_plain_error(
+    runner: FakeRunner, unit_dir: Path, logged: io.StringIO
+) -> None:
+    """A missing service is still the ordinary error path, not an empty JSON body."""
+    result = invoke("service", "status", "wasm-absent", "--json")
+
+    assert result.exit_code == 1
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(result.output)
+
+
+def test_list_json_before_the_command_name(runner: FakeRunner, unit_dir: Path) -> None:
+    """The root's --json, given before the command, produces the payload too."""
+    runner.script(
+        ["systemctl", "list-units"],
+        stdout=(
+            "UNIT LOAD ACTIVE SUB DESCRIPTION\n"
+            "wasm-up.service loaded active running WASM managed service\n"
+        ),
+    )
+
+    result = CliRunner().invoke(root, ["--json", "service", "list", "--all"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload == [{"name": "wasm-up", "status": "running", "state": "running"}]
 
 
 def test_logs_asks_the_journal_for_the_requested_lines(runner: FakeRunner, owned: str) -> None:

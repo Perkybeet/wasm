@@ -35,6 +35,7 @@ from wasm.cli.commands import webapp
 from wasm.core.logger import Logger
 from wasm.core.runner import DryRunRunner, FakeRunner, get_runner
 from wasm.deployers import lifecycle
+from wasm.managers.webserver import SiteDeletion
 
 #: The commands this module owns, as the user types them.
 COMMANDS = (
@@ -707,7 +708,21 @@ def test_create_configures_the_deployer_and_deploys(
         # own, so the deployer resolves "default" against the store.
         "layout": "default",
         "persistent_paths": None,
+        "replace_existing": False,
     }
+
+
+def test_create_force_asks_the_deployer_to_deploy_over_the_directory(
+    cli_runner: CliRunner, deployer: DeployerSpy
+) -> None:
+    """Without it a directory that holds files is refused by the deployer."""
+    result = cli_runner.invoke(
+        webapp.cli.commands["create"],
+        ["-d", "example.com", "-s", "https://github.com/user/repo", "-t", "nextjs", "--force"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert deployer.configured["replace_existing"] is True
 
 
 def test_create_accepts_yarn(cli_runner: CliRunner, deployer: DeployerSpy) -> None:
@@ -1403,25 +1418,20 @@ def test_delete_with_force_removes_the_whole_deployment(
         tmp_path: Applications directory.
     """
     monkeypatch.setattr(webapp, "Config", lambda: SimpleNamespace(apps_directory=tmp_path))
-    monkeypatch.setattr(webapp, "NginxManager", lambda verbose=False: _AbsentSite())
-    monkeypatch.setattr(webapp, "ApacheManager", lambda verbose=False: _AbsentSite())
+    # The deletion itself is lifecycle.delete_app, shared with the console.
     monkeypatch.setattr(
-        webapp,
-        "CertManager",
-        lambda verbose=False: SimpleNamespace(
-            is_installed=lambda: False, cert_exists=lambda d: False
-        ),
+        lifecycle,
+        "delete_site_completely",
+        lambda domain, **kwargs: SiteDeletion(domain=domain),
     )
-    removed: list[Path] = []
-    monkeypatch.setattr(webapp, "remove_directory", lambda path, sudo=False: removed.append(path))
     (tmp_path / "example-com").mkdir()
-    store.apps["example.com"] = make_app()
+    store.apps["example.com"] = make_app(app_path=str(tmp_path / "example-com"))
 
     result = cli_runner.invoke(webapp.cli.commands["delete"], ["example.com", "-y"])
 
     assert result.exit_code == 0, result.output
     assert ("delete_service", "example-com") in services.calls
-    assert removed == [tmp_path / "example-com"]
+    assert not (tmp_path / "example-com").exists()
     assert store.deleted == [
         ("site", "example.com"),
         ("service", "example-com"),
@@ -1447,19 +1457,14 @@ def test_delete_keeps_the_files_when_asked(
         tmp_path: Applications directory.
     """
     monkeypatch.setattr(webapp, "Config", lambda: SimpleNamespace(apps_directory=tmp_path))
-    monkeypatch.setattr(webapp, "NginxManager", lambda verbose=False: _AbsentSite())
-    monkeypatch.setattr(webapp, "ApacheManager", lambda verbose=False: _AbsentSite())
+    # The deletion itself is lifecycle.delete_app, shared with the console.
     monkeypatch.setattr(
-        webapp,
-        "CertManager",
-        lambda verbose=False: SimpleNamespace(
-            is_installed=lambda: False, cert_exists=lambda d: False
-        ),
+        lifecycle,
+        "delete_site_completely",
+        lambda domain, **kwargs: SiteDeletion(domain=domain),
     )
-    removed: list[Path] = []
-    monkeypatch.setattr(webapp, "remove_directory", lambda path, sudo=False: removed.append(path))
     (tmp_path / "example-com").mkdir()
-    store.apps["example.com"] = make_app()
+    store.apps["example.com"] = make_app(app_path=str(tmp_path / "example-com"))
 
     result = cli_runner.invoke(
         webapp.cli.commands["delete"], ["example.com", "--force", "--keep-files"]
@@ -1467,7 +1472,7 @@ def test_delete_keeps_the_files_when_asked(
     output = shown(result, console)
 
     assert result.exit_code == 0, output
-    assert removed == []
+    assert (tmp_path / "example-com").is_dir()
     assert "Keeping application files" in output
 
 

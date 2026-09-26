@@ -20,12 +20,13 @@ a certificate that had in fact never been touched.
 
 from __future__ import annotations
 
+import json
 import sys
 from argparse import Namespace
 
 import click
 
-from wasm.cli.app import Context, pass_context
+from wasm.cli.app import Context, WasmGroup, json_option, pass_context
 from wasm.core.exceptions import WASMError
 from wasm.core.logger import Logger
 from wasm.managers.apache_manager import ApacheManager
@@ -51,7 +52,7 @@ WEBSERVERS = ("nginx", "apache")
 _NOT_FOUND_HINT = "Run 'wasm site list' to see the virtual hosts this server knows about."
 
 
-class SiteGroup(click.Group):
+class SiteGroup(WasmGroup):
     """
     The ``site`` group, resolving the historical spellings of its subcommands.
 
@@ -158,7 +159,7 @@ def _site_create(
     logger.success(f"Site created: {domain}")
 
 
-def _site_list(*, webserver: str, logger: Logger, verbose: bool) -> None:
+def _site_list(*, webserver: str, logger: Logger, verbose: bool, json_output: bool = False) -> None:
     """
     Print every virtual host on the requested web servers.
 
@@ -166,9 +167,8 @@ def _site_list(*, webserver: str, logger: Logger, verbose: bool) -> None:
         webserver: "nginx", "apache" or "all".
         logger: Logger for the table.
         verbose: Enable verbose logging in the managers.
+        json_output: Print the sites as JSON instead of a table.
     """
-    logger.header("Web Server Sites")
-
     all_sites = []
 
     if webserver in ("nginx", "all"):
@@ -184,6 +184,30 @@ def _site_list(*, webserver: str, logger: Logger, verbose: bool) -> None:
             for site in apache.list_sites():
                 site["webserver"] = "apache"
                 all_sites.append(site)
+
+    if json_output:
+        # Same outer shape as GET /api/sites (SiteListResponse); "name" rather
+        # than "domain", matching that response's own field.
+        click.echo(
+            json.dumps(
+                {
+                    "sites": [
+                        {
+                            "name": site["domain"],
+                            "webserver": site["webserver"],
+                            "enabled": site["enabled"],
+                            "config_path": site["config_path"],
+                        }
+                        for site in all_sites
+                    ],
+                    "total": len(all_sites),
+                    "webserver": webserver,
+                }
+            )
+        )
+        return
+
+    logger.header("Web Server Sites")
 
     if not all_sites:
         logger.info("No sites found")
@@ -397,10 +421,16 @@ def create(
     show_default=True,
     help="Only show sites from this web server.",
 )
+@json_option("Print the site list as JSON.")
 @pass_context
 def list_sites(state: Context, webserver: str) -> None:
     """List the sites configured on this server."""
-    _site_list(webserver=webserver, logger=state.logger, verbose=state.verbose)
+    _site_list(
+        webserver=webserver,
+        logger=state.logger,
+        verbose=state.verbose,
+        json_output=state.json_output,
+    )
 
 
 @cli.command("enable")

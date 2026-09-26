@@ -25,7 +25,7 @@ import json
 
 import click
 
-from wasm.cli.app import Context, json_option, pass_context
+from wasm.cli.app import Context, WasmGroup, json_option, pass_context
 from wasm.core.exceptions import DependencyError
 from wasm.core.logger import Logger
 from wasm.core.store import DomainRecord
@@ -93,7 +93,7 @@ def _warn_about_dns(logger: Logger, domain: str) -> None:
     logger.info("Visitors and the certificate authority reach it only once DNS points here.")
 
 
-@click.group("domain")
+@click.group("domain", cls=WasmGroup)
 def cli() -> None:
     """
     Serve an application on more domains: aliases and redirects.

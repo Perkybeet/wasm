@@ -78,6 +78,34 @@ class TestValidateDomain:
         with pytest.raises(DomainError):
             validate_domain("")
 
+    def test_has_no_dead_allow_reserved_parameter(self):
+        """
+        ``allow_reserved`` computed whether a domain looked reserved and then
+        discarded the answer in both branches of an ``if``/``pass`` that never
+        raised - so every caller got the same result whether the flag was
+        True or False, and none of the twenty-odd call sites in the tree ever
+        passed it. A parameter nobody can observe the effect of is dead code,
+        not an API: it is removed rather than wired up to a policy no caller
+        asked for and no test ever covered.
+        """
+        import inspect
+
+        assert "allow_reserved" not in inspect.signature(validate_domain).parameters
+
+    def test_reserved_looking_domains_are_still_accepted(self):
+        """
+        The dead check never actually rejected anything - every one of
+        example.com, localhost and test.local passed 'validate_domain'
+        unchanged before this cleanup. Removing the no-op branch must not
+        change that: the twenty-odd production call sites (site, cert,
+        webapp, lifecycle...) never opted out of a reserved-domain policy,
+        so introducing real enforcement here would be a behaviour change,
+        not a cleanup.
+        """
+        assert validate_domain("example.com") == "example.com"
+        assert validate_domain("localhost") == "localhost"
+        assert validate_domain("test.local") == "test.local"
+
 
 class TestGetDomainParts:
     """Tests for get_domain_parts function."""

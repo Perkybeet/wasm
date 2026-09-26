@@ -227,6 +227,35 @@ class TestErrorHandling:
         assert not offenders, "bare excepts:\n" + "\n".join(f"  {o}" for o in offenders)
 
 
+class TestOneImplementation:
+    """
+    A rule copy-pasted into several files drifts the moment one copy changes
+    and the others do not - app type detection had four implementations with
+    contradicting precedence before this project settled on "use the existing
+    one or move it somewhere both callers can reach".
+    """
+
+    def test_global_flags_folding_has_one_implementation(self):
+        """
+        ``--verbose``/``--dry-run``/``--no-color`` have always been
+        re-spellable after a subcommand's name, and four command modules
+        each grew their own private callback for folding them into the
+        shared context, differing only in incidental details (``hidden=True``
+        here, a missing logger-cache invalidation there) that made the
+        duplication easy to miss in review. All four now import the one
+        decorator ``wasm.cli.app`` declares - the same module ``json_option``
+        already lives in.
+        """
+        from wasm.cli.app import global_flags
+        from wasm.cli.commands import config, setup, web, webapp
+
+        for module in (config, setup, web, webapp):
+            assert module.global_flags is global_flags, (
+                f"{module.__name__}.global_flags is not wasm.cli.app.global_flags - "
+                "it has its own copy of the folding logic"
+            )
+
+
 class TestFilesystemSeam:
     """
     Changes to disk go through wasm.core.fs, so --dry-run can refuse them.
@@ -548,7 +577,12 @@ class TestPackaging:
 
     #: Modules imported conditionally, inside a try/except ImportError, to
     #: degrade when an optional extra is absent.
-    OPTIONAL = {"psutil", "inquirer", "questionary", "rich", "httpx", "tomli"}
+    #:
+    #: rich is not one of these: wasm.core.logger imports it unconditionally
+    #: at module scope, so a machine without it cannot run any command at
+    #: all. It is a hard dependency in all four packaging files and belongs
+    #: in the checked set, not here.
+    OPTIONAL = {"psutil", "inquirer", "questionary", "httpx", "tomli"}
 
     #: Import names whose distribution is spelled differently.
     DISTRIBUTION_NAMES = {
@@ -593,14 +627,30 @@ class TestPackaging:
         An undeclared import is a package that fails to start after install.
 
         pydantic reached eleven modules without ever being declared in
-        pyproject.toml, setup.py, debian.control or the RPM spec.
+        pyproject.toml, setup.py, debian.control or the RPM spec - but this
+        test only ever read pyproject.toml, so a Debian or RPM gap would have
+        passed silently. All four packaging manifests are checked now.
+
+        pyproject.toml and setup.py both declare PyPI distribution names
+        (``PyYAML``, ``Jinja2``); the Debian and RPM package names are always
+        the import name with a ``python3-`` (or distro-macro) prefix, so the
+        bare import name is looked for there instead.
         """
-        declared = (REPO / "pyproject.toml").read_text(encoding="utf-8").lower()
+        sources = {
+            "pyproject.toml": (REPO / "pyproject.toml").read_text(encoding="utf-8").lower(),
+            "setup.py": (REPO / "setup.py").read_text(encoding="utf-8").lower(),
+            "obs/debian.control": (REPO / "obs/debian.control").read_text(encoding="utf-8").lower(),
+            "rpm/wasm.spec": (REPO / "rpm/wasm.spec").read_text(encoding="utf-8").lower(),
+        }
+        pypi_sources = {"pyproject.toml", "setup.py"}
+
         missing = set()
         for name in self.third_party_imports() - self.OPTIONAL:
-            distribution = self.DISTRIBUTION_NAMES.get(name, name).lower()
-            if distribution not in declared:
-                missing.add(name)
+            pypi_name = self.DISTRIBUTION_NAMES.get(name, name).lower()
+            for filename, text in sources.items():
+                needle = pypi_name if filename in pypi_sources else name
+                if needle not in text:
+                    missing.add(f"{name} missing from {filename}")
 
         check_ratchet(missing, self.UNDECLARED_KNOWN, "every import is declared")
 
@@ -739,13 +789,21 @@ class TestPackaging:
         spec = (REPO / "rpm/wasm.spec").read_text(encoding="utf-8")
         # Only the scriptlet runs on the machine; the changelog below it is prose.
         post = spec.split("\n%post", 1)[1].split("\n%", 1)[0] if "\n%post" in spec else ""
+        preun = spec.split("\n%preun", 1)[1].split("\n%", 1)[0] if "\n%preun" in spec else ""
         scripts = {
             "obs/debian.postinst": (REPO / "obs/debian.postinst").read_text(encoding="utf-8"),
             "rpm/wasm.spec %post": post,
         }
+        prerm_path = REPO / "obs/debian.prerm"
+        if prerm_path.exists():
+            scripts["obs/debian.prerm"] = prerm_path.read_text(encoding="utf-8")
+        if preun:
+            scripts["rpm/wasm.spec %preun"] = preun
         forbidden = (
             ("pip install", "pip3 install", "--break-system-packages"),
-            ("chown -R www-data", "chown -R www-data:www-data /var/www/apps"),
+            # Not just the www-data/var-www spelling that shipped: no maintainer
+            # script may recursively chown anything, anywhere.
+            ("chown -R",),
             ("chmod 755 /etc/wasm", "chmod 640 /etc/wasm/config.yaml"),
         )
 
@@ -963,6 +1021,71 @@ class TestMaintainerScripts:
         assert exists, "no chmod/%attr for config.yaml found in any packaging script"
         assert not offenders, "\n".join(f"  {o}" for o in offenders)
 
+    def test_package_removal_stops_and_disables_wasm_monitor(self):
+        """
+        'wasm monitor install' writes and enables a systemd unit that neither
+        dpkg nor rpm ever shipped, so removing the package left it running
+        under a binary that had just disappeared. Both maintainer scripts
+        must stop and disable it.
+        """
+        prerm = (REPO / "obs/debian.prerm").read_text(encoding="utf-8")
+        preun = self._rpm_scriptlets().get("rpm/wasm.spec %preun")
+
+        assert preun is not None, "rpm/wasm.spec has no %preun scriptlet"
+
+        for name, text in (("obs/debian.prerm", prerm), ("rpm/wasm.spec %preun", preun)):
+            assert "wasm-monitor" in text, f"{name} never mentions wasm-monitor.service"
+            assert re.search(r"systemctl\s+stop\s+wasm-monitor", text), (
+                f"{name} does not stop wasm-monitor.service"
+            )
+            assert re.search(r"systemctl\s+disable\s+wasm-monitor", text), (
+                f"{name} does not disable wasm-monitor.service"
+            )
+
+    def test_removal_scripts_never_start_or_enable_anything(self):
+        """
+        A script that runs on removal has exactly one job for a unit WASM
+        installed itself: make sure it is not running. 'start', 'enable' or
+        'restart' would be the postinst/%post update-and-restart logic
+        landing where it can only ever fire on the way out.
+        """
+        prerm = (REPO / "obs/debian.prerm").read_text(encoding="utf-8")
+        preun = self._rpm_scriptlets().get("rpm/wasm.spec %preun", "")
+
+        for name, text in (("obs/debian.prerm", prerm), ("rpm/wasm.spec %preun", preun)):
+            offenders = [
+                line.strip()
+                for line in text.splitlines()
+                if re.search(r"systemctl\s+(start|enable|restart)\b", line)
+            ]
+            assert not offenders, f"{name} starts or enables a unit on removal: {offenders}"
+
+    def test_debian_prerm_only_stops_units_on_an_actual_removal(self):
+        """
+        $1 is "remove" only when the package is being uninstalled outright;
+        "upgrade" (and the failure/deconfigure variants dpkg also calls this
+        with) must leave the unit alone - it is meant to survive the bump.
+        """
+        prerm = (REPO / "obs/debian.prerm").read_text(encoding="utf-8")
+        assert re.search(r'case\s+"\$1"\s+in', prerm), "prerm does not branch on $1"
+
+        remove_start = prerm.index("remove)")
+        next_case = prerm.index(";;", remove_start)
+        remove_body = prerm[remove_start:next_case]
+        assert "systemctl" in remove_body, "prerm's remove) branch never calls systemctl"
+
+        after_remove = prerm[next_case:]
+        upgrade_start = after_remove.index("upgrade")
+        upgrade_body = after_remove[upgrade_start : after_remove.index(";;", upgrade_start)]
+        assert "systemctl" not in upgrade_body, "prerm must not touch the unit on upgrade"
+
+    def test_rpm_preun_only_stops_units_on_an_actual_removal(self):
+        """$1 is 0 in %preun only on final removal, never on an upgrade."""
+        preun = self._rpm_scriptlets().get("rpm/wasm.spec %preun", "")
+        assert re.search(r"\$1\s*(-eq|=)\s*0", preun), (
+            "rpm/wasm.spec %preun does not guard on $1 == 0 (final removal)"
+        )
+
     def test_python3_venv_is_a_debian_dependency(self):
         """
         wasm.deployers.python.PythonDeployer.pre_install runs
@@ -980,6 +1103,21 @@ class TestMaintainerScripts:
         depends_block = "\n".join(block)
 
         assert "python3-venv" in depends_block, "obs/debian.control Depends is missing python3-venv"
+
+    def test_py_typed_marker_exists(self):
+        """
+        pyproject.toml's package-data has declared 'py.typed' since the
+        package was first typed, but the file itself was never created - so
+        every wheel built from this repo shipped without it, and mypy
+        treats an installed wasm as untyped (implicit Any) from any project
+        that depends on it.
+        """
+        marker = SRC / "py.typed"
+        assert marker.exists(), (
+            f"{marker} does not exist, but pyproject.toml's "
+            "[tool.setuptools.package-data] declares 'py.typed'"
+        )
+        assert marker.read_text(encoding="utf-8") == "", "py.typed is a marker file; it stays empty"
 
 
 class TestImportable:

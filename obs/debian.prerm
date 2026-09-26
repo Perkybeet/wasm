@@ -1,0 +1,34 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove)
+        # 'wasm monitor install' writes and enables wasm-monitor.service at
+        # runtime; the package itself never ships that unit, so dpkg has no
+        # unit of its own to stop here and the daemon kept running under a
+        # binary that had just been deleted. Data (config.yaml, /var/log/wasm,
+        # deployed applications) is untouched: this only stops and disables
+        # units, never on "upgrade" below, where they are meant to survive
+        # the version bump.
+        systemctl stop wasm-monitor.service >/dev/null 2>&1 || true
+        systemctl disable wasm-monitor.service >/dev/null 2>&1 || true
+
+        # The console runs as a daemon (wasm web start -d), not as a unit; stop
+        # it while its binary still exists.
+        if [ -x /usr/bin/wasm ]; then
+            /usr/bin/wasm web stop >/dev/null 2>&1 || true
+        fi
+        ;;
+
+    upgrade|failed-upgrade|deconfigure)
+        ;;
+
+    *)
+        echo "prerm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

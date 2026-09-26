@@ -18,12 +18,12 @@ from __future__ import annotations
 
 import click
 
-from wasm.cli.app import Context, pass_context
+from wasm.cli.app import Context, WasmGroup, pass_context
 from wasm.core.config import Config
 from wasm.core.notifier import CHANNELS, Notifier
 
 
-@click.group("notify")
+@click.group("notify", cls=WasmGroup)
 def cli() -> None:
     """Send test notifications through a configured channel."""
 

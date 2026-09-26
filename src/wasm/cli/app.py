@@ -42,7 +42,7 @@ import click
 from wasm import __version__
 from wasm.core.exceptions import WASMError
 from wasm.core.fs import DryRunFileSystem, set_fs
-from wasm.core.logger import Logger, set_colors_disabled
+from wasm.core.logger import Colors, Logger, set_colors_disabled
 from wasm.core.runner import DryRunRunner, SubprocessRunner, set_runner
 
 log = logging.getLogger(__name__)
@@ -184,6 +184,74 @@ def json_option(help_text: str = "Print machine-readable JSON.") -> Callable[[_F
     return decorate
 
 
+class WasmCommand(click.Command):
+    """
+    A leaf command that refuses ``--json`` unless it explicitly supports it.
+
+    ``--json`` typed before the subcommand name always parses: the root group
+    declares it unconditionally, for every invocation, so it can be folded
+    into :class:`Context` before the subcommand's own options are even
+    looked at. That is exactly what let it go silently inert - a command
+    that never checks the shared context for it accepted the flag and
+    printed its ordinary human output regardless, for every command in
+    fourteen modules that never opted in.
+
+    Every module's group uses :class:`WasmGroup` as its ``command_class``,
+    which makes this the class every leaf command in the tree is built from,
+    so "does this command handle --json" is a property of the tree instead
+    of something ninety call sites each have to remember to check. A command
+    opts in with :func:`json_option`; anything else gets a clear refusal
+    instead of a flag that does nothing.
+    """
+
+    def invoke(self, ctx: click.Context) -> Any:
+        state = ctx.ensure_object(Context)
+        if state.json_output and not self._declares_json_option():
+            raise click.UsageError(
+                f"'{ctx.command_path}' has no JSON output; drop --json to run it."
+            )
+        return super().invoke(ctx)
+
+    def _declares_json_option(self) -> bool:
+        """
+        Report whether this command opted into ``--json`` via :func:`json_option`.
+
+        Checking for the option by its callback's identity, rather than by a
+        separate marker a command would have to set by hand, is what keeps
+        this in one place: a command that wants ``--json`` declares the
+        option it already needs to declare for the after-the-name spelling
+        to parse, and nothing else.
+
+        Returns:
+            True when :func:`json_option` was used to declare this command.
+        """
+        return any(
+            isinstance(param, click.Option) and param.callback is _adopt_json
+            for param in self.params
+        )
+
+
+class WasmGroup(click.Group):
+    """
+    The one group class every command module's tree is built from.
+
+    Setting ``command_class`` here, instead of passing ``cls=WasmCommand`` at
+    each of the roughly ninety ``@group.command(...)`` call sites across the
+    tree, is what makes ``--json`` handling a property of how a group is
+    declared rather than something each command has to opt into remembering
+    - the same reasoning that put ``--dry-run`` on the execution seam instead
+    of in every command that changes something.
+
+    ``group_class = type`` carries this class - or whichever subclass a
+    module defines for its own alias resolution, since every such subclass
+    now inherits from this one - down to a nested group such as
+    ``backup schedule``, so the property holds however deep a command sits.
+    """
+
+    command_class = WasmCommand
+    group_class = type
+
+
 def enable_dry_run(state: Context) -> None:
     """
     Turn the invocation into a rehearsal.
@@ -213,6 +281,100 @@ def enable_dry_run(state: Context) -> None:
         )
     )
     set_fs(DryRunFileSystem(on_skip=logger.info))
+
+
+def _fold_global_flag(attribute: str) -> Callable[[click.Context, click.Parameter, bool], None]:
+    """
+    Build the callback that folds one global flag into the shared context.
+
+    ``--verbose``, ``--dry-run`` and ``--no-color`` all have always worked
+    typed after a subcommand's name, which means every subcommand needs its
+    own copy of these three options. Before this, four modules
+    (``config.py``, ``setup.py``, ``webapp.py``, ``web.py``) each grew a
+    private, near-identical version of this callback, differing only in
+    incidental details - ``hidden=True`` here, ``default=None`` there, a
+    cache invalidation for the logger in one and not the others - that made
+    the duplication easy to miss in review. This is the one place that
+    decides what each flag does; :func:`global_flags` is the one decorator
+    that offers them.
+
+    Args:
+        attribute: Name of the :class:`Context` attribute to set.
+
+    Returns:
+        A Click option callback.
+    """
+
+    def fold(ctx: click.Context, _param: click.Parameter, value: bool) -> None:
+        if not value:
+            return
+        state = ctx.ensure_object(Context)
+        setattr(state, attribute, True)
+
+        # The root callback has already run by the time a subcommand's own
+        # options are parsed, so a flag typed after the subcommand name has
+        # to apply its own side effect here.
+        if attribute == "verbose":
+            # A logger already built with the old verbosity is stale.
+            state._logger = None
+        elif attribute == "no_color":
+            set_colors_disabled(True)
+        elif attribute == "dry_run":
+            enable_dry_run(state)
+
+    return fold
+
+
+#: Applied in declaration order, so verbosity is adopted before anything that
+#: logs during parsing.
+_GLOBAL_FLAGS = (
+    click.option(
+        "-v",
+        "--verbose",
+        is_flag=True,
+        is_eager=True,
+        expose_value=False,
+        callback=_fold_global_flag("verbose"),
+        help="Show the detail of each step.",
+    ),
+    click.option(
+        "--dry-run",
+        is_flag=True,
+        is_eager=True,
+        expose_value=False,
+        callback=_fold_global_flag("dry_run"),
+        help="Rehearse without changing anything. Read-only checks still run.",
+    ),
+    click.option(
+        "--no-color",
+        is_flag=True,
+        is_eager=True,
+        expose_value=False,
+        callback=_fold_global_flag("no_color"),
+        help="Never emit colour.",
+    ),
+)
+
+
+def global_flags(command: _F) -> _F:
+    """
+    Accept ``--verbose``/``--dry-run``/``--no-color`` after a command's name.
+
+    They are the same flags the root group declares and they end up in the
+    same place, the shared :class:`Context`. Nothing here binds a parameter
+    of the command function: a late flag can only ever turn a setting on, and
+    can never overwrite what the user asked for before the command name,
+    which is the argparse-era bug this whole migration exists to remove.
+
+    Args:
+        command: The command function being decorated.
+
+    Returns:
+        The same function, with the three options attached.
+    """
+    for option in reversed(_GLOBAL_FLAGS):
+        command = option(command)
+    return command
 
 
 class LazyGroup(click.Group):
@@ -364,6 +526,13 @@ def main(argv: list[str] | None = None) -> int:
         logger.error(str(exc))
         if exc.details:
             logger.info(exc.details)
+        # A system error is never paraphrased: nginx's, systemd's or psql's
+        # own output is shown verbatim, exactly like the API's ErrorResponse
+        # carries it in its own "output" field (wasm.web.api.deps.error_response).
+        if exc.output:
+            logger.blank()
+            for line in exc.output.rstrip("\n").splitlines():
+                logger._write(logger._colorize(line, Colors.DIM))
         return 1
     except KeyboardInterrupt:
         click.echo("\nInterrupted", err=True)

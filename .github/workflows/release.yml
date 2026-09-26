@@ -168,6 +168,7 @@ jobs:
           cp obs/debian.rules debian/rules
           cp obs/debian.postinst debian/postinst
           cp obs/debian.postrm debian/postrm
+          cp obs/debian.prerm debian/prerm
           cp obs/wasm.default.yaml debian/wasm.default.yaml
           cp obs/wasm.dirs debian/dirs
           cp obs/wasm.manpages debian/manpages
@@ -506,6 +507,7 @@ jobs:
           cp obs/debian.rules debian/rules
           cp obs/debian.postinst debian/postinst
           cp obs/debian.postrm debian/postrm
+          cp obs/debian.prerm debian/prerm
           cp obs/wasm.default.yaml debian/wasm.default.yaml
           cp obs/wasm.dirs debian/dirs
           cp obs/wasm.manpages debian/manpages

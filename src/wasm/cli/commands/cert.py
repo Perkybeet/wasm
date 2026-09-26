@@ -25,6 +25,7 @@ Two rules shape the code:
 
 from __future__ import annotations
 
+import json
 import sys
 from argparse import Namespace
 from collections.abc import Sequence
@@ -32,7 +33,7 @@ from pathlib import Path
 
 import click
 
-from wasm.cli.app import Context, pass_context
+from wasm.cli.app import Context, WasmGroup, json_option, pass_context
 from wasm.cli.panel_links import open_in_panel
 from wasm.core.exceptions import CertificateError, DomainError, WASMError
 from wasm.core.logger import Logger
@@ -53,7 +54,7 @@ COMMAND_ALIASES: dict[str, str] = {
 }
 
 
-class CertGroup(click.Group):
+class CertGroup(WasmGroup):
     """A group that also answers to the older spellings of its subcommands."""
 
     def get_command(self, ctx: click.Context, name: str) -> click.Command | None:
@@ -220,20 +221,36 @@ def _create_certificate(
     return 0
 
 
-def _list_certificates(manager: CertManager, logger: Logger) -> int:
+def _list_certificates(manager: CertManager, logger: Logger, *, json_output: bool = False) -> int:
     """
     Show every certificate certbot manages on this machine.
 
     Args:
         manager: The certificate manager.
         logger: Where the table is written.
+        json_output: Print the certificates as JSON instead of a table.
 
     Returns:
         Exit code.
     """
+    certificates = manager.list_certificates()
+
+    if json_output:
+        click.echo(
+            json.dumps(
+                {
+                    "certificates": [
+                        {"name": cert.name, "domains": list(cert.domains), "expiry": cert.expiry}
+                        for cert in certificates
+                    ],
+                    "total": len(certificates),
+                }
+            )
+        )
+        return 0
+
     logger.header("SSL Certificates")
 
-    certificates = manager.list_certificates()
     if not certificates:
         logger.info("No certificates found")
         return 0
@@ -249,7 +266,9 @@ def _list_certificates(manager: CertManager, logger: Logger) -> int:
     return 0
 
 
-def _show_certificate(manager: CertManager, logger: Logger, domain: str) -> int:
+def _show_certificate(
+    manager: CertManager, logger: Logger, domain: str, *, json_output: bool = False
+) -> int:
     """
     Show what one certificate covers and how long it is valid for.
 
@@ -257,6 +276,7 @@ def _show_certificate(manager: CertManager, logger: Logger, domain: str) -> int:
         manager: The certificate manager.
         logger: Where the detail is written.
         domain: Validated domain name.
+        json_output: Print the certificate's details as JSON.
 
     Returns:
         Exit code.
@@ -271,6 +291,25 @@ def _show_certificate(manager: CertManager, logger: Logger, domain: str) -> int:
             details="Run 'wasm cert list' to see what this machine holds.",
         )
 
+    test = manager.test_cert(domain)
+
+    if json_output:
+        click.echo(
+            json.dumps(
+                {
+                    "name": info.name,
+                    "domains": list(info.domains),
+                    "expiry": info.expiry_full,
+                    "cert_path": info.cert_path,
+                    "key_path": info.key_path,
+                    "valid": test.valid,
+                    "not_before": test.not_before,
+                    "not_after": test.not_after,
+                }
+            )
+        )
+        return 0
+
     logger.header(f"Certificate: {domain}")
     logger.key_value("Name", info.name)
     logger.key_value("Domains", ", ".join(info.domains))
@@ -281,7 +320,6 @@ def _show_certificate(manager: CertManager, logger: Logger, domain: str) -> int:
     if info.key_path:
         logger.key_value("Private Key", info.key_path)
 
-    test = manager.test_cert(domain)
     if test.valid:
         logger.blank()
         logger.success("Certificate is valid")
@@ -466,10 +504,11 @@ def create_command(
     is_flag=True,
     help="Print the panel URL for the certificate list, opening it if a display is available.",
 )
+@json_option("Print the certificate list as JSON.")
 @pass_context
 def list_command(ctx: Context, open_panel: bool) -> None:
     """List the certificates this machine holds, with their expiry dates."""
-    code = _list_certificates(_manager(ctx.verbose), ctx.logger)
+    code = _list_certificates(_manager(ctx.verbose), ctx.logger, json_output=ctx.json_output)
     if open_panel and code == 0:
         # /certificates does not exist in the console: certificates are the
         # default tab of /domains, not a page of their own. The explicit
@@ -479,10 +518,11 @@ def list_command(ctx: Context, open_panel: bool) -> None:
 
 @cli.command("info", short_help="Show one certificate. Also 'show'.")
 @click.argument("domain", callback=_normalise_domain)
+@json_option("Print the certificate's details as JSON.")
 @pass_context
 def info_command(ctx: Context, domain: str) -> None:
     """Show what the certificate for DOMAIN covers and when it expires."""
-    _show_certificate(_manager(ctx.verbose), ctx.logger, domain)
+    _show_certificate(_manager(ctx.verbose), ctx.logger, domain, json_output=ctx.json_output)
 
 
 @cli.command("renew", short_help="Renew certificates that are due.")

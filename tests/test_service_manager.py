@@ -763,6 +763,29 @@ def test_list_services_excludes_foreign_units(
     assert names == ["wasm-example"]
 
 
+@pytest.mark.parametrize(
+    ("raw_state", "running"),
+    [
+        ("active", True),
+        ("active\n", True),
+        ("inactive", False),
+        ("failed", False),
+        ("activating", False),
+        ("deactivating", False),
+        ("", False),
+    ],
+)
+def test_state_is_running_is_the_one_place_that_decides(raw_state: str, running: bool) -> None:
+    """
+    ``systemctl is-active`` (get_status) and the ACTIVE column
+    ``systemctl list-units`` prints (list_services) share this vocabulary.
+    Only one of its values means "running", and this is the one place that
+    says so, so 'wasm service list' and the web API cannot end up asking the
+    question two different ways.
+    """
+    assert ServiceManager.state_is_running(raw_state) is running
+
+
 def test_list_services_query_is_scoped(manager: ServiceManager, runner: FakeRunner) -> None:
     """Asking for '*' is what surfaced ssh and cron as deletable in the panel."""
     manager.list_services()

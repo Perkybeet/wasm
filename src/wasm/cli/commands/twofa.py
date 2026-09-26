@@ -19,9 +19,11 @@ accepts typed in by hand or turned into a QR code by another tool.
 
 from __future__ import annotations
 
+import json
+
 import click
 
-from wasm.cli.app import Context, pass_context
+from wasm.cli.app import Context, WasmGroup, json_option, pass_context
 from wasm.web.auth import SecurityConfig, TokenManager
 
 
@@ -35,16 +37,22 @@ def _manager() -> TokenManager:
     return TokenManager(SecurityConfig())
 
 
-@click.group("2fa")
+@click.group("2fa", cls=WasmGroup)
 def cli() -> None:
     """Enrol, confirm, disable or recover two-factor authentication for logins."""
 
 
 @cli.command("status")
+@json_option("Print the status as JSON.")
 @pass_context
 def status_command(ctx: Context) -> None:
     """Report the two-factor state, without exposing any secret."""
     status = _manager().totp_status()
+
+    if ctx.json_output:
+        click.echo(json.dumps(status))
+        return
+
     logger = ctx.logger
     logger.key_value("Enabled", "yes" if status["enabled"] else "no")
     logger.key_value("Enrolment pending", "yes" if status["pending"] else "no")

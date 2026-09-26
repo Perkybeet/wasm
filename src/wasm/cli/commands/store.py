@@ -26,7 +26,7 @@ from pathlib import Path
 
 import click
 
-from wasm.cli.app import Context, pass_context
+from wasm.cli.app import Context, WasmGroup, json_option, pass_context
 from wasm.core.config import Config, secure_write
 from wasm.core.exceptions import ConfigError, WASMError
 from wasm.core.logger import Logger
@@ -516,7 +516,7 @@ def _store_path() -> int:
     return 0
 
 
-@click.group(name="store")
+@click.group(name="store", cls=WasmGroup)
 def cli() -> None:
     """Inspect and maintain the database WASM records deployments in."""
 
@@ -529,6 +529,7 @@ def init(state: Context) -> None:
 
 
 @cli.command("stats")
+@json_option("Print the counts as JSON.")
 @pass_context
 def stats(state: Context) -> None:
     """Count the applications, sites, services and databases on record."""

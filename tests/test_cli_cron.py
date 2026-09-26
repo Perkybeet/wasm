@@ -16,6 +16,7 @@ test rather than shipping.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -169,16 +170,24 @@ def test_no_command_binds_a_global_flag(cli_runner: CliRunner) -> None:
     """
     No subcommand redeclares --verbose/--dry-run/--json/--no-color as its own.
 
-    None of these commands offer JSON or re-expose the global flags at all,
-    so simply not declaring them is what keeps 'wasm --dry-run cron delete
-    <name> --force' from being overridden by a subparser default - the
-    argparse-era bug this whole migration exists to remove.
+    ``list`` and ``runs`` offer ``--json`` (via ``json_option``, with
+    ``expose_value=False``), which can only ever switch the shared Context on
+    and never binds - and so cannot overwrite - a value on the command
+    function. None of the others re-expose a global flag at all, so simply
+    not declaring one is what keeps 'wasm --dry-run cron delete <name>
+    --force' from being overridden by a subparser default - the argparse-era
+    bug this whole migration exists to remove.
     """
     global_flags = {"--verbose", "-v", "--dry-run", "--json", "--no-color"}
     for name in cron_cli.cli.list_commands(click.Context(cron_cli.cli)):
         command = cron_cli.cli.get_command(click.Context(cron_cli.cli), name)
         assert command is not None
-        present = {opt for param in command.params for opt in getattr(param, "opts", [])}
+        present = {
+            opt
+            for param in command.params
+            if getattr(param, "expose_value", True)
+            for opt in getattr(param, "opts", [])
+        }
         assert not present & global_flags, f"cron {name} redeclares a global flag"
 
 
@@ -211,6 +220,37 @@ def test_list_reports_an_owned_job(
     assert "cleanup" in result.output
     assert "daily" in result.output
     assert "enabled" in result.output
+
+
+def test_list_json_reports_the_same_shape_the_api_uses(
+    cli_runner: CliRunner, runner: FakeRunner, systemd_dir: Path
+) -> None:
+    """
+    'wasm cron list --json' carries the fields GET /api/cron's CronJobInfo
+    does, since both are built from CronManager.list_jobs.
+    """
+    write_owned_pair(systemd_dir)
+    runner.script(["systemctl", "list-unit-files"], stdout=LIST_UNIT_FILES_LINE)
+    runner.script(["systemctl", "show", "wasm-cron-cleanup.timer"], stdout=SHOW_TIMER_OUTPUT)
+    runner.script(["systemctl", "show", "wasm-cron-cleanup.service"], stdout="")
+
+    result = cli_runner.invoke(cron_cli.cli, ["list", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["total"] == 1
+    job = payload["jobs"][0]
+    assert job["name"] == "cleanup"
+    assert job["schedule"] == "daily"
+    assert job["enabled"] is True
+
+
+def test_list_json_reports_an_empty_machine(cli_runner: CliRunner, runner: FakeRunner) -> None:
+    """No jobs is {"jobs": [], "total": 0}, not the human hint text."""
+    result = cli_runner.invoke(cron_cli.cli, ["list", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == {"jobs": [], "total": 0}
 
 
 def test_list_shows_the_effective_working_directory(
@@ -411,6 +451,24 @@ def test_runs_reconstructs_history_from_the_journal(
 
     assert result.exit_code == 0, result.output
     assert "cleaning caches" in result.output
+
+
+def test_runs_json_carries_the_same_fields_as_the_api(
+    cli_runner: CliRunner, runner: FakeRunner, systemd_dir: Path
+) -> None:
+    """'wasm cron runs --json' matches GET /api/cron/{name}/runs's CronRunInfo."""
+    write_owned_pair(systemd_dir)
+    runner.script(["journalctl", "-u", "wasm-cron-cleanup.service"], stdout=JOURNAL_OUTPUT)
+
+    result = cli_runner.invoke(cron_cli.cli, ["runs", "cleanup", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["name"] == "cleanup"
+    assert payload["total"] == 1
+    run = payload["runs"][0]
+    assert "cleaning caches" in run["output"]
+    assert run["success"] is True
 
 
 def test_runs_reports_no_history(

@@ -21,7 +21,7 @@ import re
 
 import click
 
-from wasm.cli.app import Context, pass_context
+from wasm.cli.app import Context, WasmGroup, json_option, pass_context
 from wasm.core.exceptions import WASMError
 from wasm.core.logger import Logger
 from wasm.core.store import DeploymentTrigger, get_store
@@ -62,7 +62,7 @@ def print_plan(logger: Logger, plan: MigrationPlan) -> None:
         logger.warning(warning)
 
 
-@click.group("app")
+@click.group("app", cls=WasmGroup)
 def cli() -> None:
     """Change how a deployed application is laid out and what it may use."""
 
@@ -77,6 +77,7 @@ def cli() -> None:
     help="Keep this path in shared/ across releases. Repeat for each; replaces detection.",
 )
 @click.option("--yes", "-y", is_flag=True, default=False, help="Do not ask for confirmation.")
+@json_option("Print the migration plan (or, with --yes, its result) as JSON.")
 @pass_context
 def migrate_command(ctx: Context, domain: str, persist: tuple[str, ...], yes: bool) -> None:
     """
@@ -202,6 +203,7 @@ def _describe(limits: ResourceLimits) -> str:
 @click.option("--cpu", metavar="PERCENT", help="CPU quota: 50% of one CPU, 200% for two, or none.")
 @click.option("--tasks", metavar="N", help="Processes and threads it may run, or none.")
 @click.option("--restart", is_flag=True, default=False, help="Restart now so the new limits apply.")
+@json_option("Print the limits as JSON.")
 @pass_context
 def limits_command(
     ctx: Context,

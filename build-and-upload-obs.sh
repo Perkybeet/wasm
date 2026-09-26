@@ -90,6 +90,7 @@ cp "$SCRIPT_DIR/obs/debian.rules" .
 cp "$SCRIPT_DIR/obs/debian.copyright" .
 cp "$SCRIPT_DIR/obs/debian.postinst" .
 cp "$SCRIPT_DIR/obs/debian.postrm" .
+cp "$SCRIPT_DIR/obs/debian.prerm" .
 cp "$SCRIPT_DIR/obs/wasm.dsc" .
 cp "$SCRIPT_DIR/obs/wasm.1" .
 cp "$SCRIPT_DIR/obs/wasm.default.yaml" .

@@ -255,6 +255,26 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
     echo "nothing. The auto_terminate and use_ai settings are ignored."
 fi
 
+%preun
+# $1 is 0 only when this is the last version being removed, never on an
+# upgrade (where it is 1 or more, and the unit is meant to survive the
+# version bump untouched).
+if [ $1 -eq 0 ]; then
+    # 'wasm monitor install' writes and enables wasm-monitor.service at
+    # runtime; this spec never packages that unit, so rpm has none of its own
+    # to stop here and the daemon kept running under a binary that had just
+    # been removed. Data (config.yaml, /var/log/wasm, deployed applications)
+    # is untouched: this only stops and disables units.
+    systemctl stop wasm-monitor.service >/dev/null 2>&1 || :
+    systemctl disable wasm-monitor.service >/dev/null 2>&1 || :
+
+    # The console runs as a daemon (wasm web start -d), not as a unit; stop it
+    # while its binary still exists.
+    if [ -x /usr/bin/wasm ]; then
+        /usr/bin/wasm web stop >/dev/null 2>&1 || :
+    fi
+fi
+
 %changelog
 * Sat Sep 26 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.6.5-1
 - Fix the Debian package pip-installing into the system Python with --break-system-packages on every install and upgrade

@@ -293,7 +293,13 @@ def test_no_subcommand_redeclares_a_global_flag() -> None:
         for command in commands
         if command is not None
         for option in command.params
-        if isinstance(option, click.Option) and GLOBAL_FLAGS.intersection(option.opts)
+        # expose_value=False (json_option's own contract) means the option
+        # can only ever switch the shared Context on and can never bind -
+        # and so overwrite - a value on the command function, which is the
+        # defect this guard exists to catch.
+        if isinstance(option, click.Option)
+        and option.expose_value
+        and GLOBAL_FLAGS.intersection(option.opts)
     }
 
     assert offenders == {}, f"commands that shadow a global flag: {offenders}"
@@ -433,6 +439,33 @@ def test_status_states_what_the_monitor_will_not_do(
 
     output = cli_output.getvalue()
     assert "signals, terminates or restarts a process" in output
+
+
+def test_status_json_carries_the_same_fields_the_api_uses(monitor_env: Any) -> None:
+    """
+    'wasm monitor status --json' matches GET /api/monitor/status's
+    MonitorStatus and GET /api/monitor/config's MonitorSettings, both built
+    from the same ProcessMonitor.
+    """
+    result = invoke("status", "--json")
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["installed"] is False
+    assert payload["settings"]["scan_interval"] > 0
+    assert any("signals, terminates or restarts a process" in item for item in payload["scope"])
+
+
+def test_status_without_json_still_prints_a_report(
+    monitor_env: Any, cli_output: io.StringIO
+) -> None:
+    """The default stays human-readable; --json is opt-in."""
+    result = invoke("status")
+
+    assert result.exit_code == 0, result.output
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(result.output)
+    assert "signals, terminates or restarts a process" in cli_output.getvalue()
 
 
 def test_status_open_prints_the_configured_panel_url_without_a_display(

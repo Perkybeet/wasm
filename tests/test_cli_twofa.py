@@ -13,6 +13,7 @@ calls, over the same on-disk state.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -69,6 +70,26 @@ def test_status_reports_disabled_on_a_fresh_install(cli_runner: CliRunner, state
 
     assert result.exit_code == 0, result.output
     assert "Enabled: no" in result.output
+
+
+def test_status_json_reports_the_same_state(cli_runner: CliRunner, state_dir: Path) -> None:
+    """The payload carries the same facts the key/value report shows."""
+    result = cli_runner.invoke(root_cli, ["2fa", "status", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload == {"enabled": False, "pending": False, "backup_codes_remaining": 0}
+
+
+def test_status_without_json_still_prints_for_a_human(
+    cli_runner: CliRunner, state_dir: Path
+) -> None:
+    """The default stays human-readable; --json is opt-in."""
+    result = cli_runner.invoke(root_cli, ["2fa", "status"])
+
+    assert result.exit_code == 0, result.output
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(result.output)
 
 
 def test_enroll_prints_a_secret_and_an_otpauth_uri(cli_runner: CliRunner, state_dir: Path) -> None:

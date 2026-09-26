@@ -26,11 +26,12 @@ tested directly, for the same reason.
 
 from __future__ import annotations
 
+import json
 from argparse import Namespace
 
 import click
 
-from wasm.cli.app import Context, pass_context
+from wasm.cli.app import Context, json_option, pass_context
 from wasm.core.logger import Logger
 from wasm.managers.health import HealthCheck, HealthReport, collect_health_report
 
@@ -116,7 +117,33 @@ def _print_report(logger: Logger, report: HealthReport) -> None:
         logger.warning("System is healthy with minor warnings.")
 
 
-def run_health_check(verbose: bool = False) -> int:
+def report_as_dict(report: HealthReport) -> dict:
+    """
+    Build the JSON payload for a health report.
+
+    Same shape as ``GET /api/system/health`` (:class:`~wasm.web.api.system.SystemHealthOut`),
+    both built from :func:`~wasm.managers.health.collect_health_report`, so the
+    console's server card and a script parsing ``wasm health --json`` can
+    never disagree about what a check found.
+
+    Args:
+        report: The report to serialise.
+
+    Returns:
+        A JSON-serialisable mapping.
+    """
+    return {
+        "verdict": report.verdict,
+        "checks": [
+            {"name": check.name, "value": check.value, "status": check.status}
+            for check in report.checks
+        ],
+        "issues": report.issues,
+        "warnings": report.warnings,
+    }
+
+
+def run_health_check(verbose: bool = False, *, json_output: bool = False) -> int:
     """
     Inspect the server and report what is wrong with it.
 
@@ -125,22 +152,29 @@ def run_health_check(verbose: bool = False) -> int:
 
     Args:
         verbose: Print the detail of each step.
+        json_output: Print the report as JSON instead of for a human.
 
     Returns:
         1 when the check found issues, 0 otherwise.
     """
+    report = collect_health_report(verbose=verbose)
+
+    if json_output:
+        click.echo(json.dumps(report_as_dict(report)))
+        return 1 if report.verdict == "error" else 0
+
     logger = Logger(verbose=verbose)
 
     logger.header("System Health Check")
     logger.blank()
 
-    report = collect_health_report(verbose=verbose)
     _print_report(logger, report)
 
     return 1 if report.verdict == "error" else 0
 
 
 @click.command("health")
+@json_option("Print the report as JSON.")
 @pass_context
 def cli(ctx: Context) -> int:
     """
@@ -149,7 +183,7 @@ def cli(ctx: Context) -> int:
     Looks at free disk space, the web server, every deployed application,
     certificates close to expiry and memory pressure. It only reads.
     """
-    return run_health_check(verbose=ctx.verbose)
+    return run_health_check(verbose=ctx.verbose, json_output=ctx.json_output)
 
 
 def handle_health(args: Namespace) -> int:

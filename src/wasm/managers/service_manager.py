@@ -711,6 +711,27 @@ class ServiceManager(BaseManager):
         """
         return self._resolve_service_file(name).exists()
 
+    @staticmethod
+    def state_is_running(raw_state: str) -> bool:
+        """
+        Decide whether a systemd active-state string means "running".
+
+        ``systemctl is-active`` and the ACTIVE column ``systemctl
+        list-units`` prints share one vocabulary (``active``, ``inactive``,
+        ``failed``, ``activating``, ``deactivating``, ``reloading``), and
+        exactly one value of it means the unit is up. This is the one place
+        that decides that, so :meth:`get_status` (which the web API reads)
+        and a caller of :meth:`list_services` (``wasm service list``) cannot
+        end up answering "is it running" two different ways.
+
+        Args:
+            raw_state: The raw string systemd reported.
+
+        Returns:
+            True when the state means the unit is running.
+        """
+        return raw_state.strip() == "active"
+
     def list_services(self, all_services: bool = False) -> list[dict]:
         """
         List WASM-managed services.
@@ -807,8 +828,8 @@ class ServiceManager(BaseManager):
         # probes below only read, systemd is the authority on what is running,
         # and a status call that lies about a live service is how a broken
         # deployment gets reported as healthy. ``exists`` reports our own view.
-        is_active = (
-            self._exec(["systemctl", "is-active", info.unit_file]).stdout.strip() == "active"
+        is_active = self.state_is_running(
+            self._exec(["systemctl", "is-active", info.unit_file]).stdout
         )
         is_enabled = (
             self._exec(["systemctl", "is-enabled", info.unit_file]).stdout.strip() == "enabled"

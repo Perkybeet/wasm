@@ -37,7 +37,7 @@ from typing import Any, NoReturn
 
 import click
 
-from wasm.cli.app import Context, pass_context
+from wasm.cli.app import Context, WasmGroup, json_option, pass_context
 from wasm.cli.panel_links import open_in_panel
 from wasm.core.config import Config
 from wasm.core.exceptions import DatabaseError, DatabaseQueryError
@@ -1482,7 +1482,7 @@ def handle_db(args: Namespace) -> int:
 # ==================== The Click front end ====================
 
 
-class DatabaseGroup(click.Group):
+class DatabaseGroup(WasmGroup):
     """
     The ``db`` group, with the shorthand its subcommands have always had.
 
@@ -1532,6 +1532,7 @@ def uninstall(ctx: Context, engine: str, purge: bool, force: bool) -> None:
 
 @cli.command()
 @click.argument("engine", type=ENGINE, required=False)
+@json_option("Print the statuses as JSON.")
 @pass_context
 def status(ctx: Context, engine: str | None) -> None:
     """Show which engines are installed and which are running."""
@@ -1563,6 +1564,7 @@ def restart(ctx: Context, engine: str) -> None:
 
 
 @cli.command()
+@json_option("Print the engine list as JSON.")
 @pass_context
 def engines(ctx: Context) -> None:
     """List the engines WASM can manage, and their versions."""
@@ -1604,6 +1606,7 @@ def drop(ctx: Context, name: str, engine: str, force: bool) -> None:
     is_flag=True,
     help="Print the panel URL for the database list, opening it if a display is available.",
 )
+@json_option("Print the database list as JSON.")
 @pass_context
 def list_databases(ctx: Context, engine: str | None, open_panel: bool) -> None:
     """List the databases on every running engine."""
@@ -1616,6 +1619,7 @@ def list_databases(ctx: Context, engine: str | None, open_panel: bool) -> None:
 @cli.command()
 @click.argument("name")
 @click.option("--engine", "-e", type=ENGINE, required=True, help="Engine the database is on.")
+@json_option("Print the database's details as JSON.")
 @pass_context
 def info(ctx: Context, name: str, engine: str) -> None:
     """Show the size, owner and encoding of a database."""
@@ -1667,6 +1671,7 @@ def user_delete(ctx: Context, username: str, engine: str, host: str, force: bool
 
 @cli.command("user-list")
 @click.option("--engine", "-e", type=ENGINE, required=True, help="Engine to list the users of.")
+@json_option("Print the user list as JSON.")
 @pass_context
 def user_list(ctx: Context, engine: str) -> None:
     """List the users of an engine."""
@@ -1780,6 +1785,7 @@ def restore(
 @cli.command()
 @click.option("--engine", "-e", type=ENGINE, help="Only this engine. Defaults to all of them.")
 @click.option("--database", "-d", help="Only backups of this database.")
+@json_option("Print the backup list as JSON.")
 @pass_context
 def backups(ctx: Context, engine: str | None, database: str | None) -> None:
     """List the database backups on this server."""

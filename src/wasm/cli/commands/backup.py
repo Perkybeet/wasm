@@ -35,7 +35,7 @@ from typing import Any
 
 import click
 
-from wasm.cli.app import Context, pass_context
+from wasm.cli.app import Context, WasmGroup, json_option, pass_context
 from wasm.cli.panel_links import open_in_panel
 from wasm.core.exceptions import WASMError
 from wasm.core.logger import Logger
@@ -63,7 +63,7 @@ SCHEDULE_ALIASES: dict[str, str] = {
 REDIS_METHODS: tuple[str, ...] = ("rdb", "aof")
 
 
-class AliasedGroup(click.Group):
+class AliasedGroup(WasmGroup):
     """
     A group that answers to the alternative spellings of its subcommands.
 
@@ -704,7 +704,7 @@ def _rollback_app(
     return 0
 
 
-@click.group()
+@click.group(cls=WasmGroup)
 def cli() -> None:
     """
     Container for the commands this module defines.
@@ -839,6 +839,7 @@ def backup_create(
     is_flag=True,
     help="Print the panel URL for the backup list, opening it if a display is available.",
 )
+@json_option("Print the backup list as JSON.")
 @pass_context
 def backup_list(
     state: Context,
@@ -922,6 +923,7 @@ def backup_verify(state: Context, backup_id: str) -> None:
 
 @backup.command("info")
 @click.argument("backup_id")
+@json_option("Print the backup's metadata as JSON.")
 @pass_context
 def backup_info(state: Context, backup_id: str) -> None:
     """
@@ -931,6 +933,7 @@ def backup_info(state: Context, backup_id: str) -> None:
 
 
 @backup.command("storage")
+@json_option("Print the storage usage as JSON.")
 @pass_context
 def backup_storage(state: Context) -> None:
     """

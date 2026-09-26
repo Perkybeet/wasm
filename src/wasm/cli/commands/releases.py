@@ -20,7 +20,7 @@ import json
 
 import click
 
-from wasm.cli.app import Context, json_option, pass_context
+from wasm.cli.app import Context, WasmGroup, json_option, pass_context
 from wasm.core.logger import Logger
 from wasm.core.store import DeploymentTrigger
 from wasm.deployers.lifecycle import ReleaseInfo, activate_release, list_releases
@@ -56,7 +56,7 @@ def print_releases(logger: Logger, domain: str, releases: list[ReleaseInfo]) -> 
     logger.info(f"Go back to one with: wasm releases rollback {domain} <release>")
 
 
-@click.group("releases")
+@click.group("releases", cls=WasmGroup)
 def cli() -> None:
     """List an application's releases and go back to one instantly."""
 
