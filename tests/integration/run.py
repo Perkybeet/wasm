@@ -83,6 +83,16 @@ UPGRADE_COMPOSE_APP = "upg-compose-test"
 UPGRADE_COMPOSE_ROOT = f"/var/www/apps/{UPGRADE_COMPOSE_APP}"
 
 #: The query behind :func:`_store_apps_snapshot`: columns that exist in both
+#: The schema the working tree's store migrates to, read from its source rather than imported:
+#: the harness runs on the host and never imports the package it tests.
+SCHEMA_VERSION = int(
+    re.search(
+        r"^SCHEMA_VERSION = (\d+)$",
+        (Path(__file__).resolve().parents[2] / "src/wasm/core/store.py").read_text(),
+        re.MULTILINE,
+    ).group(1)  # type: ignore[union-attr]
+)
+
 #: the 1.6.5 (schema v3) and 2.0 (schema v8) apps table, in a stable order, so
 #: the row for each application can be compared byte-for-byte across the
 #: upgrade. `layout` and the other v5+ columns are checked separately, since
@@ -1831,7 +1841,8 @@ def run_upgrade_rehearsal(sc: Scenario, wheel: Path) -> None:
         label="[2.0] SELECT MAX(version) FROM schema_version",
     )
     sc.check(
-        schema.stdout.strip() == "8", f"the store did not migrate to schema v8: {schema.stdout!r}"
+        schema.stdout.strip() == str(SCHEMA_VERSION),
+        f"the store did not migrate to schema v{SCHEMA_VERSION}: {schema.stdout!r}",
     )
 
     after_apps_rows = _store_apps_snapshot(sc, "[2.0] SELECT every app row's shared columns")
