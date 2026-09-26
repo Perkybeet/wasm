@@ -17,14 +17,16 @@ case "$1" in
             groupadd --system wasm
         fi
 
-        # Set proper permissions for directories
+        # The apps directory itself only. What is inside belongs to each
+        # application and its deploys: a recursive chown here reassigned every
+        # file on every upgrade, including data directories bind-mounted into
+        # containers that run under their own uid.
         if [ -d /var/www/apps ]; then
-            chown -R www-data:www-data /var/www/apps
             chmod 755 /var/www/apps
         fi
 
         if [ -d /var/log/wasm ]; then
-            chown -R www-data:wasm /var/log/wasm
+            chown www-data:wasm /var/log/wasm
             chmod 775 /var/log/wasm
         fi
 
