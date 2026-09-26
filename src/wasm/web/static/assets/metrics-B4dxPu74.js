@@ -1,1 +1,0 @@
-import{A as e,x as t}from"./auth-BgK-BkzO.js";var n={all:[`metrics`],latest:[`metrics`,`latest`],catalogue:[`metrics`,`catalogue`],series:(e,t)=>[`metrics`,`series`,e,{window:t}]},r=(r,i)=>e({queryKey:n.series(r,i),queryFn:({signal:e})=>t(`get`,`/api/metrics/{metric}`,{params:{metric:r},query:{window:i},signal:e})});export{r as n,n as t};
