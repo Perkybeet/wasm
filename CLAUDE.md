@@ -1,7 +1,8 @@
 # WASM - Context for AI Assistants
 
 Python 3.10+ CLI for deploying web apps on Linux servers. Automates Nginx/Apache, SSL,
-systemd, databases and backups, and serves an optional control panel.
+systemd, databases and backups; builds every deploy as a health-gated release with instant
+rollback; and serves an optional browser console (React SPA) over a JSON API.
 
 **Repository**: https://github.com/Perkybeet/wasm | **License**: WASM-NCSAL 1.0
 
@@ -30,9 +31,9 @@ never argv, because everything on a command line is visible in `ps` to every loc
 the runner cannot be tested and fails loudly instead. `tests/test_architecture.py` enforces
 the import rule.
 
-`--dry-run` is implemented here too, as `DryRunRunner`. It is not wired per command: that is
-what left the flag honoured in three code paths and silently ignored in every destructive
-one.
+`--dry-run` is implemented here too, as `DryRunRunner`, and for file changes as
+`DryRunFileSystem` in `core/fs.py`. It is not wired per command: that is what left the flag
+honoured in three code paths and silently ignored in every destructive one.
 
 ### 2. `except Exception` is only allowed at an error boundary, and must log
 
@@ -68,22 +69,32 @@ template engine, not by remembering.
 src/wasm/
   core/
     runner.py       the only place processes are executed
-    store.py        SQLite persistence with versioned migrations
+    fs.py           the seam every file change goes through (DryRunFileSystem under --dry-run)
+    store.py        SQLite persistence (WAL) with versioned migrations
     config.py       layered config; secrets written 0600, redacted on the way out
     exceptions.py   WASMError hierarchy, used for real
   validators/       names, environments, sources, ports, domains
-  managers/         adapters: web server, systemd, certs, backups, databases, source
-  deployers/        strategies over a declarative pipeline
+  managers/         adapters: web server, systemd, certs, backups, databases, source, cron
+    diagnose.py     why an app is down: read-only probes, most likely cause first
+    health.py       the server-wide report behind `wasm health` and /api/system/health
+  deployers/        strategies over a declarative pipeline (base.py), one per app type
+    releases.py     ReleaseManager: the only code that knows releases/, current, shared/
+    lifecycle.py    the one "update an app"; release activation; resource limits
+    migrate.py      in-place to releases, explicit only, undone exactly on failure
+    domains.py      the one "names an app answers on": store, site, certificate, DNS check
+    helpers/        layout.py (which layout, where .env lives), health_gate.py, release_build.py
   web/
     api/            thin layer over the managers; one error contract for every router
     server.py       security middleware, CSP, serves the console
     events.py       the /events SSE stream the console listens to
+    jobs.py         background jobs, persisted with their logs
     static/         the console's committed Vite build (generated from panel/, never edited)
-  cli/              argparse tree; handlers hold no business logic
+  cli/              Click tree (app.py, commands/); handlers hold no business logic
 panel/              WASM Console source: React 19, TypeScript, Vite, TanStack Router/Query,
                     Base UI, Tailwind v4; src/api/schema.gen.ts is generated from openapi.json
   e2e/              Playwright + axe + CSP gate against the real backend
 scripts/console_server.py   the real API on a seeded, sandboxed store (development and E2E)
+tests/integration/run.py    real deploys in a systemd container (Docker); not part of pytest
 ```
 
 ### Adding a deployer
@@ -94,11 +105,57 @@ scripts/console_server.py   the real API on a seeded, sandboxed store (developme
 4. Register with `DeployerRegistry.register(MyTypeDeployer)` at the end of the file.
 5. Add a `detect()` test with a fake file tree, including the ambiguous cases.
 
+Build on `BaseDeployer` and the type gets releases, the health gate, domains and limits for
+free. `MonorepoDeployer` and `DockerComposeDeployer` implement `AppDeployer` directly, which
+is why they deploy in place and refuse aliases (`SUPPORTS_RELEASES` is read with `getattr`,
+defaulting to false).
+
+---
+
+## Deploy engine
+
+An application is on one of two layouts, recorded in `apps.layout`:
+
+- `inplace` (1.x): the service runs the tree every update rebuilds.
+- `releases`: `releases/<id>/` per deploy, `current` pointing at the active one, `.env` and
+  persistent paths in `shared/`, a git cache in `repo/`.
+
+`BaseDeployer` works with three paths, and code must use the right one:
+
+- `app_path`: the application directory the store records.
+- `build_path`: where the code being deployed is built. The new release on releases,
+  `app_path` in place. Everything that reads or builds the project uses it.
+- `runtime_path`: what the unit and the web server are given. `app_path/current` on
+  releases, `app_path` in place, so one unit and one site serve every release.
+
+In place the three are the same directory, which is what keeps that layout exactly as it was.
+Outside a deploy, ask `helpers/layout.py`: `env_file_for(app)` for the `.env`,
+`code_path_for(app)` for the running code. Never join `app_path` with `".env"`.
+
+Rules:
+
+- **An in-place application is never converted implicitly.** `choose_layout()` keeps the
+  layout an existing application has, a redeploy that asks for another is an error, and
+  `ReleaseManager.activate()` refuses to replace a real `current` directory. Only
+  `migrate.migrate()`, called by `wasm app migrate` and `POST /api/apps/{d}/migrate`,
+  moves an application onto releases.
+- **Every activation passes the same `HealthGate`**: deploy, update, rollback, migration and
+  limits applied with a restart. When it fails, what served before is put back (the previous
+  release, the in-place tree, the old limits) and the error carries the probes and the
+  journal verbatim.
+- **`lifecycle.update_app` is the only update.** The CLI, the console's job and the webhook
+  all call it.
+- **Nothing is written through a symlink found in a release or in `shared/`.** A repository
+  is untrusted input.
+
 ---
 
 ## Conventions
 
-- Service names: `wasm-{domain}`. App directories: `/var/www/apps/{app_name}/`.
+- App name: the domain with dots as dashes (`shop.example.com` is `shop-example-com`). It
+  names the directory `/var/www/apps/{app_name}/` and the unit `{app_name}.service`; units
+  from before 0.14.1 keep a legacy `wasm-` prefix. Cron and backup timers are `wasm-cron-*`
+  and `wasm-backup-*`.
 - Google-style docstrings on everything public, with Args/Returns/Raises.
 - Type hints everywhere, modern syntax (`X | None`, `list[str]`).
 - Actionable errors: `raise DeploymentError("what happened", details="how to fix it")`.
@@ -189,14 +246,19 @@ Debian or Ubuntu, which is why interactive mode never worked there.
 
 | Import | Debian | RPM |
 |--------|--------|-----|
-| `jinja2` | `python3-jinja2` | `python3-jinja2` |
-| `yaml` | `python3-yaml` | `python3-pyyaml` |
+| `click` | `python3-click` | `python3-click` |
+| `jinja2` | `python3-jinja2` | `python3-jinja2` (openSUSE: `python3-Jinja2`) |
+| `yaml` | `python3-yaml` | `python3-pyyaml` (openSUSE: `python3-PyYAML`) |
+| `rich` | `python3-rich` | `python3-rich` |
+| `questionary` | `python3-questionary` (Recommends: absent on Debian 12, Ubuntu 22.04) | `python3-questionary` |
 | `fastapi` | `python3-fastapi` | `python3-fastapi` |
 | `starlette` | `python3-starlette` | `python3-starlette` |
 | `pydantic` | `python3-pydantic` | `python3-pydantic` |
 | `uvicorn` | `python3-uvicorn` | `python3-uvicorn` |
 | `psutil` | `python3-psutil` | `python3-psutil` |
-| `jose` | `python3-jose` | `python3-jose` (openSUSE: `python3-python-jose`) |
+
+Every model the API adds goes through `web/pydantic_compat.py`: Ubuntu 24.04 and Debian 12
+ship pydantic 1.10, and a CI job pins it.
 
 ---
 
@@ -207,7 +269,10 @@ is committed to `src/wasm/web/static/` and served by `server.py`: hashed chunks 
 `/assets` (cached immutable for a year) and `index.html` (`no-store`) for every GET outside
 `/api`, `/assets`, `/events`, `/ws`, `/hooks` and `/health`, where a miss answers JSON. The
 backend renders no pages: the console is a client of the JSON API, the `/events` stream
-(`machine`, `metrics`, `app`, `job`, `notice`) and the log and job WebSockets, like any script.
+(`machine`, `metrics`, `app`, `job`, `state`, `notice`) and the log and job WebSockets, like
+any script. Destructive endpoints depend on `require_elevated` (sudo mode, `api/deps.py`);
+the console answers the `403 elevation_required` with its "Confirm it's you" dialog and
+retries once.
 FastAPI's OpenAPI schema is exported to `panel/openapi.json` and compiled into
 `panel/src/api/schema.gen.ts`, so the console cannot call an endpoint that does not exist.
 

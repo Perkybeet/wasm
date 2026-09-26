@@ -1,192 +1,132 @@
-# WASM Process Monitor
+# Resource monitor
 
-AI-powered security monitoring for Linux servers. Automatically detects and neutralizes suspicious processes like cryptocurrency miners, reverse shells, and other malicious activity.
+`wasm monitor` watches the machine and writes down what stands out: resource use, processes
+worth a look, units that stopped, certificates about to expire and full disks. It keeps what
+it noticed in a local database and can mail you a report.
 
-## Features
+It reports and does nothing else:
 
-- **AI-Powered Analysis**: Uses OpenAI GPT models to analyze process behavior
-- **Pattern Matching**: Quick detection of known malware signatures (XMRig, kinsing, etc.)
-- **Automatic Mitigation**: Terminates malicious processes and cleans up associated files
-- **Email Alerts**: Sends detailed reports when threats are detected
-- **Persistence Detection**: Identifies crontab entries and other persistence mechanisms
-- **Parent Process Tracking**: Can terminate entire process trees
+- it never signals, terminates or restarts a process;
+- it never deletes or modifies a file, except the systemd unit it installs;
+- it never decides anything from a process's command line;
+- nothing about the machine is sent to a third-party service. Reports go to your SMTP relay;
+  the disk, certificate and unit events also go through the notification channels you
+  configured (see [Notifications](#notifications)).
 
-## Installation
-
-1. Install the monitor dependencies:
-   ```bash
-   pip install wasm-cli[monitor]
-   # or
-   pip install psutil httpx
-   ```
-
-2. Configure the monitor in `/etc/wasm/config.yaml`:
-   ```yaml
-   monitor:
-     enabled: true
-     scan_interval: 3600  # Every hour
-     
-     # AI Analysis
-     use_ai: true
-     openai:
-       api_key: "your-openai-api-key"
-       model: "gpt-4o-mini"
-     
-     # Email notifications
-     smtp:
-       host: "smtp.example.com"
-       port: 465
-       username: "alerts@example.com"
-       password: "your-password"
-       use_ssl: true
-     
-     email_recipients:
-       - "admin@example.com"
-   ```
-
-3. Install and enable the systemd service:
-   ```bash
-   sudo wasm monitor install
-   sudo wasm monitor enable
-   ```
+Before 1.0 the monitor sent process data to OpenAI and could kill processes and delete their
+files. All of that is gone. The flags `--force-ai` and `--all` on `wasm monitor scan` are
+still accepted, ignored with a warning; the settings `monitor.auto_terminate`,
+`monitor.terminate_malicious_only` and `monitor.dry_run` are pinned to their safe values
+whatever the file says; `monitor.use_ai`, `monitor.ai_interval` and `monitor.openai.*` have no
+effect.
 
 ## Commands
 
 ```bash
-# Show monitor status
-wasm monitor status
+wasm monitor scan          # look at the machine once and print what stands out
+wasm monitor run           # scan on a loop in this terminal, until Ctrl+C
+wasm monitor install       # write the systemd unit, without starting it
+wasm monitor enable        # start it now and at every boot, installing it if needed
+wasm monitor disable       # stop it and keep it from starting at boot
+wasm monitor uninstall     # remove the unit; recorded observations stay
+wasm monitor status        # whether it runs, and what it watches
+wasm monitor config        # the settings in effect and where the database lives
+wasm monitor test-email    # send one email to the recipients, to prove the settings
+```
 
-# Run a single scan (manual)
-wasm monitor scan
-wasm monitor scan --dry-run  # Don't terminate, just report
+The unit is `wasm-monitor.service`. It runs `wasm monitor run` as root, restarts on failure,
+and is sandboxed (`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome=read-only`,
+`PrivateDevices`). The console's Server page has the same controls.
 
-# Run continuously in foreground
-wasm monitor run
+## What it watches
 
-# Manage the systemd service
-wasm monitor install    # Install service file
-wasm monitor enable     # Enable and start
-wasm monitor disable    # Disable and stop
-wasm monitor uninstall  # Remove service
+Every scan interval (30 seconds by default, never less than 10):
 
-# Test email configuration
+| Watch | Recorded when | Severity |
+|---|---|---|
+| Process names | The executable's name starts with a known miner or malware name: `xmrig`, `minerd`, `cpuminer`, `cgminer`, `bfgminer`, `ethminer`, `ccminer`, `kdevtmpfsi`, `kinsing`, `kerberods`, `watchdogs`. Common daemons are never flagged. | `warning` |
+| Process resource use | A process uses more CPU or memory than `monitor.cpu_threshold` or `monitor.memory_threshold` percent (80 by default). | `notice` |
+| Units | A unit listed in `monitor.watch_units` stops being active. | notification `unit_failed` |
+| Certificates | A certificate has less than 14 days left; at most one message per certificate per day. | notification `cert_expiring` |
+| Disks | A filesystem crosses 90% used; one message per crossing. | notification `disk_threshold` |
+
+Observations are kept in `/var/lib/wasm/observations.db` (`~/.local/share/wasm/` when run
+without root). The same process and signal within an hour is recorded once; observations
+older than `monitor.retention_days` (30) are purged hourly, and at most
+`monitor.max_observations` (5000) are kept. Acknowledging one, from the console or
+`POST /api/monitor/observations/{id}/acknowledge`, marks it seen and does nothing to the
+process.
+
+Certificate and disk checks, and the certificate expiry notifications, only happen while the
+monitor runs.
+
+## Email
+
+```bash
+wasm config set monitor.smtp.host smtp.example.com
+wasm config set monitor.smtp.port 465
+wasm config set monitor.smtp.username alerts@example.com
+wasm config set monitor.smtp.password '...'
+wasm config set monitor.email_recipients '["admin@example.com"]'
+wasm config set monitor.notify true
 wasm monitor test-email
-
-# Show current configuration
-wasm monitor config
 ```
 
-## Configuration Options
+With `monitor.notify` on, a scan that records new observations mails them to the
+recipients. A process that keeps matching the same signal does not send a message every
+scan. Credentials are only sent over TLS: `use_ssl` (implicit TLS, the default) or `use_tls`
+(STARTTLS); without either, a configured password is refused.
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `enabled` | `false` | Enable/disable the monitor |
-| `scan_interval` | `3600` | Seconds between scans |
-| `cpu_threshold` | `80.0` | CPU % to flag for analysis |
-| `memory_threshold` | `80.0` | Memory % to flag for analysis |
-| `auto_terminate` | `true` | Automatically kill threats |
-| `terminate_malicious_only` | `true` | Only kill "malicious" (not "suspicious") |
-| `use_ai` | `true` | Use OpenAI for deep analysis |
-| `dry_run` | `false` | Report only, don't terminate |
+## Configuration
 
-## How It Works
+| Key | Default | Meaning |
+|---|---|---|
+| `monitor.enabled` | `false` | Whether it is meant to run at boot |
+| `monitor.scan_interval` | `30` | Seconds between scans, at least 10 |
+| `monitor.cpu_threshold` | `80.0` | CPU percent above which a process is recorded |
+| `monitor.memory_threshold` | `80.0` | Memory percent above which a process is recorded |
+| `monitor.watch_units` | `[]` | Units whose state is reported |
+| `monitor.notify` | `false` | Mail new observations |
+| `monitor.retention_days` | `30` | Days observations are kept |
+| `monitor.max_observations` | `5000` | Observations kept at most |
+| `monitor.email_recipients` | `[]` | Who receives the mail |
+| `monitor.smtp.host`, `.port`, `.username`, `.password` | `""`, `465`, `""`, `""` | SMTP relay |
+| `monitor.smtp.use_ssl`, `.use_tls` | `true`, `false` | Implicit TLS, or STARTTLS |
+| `monitor.smtp.from_address` | the username | Sender |
+| `monitor.smtp.timeout` | `30` | Seconds, at most 120 |
 
-1. **Process Collection**: Gathers information about all running processes including CPU/memory usage, command line, network connections, and open files.
+`wasm config get` and `wasm config set` take these keys; secret values print as `***`. Give
+`monitor.watch_units` as a list: `wasm config set monitor.watch_units
+nginx.service,postgresql.service --list`.
 
-2. **Quick Pattern Check**: Immediately flags processes matching known malware patterns:
-   - Cryptocurrency miners (XMRig, minerd, cpuminer, etc.)
-   - Reverse shells (netcat with execution, python socket shells, etc.)
-   - Obfuscated commands (base64 encoded, curl|sh patterns)
+## Notifications
 
-3. **AI Analysis**: Sends suspicious processes to OpenAI for deeper behavioral analysis.
+The `unit_failed`, `cert_expiring` and `disk_threshold` events go through WASM's notification
+channels (webhook, Slack, Discord, Telegram, email), which are configured under
+`notifications.*` in the console's Settings > Notifications or with `wasm config set`, and
+only when `notifications.enabled` is on and the event is enabled. Test a channel with
+`wasm notify test <channel>`.
 
-4. **Threat Response**:
-   - Sends initial alert email with detected threats
-   - Terminates malicious processes (if auto_terminate is enabled)
-   - Cleans up associated files in /tmp, /var/tmp, /dev/shm
-   - Sends final report with actions taken
+## API
 
-5. **Persistence Check**: Looks for persistence mechanisms:
-   - Crontab entries
-   - User systemd services
-   - /etc/rc.local entries
-
-## Email Notifications
-
-The monitor sends two types of emails:
-
-### Initial Alert
-Sent immediately when threats are detected. Contains:
-- Server hostname and timestamp
-- List of suspicious/malicious processes
-- Process details (PID, user, CPU, memory, command)
-- Threat confidence level and reason
-
-### Mitigation Report
-Sent after taking action. Contains:
-- All information from initial alert
-- Actions taken for each threat
-- Files removed
-- Persistence mechanisms found
-
-## Known Malware Patterns
-
-The monitor immediately flags these patterns as malicious:
-- `xmrig`, `minerd`, `cpuminer`, `cgminer` - Cryptocurrency miners
-- `kdevtmpfsi`, `kinsing` - Known Linux malware
-- `kerberods`, `watchdogs` - Backdoors and droppers
-
-Suspicious patterns that trigger AI analysis:
-- `curl|sh`, `wget|sh` - Remote code execution
-- `nc -e`, `ncat -e` - Reverse shells
-- `/dev/tcp/` - Bash network connections
-- `python -c "...socket..."` - Script-based shells
-
-## Example: Detecting a Crypto Miner
-
-When a Monero miner is detected, you'll receive an email like:
-
-```
-🚨 WASM Security Alert - MALICIOUS PROCESS DETECTED
-
-Server: web-server-01
-Time: 2024-01-15 14:30:00
-Threats detected: 2
-
-[MALICIOUS] xmrig (PID: 12345)
-  User: www-data
-  CPU: 98.5% | Memory: 2.3%
-  Confidence: 95%
-  Reason: Matches known malicious pattern: xmrig
-  Command: /tmp/.hidden/xmrig -o pool.minexmr.com:4444 -u ...
-```
-
-And after mitigation:
-
-```
-🛡️ WASM Security Monitor - Mitigation Report
-
-[NEUTRALIZED] xmrig (PID: 12345)
-  Action: Terminated process tree (3 processes); Removed 2 malicious files
-```
+| Endpoint | |
+|---|---|
+| `GET /api/monitor/status` | Unit state, and the list of things the monitor never does |
+| `GET /api/monitor/config` | Settings in effect |
+| `GET /api/monitor/metrics` | One live reading of CPU, load, memory, swap, disks, network |
+| `GET /api/monitor/processes` | The process table, sortable, at most 500 |
+| `POST /api/monitor/scan` | Run one scan now |
+| `GET /api/monitor/observations` | Recorded observations and their counts |
+| `POST /api/monitor/observations/{id}/acknowledge` | Mark one as seen |
+| `POST /api/monitor/install`, `/uninstall`, `/enable`, `/disable`, `/start`, `/stop` | Manage the unit |
+| `POST /api/monitor/test-email` | Send a test email |
 
 ## Troubleshooting
 
-### Monitor not detecting processes
-- Ensure `psutil` is installed: `pip install psutil`
-- Check permissions: the monitor needs root access
-
-### AI analysis not working
-- Verify your OpenAI API key is correct
-- Check internet connectivity
-- Try a different model if rate limited
-
-### Emails not sending
-- Test with `wasm monitor test-email`
-- Verify SMTP credentials
-- Check firewall allows outbound port 465/587
-
-### False positives
-- Add legitimate processes to safe patterns in configuration
-- Use `dry_run: true` initially to review detections
-- Set `terminate_malicious_only: true` to be conservative
+- **Nothing is recorded.** `psutil` must be installed (`apt install python3-psutil`, or
+  `pip install psutil`), and the monitor needs root to see every process.
+- **No email.** Run `wasm monitor test-email`: it prints the SMTP server's own error. Check
+  that the firewall allows outbound 465 or 587.
+- **Too many resource-use observations.** Raise `monitor.cpu_threshold` or
+  `monitor.memory_threshold`. The same process with the same signal is recorded at most once
+  an hour.
