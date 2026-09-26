@@ -14,7 +14,7 @@ you create from now on.
 ### Your applications
 
 - **Existing applications stay in place.** `wasm update` on an application deployed by 1.x
-  does what it did in 1.6.4: backup, pull, rebuild, restart. Nothing is converted
+  does what it did in 1.6.5: backup, pull, rebuild, restart. Nothing is converted
   implicitly; moving an application to the release layout is `wasm app migrate DOMAIN`, one
   application at a time (see [releases.md](releases.md)).
 - **New applications build releases.** The new setting `deploy.layout` defaults to
@@ -25,6 +25,14 @@ you create from now on.
 - **`wasm create` without `--type` detects the type.** In 1.x it deployed every application
   created without `--type` as Node.js. A script that relied on that should pass
   `--type nodejs`.
+- **`wasm create` refuses a directory that already holds files.** In 1.x, deploying a domain
+  whose application directory already existed overwrote it, and a failed deploy could delete
+  it. 2.0 refuses unless you pass `--force`, and even then never deletes a directory it did
+  not create. Redeploying an application that is already on releases needs no flag.
+- **One operation per application at a time.** An update, deploy, rollback, migration,
+  restore or deletion takes a lock on the application; a second one started meanwhile (a
+  webhook during a manual update, say) is refused with the name of the operation that holds
+  it, instead of both running over the same tree.
 - **`www` is a redirect.** `wasm create --www` now records `www.<domain>` as a redirect to the
   domain (a `301`), where 1.x served the application on both names. Applications deployed by
   1.x with `--www` keep serving both: the first `wasm domain add` or `remove` on one of them

@@ -174,7 +174,8 @@ release directory.
 
 After a successful activation, releases beyond the newest five are deleted, oldest first.
 The active release is never deleted, even when a rollback made it older than the five
-newest. Rows of failed releases stay listed while they are among the newest five and are
+newest, and neither is the release just before it, which is what `wasm rollback` goes back to.
+Rows of failed releases stay listed while they are among the newest five and are
 forgotten after that.
 
 The retention is recorded per application (`keep_releases` in `GET /api/apps/{domain}`,
@@ -193,27 +194,33 @@ wasm app migrate shop.example.com --persist storage --persist public/uploads
 
 `--dry-run` is a global option and goes before the command. The console offers the same
 operation from the application's Settings tab; the API has `GET /api/apps/{domain}/migrate/plan`
-(read only) and `POST /api/apps/{domain}/migrate` (needs sudo mode).
+(read only) and `POST /api/apps/{domain}/migrate` (needs sudo mode), which queues the migration
+as a job and answers `202` with it.
 
 What the migration does:
 
-1. **The live tree becomes the first release.** It is moved, not copied: every change is a
+1. **The unit is stopped first**, so nothing writes into the tree while it moves. The plan
+   states this downtime; it lasts until the health gate passes, usually seconds.
+2. **The live tree becomes the first release.** It is moved, not copied: every change is a
    rename inside the application directory, or the creation of a directory or a link.
-2. **The environment moves to `shared/`.** `.env` and WASM's inventory of it (`.wasm`) are
+3. **The environment moves to `shared/`.** `.env` and WASM's inventory of it (`.wasm`) are
    moved to `shared/` and linked into the release.
-3. **What the application wrote for itself moves to `shared/`.** In a git checkout that is
+4. **What the application wrote for itself moves to `shared/`.** In a git checkout that is
    every untracked directory, ignored or not (`git status --ignored`), minus build output
    (`node_modules`, `.next`, `dist`, `build`, `.venv`, `__pycache__` and similar). Without
    git, WASM cannot tell uploads from code: it keeps whichever of `uploads`,
    `public/uploads`, `storage` and `data` exist, and warns you to name the rest. `--persist`
-   replaces detection entirely.
-4. **The unit and the site are rewritten to run from `current`**, when they name the
+   replaces detection entirely. SQLite databases are found by their file header wherever
+   they are (outside build output) and always move to `shared/`, with their `-wal`, `-shm`
+   and `-journal` files beside them; a `--persist` list that leaves one out is refused.
+5. **The unit and the site are rewritten to run from `current`**, when they name the
    application directory. A proxied site only names a port and is left alone.
-5. **The file count is verified.** Regular files and their bytes are counted before and after,
+6. **The file count is verified.** Regular files and their bytes are counted before and after,
    `shared/` included. Any difference fails the migration.
-6. **The application goes through the health gate.** If it does not answer, every rename is
+7. **The application goes through the health gate.** If it does not answer, every rename is
    reversed, the unit and site are put back byte for byte, and the application is restarted
-   on the tree it had.
+   on the tree it had. Every undo step is attempted even when an earlier one fails; anything
+   that could not be put back is listed in the error with where it is now.
 
 Read the plan before confirming. Two warnings in it matter:
 
