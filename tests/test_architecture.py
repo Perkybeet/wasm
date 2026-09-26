@@ -642,6 +642,42 @@ class TestPackaging:
             + "\n".join(f"  {line}" for line in offenders)
         )
 
+    def test_maintainer_scripts_never_loosen_or_pip_install(self):
+        """
+        What runs as root on every package upgrade must not undo WASM's own rules.
+
+        The Debian postinst pip-installed a module into the system Python with
+        --break-system-packages, reassigned every file under /var/www/apps to
+        www-data (a bind-mounted database directory included), and opened
+        /etc/wasm and config.yaml, which hold credentials, to a group. It ran on
+        every upgrade.
+        """
+        spec = (REPO / "rpm/wasm.spec").read_text(encoding="utf-8")
+        # Only the scriptlet runs on the machine; the changelog below it is prose.
+        post = spec.split("\n%post", 1)[1].split("\n%", 1)[0] if "\n%post" in spec else ""
+        scripts = {
+            "obs/debian.postinst": (REPO / "obs/debian.postinst").read_text(encoding="utf-8"),
+            "rpm/wasm.spec %post": post,
+        }
+        forbidden = (
+            ("pip install", "pip3 install", "--break-system-packages"),
+            ("chown -R www-data", "chown -R www-data:www-data /var/www/apps"),
+            ("chmod 755 /etc/wasm", "chmod 640 /etc/wasm/config.yaml"),
+        )
+
+        offenders = [
+            f"{name}: {line.strip()}"
+            for name, text in scripts.items()
+            for line in text.splitlines()
+            if not line.strip().startswith("#")
+            for group in forbidden
+            if any(needle in line for needle in group)
+        ]
+
+        assert not offenders, "Maintainer scripts must not do this:\n" + "\n".join(
+            f"  {line}" for line in offenders
+        )
+
     def test_version_is_consistent_across_packaging_files(self):
         """The version lives in six files; drift caused corrective releases."""
         import subprocess

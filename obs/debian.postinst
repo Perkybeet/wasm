@@ -3,33 +3,35 @@ set -e
 
 case "$1" in
     configure)
-        # Install Python dependencies that aren't available as .deb packages
-        echo "Installing Python dependencies..."
-        pip3 install inquirer --break-system-packages --quiet 2>/dev/null || {
-            echo "Warning: Failed to install inquirer. Interactive mode may not work."
-        }
-        
+        # Nothing is pip-installed: every runtime dependency is a Debian package,
+        # and installing into the system Python with --break-system-packages
+        # can break the distribution's own tools.
+
         # Create wasm group if it doesn't exist
         if ! getent group wasm > /dev/null 2>&1; then
             groupadd --system wasm
         fi
-        
-        # Set proper permissions for directories
+
+        # The apps directory itself only. What is inside belongs to each
+        # application and its deploys: a recursive chown here reassigned every
+        # file on every upgrade, including data directories bind-mounted into
+        # containers that run under their own uid.
         if [ -d /var/www/apps ]; then
-            chown -R www-data:www-data /var/www/apps
             chmod 755 /var/www/apps
         fi
-        
+
         if [ -d /var/log/wasm ]; then
-            chown -R www-data:wasm /var/log/wasm
+            chown www-data:wasm /var/log/wasm
             chmod 775 /var/log/wasm
         fi
-        
+
+        # The configuration holds credentials (SMTP, notification webhooks).
+        # WASM writes it root-only (0700 directory, 0600 file); an upgrade must
+        # never loosen that.
         if [ -d /etc/wasm ]; then
-            chmod 755 /etc/wasm
-            # Config file readable by wasm group (contains sensitive data)
-            chown root:wasm /etc/wasm/config.yaml 2>/dev/null || true
-            chmod 640 /etc/wasm/config.yaml 2>/dev/null || true
+            chmod 700 /etc/wasm
+            chown root:root /etc/wasm/config.yaml 2>/dev/null || true
+            chmod 600 /etc/wasm/config.yaml 2>/dev/null || true
         fi
 
         # Upgrade config file with new defaults (preserves user values)

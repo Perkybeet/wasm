@@ -1,3 +1,11 @@
+wasm (1.6.5-1) unstable; urgency=medium
+
+  * Fix the Debian package pip-installing into the system Python with --break-system-packages on every install and upgrade
+  * Fix the Debian package recursively reassigning every file under /var/www/apps to www-data on every upgrade, which could break data directories bind-mounted into containers
+  * Fix the Debian package loosening /etc/wasm and config.yaml, which hold credentials, to group-readable on every upgrade; they stay root-only
+
+ -- Yago Lopez Prado <yago.lopez.adeje@gmail.com>  Sat, 26 Sep 2026 00:48:55 +0000
+
 wasm (1.6.4-1) unstable; urgency=medium
 
   * Fix wasm update deleting everything an application wrote into its own tree (uploads included) when it was deployed from a local directory or an archive: the source is now copied over the tree instead of replacing it

@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        1.6.4
+Version:        1.6.5
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -222,6 +222,10 @@ if systemctl is-enabled wasm-monitor.service >/dev/null 2>&1; then
 fi
 
 %changelog
+* Sat Sep 26 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.6.5-1
+- Fix the Debian package pip-installing into the system Python with --break-system-packages on every install and upgrade
+- Fix the Debian package recursively reassigning every file under /var/www/apps to www-data on every upgrade, which could break data directories bind-mounted into containers
+- Fix the Debian package loosening /etc/wasm and config.yaml, which hold credentials, to group-readable on every upgrade; they stay root-only
 * Fri Sep 25 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.6.4-1
 - Fix wasm update deleting everything an application wrote into its own tree (uploads included) when it was deployed from a local directory or an archive: the source is now copied over the tree instead of replacing it
 - Fix a forced git update running git clean, which deleted every untracked file that was not ignored
