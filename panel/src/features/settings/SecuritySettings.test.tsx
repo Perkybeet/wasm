@@ -113,6 +113,41 @@ describe("Settings > Security", () => {
     expect(backend.callsTo("POST /api/auth/2fa/confirm").map((call) => call.body)).toEqual([{ code: "000000" }, { code: "123456" }]);
   });
 
+  it("asks to confirm it's you before starting setup, and opens the enrolment dialog only after", { timeout: 20_000 }, async () => {
+    const twoFactor = { enabled: false };
+    let elevated = false;
+    fakeBackend(
+      securityRoutes(twoFactor, {
+        "POST /api/auth/2fa/enroll": () => {
+          if (!elevated) return problem(403, "elevation_required", "Confirm it's you to continue.");
+          return json(200, ENROLLMENT);
+        },
+        "POST /api/auth/elevate": (call) => {
+          if ((call.body as { token: string }).token !== "wasm_mastertoken") {
+            return problem(401, "invalid_credential", "That token was not accepted.");
+          }
+          elevated = true;
+          return json(200, { elevated_until: new Date(Date.now() + 600_000).toISOString() });
+        },
+      }),
+    );
+    const { user } = renderConsole("/settings/security");
+    await user.click(await screen.findByRole("button", { name: "Set up two-factor authentication" }));
+
+    // Two-factor is off, so elevation is done with the access token, not a code (D5).
+    const confirm = await screen.findByRole("dialog", { name: "Confirm it's you" });
+    expect(confirm).toHaveAccessibleDescription(/access token/i);
+    expect(screen.queryByRole("dialog", { name: "Set up two-factor authentication" })).not.toBeInTheDocument();
+    await user.type(within(confirm).getByLabelText("Access token"), "wasm_mastertoken");
+    await user.click(within(confirm).getByRole("button", { name: "Confirm" }));
+
+    // Only once elevated does the enrolment dialog open, with the secret fetched after the retry.
+    const dialog = await screen.findByRole("dialog", { name: "Set up two-factor authentication" });
+    expect(screen.queryByRole("dialog", { name: "Confirm it's you" })).not.toBeInTheDocument();
+    expect(within(dialog).getByText("JBSW Y3DP EHPK 3PXP JBSW Y3DP EHPK 3PXP")).toBeInTheDocument();
+    await expectNoAxeViolations(dialog);
+  });
+
   it("turns it off with a code, confirming it's you first when the server asks", { timeout: 20_000 }, async () => {
     const twoFactor = { enabled: true };
     let elevated = false;

@@ -1,9 +1,9 @@
-import { screen, waitFor, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
 import { expectNoAxeViolations } from "../../../test/axe";
 import { renderConsole } from "../../../test/console";
-import { APPS, SESSION, fakeBackend, json, problem, signedInRoutes } from "../../../test/fakes";
+import { APPS, FakeEventSource, SESSION, fakeBackend, json, problem, signedInRoutes } from "../../../test/fakes";
 import type { RouteHandler } from "../../../test/fakes";
 import { deletionSummary } from "./DangerSection";
 import { planItems } from "./MigrationPlanView";
@@ -66,6 +66,20 @@ const PLAN = {
   warnings: ["/var/www/apps/shop-example-com is not a git checkout, so what the application wrote for itself cannot be told apart from its code."],
   files: 7,
   bytes: 661,
+};
+
+const MIGRATE_JOB = {
+  id: "m1",
+  type: "migrate",
+  name: `Migrate ${DOMAIN}`,
+  description: `Moving ${DOMAIN} onto the release layout`,
+  status: "pending",
+  progress: 0,
+  total_steps: 100,
+  current_step: "",
+  created_at: "2026-09-25T20:53:00",
+  logs: [],
+  metadata: { domain: DOMAIN },
 };
 
 const DELIVERIES = {
@@ -314,19 +328,8 @@ describe("enabling releases", () => {
       "GET /api/auth/session": () => json(200, ELEVATED),
       [`GET /api/apps/${DOMAIN}/migrate/plan`]: () => json(200, PLAN),
       [`POST /api/apps/${DOMAIN}/migrate`]: () =>
-        json(200, {
-          domain: DOMAIN,
-          release_id: "20260925-205300-nogit",
-          persistent: ["uploads", "storage"],
-          env_files: [".env"],
-          files_before: 7,
-          files_after: 7,
-          bytes_before: 661,
-          bytes_after: 661,
-          unit_rewritten: true,
-          site_rewritten: false,
-          deployment_id: 40,
-        }),
+        json(202, { job_id: MIGRATE_JOB.id, status: "pending", message: `Migration of ${DOMAIN} to releases queued`, job: MIGRATE_JOB }),
+      [`GET /api/jobs/${MIGRATE_JOB.id}`]: () => json(200, MIGRATE_JOB),
     });
     const releases = section("Releases");
     expect(backend.callsTo(`GET /api/apps/${DOMAIN}/migrate/plan`)).toHaveLength(0);
@@ -344,21 +347,76 @@ describe("enabling releases", () => {
     await waitFor(() => {
       expect(backend.callsTo(`POST /api/apps/${DOMAIN}/migrate`)[0]?.body).toEqual({ persist: ["uploads", "storage"] });
     });
+    // Queuing only answers 202; the dialog stays open, following the job, until it ends.
+    expect(await within(dialog).findByText(/Moving the tree, rewriting the unit/)).toBeInTheDocument();
+
+    act(() => {
+      FakeEventSource.latest().open();
+      FakeEventSource.latest().emit("job", {
+        ...MIGRATE_JOB,
+        status: "completed",
+        progress: 100,
+        result: {
+          domain: DOMAIN,
+          status: "migrated",
+          release_id: "20260925-205300-nogit",
+          persistent: ["uploads", "storage"],
+          env_files: [".env"],
+          files_before: 7,
+          files_after: 7,
+          bytes_before: 661,
+          bytes_after: 661,
+          unit_rewritten: true,
+          site_rewritten: false,
+          deployment_id: 40,
+        },
+      });
+    });
     expect(await screen.findByText(/7 files before, 7 after/)).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: `Migrate ${DOMAIN} to releases?` })).not.toBeInTheDocument();
   });
 
-  it("shows why a migration failed, and that it was undone", async () => {
+  it("shows why a migration could not be queued", async () => {
     const { user } = await settingsOf(IN_PLACE_APP, {
       "GET /api/auth/session": () => json(200, ELEVATED),
       [`GET /api/apps/${DOMAIN}/migrate/plan`]: () => json(200, PLAN),
       [`POST /api/apps/${DOMAIN}/migrate`]: () =>
-        problem(500, "deploymenterror", "shop.example.com did not answer on the new layout: http://127.0.0.1:3000/ refused the connection"),
+        problem(409, "app_busy", "shop.example.com: update started at 20:52:00 is still running", {
+          hint: "Wait for it to finish, or follow it in Jobs",
+        }),
     });
     const releases = section("Releases");
     await user.click(within(releases).getByRole("button", { name: "Plan the migration" }));
     await user.click(await within(releases).findByRole("button", { name: "Migrate to releases" }));
     const dialog = await screen.findByRole("dialog", { name: `Migrate ${DOMAIN} to releases?` });
     await user.click(within(dialog).getByRole("button", { name: "Migrate to releases" }));
+    expect(await within(dialog).findByText(/update started at 20:52:00 is still running/)).toBeInTheDocument();
+    expect(within(dialog).getByText("Wait for it to finish, or follow it in Jobs")).toBeInTheDocument();
+  });
+
+  it("shows why a queued migration failed, and that it was undone", async () => {
+    const { user } = await settingsOf(IN_PLACE_APP, {
+      "GET /api/auth/session": () => json(200, ELEVATED),
+      [`GET /api/apps/${DOMAIN}/migrate/plan`]: () => json(200, PLAN),
+      [`POST /api/apps/${DOMAIN}/migrate`]: () =>
+        json(202, { job_id: MIGRATE_JOB.id, status: "pending", message: `Migration of ${DOMAIN} to releases queued`, job: MIGRATE_JOB }),
+      [`GET /api/jobs/${MIGRATE_JOB.id}`]: () => json(200, MIGRATE_JOB),
+    });
+    const releases = section("Releases");
+    await user.click(within(releases).getByRole("button", { name: "Plan the migration" }));
+    await user.click(await within(releases).findByRole("button", { name: "Migrate to releases" }));
+    const dialog = await screen.findByRole("dialog", { name: `Migrate ${DOMAIN} to releases?` });
+    await user.click(within(dialog).getByRole("button", { name: "Migrate to releases" }));
+    await within(dialog).findByText(/Moving the tree, rewriting the unit/);
+
+    act(() => {
+      FakeEventSource.latest().open();
+      FakeEventSource.latest().emit("job", {
+        ...MIGRATE_JOB,
+        status: "failed",
+        error: "shop.example.com did not answer on the new layout: http://127.0.0.1:3000/ refused the connection",
+      });
+    });
     expect(await within(dialog).findByText(/did not answer on the new layout/)).toBeInTheDocument();
     expect(within(dialog).getByText(/WASM put everything back as it was/)).toBeInTheDocument();
   });

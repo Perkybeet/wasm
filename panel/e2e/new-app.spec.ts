@@ -7,9 +7,9 @@
 
 import type { Page } from "@playwright/test";
 
-import { expect, expectNoA11yViolations, settle, signIn, stillness, test, totpCode } from "./fixtures";
+import { confirmItsYou, expect, expectNoA11yViolations, settle, signIn, stillness, test } from "./fixtures";
 import type { ConsoleServer } from "./fixtures";
-import { wizardSource } from "./wizard-sources";
+import { inspectSource, wizardSource } from "./wizard-sources";
 
 /** The CSRF header every write through `page.request` carries, mirrored from its cookie. */
 async function csrf(page: Page): Promise<Record<string, string>> {
@@ -20,8 +20,7 @@ async function csrf(page: Page): Promise<Record<string, string>> {
 /**
  * Leaves the worker's machine as seeded once this spec's deploy has ended: other specs count its
  * apps. A deploy that failed has removed its app already; one that succeeded is deleted.
- * Elevation takes a two-factor code, and a code already used for signing in is refused, so a
- * refusal waits for the next one.
+ * Deleting it needs sudo mode, confirmed here with an unspent second factor.
  */
 async function forgetApp(page: Page, server: ConsoleServer, domain: string): Promise<void> {
   // Nothing on screen may keep asking about the app once it is gone.
@@ -37,25 +36,15 @@ async function forgetApp(page: Page, server: ConsoleServer, domain: string): Pro
     .toBe(false);
   // A first deploy that fails undoes itself, app record included.
   if ((await page.request.get(`/api/apps/${domain}`)).status() === 404) return;
-  const secret = server.totpSecret ?? "";
-  let elevated = await page.request.post("/api/auth/elevate", { data: { code: totpCode(secret) }, headers: await csrf(page) });
-  if (!elevated.ok()) {
-    await page.waitForTimeout(30_000 - (Date.now() % 30_000) + 500);
-    elevated = await page.request.post("/api/auth/elevate", { data: { code: totpCode(secret) }, headers: await csrf(page) });
-  }
+  const elevated = await page.request.post("/api/auth/elevate", { data: { code: server.secondFactor() }, headers: await csrf(page) });
   expect(elevated.ok(), await elevated.text()).toBe(true);
   const deleted = await page.request.delete(`/api/apps/${domain}?remove_files=true&remove_ssl=true`, { headers: await csrf(page) });
   expect(deleted.ok(), await deleted.text()).toBe(true);
   await expect.poll(async () => (await page.request.get(`/api/apps/${domain}`)).status(), { timeout: 60_000 }).toBe(404);
 }
 
-async function inspect(page: Page, source: string): Promise<void> {
-  await page.getByLabel("Repository or directory").fill(source);
-  await page.getByRole("button", { name: "Inspect source" }).click();
-  await expect(page.getByRole("heading", { level: 2, name: "Review" })).toBeFocused();
-}
 
-test("inspects a directory on the server, deploys it and lands on its deployment", async ({ page, consoleServer }) => {
+test("inspects a directory on the server, deploys it and lands on its deployment", async ({ page, consoleServer, problems }) => {
   // The deploy runs to its end (a failed health check: nothing listens in the sandbox) before
   // the test lets go of the machine.
   test.setTimeout(180_000);
@@ -67,7 +56,7 @@ test("inspects a directory on the server, deploys it and lands on its deployment
 
   const source = await wizardSource(page, "storefront");
   const inspected = page.waitForResponse((response) => response.url().endsWith("/api/apps/inspect"));
-  await inspect(page, source);
+  await inspectSource(page, consoleServer, problems, source);
   expect((await inspected).request().postDataJSON()).toEqual({ source });
 
   // What the real inspection found: a Next.js project on npm with a lock file.
@@ -113,9 +102,9 @@ test("inspects a directory on the server, deploys it and lands on its deployment
   await forgetApp(page, consoleServer, domain);
 });
 
-test("a taken domain and the variables without a default keep the operator on Review", async ({ page, consoleServer }) => {
+test("a taken domain and the variables without a default keep the operator on Review", async ({ page, consoleServer, problems }) => {
   await signIn(page, consoleServer, "/apps/new");
-  await inspect(page, await wizardSource(page, "storefront"));
+  await inspectSource(page, consoleServer, problems, await wizardSource(page, "storefront"));
   await page.getByLabel("Domain", { exact: true }).fill("picconia.com");
   await page.getByRole("button", { name: "Continue" }).click();
   await expect(page.getByText("picconia.com is already deployed.", { exact: false })).toBeVisible();
@@ -136,21 +125,26 @@ test("a taken domain and the variables without a default keep the operator on Re
 test("a directory that does not exist is refused on its field, in the server's words", async ({ page, consoleServer, problems }) => {
   // SourceError now answers 400, in the API's error contract, not the unqualified 500 an
   // earlier build gave it - Chromium still logs the failed resource either way.
-  problems.expect(/status of 400 .* \/api\/apps\/inspect$/);
+  // Reading a directory on the server needs sudo mode first, which is a 403 of its own.
+  problems.expect(/status of 40[03] .* \/api\/apps\/inspect$/);
   await signIn(page, consoleServer, "/apps/new");
   await page.getByLabel("Repository or directory").fill("/var/www/src/does-not-exist");
-  const inspected = page.waitForResponse((response) => response.url().endsWith("/api/apps/inspect"));
+  const inspected = page.waitForResponse((response) => response.url().endsWith("/api/apps/inspect") && response.status() !== 403);
   await page.getByRole("button", { name: "Inspect source" }).click();
+  const refusal = page.getByText("Source path does not exist: /var/www/src/does-not-exist");
+  const confirm = page.getByRole("dialog", { name: "Confirm it's you" });
+  await expect(confirm.or(refusal)).toBeVisible();
+  if (await confirm.isVisible()) await confirmItsYou(page, consoleServer);
   expect((await inspected).status()).toBe(400);
-  await expect(page.getByText("Source path does not exist: /var/www/src/does-not-exist")).toBeVisible();
+  await expect(refusal).toBeVisible();
   await expect(page.getByLabel("Repository or directory")).toHaveAttribute("aria-invalid", "true");
   await settle(page);
   await expectNoA11yViolations(page, "a refused source");
 });
 
-test("the type select lists every type the deployer registry knows, not a hand-kept copy", async ({ page, consoleServer }) => {
+test("the type select lists every type the deployer registry knows, not a hand-kept copy", async ({ page, consoleServer, problems }) => {
   await signIn(page, consoleServer, "/apps/new");
-  await inspect(page, await wizardSource(page, "storefront"));
+  await inspectSource(page, consoleServer, problems, await wizardSource(page, "storefront"));
   await page.getByRole("combobox", { name: "Deploy as" }).click();
   // Detected first, the closest match on top.
   const options = page.getByRole("listbox").getByRole("option");
@@ -161,9 +155,9 @@ test("the type select lists every type the deployer registry knows, not a hand-k
   await page.keyboard.press("Escape");
 });
 
-test("a domain that resolves elsewhere warns instead of blocking the deploy", async ({ page, consoleServer }) => {
+test("a domain that resolves elsewhere warns instead of blocking the deploy", async ({ page, consoleServer, problems }) => {
   await signIn(page, consoleServer, "/apps/new");
-  await inspect(page, await wizardSource(page, "storefront"));
+  await inspectSource(page, consoleServer, problems, await wizardSource(page, "storefront"));
   // old.qrboda.com is modelled as pointing at another server.
   await page.getByLabel("Domain", { exact: true }).fill("old.qrboda.com");
   await expect(page.getByText("old.qrboda.com points somewhere else")).toBeVisible();
@@ -177,13 +171,13 @@ test("a domain that resolves elsewhere warns instead of blocking the deploy", as
   await expect(page.getByRole("heading", { level: 2, name: "Deploy" })).toBeFocused();
 });
 
-test("also serving www and resource limits reach the deploy request", async ({ page, consoleServer }) => {
+test("also serving www and resource limits reach the deploy request", async ({ page, consoleServer, problems }) => {
   test.setTimeout(120_000);
   // A bare two-label domain outside any seeded zone: www only ever means something for one of
   // these, and this one deliberately has no DNS record, which is not a reason to refuse it.
   const domain = "wasm-e2e-wizard.example";
   await signIn(page, consoleServer, "/apps/new");
-  await inspect(page, await wizardSource(page, "landing"));
+  await inspectSource(page, consoleServer, problems, await wizardSource(page, "landing"));
   await page.getByLabel("Domain", { exact: true }).fill(domain);
   await expect(page.getByText(`${domain} has no DNS record yet`)).toBeVisible();
   await page.getByRole("checkbox", { name: "Also serve www" }).check();

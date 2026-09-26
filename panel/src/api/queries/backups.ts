@@ -23,12 +23,6 @@ export const backupsQuery = (domain: string | null = null) =>
     queryFn: ({ signal }) => request("get", "/api/backups", { query: domain === null ? {} : { domain }, signal }),
   });
 
-export const backupQuery = (id: string) =>
-  queryOptions({
-    queryKey: backupKeys.detail(id),
-    queryFn: ({ signal }) => request("get", "/api/backups/{backup_id}", { params: { backup_id: id }, signal }),
-  });
-
 export const backupStorageQuery = () =>
   queryOptions({
     queryKey: backupKeys.storage,

@@ -1,9 +1,8 @@
 import { Check, Copy } from "lucide-react";
-import { useEffect, useState } from "react";
 
-import { Button } from "../../components/ui/Button";
-import type { ButtonSize, ButtonVariant } from "../../components/ui/Button";
-import { copyText } from "../../lib/clipboard";
+import { Button } from "./Button";
+import type { ButtonSize, ButtonVariant } from "./Button";
+import { useCopyState } from "./useCopyState";
 
 export interface CopyTextButtonProps {
   /** The exact text placed on the clipboard. */
@@ -20,32 +19,14 @@ export interface CopyTextButtonProps {
  * codes): the words stay, the icon confirms, and the outcome is announced.
  */
 export function CopyTextButton({ value, children, variant = "secondary", size = "md", className }: CopyTextButtonProps) {
-  const [state, setState] = useState<"idle" | "copied" | "failed">("idle");
-  useEffect(() => {
-    if (state === "idle") return;
-    const timer = setTimeout(() => {
-      setState("idle");
-    }, 2000);
-    return () => {
-      clearTimeout(timer);
-    };
-  }, [state]);
+  const { state, copy } = useCopyState(2000);
   return (
     <>
       <Button
         variant={variant}
         size={size}
         icon={state === "copied" ? <Check aria-hidden="true" className="text-ok" /> : <Copy aria-hidden="true" />}
-        onClick={() => {
-          copyText(value).then(
-            () => {
-              setState("copied");
-            },
-            () => {
-              setState("failed");
-            },
-          );
-        }}
+        onClick={() => void copy(value)}
         {...(className !== undefined ? { className } : {})}
       >
         {children}

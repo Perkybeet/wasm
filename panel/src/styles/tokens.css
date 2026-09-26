@@ -64,9 +64,15 @@
   --brand-blue: #4aa3d9;
   --brand-green: #4fc97a;
 
-  /* Type. Mona Sans carries the interface; JetBrains Mono carries every system value. */
+  /* Type. Mona Sans carries the interface; JetBrains Mono carries every system value. Build
+     and deploy logs are CLI output verbatim (CLAUDE.md: never paraphrased), and the CLI
+     writes emoji glyphs (📦, 🔨...) into its own progress lines; JetBrains Mono has no glyphs
+     for them, so an emoji-capable fallback font is listed after it, only for the code points
+     JetBrains Mono itself does not cover. */
   --font-sans: "Mona Sans Variable", ui-sans-serif, system-ui, sans-serif;
-  --font-mono: "JetBrains Mono Variable", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --font-mono:
+    "JetBrains Mono Variable", ui-monospace, "SFMono-Regular", Menlo, "Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji",
+    monospace;
   --fs-12: 0.75rem;
   --lh-12: 1rem;
   --fs-13: 0.8125rem;

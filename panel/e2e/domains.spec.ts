@@ -9,18 +9,7 @@
 
 import type { Page } from "@playwright/test";
 
-import { expect, expectNoA11yViolations, settle, signIn, stillness, test, totpCode } from "./fixtures";
-import type { ConsoleServer } from "./fixtures";
-
-/** Answers "Confirm it's you" with a fresh two-factor code. */
-async function confirmItsYou(page: Page, server: ConsoleServer): Promise<void> {
-  const dialog = page.getByRole("dialog", { name: "Confirm it's you" });
-  await expect(dialog).toBeVisible();
-  if (server.totpSecret === null) throw new Error("the E2E server runs with two-factor sign-in");
-  await dialog.getByLabel("Authentication code").fill(totpCode(server.totpSecret));
-  await dialog.getByRole("button", { name: "Confirm" }).click();
-  await expect(dialog).toBeHidden();
-}
+import { confirmItsYou, expect, expectNoA11yViolations, settle, signIn, stillness, test } from "./fixtures";
 
 /** Closes every toast, which sit over the page and are not what axe is judging. */
 async function dismissToasts(page: Page): Promise<void> {

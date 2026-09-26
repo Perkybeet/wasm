@@ -23,6 +23,8 @@ export type PrivilegesResponse = ResponseOf<"/api/databases/engines/{engine}/pri
 export const databaseKeys = {
   all: ["databases"] as const,
   engines: ["databases", "engines"] as const,
+  /** Every list, whatever engine it is filtered to: the prefix of `list`. */
+  lists: ["databases", "list"] as const,
   list: (engine: string | null) => ["databases", "list", { engine }] as const,
   detail: (engine: string, name: string) => ["database", engine, name] as const,
   users: (engine: string) => ["databases", "users", engine] as const,

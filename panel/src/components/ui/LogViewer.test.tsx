@@ -262,6 +262,38 @@ describe("LogViewer", () => {
     expect(screen.getByRole("button", { name: "Download output" })).toBeDisabled();
   });
 
+  it("tells Copy and Download apply to the whole log, not only the rendered rows", () => {
+    render(<LogViewer lines={lines(5000)} />);
+    const hint = "Copies or downloads the entire log, not only the lines currently shown.";
+    expect(screen.getByText(hint)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy output" })).toHaveAccessibleDescription(hint);
+    expect(screen.getByRole("button", { name: "Download output" })).toHaveAccessibleDescription(hint);
+  });
+
+  describe("Ctrl/Cmd+F", () => {
+    it("redirects it to the search box when focus is inside the viewer", async () => {
+      render(<LogViewer lines={lines(3)} />);
+      const region = screen.getByRole("region", { name: "Log output" });
+      region.focus();
+      await userEvent.keyboard("{Control>}f{/Control}");
+      expect(screen.getByRole("searchbox", { name: "Search output" })).toHaveFocus();
+    });
+
+    it("leaves the browser's own find alone when focus is outside the viewer", async () => {
+      render(
+        <>
+          <input aria-label="Somewhere else on the page" />
+          <LogViewer lines={lines(3)} />
+        </>,
+      );
+      const outside = screen.getByRole("textbox", { name: "Somewhere else on the page" });
+      outside.focus();
+      await userEvent.keyboard("{Control>}f{/Control}");
+      expect(outside).toHaveFocus();
+      expect(screen.getByRole("searchbox", { name: "Search output" })).not.toHaveFocus();
+    });
+  });
+
   describe("pageSearch", () => {
     it("leaves the search box out of the page's `/` target by default", () => {
       render(<LogViewer lines={lines(1)} />);

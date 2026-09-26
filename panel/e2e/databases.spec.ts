@@ -7,7 +7,7 @@
  */
 
 
-import { expect, expectNoA11yViolations, settle, signIn, test, toasts, totpCode } from "./fixtures";
+import { expect, expectNoA11yViolations, settle, signIn, test, toasts } from "./fixtures";
 
 test("engines, databases and users are listed, and the page passes axe", async ({ page, consoleServer }) => {
   await signIn(page, consoleServer, "/databases");
@@ -115,7 +115,7 @@ test("write mode asks the operator to confirm it's them before it runs", async (
   await expect(elevate).toBeVisible();
   await expectNoA11yViolations(page, "the elevation dialog");
 
-  await elevate.getByLabel("Authentication code").fill(totpCode(consoleServer.totpSecret ?? ""));
+  await elevate.getByLabel("Authentication code").fill(consoleServer.secondFactor());
   const retried = page.waitForResponse((response) => response.url().endsWith("/api/databases/query"));
   await elevate.getByRole("button", { name: "Confirm" }).click();
   expect((await retried).status()).toBe(200);

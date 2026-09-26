@@ -3,6 +3,7 @@ import type { CSSProperties, ReactElement, ReactNode } from "react";
 import uPlot from "uplot";
 
 import { cx } from "../../lib/cx";
+import { isHttpUrl } from "../../lib/url";
 import { Button } from "./Button";
 import { STATUS, StatusGlyph } from "./StatusPill";
 import type { Status } from "./StatusPill";
@@ -23,7 +24,9 @@ export interface ChartMarker {
   label: string;
   /** Colour and shape, the same vocabulary as everywhere else a state is drawn. */
   state: Status;
-  /** A plain link target, used when there is no `renderMarker`. */
+  /** A plain link target, used when there is no `renderMarker`. Only an http(s) URL is drawn
+   * as a link; anything else (a relative path, a dangerous scheme) falls back to an inert
+   * control, the same as having neither. */
   href?: string;
   /**
    * Wraps the marker's affordance in a link. Chart does not import a router, so a caller
@@ -283,17 +286,18 @@ const MARKER_CHIP_CLASS =
 function markerAffordance(marker: ChartMarker, children: ReactNode, className: string): ReactElement<Record<string, unknown>> {
   const style: CSSProperties = { color: `var(${TONE_TOKENS[STATUS[marker.state].tone]})` };
   if (marker.renderMarker) return marker.renderMarker(marker, children, { className, style });
-  if (marker.href !== undefined) {
+  if (marker.href !== undefined && isHttpUrl(marker.href)) {
     return (
       <a href={marker.href} aria-label={marker.label} className={className} style={style}>
         {children}
       </a>
     );
   }
-  // Neither a link nor a caller's own render: still a real, natively focusable control (so
-  // the tooltip reaches keyboard users), just one with nowhere to go.
+  // Neither a link nor a caller's own render - or an href that is not safe to navigate to:
+  // still a real, natively focusable control (so the tooltip reaches keyboard users), marked
+  // aria-disabled since, unlike a native `disabled`, that still lets it take focus.
   return (
-    <button type="button" aria-label={marker.label} className={className} style={style}>
+    <button type="button" aria-disabled="true" aria-label={marker.label} className={className} style={style}>
       {children}
     </button>
   );

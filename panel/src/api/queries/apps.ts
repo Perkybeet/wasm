@@ -121,10 +121,24 @@ export const diagnosisQuery = (domain: string) =>
     staleTime: 0,
   });
 
-/** What moving an in-place app onto releases would do. Reads the disk; changes nothing. */
+/**
+ * What moving an in-place app onto releases would do, or null when it is on releases already;
+ * the API says so with a 409, the same way `releasesQuery` reads "no releases yet". Real, not
+ * just theoretical: a finished job on this app (this migration among them, now that it runs as
+ * one) invalidates the app's whole query prefix, migration-plan included, and this query can
+ * still be enabled for the moment it takes the page to notice the app is on releases now.
+ * Reads the disk; changes nothing.
+ */
 export const migrationPlanQuery = (domain: string) =>
   queryOptions({
     queryKey: appKeys.migrationPlan(domain),
-    queryFn: ({ signal }) => request("get", "/api/apps/{domain}/migrate/plan", { params: { domain }, signal }),
+    queryFn: async ({ signal }): Promise<MigrationPlan | null> => {
+      try {
+        return await request("get", "/api/apps/{domain}/migrate/plan", { params: { domain }, signal });
+      } catch (error: unknown) {
+        if (isApiError(error) && error.status === 409) return null;
+        throw error;
+      }
+    },
     staleTime: 0,
   });

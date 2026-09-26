@@ -135,8 +135,18 @@ describe("Chart", () => {
 });
 
 describe("Chart markers", () => {
-  const inRange: ChartMarker = { at: T0 + 60, label: "Deploy 25, succeeded, 14:01", state: "running", href: "#deploy-25" };
-  const outOfRange: ChartMarker = { at: T0 - 600, label: "Deploy 9, failed, 13:50", state: "failed", href: "#deploy-9" };
+  const inRange: ChartMarker = {
+    at: T0 + 60,
+    label: "Deploy 25, succeeded, 14:01",
+    state: "running",
+    href: "https://wasm.example.com/deploys/25",
+  };
+  const outOfRange: ChartMarker = {
+    at: T0 - 600,
+    label: "Deploy 9, failed, 13:50",
+    state: "failed",
+    href: "https://wasm.example.com/deploys/9",
+  };
 
   function WithMarkers({ markers }: { markers: readonly ChartMarker[] }) {
     return (
@@ -153,7 +163,7 @@ describe("Chart markers", () => {
   it("draws an in-range marker as a focusable link with its full accessible name", () => {
     render(<WithMarkers markers={[inRange]} />);
     const link = screen.getByRole("link", { name: inRange.label });
-    expect(link).toHaveAttribute("href", "#deploy-25");
+    expect(link).toHaveAttribute("href", "https://wasm.example.com/deploys/25");
   });
 
   it("does not draw a marker outside the time range", () => {
@@ -196,6 +206,19 @@ describe("Chart markers", () => {
     const marker: ChartMarker = { at: T0 + 60, label: "Release 9, unlinked", state: "stopped" };
     render(<WithMarkers markers={[marker]} />);
     expect(screen.getByRole("button", { name: "Release 9, unlinked" })).toBeInTheDocument();
+  });
+
+  it("falls back to an aria-disabled control rather than a link for an href that is not http(s)", () => {
+    const marker: ChartMarker = {
+      at: T0 + 60,
+      label: "Deploy 25, succeeded, 14:01",
+      state: "running",
+      href: "javascript:alert(1)",
+    };
+    render(<WithMarkers markers={[marker]} />);
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+    const button = screen.getByRole("button", { name: marker.label });
+    expect(button).toHaveAttribute("aria-disabled", "true");
   });
 
   it("keeps markers in the table view so they do not vanish for screen reader users", async () => {

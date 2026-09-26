@@ -12,24 +12,13 @@
 import type { Page, TestInfo } from "@playwright/test";
 import path from "node:path";
 
-import type { ConsoleServer } from "./fixtures";
-import { expect, expectNoA11yViolations, settle, signIn, stillness, test, totpCode } from "./fixtures";
+import { confirmItsYou, expect, expectNoA11yViolations, settle, signIn, stillness, test } from "./fixtures";
 
 const RELEASE_APP = "tienda.cittek.es";
 const IN_PLACE_APP = "pedidos.cittek.es";
 
 function region(page: Page, name: string) {
   return page.getByRole("region", { name, exact: true });
-}
-
-/** Answers "Confirm it's you" with a fresh two-factor code. */
-async function confirmItsYou(page: Page, server: ConsoleServer): Promise<void> {
-  const dialog = page.getByRole("dialog", { name: "Confirm it's you" });
-  await expect(dialog).toBeVisible();
-  if (server.totpSecret === null) throw new Error("the E2E server runs with two-factor sign-in");
-  await dialog.getByLabel("Authentication code").fill(totpCode(server.totpSecret));
-  await dialog.getByRole("button", { name: "Confirm" }).click();
-  await expect(dialog).toBeHidden();
 }
 
 /** A screenshot for review, when asked for: `WASM_TABS_SCREENS=/tmp/console-tabs`. */
@@ -152,8 +141,14 @@ test("limits are refused as the backend would, then saved with exactly what the 
   await expect(limits.getByRole("button", { name: "Restart now" })).toBeVisible();
 });
 
-test("an in-place app moves to releases after its plan is read and confirmed", async ({ page, consoleServer }, testInfo) => {
+test("an in-place app moves to releases after its plan is read and confirmed", async ({ page, consoleServer, problems }, testInfo) => {
   const domain = testInfo.project.name === "dark" ? "docs.cittek.es" : "blog.cittek.es";
+  // The migration finishing invalidates the app's whole query prefix, migration-plan included
+  // (the same way any finished job on an app does): the plan can still be enabled for the
+  // moment it takes this page to notice the app is on releases now, and asks again - the API
+  // says so with a 409, the same way it already does for `releasesQuery` on an app still in
+  // place. See migrationPlanQuery's own doc comment.
+  problems.expect(new RegExp(`status of 409 .*/api/apps/${domain.replace(/\./g, "\\.")}/migrate/plan$`));
   await page.setViewportSize({ width: 1440, height: 1000 });
   await signIn(page, consoleServer, `/apps/${domain}/settings`);
   const releases = region(page, "Releases");
@@ -178,16 +173,20 @@ test("an in-place app moves to releases after its plan is read and confirmed", a
   await review(page, testInfo, "settings-migration-confirm-1440");
   await expectNoA11yViolations(page, "the migration confirmation");
 
+  // The endpoint only queues the move now (a job, like an update); it answers 202 with the
+  // job, and the dialog itself follows it to completion (see ReleasesSection.tsx).
   const migrated = page.waitForResponse((r) => r.url().endsWith(`/api/apps/${domain}/migrate`) && r.request().method() === "POST");
   await dialog.getByRole("button", { name: "Migrate to releases" }).click();
   const response = await migrated;
-  expect(response.status()).toBe(200);
+  expect(response.status()).toBe(202);
   expect(response.request().postDataJSON()).toEqual({ persist: ["uploads", "storage"] });
-  const result = (await response.json()) as { files_before: number; files_after: number };
-  expect(result.files_after).toBe(result.files_before);
 
-  await expect(dialog).toBeHidden();
-  await expect(page.getByText(`${String(result.files_before)} files before, ${String(result.files_after)} after`, { exact: false })).toBeVisible();
+  await expect(dialog).toBeHidden({ timeout: 15_000 });
+  const summary = page.getByText(/files before, .* after \(/);
+  await expect(summary).toBeVisible();
+  const match = /^([\d,]+) files before, ([\d,]+) after/.exec((await summary.textContent()) ?? "");
+  if (!match) throw new Error(`Unexpected migration summary text: ${(await summary.textContent()) ?? ""}`);
+  expect(match[2]).toBe(match[1]);
   // The app is now on releases: the section shows the release serving.
   await expect(region(page, "Source and runtime").getByText("Releases", { exact: true })).toBeVisible();
   await expect(releases.getByText("Serving", { exact: true })).toBeVisible();

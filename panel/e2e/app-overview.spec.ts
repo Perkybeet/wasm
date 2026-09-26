@@ -7,7 +7,7 @@
 
 import type { Page } from "@playwright/test";
 
-import { expect, expectNoA11yViolations, settle, signIn, stillness, test, toasts, totpCode } from "./fixtures";
+import { expect, expectNoA11yViolations, settle, signIn, stillness, test, toasts } from "./fixtures";
 
 const DOMAIN = "picconia.com";
 
@@ -126,7 +126,7 @@ test("Delete stays disabled until the domain is typed", async ({ page, consoleSe
   // Deleting is a sudo-mode action: "Confirm it's you" comes first, never on top of the dialog.
   const elevate = page.getByRole("dialog", { name: "Confirm it's you" });
   await expect(elevate).toBeVisible();
-  await elevate.getByLabel("Authentication code").fill(totpCode(consoleServer.totpSecret ?? ""));
+  await elevate.getByLabel("Authentication code").fill(consoleServer.secondFactor());
   await elevate.getByRole("button", { name: "Confirm" }).click();
   await expect(elevate).toBeHidden();
 

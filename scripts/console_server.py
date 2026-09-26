@@ -59,6 +59,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatch
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 REPO = Path(__file__).resolve().parent.parent
@@ -105,12 +106,32 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="enable two-factor sign-in and print its secret as totp_secret",
     )
     parser.add_argument(
+        "--backup-codes",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "with --totp, enrol N backup codes instead of the usual count and print them as "
+            "backup_codes: each is good for one sign-in or confirmation, where a TOTP code is "
+            "good for one per 30-second step, which a test suite signing in every few seconds "
+            "cannot wait for"
+        ),
+    )
+    parser.add_argument(
         "--static-dir",
         type=Path,
         default=None,
         help=(
             "serve the console build from this directory instead of wasm/web/static, "
             "so several builds can be exercised side by side (development only)"
+        ),
+    )
+    parser.add_argument(
+        "--hostname",
+        default=None,
+        help=(
+            "report this hostname from the machine strip instead of this machine's own "
+            "(development and screenshots only)"
         ),
     )
     args = parser.parse_args(argv)
@@ -629,6 +650,22 @@ _MYSQL_DEMO_ROWS_HEADERS = (
 _SQL_LITERAL = re.compile(r"=\s*'([^']*)'")
 
 
+def _psql_console_sql(args: Sequence[str]) -> str:
+    """
+    Recover the SQL a psql invocation carries in its ``-c`` options.
+
+    The console statement reaches psql as ``-c`` strings rather than on stdin
+    (see PostgresManager._console_argv), so the model reads it from argv.
+
+    Args:
+        args: The psql argv.
+
+    Returns:
+        The ``-c`` strings joined by newlines, or "" when there are none.
+    """
+    return "\n".join(args[i + 1] for i, arg in enumerate(args[:-1]) if arg == "-c")
+
+
 def _sql_literal(statement: str) -> str | None:
     """
     Args:
@@ -730,7 +767,8 @@ def make_runner(
             self._mysql_databases: dict[str, tuple[int, int]] = dict(_MYSQL_DATABASES)
 
         def run(self, argv: Sequence[str], **kwargs: Any) -> CommandResult:
-            # SQL reaches the database clients on stdin, never in argv.
+            # WASM's own SQL reaches the database clients on stdin; the psql
+            # console statement arrives in -c instead (see _psql_console_sql).
             self._stdin.value = kwargs.get("input") or ""
             return super().run(argv, **kwargs)
 
@@ -765,9 +803,8 @@ def make_runner(
                 headers = "--csv" in args or (
                     program == "mysql" and "-B" in args and "-N" not in args
                 )
-                return ok(
-                    args, self._sql(program, getattr(self._stdin, "value", ""), headers=headers)
-                )
+                statement = getattr(self._stdin, "value", "") or _psql_console_sql(args)
+                return ok(args, self._sql(program, statement, headers=headers))
             if program == "certbot" and args[1:2] == ("certificates",):
                 return ok(args, self._certificates())
             if program == "certbot" and "--version" in args:
@@ -3552,21 +3589,33 @@ def bind(host: str, port: int) -> socket.socket:
     return sock
 
 
-def enable_totp() -> str:
+def enable_totp(backup_codes: int | None = None) -> tuple[str, list[str]]:
     """
     Turn on two-factor sign-in with a freshly enrolled secret.
 
+    Args:
+        backup_codes: How many backup codes to enrol, when not the usual count.
+
     Returns:
-        The secret, so a test can compute codes.
+        The secret, so a test can compute codes, and the backup codes.
     """
     from wasm.core import totp
+    from wasm.web import auth
     from wasm.web.server import get_token_manager
 
     manager = get_token_manager()
     secret = manager.begin_totp_enrollment()
-    if manager.confirm_totp_enrollment(totp.totp_now(secret)) is None:
+    usual = auth.BACKUP_CODE_COUNT
+    # Only this enrolment: a later "new backup codes" gives the usual count, as in production.
+    if backup_codes is not None:
+        auth.BACKUP_CODE_COUNT = backup_codes
+    try:
+        codes = manager.confirm_totp_enrollment(totp.totp_now(secret))
+    finally:
+        auth.BACKUP_CODE_COUNT = usual
+    if codes is None:
         raise RuntimeError("two-factor enrolment did not accept its own code")
-    return secret
+    return secret, codes
 
 
 def use_console_build(static_dir: Path) -> None:
@@ -3591,6 +3640,26 @@ def use_console_build(static_dir: Path) -> None:
     server.STATIC_DIR = static_dir
     server.ASSETS_DIR = static_dir / "assets"
     server.INDEX_HTML = static_dir / "index.html"
+
+
+def use_fixed_hostname(hostname: str) -> None:
+    """
+    Make the machine snapshot report a fixed hostname instead of this machine's own.
+
+    Development and screenshots only: a recording or a review screenshot should not carry
+    the developer's real machine name. ``wasm.web.machine.read_machine`` is the one place that
+    reads it, with a bare ``socket.gethostname()`` - not a module-level constant this could
+    rebind the way ``use_console_build`` rebinds ``server.STATIC_DIR`` - so this replaces the
+    name ``machine`` itself resolves ``socket`` to, inside that module's own namespace only.
+    Every other reader of ``socket.gethostname()`` (the session's own hostname, the TOTP
+    account name in ``wasm.web.api.auth``) keeps the real module and is unaffected.
+
+    Args:
+        hostname: The name to report.
+    """
+    import wasm.web.machine as machine_module
+
+    machine_module.socket = SimpleNamespace(gethostname=lambda: hostname)  # type: ignore[assignment]
 
 
 def serve(args: argparse.Namespace, sandbox: Sandbox) -> None:
@@ -3640,9 +3709,11 @@ def serve(args: argparse.Namespace, sandbox: Sandbox) -> None:
     )
     if args.static_dir is not None:
         use_console_build(args.static_dir)
+    if args.hostname is not None:
+        use_fixed_hostname(args.hostname)
     app = create_app(config)
     token = get_token_manager().generate_master_token()
-    totp_secret = enable_totp() if args.totp else None
+    totp_secret, backup_codes = enable_totp(args.backup_codes) if args.totp else (None, [])
     seed_settings_api_tokens()
     pin_settings_update_check()
 
@@ -3664,11 +3735,13 @@ def serve(args: argparse.Namespace, sandbox: Sandbox) -> None:
         while not server.started and not server.should_exit:
             time.sleep(0.02)
         if server.started:
-            line = {
+            line: dict[str, object] = {
                 "url": f"http://{display_host}:{port}",
                 "token": token,
                 "totp_secret": totp_secret,
             }
+            if args.backup_codes is not None:
+                line["backup_codes"] = backup_codes
             if args.keep:
                 line["sandbox"] = str(sandbox.root)
             print(json.dumps(line), flush=True)

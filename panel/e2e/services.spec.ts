@@ -3,7 +3,8 @@
  * editor (behind elevation) and deleting it (behind elevation, confirmed by typing the name).
  */
 
-import { expect, expectNoA11yViolations, settle, signIn, test, toasts, totpCode } from "./fixtures";
+import { expect, expectNoA11yViolations, settle, signIn, test, toasts } from "./fixtures";
+import { confirmItsYou } from "./settings.helpers";
 
 test("lists a seeded WASM-managed service and opens its page", async ({ page, consoleServer }) => {
   await signIn(page, consoleServer, "/services");
@@ -33,7 +34,9 @@ test("restarts a unit from its own page", async ({ page, consoleServer }) => {
   await expect(toasts(page).getByText("Restarted wasm-picconia-com")).toBeVisible();
 });
 
-test("creates a service in simple mode and finds it in the list", async ({ page, consoleServer }) => {
+test("creates a service in simple mode and finds it in the list", async ({ page, consoleServer, problems }) => {
+  // Creating a service asks "Confirm it's you" by answering 403 first, by design.
+  problems.expect(/status of 403 .* \/api\/services$/);
   await signIn(page, consoleServer, "/services");
   await page.getByRole("button", { name: "New service" }).click();
   const dialog = page.getByRole("dialog", { name: "New service" });
@@ -41,8 +44,11 @@ test("creates a service in simple mode and finds it in the list", async ({ page,
 
   await dialog.getByLabel("Name", { exact: true }).fill("e2e-worker");
   await dialog.getByLabel("Command", { exact: true }).fill("/usr/bin/node worker.js");
-  const created = page.waitForResponse((response) => response.url().endsWith("/api/services") && response.request().method() === "POST");
+  const created = page.waitForResponse(
+    (response) => response.url().endsWith("/api/services") && response.request().method() === "POST" && response.status() === 200,
+  );
   await dialog.getByRole("button", { name: "Create service" }).click();
+  await confirmItsYou(page, consoleServer);
   expect((await created).status()).toBe(200);
   await expect(toasts(page).getByText("Created e2e-worker")).toBeVisible();
 
@@ -62,7 +68,7 @@ test("saving the unit file asks to confirm it's you, then shows the saved result
   const confirm = page.getByRole("dialog", { name: "Confirm it's you" });
   await expect(confirm).toBeVisible();
   await expectNoA11yViolations(page, "the elevation dialog");
-  await page.getByLabel("Authentication code").fill(totpCode(consoleServer.totpSecret ?? ""));
+  await page.getByLabel("Authentication code").fill(consoleServer.secondFactor());
   await page.getByRole("button", { name: "Confirm" }).click();
   await expect(confirm).toBeHidden();
 
@@ -129,14 +135,22 @@ test("shows every unit, including one WASM did not create, read-only, behind the
   await expectNoA11yViolations(page, "a foreign unit's own page");
 });
 
-test("deleting a service is confirmed by typing its name and needs a fresh confirmation", async ({ page, consoleServer, problems }) => {
-  problems.expect(/status of 403 .*\/api\/services\/e2e-deleteme$/);
+test("deleting is confirmed by typing its name; creating it moments before already elevated the session", async ({
+  page,
+  consoleServer,
+  problems,
+}) => {
+  // Creating asks "Confirm it's you" by answering 403 first; that confirmation elevates the
+  // session for the next 10 minutes, so deleting the same service right after does not ask
+  // again - only the type-to-confirm safety net below runs.
+  problems.expect(/status of 403 .* \/api\/services$/);
   await signIn(page, consoleServer, "/services");
   await page.getByRole("button", { name: "New service" }).click();
   const createDialog = page.getByRole("dialog", { name: "New service" });
   await createDialog.getByLabel("Name", { exact: true }).fill("e2e-deleteme");
   await createDialog.getByLabel("Command", { exact: true }).fill("/usr/bin/node worker.js");
   await createDialog.getByRole("button", { name: "Create service" }).click();
+  await confirmItsYou(page, consoleServer);
   await expect(toasts(page).getByText("Created e2e-deleteme")).toBeVisible();
 
   await page.goto("/services/e2e-deleteme");
@@ -148,11 +162,6 @@ test("deleting a service is confirmed by typing its name and needs a fresh confi
   await dialog.locator("input").fill("e2e-deleteme");
   await expect(confirmButton).toBeEnabled();
   await confirmButton.click();
-
-  const elevate = page.getByRole("dialog", { name: "Confirm it's you" });
-  await expect(elevate).toBeVisible();
-  await page.getByLabel("Authentication code").fill(totpCode(consoleServer.totpSecret ?? ""));
-  await page.getByRole("button", { name: "Confirm" }).click();
 
   await expect(page).toHaveURL(/\/services$/);
   await expect(toasts(page).getByText("Deleted e2e-deleteme")).toBeVisible();

@@ -1,6 +1,6 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { ArrowDown, ArrowDownToLine, ChevronDown, ChevronUp, Download, Search, WrapText } from "lucide-react";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent, ReactNode } from "react";
 
 import type { AnsiSegment, AnsiStyle } from "../../lib/ansi";
@@ -200,6 +200,7 @@ export function LogViewer({
   const lastTop = useRef(0);
   const loadRequested = useRef(false);
   const firstId = useRef<number | undefined>(lines[0]?.id);
+  const fullLogHintId = useId();
 
   const [following, setFollowing] = useState(follow);
   const [atBottom, setAtBottom] = useState(true);
@@ -421,14 +422,21 @@ export function LogViewer({
             <span className="max-sm:sr-only">Follow</span>
           </Button>
           <IconButton size="sm" label="Wrap lines" icon={<WrapText />} pressed={wrap} onClick={() => setWrap((v) => !v)} />
-          <CopyButton value={plainText} label="Copy output" />
+          <CopyButton value={plainText} label="Copy output" aria-describedby={fullLogHintId} />
           <IconButton
             size="sm"
             label="Download output"
             icon={<Download />}
             disabled={lines.length === 0}
             onClick={() => downloadText(filename, `${plainText()}\n`)}
+            aria-describedby={fullLogHintId}
           />
+          {/* Only the rows in view are ever in the DOM (see the module docstring): a screen
+              reader reading the region finds just those, so it has to be told that Copy and
+              Download act on the whole log, not only what happens to be rendered. */}
+          <span id={fullLogHintId} className="sr-only">
+            Copies or downloads the entire log, not only the lines currently shown.
+          </span>
         </div>
       </div>
 

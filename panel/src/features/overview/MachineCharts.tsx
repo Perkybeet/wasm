@@ -11,13 +11,7 @@ import { Skeleton } from "../../components/ui/Skeleton";
 import { formatBytes, formatBytesRate, formatPercent } from "../../lib/format";
 import { alignSeries, latest, resolutionWords } from "./series";
 import type { Points } from "./series";
-
-export const WINDOWS: readonly { value: MetricWindow; label: string }[] = [
-  { value: "1h", label: "1h" },
-  { value: "24h", label: "24h" },
-  { value: "7d", label: "7d" },
-  { value: "30d", label: "30d" },
-];
+import { WINDOWS } from "./windows";
 
 const WINDOW_WORDS: Record<MetricWindow, string> = {
   "1h": "Last hour",

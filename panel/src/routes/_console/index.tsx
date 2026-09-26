@@ -1,8 +1,8 @@
 import { createFileRoute } from "@tanstack/react-router";
 
 import type { MetricWindow } from "../../api/queries/metrics";
-import { WINDOWS } from "../../features/overview/MachineCharts";
 import { OverviewPage } from "../../features/overview/OverviewPage";
+import { WINDOWS } from "../../features/overview/windows";
 
 interface OverviewSearch {
   /** The machine charts' time range; the last hour when absent. */

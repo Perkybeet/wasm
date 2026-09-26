@@ -83,6 +83,13 @@ export function useServiceActions(name: string) {
     onSuccess: () => {
       toast.success(`Deleted ${name}`);
       void queryClient.invalidateQueries({ queryKey: serviceKeys.all });
+      // Deleted, not just stale: nothing should be able to read a cached answer for a unit
+      // that no longer exists. Only once nothing is still watching it: this page's own detail
+      // query is exactly that until the redirect below unmounts it, and removing an entry an
+      // active observer still needs makes the query client refetch it immediately - a GET the
+      // deleted unit can only answer 404, logged as a console error the same way any failed
+      // request is.
+      queryClient.removeQueries({ queryKey: serviceKeys.detail(name), type: "inactive" });
     },
   });
 

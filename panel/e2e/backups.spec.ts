@@ -5,7 +5,7 @@
  * fixture.
  */
 
-import { expect, expectNoA11yViolations, settle, signIn, test, toasts, totpCode } from "./fixtures";
+import { expect, expectNoA11yViolations, settle, signIn, test, toasts } from "./fixtures";
 
 function rows(page: import("@playwright/test").Page) {
   return page.getByRole("region", { name: "Backups" }).getByRole("row").filter({ hasNot: page.getByRole("columnheader") });
@@ -86,7 +86,7 @@ test("restoring a backup is confirmed by typing the target domain", async ({ pag
   const elevate = page.getByRole("dialog", { name: "Confirm it's you" });
   await expect(elevate).toBeVisible();
   await expectNoA11yViolations(page, "the elevation dialog");
-  await elevate.getByLabel("Authentication code").fill(totpCode(consoleServer.totpSecret ?? ""));
+  await elevate.getByLabel("Authentication code").fill(consoleServer.secondFactor());
   const requested = page.waitForRequest(
     (request) => request.url().includes("/api/backups/") && request.url().endsWith("/restore") && request.method() === "POST",
   );

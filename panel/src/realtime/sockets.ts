@@ -23,6 +23,11 @@ export type SocketStatus = "connecting" | "open" | "reconnecting" | "closed";
 /** Close code the backend uses for a handshake without a valid session or ticket. */
 export const WS_CLOSE_UNAUTHORIZED = 4401;
 
+/** Close code the backend uses when a connection reaches its maximum lifetime: routine
+ * housekeeping, not a dropped connection, so it reconnects at once and never tells the
+ * operator anything happened. */
+export const WS_CLOSE_MAX_LIFETIME = 4408;
+
 /** The part of WebSocket the streams use, so tests can drive it. */
 export interface SocketLike {
   onopen: ((event: Event) => void) | null;
@@ -134,6 +139,12 @@ export class StreamSocket {
         this.running = false;
         this.options.onStatus("closed");
         expireSession();
+        return;
+      }
+      if (event.code === WS_CLOSE_MAX_LIFETIME) {
+        // Expected: reconnect right away, without the backoff a real drop would get and
+        // without the "reconnecting" status a real drop would show.
+        void this.open();
         return;
       }
       this.retry();

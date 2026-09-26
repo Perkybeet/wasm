@@ -38,6 +38,21 @@ describe("Settings > About", () => {
     await expectNoAxeViolations(container);
   });
 
+  it("does not turn an unsafe release_url into a link", async () => {
+    fakeBackend(
+      aboutRoutes({
+        current_version: "2.0.0",
+        latest_version: "2.1.0",
+        has_update: true,
+        update_command: "pip install --upgrade wasm-cli",
+        release_url: "javascript:alert(1)",
+      }),
+    );
+    renderConsole("/settings/about");
+    expect(await screen.findByText("Version 2.1.0 is available")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /What is new in/ })).not.toBeInTheDocument();
+  });
+
   it("says when it is up to date, and when it could not tell", async () => {
     const backend = fakeBackend(
       aboutRoutes({ current_version: "2.1.0", latest_version: "2.1.0", has_update: false, update_command: null, release_url: null }),

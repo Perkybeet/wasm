@@ -53,6 +53,36 @@ describe("api", () => {
     });
   });
 
+  it("carries a busy application's 409 through generically, detail and hint included", async () => {
+    fakeBackend({
+      "PATCH /api/apps/shop.example.com/limits": () =>
+        problem(409, "app_busy", "shop.example.com: update started at 14:02:10 is still running", {
+          hint: "Wait for it to finish, or follow it in Jobs",
+        }),
+    });
+    await expect(api("PATCH", "/api/apps/shop.example.com/limits", { memory_max_mb: 256 })).rejects.toMatchObject({
+      status: 409,
+      error: "app_busy",
+      detail: "shop.example.com: update started at 14:02:10 is still running",
+      hint: "Wait for it to finish, or follow it in Jobs",
+    });
+  });
+
+  it("carries an oversized body's 413 through generically, detail and hint included", async () => {
+    fakeBackend({
+      "POST /api/apps": () =>
+        problem(413, "payload_too_large", "The request body is larger than the server accepts.", {
+          hint: "Send a smaller request.",
+        }),
+    });
+    await expect(api("POST", "/api/apps", { domain: "shop.example.com" })).rejects.toMatchObject({
+      status: 413,
+      error: "payload_too_large",
+      detail: "The request body is larger than the server accepts.",
+      hint: "Send a smaller request.",
+    });
+  });
+
   it("reports a proxy's non-JSON error page as it was written", async () => {
     fakeBackend({ "GET /api/apps": () => new Response("<h1>502 Bad Gateway</h1>", { status: 502 }) });
     await expect(api("GET", "/api/apps")).rejects.toMatchObject({

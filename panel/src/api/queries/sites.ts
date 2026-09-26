@@ -12,6 +12,8 @@ export type SiteTemplates = ResponseOf<"/api/sites/templates", "get">;
 
 export const siteKeys = {
   all: ["sites"] as const,
+  /** Every single site's own entry: the prefix of `detail` and `config`. */
+  details: ["site"] as const,
   detail: (domain: string) => ["site", domain] as const,
   config: (domain: string) => ["site", domain, "config"] as const,
   templates: ["sites", "templates"] as const,

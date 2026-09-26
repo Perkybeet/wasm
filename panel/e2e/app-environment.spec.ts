@@ -14,25 +14,17 @@ import type { Page, TestInfo } from "@playwright/test";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 
-import type { ConsoleServer } from "./fixtures";
-import { expect, expectNoA11yViolations, settle, signIn, test, toasts, totpCode } from "./fixtures";
+import { confirmItsYou, expect, expectNoA11yViolations, settle, signIn, test, toasts } from "./fixtures";
 
 const FIXTURES = path.resolve(import.meta.dirname, "..", "..", "tests", "fixtures", "env");
 const MESSY = readFileSync(path.join(FIXTURES, "messy.env"), "utf8");
 const MESSY_MAP = JSON.parse(readFileSync(path.join(FIXTURES, "messy.json"), "utf8")) as Record<string, string>;
+const SAVED_MAP = Object.fromEntries(Object.entries(MESSY_MAP).filter(([name]) => name !== "PORT"));
 
 const SCREENS = process.env.WASM_TABS_SCREENS ?? "/tmp/console-tabs";
 
 function appFor(testInfo: TestInfo): string {
   return testInfo.project.name === "dark" ? "tienda.cittek.es" : "pedidos.cittek.es";
-}
-
-async function confirmItsYou(page: Page, server: ConsoleServer): Promise<void> {
-  const dialog = page.getByRole("dialog", { name: "Confirm it's you" });
-  await expect(dialog).toBeVisible();
-  await dialog.getByLabel("Authentication code").fill(totpCode(server.totpSecret ?? ""));
-  await dialog.getByRole("button", { name: "Confirm" }).click();
-  await expect(dialog).toBeHidden();
 }
 
 function table(page: Page, domain: string) {
@@ -58,6 +50,10 @@ test("a messy .env pasted in is saved as exactly what EnvManager reads from it",
   await expectNoA11yViolations(page, "the paste dialog");
   await paste.getByRole("button", { name: `Stage ${String(count)} variables` }).click();
   await expect(paste).toBeHidden();
+  // WASM sets PORT itself, and the backend refuses a save that adds or changes it; the
+  // operator keeps the app's own before saving, which also proves a staged change can be undone.
+  await page.getByRole("button", { name: "Undo the change to PORT" }).click();
+  const { port } = (await (await page.request.get(`/api/apps/${domain}`)).json()) as { port: number };
 
   await page.getByRole("button", { name: "Review and save" }).click();
   await confirmItsYou(page, consoleServer);
@@ -68,7 +64,7 @@ test("a messy .env pasted in is saved as exactly what EnvManager reads from it",
 
   const put = page.waitForRequest((request) => request.method() === "PUT" && request.url().endsWith(`/api/apps/${domain}/env`));
   await review.getByRole("button", { name: "Save changes" }).click();
-  expect((await put).postDataJSON()).toEqual({ variables: MESSY_MAP });
+  expect((await put).postDataJSON()).toEqual({ variables: { ...SAVED_MAP, PORT: String(port) } });
 
   const saved = page.getByRole("dialog", { name: "Environment saved" });
   await expect(saved).toBeVisible();

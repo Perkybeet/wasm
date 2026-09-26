@@ -63,6 +63,7 @@ describe("jobActionLabel", () => {
   it("translates every JobType to a sentence-case word", () => {
     expect(jobActionLabel("deploy")).toBe("Deploy");
     expect(jobActionLabel("cert_renew")).toBe("Renew certificate");
+    expect(jobActionLabel("migrate")).toBe("Migrate to releases");
   });
 
   it("shows an unrecognised type verbatim rather than guessing", () => {

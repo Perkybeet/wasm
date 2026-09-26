@@ -28,7 +28,7 @@ async function csrfHeaders(context: APIRequestContext): Promise<Record<string, s
 async function otherSession(server: ConsoleServer): Promise<APIRequestContext> {
   const context = await playwrightRequest.newContext({ baseURL: server.url });
   const response = await context.post("/api/auth/login", {
-    data: { token: server.token, ...(server.totpSecret !== null ? { totp_code: totpCode(server.totpSecret) } : {}) },
+    data: { token: server.token, ...(server.totpSecret !== null ? { totp_code: server.secondFactor() } : {}) },
   });
   expect(response.ok()).toBe(true);
   return context;
@@ -140,7 +140,26 @@ test("a failure toast is announced once and stays reachable from the keyboard", 
   await expectAccessibleToast(page, `Could not sign out session ${prefix}`, "assertive");
 });
 
-test("new backup codes replace the old ones after confirming it's you, and are shown once", async ({ page, consoleServer, problems }) => {
+// ---------------------------------------------------------------------------------------
+// Replacing the backup codes would spend the worker server's pool that every other test signs
+// in with, so this one gets a server of its own, with the usual eight.
+
+const withOwnBackupCodes = test.extend<object, { consoleServer: ConsoleServer }>({
+  consoleServer: [
+    // eslint-disable-next-line no-empty-pattern -- Playwright requires the destructuring form
+    async ({}, use) => {
+      const server = await startConsoleServer(["--totp"]);
+      try {
+        await use(server);
+      } finally {
+        await server.stop();
+      }
+    },
+    { scope: "worker", timeout: 75_000 },
+  ],
+});
+
+withOwnBackupCodes("new backup codes replace the old ones after confirming it's you, and are shown once", async ({ page, consoleServer, problems }) => {
   // The first ask is refused until the operator confirms it's them, as designed.
   problems.expect(/status of 403 .* \/api\/auth\/2fa\/backup-codes$/);
   await signIn(page, consoleServer, "/settings/security");
@@ -192,12 +211,16 @@ async function signInWithCode(page: Page, server: ConsoleServer, secret: string)
 }
 
 withoutTwoFactor("enrol two-factor end to end, sign in with it, turn it off", async ({ page, consoleServer, problems, browser }) => {
-  // Turning it off asks "Confirm it's you" by answering 403 first, by design.
-  problems.expect(/status of 403 .* \/api\/auth\/2fa\/disable$/);
+  // Starting the enrolment asks "Confirm it's you" by answering 403 first, by design; two-
+  // factor is off going in, so it is confirmed with the access token. That confirmation
+  // elevates the session for the next 10 minutes, so turning it off at the end of this same
+  // session does not ask again.
+  problems.expect(/status of 403 .* \/api\/auth\/2fa\/enroll$/);
   await signIn(page, consoleServer, "/settings/security");
   const section = page.getByRole("region", { name: "Two-factor authentication" });
   await expect(section.getByText("Off", { exact: true })).toBeVisible();
   await section.getByRole("button", { name: "Set up two-factor authentication" }).click();
+  await confirmItsYou(page, consoleServer);
 
   const dialog = page.getByRole("dialog", { name: "Set up two-factor authentication" });
   const qr = dialog.getByRole("img", { name: /QR code to add WASM/ });
@@ -238,7 +261,7 @@ withoutTwoFactor("enrol two-factor end to end, sign in with it, turn it off", as
   const off = page.getByRole("dialog", { name: "Turn off two-factor authentication" });
   await off.getByLabel("Authentication or backup code").fill(totpCode(secret));
   await off.getByRole("button", { name: "Turn off" }).click();
-  await confirmItsYou(page, consoleServer, secret);
+  // Still elevated from confirming the enrolment above: no second "Confirm it's you".
   await expect(toastSaying(page, "Turned off two-factor authentication")).toBeVisible();
   await expect(section.getByRole("button", { name: "Set up two-factor authentication" })).toBeVisible();
   await settle(page);

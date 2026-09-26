@@ -760,9 +760,9 @@ function Charts() {
   const metrics = sampleMetrics();
   const week = sampleWeekMetrics();
   const weekMarkers = [
-    { at: week.timestamps[24] ?? 0, label: "Deploy 118, succeeded, Sep 19, 14:00", state: "running" as const, href: "#deploy-118" },
-    { at: week.timestamps[96] ?? 0, label: "Deploy 121, failed, Sep 22, 14:00", state: "failed" as const, href: "#deploy-121" },
-    { at: week.timestamps[144] ?? 0, label: "Deploy 124, in progress, Sep 24, 14:00", state: "deploying" as const, href: "#deploy-124" },
+    { at: week.timestamps[24] ?? 0, label: "Deploy 118, succeeded, Sep 19, 14:00", state: "running" as const, href: "https://wasm.example.com/deploys/118" },
+    { at: week.timestamps[96] ?? 0, label: "Deploy 121, failed, Sep 22, 14:00", state: "failed" as const, href: "https://wasm.example.com/deploys/121" },
+    { at: week.timestamps[144] ?? 0, label: "Deploy 124, in progress, Sep 24, 14:00", state: "deploying" as const, href: "https://wasm.example.com/deploys/124" },
   ];
   return (
     <Section

@@ -17,6 +17,7 @@ import { ErrorBlock } from "../../components/page/QueryState";
 import { Button } from "../../components/ui/Button";
 import { Checkbox } from "../../components/ui/Checkbox";
 import { CopyButton } from "../../components/ui/CopyButton";
+import { CopyTextButton } from "../../components/ui/CopyTextButton";
 import { Dialog } from "../../components/ui/Dialog";
 import { Field } from "../../components/ui/Field";
 import { Input } from "../../components/ui/Input";
@@ -27,7 +28,6 @@ import { cx } from "../../lib/cx";
 import { reportActionError } from "../apps/useAppActions";
 import { splitErrors } from "./formErrors";
 import { QrCode } from "./QrCode";
-import { CopyTextButton } from "./CopyTextButton";
 import { backupCodesFile, groupSecret } from "./security";
 import { SettingsSection } from "./SettingsForm";
 
@@ -49,7 +49,7 @@ function useRefreshTwoFactor() {
 // ---------------------------------------------------------------------------------------
 // Enrolment
 
-interface EnrollDialogProps {
+export interface EnrollDialogProps {
   open: boolean;
   enrollment: TwoFactorEnrollment | null;
   onClose: () => void;
@@ -58,9 +58,13 @@ interface EnrollDialogProps {
 /**
  * Setting up two-factor authentication: scan the code (or type the key), prove it with a code
  * from the app, then keep the backup codes, which are shown this once. Keyed by the secret, so
- * every setup starts from a clean state.
+ * every setup starts from a clean state; closing it for any reason clears that state again, so
+ * the secret and the backup codes never outlive the dialog that showed them.
+ *
+ * Exported for `TwoFactorSection.test.tsx`, which checks that in isolation from the parent's
+ * own key-based reset.
  */
-function EnrollDialog({ open, enrollment, onClose }: EnrollDialogProps) {
+export function EnrollDialog({ open, enrollment, onClose }: EnrollDialogProps) {
   const refresh = useRefreshTwoFactor();
   const { data: session } = useQuery(sessionQuery());
   const hostname = session?.hostname ?? "this server";
@@ -93,6 +97,14 @@ function EnrollDialog({ open, enrollment, onClose }: EnrollDialogProps) {
       return;
     }
     if (codes !== null) toast.success("Turned on two-factor authentication");
+    // The secret, its QR URI and the backup codes are plaintext in state only while this
+    // dialog is open; closing it - cancelled, confirmed, or dismissed however it closes -
+    // wipes them, rather than leaving them sitting in memory for as long as this settings
+    // page stays mounted.
+    setCodes(null);
+    setCode("");
+    setSaved(false);
+    setNudge(false);
     onClose();
   };
 
@@ -577,6 +589,9 @@ export function TwoFactorSection() {
         enrollment={enrollment}
         onClose={() => {
           setEnrolling(false);
+          // Closing loses the only handle on the secret and QR URI held here; forgetting it
+          // also means the next "Set up" starts this dialog from a clean key.
+          setEnrollment(null);
         }}
       />
       <DisableDialog

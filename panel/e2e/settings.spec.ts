@@ -4,7 +4,7 @@
  * Every settings page passes axe and the CSP and console gates, in both themes.
  */
 
-import { expect, expectNoA11yViolations, settle, signIn, test, totpCode } from "./fixtures";
+import { expect, expectNoA11yViolations, settle, signIn, test } from "./fixtures";
 import { expectAccessibleToast, holdToast, stillness } from "./settings.helpers";
 
 const PAGES = [
@@ -51,7 +51,7 @@ test("a refused value is shown beside its field, verbatim; the fixed value saves
   const elevate = page.getByRole("dialog", { name: "Confirm it's you" });
   await expect(elevate).toBeVisible();
   await expectNoA11yViolations(page, "the elevation dialog");
-  await elevate.getByLabel("Authentication code").fill(totpCode(consoleServer.totpSecret ?? ""));
+  await elevate.getByLabel("Authentication code").fill(consoleServer.secondFactor());
   const refused = page.waitForResponse((response) => response.url().endsWith("/api/config/backup") && response.request().method() === "PUT");
   await elevate.getByRole("button", { name: "Confirm" }).click();
   expect((await refused).status()).toBe(422);

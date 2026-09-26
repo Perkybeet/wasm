@@ -10,6 +10,8 @@ export type CertEntry = CertList["certificates"][number];
 
 export const certKeys = {
   all: ["certs"] as const,
+  /** Every single certificate's own entry: the prefix of `detail`. */
+  details: ["cert"] as const,
   detail: (domain: string) => ["cert", domain] as const,
 };
 
@@ -17,10 +19,4 @@ export const certsQuery = () =>
   queryOptions({
     queryKey: certKeys.all,
     queryFn: ({ signal }) => request("get", "/api/certs", { signal }),
-  });
-
-export const certQuery = (domain: string) =>
-  queryOptions({
-    queryKey: certKeys.detail(domain),
-    queryFn: ({ signal }) => request("get", "/api/certs/{domain}", { params: { domain }, signal }),
   });

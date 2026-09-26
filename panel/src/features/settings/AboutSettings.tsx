@@ -13,6 +13,7 @@ import { ErrorBlock } from "../../components/page/QueryState";
 import { Section, Sections } from "../../components/page/Section";
 import { Button } from "../../components/ui/Button";
 import { Skeleton } from "../../components/ui/Skeleton";
+import { isHttpUrl } from "../../lib/url";
 
 type UpdateInfo = ResponseOf<"/api/system/version", "get">;
 
@@ -47,7 +48,7 @@ function UpdateState({ info }: { info: UpdateInfo }): ReactNode {
           {`Version ${info.latest_version} is available`}
         </p>
         {info.update_command ? <CommandHint label="Update from a terminal" command={info.update_command} /> : null}
-        {info.release_url ? (
+        {info.release_url && isHttpUrl(info.release_url) ? (
           <a
             href={info.release_url}
             target="_blank"

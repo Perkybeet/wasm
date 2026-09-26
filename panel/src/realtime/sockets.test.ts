@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { configureApi } from "../api/client";
 import { jobKeys } from "../api/queries/jobs";
 import { FakeWebSocket } from "../test/fakes";
-import { StreamSocket, WS_CLOSE_UNAUTHORIZED, useJobStream, useLogStream } from "./sockets";
+import { StreamSocket, WS_CLOSE_MAX_LIFETIME, WS_CLOSE_UNAUTHORIZED, useJobStream, useLogStream } from "./sockets";
 
 const connect = (url: string) => new FakeWebSocket(url);
 
@@ -71,6 +71,33 @@ describe("StreamSocket", () => {
     expect(onSessionExpired).toHaveBeenCalledOnce();
     expect(FakeWebSocket.instances).toHaveLength(1);
     expect(statuses.at(-1)).toBe("closed");
+  });
+
+  it("reconnects at once and quietly on a 4408 close, its maximum lifetime reached", async () => {
+    let issued = 0;
+    const statuses: string[] = [];
+    const socket = new StreamSocket({
+      path: "/ws/jobs/j1",
+      getTicket: () => Promise.resolve(`ticket-${String((issued += 1))}`),
+      connect,
+      onFrame: () => undefined,
+      onStatus: (status) => statuses.push(status),
+    });
+    socket.start();
+    await flush();
+    FakeWebSocket.latest().open();
+    expect(statuses).toEqual(["connecting", "open"]);
+
+    FakeWebSocket.latest().drop(WS_CLOSE_MAX_LIFETIME);
+    await flush();
+    FakeWebSocket.latest().open();
+    // A new connection, immediately: "connecting" again (the same neutral state the first
+    // connection went through), never "reconnecting" - the pill a real drop shows.
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(new URL(FakeWebSocket.latest().url).searchParams.get("ticket")).toBe("ticket-2");
+    expect(statuses).toEqual(["connecting", "open", "connecting", "open"]);
+    expect(statuses).not.toContain("reconnecting");
+    socket.stop();
   });
 });
 

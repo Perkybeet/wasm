@@ -21,6 +21,7 @@ describe("jobWords", () => {
   it("names each job the way the header says it", () => {
     expect(jobWords("update")).toEqual({ running: "Updating", noun: "Update" });
     expect(jobWords("restore")).toEqual({ running: "Rolling back", noun: "Rollback" });
+    expect(jobWords("migrate")).toEqual({ running: "Migrating", noun: "Migration" });
     expect(jobWords("something_new")).toEqual({ running: "Working", noun: "Job" });
   });
 });

@@ -60,9 +60,10 @@ export interface RunQueryInput {
 export function useDatabaseActions() {
   const queryClient = useQueryClient();
 
-  const refreshList = (engine?: string): void => {
-    void queryClient.invalidateQueries({ queryKey: databaseKeys.list(engine ?? null) });
-    void queryClient.invalidateQueries({ queryKey: databaseKeys.all, exact: true });
+  // Every list, not just the engine that changed: a database created or dropped on one engine
+  // also changes what the unfiltered "every engine" list shows.
+  const refreshList = (): void => {
+    void queryClient.invalidateQueries({ queryKey: databaseKeys.lists });
   };
 
   const createDatabase = useMutation({
@@ -77,16 +78,22 @@ export function useDatabaseActions() {
       }),
     onSuccess: (database) => {
       toast.success(`Database '${database.name}' created`);
-      refreshList(database.engine);
+      refreshList();
     },
   });
 
   const dropDatabase = useMutation({
     mutationFn: ({ engine, name, force = false }: { engine: string; name: string; force?: boolean }) =>
       request("delete", "/api/databases/databases/{engine}/{name}", { params: { engine, name }, query: { force } }),
-    onSuccess: (result, { engine }) => {
+    onSuccess: (result, { engine, name }) => {
       toast.success(result.message);
-      refreshList(engine);
+      refreshList();
+      // The dropped database's own detail entry, if anything cached one: it no longer exists,
+      // so nothing should be able to read a stale answer for it out of the cache. Only once
+      // nothing is still watching it (see useServiceActions.ts's own removeQueries, the same
+      // reasoning): removing an entry an active observer still needs makes the query client
+      // refetch it immediately, and a dropped database can only answer that with a 404.
+      queryClient.removeQueries({ queryKey: databaseKeys.detail(engine, name), type: "inactive" });
     },
     onError: (error, { name }) => {
       reportActionError(`Could not drop '${name}'`, error);

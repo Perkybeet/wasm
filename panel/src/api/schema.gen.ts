@@ -33,8 +33,13 @@ export interface paths {
          * Create App
          * @description Queue the deployment of a new application.
          *
+         *     Admin scope, through the blanket policy: the build runs as root. A local
+         *     path as the source is further reserved to the operator in person; see
+         *     :func:`_require_local_source_privilege`.
+         *
          *     Args:
          *         body: The deployment request.
+         *         request: The incoming request, for the audit record of a refusal.
          *         session: The authenticated session.
          *
          *     Returns:
@@ -42,7 +47,8 @@ export interface paths {
          *
          *     Raises:
          *         HTTPException: 409 when the domain is already deployed, 503 when no
-         *             port is free.
+         *             port is free, 403 when the source is a local path and the
+         *             credential may not deploy one.
          *         PortError: When the requested port is not usable.
          *         DomainError: When the domain is not acceptable.
          *         ValidationError: A resource limit is out of range (400, with the
@@ -77,14 +83,21 @@ export interface paths {
          *     removed before this returns, and no application, domain or unit is
          *     created.
          *
+         *     Admin scope, like creating one: fetching runs as root and reads back what
+         *     it fetched. A local path is reserved to the operator in person, exactly
+         *     as it is for ``POST /api/apps``.
+         *
          *     Args:
          *         body: The source to inspect and the branch to check out.
+         *         request: The incoming request, for the audit record of a refusal.
          *         session: The authenticated session.
          *
          *     Returns:
          *         The inspection result.
          *
          *     Raises:
+         *         HTTPException: 403 when the source is a local path and the credential
+         *             may not read one.
          *         SourceError: The source is invalid, or fetching it failed. Answered
          *             as 400: the operator gave a source WASM cannot reach, not a
          *             server fault.
@@ -382,7 +395,9 @@ export interface paths {
          *
          *     Raises:
          *         HTTPException: 404 when the application is unknown, 422 when a name
-         *             or a value is not safe to write into a systemd unit.
+         *             or a value is not safe to write into a systemd unit, or when the
+         *             request tries to set PORT or NODE_ENV, which the unit sets inline
+         *             and are refused by :func:`~wasm.deployers.helpers.app_env.write_app_env`.
          */
         put: operations["update_app_env_api_apps__domain__env_put"];
         post?: never;
@@ -469,11 +484,19 @@ export interface paths {
         put?: never;
         /**
          * Migrate App
-         * @description Move an in-place application onto the release layout.
+         * @description Queue the move of an in-place application onto the release layout.
          *
          *     Rewrites the unit and the site and moves the whole application tree, so
-         *     it needs sudo mode. The plan is worked out again here rather than taken
-         *     from the client: what is executed is what is on disk now.
+         *     it needs sudo mode. It runs as a job, like an update: the unit is stopped
+         *     while the tree moves and the health check waits for it on the new layout,
+         *     and the job keeps its log whatever happens to the browser. The job's
+         *     result has the first release, what moved to ``shared/`` and the file
+         *     counts before and after.
+         *
+         *     The plan is worked out here only to refuse a request that cannot run (an
+         *     application on releases already, a path that is not inside it); the job
+         *     plans again when it runs, so what is migrated is what is on disk then,
+         *     never a plan the client sent.
          *
          *     Args:
          *         domain: Domain of the application.
@@ -481,15 +504,14 @@ export interface paths {
          *         session: The authenticated, elevated session.
          *
          *     Returns:
-         *         What was done.
+         *         The queued job.
          *
          *     Raises:
          *         HTTPException: 404 when the application is unknown, 409 when it is on
          *             releases already.
          *         ValidationError: A path in ``persist`` is not inside the application.
-         *         DeploymentError: A step failed or the application did not answer on
-         *             the new layout; everything was put back, and the details carry
-         *             the health check's own output.
+         *         DeploymentError: Its type cannot use releases, or the paths named
+         *             leave a SQLite database out.
          */
         post: operations["migrate_app_api_apps__domain__migrate_post"];
         delete?: never;
@@ -913,18 +935,23 @@ export interface paths {
          * Two Factor Confirm
          * @description Verify a code from the authenticator and activate the second factor.
          *
+         *     Sudo mode, like enrolling: this is the step that switches the second
+         *     factor on and hands out the backup codes.
+         *
          *     Args:
          *         request: The incoming request.
          *         body: The code the app shows for the pending secret.
-         *         session: The authenticated session.
+         *         session: The authenticated session, elevated.
          *
          *     Returns:
          *         The backup codes, in clear, exactly once.
          *
          *     Raises:
-         *         HTTPException: 400 when the code does not verify. Not counted by the
-         *             lockout: the pending secret is on the operator's own screen, so a
-         *             wrong code here proves a typo, not a guess at a credential.
+         *         HTTPException: 403 with ``error: "elevation_required"`` per
+         *             :func:`wasm.web.api.deps.require_elevated`. 400 when the code
+         *             does not verify. Not counted by the lockout: the pending secret
+         *             is on the operator's own screen, so a wrong code here proves a
+         *             typo, not a guess at a credential.
          */
         post: operations["two_factor_confirm_api_auth_2fa_confirm_post"];
         delete?: never;
@@ -982,12 +1009,21 @@ export interface paths {
          * Two Factor Enroll
          * @description Begin enrolment: generate a pending secret. Nothing is enforced yet.
          *
+         *     Sudo mode, confirmed with the master token (two-factor is off, or there
+         *     would be nothing to enrol): the factor enrolled here is the one every
+         *     later confirmation asks for, so a session nobody re-confirmed must not be
+         *     able to bind its own authenticator.
+         *
          *     Args:
          *         request: The incoming request.
-         *         session: The authenticated session.
+         *         session: The authenticated session, elevated.
          *
          *     Returns:
          *         The secret and its provisioning URI, shown to the operator once.
+         *
+         *     Raises:
+         *         HTTPException: 403 with ``error: "elevation_required"`` per
+         *             :func:`wasm.web.api.deps.require_elevated`.
          */
         post: operations["two_factor_enroll_api_auth_2fa_enroll_post"];
         delete?: never;
@@ -1116,10 +1152,14 @@ export interface paths {
          *
          *     Every other endpoint under ``/api`` requires ``require_auth`` and answers
          *     401 to an anonymous caller; this one exists so the console has something
-         *     to call before it knows which of those two things it is. The credential
-         *     is checked but never counted towards the lockout - an anonymous probe of
-         *     this endpoint is not a credential guess, because nothing here is graded
-         *     pass or fail the way a login attempt is.
+         *     to call before it knows which of those two things it is. A caller that
+         *     presents nothing is not guessing anything and is not counted. A caller
+         *     that presents a credential is checked exactly as ``require_auth`` checks
+         *     one, through :func:`~wasm.web.auth.verify_credential`, and a wrong one is
+         *     counted towards the lockout: the answer here says whether the value was
+         *     the master token, so without counting this was a guessing oracle with no
+         *     limit. A session cookie this server signed but that has since expired is
+         *     not a guess and is not counted.
          *
          *     Args:
          *         request: The incoming request.
@@ -1438,12 +1478,13 @@ export interface paths {
          * @description Schedule automatic backups of an application on a systemd timer.
          *
          *     Scheduling the same domain again rewrites its unit pair, so this is also
-         *     how a schedule is changed.
+         *     how a schedule is changed. Sudo mode, like deleting one: a schedule is a
+         *     root timer, and its retention decides which backups are thrown away.
          *
          *     Args:
          *         data: The schedule request. Its calendar expression was already
          *             checked against the scheduler's own rules by the request model.
-         *         session: The authenticated session.
+         *         session: The authenticated session, elevated.
          *
          *     Returns:
          *         The action outcome, carrying the schedule as created.
@@ -2252,10 +2293,13 @@ export interface paths {
          * Create Job
          * @description Create a cron job as a systemd timer, or rewrite one WASM already owns.
          *
+         *     Sudo mode, creating or rewriting alike: either way the result is a
+         *     command of the caller's choosing that runs as root on a timer.
+         *
          *     Args:
          *         data: The job request. Its calendar expression was already checked
          *             against the manager's own rules by the request model.
-         *         session: The authenticated session.
+         *         session: The authenticated session, elevated.
          *
          *     Returns:
          *         The action outcome, carrying the job as created.
@@ -3766,6 +3810,12 @@ export interface paths {
          * Get Observations
          * @description Read stored observations, newest first.
          *
+         *     A scan runs as admin, but this endpoint is a plain GET and needs only
+         *     read scope - so it is the actual route by which a lesser credential could
+         *     read another process's argv, stored by an admin-run scan days earlier.
+         *     The command line is only included for an admin-scoped *reader*; see
+         *     :func:`_visible_command`.
+         *
          *     Args:
          *         limit: Maximum number of rows to return.
          *         include_acknowledged: Include rows an operator already dismissed.
@@ -3835,6 +3885,10 @@ export interface paths {
          * Get All Processes
          * @description List the processes on the machine.
          *
+         *     The command line is only included for an admin-scoped credential - see
+         *     :func:`_visible_command` - because argv routinely carries another
+         *     process's secrets.
+         *
          *     Args:
          *         limit: Maximum number of rows to return.
          *         sort_by: One of cpu, memory, name, pid.
@@ -3869,7 +3923,12 @@ export interface paths {
          * @description Run one scan and return what stood out.
          *
          *     There is no dry-run parameter because there is no other mode: a scan reads
-         *     the process table and writes rows to the observation store.
+         *     the process table and writes rows to the observation store. This endpoint
+         *     already requires admin scope at the auth chokepoint (mutations default to
+         *     admin), so the command line in the response is never actually seen below
+         *     admin today; it is still gated the same way as :func:`get_observations`,
+         *     so relaxing the endpoint's own scope requirement later cannot reopen the
+         *     leak this closes.
          *
          *     Args:
          *         session: Authenticated session, injected.
@@ -4077,6 +4136,11 @@ export interface paths {
         /**
          * Create Service
          * @description Create a new systemd service.
+         *
+         *     Sudo mode, for either form of the request - a raw unit or the fields
+         *     that render one: a unit is a command systemd runs as root, restarted for
+         *     as long as the machine is up, which is the same standing reach editing a
+         *     unit by hand has.
          */
         post: operations["create_service_api_services_post"];
         delete?: never;
@@ -4808,7 +4872,9 @@ export interface paths {
          * @description List running processes.
          *
          *     This is a read-only view. There is deliberately no endpoint that signals a
-         *     process; see the module docstring.
+         *     process; see the module docstring. The command line is only included for
+         *     an admin-scoped credential - see :func:`_visible_command` - because argv
+         *     routinely carries another process's secrets.
          *
          *     Args:
          *         limit: How many processes to return after sorting.
@@ -7223,47 +7289,6 @@ export interface components {
             warnings: string[];
         };
         /**
-         * MigrationResultOut
-         * @description What a migration did.
-         *
-         *     Attributes:
-         *         domain: The application's domain.
-         *         release_id: The first release, now active.
-         *         persistent: What is kept in ``shared/``.
-         *         env_files: Environment files moved to ``shared/``.
-         *         files_before: Regular files before.
-         *         files_after: Regular files after, ``shared/`` included; always equal.
-         *         bytes_before: Their size before.
-         *         bytes_after: Their size after.
-         *         unit_rewritten: Whether the unit was rewritten.
-         *         site_rewritten: Whether the site was rewritten.
-         *         deployment_id: The deployment history row that records it.
-         */
-        MigrationResultOut: {
-            /** Bytes After */
-            bytes_after: number;
-            /** Bytes Before */
-            bytes_before: number;
-            /** Deployment Id */
-            deployment_id?: number | null;
-            /** Domain */
-            domain: string;
-            /** Env Files */
-            env_files: string[];
-            /** Files After */
-            files_after: number;
-            /** Files Before */
-            files_before: number;
-            /** Persistent */
-            persistent: string[];
-            /** Release Id */
-            release_id: string;
-            /** Site Rewritten */
-            site_rewritten: boolean;
-            /** Unit Rewritten */
-            unit_rewritten: boolean;
-        };
-        /**
          * MonitorActionResponse
          * @description Outcome of a systemd action against the monitor unit, or of acknowledging
          *     an observation - every handler below answers exactly these two fields.
@@ -9260,12 +9285,12 @@ export interface operations {
         };
         responses: {
             /** @description Successful Response */
-            200: {
+            202: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["MigrationResultOut"];
+                    "application/json": components["schemas"]["JobAcceptedResponse"];
                 };
             };
             /** @description Validation Error */

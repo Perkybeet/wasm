@@ -5,18 +5,8 @@ import { sitesQuery } from "../../api/queries/sites";
 import { PageHeader } from "../../app/PageHeader";
 import { Tab, TabList, TabPanel, Tabs } from "../../components/ui/Tabs";
 import { CertificatesTab } from "./CertificatesTab";
+import type { DomainsTab } from "./search";
 import { SitesTab } from "./SitesTab";
-
-export type DomainsTab = "certificates" | "sites";
-
-export interface DomainsSearch {
-  tab?: DomainsTab;
-}
-
-/** The page's search params: the open tab, certificates unless the URL says sites. */
-export function validateDomainsSearch(search: Record<string, unknown>): DomainsSearch {
-  return search["tab"] === "sites" ? { tab: "sites" } : search["tab"] === "certificates" ? { tab: "certificates" } : {};
-}
 
 export interface DomainsPageProps {
   tab: DomainsTab;

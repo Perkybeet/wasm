@@ -15,8 +15,8 @@ export function useCertificateRefresh(): void {
   useServerEvent("job", (job) => {
     if (!CERT_JOB_TYPES.has(job.type) || !isJobFinished(job)) return;
     void queryClient.invalidateQueries({ queryKey: certKeys.all });
-    void queryClient.invalidateQueries({ queryKey: ["cert"] });
+    void queryClient.invalidateQueries({ queryKey: certKeys.details });
     void queryClient.invalidateQueries({ queryKey: siteKeys.all });
-    void queryClient.invalidateQueries({ queryKey: ["site"] });
+    void queryClient.invalidateQueries({ queryKey: siteKeys.details });
   });
 }

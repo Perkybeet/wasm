@@ -10,6 +10,7 @@ const JOB_WORDS: Readonly<Record<string, { running: string; noun: string }>> = {
   restore: { running: "Rolling back", noun: "Rollback" },
   delete: { running: "Deleting", noun: "Deletion" },
   backup: { running: "Backing up", noun: "Backup" },
+  migrate: { running: "Migrating", noun: "Migration" },
   service_action: { running: "Working", noun: "Service action" },
 };
 

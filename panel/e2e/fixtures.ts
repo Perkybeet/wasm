@@ -30,6 +30,13 @@ export interface ConsoleServer {
   token: string;
   /** Set when the server was started with two-factor sign-in enabled. */
   totpSecret: string | null;
+  /**
+   * A second factor nothing has spent yet: one of the server's backup codes. A TOTP code is
+   * good once per 30-second step and purpose (RFC 6238, 5.2, which the server enforces), and a
+   * suite that signs in every few seconds cannot wait for the next step, so every sign-in and
+   * confirmation that is not about TOTP itself spends a backup code instead.
+   */
+  secondFactor: () => string;
 }
 
 export interface RunningServer extends ConsoleServer {
@@ -86,7 +93,7 @@ export async function startConsoleServer(args: readonly string[] = []): Promise<
     });
   });
 
-  let parsed: { url: string; token: string; totp_secret: string | null };
+  let parsed: { url: string; token: string; totp_secret: string | null; backup_codes?: string[] };
   try {
     parsed = JSON.parse(await first) as typeof parsed;
   } catch (error: unknown) {
@@ -94,10 +101,19 @@ export async function startConsoleServer(args: readonly string[] = []): Promise<
     throw error;
   }
 
+  const unspent = [...(parsed.backup_codes ?? [])];
   return {
     url: parsed.url,
     token: parsed.token,
     totpSecret: parsed.totp_secret,
+    secondFactor: () => {
+      const code = unspent.shift();
+      if (code !== undefined) return code;
+      // A server started without a pool of backup codes: fine for the one or two factors a
+      // single test spends, each purpose once per step.
+      if (parsed.totp_secret === null) throw new Error("the console server has no second factor");
+      return totpCode(parsed.totp_secret);
+    },
     stop: async () => {
       if (child.exitCode !== null) return;
       child.kill("SIGTERM");
@@ -140,11 +156,24 @@ export async function signIn(page: Page, server: ConsoleServer, next?: string): 
   if (server.totpSecret !== null) {
     const code = page.getByLabel("Two-factor code");
     await expect(code).toBeFocused();
-    await code.fill(totpCode(server.totpSecret));
+    await code.fill(server.secondFactor());
     await page.getByRole("button", { name: "Verify" }).click();
   }
   await expect(page).not.toHaveURL(/\/login/);
   await expect(page.getByRole("heading", { level: 1 })).toBeVisible();
+}
+
+/**
+ * Answers "Confirm it's you": with an unspent second factor when the server has two-factor
+ * sign-in on, with the access token otherwise.
+ */
+export async function confirmItsYou(page: Page, server: ConsoleServer): Promise<void> {
+  const dialog = page.getByRole("dialog", { name: "Confirm it's you" });
+  await expect(dialog).toBeVisible();
+  if (server.totpSecret !== null) await dialog.getByLabel("Authentication code").fill(server.secondFactor());
+  else await dialog.getByLabel("Access token").fill(server.token);
+  await dialog.getByRole("button", { name: "Confirm" }).click();
+  await expect(dialog).toBeHidden();
 }
 
 /**
@@ -230,7 +259,8 @@ export const test = base.extend<Fixtures, WorkerFixtures>({
     // eslint-disable-next-line no-empty-pattern -- Playwright requires the destructuring form
     async ({}, use) => {
       // Two-factor on: the hardened configuration, and the sign-in every test goes through.
-      const server = await startConsoleServer(["--totp"]);
+      // Enough backup codes for every sign-in and confirmation one worker makes.
+      const server = await startConsoleServer(["--totp", "--backup-codes", "500"]);
       try {
         await use(server);
       } finally {

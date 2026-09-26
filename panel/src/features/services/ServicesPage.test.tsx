@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import type { ServiceList } from "../../api/queries/services";
 import { expectNoAxeViolations } from "../../test/axe";
 import { renderConsole } from "../../test/console";
-import { fakeBackend, json, signedInRoutes } from "../../test/fakes";
+import { fakeBackend, json, problem, signedInRoutes } from "../../test/fakes";
 import type { RouteHandler } from "../../test/fakes";
 
 const SERVICES: ServiceList["services"] = [
@@ -120,6 +120,33 @@ describe("the services list", () => {
     });
     expect(backend.callsTo("POST /api/services")[0]?.body).toMatchObject({ name: "e2e-worker", command: "/usr/bin/node worker.js" });
     expect(await screen.findByText("Created e2e-worker")).toBeInTheDocument();
+  });
+
+  it("confirms it's you before creating a service, and retries once confirmed", async () => {
+    let elevated = false;
+    const { user, backend, table } = await servicesAt("/services", {
+      "POST /api/services": () => {
+        if (!elevated) return problem(403, "elevation_required", "Confirm it's you to continue.");
+        return json(200, { success: true, message: "Service created: e2e-worker", service: "e2e-worker" });
+      },
+      "POST /api/auth/elevate": () => {
+        elevated = true;
+        return json(200, { elevated_until: new Date(Date.now() + 600_000).toISOString() });
+      },
+    });
+    await within(table).findByText("wasm-shop-example-com");
+    await user.click(screen.getByRole("button", { name: "New service" }));
+    const dialog = await screen.findByRole("dialog", { name: "New service" });
+    await user.type(within(dialog).getByLabelText("Name", { exact: true }), "e2e-worker");
+    await user.type(within(dialog).getByLabelText("Command", { exact: true }), "/usr/bin/node worker.js");
+    await user.click(within(dialog).getByRole("button", { name: "Create service" }));
+
+    const confirm = await screen.findByRole("dialog", { name: "Confirm it's you" });
+    await user.type(within(confirm).getByLabelText("Authentication code"), "123456");
+    await user.click(within(confirm).getByRole("button", { name: "Confirm" }));
+
+    expect(await screen.findByText("Created e2e-worker")).toBeInTheDocument();
+    expect(backend.callsTo("POST /api/services")).toHaveLength(2);
   });
 
   it("invites the first service on an empty machine", async () => {

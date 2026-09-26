@@ -133,4 +133,15 @@ describe("design tokens", () => {
   it("drops motion to zero for people who ask for reduced motion", () => {
     expect(tokensCss).toMatch(/prefers-reduced-motion: reduce[\s\S]*--duration-fast: 0ms;[\s\S]*--duration-base: 0ms;/);
   });
+
+  it("gives the mono stack an emoji-capable fallback, so a build log's own glyphs render", () => {
+    // Deploy and build logs are CLI output verbatim (icons like 📦 and 🔨 included, see
+    // CLAUDE.md's "a system error is never paraphrased"); JetBrains Mono has none of them, so
+    // an emoji font has to follow it in the stack or they draw as tofu boxes.
+    const match = /--font-mono:\s*([^;]+);/.exec(tokensCss);
+    expect(match).not.toBeNull();
+    const stack = match?.[1] ?? "";
+    expect(stack).toContain('"JetBrains Mono Variable"');
+    expect(stack).toMatch(/"Noto Color Emoji"|"Apple Color Emoji"|"Segoe UI Emoji"/);
+  });
 });

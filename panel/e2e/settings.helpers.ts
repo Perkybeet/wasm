@@ -5,22 +5,11 @@
 
 import type { Page } from "@playwright/test";
 
-import { expect, stillness, totpCode } from "./fixtures";
-import type { ConsoleServer } from "./fixtures";
+import { confirmItsYou, expect, stillness } from "./fixtures";
 
 // stillness is fixtures.ts's own (it also waits inside settle()); re-exported here so specs
 // that already import it from this module keep working with one implementation behind it.
-export { stillness };
-
-/** Answers "Confirm it's you" with a code for the server's second factor, or its token. */
-export async function confirmItsYou(page: Page, server: ConsoleServer, secret: string | null = server.totpSecret): Promise<void> {
-  const dialog = page.getByRole("dialog", { name: "Confirm it's you" });
-  await expect(dialog).toBeVisible();
-  if (secret !== null) await dialog.getByLabel("Authentication code").fill(totpCode(secret));
-  else await dialog.getByLabel("Access token").fill(server.token);
-  await dialog.getByRole("button", { name: "Confirm" }).click();
-  await expect(dialog).toBeHidden();
-}
+export { confirmItsYou, stillness };
 
 /** The visible toast (not its announcement) that says `text`. */
 export function toastSaying(page: Page, text: string | RegExp) {

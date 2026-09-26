@@ -4271,82 +4271,6 @@
         "title": "MigrationPlanOut",
         "type": "object"
       },
-      "MigrationResultOut": {
-        "description": "What a migration did.\n\nAttributes:\n    domain: The application's domain.\n    release_id: The first release, now active.\n    persistent: What is kept in ``shared/``.\n    env_files: Environment files moved to ``shared/``.\n    files_before: Regular files before.\n    files_after: Regular files after, ``shared/`` included; always equal.\n    bytes_before: Their size before.\n    bytes_after: Their size after.\n    unit_rewritten: Whether the unit was rewritten.\n    site_rewritten: Whether the site was rewritten.\n    deployment_id: The deployment history row that records it.",
-        "properties": {
-          "bytes_after": {
-            "title": "Bytes After",
-            "type": "integer"
-          },
-          "bytes_before": {
-            "title": "Bytes Before",
-            "type": "integer"
-          },
-          "deployment_id": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Deployment Id"
-          },
-          "domain": {
-            "title": "Domain",
-            "type": "string"
-          },
-          "env_files": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Env Files",
-            "type": "array"
-          },
-          "files_after": {
-            "title": "Files After",
-            "type": "integer"
-          },
-          "files_before": {
-            "title": "Files Before",
-            "type": "integer"
-          },
-          "persistent": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Persistent",
-            "type": "array"
-          },
-          "release_id": {
-            "title": "Release Id",
-            "type": "string"
-          },
-          "site_rewritten": {
-            "title": "Site Rewritten",
-            "type": "boolean"
-          },
-          "unit_rewritten": {
-            "title": "Unit Rewritten",
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "domain",
-          "release_id",
-          "persistent",
-          "env_files",
-          "files_before",
-          "files_after",
-          "bytes_before",
-          "bytes_after",
-          "unit_rewritten",
-          "site_rewritten"
-        ],
-        "title": "MigrationResultOut",
-        "type": "object"
-      },
       "MonitorActionResponse": {
         "description": "Outcome of a systemd action against the monitor unit, or of acknowledging\nan observation - every handler below answers exactly these two fields.",
         "properties": {
@@ -6966,7 +6890,7 @@
         ]
       },
       "post": {
-        "description": "Queue the deployment of a new application.\n\nArgs:\n    body: The deployment request.\n    session: The authenticated session.\n\nReturns:\n    The queued job.\n\nRaises:\n    HTTPException: 409 when the domain is already deployed, 503 when no\n        port is free.\n    PortError: When the requested port is not usable.\n    DomainError: When the domain is not acceptable.\n    ValidationError: A resource limit is out of range (400, with the\n        range) - the same check ``PATCH .../limits`` runs, so a limit\n        given at creation cannot be more permissive than one set later -\n        or ``package_manager`` names one WASM does not drive.",
+        "description": "Queue the deployment of a new application.\n\nAdmin scope, through the blanket policy: the build runs as root. A local\npath as the source is further reserved to the operator in person; see\n:func:`_require_local_source_privilege`.\n\nArgs:\n    body: The deployment request.\n    request: The incoming request, for the audit record of a refusal.\n    session: The authenticated session.\n\nReturns:\n    The queued job.\n\nRaises:\n    HTTPException: 409 when the domain is already deployed, 503 when no\n        port is free, 403 when the source is a local path and the\n        credential may not deploy one.\n    PortError: When the requested port is not usable.\n    DomainError: When the domain is not acceptable.\n    ValidationError: A resource limit is out of range (400, with the\n        range) - the same check ``PATCH .../limits`` runs, so a limit\n        given at creation cannot be more permissive than one set later -\n        or ``package_manager`` names one WASM does not drive.",
         "operationId": "create_app_api_apps_post",
         "requestBody": {
           "content": {
@@ -7008,7 +6932,7 @@
     },
     "/api/apps/inspect": {
       "post": {
-        "description": "Preview what a repository is before deploying it.\n\nFetches the source into a throwaway checkout, detects the application\ntype, and reports the commands, port and environment variables a\ndeployment would use, so the new-app wizard has something real to show\ninstead of a guess. Nothing is written outside the checkout, which is\nremoved before this returns, and no application, domain or unit is\ncreated.\n\nArgs:\n    body: The source to inspect and the branch to check out.\n    session: The authenticated session.\n\nReturns:\n    The inspection result.\n\nRaises:\n    SourceError: The source is invalid, or fetching it failed. Answered\n        as 400: the operator gave a source WASM cannot reach, not a\n        server fault.\n    ValidationError: The checkout matches no registered application\n        type. ``inspect_source`` raises ``DeploymentError`` for this -\n        right for the CLI, where it means the whole operation failed -\n        but here it is the wizard's input that could not be classified,\n        so it is translated to the API's validation-error contract\n        (400 with details) instead of the 500 an unqualified\n        ``DeploymentError`` would answer.",
+        "description": "Preview what a repository is before deploying it.\n\nFetches the source into a throwaway checkout, detects the application\ntype, and reports the commands, port and environment variables a\ndeployment would use, so the new-app wizard has something real to show\ninstead of a guess. Nothing is written outside the checkout, which is\nremoved before this returns, and no application, domain or unit is\ncreated.\n\nAdmin scope, like creating one: fetching runs as root and reads back what\nit fetched. A local path is reserved to the operator in person, exactly\nas it is for ``POST /api/apps``.\n\nArgs:\n    body: The source to inspect and the branch to check out.\n    request: The incoming request, for the audit record of a refusal.\n    session: The authenticated session.\n\nReturns:\n    The inspection result.\n\nRaises:\n    HTTPException: 403 when the source is a local path and the credential\n        may not read one.\n    SourceError: The source is invalid, or fetching it failed. Answered\n        as 400: the operator gave a source WASM cannot reach, not a\n        server fault.\n    ValidationError: The checkout matches no registered application\n        type. ``inspect_source`` raises ``DeploymentError`` for this -\n        right for the CLI, where it means the whole operation failed -\n        but here it is the wizard's input that could not be classified,\n        so it is translated to the API's validation-error contract\n        (400 with details) instead of the 500 an unqualified\n        ``DeploymentError`` would answer.",
         "operationId": "inspect_app_source_api_apps_inspect_post",
         "requestBody": {
           "content": {
@@ -7468,7 +7392,7 @@
         ]
       },
       "put": {
-        "description": "Replace an application's ``.env`` file wholesale.\n\nEvery name and value is validated against what can safely reach a\nsystemd unit (:mod:`wasm.validators.environment`) before anything is\nwritten, so a rejected variable leaves the file on disk untouched. The\nwrite goes through :func:`~wasm.deployers.helpers.app_env.write_app_env`,\nthe same function ``wasm env configure`` uses, so the file lands 0600,\nowned by the service account, in ``shared/`` on the release layout.\n\nThe application is not restarted: a process already running keeps the\nenvironment it started with until it is, so the caller is told a restart\nis required rather than one being queued silently underneath it.\n\nArgs:\n    domain: Domain of the application.\n    body: The complete name to value mapping to write.\n    request: The incoming request, for the audit record.\n    session: The authenticated session.\n\nReturns:\n    Confirmation that a restart is required to pick up the change.\n\nRaises:\n    HTTPException: 404 when the application is unknown, 422 when a name\n        or a value is not safe to write into a systemd unit.",
+        "description": "Replace an application's ``.env`` file wholesale.\n\nEvery name and value is validated against what can safely reach a\nsystemd unit (:mod:`wasm.validators.environment`) before anything is\nwritten, so a rejected variable leaves the file on disk untouched. The\nwrite goes through :func:`~wasm.deployers.helpers.app_env.write_app_env`,\nthe same function ``wasm env configure`` uses, so the file lands 0600,\nowned by the service account, in ``shared/`` on the release layout.\n\nThe application is not restarted: a process already running keeps the\nenvironment it started with until it is, so the caller is told a restart\nis required rather than one being queued silently underneath it.\n\nArgs:\n    domain: Domain of the application.\n    body: The complete name to value mapping to write.\n    request: The incoming request, for the audit record.\n    session: The authenticated session.\n\nReturns:\n    Confirmation that a restart is required to pick up the change.\n\nRaises:\n    HTTPException: 404 when the application is unknown, 422 when a name\n        or a value is not safe to write into a systemd unit, or when the\n        request tries to set PORT or NODE_ENV, which the unit sets inline\n        and are refused by :func:`~wasm.deployers.helpers.app_env.write_app_env`.",
         "operationId": "update_app_env_api_apps__domain__env_put",
         "parameters": [
           {
@@ -7629,7 +7553,7 @@
     },
     "/api/apps/{domain}/migrate": {
       "post": {
-        "description": "Move an in-place application onto the release layout.\n\nRewrites the unit and the site and moves the whole application tree, so\nit needs sudo mode. The plan is worked out again here rather than taken\nfrom the client: what is executed is what is on disk now.\n\nArgs:\n    domain: Domain of the application.\n    body: Paths to keep in ``shared/``, if the detection is not wanted.\n    session: The authenticated, elevated session.\n\nReturns:\n    What was done.\n\nRaises:\n    HTTPException: 404 when the application is unknown, 409 when it is on\n        releases already.\n    ValidationError: A path in ``persist`` is not inside the application.\n    DeploymentError: A step failed or the application did not answer on\n        the new layout; everything was put back, and the details carry\n        the health check's own output.",
+        "description": "Queue the move of an in-place application onto the release layout.\n\nRewrites the unit and the site and moves the whole application tree, so\nit needs sudo mode. It runs as a job, like an update: the unit is stopped\nwhile the tree moves and the health check waits for it on the new layout,\nand the job keeps its log whatever happens to the browser. The job's\nresult has the first release, what moved to ``shared/`` and the file\ncounts before and after.\n\nThe plan is worked out here only to refuse a request that cannot run (an\napplication on releases already, a path that is not inside it); the job\nplans again when it runs, so what is migrated is what is on disk then,\nnever a plan the client sent.\n\nArgs:\n    domain: Domain of the application.\n    body: Paths to keep in ``shared/``, if the detection is not wanted.\n    session: The authenticated, elevated session.\n\nReturns:\n    The queued job.\n\nRaises:\n    HTTPException: 404 when the application is unknown, 409 when it is on\n        releases already.\n    ValidationError: A path in ``persist`` is not inside the application.\n    DeploymentError: Its type cannot use releases, or the paths named\n        leave a SQLite database out.",
         "operationId": "migrate_app_api_apps__domain__migrate_post",
         "parameters": [
           {
@@ -7653,11 +7577,11 @@
           "required": true
         },
         "responses": {
-          "200": {
+          "202": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/MigrationResultOut"
+                  "$ref": "#/components/schemas/JobAcceptedResponse"
                 }
               }
             },
@@ -8300,7 +8224,7 @@
     },
     "/api/auth/2fa/confirm": {
       "post": {
-        "description": "Verify a code from the authenticator and activate the second factor.\n\nArgs:\n    request: The incoming request.\n    body: The code the app shows for the pending secret.\n    session: The authenticated session.\n\nReturns:\n    The backup codes, in clear, exactly once.\n\nRaises:\n    HTTPException: 400 when the code does not verify. Not counted by the\n        lockout: the pending secret is on the operator's own screen, so a\n        wrong code here proves a typo, not a guess at a credential.",
+        "description": "Verify a code from the authenticator and activate the second factor.\n\nSudo mode, like enrolling: this is the step that switches the second\nfactor on and hands out the backup codes.\n\nArgs:\n    request: The incoming request.\n    body: The code the app shows for the pending secret.\n    session: The authenticated session, elevated.\n\nReturns:\n    The backup codes, in clear, exactly once.\n\nRaises:\n    HTTPException: 403 with ``error: \"elevation_required\"`` per\n        :func:`wasm.web.api.deps.require_elevated`. 400 when the code\n        does not verify. Not counted by the lockout: the pending secret\n        is on the operator's own screen, so a wrong code here proves a\n        typo, not a guess at a credential.",
         "operationId": "two_factor_confirm_api_auth_2fa_confirm_post",
         "requestBody": {
           "content": {
@@ -8384,7 +8308,7 @@
     },
     "/api/auth/2fa/enroll": {
       "post": {
-        "description": "Begin enrolment: generate a pending secret. Nothing is enforced yet.\n\nArgs:\n    request: The incoming request.\n    session: The authenticated session.\n\nReturns:\n    The secret and its provisioning URI, shown to the operator once.",
+        "description": "Begin enrolment: generate a pending secret. Nothing is enforced yet.\n\nSudo mode, confirmed with the master token (two-factor is off, or there\nwould be nothing to enrol): the factor enrolled here is the one every\nlater confirmation asks for, so a session nobody re-confirmed must not be\nable to bind its own authenticator.\n\nArgs:\n    request: The incoming request.\n    session: The authenticated session, elevated.\n\nReturns:\n    The secret and its provisioning URI, shown to the operator once.\n\nRaises:\n    HTTPException: 403 with ``error: \"elevation_required\"`` per\n        :func:`wasm.web.api.deps.require_elevated`.",
         "operationId": "two_factor_enroll_api_auth_2fa_enroll_post",
         "responses": {
           "200": {
@@ -8512,7 +8436,7 @@
     },
     "/api/auth/session": {
       "get": {
-        "description": "Report whether the caller is signed in, without demanding that they are.\n\nEvery other endpoint under ``/api`` requires ``require_auth`` and answers\n401 to an anonymous caller; this one exists so the console has something\nto call before it knows which of those two things it is. The credential\nis checked but never counted towards the lockout - an anonymous probe of\nthis endpoint is not a credential guess, because nothing here is graded\npass or fail the way a login attempt is.\n\nArgs:\n    request: The incoming request.\n\nReturns:\n    The session's bootstrap information, ``authenticated=False`` and\n    nothing else populated when no credential, or an expired or revoked\n    one, was presented.",
+        "description": "Report whether the caller is signed in, without demanding that they are.\n\nEvery other endpoint under ``/api`` requires ``require_auth`` and answers\n401 to an anonymous caller; this one exists so the console has something\nto call before it knows which of those two things it is. A caller that\npresents nothing is not guessing anything and is not counted. A caller\nthat presents a credential is checked exactly as ``require_auth`` checks\none, through :func:`~wasm.web.auth.verify_credential`, and a wrong one is\ncounted towards the lockout: the answer here says whether the value was\nthe master token, so without counting this was a guessing oracle with no\nlimit. A session cookie this server signed but that has since expired is\nnot a guess and is not counted.\n\nArgs:\n    request: The incoming request.\n\nReturns:\n    The session's bootstrap information, ``authenticated=False`` and\n    nothing else populated when no credential, or an expired or revoked\n    one, was presented.",
         "operationId": "get_session_info_api_auth_session_get",
         "responses": {
           "200": {
@@ -8812,7 +8736,7 @@
         ]
       },
       "post": {
-        "description": "Schedule automatic backups of an application on a systemd timer.\n\nScheduling the same domain again rewrites its unit pair, so this is also\nhow a schedule is changed.\n\nArgs:\n    data: The schedule request. Its calendar expression was already\n        checked against the scheduler's own rules by the request model.\n    session: The authenticated session.\n\nReturns:\n    The action outcome, carrying the schedule as created.\n\nRaises:\n    BackupError: When a unit cannot be written or the timer cannot be\n        enabled.",
+        "description": "Schedule automatic backups of an application on a systemd timer.\n\nScheduling the same domain again rewrites its unit pair, so this is also\nhow a schedule is changed. Sudo mode, like deleting one: a schedule is a\nroot timer, and its retention decides which backups are thrown away.\n\nArgs:\n    data: The schedule request. Its calendar expression was already\n        checked against the scheduler's own rules by the request model.\n    session: The authenticated session, elevated.\n\nReturns:\n    The action outcome, carrying the schedule as created.\n\nRaises:\n    BackupError: When a unit cannot be written or the timer cannot be\n        enabled.",
         "operationId": "create_schedule_api_backup_schedules_post",
         "requestBody": {
           "content": {
@@ -10047,7 +9971,7 @@
         ]
       },
       "post": {
-        "description": "Create a cron job as a systemd timer, or rewrite one WASM already owns.\n\nArgs:\n    data: The job request. Its calendar expression was already checked\n        against the manager's own rules by the request model.\n    session: The authenticated session.\n\nReturns:\n    The action outcome, carrying the job as created.\n\nRaises:\n    ServiceError: When a value is unusable, a unit belongs to someone\n        else, or the timer cannot be written or enabled.",
+        "description": "Create a cron job as a systemd timer, or rewrite one WASM already owns.\n\nSudo mode, creating or rewriting alike: either way the result is a\ncommand of the caller's choosing that runs as root on a timer.\n\nArgs:\n    data: The job request. Its calendar expression was already checked\n        against the manager's own rules by the request model.\n    session: The authenticated session, elevated.\n\nReturns:\n    The action outcome, carrying the job as created.\n\nRaises:\n    ServiceError: When a value is unusable, a unit belongs to someone\n        else, or the timer cannot be written or enabled.",
         "operationId": "create_job_api_cron_post",
         "requestBody": {
           "content": {
@@ -12394,7 +12318,7 @@
     },
     "/api/monitor/observations": {
       "get": {
-        "description": "Read stored observations, newest first.\n\nArgs:\n    limit: Maximum number of rows to return.\n    include_acknowledged: Include rows an operator already dismissed.\n    severity: Restrict to notice or warning.\n    session: Authenticated session, injected.\n\nReturns:\n    The requested page and the store totals.\n\nRaises:\n    WASMError: When the store cannot be read; caught by ``WASMErrorRoute``.\n    HTTPException: 500 for a filesystem error the store itself did not\n        wrap - OSError is not a WASMError, so it would otherwise crash.",
+        "description": "Read stored observations, newest first.\n\nA scan runs as admin, but this endpoint is a plain GET and needs only\nread scope - so it is the actual route by which a lesser credential could\nread another process's argv, stored by an admin-run scan days earlier.\nThe command line is only included for an admin-scoped *reader*; see\n:func:`_visible_command`.\n\nArgs:\n    limit: Maximum number of rows to return.\n    include_acknowledged: Include rows an operator already dismissed.\n    severity: Restrict to notice or warning.\n    session: Authenticated session, injected.\n\nReturns:\n    The requested page and the store totals.\n\nRaises:\n    WASMError: When the store cannot be read; caught by ``WASMErrorRoute``.\n    HTTPException: 500 for a filesystem error the store itself did not\n        wrap - OSError is not a WASMError, so it would otherwise crash.",
         "operationId": "get_observations_api_monitor_observations_get",
         "parameters": [
           {
@@ -12510,7 +12434,7 @@
     },
     "/api/monitor/processes": {
       "get": {
-        "description": "List the processes on the machine.\n\nArgs:\n    limit: Maximum number of rows to return.\n    sort_by: One of cpu, memory, name, pid.\n    session: Authenticated session, injected.\n\nReturns:\n    The requested page, sorted as asked.\n\nRaises:\n    HTTPException: When psutil is not installed.",
+        "description": "List the processes on the machine.\n\nThe command line is only included for an admin-scoped credential - see\n:func:`_visible_command` - because argv routinely carries another\nprocess's secrets.\n\nArgs:\n    limit: Maximum number of rows to return.\n    sort_by: One of cpu, memory, name, pid.\n    session: Authenticated session, injected.\n\nReturns:\n    The requested page, sorted as asked.\n\nRaises:\n    HTTPException: When psutil is not installed.",
         "operationId": "get_all_processes_api_monitor_processes_get",
         "parameters": [
           {
@@ -12567,7 +12491,7 @@
     },
     "/api/monitor/scan": {
       "post": {
-        "description": "Run one scan and return what stood out.\n\nThere is no dry-run parameter because there is no other mode: a scan reads\nthe process table and writes rows to the observation store.\n\nArgs:\n    session: Authenticated session, injected.\n\nReturns:\n    The observations, warnings first.\n\nRaises:\n    HTTPException: When the process table cannot be read.",
+        "description": "Run one scan and return what stood out.\n\nThere is no dry-run parameter because there is no other mode: a scan reads\nthe process table and writes rows to the observation store. This endpoint\nalready requires admin scope at the auth chokepoint (mutations default to\nadmin), so the command line in the response is never actually seen below\nadmin today; it is still gated the same way as :func:`get_observations`,\nso relaxing the endpoint's own scope requirement later cannot reopen the\nleak this closes.\n\nArgs:\n    session: Authenticated session, injected.\n\nReturns:\n    The observations, warnings first.\n\nRaises:\n    HTTPException: When the process table cannot be read.",
         "operationId": "run_scan_api_monitor_scan_post",
         "responses": {
           "200": {
@@ -12767,7 +12691,7 @@
         ]
       },
       "post": {
-        "description": "Create a new systemd service.",
+        "description": "Create a new systemd service.\n\nSudo mode, for either form of the request - a raw unit or the fields\nthat render one: a unit is a command systemd runs as root, restarted for\nas long as the machine is up, which is the same standing reach editing a\nunit by hand has.",
         "operationId": "create_service_api_services_post",
         "requestBody": {
           "content": {
@@ -13880,7 +13804,7 @@
     },
     "/api/system/processes": {
       "get": {
-        "description": "List running processes.\n\nThis is a read-only view. There is deliberately no endpoint that signals a\nprocess; see the module docstring.\n\nArgs:\n    limit: How many processes to return after sorting.\n    sort_by: One of ``cpu``, ``memory``, ``pid`` or ``name``. An unknown\n        key falls back to ``cpu``.\n    session: The authenticated session.\n\nReturns:\n    The processes, sorted and truncated.",
+        "description": "List running processes.\n\nThis is a read-only view. There is deliberately no endpoint that signals a\nprocess; see the module docstring. The command line is only included for\nan admin-scoped credential - see :func:`_visible_command` - because argv\nroutinely carries another process's secrets.\n\nArgs:\n    limit: How many processes to return after sorting.\n    sort_by: One of ``cpu``, ``memory``, ``pid`` or ``name``. An unknown\n        key falls back to ``cpu``.\n    session: The authenticated session.\n\nReturns:\n    The processes, sorted and truncated.",
         "operationId": "get_processes_api_system_processes_get",
         "parameters": [
           {

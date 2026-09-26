@@ -5,7 +5,7 @@ import { useMemo, useState } from "react";
 import { request } from "../../api/client";
 import { certKeys, certsQuery } from "../../api/queries/certs";
 import type { CertEntry } from "../../api/queries/certs";
-import { activeJobsQuery, useFollowedJob } from "../../api/queries/jobs";
+import { activeJobsQuery, jobKeys, useFollowedJob } from "../../api/queries/jobs";
 import type { Job } from "../../api/queries/jobs";
 import { CommandHint } from "../../components/page/CommandHint";
 import { KeyValueList } from "../../components/page/KeyValueList";
@@ -141,7 +141,7 @@ export function CertificatesTab() {
     mutationFn: ({ cert, force }: { cert: CertEntry; force: boolean }) =>
       request("post", "/api/certs/{domain}/renew", { params: { domain: cert.domain }, body: { force } }),
     onSuccess: (result, { cert, force }) => {
-      void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+      void queryClient.invalidateQueries({ queryKey: jobKeys.all });
       followJob(result.job_id, {
         running: `${force ? "Renewing" : "Renewing if due"} ${cert.domain}`,
         done: force ? `Renewed ${cert.domain}` : `Renewal of ${cert.domain} finished. Certbot renews only what is due; its log says which.`,

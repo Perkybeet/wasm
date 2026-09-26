@@ -17,6 +17,7 @@ import { backupDomains, filterBackups, isFiltered } from "./filters";
 import type { BackupsSearch } from "./filters";
 import { SchedulesSection } from "./SchedulesSection";
 import { StorageUsageBar } from "./StorageUsageBar";
+import { useBackupRefresh } from "./useBackupRefresh";
 
 const ALL = "all";
 
@@ -29,6 +30,7 @@ export interface BackupsPageProps {
 
 /** Every backup on the machine, its storage footprint, and the schedules that create more of them. */
 export function BackupsPage({ search, onSearchChange }: BackupsPageProps) {
+  useBackupRefresh();
   const backups = useQuery(backupsQuery(search.domain ?? null));
   const all = useMemo(() => backups.data?.backups ?? [], [backups.data]);
   const shown = useMemo(() => filterBackups(all, search), [all, search]);

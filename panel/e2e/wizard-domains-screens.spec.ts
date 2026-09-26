@@ -14,9 +14,9 @@
 import type { Page } from "@playwright/test";
 import path from "node:path";
 
-import { expect, settle, signIn, stillness, test, totpCode } from "./fixtures";
-import type { ConsoleServer } from "./fixtures";
-import { wizardSource } from "./wizard-sources";
+import { confirmItsYou, expect, settle, signIn, stillness, test } from "./fixtures";
+import type { ConsoleServer, PageProblems } from "./fixtures";
+import { inspectSource, wizardSource } from "./wizard-sources";
 
 const OUT = process.env.WASM_WIZARD_SCREENS ?? "/tmp/console-wizard";
 
@@ -27,15 +27,13 @@ interface Screen {
   name: string;
   path: string;
   /** Brings the page to the state the screenshot is about. */
-  act?: (page: Page, server: ConsoleServer) => Promise<void>;
+  act?: (page: Page, server: ConsoleServer, problems: PageProblems) => Promise<void>;
   /** A console error the state causes on purpose. */
   expect?: RegExp;
 }
 
-async function inspected(page: Page): Promise<void> {
-  await page.getByLabel("Repository or directory").fill(await wizardSource(page, "storefront"));
-  await page.getByRole("button", { name: "Inspect source" }).click();
-  await expect(page.getByRole("heading", { name: "Review", level: 2 })).toBeVisible();
+async function inspected(page: Page, server: ConsoleServer, problems: PageProblems): Promise<void> {
+  await inspectSource(page, server, problems, await wizardSource(page, "storefront"));
 }
 
 const SCREENS: readonly Screen[] = [
@@ -44,8 +42,8 @@ const SCREENS: readonly Screen[] = [
   {
     name: "wizard-deploy",
     path: "/apps/new",
-    act: async (page) => {
-      await inspected(page);
+    act: async (page, server, problems) => {
+      await inspected(page, server, problems);
       await page.getByLabel("Domain", { exact: true }).fill("tienda-nueva.qrboda.com");
       for (const field of await page.getByRole("button", { name: /^Generate/ }).all()) await field.click();
       await page.getByLabel("DATABASE_URL").fill("postgres://storefront@localhost/storefront");
@@ -58,11 +56,15 @@ const SCREENS: readonly Screen[] = [
     path: "/apps/new",
     // The API answers a source that cannot be fetched with 400, in the error contract, which
     // Chromium still logs as a failed resource.
-    expect: /status of 400 .* \/api\/apps\/inspect$/,
-    act: async (page) => {
+    expect: /status of 40[03] .* \/api\/apps\/inspect$/,
+    act: async (page, server) => {
       await page.getByLabel("Repository or directory").fill("/var/www/src/does-not-exist");
       await page.getByRole("button", { name: "Inspect source" }).click();
-      await expect(page.getByText("Source path does not exist")).toBeVisible();
+      const refusal = page.getByText("Source path does not exist");
+      const confirm = page.getByRole("dialog", { name: "Confirm it's you" });
+      await expect(confirm.or(refusal)).toBeVisible();
+      if (await confirm.isVisible()) await confirmItsYou(page, server);
+      await expect(refusal).toBeVisible();
     },
   },
   { name: "domains-certificates", path: "/domains" },
@@ -88,7 +90,7 @@ const SCREENS: readonly Screen[] = [
       await page.getByRole("button", { name: "Test and save" }).click();
       const elevate = page.getByRole("dialog", { name: "Confirm it's you" });
       if (await elevate.isVisible({ timeout: 2_000 }).catch(() => false)) {
-        await elevate.getByLabel("Authentication code").fill(totpCode(server.totpSecret ?? ""));
+        await elevate.getByLabel("Authentication code").fill(server.secondFactor());
         await elevate.getByRole("button", { name: "Confirm" }).click();
       }
       await expect(page.getByText("Nothing was saved: the configuration test failed.")).toBeVisible();
@@ -138,7 +140,7 @@ test.describe("wizard and domains screens @screens", () => {
         else await page.goto(screen.path);
         await expect(page.getByRole("heading", { level: 1 })).toBeVisible();
         await settle(page);
-        await screen.act?.(page, consoleServer);
+        await screen.act?.(page, consoleServer, problems);
         await settle(page);
         await stillness(page);
         await page.screenshot({ path: path.join(dir, `${screen.name}-${label}.png`), fullPage: true });

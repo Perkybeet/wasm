@@ -3,7 +3,7 @@
  * running one now, enabling and disabling it, and its run history.
  */
 
-import { expect, expectNoA11yViolations, settle, signIn, test, toasts } from "./fixtures";
+import { confirmItsYou, expect, expectNoA11yViolations, settle, signIn, test, toasts } from "./fixtures";
 
 test("lists the seeded jobs with their schedule and next run, and passes axe", async ({ page, consoleServer }) => {
   await signIn(page, consoleServer, "/cron");
@@ -17,7 +17,9 @@ test("lists the seeded jobs with their schedule and next run, and passes axe", a
   await expectNoA11yViolations(page, "the cron jobs list");
 });
 
-test("creates a job with a daily preset and sees it listed with a next run", async ({ page, consoleServer }) => {
+test("creates a job with a daily preset and sees it listed with a next run", async ({ page, consoleServer, problems }) => {
+  // A cron job runs as root on a schedule: creating one needs sudo mode, asked for on submit.
+  problems.expect(/status of 403 .* \/api\/cron$/);
   await signIn(page, consoleServer, "/cron");
   await page.getByRole("button", { name: "New job" }).click();
   const dialog = page.getByRole("dialog", { name: "New cron job" });
@@ -26,8 +28,11 @@ test("creates a job with a daily preset and sees it listed with a next run", asy
   await dialog.getByLabel("Name", { exact: true }).fill("e2e-report");
   await dialog.getByLabel("Command", { exact: true }).fill("/usr/bin/wasm backup create example.com");
 
-  const created = page.waitForResponse((response) => response.url().endsWith("/api/cron") && response.request().method() === "POST");
+  const created = page.waitForResponse(
+    (response) => response.url().endsWith("/api/cron") && response.request().method() === "POST" && response.status() !== 403,
+  );
   await dialog.getByRole("button", { name: "Create job" }).click();
+  await confirmItsYou(page, consoleServer);
   const response = await created;
   expect(response.status()).toBe(201);
   const body = (await response.json()) as { job: { next_run: string } | null };

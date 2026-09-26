@@ -1,13 +1,14 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { CircleCheck, Layers } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { request } from "../../../api/client";
 import { ElevationCancelledError } from "../../../api/errors";
 import { appKeys, migrationPlanQuery, releasesQuery } from "../../../api/queries/apps";
 import type { App, MigrationPlan } from "../../../api/queries/apps";
-import type { ResponseOf } from "../../../api/client";
+import { isJobFinished, useFollowedJob } from "../../../api/queries/jobs";
+import type { Job } from "../../../api/queries/jobs";
 import { CommandHint } from "../../../components/page/CommandHint";
 import { KeyValueList, KeyValueListSkeleton } from "../../../components/page/KeyValueList";
 import { ErrorBlock } from "../../../components/page/QueryState";
@@ -23,7 +24,25 @@ import { useConfirmItsYou } from "../useDeleteApp";
 import { MigrationPlanView } from "./MigrationPlanView";
 import { LINK, PANEL } from "./panel";
 
-type MigrationResult = ResponseOf<"/api/apps/{domain}/migrate", "post">;
+/**
+ * The migration summary a finished `migrate` job's `result` carries (see `migrate_app_job`):
+ * the same fields `POST /api/apps/{domain}/migrate` used to answer synchronously, before it
+ * became a job.
+ */
+interface MigrationSummary {
+  domain: string;
+  status: string;
+  release_id: string;
+  persistent: string[];
+  env_files: string[];
+  files_before: number;
+  files_after: number;
+  bytes_before: number;
+  bytes_after: number;
+  unit_rewritten: boolean;
+  site_rewritten: boolean;
+  deployment_id: number | null;
+}
 
 /** What the app has on the release layout: the release serving, how many are on disk, how many are kept. */
 function ReleasesFacts({ domain, keepReleases }: { domain: string; keepReleases: number }) {
@@ -73,7 +92,7 @@ function ReleasesFacts({ domain, keepReleases }: { domain: string; keepReleases:
   );
 }
 
-function MigrationDone({ result }: { result: MigrationResult }) {
+function MigrationDone({ result }: { result: MigrationSummary }) {
   return (
     <div role="status" className="flex items-start gap-2.5 rounded-control border border-ok/40 bg-ok-soft px-3 py-2.5">
       <CircleCheck aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-ok" />
@@ -113,16 +132,24 @@ export function confirmation(plan: MigrationPlan): string {
  * which is worked out from the disk on request, and confirmed it; the migration itself is
  * undone by the backend if the app does not come up on the new layout.
  */
-function MigrationCard({ app, onMigrated }: { app: App; onMigrated: (result: MigrationResult) => void }) {
+function MigrationCard({ app, onMigrated }: { app: App; onMigrated: (result: MigrationSummary) => void }) {
   const domain = app.domain;
   const queryClient = useQueryClient();
   const confirmItsYou = useConfirmItsYou();
+  const followed = useFollowedJob();
+  // Guards the one-time effects below (the toast, the invalidations, onMigrated) against
+  // running again for a job already handled - the query keeps answering the same finished
+  // job on every render, and effects run more than once in development besides.
+  const notifiedRef = useRef<string | null>(null);
   const [requested, setRequested] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [done, setDone] = useState(false);
   // Once migrated the app has no plan: the backend answers 409, so it is not asked again.
   const plan = useQuery({ ...migrationPlanQuery(domain), enabled: requested && !done, refetchOnWindowFocus: false });
 
+  // Queuing the move only answers 202 with the job; migrating - the tree, the unit, the health
+  // check - happens after, followed here exactly as an update or a rollback is (useFollowedJob:
+  // the job's own events, and a poll as the guarantee).
   const migrate = useMutation({
     mutationFn: (current: MigrationPlan) =>
       request("post", "/api/apps/{domain}/migrate", {
@@ -131,21 +158,32 @@ function MigrationCard({ app, onMigrated }: { app: App; onMigrated: (result: Mig
         body: { persist: current.persistent.length > 0 ? current.persistent : null },
       }),
     onSuccess: (result) => {
-      setDone(true);
-      setConfirming(false);
-      onMigrated(result);
-      // Not the app's whole prefix: its plan would be asked for again and answer 409.
-      void queryClient.invalidateQueries({ queryKey: appKeys.detail(domain), exact: true });
-      void queryClient.invalidateQueries({ queryKey: appKeys.releases(domain) });
-      void queryClient.invalidateQueries({ queryKey: appKeys.rollbackPoints(domain) });
-      void queryClient.invalidateQueries({ queryKey: appKeys.list, exact: true });
-      // The toast is announced; saying it again would read it twice.
-      toast.success(`Migrated ${domain} to releases`);
+      followed.follow(result.job as Job);
     },
   });
 
+  const migrating = migrate.isPending || (followed.job !== null && !isJobFinished(followed.job));
+  const jobFailed = followed.job !== null && isJobFinished(followed.job) && followed.job.status !== "completed";
+
+  useEffect(() => {
+    const job = followed.job;
+    if (job === null || !isJobFinished(job) || job.status !== "completed" || notifiedRef.current === job.id) return;
+    notifiedRef.current = job.id;
+    setDone(true);
+    setConfirming(false);
+    onMigrated(job.result as unknown as MigrationSummary);
+    // Not the app's whole prefix: its plan would be asked for again and answer 409.
+    void queryClient.invalidateQueries({ queryKey: appKeys.detail(domain), exact: true });
+    void queryClient.invalidateQueries({ queryKey: appKeys.releases(domain) });
+    void queryClient.invalidateQueries({ queryKey: appKeys.rollbackPoints(domain) });
+    void queryClient.invalidateQueries({ queryKey: appKeys.list, exact: true });
+    // The toast is announced; saying it again would read it twice.
+    toast.success(`Migrated ${domain} to releases`);
+  }, [followed.job, domain, onMigrated, queryClient]);
+
   const openConfirm = (): void => {
     migrate.reset();
+    followed.dismiss();
     confirmItsYou().then(
       () => {
         setConfirming(true);
@@ -157,7 +195,7 @@ function MigrationCard({ app, onMigrated }: { app: App; onMigrated: (result: Mig
   };
 
   const close = (next: boolean): void => {
-    if (!next && migrate.isPending) return;
+    if (!next && migrating) return;
     setConfirming(next);
   };
 
@@ -188,6 +226,10 @@ function MigrationCard({ app, onMigrated }: { app: App; onMigrated: (result: Mig
         <div className="pl-7">
           <ErrorBlock error={plan.error} title="Could not plan the migration" onRetry={() => void plan.refetch()} retrying={plan.isRefetching} />
         </div>
+      ) : plan.data === null ? (
+        // Already on releases (a 409): the app's own detail is stale for a moment too, and
+        // this section switches to ReleasesFacts as soon as it catches up.
+        <p className="pl-7 text-13 text-fg-muted">This app is on the release layout already.</p>
       ) : (
         <div className="flex min-w-0 flex-col gap-4 sm:pl-7">
           <MigrationPlanView plan={plan.data} />
@@ -195,6 +237,13 @@ function MigrationCard({ app, onMigrated }: { app: App; onMigrated: (result: Mig
             <ErrorBlock
               live
               error={migrate.error}
+              title="The migration could not be queued"
+              hint="WASM put everything back as it was: the app still runs in place, from the same directory."
+            />
+          ) : jobFailed ? (
+            <ErrorBlock
+              live
+              error={{ detail: followed.job?.error ?? "The job failed without saying why. Its log is on the Activity page." }}
               title="The migration did not complete"
               hint="WASM put everything back as it was: the app still runs in place, from the same directory."
             />
@@ -217,22 +266,30 @@ function MigrationCard({ app, onMigrated }: { app: App; onMigrated: (result: Mig
         description={plan.data ? confirmation(plan.data) : undefined}
         footer={
           <>
-            <Button disabled={migrate.isPending} onClick={() => close(false)}>
+            <Button disabled={migrating} onClick={() => close(false)}>
               Cancel
             </Button>
-            <Button variant="primary" loading={migrate.isPending} onClick={() => plan.data && migrate.mutate(plan.data)}>
+            <Button variant="primary" loading={migrating} onClick={() => plan.data && migrate.mutate(plan.data)}>
               Migrate to releases
             </Button>
           </>
         }
       >
-        {migrate.isPending ? (
+        {migrating ? (
           <p className="text-13 text-fg-muted">Moving the tree, rewriting the unit and waiting for the health check. This takes a few seconds.</p>
         ) : migrate.isError ? (
           <ErrorBlock
             live
             compact
             error={migrate.error}
+            title="The migration could not be queued"
+            hint="WASM put everything back as it was: the app still runs in place, from the same directory."
+          />
+        ) : jobFailed ? (
+          <ErrorBlock
+            live
+            compact
+            error={{ detail: followed.job?.error ?? "The job failed without saying why. Its log is on the Activity page." }}
             title="The migration did not complete"
             hint="WASM put everything back as it was: the app still runs in place, from the same directory."
           />
@@ -250,7 +307,7 @@ function MigrationCard({ app, onMigrated }: { app: App; onMigrated: (result: Mig
  * how many are kept to go back to; for one still in place, the way onto releases.
  */
 export function ReleasesSection({ app }: { app: App }) {
-  const [migrated, setMigrated] = useState<MigrationResult | null>(null);
+  const [migrated, setMigrated] = useState<MigrationSummary | null>(null);
   const onReleases = app.layout === "releases";
 
   return (
