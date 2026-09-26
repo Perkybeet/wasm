@@ -14,6 +14,14 @@ which applications are deployed; a failed signature answers 401 with no hint
 of what was checked. Every outcome - accepted, ignored or refused - is written
 to the audit log, never including the secret or the presented signature.
 
+Wrong signatures are counted per application, not per address. A forge sends
+every customer's deliveries from a few shared addresses, so a lockout of the
+address - which is what this counted towards before - let anyone with an
+account on the same forge point a webhook of their own at the panel with a
+wrong secret and cut off every genuine delivery, for every application. Now
+the application being guessed at stops taking deliveries for a while, and
+nothing else does.
+
 The routers here are mounted in :mod:`wasm.web.server`, not in
 :mod:`wasm.web.api.router`: the hook must not inherit the ``/api`` prefix and
 its conventions, and the secret-management endpoints live under ``/api/apps``
@@ -39,9 +47,10 @@ from wasm.core.exceptions import DeploymentError, DomainError
 from wasm.core.store import DeploymentRecord, DeploymentTrigger, StoreError, get_store
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import WASMErrorRoute, strict_domain
-from wasm.web.auth import actor_label, get_audit_logger, get_client_ip, record_auth_failure
+from wasm.web.auth import actor_label, get_audit_logger, get_client_ip
 from wasm.web.jobs import JobContext, JobType, get_job_manager, run_update
 from wasm.web.pydantic_compat import iso_offset_validator
+from wasm.web.server import get_webhook_failures
 
 #: The unauthenticated delivery surface, mounted at ``/hooks``.
 router = APIRouter(route_class=WASMErrorRoute)
@@ -345,19 +354,31 @@ async def deliver(domain: str, request: Request) -> JSONResponse:
         _record(request, validated, "denied", "unknown domain or webhooks not configured")
         raise HTTPException(status_code=404, detail="Not found")
 
+    # Checked only once a secret exists, so this answers nothing about an
+    # application the 404 above would not already have: failures are only
+    # ever counted against a domain that has a webhook.
+    failures = get_webhook_failures()
+    if failures.is_locked(validated):
+        remaining = failures.get_lockout_remaining(validated)
+        _record(request, validated, "locked", f"refused for {remaining} more seconds")
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": "locked_out",
+                "detail": "Too many deliveries with a wrong signature for this application.",
+                "hint": "Check the webhook secret configured on the forge.",
+                "fields": None,
+            },
+            headers={"Retry-After": str(remaining)},
+        )
+
     provider = _verify_provider(secret, body, request)
     if provider is None:
         _record(request, validated, "denied", "signature verification failed")
-        # A wrong webhook signature is a credential guess exactly as much as a
-        # wrong master token is: it is the one thing this endpoint checks,
-        # and it can be brute forced the same way. Feeding it into the same
-        # lockout the login form uses means an attacker cannot use the
-        # deliberately unauthenticated hook surface as a side channel that
-        # never counts against them - and, once locked out, SecurityMiddleware
-        # refuses this route before it runs (AUTH_PATH_PREFIXES).
-        record_auth_failure(
-            get_client_ip(request), f"/hooks/deploy/{validated}", "webhook_signature"
-        )
+        # A wrong signature is a guess at this application's secret, and is
+        # counted against this application. Not against the address: see
+        # the module docstring for why that cut off whole forges.
+        failures.record_failure(validated)
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     delivery = _delivery_id(request)

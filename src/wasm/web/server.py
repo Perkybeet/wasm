@@ -48,17 +48,20 @@ from wasm.core.net import host_addresses, is_loopback_host, local_address, loopb
 from wasm.core.notifier import NotificationEvent
 from wasm.web.auth import (
     SAFE_METHODS,
+    SESSION_COOKIE_NAME,
     WS_CLOSE_FORBIDDEN,
     WS_CLOSE_RATE_LIMITED,
     WS_CLOSE_UNAUTHORIZED,
     AuditLogger,
     BruteForceProtection,
+    ConnectionLimiter,
     RateLimiter,
     SecurityConfig,
     TokenManager,
     actor_label,
     authenticate_connection,
     bearer_token,
+    credential_key,
     get_audit_logger,
     get_client_ip,
     get_security_config,
@@ -73,6 +76,13 @@ from wasm.web.auth import (
 from wasm.web.events import AppStatePublisher, announce_app_mutation
 
 logger = logging.getLogger(__name__)
+
+#: Path prefix of the forge webhooks, which get :data:`MAX_HOOK_BODY_BYTES`.
+HOOKS_PATH_PREFIX = "/hooks/"
+
+#: Methods whose body the middleware reads and counts before the app does.
+#: Nothing reads a GET's body, so a GET is judged by its declared length only.
+_BODY_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 #: The console's committed Vite build: ``index.html``, the files Vite copies
 #: from ``panel/public`` (the favicon) and ``assets/`` with every hashed chunk.
@@ -205,24 +215,25 @@ def _spends_no_rate_budget(scope: Scope, path: str) -> bool:
 #: Endpoints that check a credential carried in the request itself - the
 #: master token, a second factor - and count a wrong one against the lockout.
 #: A locked-out address is refused them before they run, whatever else it
-#: carries, a session cookie included: counting guesses without ever refusing
-#: the next one is no limit at all. The console signs in through
-#: ``/api/auth/login`` like any script does; sudo mode and turning two-factor
-#: off ask for a factor again from inside a session. tests/test_web_auth.py
-#: holds every path here to a real route, and every handler that calls
+#: carries: counting guesses without ever refusing the next one is no limit
+#: at all. The console signs in through ``/api/auth/login`` like any script
+#: does; sudo mode and turning two-factor off ask for a factor again from
+#: inside a session. tests/test_web_auth.py holds every path here to a real
+#: route, and every handler that calls
 #: :func:`~wasm.web.auth.record_auth_failure` to a path here.
+#:
+#: The forge webhook is not here on purpose. Its wrong signatures are
+#: counted per application by :func:`get_webhook_failures`, not per address:
+#: a forge's deliveries share a few egress addresses, and refusing one of
+#: them would refuse every genuine delivery behind it.
 AUTH_PATHS = frozenset({"/api/auth/login", "/api/auth/elevate", "/api/auth/2fa/disable"})
-
-#: The same for credential-checking routes whose path carries a parameter.
-#: ``POST /hooks/deploy/{domain}`` verifies a forge's signature and counts a
-#: wrong one; it holds no session, so nothing else would stop a locked-out
-#: address from guessing on.
-AUTH_PATH_PREFIXES = ("/hooks/",)
 
 _token_manager: TokenManager | None = None
 _rate_limiter: RateLimiter | None = None
 _brute_force: BruteForceProtection | None = None
 _audit_logger: AuditLogger | None = None
+_connection_limiter: ConnectionLimiter | None = None
+_webhook_failures: BruteForceProtection | None = None
 
 
 def get_token_manager() -> TokenManager:
@@ -275,6 +286,42 @@ def get_brute_force() -> BruteForceProtection:
         # wasm.web.auth reach for, or failures would be split across channels.
         set_brute_force_protection(_brute_force)
     return _brute_force
+
+
+def get_connection_limiter() -> ConnectionLimiter:
+    """
+    Return the per-credential WebSocket counter, creating it on first use.
+
+    Returns:
+        The process-wide connection limiter.
+    """
+    global _connection_limiter
+    if _connection_limiter is None:
+        _connection_limiter = ConnectionLimiter(get_security_config().ws_max_per_credential)
+    return _connection_limiter
+
+
+def get_webhook_failures() -> BruteForceProtection:
+    """
+    Return the webhook signature failure tracker, keyed by application domain.
+
+    The same lockout mechanics as the address lockout, over a different key
+    and with its own thresholds (``webhook_max_failures``,
+    ``webhook_lockout_duration``): the hook is refused for one application
+    that is being guessed at, while every other application's deliveries,
+    from the same forge address, keep arriving.
+
+    Returns:
+        The process-wide tracker.
+    """
+    global _webhook_failures
+    if _webhook_failures is None:
+        config = get_security_config()
+        _webhook_failures = BruteForceProtection(
+            max_attempts=config.webhook_max_failures,
+            lockout_duration=config.webhook_lockout_duration,
+        )
+    return _webhook_failures
 
 
 def get_audit() -> AuditLogger | None:
@@ -474,7 +521,8 @@ def create_app(config: SecurityConfig | None = None) -> FastAPI:
         SecurityError: When secrets, sessions or the audit log cannot be
             persisted, or when TLS is required but not configured.
     """
-    global _token_manager, _rate_limiter, _brute_force, _audit_logger
+    global _token_manager, _rate_limiter, _brute_force, _audit_logger, _connection_limiter
+    global _webhook_failures
 
     security_config = config or SecurityConfig()
     set_security_config(security_config)
@@ -502,6 +550,11 @@ def create_app(config: SecurityConfig | None = None) -> FastAPI:
         lockout_duration=security_config.lockout_duration,
     )
     set_brute_force_protection(_brute_force)
+    _connection_limiter = ConnectionLimiter(security_config.ws_max_per_credential)
+    _webhook_failures = BruteForceProtection(
+        max_attempts=security_config.webhook_max_failures,
+        lockout_duration=security_config.webhook_lockout_duration,
+    )
 
     app = FastAPI(
         title="WASM Web Interface",
@@ -782,6 +835,25 @@ class SecurityMiddleware:
             )
             return
 
+        if scope["type"] == "http":
+            limit = self._body_limit(path)
+            too_large = self._declared_length(connection) > limit
+            if not too_large and str(scope.get("method", "")).upper() in _BODY_METHODS:
+                receive, too_large = await self._read_body(receive, limit)
+            if too_large:
+                await self._deny(
+                    scope,
+                    receive,
+                    send,
+                    connection,
+                    status_code=413,
+                    ws_code=WS_CLOSE_FORBIDDEN,
+                    detail=f"The request body is larger than this endpoint accepts ({limit} bytes).",
+                    error="payload_too_large",
+                    hint="Send a smaller body. The limits are in docs/security.md.",
+                )
+                return
+
         if self._guards_credentials(scope, connection, path):
             brute_force = get_brute_force()
             if brute_force.is_locked(client_ip):
@@ -821,11 +893,114 @@ class SecurityMiddleware:
                     error="unauthorized",
                 )
                 return
+            # One budget per credential, taken here at the one place every
+            # handshake passes and given back when the handler returns - that
+            # is, when the socket closes - whatever route it was.
+            key = credential_key(session)
+            limiter = get_connection_limiter()
+            if not limiter.acquire(key):
+                if audit:
+                    audit.record(
+                        action="ws.connect",
+                        result="denied",
+                        client_ip=client_ip,
+                        actor=actor_label(session),
+                        resource=path,
+                        detail=f"credential already holds {limiter.limit} open WebSockets",
+                    )
+                await self._deny(
+                    scope,
+                    receive,
+                    send,
+                    connection,
+                    status_code=429,
+                    ws_code=WS_CLOSE_RATE_LIMITED,
+                    detail="Too many open WebSockets for this credential. Close one first.",
+                    error="rate_limited",
+                )
+                return
             scope.setdefault("state", {})["session"] = session
-            await self.app(scope, receive, send)
+            try:
+                await self.app(scope, receive, send)
+            finally:
+                limiter.release(key)
             return
 
         await self.app(scope, receive, self._wrap_send(scope, connection, client_ip, send))
+
+    def _body_limit(self, path: str) -> int:
+        """
+        The largest body a request to a path may carry.
+
+        Args:
+            path: The request path.
+
+        Returns:
+            The forge webhook's cap under ``/hooks/``, the API's everywhere
+            else.
+        """
+        if path.startswith(HOOKS_PATH_PREFIX):
+            return self.config.max_hook_body_bytes
+        return self.config.max_body_bytes
+
+    @staticmethod
+    def _declared_length(connection: HTTPConnection) -> int:
+        """
+        Read the ``Content-Length`` a request declares.
+
+        Args:
+            connection: A view over the scope.
+
+        Returns:
+            The declared length, or 0 when there is none or it is not a
+            number - the server's own HTTP parser refuses a malformed one,
+            and a chunked body is counted as it is read instead.
+        """
+        declared = connection.headers.get("content-length", "")
+        try:
+            return max(0, int(declared))
+        except ValueError:
+            return 0
+
+    @staticmethod
+    async def _read_body(receive: Receive, limit: int) -> tuple[Receive, bool]:
+        """
+        Read a request body up front, counting it, and hand it on unchanged.
+
+        Done here rather than by wrapping ``receive`` for the app to call:
+        FastAPI reads the body inside a ``try`` that turns any error into a
+        400, so a limit enforced from inside the app would answer "could not
+        parse" instead of 413. Reading first costs no more memory than the
+        app's own read would - FastAPI buffers every JSON body whole - and
+        is bounded by ``limit``.
+
+        Args:
+            receive: The server's receive channel.
+            limit: Bytes allowed.
+
+        Returns:
+            A receive channel that replays what was read and then defers to
+            the original, and whether the body went over the limit.
+        """
+        buffered: list[Message] = []
+        total = 0
+        while True:
+            message = await receive()
+            buffered.append(message)
+            if message["type"] != "http.request":
+                break
+            total += len(message.get("body", b""))
+            if total > limit:
+                return receive, True
+            if not message.get("more_body", False):
+                break
+
+        async def replay() -> Message:
+            if buffered:
+                return buffered.pop(0)
+            return await receive()
+
+        return replay, False
 
     @staticmethod
     def _guards_credentials(scope: Scope, connection: HTTPConnection, path: str) -> bool:
@@ -833,12 +1008,16 @@ class SecurityMiddleware:
         Report whether the lockout applies to this connection.
 
         The lockout exists to stop credential guessing, so it covers everything
-        that can carry a guess: the endpoints in :data:`AUTH_PATHS` and under
-        :data:`AUTH_PATH_PREFIXES` (login, sudo mode, the webhook), any request
-        presenting a Bearer token, and every WebSocket handshake. Anything else
-        a browser holding a valid session cookie does is deliberately not
-        blocked, so one attacker cannot lock the operator out of their own
-        panel - only out of the endpoints that check a credential.
+        that can carry a guess: the endpoints in :data:`AUTH_PATHS` (login,
+        sudo mode, turning 2FA off), any request presenting a Bearer token or
+        a session cookie, and every WebSocket handshake.
+
+        The session cookie used to be exempt, so that an attacker could not
+        lock the operator out of a console they were already signed in to.
+        But a cookie is a credential like any other - one that is checked
+        against the master token too - and an address that is refused
+        everywhere except the cookie has not been refused. A lockout is keyed
+        on the attacker's own address; an operator elsewhere is not affected.
 
         Args:
             scope: The ASGI connection scope.
@@ -850,7 +1029,9 @@ class SecurityMiddleware:
         """
         if scope["type"] == "websocket":
             return True
-        if path in AUTH_PATHS or path.startswith(AUTH_PATH_PREFIXES):
+        if path in AUTH_PATHS:
+            return True
+        if connection.cookies.get(SESSION_COOKIE_NAME):
             return True
         return bearer_token(connection) is not None
 
@@ -977,6 +1158,7 @@ class SecurityMiddleware:
         detail: str,
         error: str,
         headers: dict[str, str] | None = None,
+        hint: str | None = None,
     ) -> None:
         """
         Refuse a connection in the shape its protocol understands.
@@ -996,6 +1178,7 @@ class SecurityMiddleware:
             error: Machine-readable error code - see
                 ``wasm.web.api.deps.ErrorResponse``.
             headers: Extra response headers.
+            hint: How to fix it, when there is something the client can do.
         """
         if scope["type"] == "websocket":
             # Closing before accepting is how ASGI refuses a handshake; the
@@ -1011,7 +1194,7 @@ class SecurityMiddleware:
 
         response = JSONResponse(
             status_code=status_code,
-            content={"error": error, "detail": detail, "hint": None, "fields": None},
+            content={"error": error, "detail": detail, "hint": hint, "fields": None},
             headers=headers,
         )
         self._harden_headers(MutableHeaders(raw=response.raw_headers), connection, status_code)

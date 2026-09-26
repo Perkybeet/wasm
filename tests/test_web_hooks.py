@@ -488,16 +488,23 @@ def test_rate_limiting_applies_to_the_hook_surface(tmp_path: Path, store: WASMSt
     assert statuses[-1] == 429
 
 
-def test_a_locked_out_address_cannot_post_to_the_hook(
-    tmp_path: Path, store: WASMStore, secret: str, queued: list[dict[str, Any]]
-) -> None:
-    """
-    Bad signatures are counted by the lockout, so the lockout has to refuse.
+OTHER_DOMAIN = "other.example.com"
 
-    The reported defect: the hook counted every wrong signature, but the
-    middleware's lockout gate only guarded the login form, Bearer requests
-    and WebSockets, so a locked-out address kept guessing signatures at the
-    hook - and could still deliver - as if nothing had happened.
+#: A delivery with a signature no secret produced.
+WRONG_SIGNATURE = {"X-Hub-Signature-256": "sha256=" + "0" * 64, "Content-Type": "application/json"}
+
+
+@pytest.fixture
+def forge(tmp_path: Path, store: WASMStore) -> TestClient:
+    """
+    A forge's delivery client against a panel with a small webhook budget.
+
+    Every delivery comes from the same address, the way a forge's shared
+    egress does: the deliveries of every customer of that forge, the
+    attacker's included, arrive from it.
+
+    Returns:
+        The client.
     """
     app = build_app(
         SecurityConfig(
@@ -505,24 +512,83 @@ def test_a_locked_out_address_cannot_post_to_the_hook(
             rate_limit_requests=5000,
             max_failed_attempts=3,
             lockout_duration=60,
+            webhook_max_failures=3,
+            webhook_lockout_duration=60,
         )
     )
-    client = TestClient(app, client=("testclient", 50000))
+    return TestClient(app, client=("testclient", 50000))
 
-    wrong = {"X-Hub-Signature-256": "sha256=" + "0" * 64, "Content-Type": "application/json"}
+
+def test_bad_signatures_lock_out_that_domain_only(
+    forge: TestClient, store: WASMStore, secret: str, queued: list[dict[str, Any]]
+) -> None:
+    """
+    Guessing one application's secret stops that application's hook, not the forge.
+
+    The failures used to feed the address lockout. A forge's deliveries all
+    come from a few shared addresses, so anyone could point a webhook of
+    their own at the panel with a wrong secret and lock out the forge's
+    address - and with it every genuine delivery for every application.
+    """
+    store.create_app(
+        App(
+            domain=OTHER_DOMAIN,
+            app_type="nodejs",
+            source="https://github.com/you/other",
+            branch="main",
+            port=3001,
+            app_path="/var/www/apps/other-example-com",
+        )
+    )
+    other_secret = mint_webhook_secret(OTHER_DOMAIN)
+
     statuses = [
-        client.post(f"/hooks/deploy/{DOMAIN}", content=PUSH_MAIN, headers=wrong).status_code
+        forge.post(
+            f"/hooks/deploy/{DOMAIN}", content=PUSH_MAIN, headers=WRONG_SIGNATURE
+        ).status_code
         for _ in range(3)
     ]
     assert statuses == [401, 401, 401]
 
-    signed = client.post(
+    locked = forge.post(
         f"/hooks/deploy/{DOMAIN}", content=PUSH_MAIN, headers=github_headers(secret, PUSH_MAIN)
     )
-
-    assert signed.status_code == 429, signed.text
-    assert signed.json()["error"] == "locked_out"
+    assert locked.status_code == 429, locked.text
+    assert locked.json()["error"] == "locked_out"
+    assert "Retry-After" in locked.headers
     assert queued == []
+
+    other = forge.post(
+        f"/hooks/deploy/{OTHER_DOMAIN}",
+        content=PUSH_MAIN,
+        headers=github_headers(other_secret, PUSH_MAIN),
+    )
+    assert other.status_code == 202, other.text
+    assert len(queued) == 1
+
+
+def test_bad_signatures_do_not_lock_out_the_forge_s_address(forge: TestClient, secret: str) -> None:
+    """The address stays usable for everything else: it is shared, not the attacker's."""
+    for _ in range(5):
+        forge.post(f"/hooks/deploy/{DOMAIN}", content=PUSH_MAIN, headers=WRONG_SIGNATURE)
+
+    token = get_token_manager().generate_master_token()
+    assert forge.post("/api/auth/login", json={"token": token}).status_code == 200
+
+
+def test_bad_signatures_are_audited_per_domain(
+    forge: TestClient, secret: str, tmp_path: Path
+) -> None:
+    """Every refusal, and the lockout it leads to, names the application."""
+    for _ in range(4):
+        forge.post(f"/hooks/deploy/{DOMAIN}", content=PUSH_MAIN, headers=WRONG_SIGNATURE)
+
+    lines = (tmp_path / "state" / "web-audit.log").read_text().splitlines()
+    entries = [json.loads(line) for line in lines if line.strip()]
+    hooks = [e for e in entries if e["action"] == "hooks.deploy"]
+    assert [e["result"] for e in hooks] == ["denied", "denied", "denied", "locked"]
+    assert all(e["resource"] == f"/hooks/deploy/{DOMAIN}" for e in hooks)
+    assert secret not in "\n".join(lines)
 
 
 def test_the_ip_whitelist_applies_to_the_hook_surface(tmp_path: Path, store: WASMStore) -> None:

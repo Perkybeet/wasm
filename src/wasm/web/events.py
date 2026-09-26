@@ -55,7 +55,7 @@ from starlette.concurrency import run_in_threadpool
 
 from wasm.core.exceptions import WASMError
 from wasm.web import metrics_collector
-from wasm.web.auth import SAFE_METHODS, require_auth
+from wasm.web.auth import SAFE_METHODS, credential_is_current, require_auth
 from wasm.web.jobs import Job
 from wasm.web.machine import read_machine
 from wasm.web.pydantic_compat import dump_model
@@ -67,6 +67,11 @@ router = APIRouter(include_in_schema=False)
 #: Seconds between keepalive comments. Proxies and load balancers close an idle
 #: response, and a silent stream is indistinguishable from a broken one.
 HEARTBEAT_SECONDS = 25
+
+#: Seconds between re-checks of the credential the stream was opened with.
+#: The heartbeat's cadence, kept as its own timer because the metrics frames
+#: every two seconds keep the keepalive itself from ever being due.
+CREDENTIAL_RECHECK_SECONDS: float = HEARTBEAT_SECONDS
 
 #: Seconds between ``metrics`` events, matching the collector's own tick.
 METRICS_INTERVAL_SECONDS = 2.0
@@ -550,12 +555,17 @@ def announce_app_mutation(method: str, path: str, status_code: int) -> None:
         _in_thread(domain)
 
 
-async def _stream(request: Request) -> AsyncIterator[str]:
+async def _stream(request: Request, session: dict[str, Any] | None = None) -> AsyncIterator[str]:
     """
-    Yield events until the client goes away.
+    Yield events until the client goes away or its credential does.
 
     Args:
         request: The incoming request, watched for disconnection.
+        session: The payload the stream was authenticated with. Re-checked
+            every :data:`CREDENTIAL_RECHECK_SECONDS`, and the stream ends as
+            soon as it is no longer accepted: revoking a token or signing out
+            used to leave every feed it had opened running. None only in
+            tests that drive the generator without a credential.
 
     Yields:
         Server-sent event frames.
@@ -625,12 +635,18 @@ async def _stream(request: Request) -> AsyncIterator[str]:
         metrics_at = now
         machine_at = now + MACHINE_INTERVAL_SECONDS
         heartbeat_at = now + HEARTBEAT_SECONDS
+        recheck_at = now + CREDENTIAL_RECHECK_SECONDS
 
         while True:
             if await request.is_disconnected():
                 return
 
             now = loop.time()
+            if session is not None and now >= recheck_at:
+                # A SQLite read, off the event loop like the machine snapshot.
+                if not await run_in_threadpool(credential_is_current, session):
+                    return
+                recheck_at = loop.time() + CREDENTIAL_RECHECK_SECONDS
             if now >= metrics_at:
                 frame = metrics_frame()
                 if frame is not None:
@@ -646,7 +662,7 @@ async def _stream(request: Request) -> AsyncIterator[str]:
                     heartbeat_at = loop.time() + HEARTBEAT_SECONDS
                 machine_at = now + MACHINE_INTERVAL_SECONDS
 
-            timeout = min(metrics_at, machine_at, heartbeat_at) - loop.time()
+            timeout = min(metrics_at, machine_at, heartbeat_at, recheck_at) - loop.time()
             try:
                 yield await asyncio.wait_for(queue.get(), timeout=max(0.0, timeout))
                 heartbeat_at = loop.time() + HEARTBEAT_SECONDS
@@ -661,24 +677,25 @@ async def _stream(request: Request) -> AsyncIterator[str]:
 
 @router.get("/events")
 async def events(
-    request: Request, _: Annotated[dict[str, Any], Depends(require_auth)]
+    request: Request, session: Annotated[dict[str, Any], Depends(require_auth)]
 ) -> StreamingResponse:
     """
     Stream state changes to the console.
 
     Args:
         request: The incoming request.
-        _: The session, required exactly as the API requires it: an
+        session: The session, required exactly as the API requires it: an
             EventSource sends the session cookie, and a missing or expired
             one is a 401, which the console cannot read from an EventSource:
             it notices on its next session check after the drop and answers
-            with the sign-in page.
+            with the sign-in page. The stream re-checks it on its heartbeat
+            and ends once it is revoked or has expired.
 
     Returns:
         An event stream.
     """
     return StreamingResponse(
-        _stream(request),
+        _stream(request, session),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

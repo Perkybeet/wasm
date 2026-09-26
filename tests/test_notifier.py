@@ -24,6 +24,7 @@ the notifier built. What is being defended:
 from __future__ import annotations
 
 import io
+import ipaddress
 import json
 import logging
 from pathlib import Path
@@ -485,3 +486,93 @@ class TestAgreementWithDefaults:
         """A typo'd kind would silently bypass the operator's filters."""
         with pytest.raises(ValueError, match="deploy_sucess"):
             NotificationEvent(kind="deploy_sucess", title="t", body="b")
+
+
+class TestSSRFGuard:
+    """
+    IPv6 forms that reach a forbidden IPv4 through tunnelling or mapping.
+
+    ``_FORBIDDEN_NETWORKS`` lists IPv4 and native IPv6 ranges directly, but
+    IPv4-mapped (``::ffff:0:0/96``), NAT64 (``64:ff9b::/96``, RFC 6052) and
+    6to4 (``2002::/16``) addresses carry an IPv4 address inside an IPv6
+    wrapper that none of those entries would catch on its own. The
+    unspecified address (``::``) reaches the local host on Linux the same
+    way ``0.0.0.0`` does. This class exercises both the address-level guard
+    (``_is_forbidden``) and the URL-level one (``_require_public_destination``),
+    the second overriding ``public_dns`` so a literal address in the URL is
+    resolved by the real, unpatched ``_resolve_host``.
+    """
+
+    @pytest.fixture(autouse=True)
+    def public_dns(self) -> None:
+        """
+        Shadow the module-level fake-DNS fixture for this class.
+
+        These tests assert on real address literals and on ``_resolve_host``
+        results they set up themselves; the module's autouse fixture would
+        otherwise force every host, literal or not, to a fixed public
+        address and make every case in this class pass for the wrong reason.
+        """
+        return None
+
+    @pytest.mark.parametrize(
+        "address",
+        [
+            "::ffff:127.0.0.1",  # IPv4-mapped IPv6, loopback
+            "::ffff:169.254.169.254",  # IPv4-mapped IPv6, cloud metadata
+            "::ffff:10.0.0.1",  # IPv4-mapped IPv6, RFC 1918
+            "64:ff9b::7f00:1",  # NAT64, loopback
+            "64:ff9b::a9fe:a9fe",  # NAT64, cloud metadata
+            "2002:7f00:0001::1",  # 6to4, loopback
+            "2002:a9fe:a9fe::1",  # 6to4, cloud metadata
+            "::",  # unspecified address
+        ],
+    )
+    def test_ipv6_forms_embedding_a_forbidden_ipv4_are_forbidden(self, address: str) -> None:
+        """Each tunnelling/mapping form that reaches a forbidden IPv4 is caught."""
+        assert notifier_module._is_forbidden(ipaddress.ip_address(address)) is True
+
+    @pytest.mark.parametrize(
+        "address",
+        [
+            "::ffff:8.8.8.8",
+            "64:ff9b::808:808",
+            "2002:0808:0808::1",
+        ],
+    )
+    def test_ipv6_forms_embedding_a_public_ipv4_are_allowed(self, address: str) -> None:
+        """A public address must still pass, even wrapped in one of these forms."""
+        assert notifier_module._is_forbidden(ipaddress.ip_address(address)) is False
+
+    @pytest.mark.parametrize(
+        "address",
+        [
+            "::ffff:127.0.0.1",
+            "64:ff9b::7f00:1",
+            "2002:7f00:0001::1",
+            "::",
+        ],
+    )
+    def test_url_literal_embedding_a_forbidden_ipv4_is_refused(
+        self, config: Config, address: str
+    ) -> None:
+        """A literal in the URL bypasses DNS entirely; the guard must still catch it."""
+        with pytest.raises(ValueError, match="resolves to"):
+            notifier_module._require_public_destination(f"http://[{address}]/hook", config)
+
+    def test_resolved_name_embedding_a_forbidden_ipv4_is_refused(
+        self, config: Config, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A name resolving to one of these forms is refused exactly like a literal."""
+        monkeypatch.setattr(
+            notifier_module, "_resolve_host", lambda host: ("::ffff:169.254.169.254",)
+        )
+        with pytest.raises(ValueError, match="resolves to"):
+            notifier_module._require_public_destination("http://metadata.internal/hook", config)
+
+    def test_resolved_name_embedding_a_public_ipv4_is_allowed(
+        self, config: Config, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A resolved embedded address that is genuinely public must still pass."""
+        monkeypatch.setattr(notifier_module, "_resolve_host", lambda host: ("::ffff:8.8.8.8",))
+        notifier_module._require_public_destination("http://dns.example.test/hook", config)

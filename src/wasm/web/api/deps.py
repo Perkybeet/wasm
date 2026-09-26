@@ -47,6 +47,7 @@ from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from wasm.core.applock import AppBusyError
 from wasm.core.exceptions import (
     ConfigError,
     DatabaseExistsError,
@@ -87,6 +88,7 @@ _ERROR_BY_STATUS: dict[int, str] = {
     403: "forbidden",
     404: "not_found",
     409: "conflict",
+    413: "payload_too_large",
     422: "validation_error",
     429: "rate_limited",
 }
@@ -103,12 +105,24 @@ _STATUS_BY_ERROR: tuple[tuple[type[WASMError], int], ...] = (
     (DatabaseNotFoundError, 404),
     (DatabaseExistsError, 409),
     (DomainConflictError, 409),
+    (AppBusyError, 409),
     (SecurityError, 400),
     (ValidationError, 400),
     (DomainError, 400),
     (ConfigError, 400),
     (SourceError, 400),
     (WASMPermissionError, 403),
+)
+
+
+#: Errors whose ``error`` code and hint are a promise to the console rather
+#: than derived from the class name and the details. An application being
+#: busy is a wait, not a fault: the console branches on ``app_busy`` to offer
+#: the running job instead of an error, and the exception's own details are
+#: written for a terminal ("retry the command") rather than for a screen that
+#: can link to the job.
+_CONTRACT_BY_ERROR: tuple[tuple[type[WASMError], str, str], ...] = (
+    (AppBusyError, "app_busy", "Wait for it to finish, or follow it in Jobs"),
 )
 
 
@@ -187,16 +201,22 @@ def error_response(exc: WASMError) -> JSONResponse:
     # and details travels only in hint.  WASMError defaults ``details`` to an
     # empty string; an empty hint is no hint, and the client should not have
     # to know the difference.
+    # Lowercased so a client branches on one casing convention regardless of
+    # whether the code came from a WASM exception or from the fixed
+    # vocabulary in _ERROR_BY_STATUS.
+    error = type(exc).__name__.lower()
+    hint: str | None = getattr(exc, "details", None) or None
+    for error_type, code, contract_hint in _CONTRACT_BY_ERROR:
+        if isinstance(exc, error_type):
+            error, hint = code, contract_hint
+            break
     return JSONResponse(
         status_code=status_for(exc),
         content=dump_model(
             ErrorResponse(
                 detail=exc.message,
-                hint=getattr(exc, "details", None) or None,
-                # Lowercased so a client branches on one casing convention
-                # regardless of whether the code came from a WASM exception
-                # or from the fixed vocabulary in _ERROR_BY_STATUS.
-                error=type(exc).__name__.lower(),
+                hint=hint,
+                error=error,
                 output=getattr(exc, "output", None),
             )
         ),
@@ -480,30 +500,41 @@ _ELEVATION_REQUIRED_DETAIL: dict[str, Any] = {
 }
 
 
+#: Credentials sudo mode does not ask to confirm. Both are standing
+#: credentials an operator issued on purpose - the master token, or an API
+#: token minted from a confirmed session or from the root CLI - so the
+#: confirmation already happened once, when they were made.
+ELEVATION_EXEMPT_TYPES = frozenset({"master", "api_token"})
+
+
 def ensure_elevated(request: Request, session: dict[str, Any]) -> None:
     """
-    Refuse a destructive action from a cookie session that has not confirmed recently.
+    Refuse a destructive action from a session that has not confirmed recently.
 
-    This is the chokepoint D5's sudo mode runs at. A browser holding a session
-    cookie must have called ``POST /api/auth/elevate`` within the last ten
-    minutes; automation presenting a Bearer credential - an admin-scoped API
-    token or the master token - is exempt, because issuing that credential at
-    all already required an operator's confirmation once. Which channel a
-    session arrived on is decided once, at ``require_auth``, and carried here
-    as ``session["source"]`` rather than re-derived, so this can be called
-    both as a route dependency and, for the handful of endpoints where
-    elevation depends on the request body (a write-mode database query, an
-    unmasked env read), directly from inside the handler.
+    This is the chokepoint D5's sudo mode runs at. A console session must have
+    called ``POST /api/auth/elevate`` within the last ten minutes; the master
+    token and API tokens are exempt, because issuing that credential at all
+    already required an operator's confirmation once.
+
+    The exemption is decided by what the credential *is*
+    (``session["type"]``, set where it was verified), never by the channel it
+    arrived on. A session token is accepted in the ``Authorization`` header
+    too, and exempting that header is how moving the same session out of the
+    cookie used to skip the confirmation. A payload with no type is not
+    exempt. This can be called both as a route dependency and, for the
+    handful of endpoints where elevation depends on the request body (a
+    write-mode database query, an unmasked env read), directly from inside
+    the handler.
 
     Args:
         request: The incoming request, for the audit record.
         session: The authenticated session payload.
 
     Raises:
-        HTTPException: 403 with ``error: "elevation_required"`` when a cookie
-            session has not elevated, or its window has expired.
+        HTTPException: 403 with ``error: "elevation_required"`` when a session
+            has not elevated, or its window has expired.
     """
-    if session.get("source") != "cookie" or is_elevated(session):
+    if session.get("type") in ELEVATION_EXEMPT_TYPES or is_elevated(session):
         return
 
     audit = get_audit_logger()

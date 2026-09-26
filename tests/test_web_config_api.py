@@ -82,7 +82,7 @@ def client(config_path: Path) -> TestClient:
     """
     app = FastAPI()
     app.include_router(config_api.router, prefix="/api/config")
-    app.dependency_overrides[get_current_session] = lambda: {"session_id": "test"}
+    app.dependency_overrides[get_current_session] = lambda: {"session_id": "test", "type": "master"}
     return TestClient(app, raise_server_exceptions=False)
 
 
@@ -469,6 +469,24 @@ class TestUpdateSemantics:
         assert response.status_code == 200, response.text
         assert stored_value(config_path, "apps_directory") == "/srv/apps"
         assert stored_value(config_path, "apps") is None
+
+    def test_full_replace_folds_the_deprecated_logging_directory_alias(
+        self, client: TestClient, config_path: Path
+    ) -> None:
+        """
+        obs/wasm.default.yaml shipped 'logging.directory' while the code's
+        own default named the setting 'logging.file'. The alias that closes
+        that gap must fold into the nested canonical key, not a bogus
+        top-level key literally named 'logging.file'.
+        """
+        response = client.put(
+            "/api/config", json={"config": {"logging": {"directory": "/srv/logs/wasm.log"}}}
+        )
+
+        assert response.status_code == 200, response.text
+        assert stored_value(config_path, "logging.file") == "/srv/logs/wasm.log"
+        assert stored_value(config_path, "logging.directory") is None
+        assert isinstance(yaml.safe_load(config_path.read_text())["logging"], dict)
 
     def test_apps_directory_round_trip(self, client: TestClient) -> None:
         """What was written must be what is read back."""

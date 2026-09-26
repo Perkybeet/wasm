@@ -321,6 +321,8 @@ def test_an_injected_calendar_answers_422_with_the_managers_refusal(
     client: TestClient, runner: FakeRunner, systemd_dir: Path
 ) -> None:
     """The request model refuses what the manager would refuse, at 422."""
+    # Creating or rewriting a job is a sudo-mode action.
+    elevate(client)
     response = client.post(
         "/api/cron",
         json={"name": "cleanup", "command": "/usr/bin/true", "schedule": INJECTED_CALENDAR},
@@ -335,6 +337,8 @@ def test_creating_a_job_writes_the_units_and_enables_the_timer(
     client: TestClient, runner: FakeRunner, systemd_dir: Path
 ) -> None:
     """POST writes the timer/service pair through the manager and enables it."""
+    # Creating or rewriting a job is a sudo-mode action.
+    elevate(client)
     response = client.post(
         "/api/cron",
         json={

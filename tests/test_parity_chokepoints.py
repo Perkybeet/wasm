@@ -122,7 +122,11 @@ def _client(router: Any, prefix: str, *, elevated: bool = False) -> TestClient:
     """
     app = FastAPI()
     app.include_router(router, prefix=prefix)
-    app.dependency_overrides[get_current_session] = lambda: {"session_id": "test", "scope": "admin"}
+    app.dependency_overrides[get_current_session] = lambda: {
+        "session_id": "test",
+        "scope": "admin",
+        "type": "master",
+    }
     if elevated:
         app.dependency_overrides[require_elevated] = lambda: {
             "session_id": "test",
@@ -808,8 +812,9 @@ class TestDeleteAppJobRoutesThroughTheChokepoints:
 
             return SiteDeletion(domain=domain)
 
+        # The job removes through lifecycle.delete_app, the one deletion.
         monkeypatch.setattr(
-            "wasm.managers.webserver.delete_site_completely", fake_delete_site_completely
+            "wasm.deployers.lifecycle.delete_site_completely", fake_delete_site_completely
         )
 
         set_fs(RecordingFileSystem())

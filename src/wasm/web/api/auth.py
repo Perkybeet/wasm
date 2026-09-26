@@ -27,12 +27,12 @@ from wasm.web.auth import (
     IssuedSession,
     actor_label,
     bearer_token,
-    check_credential,
     get_audit_logger,
     get_client_ip,
     is_secure_request,
     record_auth_failure,
     require_auth,
+    verify_credential,
 )
 from wasm.web.server import get_brute_force, get_token_manager
 
@@ -347,7 +347,7 @@ async def login(request: Request, response: Response, body: LoginRequest) -> Log
             raise _login_failure(
                 "totp_required", "Two-factor authentication is enabled. Include totp_code."
             )
-        if not token_manager.verify_second_factor(code):
+        if not token_manager.verify_second_factor(code, purpose="login"):
             # The same chokepoint that counts a bad master token: a wrong
             # second factor is a credential guess, and it must not have its
             # own, softer counter.
@@ -386,10 +386,14 @@ async def get_session_info(request: Request) -> SessionInfo:
 
     Every other endpoint under ``/api`` requires ``require_auth`` and answers
     401 to an anonymous caller; this one exists so the console has something
-    to call before it knows which of those two things it is. The credential
-    is checked but never counted towards the lockout - an anonymous probe of
-    this endpoint is not a credential guess, because nothing here is graded
-    pass or fail the way a login attempt is.
+    to call before it knows which of those two things it is. A caller that
+    presents nothing is not guessing anything and is not counted. A caller
+    that presents a credential is checked exactly as ``require_auth`` checks
+    one, through :func:`~wasm.web.auth.verify_credential`, and a wrong one is
+    counted towards the lockout: the answer here says whether the value was
+    the master token, so without counting this was a guessing oracle with no
+    limit. A session cookie this server signed but that has since expired is
+    not a guess and is not counted.
 
     Args:
         request: The incoming request.
@@ -401,8 +405,18 @@ async def get_session_info(request: Request) -> SessionInfo:
     """
     token_manager = get_token_manager()
     client_ip = get_client_ip(request)
-    credential = bearer_token(request) or request.cookies.get(SESSION_COOKIE_NAME)
-    session = check_credential(credential, client_ip) if credential else None
+    bearer = bearer_token(request)
+    credential = bearer or request.cookies.get(SESSION_COOKIE_NAME)
+    session = (
+        verify_credential(
+            credential,
+            client_ip,
+            resource="/api/auth/session",
+            source="bearer" if bearer else "cookie",
+        )
+        if credential
+        else None
+    )
 
     if session is None:
         return SessionInfo(
@@ -463,7 +477,7 @@ async def elevate(
             raise _login_failure(
                 "totp_required", "Two-factor authentication is enabled. Include code."
             )
-        if not token_manager.verify_second_factor(code):
+        if not token_manager.verify_second_factor(code, purpose="elevate"):
             record_auth_failure(client_ip, "/api/auth/elevate", "totp")
             attempts_remaining = get_brute_force().get_attempts_remaining(client_ip)
             raise _login_failure(
@@ -840,17 +854,26 @@ def two_factor_status(session: dict[str, Any] = Depends(require_auth)) -> TwoFac
 
 @router.post("/2fa/enroll", response_model=TwoFactorEnrollment)
 def two_factor_enroll(
-    request: Request, session: dict[str, Any] = Depends(require_auth)
+    request: Request, session: dict[str, Any] = Depends(require_elevated)
 ) -> TwoFactorEnrollment:
     """
     Begin enrolment: generate a pending secret. Nothing is enforced yet.
 
+    Sudo mode, confirmed with the master token (two-factor is off, or there
+    would be nothing to enrol): the factor enrolled here is the one every
+    later confirmation asks for, so a session nobody re-confirmed must not be
+    able to bind its own authenticator.
+
     Args:
         request: The incoming request.
-        session: The authenticated session.
+        session: The authenticated session, elevated.
 
     Returns:
         The secret and its provisioning URI, shown to the operator once.
+
+    Raises:
+        HTTPException: 403 with ``error: "elevation_required"`` per
+            :func:`wasm.web.api.deps.require_elevated`.
     """
     token_manager = get_token_manager()
     secret = token_manager.begin_totp_enrollment()
@@ -870,23 +893,28 @@ def two_factor_enroll(
 
 @router.post("/2fa/confirm", response_model=TwoFactorConfirmed)
 def two_factor_confirm(
-    request: Request, body: TwoFactorCode, session: dict[str, Any] = Depends(require_auth)
+    request: Request, body: TwoFactorCode, session: dict[str, Any] = Depends(require_elevated)
 ) -> TwoFactorConfirmed:
     """
     Verify a code from the authenticator and activate the second factor.
 
+    Sudo mode, like enrolling: this is the step that switches the second
+    factor on and hands out the backup codes.
+
     Args:
         request: The incoming request.
         body: The code the app shows for the pending secret.
-        session: The authenticated session.
+        session: The authenticated session, elevated.
 
     Returns:
         The backup codes, in clear, exactly once.
 
     Raises:
-        HTTPException: 400 when the code does not verify. Not counted by the
-            lockout: the pending secret is on the operator's own screen, so a
-            wrong code here proves a typo, not a guess at a credential.
+        HTTPException: 403 with ``error: "elevation_required"`` per
+            :func:`wasm.web.api.deps.require_elevated`. 400 when the code
+            does not verify. Not counted by the lockout: the pending secret
+            is on the operator's own screen, so a wrong code here proves a
+            typo, not a guess at a credential.
     """
     token_manager = get_token_manager()
     codes = token_manager.confirm_totp_enrollment(body.code)

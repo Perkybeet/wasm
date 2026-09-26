@@ -155,8 +155,12 @@ _IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
 #: (loopback), private networks (RFC 1918), carrier-grade NAT (RFC 6598,
 #: what a cloud metadata endpoint typically sits behind), link-local (which
 #: is also where 169.254.169.254, the cloud metadata address itself, lives),
-#: "this network" (0.0.0.0/8) and IPv6's loopback, unique-local and
-#: link-local equivalents.
+#: "this network" (0.0.0.0/8), IPv6's loopback, unique-local and link-local
+#: equivalents, and the unspecified address (``::``), which Linux treats as
+#: the local host on connect. This list only covers addresses in their own,
+#: native form: an address that reaches one of these IPv4 ranges wrapped in
+#: an IPv4-mapped, NAT64 or 6to4 IPv6 form is caught separately, by
+#: :func:`_embedded_ipv4`, because none of these entries matches the wrapper.
 _FORBIDDEN_NETWORKS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = tuple(
     ipaddress.ip_network(cidr)
     for cidr in (
@@ -167,11 +171,18 @@ _FORBIDDEN_NETWORKS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] =
         "169.254.0.0/16",
         "172.16.0.0/12",
         "192.168.0.0/16",
+        "::/128",
         "::1/128",
         "fc00::/7",
         "fe80::/10",
     )
 )
+
+#: RFC 6052's "well-known prefix": an address in this /96 carries an IPv4
+#: address in its low 32 bits, so a request to it is a request to that IPv4
+#: address, wrapper aside. ``ipaddress`` has no built-in accessor for this
+#: one, unlike ``ipv4_mapped`` and ``sixtofour`` below.
+_NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
 
 
 def _resolve_host(host: str) -> tuple[str, ...]:
@@ -203,19 +214,58 @@ def _resolve_host(host: str) -> tuple[str, ...]:
     return tuple(sorted({str(info[4][0]).split("%", 1)[0] for info in infos}))
 
 
-def _is_forbidden(address: _IPAddress) -> bool:
+def _embedded_ipv4(address: _IPAddress) -> ipaddress.IPv4Address | None:
     """
-    Report whether an address falls inside :data:`_FORBIDDEN_NETWORKS`.
+    Extract the IPv4 address an IPv6 address maps or tunnels, if any.
+
+    Three IPv6 forms carry an IPv4 address that a network stack dials
+    exactly as if it had been given directly: IPv4-mapped
+    (``::ffff:0:0/96``), NAT64 (``64:ff9b::/96``, RFC 6052) and 6to4
+    (``2002::/16``). Each is a second route to an address
+    :data:`_FORBIDDEN_NETWORKS` would otherwise catch, so :func:`_is_forbidden`
+    checks the embedded address too instead of trusting the IPv6 wrapper to
+    be exempt.
 
     Args:
         address: A resolved destination address.
 
     Returns:
-        True when the address is not one a notification may be sent to.
+        The embedded IPv4 address, or None when ``address`` is already IPv4
+        or carries no embedded address.
     """
-    return any(
+    if not isinstance(address, ipaddress.IPv6Address):
+        return None
+    if address.ipv4_mapped is not None:
+        return address.ipv4_mapped
+    if address.sixtofour is not None:
+        return address.sixtofour
+    if address in _NAT64_PREFIX:
+        return ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)
+    return None
+
+
+def _is_forbidden(address: _IPAddress) -> bool:
+    """
+    Report whether an address falls inside :data:`_FORBIDDEN_NETWORKS`.
+
+    Also follows IPv4-mapped, NAT64 and 6to4 IPv6 addresses to the IPv4
+    address they embed (see :func:`_embedded_ipv4`): those forms would
+    otherwise reach a forbidden address through a wrapper none of this
+    tuple's entries matches.
+
+    Args:
+        address: A resolved destination address.
+
+    Returns:
+        True when the address, or the IPv4 address it embeds, is not one a
+        notification may be sent to.
+    """
+    if any(
         address.version == network.version and address in network for network in _FORBIDDEN_NETWORKS
-    )
+    ):
+        return True
+    embedded = _embedded_ipv4(address)
+    return embedded is not None and _is_forbidden(embedded)
 
 
 def _require_public_destination(url: str, config: Config) -> None:

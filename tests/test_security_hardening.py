@@ -32,6 +32,8 @@ Five defects, each closed at its own chokepoint:
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import io
 import ipaddress
 import uuid
@@ -371,8 +373,17 @@ def hook_client(lockout_app: Any) -> TestClient:
     return TestClient(lockout_app, client=("testclient", 50000))
 
 
-class TestWebhookSignatureFailuresFeedTheLockout:
-    def test_three_bad_signatures_then_a_login_is_locked_out(
+class TestWebhookSignatureFailuresLockTheApplication:
+    """
+    Bad signatures are counted per application, never per address.
+
+    They used to feed the address lockout, and a forge delivers every
+    customer's webhooks from a few shared addresses: three bad deliveries
+    from anyone on the same forge locked the forge out of the panel. See
+    tests/test_web_hooks.py for the per-application lockout itself.
+    """
+
+    def test_bad_signatures_do_not_lock_the_address_out_of_signing_in(
         self, hook_client: TestClient, secret: str
     ) -> None:
         body = b'{"ref": "refs/heads/main"}'
@@ -390,26 +401,29 @@ class TestWebhookSignatureFailuresFeedTheLockout:
 
         login = hook_client.post("/api/auth/login", json={"token": "whatever-it-is"})
 
-        assert login.status_code == 429
+        assert login.status_code == 401, login.text
 
-    def test_two_bad_signatures_do_not_lock_out_on_their_own(
+    def test_bad_logins_do_not_stop_the_forge_delivering(
         self, hook_client: TestClient, secret: str
     ) -> None:
-        body = b'{"ref": "refs/heads/main"}'
-        for _ in range(2):
-            hook_client.post(
-                f"/hooks/deploy/{DOMAIN}",
-                content=body,
-                headers={
-                    "X-Hub-Signature-256": "sha256=" + "0" * 64,
-                    "X-GitHub-Delivery": str(uuid.uuid4()),
-                    "Content-Type": "application/json",
-                },
-            )
+        for _ in range(3):
+            hook_client.post("/api/auth/login", json={"token": "whatever-it-is"})
+        assert hook_client.post("/api/auth/login", json={"token": "x"}).status_code == 429
 
-        login = hook_client.post("/api/auth/login", json={"token": "whatever-it-is"})
+        body = b'{"ref": "refs/heads/other"}'
+        signature = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        response = hook_client.post(
+            f"/hooks/deploy/{DOMAIN}",
+            content=body,
+            headers={
+                "X-Hub-Signature-256": signature,
+                "X-GitHub-Delivery": str(uuid.uuid4()),
+                "Content-Type": "application/json",
+            },
+        )
 
-        assert login.status_code != 429
+        # Authentic, and ignored only because it pushed another branch.
+        assert response.status_code == 200, response.text
 
 
 # --------------------------------------------------------------------------
@@ -427,10 +441,9 @@ class TestPostgresReadOnlyRole:
 
         postgres.execute_query(database="shop", query="SELECT 1", read_only=True)
 
-        sent = runner.inputs[-1]
-        assert sent.startswith("BEGIN READ ONLY;")
-        assert 'SET ROLE "wasm_ro_shop";' in sent
-        assert sent.rstrip().endswith("COMMIT;")
+        call = runner.calls[-1]
+        sent = [call[i + 1] for i, arg in enumerate(call[:-1]) if arg == "-c"]
+        assert sent == ["BEGIN READ ONLY", 'SET ROLE "wasm_ro_shop"', "SELECT 1", "COMMIT"]
 
     def test_the_role_is_provisioned_least_privilege(
         self, postgres: Any, runner: FakeRunner
@@ -473,8 +486,8 @@ class TestPostgresReadOnlyRole:
 
         postgres.execute_query(database=long_name, query="SELECT 1", read_only=True)
 
-        sent = runner.inputs[-1]
-        role = sent.split("SET ROLE ")[1].split(";")[0].strip('"')
+        set_role = next(arg for arg in runner.calls[-1] if arg.startswith("SET ROLE "))
+        role = set_role.removeprefix("SET ROLE ").strip('"')
         assert len(role) <= 63
 
 

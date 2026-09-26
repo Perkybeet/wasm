@@ -160,6 +160,8 @@ def test_creating_a_schedule_writes_both_units_and_enables_the_timer(
     client: TestClient, runner: FakeRunner, systemd_dir: Path
 ) -> None:
     """POST writes the timer/service pair through the manager and enables it."""
+    # Creating or rewriting a schedule is a sudo-mode action.
+    elevate(client)
     response = client.post(
         "/api/backup-schedules",
         json={"domain": "example.com", "schedule": "daily", "retention_count": 5},
@@ -177,6 +179,8 @@ def test_the_created_schedule_is_echoed_back(
     client: TestClient, runner: FakeRunner, systemd_dir: Path
 ) -> None:
     """The response carries the schedule as created, retention included."""
+    # Creating or rewriting a schedule is a sudo-mode action.
+    elevate(client)
     response = client.post(
         "/api/backup-schedules",
         json={"domain": "example.com", "schedule": "weekly", "retention_count": 5},
@@ -278,6 +282,8 @@ def test_an_injected_calendar_answers_422_with_the_schedulers_refusal(
     refused by the request model, in the scheduler's own words, and nothing
     is written or enabled.
     """
+    # Creating or rewriting a schedule is a sudo-mode action.
+    elevate(client)
     response = client.post(
         "/api/backup-schedules",
         json={"domain": "example.com", "schedule": INJECTED_CALENDAR},

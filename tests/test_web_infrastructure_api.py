@@ -52,7 +52,7 @@ def _client(*routers: Any) -> TestClient:
     app = FastAPI()
     for router, prefix in routers:
         app.include_router(router, prefix=prefix)
-    app.dependency_overrides[get_current_session] = lambda: {"session_id": "test"}
+    app.dependency_overrides[get_current_session] = lambda: {"session_id": "test", "type": "master"}
     return TestClient(app, raise_server_exceptions=False)
 
 

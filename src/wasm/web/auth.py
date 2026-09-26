@@ -35,7 +35,7 @@ equivalent to a root shell. The design decisions that follow from that:
 
 from __future__ import annotations
 
-import contextlib
+import errno
 import hashlib
 import hmac
 import ipaddress
@@ -45,7 +45,7 @@ import os
 import re
 import secrets
 import sqlite3
-import tempfile
+import stat
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -53,13 +53,14 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import HTTPException, Request, status
 from starlette.requests import HTTPConnection
 
 from wasm.core import totp
 from wasm.core.exceptions import SecurityError
-from wasm.core.fs import SECRET_MODE, get_fs
+from wasm.core.fs import SECRET_MODE, get_fs, is_rehearsal
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +116,33 @@ WS_CLOSE_UNAUTHORIZED = 4401
 WS_CLOSE_FORBIDDEN = 4403
 WS_CLOSE_RATE_LIMITED = 4429
 
+#: Wrong webhook signatures one application's hook tolerates inside
+#: :data:`WEBHOOK_LOCKOUT_DURATION` before it refuses deliveries for that long.
+#: Counted per application, never per address: a forge delivers every
+#: customer's webhooks from a few shared addresses, so an address lockout fed
+#: by signatures let anyone with an account on the forge cut off everyone.
+#: Ten is more wrong deliveries than a misconfigured secret produces between
+#: the operator noticing and fixing it; the secret itself is 256 bits.
+WEBHOOK_MAX_FAILURES = 10
+WEBHOOK_LOCKOUT_DURATION = 900
+
+#: Largest request body the panel reads, checked before authentication. The
+#: API's biggest legitimate bodies - a unit file, a site configuration, an
+#: ``.env`` - are a few kilobytes; a mebibyte is generous and still bounded.
+MAX_BODY_BYTES = 1024 * 1024
+
+#: The forge webhook's own cap. GitHub sends push payloads of up to 25 MB, but
+#: those are pushes of hundreds of commits; the hook reads nothing but the
+#: branch, and an ordinary push is a few kilobytes. A delivery over this is
+#: refused with 413, which the forge shows in its delivery log.
+MAX_HOOK_BODY_BYTES = 5 * 1024 * 1024
+
+#: WebSockets one credential may hold open at once. Every log socket is a
+#: ``journalctl -f`` running as root, so without a cap one token could hold
+#: the process table hostage. A console tab uses one or two (the log drawer,
+#: a job it follows); eight leaves room for several tabs and a script.
+WS_MAX_PER_CREDENTIAL = 8
+
 #: Subprotocol prefix carrying a session token, for clients that cannot send a
 #: cookie: ``Sec-WebSocket-Protocol: wasm.auth, wasm.token.<token>``.
 WS_SUBPROTOCOL = "wasm.auth"
@@ -140,15 +168,17 @@ SCOPE_RANK = {scope: rank for rank, scope in enumerate(API_TOKEN_SCOPES)}
 #: a database whose value here is "when was this credential last alive".
 API_TOKEN_LAST_USED_THROTTLE = 60
 
-#: The mutations a ``deploy`` scope is for: queueing a deployment, an update
-#: or a rollback. Every other mutation - deleting applications, editing
-#: configuration, managing credentials - stays ``admin``. This is the whole
-#: scope policy, stated once and enforced at the same chokepoint that
-#: resolves the credential; see :func:`required_scope`.
+#: The mutations a ``deploy`` scope is for: moving an application that already
+#: exists - an update, a rollback. Every other mutation - creating an
+#: application, inspecting a source, deleting, editing configuration, managing
+#: credentials - stays ``admin``. Creating and inspecting are not deploy
+#: operations in this sense: both fetch a source the caller names and build or
+#: read it as root, so a token handed to CI would otherwise be able to point
+#: the machine at any repository, or any directory on it. This is the whole
+#: scope policy, stated once and enforced at the same chokepoint that resolves
+#: the credential; see :func:`required_scope`.
 DEPLOY_SCOPE_PATHS = frozenset(
     {
-        "/api/apps",
-        "/api/apps/inspect",
         "/api/jobs/update",
         "/api/jobs/rollback",
     }
@@ -242,6 +272,12 @@ class SecurityConfig:
         audit_enabled: Whether privileged actions are written to the audit log.
         audit_max_bytes: Size at which the audit log is rotated.
         audit_backups: Rotated audit files kept before the oldest is deleted.
+        ws_max_per_credential: WebSockets one credential may hold open at once.
+        max_body_bytes: Largest request body read, before authentication.
+        max_hook_body_bytes: The same for forge deliveries under ``/hooks/``.
+        webhook_max_failures: Wrong signatures one application's hook takes
+            before it refuses deliveries for ``webhook_lockout_duration``.
+        webhook_lockout_duration: Seconds that window and that refusal last.
     """
 
     host: str = "127.0.0.1"
@@ -266,6 +302,11 @@ class SecurityConfig:
     audit_enabled: bool = True
     audit_max_bytes: int = AUDIT_MAX_BYTES
     audit_backups: int = AUDIT_BACKUPS
+    ws_max_per_credential: int = WS_MAX_PER_CREDENTIAL
+    max_body_bytes: int = MAX_BODY_BYTES
+    max_hook_body_bytes: int = MAX_HOOK_BODY_BYTES
+    webhook_max_failures: int = WEBHOOK_MAX_FAILURES
+    webhook_lockout_duration: int = WEBHOOK_LOCKOUT_DURATION
 
     @property
     def resolved_state_dir(self) -> Path:
@@ -405,15 +446,28 @@ def ensure_state_dir(path: Path) -> None:
     """
     Create the state directory with owner-only permissions.
 
+    Through the filesystem seam, like every other change WASM makes, so a
+    ``--dry-run`` reports the directory it would create and creates nothing.
+
     Args:
         path: Directory that must exist and be private.
 
     Raises:
         SecurityError: When the directory cannot be created.
     """
+    fs = get_fs()
     try:
-        path.mkdir(parents=True, exist_ok=True)
-        os.chmod(path, DIR_MODE)
+        if not path.is_dir():
+            fs.make_dir(path, mode=DIR_MODE, parents=True)
+        if not path.is_dir():
+            if is_rehearsal():
+                # The seam declined to create it; there is nothing to tighten.
+                return
+            # make_dir leaves an existing entry alone, so a file squatting on
+            # the name is only noticed here.
+            raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), str(path))
+        if stat.S_IMODE(path.stat().st_mode) != DIR_MODE:
+            fs.chmod(path, DIR_MODE)
     except OSError as exc:
         raise SecurityError(
             f"Cannot create the WASM web state directory {path}",
@@ -429,6 +483,13 @@ def write_private_file(path: Path, content: str) -> None:
     """
     Write a file that only its owner can read.
 
+    Through the filesystem seam, which writes beside the destination and
+    renames over it with the mode set at creation: a running console
+    re-reads the signing key and the token hash whenever they change (see
+    :class:`TokenManager`), and a truncate-then-write would let it read the
+    empty file in between. Under ``--dry-run`` nothing is written; the
+    caller keeps what it meant to write in memory for the rest of the run.
+
     Args:
         path: Destination file.
         content: Text to write.
@@ -438,23 +499,7 @@ def write_private_file(path: Path, content: str) -> None:
     """
     ensure_state_dir(path.parent)
     try:
-        # Written beside the destination and renamed over it: a running console
-        # re-reads the signing key and the token hash whenever they change (see
-        # TokenManager), and a truncate-then-write would let it read the empty
-        # file in between. mkstemp creates the file 0600 from the start.
-        fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
-        try:
-            try:
-                os.write(fd, content.encode())
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            os.chmod(temporary, FILE_MODE)
-            os.replace(temporary, path)
-        except OSError:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(temporary)
-            raise
+        get_fs().write_text(path, content, mode=FILE_MODE)
     except OSError as exc:
         raise SecurityError(
             f"Cannot write {path}",
@@ -463,6 +508,20 @@ def write_private_file(path: Path, content: str) -> None:
                 f"{STATE_DIR_ENV} to a directory the current user owns."
             ),
         ) from exc
+
+
+def _generation(secret_material: str) -> str:
+    """
+    Digest a secret into a label that says which issue of it is in force.
+
+    Args:
+        secret_material: A stored hash or a signing key.
+
+    Returns:
+        The first 16 hex characters of its SHA-256: enough to tell two issues
+        apart, and nothing a caller could turn back into the material.
+    """
+    return hashlib.sha256(secret_material.encode()).hexdigest()[:16]
 
 
 def _file_stamp(path: Path) -> tuple[int, int, int, int] | None:
@@ -603,6 +662,70 @@ class RateLimiter:
         oldest = sorted(self._requests, key=lambda ip: self._requests[ip][-1])
         for ip in oldest[: len(self._requests) - self.max_tracked]:
             del self._requests[ip]
+
+
+class ConnectionLimiter:
+    """
+    Counts the long-lived connections each credential holds open.
+
+    Keyed by :func:`credential_key`, not by address: the cost being bounded -
+    a process and a socket per stream - is spent on behalf of a credential,
+    and one script at its limit must not stop the operator's console from
+    opening its own.
+    """
+
+    def __init__(self, limit: int = WS_MAX_PER_CREDENTIAL) -> None:
+        """
+        Args:
+            limit: Connections allowed per credential at once.
+        """
+        self.limit = limit
+        self._open: dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    def acquire(self, key: str) -> bool:
+        """
+        Take a place for one more connection, if there is one.
+
+        Args:
+            key: The credential's key.
+
+        Returns:
+            True when the connection may open; the caller must
+            :meth:`release` it when it closes. False when the credential is
+            already at its limit.
+        """
+        with self._lock:
+            held = self._open.get(key, 0)
+            if held >= self.limit:
+                return False
+            self._open[key] = held + 1
+            return True
+
+    def release(self, key: str) -> None:
+        """
+        Give back the place a closed connection held.
+
+        Args:
+            key: The credential's key, as passed to :meth:`acquire`.
+        """
+        with self._lock:
+            held = self._open.get(key, 0) - 1
+            if held > 0:
+                self._open[key] = held
+            else:
+                self._open.pop(key, None)
+
+    def held(self, key: str) -> int:
+        """
+        Args:
+            key: The credential's key.
+
+        Returns:
+            How many connections it holds open now.
+        """
+        with self._lock:
+            return self._open.get(key, 0)
 
 
 class BruteForceProtection:
@@ -751,10 +874,13 @@ class SessionStore:
             SecurityError: When the database cannot be created.
         """
         self.path = path
-        ensure_state_dir(path.parent)
         try:
-            self._conn = sqlite3.connect(str(path), check_same_thread=False)
-            os.chmod(path, FILE_MODE)
+            if is_rehearsal():
+                self._conn = self._rehearsal_copy(path)
+            else:
+                ensure_state_dir(path.parent)
+                self._conn = sqlite3.connect(str(path), check_same_thread=False)
+                os.chmod(path, FILE_MODE)
         except (sqlite3.Error, OSError) as exc:
             raise SecurityError(
                 f"Cannot open the web session database {path}",
@@ -766,6 +892,35 @@ class SessionStore:
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
         self._create_schema()
+
+    @staticmethod
+    def _rehearsal_copy(path: Path) -> sqlite3.Connection:
+        """
+        Open a private, in-memory copy of the database for a ``--dry-run``.
+
+        SQLite writes past the filesystem seam, so a rehearsal cannot open the
+        real file: ``wasm --dry-run token create`` would issue a live token,
+        and on a fresh machine simply connecting creates the file. The copy
+        answers reads with the real state and forgets every write when the
+        process ends, which is what a rehearsal promises.
+
+        Args:
+            path: The database file, which may not exist.
+
+        Returns:
+            An in-memory connection holding whatever the file held.
+
+        Raises:
+            sqlite3.Error: When the existing file cannot be read.
+        """
+        memory = sqlite3.connect(":memory:", check_same_thread=False)
+        if path.is_file():
+            source = sqlite3.connect(f"file:{quote(str(path.resolve()))}?mode=ro", uri=True)
+            try:
+                source.backup(memory)
+            finally:
+                source.close()
+        return memory
 
     def _create_schema(self) -> None:
         """Create the session and ticket tables when missing, and migrate old ones."""
@@ -797,6 +952,18 @@ class SessionStore:
                 # NULL by default: a session predating sudo mode, like a
                 # freshly created one, has not confirmed anything yet.
                 self._conn.execute("ALTER TABLE sessions ADD COLUMN elevated_until REAL")
+            if "family" not in columns:
+                # The login a session descends from. Renewal replaces the sid,
+                # so the sid alone cannot say "this is still the same sign-in"
+                # - which is what a stream opened before the renewal, and a
+                # logout that must also end the predecessor, need to ask.
+                self._conn.execute("ALTER TABLE sessions ADD COLUMN family TEXT")
+                self._conn.execute("UPDATE sessions SET family = sid")
+            if "rotated_to" not in columns:
+                # The one successor a renewal minted. Set once, so a retired
+                # sid in its grace period re-issues that successor instead of
+                # minting another on every request still carrying it.
+                self._conn.execute("ALTER TABLE sessions ADD COLUMN rotated_to TEXT")
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS ws_tickets (
@@ -849,8 +1016,8 @@ class SessionStore:
         with self._lock, self._conn:
             self._conn.execute(
                 "INSERT OR REPLACE INTO sessions "
-                "(sid, csrf_token, client_ip, issued_at, created_at, expires_at, revoked) "
-                "VALUES (?, ?, ?, ?, ?, ?, 0)",
+                "(sid, csrf_token, client_ip, issued_at, created_at, expires_at, revoked, family) "
+                "VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
                 (
                     sid,
                     csrf_token,
@@ -858,6 +1025,7 @@ class SessionStore:
                     now,
                     now if created_at is None else created_at,
                     expires_at,
+                    sid,
                 ),
             )
         self.purge_expired()
@@ -910,6 +1078,10 @@ class SessionStore:
         """
         Replace a session with a fresh identifier in one transaction.
 
+        A session rotates once. The check and the write share the lock and
+        the transaction, so two requests racing with the same retired cookie
+        cannot both mint a successor.
+
         Args:
             old_sid: Session being retired.
             new_sid: Identifier of the replacement.
@@ -917,19 +1089,21 @@ class SessionStore:
             expires_at: Expiry of the replacement, as a UNIX timestamp.
 
         Returns:
-            The row of the retired session, or None when it no longer exists.
+            The row of the retired session, or None when it no longer exists
+            or was already rotated - ask :meth:`get` for its ``rotated_to``.
         """
         now = time.time()
         with self._lock, self._conn:
             row = self._conn.execute(
-                "SELECT * FROM sessions WHERE sid = ? AND revoked = 0", (old_sid,)
+                "SELECT * FROM sessions WHERE sid = ? AND revoked = 0 AND rotated_to IS NULL",
+                (old_sid,),
             ).fetchone()
             if row is None:
                 return None
             self._conn.execute(
                 "INSERT OR REPLACE INTO sessions "
                 "(sid, csrf_token, client_ip, issued_at, created_at, expires_at, revoked, "
-                "elevated_until) VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+                "elevated_until, family) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
                 (
                     new_sid,
                     csrf_token,
@@ -940,6 +1114,7 @@ class SessionStore:
                     # Renewal must not reset the 10 minute window, only carry
                     # whatever is left of it to the new session id.
                     row["elevated_until"],
+                    row["family"] or old_sid,
                 ),
             )
             # The retired identifier is not deleted outright: a dashboard fires
@@ -947,21 +1122,54 @@ class SessionStore:
             # It is given a short grace instead, after which a captured copy of
             # the previous cookie is worthless.
             self._conn.execute(
-                "UPDATE sessions SET expires_at = MIN(expires_at, ?) WHERE sid = ?",
-                (now + SESSION_ROTATION_GRACE, old_sid),
+                "UPDATE sessions SET expires_at = MIN(expires_at, ?), rotated_to = ? WHERE sid = ?",
+                (now + SESSION_ROTATION_GRACE, new_sid, old_sid),
             )
         return dict(row)
 
-    def revoke(self, sid: str) -> None:
+    def family_alive(self, family: str) -> dict[str, Any] | None:
         """
-        Revoke one session.
+        Find the live session of a sign-in, whatever its sid is by now.
 
         Args:
-            sid: Session identifier.
+            family: The ``family`` of a session: the sid its login started
+                with, inherited by every renewal.
+
+        Returns:
+            The most recently issued live row of that sign-in, or None when
+            every session of it is revoked or expired.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM sessions WHERE family = ? AND revoked = 0 AND expires_at > ? "
+                "ORDER BY issued_at DESC LIMIT 1",
+                (family, time.time()),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def revoke(self, sid: str) -> None:
+        """
+        Revoke one sign-in: the session and every sid it renewed from or into.
+
+        A renewal leaves its predecessor alive for a short grace; revoking
+        only the current sid would leave that predecessor - and a stream
+        opened with it - working after a logout.
+
+        Args:
+            sid: Session identifier, current or retired.
         """
         with self._lock, self._conn:
-            self._conn.execute("UPDATE sessions SET revoked = 1 WHERE sid = ?", (sid,))
-            self._conn.execute("DELETE FROM ws_tickets WHERE sid = ?", (sid,))
+            row = self._conn.execute("SELECT family FROM sessions WHERE sid = ?", (sid,)).fetchone()
+            family = row["family"] if row is not None and row["family"] else sid
+            members = [
+                str(member["sid"])
+                for member in self._conn.execute(
+                    "SELECT sid FROM sessions WHERE family = ? OR sid = ?", (family, sid)
+                ).fetchall()
+            ]
+            for member in members or [sid]:
+                self._conn.execute("UPDATE sessions SET revoked = 1 WHERE sid = ?", (member,))
+                self._conn.execute("DELETE FROM ws_tickets WHERE sid = ?", (member,))
 
     def revoke_all(self) -> None:
         """Revoke every session and drop every pending ticket."""
@@ -980,10 +1188,22 @@ class SessionStore:
             Number of sessions revoked.
         """
         with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT family FROM sessions WHERE sid = ?", (keep_sid,)
+            ).fetchone()
+            family = row["family"] if row is not None and row["family"] else keep_sid
+            # The kept sign-in keeps its whole lineage: the predecessor still
+            # in its grace is the same operator's requests in flight.
             cursor = self._conn.execute(
-                "UPDATE sessions SET revoked = 1 WHERE sid != ? AND revoked = 0", (keep_sid,)
+                "UPDATE sessions SET revoked = 1 "
+                "WHERE sid != ? AND COALESCE(family, sid) != ? AND revoked = 0",
+                (keep_sid, family),
             )
-            self._conn.execute("DELETE FROM ws_tickets WHERE sid != ?", (keep_sid,))
+            self._conn.execute(
+                "DELETE FROM ws_tickets WHERE sid != ? AND sid NOT IN "
+                "(SELECT sid FROM sessions WHERE family = ?)",
+                (keep_sid, family),
+            )
         return cursor.rowcount
 
     def active_count(self) -> int:
@@ -994,8 +1214,11 @@ class SessionStore:
             Number of live sessions.
         """
         with self._lock:
+            # A renewed session's predecessor, alive for its grace period, is
+            # the same sign-in, not another one.
             row = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM sessions WHERE revoked = 0 AND expires_at > ?",
+                "SELECT COUNT(*) AS n FROM sessions "
+                "WHERE revoked = 0 AND expires_at > ? AND rotated_to IS NULL",
                 (time.time(),),
             ).fetchone()
         return int(row["n"])
@@ -1025,7 +1248,8 @@ class SessionStore:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT sid, client_ip, issued_at, created_at, expires_at FROM sessions "
-                "WHERE revoked = 0 AND expires_at > ? ORDER BY issued_at DESC",
+                "WHERE revoked = 0 AND expires_at > ? AND rotated_to IS NULL "
+                "ORDER BY issued_at DESC",
                 (time.time(),),
             ).fetchall()
         return [dict(row) for row in rows]
@@ -1044,7 +1268,7 @@ class SessionStore:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT sid FROM sessions WHERE revoked = 0 AND expires_at > ? "
-                "AND sid LIKE ? ORDER BY sid",
+                "AND rotated_to IS NULL AND sid LIKE ? ORDER BY sid",
                 (time.time(), prefix + "%"),
             ).fetchall()
         return [str(row["sid"]) for row in rows]
@@ -1264,7 +1488,10 @@ class AuditLogger:
         self.backups = max(0, backups)
         self._lock = threading.Lock()
         self._size = 0
-        if not enabled:
+        # A rehearsal writes no file, the audit log included; what would have
+        # been recorded goes to the process log instead, so it is not lost.
+        self._rehearsal = is_rehearsal()
+        if not enabled or self._rehearsal:
             return
         ensure_state_dir(path.parent)
         try:
@@ -1315,6 +1542,9 @@ class AuditLogger:
             "detail": detail,
         }
         payload = (json.dumps({k: v for k, v in entry.items() if v is not None}) + "\n").encode()
+        if self._rehearsal:
+            logger.info("Audit entry not written during a rehearsal: %s", payload.decode().strip())
+            return
         try:
             with self._lock:
                 if self._size + len(payload) > self.max_bytes:
@@ -1636,13 +1866,94 @@ class TokenManager:
             every call, so a token issued by another process is accepted and
             the one it replaced is refused from the next request on.
         """
+        return self.master_token_generation(token) is not None
+
+    def master_token_generation(self, token: str) -> str | None:
+        """
+        Verify a master token and name which issue of it matched.
+
+        A stream opened with the master token stays open long after the
+        handshake; it is re-checked by comparing this value with
+        :meth:`current_master_generation`, so ``wasm web token --new`` ends
+        it without the stream having to keep the token itself.
+
+        Args:
+            token: The token presented by the client.
+
+        Returns:
+            A short digest of the stored hash the token matched - not a
+            credential, and useless for recovering one - or None when the
+            token does not match.
+        """
         if not token:
-            return False
+            return None
 
         stored_hash = self._load_master_token_hash()
         if not stored_hash:
-            return False
-        return secrets.compare_digest(self._hash_token(token), stored_hash)
+            return None
+        if not secrets.compare_digest(self._hash_token(token), stored_hash):
+            return None
+        return _generation(stored_hash)
+
+    def current_master_generation(self) -> str | None:
+        """
+        Returns:
+            The digest :meth:`master_token_generation` reports for the master
+            token in force, or None when none has been issued.
+        """
+        stored_hash = self._load_master_token_hash()
+        return _generation(stored_hash) if stored_hash else None
+
+    def _key_generation(self) -> str:
+        """
+        Returns:
+            A short digest of the signing key in force. API tokens are hashed
+            with it, so ``--regenerate`` retires every one of them; a stream an
+            API token opened is re-checked against this.
+        """
+        return _generation(self._signing_key())
+
+    def credential_is_current(self, payload: Mapping[str, Any]) -> bool:
+        """
+        Re-check a credential that was verified earlier, at a handshake.
+
+        Every stream calls this on its heartbeat, so revoking a token,
+        rotating the master token, signing out or letting a session expire
+        ends the streams it had already opened, not only the ones it opens
+        next.
+
+        Args:
+            payload: The payload the credential authenticated, as
+                :func:`check_credential` or a WebSocket ticket built it.
+
+        Returns:
+            True while the same credential would still be accepted. A
+            session is judged by its sign-in (``family``), not its sid, so a
+            renewal - which replaces the sid - does not end it. A payload of
+            no known type is not current.
+        """
+        kind = payload.get("type")
+        if kind == "master":
+            generation = payload.get("generation")
+            return generation is not None and generation == self.current_master_generation()
+
+        if kind == "api_token":
+            record = self.sessions.get_api_token_by_name(str(payload.get("token_name") or ""))
+            if record is None or int(record["id"]) != payload.get("token_id"):
+                return False
+            expires_at = record["expires_at"]
+            if expires_at is not None and float(expires_at) <= time.time():
+                return False
+            return payload.get("generation") == self._key_generation()
+
+        if kind == "session":
+            family = payload.get("family") or payload.get("sid")
+            if not family:
+                return False
+            row = self.sessions.family_alive(str(family))
+            return row is not None and not self._past_absolute_deadline(row)
+
+        return False
 
     # ------------------------------------------------------------------ TOTP
 
@@ -1801,7 +2112,7 @@ class TokenManager:
                     "No two-factor enrolment is in progress",
                     details="Begin one first: POST /api/auth/2fa/enroll, or Enable in Settings.",
                 )
-            if not totp.verify(pending, code):
+            if not totp.verify(pending, code, t=_now()):
                 return None
             codes = [
                 f"{secrets.token_hex(2)}-{secrets.token_hex(2)}" for _ in range(BACKUP_CODE_COUNT)
@@ -1812,27 +2123,37 @@ class TokenManager:
                     "secret": pending,
                     "pending_secret": "",
                     "backup_codes": [self._hash_backup_code(c) for c in codes],
+                    # Steps spent under a previous secret mean nothing for this one.
+                    "last_steps": {},
                 }
             )
             self._write_totp_state(state)
         return codes
 
-    def verify_second_factor(self, code: str) -> bool:
+    def verify_second_factor(self, code: str, purpose: str = "login") -> bool:
         """
-        Check a login's second factor: a TOTP code, or a single-use backup code.
+        Check a second factor: a TOTP code, or a single-use backup code.
 
         A backup code that matches is consumed in the same locked cycle that
         verified it, so it cannot be replayed by a second login racing the
-        first.
+        first. A TOTP code is one-use too (RFC 6238, 5.2): the step it
+        matched is remembered per purpose, and that step or any earlier one
+        is refused for the same purpose afterwards. Without that, a code
+        read over a shoulder stayed good for the rest of its window, up to
+        ninety seconds with the drift allowance.
 
         Args:
             code: What the client typed.
+            purpose: What the code is being spent on - ``login``, ``elevate``
+                or ``disable``. Remembered separately so that signing in and
+                then confirming a destructive action with the same code, each
+                once, does not make the operator wait for the next one.
 
         Returns:
-            True when the code is a current TOTP value or an unused backup
-            code. False otherwise, including when two-factor is not enabled:
-            this method fails closed, and the caller decides whether a second
-            factor was required at all.
+            True when the code is a current, unused TOTP value or an unused
+            backup code. False otherwise, including when two-factor is not
+            enabled: this method fails closed, and the caller decides whether
+            a second factor was required at all.
         """
         if not code or not code.strip():
             return False
@@ -1840,7 +2161,16 @@ class TokenManager:
             state = self._read_totp_state()
             if not state["enabled"]:
                 return False
-            if totp.verify(state["secret"], code):
+            step = totp.matched_step(state["secret"], code, t=_now())
+            if step is not None:
+                spent = state.get("last_steps")
+                spent = dict(spent) if isinstance(spent, dict) else {}
+                last = spent.get(purpose)
+                if isinstance(last, int) and step <= last:
+                    return False
+                spent[purpose] = step
+                state["last_steps"] = spent
+                self._write_totp_state(state)
                 return True
             presented = self._hash_backup_code(code)
             remaining = [
@@ -1907,7 +2237,7 @@ class TokenManager:
                 "Two-factor authentication is not enabled",
                 details="There is nothing to disable. Enrol first from Settings.",
             )
-        if not self.verify_second_factor(code):
+        if not self.verify_second_factor(code, purpose="disable"):
             return False
         with self._totp_lock:
             self._write_totp_state(
@@ -2064,6 +2394,7 @@ class TokenManager:
             "ip": client_ip,
             "token_id": int(record["id"]),
             "token_name": str(record["name"]),
+            "generation": self._key_generation(),
         }
 
     # ---------------------------------------------------------------- sessions
@@ -2146,6 +2477,21 @@ class TokenManager:
             return None
         return session_id
 
+    def signed_session_token(self, token: str) -> bool:
+        """
+        Report whether a value is a session token this server signed.
+
+        Says nothing about whether the session is still alive; see
+        :meth:`verify_session_token` for that.
+
+        Args:
+            token: The presented value.
+
+        Returns:
+            True when its signature verifies under the signing key in force.
+        """
+        return bool(token) and self._decode(token) is not None
+
     def verify_session_token(
         self, token: str, client_ip: str | None = None
     ) -> dict[str, Any] | None:
@@ -2191,6 +2537,7 @@ class TokenManager:
 
         payload["csrf"] = record["csrf_token"]
         payload["expires_at"] = record["expires_at"]
+        payload["family"] = record.get("family") or session_id
         payload["type"] = "session"
         # A session is an operator in a browser; scopes exist to narrow
         # automation, not to narrow the person holding the panel.
@@ -2229,8 +2576,10 @@ class TokenManager:
 
         The replacement gets a new session id and a new CSRF token, and inherits
         the original login's birth date: activity buys more idle time, never a
-        longer life. The old identifier is deleted, so a captured copy of the
-        previous cookie stops working the moment the operator's browser renews.
+        longer life. The old identifier keeps working for
+        :data:`SESSION_ROTATION_GRACE` seconds, for the requests already in
+        flight - and each of those is answered with the *same* successor,
+        re-issued, rather than a new one: a session renews once.
 
         Args:
             payload: A verified session payload.
@@ -2239,7 +2588,7 @@ class TokenManager:
             The refreshed session, or None when renewal is not due yet or the
             login has reached its absolute deadline.
         """
-        session_id = payload.get("sid")
+        session_id = str(payload.get("sid") or "")
         record = self.sessions.get(session_id) if session_id else None
         if record is None:
             return None
@@ -2247,6 +2596,9 @@ class TokenManager:
         if self._past_absolute_deadline(record):
             self.sessions.revoke(session_id)
             return None
+
+        if record.get("rotated_to"):
+            return self._reissue(str(record["rotated_to"]))
 
         max_age = int(self.config.token_expiration_hours * 3600)
         now_ts = time.time()
@@ -2261,6 +2613,11 @@ class TokenManager:
         new_sid = secrets.token_hex(16)
         new_csrf = secrets.token_urlsafe(32)
         if self.sessions.rotate(session_id, new_sid, new_csrf, expires.timestamp()) is None:
+            # Another request carrying the same cookie won the race to rotate
+            # it; hand this one the successor that request created.
+            raced = self.sessions.get(session_id)
+            if raced is not None and raced.get("rotated_to"):
+                return self._reissue(str(raced["rotated_to"]))
             return None
 
         token = self._encode(new_sid, record["client_ip"], now, expires)
@@ -2270,6 +2627,37 @@ class TokenManager:
             csrf_token=new_csrf,
             expires_at=expires.timestamp(),
             max_age=int(expires.timestamp() - now_ts),
+        )
+
+    def _reissue(self, successor_sid: str) -> IssuedSession | None:
+        """
+        Hand out a successor a renewal already minted, again.
+
+        The token is an HMAC of the sid and the CSRF token is stored, so the
+        same cookie pair can be re-derived exactly; nothing new is created.
+
+        Args:
+            successor_sid: The ``rotated_to`` of a retired session.
+
+        Returns:
+            The successor, or None when it is no longer live.
+        """
+        successor = self.sessions.get(successor_sid)
+        if successor is None:
+            return None
+        now = utcnow()
+        expires_at = float(successor["expires_at"])
+        return IssuedSession(
+            token=self._encode(
+                successor_sid,
+                str(successor["client_ip"]),
+                now,
+                datetime.fromtimestamp(expires_at, tz=timezone.utc),
+            ),
+            session_id=successor_sid,
+            csrf_token=str(successor["csrf_token"]),
+            expires_at=expires_at,
+            max_age=max(0, int(expires_at - time.time())),
         )
 
     def elevate(self, sid: str, seconds: int = ELEVATION_SECONDS) -> float:
@@ -2346,7 +2734,7 @@ class TokenManager:
         if sid == MASTER_SID:
             # generate_master_token spends these tickets, so one that is still
             # here was issued to the token in force.
-            return master_payload(record["client_ip"])
+            return master_payload(record["client_ip"], self.current_master_generation())
         if sid.startswith(API_TOKEN_SID_PREFIX):
             token = self.sessions.get_api_token_by_name(sid[len(API_TOKEN_SID_PREFIX) :])
             return None if token is None else self._api_token_payload(token, record["client_ip"])
@@ -2360,6 +2748,7 @@ class TokenManager:
             "sid": record["sid"],
             "ip": record["client_ip"],
             "csrf": session["csrf_token"],
+            "family": session.get("family") or record["sid"],
             "scope": "admin",
         }
 
@@ -2841,6 +3230,25 @@ def scope_satisfies(granted: str, required: str) -> bool:
     return SCOPE_RANK.get(granted, -1) >= wanted
 
 
+def sees_command_lines(payload: Mapping[str, Any]) -> bool:
+    """
+    Decide whether a credential may read other processes' command lines.
+
+    A process's argv routinely carries a secret it was started with - a
+    database password or an API token passed as a flag - and every process
+    listing the panel serves would otherwise hand it to a ``read`` token given
+    to a dashboard. The policy, stated once for every listing: ``admin`` sees
+    the command line, anything less sees the process name.
+
+    Args:
+        payload: The authenticated payload.
+
+    Returns:
+        True for a credential of ``admin`` scope.
+    """
+    return scope_satisfies(str(payload.get("scope") or "read"), "admin")
+
+
 def actor_label(session: Mapping[str, Any]) -> str:
     """
     A short, non-secret label naming who is behind a session payload.
@@ -2877,8 +3285,9 @@ def required_scope(method: str, path: str) -> str:
     """
     The scope policy, stated once: what a request needs to be allowed to run.
 
-    Reads need ``read``. The mutations that queue a deployment, an update or a
-    rollback need ``deploy``. Every other mutation needs ``admin``. Endpoints
+    Reads need ``read``. The mutations that move an existing application - an
+    update, a rollback, activating a release - need ``deploy``. Every other
+    mutation, creating an application included, needs ``admin``. Endpoints
     with a stricter need than this table gives them - listing the API tokens
     is a GET that must not be readable by a ``read`` token - declare it with
     :func:`wasm.web.api.deps.require_scope`; nothing may declare a looser one.
@@ -2943,17 +3352,60 @@ def ensure_scope(request: Request, payload: dict[str, Any], required: str) -> No
     )
 
 
-def master_payload(client_ip: str | None) -> dict[str, Any]:
+def master_payload(client_ip: str | None, generation: str | None = None) -> dict[str, Any]:
     """
     The payload the master token authenticates, wherever it is presented.
 
     Args:
         client_ip: Address presenting it.
+        generation: Which issue of the master token it was, from
+            :meth:`TokenManager.master_token_generation`, so a stream can
+            tell later whether it has been rotated since.
 
     Returns:
         An ``admin`` payload named :data:`MASTER_SID`.
     """
-    return {"type": "master", "sid": MASTER_SID, "ip": client_ip, "scope": "admin"}
+    return {
+        "type": "master",
+        "sid": MASTER_SID,
+        "ip": client_ip,
+        "scope": "admin",
+        "generation": generation,
+    }
+
+
+def credential_is_current(payload: Mapping[str, Any]) -> bool:
+    """
+    Re-check a credential verified earlier; see :meth:`TokenManager.credential_is_current`.
+
+    Args:
+        payload: The payload a stream was opened with.
+
+    Returns:
+        True while it would still be accepted. False when the server was
+        never initialised: a stream nobody can vouch for is not current.
+    """
+    manager = get_global_token_manager()
+    if manager is None:
+        return False
+    return manager.credential_is_current(payload)
+
+
+def credential_key(payload: Mapping[str, Any]) -> str:
+    """
+    Name the credential behind a payload for per-credential accounting.
+
+    Args:
+        payload: A verified payload.
+
+    Returns:
+        ``master``, ``token:<name>``, or ``session:<family>`` - the sign-in,
+        not the sid, so the connections a session opened before and after a
+        renewal count against one budget.
+    """
+    if payload.get("type") == "session":
+        return f"session:{payload.get('family') or payload.get('sid')}"
+    return str(payload.get("sid") or "unknown")
 
 
 def check_credential(credential: str, client_ip: str) -> dict[str, Any] | None:
@@ -2980,8 +3432,9 @@ def check_credential(credential: str, client_ip: str) -> dict[str, Any] | None:
     if payload is not None:
         return payload
 
-    if manager.verify_master_token(credential):
-        return master_payload(client_ip)
+    generation = manager.master_token_generation(credential)
+    if generation is not None:
+        return master_payload(client_ip, generation)
 
     return None
 
@@ -3000,13 +3453,21 @@ def verify_credential(
 
     Returns:
         The session payload, tagged with the channel it arrived on under
-        ``"source"`` - :func:`require_elevated` reads it to tell a browser's
-        cookie session from automation presenting a Bearer credential -, or
-        None when the credential is not valid.
+        ``"source"`` for the record, or None when the credential is not valid.
+        No policy reads the channel: CSRF and sudo mode follow the
+        credential's ``"type"``, so a session cannot shed either by moving
+        from the cookie to the header.
     """
     payload = check_credential(credential, client_ip)
     if payload is None:
-        record_auth_failure(client_ip, resource, source)
+        manager = get_global_token_manager()
+        # A session token that carries our own signature was issued by this
+        # server: it can be expired, revoked or presented from the wrong
+        # address, but it cannot be a guess, because producing one takes the
+        # signing key. Counting it would lock out the operator whose browser
+        # simply outlived its session - on the sign-in page it was sent to.
+        if manager is None or not manager.signed_session_token(credential):
+            record_auth_failure(client_ip, resource, source)
         return None
     payload["source"] = source
     return payload
@@ -3103,9 +3564,10 @@ async def require_auth(request: Request) -> dict[str, Any]:
     FastAPI dependency enforcing authentication on an endpoint.
 
     Accepts, in order, an ``Authorization: Bearer`` session token, API token
-    or master token (for the CLI), or the session cookie. Cookie
-    authentication additionally requires the CSRF header on every unsafe
-    method.
+    or master token (for the CLI), or the session cookie. A session - in the
+    cookie or in the header - additionally requires its CSRF header on every
+    unsafe method; the master token and API tokens are not sessions and do
+    not have one.
 
     Whichever channel is used, a credential that does not match is counted by
     :func:`record_auth_failure`, so the lockout applies to master token guessing
@@ -3140,6 +3602,13 @@ async def require_auth(request: Request) -> dict[str, Any]:
         payload = verify_credential(bearer, client_ip, resource=resource, source="bearer")
         if payload is None:
             raise _unauthorized("Invalid or expired authentication token")
+        if payload.get("type") == "session":
+            # A session is held to the session's rules whichever header
+            # carries it: the CSRF token here, sudo mode in ensure_elevated.
+            # Only the master token and API tokens, which are no session, go
+            # without. A client that logged in with ``bearer: true`` received
+            # the CSRF token in the same response as the session token.
+            _check_csrf(request, payload, client_ip)
         request.state.session = payload
         ensure_scope(request, payload, required_scope(request.method, resource))
         return payload

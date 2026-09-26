@@ -15,7 +15,7 @@ Two ways in, for two kinds of client.
 ### Bearer tokens, for scripts
 
 ```bash
-wasm token create ci-deploy --scope deploy                 # prints the token once
+wasm token create ci-update --scope deploy                 # prints the token once
 wasm token create dashboard --scope read --expires-hours 720
 curl -H "Authorization: Bearer $TOKEN" https://panel.example.com/api/apps
 ```
@@ -26,21 +26,31 @@ Manage them with `wasm token list|revoke`, the console's Settings > API tokens, 
 from a browser session also needs sudo mode). The master access token is also accepted as a
 bearer credential, with admin scope.
 
-Bearer requests carry no cookie, so they need no CSRF token and are never asked for sudo
-mode.
+The master token and API tokens carry no session, so they need no CSRF token and are never
+asked for sudo mode. A *session* token presented as a Bearer credential (see `bearer` below)
+is still a session: it needs the CSRF header and sudo mode exactly like the cookie.
 
 ### Scopes
 
 | Scope | Allows |
 |---|---|
 | `read` | Every `GET`, `HEAD` and `OPTIONS`, except the three below. `.env` values come back redacted. |
-| `deploy` | `read`, plus `POST /api/apps` (create), `POST /api/apps/inspect`, `POST /api/jobs/update`, `POST /api/jobs/rollback`, `POST /api/apps/{domain}/releases/{id}/activate`. |
+| `deploy` | `read`, plus `POST /api/jobs/update`, `POST /api/jobs/rollback`, `POST /api/apps/{domain}/releases/{id}/activate`: moving an application that already exists. |
 | `admin` | Everything. |
 
-Every other `POST`, `PUT`, `PATCH` and `DELETE` needs `admin`. Three reads also need `admin`:
-`GET /api/auth/tokens`, `GET /api/audit`, and `GET /api/apps/{domain}/env?unmask=true` (which
-from a browser also needs sudo mode). A credential without the scope gets `403` with
+Every other `POST`, `PUT`, `PATCH` and `DELETE` needs `admin` - creating an application
+(`POST /api/apps`) and inspecting a source (`POST /api/apps/inspect`) included, since both
+fetch and build or read whatever source they are given, as root. Three reads also need
+`admin`: `GET /api/auth/tokens`, `GET /api/audit`, and `GET /api/apps/{domain}/env?unmask=true`
+(which from a session also needs sudo mode). Process listings answer every scope, but only
+`admin` sees each process's `command`; other scopes get `null` (or `""` in
+`/api/monitor/processes`). A credential without the scope gets `403` with
 `"error": "forbidden"` and a detail naming the scope it has and the one required.
+
+A `source` that is a local path rather than a repository URL is accepted by `POST /api/apps`
+and `POST /api/apps/inspect` only from the master token or a session in sudo mode (`403`
+`elevation_required` until it confirms). An API token gets `403` `forbidden`, whatever its
+scope. Application reads show a credential stored inside a clone URL as `***`.
 
 ### Sessions, for browsers
 
@@ -52,28 +62,34 @@ curl -c jar -H 'Content-Type: application/json' \
 
 `POST /api/auth/login` takes `token` (the master access token), `totp_code` (a TOTP code or a
 backup code, required when 2FA is on) and `bearer` (also return the session token in the
-body, for a client without a cookie jar). It answers `{success, expires_in, csrf_token,
-session_token}` and sets two cookies:
+body, for a client without a cookie jar; it then sends `X-WASM-CSRF` like a browser does).
+It answers `{success, expires_in, csrf_token, session_token}` and sets two cookies:
 
 - `wasm_session`: `HttpOnly`, `SameSite=Strict`, `Secure` over TLS.
 - `wasm_csrf`: readable by the page, holding the CSRF token.
 
-Every cookie-authenticated `POST`, `PUT`, `PATCH` and `DELETE` must echo the CSRF token in
-the `X-WASM-CSRF` header. `GET /api/auth/session` (no credential required) reports whether the
-caller is signed in, its scope, `expires_at`, `elevated_until`, whether 2FA is on, the
-hostname, the WASM version and the CSRF header and cookie names.
+Every `POST`, `PUT`, `PATCH` and `DELETE` made with a session, in the cookie or as a Bearer
+token, must echo the CSRF token in the `X-WASM-CSRF` header. `GET /api/auth/session` (no
+credential required) reports whether the caller is signed in, its scope, `expires_at`,
+`elevated_until`, whether 2FA is on, the hostname, the WASM version and the CSRF header and
+cookie names. A credential presented to it that is wrong counts toward the lockout like
+anywhere else; one the console signed that has merely expired does not.
 
 A failed sign-in answers `401` with `error` set to `invalid_token`, `totp_required` or
-`invalid_totp`. Five failures from one address lock it out for 15 minutes (`429`,
-`"error": "locked_out"`, with `Retry-After`).
+`invalid_totp`. A TOTP code is accepted once per purpose (signing in, `elevate`, disabling
+2FA); sending it again answers `invalid_totp`. Five failures from one address lock it out
+for 15 minutes (`429`, `"error": "locked_out"`, with `Retry-After`), on every request that
+carries a credential, the session cookie included.
 
 ### Sudo mode
 
-Some operations ask a browser session to confirm its operator: deleting an application, a
+Some operations ask a session to confirm its operator: deleting an application, a
 database, a user, a service, a site, a certificate, a backup or a domain; restoring a
 backup; revoking a certificate; revealing or writing an `.env`; migrating to releases;
-changing resource limits; editing a unit or site by hand; SQL in write mode; writing the
-configuration; issuing an API token; disabling 2FA; regenerating backup codes.
+changing resource limits; editing a unit or site by hand; creating a service; creating or
+rewriting a cron job or a backup schedule; deploying or inspecting a local path; SQL in
+write mode; writing the configuration; issuing an API token; enrolling, confirming or
+disabling 2FA; regenerating backup codes.
 
 Without a recent confirmation they answer:
 
@@ -87,7 +103,8 @@ HTTP/1.1 403 Forbidden
 
 `POST /api/auth/elevate` with `{"code": "123456"}` (TOTP or backup code) when 2FA is on, or
 `{"token": "wasm_..."}` when it is off, elevates the session for 10 minutes and answers
-`{"elevated_until": "..."}`. Then retry the request. Bearer credentials are exempt.
+`{"elevated_until": "..."}`. Then retry the request. The master token and API tokens are
+exempt; a session is not, whichever header carries it.
 
 ## Errors
 
@@ -106,16 +123,16 @@ Every error from every router has the same shape:
 - `error` is a stable machine code. For WASM's own exceptions it is the exception class in
   lower case (`deploymenterror`, `certificateerror`, `serviceerror`, ...); otherwise one of
   `unauthorized`, `forbidden`, `not_found`, `conflict`, `validation_error`, `rate_limited`,
-  `locked_out`, `elevation_required`, `invalid_token`, `totp_required`, `invalid_totp`,
-  `internal`.
+  `locked_out`, `elevation_required`, `payload_too_large`, `app_busy`, `invalid_token`,
+  `totp_required`, `invalid_totp`, `internal`.
 - `detail` is one sentence for a person. `hint` is the suggested fix, or `null`.
 - `fields` is set on `422` validation errors, `null` otherwise: a map from field name to
   message, which the console shows next to each form control.
 - `output` carries a system tool's own output verbatim, when there is one. Show it in a
   monospace block; do not paraphrase it.
 
-Refusals made before routing (address not allowed, TLS required, rate limit, lockout) have
-the same keys except `output`.
+Refusals made before routing (address not allowed, TLS required, body too large, rate limit,
+lockout) have the same keys except `output`.
 
 | Status | When |
 |---|---|
@@ -123,7 +140,8 @@ the same keys except `output`.
 | `401` | No credential, or an invalid or expired one |
 | `403` | Scope too narrow, sudo mode required, address not allowed |
 | `404` | Unknown application, database, job, release... |
-| `409` | Conflict: the domain is taken, the database exists, the application is in place and has no releases |
+| `409` | Conflict: the domain is taken, the database exists, the application is in place and has no releases; `app_busy` when another deploy, update, rollback, migration, restore or deletion is running on the application (`detail` names it; wait for it, or follow it in Jobs) |
+| `413` | Request body over the limit, checked before authentication: 1 MiB, or 5 MiB under `/hooks/` |
 | `422` | Request body failed validation; see `fields` |
 | `429` | Rate limit (120 requests a minute per address by default) or lockout |
 | `500` | A system operation failed; `detail`, `hint` and `output` say which and why |
@@ -168,7 +186,9 @@ curl -N -H "Authorization: Bearer $TOKEN" https://panel.example.com/events
 
 The stream starts with a `: connected` comment and sends a `: keepalive` comment after 25
 seconds of silence. It sends no `id:` or `retry:` fields: after a disconnection, reconnect and
-refetch what you display. A client that cannot keep up loses the oldest queued frames.
+refetch what you display. A client that cannot keep up loses the oldest queued frames. The
+credential is checked again every 25 seconds; once it is revoked, rotated or expired the
+stream ends, and the reconnection answers `401`.
 
 | Event | When | Data |
 |---|---|---|
@@ -183,7 +203,7 @@ refetch what you display. A client that cannot keep up loses the oldest queued f
 
 | Path | Streams |
 |---|---|
-| `/ws/logs/{domain}?lines=N` | The application's journal: the last `N` lines (1 to 500, default 50), then follows. |
+| `/ws/logs/{domain}?lines=N` | The application's journal: the last `N` lines (1 to 500, default 50), then follows. `{domain}` may also name a unit WASM manages; any other unit is refused. |
 | `/ws/jobs/{id}` | One job, until it finishes. |
 | `/ws/jobs` | Every job's transitions. |
 | `/ws/events` | Journal entries of units named `wasm-*` (cron and backup timers, the monitor, legacy application units). |
@@ -200,15 +220,21 @@ A handshake authenticates with any one of:
 A long-lived token is never accepted in the query string. A handshake from a foreign
 `Origin` is refused.
 
-Close codes: `4401` not authenticated, `4403` forbidden (origin or address), `4429` rate
-limited or locked out.
+Close codes: `4401` not authenticated, or the credential stopped being valid while the socket
+was open; `4403` forbidden (origin, address, or a unit WASM does not manage); `4408` the
+socket reached its 12 hour lifetime, reconnect; `4429` rate limited, locked out, or the
+credential already holds 8 open sockets.
+
+An open socket re-checks its credential every 30 seconds: revoking the API token, rotating
+the master token or signing out closes it with `4401` (after an `{"type": "error"}` frame).
+A session renewal does not close it.
 
 Frames are JSON:
 
 - `/ws/logs/{domain}` sends `{"type": "connected", "domain", "service"}`, then
   `{"type": "log", "data": "<line>"}` per journal line, `{"type": "warning", "data"}` for
-  journalctl's own complaints and `{"type": "error", "message"}`. A stream lasts at most 12
-  hours; reconnect after that.
+  journalctl's own complaints and `{"type": "error", "message"}`. Every socket lasts at most
+  12 hours; reconnect after that.
 - `/ws/jobs/{id}` sends `{"type": "connected", "job"}`, `{"type": "update", "job"}` on every
   change, `{"type": "finished", "job"}` once the job completes, fails or is cancelled, and
   `{"type": "heartbeat"}` after 30 quiet seconds. An unknown id gets `{"type": "error"}` and
@@ -224,7 +250,7 @@ websocat -H "Authorization: Bearer $TOKEN" \
 
 ## Examples
 
-Create an application and follow its deploy:
+Create an application and follow its deploy (an admin credential):
 
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
@@ -290,7 +316,9 @@ A delivery for a branch other than the application's answers `200 {"status": "ig
 "reason": "branch"}`; a forge retry of the same delivery answers `"reason": "duplicate"`.
 An accepted delivery queues an update (`202 {job_id, status}`), exactly like `wasm update`.
 An unknown application and one without a secret both answer `404`; a bad signature answers
-`401` and counts toward the lockout. `DELETE /api/apps/{domain}/webhook-secret` turns
+`401` and counts against that application: after 10 in 15 minutes its hook answers `429`
+(`"error": "locked_out"`, `Retry-After`) for 15 minutes. Other applications, and the forge's
+address, are not affected. A delivery larger than 5 MiB answers `413`. `DELETE /api/apps/{domain}/webhook-secret` turns
 webhooks off; `GET /api/apps/{domain}/webhook/deliveries` lists the deployments webhooks
 triggered. The hook must be reachable from the forge, which means exposing the console (see
 [security.md](security.md)).
@@ -313,8 +341,8 @@ Request and response bodies are in `/api/openapi.json`.
 | Endpoint | |
 |---|---|
 | `GET /api/apps` | List, with state, layout, limits, last deployment |
-| `POST /api/apps` | Deploy a new application (job). deploy |
-| `POST /api/apps/inspect` | Preview a source without deploying. deploy |
+| `POST /api/apps` | Deploy a new application (job). A local path needs sudo |
+| `POST /api/apps/inspect` | Preview a source without deploying. A local path needs sudo |
 | `GET /api/apps/types` | Application types |
 | `GET /api/apps/{domain}` | One application |
 | `DELETE /api/apps/{domain}` | Delete (job). sudo |
@@ -366,11 +394,13 @@ Request and response bodies are in `/api/openapi.json`.
 | `POST /api/certs/{domain}` | Obtain |
 | `POST /api/certs/{domain}/renew`, `POST /api/certs/renew-all` | Renew |
 | `POST /api/certs/{domain}/revoke`, `DELETE /api/certs/{domain}` | sudo |
-| `GET`, `POST /api/services`; `POST /api/services/verify` | Services; check a unit with `systemd-analyze verify` |
+| `GET /api/services`; `POST /api/services/verify` | Services; check a unit with `systemd-analyze verify` |
+| `POST /api/services` | Create a service, from a raw unit or from fields. sudo |
 | `GET /api/services/{name}`, `/logs`, `/config` | |
 | `POST /api/services/{name}/start`, `/stop`, `/restart`, `/enable`, `/disable` | |
 | `PUT /api/services/{name}/config`, `DELETE /api/services/{name}` | sudo |
-| `GET`, `POST /api/cron`; `POST /api/cron/preview` | Jobs; the next runs of a schedule |
+| `GET /api/cron`; `POST /api/cron/preview` | Jobs; the next runs of a schedule |
+| `POST /api/cron` | Create or rewrite a job. sudo |
 | `DELETE /api/cron/{name}`; `POST /api/cron/{name}/run`, `/enable`, `/disable` | |
 | `GET /api/cron/{name}/runs` | Recent runs, from the journal |
 
@@ -381,7 +411,8 @@ Request and response bodies are in `/api/openapi.json`.
 | `GET`, `POST /api/backups`; `GET /api/backups/storage` | |
 | `GET /api/backups/{id}`; `POST /api/backups/{id}/verify` | |
 | `POST /api/backups/{id}/restore`, `DELETE /api/backups/{id}` | sudo |
-| `GET`, `POST /api/backup-schedules`; `DELETE /api/backup-schedules/{domain}` | Scheduled backups |
+| `GET /api/backup-schedules` | Scheduled backups |
+| `POST /api/backup-schedules`, `DELETE /api/backup-schedules/{domain}` | Create or rewrite, delete. sudo |
 | `GET /api/databases/engines`; `GET /api/databases/engines/{engine}/status`, `/logs`, `/privileges` | |
 | `POST /api/databases/engines/{engine}/install`, `/uninstall`, `/start`, `/stop`, `/restart` | |
 | `GET`, `POST /api/databases/databases`; `GET /api/databases/databases/{engine}/{name}` | |
@@ -396,7 +427,7 @@ Request and response bodies are in `/api/openapi.json`.
 
 | Endpoint | |
 |---|---|
-| `GET /api/system`, `/machine`, `/cpu`, `/memory`, `/disks`, `/network`, `/processes`, `/health`, `/version` | |
+| `GET /api/system`, `/machine`, `/cpu`, `/memory`, `/disks`, `/network`, `/processes`, `/health`, `/version` | `command` in `/processes` for admin only |
 | `GET /api/metrics`, `GET /api/metrics/{metric}` | Stored metric history for charts |
 | `GET /api/monitor/status`, `/config`, `/metrics`, `/processes`, `/observations` | |
 | `POST /api/monitor/scan`, `/install`, `/uninstall`, `/enable`, `/disable`, `/start`, `/stop`, `/test-email` | |
@@ -408,8 +439,8 @@ Request and response bodies are in `/api/openapi.json`.
 | `GET /api/audit` | admin |
 | `POST /api/auth/login`, `/logout`, `/elevate`, `/ws-ticket`; `GET /api/auth/session`, `/verify` | |
 | `GET /api/auth/sessions`; `POST /api/auth/sessions/revoke-all`, `/revoke-others`; `DELETE /api/auth/sessions/{prefix}` | |
-| `GET /api/auth/2fa`; `POST /api/auth/2fa/enroll`, `/confirm` | |
-| `POST /api/auth/2fa/disable`, `/backup-codes` | sudo |
+| `GET /api/auth/2fa` | |
+| `POST /api/auth/2fa/enroll`, `/confirm`, `/disable`, `/backup-codes` | sudo |
 | `GET`, `POST /api/auth/tokens`; `DELETE /api/auth/tokens/{id}` | admin; issuing needs sudo |
 | `GET /api/openapi.json` | This contract |
 

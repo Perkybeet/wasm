@@ -177,18 +177,19 @@ def list_schedules(
 
 @router.post("", response_model=ScheduleActionResponse, status_code=201)
 def create_schedule(
-    data: CreateScheduleRequest, session: Annotated[dict, Depends(get_current_session)]
+    data: CreateScheduleRequest, session: Annotated[dict, Depends(require_elevated)]
 ) -> ScheduleActionResponse:
     """
     Schedule automatic backups of an application on a systemd timer.
 
     Scheduling the same domain again rewrites its unit pair, so this is also
-    how a schedule is changed.
+    how a schedule is changed. Sudo mode, like deleting one: a schedule is a
+    root timer, and its retention decides which backups are thrown away.
 
     Args:
         data: The schedule request. Its calendar expression was already
             checked against the scheduler's own rules by the request model.
-        session: The authenticated session.
+        session: The authenticated session, elevated.
 
     Returns:
         The action outcome, carrying the schedule as created.

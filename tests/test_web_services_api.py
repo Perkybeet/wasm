@@ -231,7 +231,7 @@ def client(unit_dir: Path) -> TestClient:
     """
     app = FastAPI()
     app.include_router(services_api.router, prefix="/api/services")
-    app.dependency_overrides[get_current_session] = lambda: {"session_id": "test"}
+    app.dependency_overrides[get_current_session] = lambda: {"session_id": "test", "type": "master"}
     return TestClient(app, raise_server_exceptions=False)
 
 

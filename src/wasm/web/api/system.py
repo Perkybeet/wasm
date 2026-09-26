@@ -29,6 +29,7 @@ from wasm.core.exceptions import DependencyError
 from wasm.managers.health import collect_health_report
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import WASMErrorRoute
+from wasm.web.auth import sees_command_lines
 from wasm.web.machine import read_machine
 
 router = APIRouter(route_class=WASMErrorRoute)
@@ -445,6 +446,24 @@ def get_disk_info(session: Annotated[dict, Depends(get_current_session)]) -> lis
     return _disk_info()
 
 
+def _visible_command(cmdline: list[str], session: dict[str, Any]) -> str | None:
+    """
+    The command line of a process as this credential may see it.
+
+    Args:
+        cmdline: The process's argv, as psutil reported it.
+        session: The authenticated session.
+
+    Returns:
+        The joined, truncated command line when
+        :func:`~wasm.web.auth.sees_command_lines` allows it; None otherwise,
+        the field's existing "unknown" rather than a second representation.
+    """
+    if not sees_command_lines(session):
+        return None
+    return " ".join(cmdline[:5]) or None
+
+
 @router.get("/processes", response_model=ProcessListResponse)
 def get_processes(
     session: Annotated[dict, Depends(get_current_session)],
@@ -455,7 +474,9 @@ def get_processes(
     List running processes.
 
     This is a read-only view. There is deliberately no endpoint that signals a
-    process; see the module docstring.
+    process; see the module docstring. The command line is only included for
+    an admin-scoped credential - see :func:`_visible_command` - because argv
+    routinely carries another process's secrets.
 
     Args:
         limit: How many processes to return after sorting.
@@ -493,7 +514,7 @@ def get_processes(
                     memory_mb=round((memory_info.rss if memory_info else 0) / (1024**2), 2),
                     status=info.get("status") or "unknown",
                     user=info.get("username") or "unknown",
-                    command=" ".join(cmdline[:5]) or None,
+                    command=_visible_command(cmdline, session),
                 )
             )
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):

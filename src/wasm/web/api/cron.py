@@ -259,15 +259,18 @@ def list_jobs(session: Annotated[dict, Depends(get_current_session)]) -> CronJob
 
 @router.post("", response_model=CronActionResponse, status_code=201)
 def create_job(
-    data: CreateCronJobRequest, session: Annotated[dict, Depends(get_current_session)]
+    data: CreateCronJobRequest, session: Annotated[dict, Depends(require_elevated)]
 ) -> CronActionResponse:
     """
     Create a cron job as a systemd timer, or rewrite one WASM already owns.
 
+    Sudo mode, creating or rewriting alike: either way the result is a
+    command of the caller's choosing that runs as root on a timer.
+
     Args:
         data: The job request. Its calendar expression was already checked
             against the manager's own rules by the request model.
-        session: The authenticated session.
+        session: The authenticated session, elevated.
 
     Returns:
         The action outcome, carrying the job as created.

@@ -272,19 +272,37 @@ def test_mutation_with_cookie_and_no_csrf_token_is_rejected(sandbox: Path) -> No
 
 
 def test_bearer_clients_skip_csrf_but_still_need_a_token(sandbox: Path) -> None:
-    """Automation authenticates with a Bearer token and no cookie."""
+    """
+    Automation authenticates with a Bearer token and no cookie.
+
+    The master token and API tokens need no CSRF token: they are not sessions
+    and have none. A *session* token moved into the header is still a session
+    and still needs its CSRF token, which the same login response carried.
+    """
     client = build_client(sandbox)
     token = get_token_manager().generate_master_token()
 
     response = client.post("/api/auth/login", json={"token": token, "bearer": True})
     session_token = response.json()["session_token"]
+    csrf = response.json()["csrf_token"]
     assert session_token
 
     client.cookies.clear()
     assert client.post("/api/auth/ws-ticket").status_code == 401
     assert (
+        client.post("/api/auth/ws-ticket", headers={"Authorization": f"Bearer {token}"}).status_code
+        == 200
+    )
+    assert (
         client.post(
             "/api/auth/ws-ticket", headers={"Authorization": f"Bearer {session_token}"}
+        ).status_code
+        == 403
+    )
+    assert (
+        client.post(
+            "/api/auth/ws-ticket",
+            headers={"Authorization": f"Bearer {session_token}", CSRF_HEADER_NAME: csrf},
         ).status_code
         == 200
     )
@@ -452,14 +470,12 @@ def test_every_lockout_path_is_a_real_route(sandbox: Path) -> None:
     The reported defect: AUTH_PATHS named ``/api/auth/token``, which does not
     exist, so the entry guarded nothing and read as if it did.
     """
-    from wasm.web.server import AUTH_PATH_PREFIXES, AUTH_PATHS
+    from wasm.web.server import AUTH_PATHS
 
     app = create_app(make_config(sandbox))
     posts = {path for path, route in iter_api_routes(app.routes) if "POST" in route.methods}
 
     assert AUTH_PATHS <= posts, sorted(AUTH_PATHS - posts)
-    for prefix in AUTH_PATH_PREFIXES:
-        assert any(path.startswith(prefix) for path in posts), prefix
 
 
 def test_every_endpoint_that_counts_a_failure_is_behind_the_lockout() -> None:
@@ -469,7 +485,7 @@ def test_every_endpoint_that_counts_a_failure_is_behind_the_lockout() -> None:
     Every handler that feeds :func:`record_auth_failure` names its path; each
     of those paths has to be one the middleware refuses a locked-out address.
     """
-    from wasm.web.server import AUTH_PATH_PREFIXES, AUTH_PATHS
+    from wasm.web.server import AUTH_PATHS
 
     api_dir = Path(auth_module.__file__).parent / "api"
     counted = {
@@ -481,11 +497,7 @@ def test_every_endpoint_that_counts_a_failure_is_behind_the_lockout() -> None:
     }
 
     assert counted, "the scan found no call sites; the pattern is stale"
-    unguarded = {
-        path
-        for path in counted
-        if path not in AUTH_PATHS and not path.startswith(AUTH_PATH_PREFIXES)
-    }
+    unguarded = {path for path in counted if path not in AUTH_PATHS}
     assert not unguarded, sorted(unguarded)
 
 
@@ -511,9 +523,9 @@ def test_a_locked_out_address_cannot_elevate_even_with_a_session(sandbox: Path) 
 
     assert response.status_code == 429, response.text
     assert response.json()["error"] == "locked_out"
-    # Browsing is not a credential guess: the operator is not locked out of
-    # their own panel, only out of the endpoints that check a credential.
-    assert client.get("/api/auth/sessions").status_code == 200
+    # The cookie is a credential channel like the others: an address that is
+    # locked out is refused on it too (tests/test_web_auth_replay.py).
+    assert client.get("/api/auth/sessions").status_code == 429
 
 
 def test_every_api_route_requires_authentication(sandbox: Path) -> None:
@@ -941,7 +953,9 @@ def test_pages_send_an_anonymous_browser_to_the_console_shell(sandbox: Path) -> 
 
     assert response.status_code == 200
     assert "text/html" in response.headers["content-type"]
-    assert "row" not in response.text, "no page content may leak through the shell"
+    # Markup, not a word: chunk names such as arrow-down-<hash>.js contain "row".
+    for markup in ("<table", "<tr>", "<tr ", "<li>", "<li "):
+        assert markup not in response.text, "no page content may leak through the shell"
 
 
 def test_cors_preflight_is_subject_to_the_ip_whitelist(sandbox: Path) -> None:
@@ -1077,25 +1091,37 @@ def test_declaring_a_tls_proxy_makes_the_cookie_secure(sandbox: Path) -> None:
 # ------------------------------------------------------------- second factor
 
 
-def enable_totp(client: TestClient, csrf: str) -> tuple[str, list[str]]:
+def enable_totp(client: TestClient, csrf: str, master: str) -> tuple[str, list[str]]:
     """
     Enrol and confirm the second factor through the API.
 
+    Enrolling needs sudo mode (see tests/test_web_sudo.py). The confirmation
+    happens in a session of its own, signed in and elevated here and then
+    dropped, so the caller's session is left exactly as unelevated as it was:
+    several callers go on to test what an unelevated session may do.
+
     Args:
-        client: A signed-in client.
-        csrf: The session's CSRF token.
+        client: A signed-in client, for the application it talks to.
+        csrf: The caller's CSRF token. Unused: the caller's session is not the
+            one that enrols. Kept so every call site reads the same.
+        master: The master token, to sign in and confirm sudo mode with.
 
     Returns:
         The shared secret and the backup codes shown at confirmation.
     """
-    enroll = client.post("/api/auth/2fa/enroll", headers={CSRF_HEADER_NAME: csrf})
+    del csrf
+    operator = TestClient(client.app, client=("testclient", 50000))
+    own_csrf = login(operator, master)["csrf_token"]
+    headers = {CSRF_HEADER_NAME: own_csrf}
+    elevated = operator.post("/api/auth/elevate", json={"token": master}, headers=headers)
+    assert elevated.status_code == 200, elevated.text
+
+    enroll = operator.post("/api/auth/2fa/enroll", headers=headers)
     assert enroll.status_code == 200, enroll.text
     secret = enroll.json()["secret"]
 
-    confirm = client.post(
-        "/api/auth/2fa/confirm",
-        json={"code": totp.totp_now(secret)},
-        headers={CSRF_HEADER_NAME: csrf},
+    confirm = operator.post(
+        "/api/auth/2fa/confirm", json={"code": totp.totp_now(secret)}, headers=headers
     )
     assert confirm.status_code == 200, confirm.text
     return secret, confirm.json()["backup_codes"]
@@ -1118,6 +1144,11 @@ def test_enrollment_confirms_activates_and_issues_backup_codes_once(sandbox: Pat
     before = client.get("/api/auth/2fa").json()
     assert before == {"enabled": False, "pending": False, "backup_codes_remaining": 0}
 
+    # Enrolling needs sudo mode, confirmed with the master token while 2FA is off.
+    elevated = client.post(
+        "/api/auth/elevate", json={"token": token}, headers={CSRF_HEADER_NAME: csrf}
+    )
+    assert elevated.status_code == 200, elevated.text
     enroll = client.post("/api/auth/2fa/enroll", headers={CSRF_HEADER_NAME: csrf})
     assert enroll.status_code == 200
     secret = enroll.json()["secret"]
@@ -1148,6 +1179,7 @@ def test_a_wrong_confirmation_code_does_not_activate_anything(sandbox: Path) -> 
     token = get_token_manager().generate_master_token()
     csrf = login(client, token)["csrf_token"]
 
+    client.post("/api/auth/elevate", json={"token": token}, headers={CSRF_HEADER_NAME: csrf})
     client.post("/api/auth/2fa/enroll", headers={CSRF_HEADER_NAME: csrf})
     refused = client.post(
         "/api/auth/2fa/confirm", json={"code": "000000"}, headers={CSRF_HEADER_NAME: csrf}
@@ -1166,7 +1198,7 @@ def test_once_enabled_a_login_without_a_code_is_refused(sandbox: Path) -> None:
     client = build_client(sandbox)
     token = get_token_manager().generate_master_token()
     csrf = login(client, token)["csrf_token"]
-    secret, _codes = enable_totp(client, csrf)
+    secret, _codes = enable_totp(client, csrf, token)
 
     without = client.post("/api/auth/login", json={"token": token})
     assert without.status_code == 401
@@ -1183,7 +1215,7 @@ def test_a_wrong_second_factor_counts_toward_the_same_lockout(sandbox: Path) -> 
     client = build_client(sandbox, max_failed_attempts=3, lockout_duration=60)
     token = get_token_manager().generate_master_token()
     csrf = login(client, token)["csrf_token"]
-    enable_totp(client, csrf)
+    enable_totp(client, csrf, token)
 
     statuses = [
         client.post("/api/auth/login", json={"token": token, "totp_code": "000000"}).status_code
@@ -1200,7 +1232,7 @@ def test_a_backup_code_opens_one_login_and_only_one(sandbox: Path) -> None:
     client = build_client(sandbox)
     token = get_token_manager().generate_master_token()
     csrf = login(client, token)["csrf_token"]
-    _secret, codes = enable_totp(client, csrf)
+    _secret, codes = enable_totp(client, csrf, token)
 
     first = client.post("/api/auth/login", json={"token": token, "totp_code": codes[0]})
     assert first.status_code == 200
@@ -1217,7 +1249,7 @@ def test_disable_requires_a_current_code_and_restores_plain_login(sandbox: Path)
     client = build_client(sandbox)
     token = get_token_manager().generate_master_token()
     csrf = login(client, token)["csrf_token"]
-    secret, _codes = enable_totp(client, csrf)
+    secret, _codes = enable_totp(client, csrf, token)
     elevated = client.post(
         "/api/auth/elevate",
         json={"code": totp.totp_now(secret)},
@@ -1253,7 +1285,7 @@ def test_a_backup_code_can_disable_when_the_authenticator_is_lost(sandbox: Path)
     client = build_client(sandbox)
     token = get_token_manager().generate_master_token()
     csrf = login(client, token)["csrf_token"]
-    secret, codes = enable_totp(client, csrf)
+    secret, codes = enable_totp(client, csrf, token)
     elevated = client.post(
         "/api/auth/elevate",
         json={"code": totp.totp_now(secret)},
@@ -1274,7 +1306,7 @@ def test_regenerating_backup_codes_requires_elevation(sandbox: Path) -> None:
     client = build_client(sandbox)
     token = get_token_manager().generate_master_token()
     csrf = login(client, token)["csrf_token"]
-    enable_totp(client, csrf)
+    enable_totp(client, csrf, token)
 
     response = client.post("/api/auth/2fa/backup-codes", headers={CSRF_HEADER_NAME: csrf})
 
@@ -1287,7 +1319,7 @@ def test_regenerating_backup_codes_invalidates_the_old_ones(sandbox: Path) -> No
     client = build_client(sandbox)
     token = get_token_manager().generate_master_token()
     csrf = login(client, token)["csrf_token"]
-    secret, old_codes = enable_totp(client, csrf)
+    secret, old_codes = enable_totp(client, csrf, token)
     elevated = client.post(
         "/api/auth/elevate",
         json={"code": totp.totp_now(secret)},
@@ -1331,7 +1363,7 @@ def test_the_secret_never_appears_again_after_confirmation(sandbox: Path, runner
     client = build_client(sandbox)
     token = get_token_manager().generate_master_token()
     csrf = login(client, token)["csrf_token"]
-    secret, codes = enable_totp(client, csrf)
+    secret, codes = enable_totp(client, csrf, token)
 
     responses = [
         client.get("/api/auth/2fa"),
@@ -1356,7 +1388,7 @@ def test_the_two_factor_state_file_is_owner_only(sandbox: Path) -> None:
     client = build_client(sandbox)
     token = get_token_manager().generate_master_token()
     csrf = login(client, token)["csrf_token"]
-    enable_totp(client, csrf)
+    enable_totp(client, csrf, token)
 
     state_file = sandbox / "state" / "web-totp"
     assert state_file.exists()
@@ -1463,7 +1495,7 @@ def test_a_read_token_reads_but_cannot_mutate_and_the_refusal_is_audited(
         store.close()
         WASMStore.reset_instance()
 
-    refused = client.post("/api/apps", headers=bearer(issued["token"]), json={})
+    refused = client.post("/api/jobs/update", headers=bearer(issued["token"]), json={})
     assert refused.status_code == 403
     assert "read" in refused.json()["detail"]
     assert "deploy" in refused.json()["detail"]
@@ -1525,7 +1557,11 @@ def test_a_deploy_token_queues_deployments_but_cannot_delete(
     sandbox: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    ``deploy`` covers deploy, update and rollback jobs; deletion stays admin.
+    ``deploy`` covers update and rollback jobs; creation and deletion stay admin.
+
+    Creating an application used to be ``deploy`` too, which made a CI token
+    root: it could point a root build at any repository or directory. See
+    tests/test_web_source_privilege.py for that boundary in full.
 
     Args:
         sandbox: Per-test temporary directory.
@@ -1589,9 +1625,15 @@ def test_a_deploy_token_queues_deployments_but_cannot_delete(
     monkeypatch.setattr("wasm.web.api.apps.get_job_manager", lambda: fake)
     monkeypatch.setattr("wasm.web.api.apps.get_store", lambda: FakeStore())
 
-    # There is one route that queues a deployment, POST /api/apps;
-    # POST /api/jobs/deploy was a duplicate of it and has been removed.
+    monkeypatch.setattr("wasm.web.api.jobs.get_job_manager", lambda: fake)
+
     accepted = client.post(
+        "/api/jobs/update", headers=bearer(issued["token"]), json={"domain": "app.example.com"}
+    )
+    assert accepted.status_code == 202, accepted.text
+    assert captured, "the update never reached the job manager"
+
+    created = client.post(
         "/api/apps",
         headers=bearer(issued["token"]),
         json={
@@ -1600,8 +1642,8 @@ def test_a_deploy_token_queues_deployments_but_cannot_delete(
             "port": 4000,
         },
     )
-    assert accepted.status_code == 202, accepted.text
-    assert captured, "the deployment never reached the job manager"
+    assert created.status_code == 403, created.text
+    assert len(captured) == 1, "creating an application is not a deploy-scope operation"
 
     delete_app = client.delete("/api/apps/app.example.com", headers=bearer(issued["token"]))
     assert delete_app.status_code == 403

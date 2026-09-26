@@ -329,18 +329,64 @@ def test_the_migration_plan_is_plan_migration_translated(
     assert (body["persistent"], body["files"], body["unit_rewrite"]) == (["uploads"], 12, True)
 
 
-def test_migrating_plans_again_and_migrates_as_the_panel(
+def test_migrating_is_queued_as_a_job(
     client: TestClient, store: WASMStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """What runs is planned from the disk now, never a plan the client sent."""
-    from wasm.deployers.migrate import MigrationResult, TreeCount
+    """
+    A migration moves the whole tree and waits for a health check: a job, not a request.
+
+    Checked here, before queueing: that the application can be migrated and
+    that the named paths are valid, so a bad request fails at once.
+    """
+    from wasm.web.jobs import JobType, migrate_app_job
 
     store.create_app(App(domain=DOMAIN, app_type="nodejs", app_path=str(tmp_path)))
+    planned: list[Any] = []
+    monkeypatch.setattr(
+        apps_api, "plan_migration", lambda domain, persist: planned.append(persist) or _plan()
+    )
+    queued: list[dict[str, Any]] = []
+
+    class Queued:
+        id = "job-7"
+        status = SimpleNamespace(value="pending")
+
+        def to_dict(self) -> dict[str, Any]:
+            return {"id": self.id, "type": "migrate"}
+
+    def create_job(**kwargs: Any) -> Queued:
+        queued.append(kwargs)
+        return Queued()
+
+    monkeypatch.setattr(apps_api, "get_job_manager", lambda: SimpleNamespace(create_job=create_job))
+
+    response = client.post(f"/api/apps/{DOMAIN}/migrate", json={"persist": ["uploads"]})
+
+    assert response.status_code == 202, response.text
+    assert response.json()["job_id"] == "job-7"
+    assert planned == [["uploads"]], "validated before it is queued"
+    (job,) = queued
+    assert job["job_type"] is JobType.MIGRATE
+    assert job["func"] is migrate_app_job
+    assert job["kwargs"] == {"domain": DOMAIN, "persist": ["uploads"]}
+    assert job["metadata"] == {"domain": DOMAIN}
+
+
+def test_the_migration_job_plans_again_and_migrates_as_the_panel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """What runs is planned from the disk when the job runs, never earlier."""
+    from wasm.deployers import migrate as migrate_module
+    from wasm.deployers.migrate import MigrationResult, TreeCount
+    from wasm.web.jobs import Job, JobContext, migrate_app_job
+
     plan = _plan()
     calls: list[Any] = []
-    monkeypatch.setattr(apps_api, "plan_migration", lambda domain, persist: plan)
+    monkeypatch.setattr(
+        migrate_module, "plan_migration", lambda domain, persist: calls.append(persist) or plan
+    )
 
-    def run(domain: str, given: Any, *, trigger: str) -> Any:
+    def run(domain: str, given: Any, *, trigger: str, logger: Any = None) -> Any:
         calls.append((domain, given, trigger))
         count = TreeCount(files=12, bytes=3400, links=1)
         return MigrationResult(
@@ -356,14 +402,20 @@ def test_migrating_plans_again_and_migrates_as_the_panel(
             deployment_id=9,
         )
 
-    monkeypatch.setattr(apps_api, "migrate", run)
+    monkeypatch.setattr(migrate_module, "migrate", run)
+    job = Job(id="job-7", type=apps_api.JobType.MIGRATE, name="migrate", description="")
 
-    response = client.post(f"/api/apps/{DOMAIN}/migrate", json={"persist": ["uploads"]})
+    result = migrate_app_job(DOMAIN, ["uploads"], job_context=JobContext(job, lambda _j: None))
 
-    assert response.status_code == 200, response.text
-    assert calls == [(DOMAIN, plan, "panel")]
-    body = response.json()
-    assert (body["files_before"], body["files_after"], body["release_id"]) == (12, 12, RELEASE_A)
+    assert calls == [["uploads"], (DOMAIN, plan, "panel")]
+    assert (result["files_before"], result["files_after"], result["release_id"]) == (
+        12,
+        12,
+        RELEASE_A,
+    )
+    assert result["deployment_id"] == 9
+    assert job.metadata["domain"] == DOMAIN
+    assert any("1 untracked file(s)" in entry.message for entry in job.logs)
 
 
 def test_migrating_needs_sudo_mode_and_an_in_place_app(

@@ -40,6 +40,7 @@ from wasm.monitor import (
 )
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import WASMErrorRoute
+from wasm.web.auth import sees_command_lines
 
 # The error boundary: this router had none, so an unmapped WASMError from
 # ProcessMonitor/ObservationStore crashed the request instead of answering
@@ -271,12 +272,49 @@ class MetricsResponse(BaseModel):
 Session = Annotated[dict, Depends(get_current_session)]
 
 
-def _observation_entry(observation: ProcessObservation) -> ObservationEntry:
+def _visible_command(command: str, session: dict[str, Any]) -> str:
+    """
+    A process table row's command line as this credential may see it.
+
+    Args:
+        command: Full argv, already truncated by the collector.
+        session: The authenticated session.
+
+    Returns:
+        ``command`` when :func:`~wasm.web.auth.sees_command_lines` allows
+        it, otherwise the empty string - ``ProcessEntry.command`` has no
+        ``None`` to fall back to.
+    """
+    return command if sees_command_lines(session) else ""
+
+
+def _visible_observation_command(command: str | None, session: dict[str, Any]) -> str | None:
+    """
+    An observation's command line as this credential may see it.
+
+    Stored observations are read back by a plain GET, days after the admin
+    scan that recorded them, so they are gated exactly like the live table.
+
+    Args:
+        command: Full argv as observed or stored, possibly missing.
+        session: The authenticated session.
+
+    Returns:
+        ``command`` when :func:`~wasm.web.auth.sees_command_lines` allows
+        it, otherwise None.
+    """
+    return command if sees_command_lines(session) else None
+
+
+def _observation_entry(
+    observation: ProcessObservation, session: dict[str, Any]
+) -> ObservationEntry:
     """
     Convert an in-memory observation to its API shape.
 
     Args:
         observation: What a scan noticed.
+        session: The authenticated session, to gate the command line by scope.
 
     Returns:
         The serialisable entry.
@@ -289,7 +327,7 @@ def _observation_entry(observation: ProcessObservation) -> ObservationEntry:
         user=process.user,
         cpu_percent=process.cpu_percent,
         memory_percent=process.memory_percent,
-        command=process.command,
+        command=_visible_observation_command(process.command, session),
         signal=observation.signal,
         severity=observation.severity,
         detail=observation.detail,
@@ -405,6 +443,10 @@ def get_all_processes(
     """
     List the processes on the machine.
 
+    The command line is only included for an admin-scoped credential - see
+    :func:`_visible_command` - because argv routinely carries another
+    process's secrets.
+
     Args:
         limit: Maximum number of rows to return.
         sort_by: One of cpu, memory, name, pid.
@@ -438,7 +480,7 @@ def get_all_processes(
                 user=p.user,
                 cpu_percent=p.cpu_percent,
                 memory_percent=p.memory_percent,
-                command=p.command,
+                command=_visible_command(p.command, session),
                 status=p.status,
             )
             for p in ordered[:limit]
@@ -452,7 +494,12 @@ def run_scan(session: Session) -> ScanResponse:
     Run one scan and return what stood out.
 
     There is no dry-run parameter because there is no other mode: a scan reads
-    the process table and writes rows to the observation store.
+    the process table and writes rows to the observation store. This endpoint
+    already requires admin scope at the auth chokepoint (mutations default to
+    admin), so the command line in the response is never actually seen below
+    admin today; it is still gated the same way as :func:`get_observations`,
+    so relaxing the endpoint's own scope requirement later cannot reopen the
+    leak this closes.
 
     Args:
         session: Authenticated session, injected.
@@ -472,7 +519,7 @@ def run_scan(session: Session) -> ScanResponse:
 
     return ScanResponse(
         scanned=scanned,
-        observations=[_observation_entry(o) for o in observations],
+        observations=[_observation_entry(o, session) for o in observations],
         count=len(observations),
         scope=list(MONITOR_SCOPE),
     )
@@ -487,6 +534,12 @@ def get_observations(
 ) -> ObservationListResponse:
     """
     Read stored observations, newest first.
+
+    A scan runs as admin, but this endpoint is a plain GET and needs only
+    read scope - so it is the actual route by which a lesser credential could
+    read another process's argv, stored by an admin-run scan days earlier.
+    The command line is only included for an admin-scoped *reader*; see
+    :func:`_visible_command`.
 
     Args:
         limit: Maximum number of rows to return.
@@ -516,18 +569,19 @@ def get_observations(
         ) from exc
 
     return ObservationListResponse(
-        observations=[_row_to_entry(row) for row in rows],
+        observations=[_row_to_entry(row, session) for row in rows],
         count=len(rows),
         stats=stats,
     )
 
 
-def _row_to_entry(row: dict[str, Any]) -> ObservationEntry:
+def _row_to_entry(row: dict[str, Any], session: dict[str, Any]) -> ObservationEntry:
     """
     Convert a stored row to its API shape.
 
     Args:
         row: A row from the observation store.
+        session: The authenticated session, to gate the command line by scope.
 
     Returns:
         The serialisable entry.
@@ -540,7 +594,7 @@ def _row_to_entry(row: dict[str, Any]) -> ObservationEntry:
         user=row.get("user"),
         cpu_percent=row.get("cpu_percent"),
         memory_percent=row.get("memory_percent"),
-        command=row.get("command"),
+        command=_visible_observation_command(row.get("command"), session),
         signal=str(row.get("signal", "")),
         severity=str(row.get("severity", "")),
         detail=row.get("detail"),

@@ -17,6 +17,7 @@ here for that to be true.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -27,7 +28,7 @@ from pydantic import BaseModel, Field
 from wasm.core import app_state
 from wasm.core.app_state import AppState, resolve_state_with_status, resolve_states_with_status
 from wasm.core.config import REDACTED, redact_secrets
-from wasm.core.exceptions import DeploymentError, ValidationError, WASMError
+from wasm.core.exceptions import DeploymentError, SourceError, ValidationError, WASMError
 from wasm.core.store import (
     DEFAULT_KEEP_RELEASES,
     App,
@@ -44,13 +45,14 @@ from wasm.deployers.helpers.layout import RELEASES
 from wasm.deployers.helpers.package_manager import SUPPORTED_PACKAGE_MANAGERS
 from wasm.deployers.inspect import inspect_source
 from wasm.deployers.lifecycle import activate_release, list_releases, set_resource_limits
-from wasm.deployers.migrate import MigrationPlan, migrate, plan_migration
+from wasm.deployers.migrate import MigrationPlan, plan_migration
 from wasm.deployers.registry import DeployerRegistry, available_types
 from wasm.deployers.releases import is_release_id
 from wasm.managers.backup_manager import RollbackManager
 from wasm.managers.service_manager import ResourceLimits, ServiceManager
-from wasm.validators.environment import EnvironmentValidationError, validate_environment
+from wasm.validators.environment import EnvironmentValidationError
 from wasm.validators.port import find_available_port, validate_port
+from wasm.validators.source import validate_source
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import (
     JobAcceptedResponse,
@@ -60,7 +62,13 @@ from wasm.web.api.deps import (
     strict_domain,
 )
 from wasm.web.auth import actor_label, ensure_scope, get_audit_logger, get_client_ip
-from wasm.web.jobs import JobType, delete_app_job, deploy_app_job, get_job_manager
+from wasm.web.jobs import (
+    JobType,
+    delete_app_job,
+    deploy_app_job,
+    get_job_manager,
+    migrate_app_job,
+)
 from wasm.web.pydantic_compat import iso_offset_validator
 
 #: app_state's display labels, translated to the fixed API vocabulary.
@@ -329,6 +337,116 @@ def _last_deployment_out(record: DeploymentRecord | None) -> LastDeploymentOut |
     )
 
 
+#: A user name alone in an http(s) URL. Forges accept an access token in that
+#: position (``https://<token>@github.com/...``), so in a source it is as much
+#: a credential as a password after a colon is. ssh's ``git@host:path`` names
+#: the account ssh logs in as, has no scheme, and is left alone.
+_HTTP_USERINFO = re.compile(r"(?P<prefix>https?://)[^:/?#@\s]+@", re.IGNORECASE)
+
+
+def public_source(source: str | None) -> str | None:
+    """
+    Render a stored source the way it may leave the server.
+
+    Releases before this one stored the URL they were given, and a clone URL
+    is where an operator puts a forge token to reach a private repository.
+    The stored value is left as it is, because the next update clones from
+    it; only what every application read sends back is redacted.
+
+    Args:
+        source: The source as stored.
+
+    Returns:
+        The source with every credential inside a URL replaced by ``***``, or
+        None when there is no source.
+    """
+    if not source:
+        return None
+    redacted = redact_url_credentials(source)
+    return _HTTP_USERINFO.sub(lambda match: f"{match.group('prefix')}{REDACTED}@", redacted)
+
+
+def _is_local_source(source: str) -> bool:
+    """
+    Report whether a source names a directory on this machine.
+
+    Decided by :func:`wasm.validators.source.validate_source`, the same
+    classification :meth:`wasm.managers.source_manager.SourceManager.fetch`
+    acts on, so the answer here is what the build would actually do.
+
+    Args:
+        source: The source as the client sent it.
+
+    Returns:
+        True for a local path. A source that is not valid at all is not
+        local: the fetch refuses it on its own, with its own reason.
+    """
+    try:
+        kind, _normalized = validate_source(source)
+    except SourceError:
+        return False
+    return kind == "local"
+
+
+def _require_local_source_privilege(
+    request: Request, session: Mapping[str, Any], source: str
+) -> None:
+    """
+    Refuse a local-path source to anyone but the operator in person.
+
+    A build runs as root and copies the directory it is given into an
+    application that is then served, so a local path reaches every file on
+    the machine. The master token is root by definition; a console session
+    may, once it has confirmed in sudo mode; an API token never may, whatever
+    its scope, because it is a standing credential held by a script. Checked
+    here, at the two endpoints that fetch a source over HTTP; the CLI runs as
+    root already and is not asked.
+
+    Args:
+        request: The incoming request, for the audit record.
+        session: The authenticated payload.
+        source: The source as the client sent it.
+
+    Raises:
+        HTTPException: 403 ``elevation_required`` for a console session that
+            has not confirmed recently, 403 ``forbidden`` for any other
+            credential.
+    """
+    if not _is_local_source(source):
+        return
+
+    kind = session.get("type")
+    if kind == "master":
+        return
+    if kind == "session":
+        ensure_elevated(request, dict(session))
+        return
+
+    audit = get_audit_logger()
+    if audit:
+        audit.record(
+            action="apps.source",
+            result="denied",
+            client_ip=get_client_ip(request),
+            actor=actor_label(session),
+            resource=request.url.path,
+            detail="local path source refused to a non-interactive credential",
+        )
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "error": "forbidden",
+            "detail": "Deploying from a local path needs the master token or a console session",
+            "hint": (
+                "API tokens deploy from a repository URL. To deploy a directory on "
+                "this machine, use the console (it asks you to confirm it's you) or "
+                "'wasm create' on the server."
+            ),
+            "fields": {"source": "local paths are not accepted from an API token"},
+        },
+    )
+
+
 def _to_app_info(
     app: App,
     state: AppState,
@@ -366,7 +484,7 @@ def _to_app_info(
         port=app.port,
         app_type=app.app_type,
         path=app.app_path,
-        source=app.source or None,
+        source=public_source(app.source),
         branch=app.branch,
         layout=app.layout,
         keep_releases=app.keep_releases,
@@ -530,13 +648,20 @@ def list_apps(session: Annotated[dict, Depends(get_current_session)]) -> AppList
 
 @router.post("", response_model=JobAcceptedResponse, status_code=202)
 def create_app(
-    body: CreateAppRequest, session: Annotated[dict, Depends(get_current_session)]
+    body: CreateAppRequest,
+    request: Request,
+    session: Annotated[dict, Depends(get_current_session)],
 ) -> JobAcceptedResponse:
     """
     Queue the deployment of a new application.
 
+    Admin scope, through the blanket policy: the build runs as root. A local
+    path as the source is further reserved to the operator in person; see
+    :func:`_require_local_source_privilege`.
+
     Args:
         body: The deployment request.
+        request: The incoming request, for the audit record of a refusal.
         session: The authenticated session.
 
     Returns:
@@ -544,7 +669,8 @@ def create_app(
 
     Raises:
         HTTPException: 409 when the domain is already deployed, 503 when no
-            port is free.
+            port is free, 403 when the source is a local path and the
+            credential may not deploy one.
         PortError: When the requested port is not usable.
         DomainError: When the domain is not acceptable.
         ValidationError: A resource limit is out of range (400, with the
@@ -553,6 +679,7 @@ def create_app(
             or ``package_manager`` names one WASM does not drive.
     """
     domain = strict_domain(body.domain)
+    _require_local_source_privilege(request, session, body.source)
 
     if get_store().get_app(domain):
         raise HTTPException(status_code=409, detail=f"Application already exists: {domain}")
@@ -674,7 +801,9 @@ class SourceInspectionResponse(BaseModel):
 # domain.
 @router.post("/inspect", response_model=SourceInspectionResponse)
 def inspect_app_source(
-    body: InspectSourceRequest, session: Annotated[dict, Depends(get_current_session)]
+    body: InspectSourceRequest,
+    request: Request,
+    session: Annotated[dict, Depends(get_current_session)],
 ) -> SourceInspectionResponse:
     """
     Preview what a repository is before deploying it.
@@ -686,14 +815,21 @@ def inspect_app_source(
     removed before this returns, and no application, domain or unit is
     created.
 
+    Admin scope, like creating one: fetching runs as root and reads back what
+    it fetched. A local path is reserved to the operator in person, exactly
+    as it is for ``POST /api/apps``.
+
     Args:
         body: The source to inspect and the branch to check out.
+        request: The incoming request, for the audit record of a refusal.
         session: The authenticated session.
 
     Returns:
         The inspection result.
 
     Raises:
+        HTTPException: 403 when the source is a local path and the credential
+            may not read one.
         SourceError: The source is invalid, or fetching it failed. Answered
             as 400: the operator gave a source WASM cannot reach, not a
             server fault.
@@ -705,6 +841,7 @@ def inspect_app_source(
             (400 with details) instead of the 500 an unqualified
             ``DeploymentError`` would answer.
     """
+    _require_local_source_privilege(request, session, body.source)
     try:
         result = inspect_source(body.source, branch=body.branch)
     except DeploymentError as exc:
@@ -1008,19 +1145,20 @@ def update_app_env(
 
     Raises:
         HTTPException: 404 when the application is unknown, 422 when a name
-            or a value is not safe to write into a systemd unit.
+            or a value is not safe to write into a systemd unit, or when the
+            request tries to set PORT or NODE_ENV, which the unit sets inline
+            and are refused by :func:`~wasm.deployers.helpers.app_env.write_app_env`.
     """
     app = _env_app(domain)
+    before = read_app_env(app)
 
     try:
-        clean = validate_environment(body.variables)
+        write_app_env(app, body.variables)
     except EnvironmentValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    before = read_app_env(app)
-    write_app_env(app, clean)
-
-    changed = sorted(key for key in set(before) | set(clean) if before.get(key) != clean.get(key))
+    after = read_app_env(app)
+    changed = sorted(key for key in set(before) | set(after) if before.get(key) != after.get(key))
     audit = get_audit_logger()
     if audit:
         audit.record(
@@ -1364,37 +1502,6 @@ class MigrateRequest(BaseModel):
     )
 
 
-class MigrationResultOut(BaseModel):
-    """
-    What a migration did.
-
-    Attributes:
-        domain: The application's domain.
-        release_id: The first release, now active.
-        persistent: What is kept in ``shared/``.
-        env_files: Environment files moved to ``shared/``.
-        files_before: Regular files before.
-        files_after: Regular files after, ``shared/`` included; always equal.
-        bytes_before: Their size before.
-        bytes_after: Their size after.
-        unit_rewritten: Whether the unit was rewritten.
-        site_rewritten: Whether the site was rewritten.
-        deployment_id: The deployment history row that records it.
-    """
-
-    domain: str
-    release_id: str
-    persistent: list[str]
-    env_files: list[str]
-    files_before: int
-    files_after: int
-    bytes_before: int
-    bytes_after: int
-    unit_rewritten: bool
-    site_rewritten: bool
-    deployment_id: int | None = None
-
-
 def _migratable(domain: str) -> App:
     """
     Look up an application a migration request is about.
@@ -1472,18 +1579,26 @@ def get_migration_plan(
     return _plan_out(plan_migration(app.domain, persist))
 
 
-@router.post("/{domain}/migrate", response_model=MigrationResultOut)
+@router.post("/{domain}/migrate", response_model=JobAcceptedResponse, status_code=202)
 def migrate_app(
     domain: str,
     body: MigrateRequest,
     session: Annotated[dict, Depends(require_elevated)],
-) -> MigrationResultOut:
+) -> JobAcceptedResponse:
     """
-    Move an in-place application onto the release layout.
+    Queue the move of an in-place application onto the release layout.
 
     Rewrites the unit and the site and moves the whole application tree, so
-    it needs sudo mode. The plan is worked out again here rather than taken
-    from the client: what is executed is what is on disk now.
+    it needs sudo mode. It runs as a job, like an update: the unit is stopped
+    while the tree moves and the health check waits for it on the new layout,
+    and the job keeps its log whatever happens to the browser. The job's
+    result has the first release, what moved to ``shared/`` and the file
+    counts before and after.
+
+    The plan is worked out here only to refuse a request that cannot run (an
+    application on releases already, a path that is not inside it); the job
+    plans again when it runs, so what is migrated is what is on disk then,
+    never a plan the client sent.
 
     Args:
         domain: Domain of the application.
@@ -1491,31 +1606,31 @@ def migrate_app(
         session: The authenticated, elevated session.
 
     Returns:
-        What was done.
+        The queued job.
 
     Raises:
         HTTPException: 404 when the application is unknown, 409 when it is on
             releases already.
         ValidationError: A path in ``persist`` is not inside the application.
-        DeploymentError: A step failed or the application did not answer on
-            the new layout; everything was put back, and the details carry
-            the health check's own output.
+        DeploymentError: Its type cannot use releases, or the paths named
+            leave a SQLite database out.
     """
     app = _migratable(domain)
-    plan = plan_migration(app.domain, body.persist)
-    result = migrate(app.domain, plan, trigger=DeploymentTrigger.PANEL.value)
-    return MigrationResultOut(
-        domain=result.domain,
-        release_id=result.release_id,
-        persistent=list(result.persistent),
-        env_files=list(result.env_files),
-        files_before=result.before.files,
-        files_after=result.after.files,
-        bytes_before=result.before.bytes,
-        bytes_after=result.after.bytes,
-        unit_rewritten=result.unit_rewritten,
-        site_rewritten=result.site_rewritten,
-        deployment_id=result.deployment_id,
+    plan_migration(app.domain, body.persist)
+    job = get_job_manager().create_job(
+        job_type=JobType.MIGRATE,
+        name=f"Migrate {app.domain}",
+        description=f"Moving {app.domain} onto the release layout",
+        func=migrate_app_job,
+        kwargs={"domain": app.domain, "persist": body.persist},
+        metadata={"domain": app.domain},
+        actor=actor_label(session),
+    )
+    return JobAcceptedResponse(
+        job_id=job.id,
+        status=job.status.value,
+        message=f"Migration of {app.domain} to releases queued",
+        job=job.to_dict(),
     )
 
 

@@ -198,7 +198,7 @@ def test_the_feed_accepts_the_console_s_cookie_session(
         monkeypatch: Replaces the endless stream.
     """
 
-    async def one_frame(request: object) -> Any:
+    async def one_frame(request: object, session: object = None) -> Any:
         yield ": connected\n\n"
 
     monkeypatch.setattr(events_module, "_stream", one_frame)

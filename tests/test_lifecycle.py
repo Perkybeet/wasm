@@ -113,6 +113,7 @@ def recorder(monkeypatch: pytest.MonkeyPatch) -> Recorder:
         lambda verbose=False: SimpleNamespace(
             get_status=lambda name: {"exists": rec.service_exists, "active": rec.service_active},
             restart=restart,
+            get_service_config=lambda name: None,
         ),
     )
     monkeypatch.setattr(lifecycle.time, "sleep", lambda seconds: None)

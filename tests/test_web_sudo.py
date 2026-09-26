@@ -510,3 +510,248 @@ def test_the_master_token_bearer_is_exempt_for_certificate_revocation(
 
     assert response.status_code == 200, response.text
     assert fake_cert_manager == [("revoke", "example.com")]
+
+
+# --------------------------------------------------------------------------
+# A session is a session on every channel
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def bearer_session(app: FastAPI, master_token: str) -> tuple[TestClient, str, str]:
+    """
+    A session signed in with ``bearer: true``: the token travels in a header.
+
+    Returns:
+        A cookie-less client, the session token and its CSRF token.
+    """
+    login = TestClient(app, client=("testclient", 50000))
+    response = login.post("/api/auth/login", json={"token": master_token, "bearer": True})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    anon = TestClient(app, client=("testclient", 50000))
+    return anon, body["session_token"], body["csrf_token"]
+
+
+def test_a_session_token_presented_as_bearer_must_still_confirm(
+    bearer_session: tuple[TestClient, str, str],
+    seeded_app: None,
+    queued: list[dict[str, Any]],
+) -> None:
+    """
+    The exemption belongs to the credential, not to the header it came in.
+
+    Sudo mode used to exempt anything that arrived as ``Authorization:
+    Bearer``, and a session token is accepted there: moving the same session
+    from the cookie to the header skipped the confirmation entirely.
+    """
+    anon, session_token, csrf = bearer_session
+
+    response = anon.delete(
+        "/api/apps/example.com",
+        headers={"Authorization": f"Bearer {session_token}", CSRF_HEADER_NAME: csrf},
+    )
+
+    assert response.status_code == 403, response.text
+    assert response.json()["error"] == "elevation_required"
+    assert not queued
+
+
+def test_a_bearer_session_can_confirm_like_a_cookie_session(
+    bearer_session: tuple[TestClient, str, str],
+    master_token: str,
+    seeded_app: None,
+    queued: list[dict[str, Any]],
+) -> None:
+    """The way out of the refusal above works on the same channel."""
+    anon, session_token, csrf = bearer_session
+    headers = {"Authorization": f"Bearer {session_token}", CSRF_HEADER_NAME: csrf}
+
+    elevated = anon.post("/api/auth/elevate", json={"token": master_token}, headers=headers)
+    assert elevated.status_code == 200, elevated.text
+
+    response = anon.delete("/api/apps/example.com", headers=headers)
+    assert response.status_code == 202, response.text
+    assert queued
+
+
+def test_a_session_token_presented_as_bearer_needs_the_csrf_header(
+    bearer_session: tuple[TestClient, str, str],
+) -> None:
+    """CSRF is the session's, so it applies to the session wherever it is presented."""
+    anon, session_token, csrf = bearer_session
+
+    without = anon.post("/api/auth/ws-ticket", headers={"Authorization": f"Bearer {session_token}"})
+    assert without.status_code == 403, without.text
+
+    with_csrf = anon.post(
+        "/api/auth/ws-ticket",
+        headers={"Authorization": f"Bearer {session_token}", CSRF_HEADER_NAME: csrf},
+    )
+    assert with_csrf.status_code == 200, with_csrf.text
+
+
+def test_a_payload_without_a_credential_type_is_not_exempt() -> None:
+    """Fail closed: only the master token and API tokens skip the confirmation."""
+    from fastapi import HTTPException
+    from starlette.requests import Request
+
+    from wasm.web.api.deps import ensure_elevated
+
+    request = Request({"type": "http", "method": "DELETE", "path": "/x", "headers": []})
+
+    for exempt in ({"type": "master"}, {"type": "api_token", "scope": "admin"}):
+        ensure_elevated(request, exempt)
+
+    for refused in ({}, {"type": "session"}, {"type": "session", "source": "bearer"}):
+        with pytest.raises(HTTPException) as caught:
+            ensure_elevated(request, refused)
+        assert caught.value.status_code == 403
+
+
+# --------------------------------------------------------------------------
+# Two-factor enrolment
+# --------------------------------------------------------------------------
+
+
+def test_enrolling_two_factor_needs_sudo_mode(client: TestClient, master_token: str) -> None:
+    """
+    Enrolling binds the second factor that guards every later confirmation.
+
+    A hijacked, unconfirmed session that could enrol its own authenticator
+    would own sudo mode from then on.
+    """
+    enroll = client.post("/api/auth/2fa/enroll")
+    assert enroll.status_code == 403, enroll.text
+    assert enroll.json()["error"] == "elevation_required"
+
+    confirm = client.post("/api/auth/2fa/confirm", json={"code": "123456"})
+    assert confirm.status_code == 403, confirm.text
+    assert confirm.json()["error"] == "elevation_required"
+
+    elevate(client, token=master_token)
+    assert client.post("/api/auth/2fa/enroll").status_code == 200
+
+
+# --------------------------------------------------------------------------
+# Standing root: services, cron jobs and backup schedules
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def recorded_units(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """
+    Stand in for ``ServiceManager`` so a create never reaches systemd.
+
+    Returns:
+        The names the endpoint created - empty when refused at the gate.
+    """
+    created: list[str] = []
+
+    class FakeServiceManager:
+        """Records what it was asked, does nothing to the machine."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            """
+            Args:
+                *args: Ignored.
+                **kwargs: Ignored.
+            """
+
+        def create_from_unit(self, name: str, content: str) -> None:
+            created.append(name)
+
+        def create_service(self, **kwargs: Any) -> None:
+            created.append(str(kwargs["name"]))
+
+        def enable(self, name: str) -> bool:
+            return True
+
+    monkeypatch.setattr("wasm.web.api.services.ServiceManager", FakeServiceManager)
+    return created
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"name": "worker", "raw_content": "[Service]\nExecStart=/bin/true\n"},
+        {"name": "worker", "command": "/bin/true"},
+    ],
+)
+def test_creating_a_service_needs_sudo_mode(
+    client: TestClient, master_token: str, recorded_units: list[str], body: dict[str, Any]
+) -> None:
+    """A unit is a command systemd runs as root for as long as the machine is up."""
+    refused = client.post("/api/services", json=body)
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["error"] == "elevation_required"
+    assert recorded_units == []
+
+    elevate(client, token=master_token)
+    accepted = client.post("/api/services", json=body)
+    assert accepted.status_code == 200, accepted.text
+    assert recorded_units == ["worker"]
+
+
+def test_creating_or_rewriting_a_cron_job_needs_sudo_mode(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``POST /api/cron`` creates a job or rewrites one: a root command on a timer either way."""
+    reached: list[str] = []
+
+    class FakeCron:
+        """Records the job, touches no timer."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            """
+            Args:
+                *args: Ignored.
+                **kwargs: Ignored.
+            """
+
+        def create_job(self, job: Any) -> Any:
+            reached.append(job.name)
+            return job
+
+        def get_job(self, name: str) -> None:
+            return None
+
+    monkeypatch.setattr("wasm.web.api.cron.CronManager", FakeCron)
+
+    response = client.post(
+        "/api/cron", json={"name": "cleanup", "command": "/bin/true", "schedule": "daily"}
+    )
+
+    assert response.status_code == 403, response.text
+    assert response.json()["error"] == "elevation_required"
+    assert reached == []
+
+
+def test_scheduling_backups_needs_sudo_mode(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A schedule writes a root timer and decides how many backups survive retention."""
+    reached: list[str] = []
+
+    class FakeScheduler:
+        """Records the schedule, touches no timer."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            """
+            Args:
+                *args: Ignored.
+                **kwargs: Ignored.
+            """
+
+        def create_schedule(self, schedule: Any) -> None:
+            reached.append(schedule.domain)
+
+    monkeypatch.setattr("wasm.web.api.backup_schedules.BackupScheduler", FakeScheduler)
+
+    response = client.post(
+        "/api/backup-schedules", json={"domain": "example.com", "schedule": "daily"}
+    )
+
+    assert response.status_code == 403, response.text
+    assert response.json()["error"] == "elevation_required"
+    assert reached == []

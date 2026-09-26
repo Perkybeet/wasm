@@ -186,7 +186,7 @@ class TestLoginFailuresAreMachineReadable:
         test_client = build_client(sandbox)
         master = get_token_manager().generate_master_token()
         body = login(test_client, master)
-        enable_totp(test_client, body["csrf_token"])
+        enable_totp(test_client, body["csrf_token"], master)
 
         response = test_client.post("/api/auth/login", json={"token": master})
 
@@ -197,7 +197,7 @@ class TestLoginFailuresAreMachineReadable:
         test_client = build_client(sandbox)
         master = get_token_manager().generate_master_token()
         body = login(test_client, master)
-        enable_totp(test_client, body["csrf_token"])
+        enable_totp(test_client, body["csrf_token"], master)
 
         response = test_client.post(
             "/api/auth/login", json={"token": master, "totp_code": "000000"}

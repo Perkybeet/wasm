@@ -19,19 +19,22 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Coroutine
 from typing import Any
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
+from starlette.concurrency import run_in_threadpool
 
 from wasm.core.exceptions import ValidationError
 from wasm.core.utils import domain_to_app_name
-from wasm.validators.names import validate_service_name
 from wasm.web.auth import (
+    WS_CLOSE_FORBIDDEN,
     WS_CLOSE_UNAUTHORIZED,
     WS_SUBPROTOCOL,
     WS_TOKEN_PREFIX,
     actor_label,
     authenticate_connection,
+    credential_is_current,
     get_audit_logger,
     get_client_ip,
     scope_satisfies,
@@ -49,9 +52,21 @@ __all__ = [
     "router",
 ]
 
-#: Upper bound on how long one journal stream may run before the client has to
-#: reconnect. A follow with no deadline is a process that outlives its session.
-LOG_STREAM_MAX_SECONDS = 12 * 3600
+#: Upper bound on how long any one socket may stay open before the client has
+#: to reconnect - and so authenticate again. A follow with no deadline is a
+#: process that outlives its session; a token that never expires does not
+#: get a socket that never closes either.
+WS_MAX_LIFETIME_SECONDS: float = 12 * 3600
+
+#: How often an open socket asks whether the credential it was opened with is
+#: still accepted. Matches the job streams' heartbeat, so a revoked token, a
+#: rotated master token or a signed-out session loses its streams within one.
+WS_RECHECK_SECONDS: float = 30.0
+
+#: Close code when a socket reaches :data:`WS_MAX_LIFETIME_SECONDS`. Not
+#: :data:`WS_CLOSE_UNAUTHORIZED`: the console reads 4401 as "signed out" and
+#: stops, while any other code makes it reconnect with a fresh ticket.
+WS_CLOSE_LIFETIME = 4408
 
 # Active WebSocket connections
 _log_connections: dict[str, set[WebSocket]] = {}
@@ -86,6 +101,84 @@ async def _terminate(process: asyncio.subprocess.Process | None) -> None:
             process.kill()
         except ProcessLookupError:
             pass
+
+
+async def _watch(session: dict[str, Any]) -> int:
+    """
+    Wait until a socket has to close, and say why.
+
+    Args:
+        session: The payload the socket was opened with.
+
+    Returns:
+        :data:`WS_CLOSE_UNAUTHORIZED` once the credential is no longer
+        accepted, :data:`WS_CLOSE_LIFETIME` once the socket has been open for
+        :data:`WS_MAX_LIFETIME_SECONDS`.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + WS_MAX_LIFETIME_SECONDS
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return WS_CLOSE_LIFETIME
+        await asyncio.sleep(min(WS_RECHECK_SECONDS, remaining))
+        # A SQLite read, off the event loop like every other blocking call here.
+        if not await run_in_threadpool(credential_is_current, session):
+            return WS_CLOSE_UNAUTHORIZED
+
+
+async def _serve(
+    websocket: WebSocket, session: dict[str, Any], *workers: Coroutine[Any, Any, None]
+) -> int:
+    """
+    Run a socket's workers until one of them ends or the socket must close.
+
+    Every route runs its reader and writer through here, next to
+    :func:`_watch`, so none of them can forget the re-check or the deadline.
+
+    Args:
+        websocket: The accepted connection.
+        session: The payload it was opened with.
+        *workers: The route's own loops.
+
+    Returns:
+        The close code the route should close with: 1000 when a worker ended
+        on its own (the client left, the job finished), otherwise what
+        :func:`_watch` decided.
+    """
+    tasks = [asyncio.create_task(worker) for worker in workers]
+    guard = asyncio.create_task(_watch(session))
+    done, pending = await asyncio.wait([*tasks, guard], return_when=asyncio.FIRST_COMPLETED)
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+
+    if guard not in done:
+        return 1000
+    code = guard.result()
+    if code == WS_CLOSE_UNAUTHORIZED:
+        message = "The credential this stream was opened with is no longer valid"
+    else:
+        message = "This stream reached its maximum lifetime; reconnect to continue"
+    try:
+        await websocket.send_json({"type": "error", "message": message})
+    except (RuntimeError, WebSocketDisconnect):
+        pass  # The client left in the same instant; there is nobody to tell.
+    return code
+
+
+async def _close(websocket: WebSocket, code: int = 1000) -> None:
+    """
+    Close a socket that may already be closed.
+
+    Args:
+        websocket: The connection.
+        code: The close code to send.
+    """
+    try:
+        await websocket.close(code=code)
+    except (RuntimeError, WebSocketDisconnect):
+        pass  # WebSocket already closed
 
 
 async def authenticate_websocket(
@@ -169,9 +262,17 @@ async def websocket_logs(
     Connect with the session cookie, with ``Sec-WebSocket-Protocol:
     wasm.auth, wasm.token.<token>``, or with ``?ticket=<single-use ticket>``.
 
+    Only a unit WASM manages is streamed. The name is resolved and judged by
+    :meth:`~wasm.managers.service_manager.ServiceManager.inspect_unit`, the
+    ownership rule ``GET /api/services/{name}/logs`` and every other service
+    operation already go through: this route used to follow whatever unit
+    the path named - ``/ws/logs/ssh`` was sshd's journal, as root, for any
+    valid credential.
+
     Args:
         websocket: The client connection.
-        domain: Domain whose service logs are streamed.
+        domain: Domain whose service logs are streamed, or the name of a unit
+            WASM manages.
         ticket: Optional single-use handshake ticket.
         lines: Backlog of log lines to send first.
     """
@@ -186,14 +287,26 @@ async def websocket_logs(
 
     try:
         # The domain is client supplied and ends up as a journalctl unit
-        # selector, where '*' and '/' are not inert. Validate before spawning.
+        # selector, where '*' and '/' are not inert. inspect_unit validates
+        # the name before anything is spawned.
         app_name = domain_to_app_name(domain)
-        service_manager = ServiceManager(verbose=False)
-        service_name = validate_service_name(service_manager._resolve_service_name(app_name))
+        unit = await run_in_threadpool(ServiceManager(verbose=False).inspect_unit, app_name)
     except ValidationError as exc:
         await websocket.send_json({"type": "error", "message": f"Invalid domain: {exc}"})
-        await websocket.close()
+        await _close(websocket)
         return
+
+    if not unit.exists or not unit.managed:
+        reason = unit.reason or f"there is no unit named {unit.unit}"
+        await websocket.send_json(
+            {
+                "type": "error",
+                "message": f"Refusing to stream a unit WASM does not manage: {unit.unit} ({reason})",
+            }
+        )
+        await _close(websocket, WS_CLOSE_FORBIDDEN)
+        return
+    service_name = unit.unit
 
     # Add to connections
     if domain not in _log_connections:
@@ -201,6 +314,7 @@ async def websocket_logs(
     _log_connections[domain].add(websocket)
 
     process = None
+    close_code = 1000
 
     try:
         # Check if journalctl exists
@@ -219,7 +333,7 @@ async def websocket_logs(
         process = await asyncio.create_subprocess_exec(
             "journalctl",
             "-u",
-            service_name,
+            unit.unit_file,
             "-f",
             "-n",
             str(lines),
@@ -239,6 +353,7 @@ async def websocket_logs(
 
         stdout = process.stdout
         stderr = process.stderr
+        follow = process
 
         # Check for immediate stderr (e.g., service not found)
         async def check_stderr() -> None:
@@ -264,7 +379,11 @@ async def websocket_logs(
                     line = await stdout.readline()
                     if not line:
                         # Check if process exited
-                        if process.returncode is not None:
+                        if follow.returncode is not None:
+                            break
+                        if stdout.at_eof():
+                            # Nothing more will ever arrive; waiting here
+                            # would spin instead of ending the stream.
                             break
                         continue
 
@@ -288,19 +407,7 @@ async def websocket_logs(
                 except (RuntimeError, json.JSONDecodeError):
                     break
 
-        # Run both tasks
-        log_task = asyncio.create_task(read_logs())
-        msg_task = asyncio.create_task(handle_messages())
-
-        _done, pending = await asyncio.wait(
-            [log_task, msg_task],
-            timeout=LOG_STREAM_MAX_SECONDS,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-
-        # Cancel pending tasks
-        for task in pending:
-            task.cancel()
+        close_code = await _serve(websocket, session, read_logs(), handle_messages())
 
     except WebSocketDisconnect:
         pass
@@ -322,10 +429,7 @@ async def websocket_logs(
         if domain in _log_connections:
             _log_connections[domain].discard(websocket)
 
-        try:
-            await websocket.close()
-        except (RuntimeError, WebSocketDisconnect):
-            pass  # WebSocket already closed
+        await _close(websocket, close_code)
 
 
 @router.websocket("/events")
@@ -350,6 +454,7 @@ async def websocket_events(websocket: WebSocket, ticket: str | None = Query(defa
     # every connection left a journalctl -f running forever. A panel that
     # reconnects on its own accumulates one per reconnection.
     process: asyncio.subprocess.Process | None = None
+    close_code = 1000
 
     try:
         await websocket.send_json({"type": "connected", "message": "Listening for system events"})
@@ -411,15 +516,7 @@ async def websocket_events(websocket: WebSocket, ticket: str | None = Query(defa
                 except (RuntimeError, json.JSONDecodeError):
                     break
 
-        event_task = asyncio.create_task(read_events())
-        msg_task = asyncio.create_task(handle_messages())
-
-        _done, pending = await asyncio.wait(
-            [event_task, msg_task], return_when=asyncio.FIRST_COMPLETED
-        )
-
-        for task in pending:
-            task.cancel()
+        close_code = await _serve(websocket, session, read_events(), handle_messages())
 
     except WebSocketDisconnect:
         pass
@@ -435,11 +532,7 @@ async def websocket_events(websocket: WebSocket, ticket: str | None = Query(defa
             pass
     finally:
         await _terminate(process)
-
-        try:
-            await websocket.close()
-        except (RuntimeError, WebSocketDisconnect):
-            pass
+        await _close(websocket, close_code)
 
 
 # Job connections: job_id -> set of websockets
@@ -502,6 +595,7 @@ async def websocket_job(
 
     # Subscribe to job updates
     manager.subscribe(job_id, on_job_update)
+    close_code = 1000
 
     try:
         # Send initial state
@@ -545,15 +639,7 @@ async def websocket_job(
                 except (RuntimeError, json.JSONDecodeError):
                     break
 
-        update_task = asyncio.create_task(send_updates())
-        msg_task = asyncio.create_task(handle_messages())
-
-        _done, pending = await asyncio.wait(
-            [update_task, msg_task], return_when=asyncio.FIRST_COMPLETED
-        )
-
-        for task in pending:
-            task.cancel()
+        close_code = await _serve(websocket, session, send_updates(), handle_messages())
 
     except WebSocketDisconnect:
         pass
@@ -568,10 +654,7 @@ async def websocket_job(
         manager.unsubscribe(job_id, on_job_update)
         if job_id in _job_connections:
             _job_connections[job_id].discard(websocket)
-        try:
-            await websocket.close()
-        except (RuntimeError, WebSocketDisconnect):
-            pass
+        await _close(websocket, close_code)
 
 
 @router.websocket("/jobs")
@@ -615,6 +698,7 @@ async def websocket_all_jobs(
 
     # Subscribe to all job updates
     manager.subscribe_all(on_any_job_update)
+    close_code = 1000
 
     try:
         # Send current jobs
@@ -658,15 +742,7 @@ async def websocket_all_jobs(
                 except (RuntimeError, json.JSONDecodeError):
                     break
 
-        update_task = asyncio.create_task(send_updates())
-        msg_task = asyncio.create_task(handle_messages())
-
-        _done, pending = await asyncio.wait(
-            [update_task, msg_task], return_when=asyncio.FIRST_COMPLETED
-        )
-
-        for task in pending:
-            task.cancel()
+        close_code = await _serve(websocket, session, send_updates(), handle_messages())
 
     except WebSocketDisconnect:
         pass
@@ -683,7 +759,4 @@ async def websocket_all_jobs(
         except ValueError:
             pass
         _all_jobs_connections.discard(websocket)
-        try:
-            await websocket.close()
-        except (RuntimeError, WebSocketDisconnect):
-            pass
+        await _close(websocket, close_code)

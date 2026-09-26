@@ -620,10 +620,15 @@ def update_service_config(
 
 @router.post("", response_model=ServiceActionResponse)
 def create_service(
-    data: CreateServiceRequest, request: Request, session: dict = Depends(get_current_session)
+    data: CreateServiceRequest, request: Request, session: dict = Depends(require_elevated)
 ):
     """
     Create a new systemd service.
+
+    Sudo mode, for either form of the request - a raw unit or the fields
+    that render one: a unit is a command systemd runs as root, restarted for
+    as long as the machine is up, which is the same standing reach editing a
+    unit by hand has.
     """
     # Creation goes through the manager so that the name, the environment and
     # the ownership rules are enforced in one place. Writing the file here,

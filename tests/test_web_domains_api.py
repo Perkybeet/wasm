@@ -62,7 +62,7 @@ def build(session: dict[str, Any]) -> TestClient:
 @pytest.fixture
 def client(store: Any) -> TestClient:
     """A client presenting an admin Bearer credential, which sudo mode does not ask."""
-    return build({"sid": "token", "scope": "admin", "source": "bearer"})
+    return build({"sid": "token", "scope": "admin", "source": "bearer", "type": "api_token"})
 
 
 class Calls:
@@ -225,7 +225,7 @@ def test_removing_calls_the_operation(client: TestClient, calls: Calls) -> None:
 
 
 def test_removing_from_a_cookie_session_needs_sudo_mode(store: Any, calls: Calls) -> None:
-    client = build({"sid": "browser", "scope": "admin", "source": "cookie"})
+    client = build({"sid": "browser", "scope": "admin", "source": "cookie", "type": "session"})
 
     response = client.delete("/api/apps/example.com/domains/shop.example.com")
 
@@ -235,7 +235,15 @@ def test_removing_from_a_cookie_session_needs_sudo_mode(store: Any, calls: Calls
 
 
 def test_removing_from_an_elevated_cookie_session_is_allowed(store: Any, calls: Calls) -> None:
-    client = build({"sid": "browser", "scope": "admin", "source": "cookie", "elevated_until": 4e9})
+    client = build(
+        {
+            "sid": "browser",
+            "scope": "admin",
+            "source": "cookie",
+            "type": "session",
+            "elevated_until": 4e9,
+        }
+    )
 
     response = client.delete("/api/apps/example.com/domains/shop.example.com")
 
@@ -295,7 +303,7 @@ def test_the_bare_dns_check_needs_no_application(
         points_here=True,
     )
     monkeypatch.setattr(domains_api, "check_dns", recorder.stub("dns", check))
-    client = build_bare({"sid": "token", "scope": "admin", "source": "bearer"})
+    client = build_bare({"sid": "token", "scope": "admin", "source": "bearer", "type": "api_token"})
 
     response = client.get("/api/domains/dns", params={"name": "new-app.example.com"})
 
@@ -322,7 +330,7 @@ def test_the_bare_dns_check_uses_the_same_operation_as_the_app_scoped_one(
         )
 
     monkeypatch.setattr(domains_api, "check_dns", fake_check_dns)
-    client = build_bare({"sid": "token", "scope": "admin", "source": "bearer"})
+    client = build_bare({"sid": "token", "scope": "admin", "source": "bearer", "type": "api_token"})
 
     client.get("/api/domains/dns", params={"name": "a.example.com"})
 

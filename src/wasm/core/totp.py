@@ -102,13 +102,16 @@ def totp_now(secret_b32: str, *, t: float | None = None, digits: int = DIGITS) -
     return _hotp(secret_b32, int(moment // PERIOD), digits)
 
 
-def verify(secret_b32: str, code: str, *, window: int = 1, t: float | None = None) -> bool:
+def matched_step(
+    secret_b32: str, code: str, *, window: int = 1, t: float | None = None
+) -> int | None:
     """
-    Check a code against the secret, allowing for clock drift.
+    Find the time step a code belongs to, allowing for clock drift.
 
     Every candidate in the window is compared in constant time, and all of
     them are computed whether or not an earlier one already matched, so the
-    comparison leaks nothing about which step a code belongs to.
+    comparison leaks nothing about which step a code belongs to. The step is
+    what a verifier remembers to refuse the same code twice (RFC 6238, 5.2).
 
     Args:
         secret_b32: The base32-encoded shared secret.
@@ -119,17 +122,36 @@ def verify(secret_b32: str, code: str, *, window: int = 1, t: float | None = Non
         t: UNIX timestamp to verify against; the current time when omitted.
 
     Returns:
-        True when the code is valid for some step inside the window.
+        The step number (UNIX time divided by :data:`PERIOD`) the code is
+        valid for, or None when it is valid for no step inside the window.
     """
     candidate = code.strip()
     if not candidate.isdigit() or len(candidate) != DIGITS or not secret_b32:
-        return False
+        return None
 
     now = int((time.time() if t is None else t) // PERIOD)
-    matched = False
+    found: int | None = None
     for offset in range(-window, window + 1):
-        matched |= hmac.compare_digest(_hotp(secret_b32, now + offset), candidate)
-    return matched
+        if hmac.compare_digest(_hotp(secret_b32, now + offset), candidate) and found is None:
+            found = now + offset
+    return found
+
+
+def verify(secret_b32: str, code: str, *, window: int = 1, t: float | None = None) -> bool:
+    """
+    Check a code against the secret, allowing for clock drift.
+
+    Args:
+        secret_b32: The base32-encoded shared secret.
+        code: The code the client typed.
+        window: Steps of drift tolerated on either side.
+        t: UNIX timestamp to verify against; the current time when omitted.
+
+    Returns:
+        True when the code is valid for some step inside the window. Says
+        nothing about whether it was used before; see :func:`matched_step`.
+    """
+    return matched_step(secret_b32, code, window=window, t=t) is not None
 
 
 def provisioning_uri(secret_b32: str, *, issuer: str = "WASM", account: str = "admin") -> str:
