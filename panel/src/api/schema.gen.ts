@@ -47,7 +47,8 @@ export interface paths {
          *         DomainError: When the domain is not acceptable.
          *         ValidationError: A resource limit is out of range (400, with the
          *             range) - the same check ``PATCH .../limits`` runs, so a limit
-         *             given at creation cannot be more permissive than one set later.
+         *             given at creation cannot be more permissive than one set later -
+         *             or ``package_manager`` names one WASM does not drive.
          */
         post: operations["create_app_api_apps_post"];
         delete?: never;
@@ -1395,6 +1396,10 @@ export interface paths {
          *     cannot rely on cookies use this instead of putting a long-lived token in a
          *     query string that proxies and access logs record.
          *
+         *     Any credential may ask: a session, the master token or an API token. The
+         *     ticket redeems as that same credential, with its scope, and only while it
+         *     is still valid - see :meth:`wasm.web.auth.TokenManager.consume_ws_ticket`.
+         *
          *     Args:
          *         request: The incoming request.
          *         session: The authenticated session.
@@ -1468,9 +1473,14 @@ export interface paths {
          * Delete Schedule
          * @description Remove an application's backup schedule.
          *
+         *     Removing the units stops future backups from ever running, silently -
+         *     D5's sudo mode list treats it the same as any other destructive delete,
+         *     so a cookie session has to confirm itself first; an admin-scoped Bearer
+         *     credential is exempt, per :func:`wasm.web.api.deps.ensure_elevated`.
+         *
          *     Args:
          *         domain: Domain whose schedule is removed.
-         *         session: The authenticated session.
+         *         session: The authenticated, elevated session.
          *
          *     Returns:
          *         The action outcome.
@@ -1899,6 +1909,15 @@ export interface paths {
          *
          *     The stored value is echoed back redacted, so a secret does not travel twice.
          *
+         *     A string value is coerced against the key's schema exactly as ``wasm
+         *     config set`` coerces argv: a key with a default is parsed as that
+         *     default's type, and a key with none is parsed as a JSON scalar or list,
+         *     falling back to a plain string. Without it, a caller that posts
+         *     form-shaped data - everything a string, such as a boolean field posted as
+         *     "false" - would store the literal string rather than the value it looks
+         *     like. A value that already arrived as JSON's own boolean, number or array
+         *     is left exactly as it was decoded.
+         *
          *     Args:
          *         body: Body carrying the dotted path and the new value.
          *         request: The incoming request, for the audit record.
@@ -2301,9 +2320,14 @@ export interface paths {
          * Delete Job
          * @description Remove a cron job's timer and service units.
          *
+         *     Deleting the units is as destructive as deleting the application they
+         *     were scheduled for - D5's sudo mode list treats it the same way, so a
+         *     cookie session has to confirm itself first; an admin-scoped Bearer
+         *     credential is exempt, per :func:`wasm.web.api.deps.ensure_elevated`.
+         *
          *     Args:
          *         name: Job name.
-         *         session: The authenticated session.
+         *         session: The authenticated, elevated session.
          *
          *     Returns:
          *         The action outcome.
@@ -2501,9 +2525,14 @@ export interface paths {
          *     backup directory, so the endpoint cannot be talked into reading
          *     ``/etc/shadow`` as the database superuser.
          *
+         *     Restoring overwrites whatever the target database currently holds - D5's
+         *     sudo mode list treats it the same as dropping a database, so a cookie
+         *     session has to confirm itself first; an admin-scoped Bearer credential is
+         *     exempt, per :func:`wasm.web.api.deps.ensure_elevated`.
+         *
          *     Args:
          *         request: The restore request.
-         *         session: The authenticated session.
+         *         session: The authenticated, elevated session.
          *
          *     Returns:
          *         The action outcome.
@@ -2873,10 +2902,15 @@ export interface paths {
          * Uninstall Engine
          * @description Queue the removal of an engine.
          *
+         *     Removing an engine can take every database it hosts with it - D5's sudo
+         *     mode list treats it the same as dropping a single database, so a cookie
+         *     session has to confirm itself first; an admin-scoped Bearer credential is
+         *     exempt, per :func:`wasm.web.api.deps.ensure_elevated`.
+         *
          *     Args:
          *         engine: Engine name.
          *         purge: Also remove configuration and data.
-         *         session: The authenticated session.
+         *         session: The authenticated, elevated session.
          *
          *     Returns:
          *         The queued job.
@@ -4809,7 +4843,8 @@ export interface paths {
          *         session: The authenticated session.
          *
          *     Returns:
-         *         The version comparison and how to update.
+         *         The version comparison and how to update, or ``status="disabled"``
+         *         and nothing else when the operator turned ``updates.check`` off.
          */
         get: operations["check_version_api_system_version_get"];
         put?: never;
@@ -5814,6 +5849,11 @@ export interface components {
              * @description MemoryMax for the unit, in MB; at least 64. Null: no limit
              */
             memory_max_mb?: number | null;
+            /**
+             * Package Manager
+             * @description Node package manager to install and build with (npm, pnpm, yarn, bun); omitted or null detects it from the project's lock file. Ignored by app types that do not use one (monorepo, docker-compose).
+             */
+            package_manager?: string | null;
             /**
              * Persistent Paths
              * @description Releases only: paths, relative to the application, linked into shared/ and kept across every release (uploads, storage)
@@ -8254,6 +8294,11 @@ export interface components {
             latest_version?: string | null;
             /** Release Url */
             release_url?: string | null;
+            /**
+             * Status
+             * @default checked
+             */
+            status: string;
             /** Update Command */
             update_command?: string | null;
         };

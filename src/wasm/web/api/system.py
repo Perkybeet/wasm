@@ -141,6 +141,11 @@ class UpdateInfo(BaseModel):
     has_update: bool
     update_command: str | None = None
     release_url: str | None = None
+    #: "checked" when GitHub was actually asked (or the cache was used),
+    #: "disabled" when the operator turned off ``updates.check`` - the panel
+    #: shows that as the reason nothing about a new release is known, rather
+    #: than a check that silently never happens.
+    status: str = "checked"
 
 
 class MachineMemory(BaseModel):
@@ -564,11 +569,15 @@ def check_version(session: Annotated[dict, Depends(get_current_session)]) -> Upd
         session: The authenticated session.
 
     Returns:
-        The version comparison and how to update.
+        The version comparison and how to update, or ``status="disabled"``
+        and nothing else when the operator turned ``updates.check`` off.
     """
     import time
 
     from wasm.core.update_checker import UpdateChecker
+
+    if not UpdateChecker.enabled():
+        return UpdateInfo(current_version=__version__, has_update=False, status="disabled")
 
     cached = UpdateChecker._read_cache()
 

@@ -3,33 +3,42 @@ set -e
 
 case "$1" in
     configure)
-        # Install Python dependencies that aren't available as .deb packages
-        echo "Installing Python dependencies..."
-        pip3 install inquirer --break-system-packages --quiet 2>/dev/null || {
-            echo "Warning: Failed to install inquirer. Interactive mode may not work."
-        }
-        
-        # Create wasm group if it doesn't exist
+        # Interactive mode's prompts come from questionary (Recommends) or,
+        # when that is not packaged for the distribution, are explained as
+        # missing. WASM never pip-installs into the system Python from a
+        # maintainer script: that bypasses dpkg entirely and, on modern
+        # Debian and Ubuntu, is refused by PEP 668 unless overridden, which is
+        # what --break-system-packages was silently forcing on every upgrade.
+
+        # wasm group: kept for /var/log/wasm below, which predates this file
+        # and is unrelated to config.yaml. It must not be used to grant
+        # group read access to config.yaml, which holds credentials.
         if ! getent group wasm > /dev/null 2>&1; then
             groupadd --system wasm
         fi
-        
+
         # Set proper permissions for directories
         if [ -d /var/www/apps ]; then
             chown -R www-data:www-data /var/www/apps
             chmod 755 /var/www/apps
         fi
-        
+
         if [ -d /var/log/wasm ]; then
             chown -R www-data:wasm /var/log/wasm
             chmod 775 /var/log/wasm
         fi
-        
+
+        # /etc/wasm holds config.yaml's credentials and, when the panel is
+        # used, its signing key and token hash (wasm.web.auth). Both must
+        # stay owner-only on every install and upgrade: tighten unconditionally
+        # rather than only when loose, so this can never widen either one.
         if [ -d /etc/wasm ]; then
-            chmod 755 /etc/wasm
-            # Config file readable by wasm group (contains sensitive data)
-            chown root:wasm /etc/wasm/config.yaml 2>/dev/null || true
-            chmod 640 /etc/wasm/config.yaml 2>/dev/null || true
+            chown root:root /etc/wasm
+            chmod 0700 /etc/wasm
+        fi
+        if [ -f /etc/wasm/config.yaml ]; then
+            chown root:root /etc/wasm/config.yaml
+            chmod 0600 /etc/wasm/config.yaml
         fi
 
         # Upgrade config file with new defaults (preserves user values)

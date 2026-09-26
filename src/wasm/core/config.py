@@ -6,7 +6,9 @@
 Global configuration management for WASM.
 
 The configuration file holds credentials (MySQL root password, SMTP account,
-OpenAI API key), so this module owns four security guarantees:
+and, in a file an older version wrote, an OpenAI API key that is no longer a
+default but is still redacted on sight if present), so this module owns four
+security guarantees:
 
 * every file it writes is created with :data:`SECRET_FILE_MODE` at ``open``
   time, never with a ``chmod`` afterwards, which would leave a window where the
@@ -34,6 +36,7 @@ rehearsal at all: the operator has already been told nothing would change.
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import os
 import re
@@ -102,18 +105,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # have until they are migrated explicitly.
         "layout": "releases",
     },
+    "updates": {
+        # Whether wasm asks GitHub for the latest release: the CLI's
+        # background check on every command and the panel's GET
+        # /api/system/version. On by default; an operator on an airgapped or
+        # firewalled server turns it off here rather than have every command
+        # start a request that can only time out. Off never blocks anything -
+        # the check already runs off the request/command path, in a
+        # background thread with a short timeout, behind a cache - it just
+        # means the request stops being made at all.
+        "check": True,
+    },
     "monitor": {
         "enabled": False,
         "scan_interval": 30,  # Local pattern scan every 30 seconds
-        "ai_interval": 3600,  # AI analysis every 1 hour
         "cpu_threshold": 80.0,
         "memory_threshold": 80.0,
-        "use_ai": True,
         "log_file": str(DEFAULT_LOG_DIR / "monitor.log"),
-        "openai": {
-            "api_key": "",
-            "model": "gpt-4o-mini",
-        },
         "smtp": {
             "host": "",
             "port": 465,
@@ -172,7 +180,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "ip_whitelist": [],
     },
     "databases": {
-        "backup_dir": "/var/backups/wasm/databases",
         "default_encoding": {
             "mysql": "utf8mb4",
             "postgresql": "UTF8",
@@ -311,13 +318,11 @@ _KEY_VALIDATORS: dict[str, Callable[[Any], Any]] = {
     "backup.max_per_app": _int_range_validator("backup.max_per_app", 1, 100),
     "web.port": _int_range_validator("web.port", 1, 65535),
     "web.session_timeout": _int_range_validator("web.session_timeout", 300, 86400),
-    # The flat key the deployers, the panel's dedicated endpoint and
-    # wasm.core.config.Config.apps_directory read, and the dotted key
-    # wasm.web.machine reads for the disk usage meter - two separate settings
-    # that share a name in every command an operator is told to run, so both
-    # get the same guard against a relative path breaking their reader.
+    # The one key every deployer, wasm.core.config.Config.apps_directory and
+    # the panel's disk usage meter read. "apps.directory" is a deprecated
+    # dotted alias, resolved to this key by _canonical_key() before a
+    # validator is even looked up - see KEY_ALIASES.
     "apps_directory": _validate_absolute_path("apps_directory"),
-    "apps.directory": _validate_absolute_path("apps.directory"),
 }
 
 
@@ -374,6 +379,174 @@ def _validate_known_values_in(tree: dict[str, Any]) -> None:
         if leaf not in node:
             continue
         node[leaf] = validator(node[leaf])
+
+
+# Deprecated dotted spellings, mapped to the flat key every deployer and the
+# rest of the codebase actually reads. "apps.directory" used to be treated as
+# a second, independent setting: wasm.web.machine's disk meter and the
+# command the panel told an operator to run both addressed it, while every
+# deployer read "apps_directory" - so the disk meter always reported the
+# hard-coded default, no matter what the apps directory was really set to.
+# Both Config.get and Config.set resolve an alias to its canonical key before
+# doing anything else, so there is exactly one setting on disk and every
+# reader agrees on it, whichever spelling wrote it.
+KEY_ALIASES: dict[str, str] = {
+    "apps.directory": "apps_directory",
+}
+
+
+def _canonical_key(key: str) -> str:
+    """
+    Resolve a deprecated dotted alias to the key every reader actually uses.
+
+    Args:
+        key: The key exactly as a caller addressed it.
+
+    Returns:
+        The canonical key, or ``key`` unchanged when it is not an alias.
+    """
+    return KEY_ALIASES.get(key, key)
+
+
+def _fold_aliases(tree: dict[str, Any]) -> dict[str, Any]:
+    """
+    Move a deprecated alias's value to its canonical key in a whole tree.
+
+    :meth:`Config.get` and :meth:`Config.set` resolve a dotted alias before
+    they ever look at ``self._config``, but :meth:`Config.replace` receives a
+    full tree - such as ``{"apps": {"directory": "/srv/apps"}}`` - with no
+    single dotted key to resolve. Without this, a full ``PUT`` written with
+    the deprecated shape would store it as a container the canonical reader
+    never looks at, silently reintroducing the split this alias exists to
+    close.
+
+    A canonical key already present in the tree wins over the alias, the same
+    precedence a caller setting both in one request should expect from the
+    more specific, current spelling.
+
+    Args:
+        tree: Configuration about to be stored. Not modified.
+
+    Returns:
+        A copy of ``tree`` with every alias folded into its canonical key and
+        removed.
+    """
+    resolved = copy.deepcopy(tree)
+    for alias, canonical in KEY_ALIASES.items():
+        *parents, leaf = alias.split(".")
+        containers: list[dict[str, Any]] = [resolved]
+        node: Any = resolved
+        for parent in parents:
+            if not isinstance(node, dict) or parent not in node:
+                node = None
+                break
+            node = node[parent]
+            containers.append(node)
+        if not isinstance(node, dict) or leaf not in node:
+            continue
+
+        value = node.pop(leaf)
+        if canonical not in resolved:
+            resolved[canonical] = value
+
+        # An alias container left empty by the pop is not a setting either;
+        # leaving it behind would still be a second, if empty, place the
+        # value used to live. Pruned deepest first, in case that empties its
+        # own parent in turn.
+        for depth in range(len(parents) - 1, -1, -1):
+            if containers[depth + 1]:
+                break
+            del containers[depth][parents[depth]]
+    return resolved
+
+
+#: Marks "this key has no default value to coerce against", for
+#: :func:`coerce_config_value`. A key's own value cannot serve as that marker,
+#: because a key can genuinely default to ``None``.
+NO_DEFAULT = object()
+
+#: Command line or PATCH words a boolean setting accepts, compared
+#: case-insensitively.
+TRUE_WORDS = frozenset({"1", "true", "yes", "on"})
+FALSE_WORDS = frozenset({"0", "false", "no", "off"})
+
+
+def coerce_config_value(existing: Any, raw: str) -> Any:
+    """
+    Parse a string value the way ``wasm config set`` and ``PATCH /api/config``
+    both have to: against the type of the key's default, or, when there is no
+    default, as a JSON scalar or list.
+
+    Argv only ever hands a command a string, and a caller sending
+    form-shaped data (everything a string, no JSON types) has the same
+    problem: without this, ``wasm config set ssl.enabled false`` or a PATCH
+    body ``{"path": "ssl.enabled", "value": "false"}`` stores the literal
+    string ``"false"``, which is truthy. A key whose current or default value
+    is a list also accepts a JSON array (``["a@example.com"]``) without any
+    extra flag, since a command line or a string field has no other way to
+    shape one.
+
+    A key with no default at all - ``existing`` is :data:`NO_DEFAULT` - has no
+    type to match, so the value is parsed as a JSON scalar (``true``,
+    ``false``, ``null``, a number) or a JSON array, and left as the plain
+    string it looks like when it is not valid JSON or parses to something
+    else, such as an object.
+
+    Args:
+        existing: Current or default value for the key, or :data:`NO_DEFAULT`
+            when the key has none.
+        raw: The value exactly as typed on the command line or received as a
+            string over the API.
+
+    Returns:
+        The value cast to match ``existing``, a JSON scalar or list recovered
+        from ``raw`` when there is no default to match, or ``raw`` unchanged
+        when nothing else applies.
+
+    Raises:
+        ConfigError: When ``existing`` is a boolean or a number and ``raw``
+            cannot be parsed as one.
+    """
+    if isinstance(existing, list):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return raw
+        return parsed if isinstance(parsed, list) else raw
+
+    if isinstance(existing, bool):
+        lowered = raw.strip().lower()
+        if lowered in TRUE_WORDS:
+            return True
+        if lowered in FALSE_WORDS:
+            return False
+        raise ConfigError(
+            f"Expected a boolean, got {raw!r}",
+            details=f"Use one of: {', '.join(sorted(TRUE_WORDS | FALSE_WORDS))}.",
+        )
+
+    if isinstance(existing, int):
+        try:
+            return int(raw)
+        except ValueError as exc:
+            raise ConfigError(f"Expected a whole number, got {raw!r}") from exc
+
+    if isinstance(existing, float):
+        try:
+            return float(raw)
+        except ValueError as exc:
+            raise ConfigError(f"Expected a number, got {raw!r}") from exc
+
+    if existing is NO_DEFAULT:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return raw
+        if parsed is None or isinstance(parsed, (bool, int, float, list)):
+            return parsed
+        return raw
+
+    return raw
 
 
 # Words that mark a configuration key as holding a secret. The key name is split
@@ -875,7 +1048,9 @@ class Config:
         Keys listed in :data:`REMOVED_KEYS` always return their pinned safe
         value and ignore ``default``, and so do the same keys read through their
         container: ``get("monitor")["auto_terminate"]`` is the pinned value, not
-        the caller's optimistic default.
+        the caller's optimistic default. A key listed in :data:`KEY_ALIASES`,
+        such as ``apps.directory``, reads its canonical key instead, so an
+        alias always answers with what was actually stored.
 
         Args:
             key: Configuration key (supports dot notation for nested values).
@@ -884,6 +1059,8 @@ class Config:
         Returns:
             Configuration value or default.
         """
+        key = _canonical_key(key)
+
         if key in REMOVED_KEYS:
             return REMOVED_KEYS[key]
 
@@ -921,6 +1098,11 @@ class Config:
         ``web.session_timeout``); a value one of them rejects is rejected here
         too, whichever front end called.
 
+        A key listed in :data:`KEY_ALIASES`, such as ``apps.directory``, is
+        written to its canonical key instead, so a deprecated spelling cannot
+        create a second, independent setting that the rest of the codebase
+        never reads.
+
         Args:
             key: Configuration key (supports dot notation).
             value: Value to set.
@@ -928,6 +1110,8 @@ class Config:
         Raises:
             ConfigError: When ``key`` has a shared rule and ``value`` fails it.
         """
+        key = _canonical_key(key)
+
         if key in REMOVED_KEYS:
             logger.debug("Ignoring write to removed configuration key %s", key)
             return
@@ -950,10 +1134,13 @@ class Config:
         """
         Replace the whole configuration with a caller-supplied mapping.
 
-        This is what a full update from the web panel goes through. Three
-        things happen on the way in: :data:`REDACTED` placeholders take the
-        secret that is currently stored, because the panel only ever saw the
-        redacted dump; removed settings are dropped, because a stale form
+        This is what a full update from the web panel goes through. Four
+        things happen on the way in: a deprecated alias such as
+        ``{"apps": {"directory": ...}}`` is folded into its canonical key,
+        because a whole-tree ``PUT`` has no single dotted key for
+        :meth:`get`/:meth:`set` to resolve; :data:`REDACTED` placeholders take
+        the secret that is currently stored, because the panel only ever saw
+        the redacted dump; removed settings are dropped, because a stale form
         must not be able to reintroduce them; and every key in
         :data:`_KEY_VALIDATORS` that is present is checked against the same
         rule :meth:`set` enforces. Without that last step a value ``wasm
@@ -969,7 +1156,8 @@ class Config:
             ConfigError: When a validated key is present with a value that
                 fails its rule.
         """
-        resolved: dict[str, Any] = restore_redacted(config, self._config)
+        folded = _fold_aliases(config)
+        resolved: dict[str, Any] = restore_redacted(folded, self._config)
         stripped = _strip_removed_keys(resolved)
         _validate_known_values_in(stripped)
         self._config = stripped

@@ -488,6 +488,43 @@ def test_rate_limiting_applies_to_the_hook_surface(tmp_path: Path, store: WASMSt
     assert statuses[-1] == 429
 
 
+def test_a_locked_out_address_cannot_post_to_the_hook(
+    tmp_path: Path, store: WASMStore, secret: str, queued: list[dict[str, Any]]
+) -> None:
+    """
+    Bad signatures are counted by the lockout, so the lockout has to refuse.
+
+    The reported defect: the hook counted every wrong signature, but the
+    middleware's lockout gate only guarded the login form, Bearer requests
+    and WebSockets, so a locked-out address kept guessing signatures at the
+    hook - and could still deliver - as if nothing had happened.
+    """
+    app = build_app(
+        SecurityConfig(
+            state_dir=tmp_path / "state",
+            rate_limit_requests=5000,
+            max_failed_attempts=3,
+            lockout_duration=60,
+        )
+    )
+    client = TestClient(app, client=("testclient", 50000))
+
+    wrong = {"X-Hub-Signature-256": "sha256=" + "0" * 64, "Content-Type": "application/json"}
+    statuses = [
+        client.post(f"/hooks/deploy/{DOMAIN}", content=PUSH_MAIN, headers=wrong).status_code
+        for _ in range(3)
+    ]
+    assert statuses == [401, 401, 401]
+
+    signed = client.post(
+        f"/hooks/deploy/{DOMAIN}", content=PUSH_MAIN, headers=github_headers(secret, PUSH_MAIN)
+    )
+
+    assert signed.status_code == 429, signed.text
+    assert signed.json()["error"] == "locked_out"
+    assert queued == []
+
+
 def test_the_ip_whitelist_applies_to_the_hook_surface(tmp_path: Path, store: WASMStore) -> None:
     """An address outside the whitelist never reaches the signature check."""
     app = build_app(SecurityConfig(state_dir=tmp_path / "state", ip_whitelist=["10.0.0.5"]))

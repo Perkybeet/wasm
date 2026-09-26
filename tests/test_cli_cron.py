@@ -213,6 +213,25 @@ def test_list_reports_an_owned_job(
     assert "enabled" in result.output
 
 
+def test_list_shows_the_effective_working_directory(
+    cli_runner: CliRunner, runner: FakeRunner, systemd_dir: Path
+) -> None:
+    """
+    The directory column is read back from the unit's own WorkingDirectory=,
+    so it shows current/ for a releases application rather than the app root
+    a stale listing would otherwise imply.
+    """
+    write_owned_pair(systemd_dir)
+    runner.script(["systemctl", "list-unit-files"], stdout=LIST_UNIT_FILES_LINE)
+    runner.script(["systemctl", "show", "wasm-cron-cleanup.timer"], stdout=SHOW_TIMER_OUTPUT)
+    runner.script(["systemctl", "show", "wasm-cron-cleanup.service"], stdout="")
+
+    result = cli_runner.invoke(cron_cli.cli, ["list"])
+
+    assert result.exit_code == 0, result.output
+    assert "/srv/caches" in result.output
+
+
 # ---------------------------------------------------------------------------
 # create
 # ---------------------------------------------------------------------------

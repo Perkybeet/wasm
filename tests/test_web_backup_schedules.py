@@ -60,6 +60,19 @@ def client(app: FastAPI) -> TestClient:
     return signed_in
 
 
+def elevate(client: TestClient) -> None:
+    """
+    Confirm sudo mode for the signed-in client.
+
+    Args:
+        client: A signed-in client.
+    """
+    response = client.post(
+        "/api/auth/elevate", json={"token": get_token_manager().generate_master_token()}
+    )
+    assert response.status_code == 200, response.text
+
+
 @pytest.fixture
 def anonymous(app: FastAPI) -> TestClient:
     """
@@ -193,13 +206,29 @@ def test_listing_reports_each_timer_with_its_next_run(
     assert schedule["last_run"] == "Fri 2026-08-14 02:00:00 UTC"
 
 
-def test_deleting_a_schedule_stops_the_timer_and_removes_both_units(
+def test_deleting_a_schedule_requires_elevation(
     client: TestClient, runner: FakeRunner, systemd_dir: Path
 ) -> None:
-    """DELETE tears down exactly what create built."""
+    """Removing a schedule's units needs a recent sudo confirmation, like any other delete."""
     timer, service = written_units(systemd_dir)
     timer.write_text("[Timer]\n")
     service.write_text("[Service]\n")
+
+    response = client.delete("/api/backup-schedules/example.com")
+
+    assert response.status_code == 403, response.text
+    assert response.json()["error"] == "elevation_required"
+    assert timer.exists() and service.exists()
+
+
+def test_deleting_a_schedule_stops_the_timer_and_removes_both_units(
+    client: TestClient, runner: FakeRunner, systemd_dir: Path
+) -> None:
+    """DELETE tears down exactly what create built, once elevated."""
+    timer, service = written_units(systemd_dir)
+    timer.write_text("[Timer]\n")
+    service.write_text("[Service]\n")
+    elevate(client)
 
     response = client.delete("/api/backup-schedules/example.com")
 
@@ -215,11 +244,30 @@ def test_deleting_a_schedule_that_does_not_exist_answers_404(
 ) -> None:
     """A delete that removed nothing must not report success."""
     runner.script(("systemctl", "is-enabled"), exit_code=1)
+    elevate(client)
 
     response = client.delete("/api/backup-schedules/example.com")
 
     assert response.status_code == 404
     assert ("systemctl", "stop", "wasm-backup-example-com.timer") not in runner.calls
+
+
+def test_deleting_a_schedule_with_the_master_token_is_exempt(
+    app: FastAPI, runner: FakeRunner, systemd_dir: Path
+) -> None:
+    """Automation presenting the master token needs no elevation either."""
+    timer, service = written_units(systemd_dir)
+    timer.write_text("[Timer]\n")
+    service.write_text("[Service]\n")
+    token = get_token_manager().generate_master_token()
+    anon = TestClient(app, client=("testclient", 50000), follow_redirects=False)
+
+    response = anon.delete(
+        "/api/backup-schedules/example.com", headers={"Authorization": f"Bearer {token}"}
+    )
+
+    assert response.status_code == 200, response.text
+    assert not timer.exists() and not service.exists()
 
 
 def test_an_injected_calendar_answers_422_with_the_schedulers_refusal(

@@ -589,9 +589,9 @@ def test_a_missing_argument_is_a_usage_error(
         ["create", "-d", "example.com", "-s", ".", "-p", "abc"],
         ["create", "-d", "example.com", "-s", ".", "-t", "cobol"],
         ["create", "-d", "example.com", "-s", ".", "-w", "iis"],
-        ["create", "-d", "example.com", "-s", ".", "--pm", "yarn"],
+        ["create", "-d", "example.com", "-s", ".", "--pm", "cobol-pm"],
         ["create", "-d", "example.com", "-s", ".", "--env-file", "/nowhere/.env"],
-        ["update", "example.com", "--package-manager", "yarn"],
+        ["update", "example.com", "--package-manager", "cobol-pm"],
         ["logs", "example.com", "-n", "lots"],
     ],
     ids=lambda argv: " ".join(argv),
@@ -699,7 +699,7 @@ def test_create_configures_the_deployer_and_deploys(
         "webserver": "nginx",
         "ssl": True,
         "branch": "main",
-        # The quotes are stripped here so they never reach systemd's Environment=.
+        # Read in EnvManager's grammar: the quotes are syntax, not part of the value.
         "env_vars": {"DATABASE_URL": "postgres://localhost/app"},
         "package_manager": "pnpm",
         "include_www": True,
@@ -708,6 +708,21 @@ def test_create_configures_the_deployer_and_deploys(
         "layout": "default",
         "persistent_paths": None,
     }
+
+
+def test_create_accepts_yarn(cli_runner: CliRunner, deployer: DeployerSpy) -> None:
+    """
+    Yarn is fully supported by PackageManagerHelper (detect, verify, install,
+    run and exec commands); PACKAGE_MANAGERS just did not say so, which made
+    '--pm yarn' a usage error before the deployer ever saw it.
+    """
+    result = cli_runner.invoke(
+        webapp.cli.commands["create"],
+        ["-d", "example.com", "-s", "https://github.com/user/repo", "-t", "nextjs", "--pm", "yarn"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert deployer.configured["package_manager"] == "yarn"
 
 
 def test_create_without_a_type_detects_it_after_fetching(
@@ -1167,6 +1182,24 @@ def test_restart_fails_when_there_is_no_service(
 # ---------------------------------------------------------------------------
 
 
+def test_update_help_is_true_for_both_layouts(cli_runner: CliRunner) -> None:
+    """
+    'A backup is taken first' used to be stated unconditionally, but that is
+    only true on the in-place layout: a releases application takes no backup
+    at all - the release that was serving stays on disk and is the way back.
+    """
+    result = cli_runner.invoke(webapp.cli.commands["update"], ["--help"])
+    # Click reflows the help text to the terminal width, so a phrase can be
+    # split across a line break; comparing on normalised whitespace is what
+    # makes the assertion independent of exactly where that happens.
+    normalized = " ".join(result.output.lower().split())
+
+    assert result.exit_code == 0, result.output
+    assert "releases layout" in normalized
+    assert "no backup" in normalized
+    assert "in-place layout" in normalized
+
+
 def test_update_delegates_the_rebuild_to_the_deployer(
     cli_runner: CliRunner,
     monkeypatch: pytest.MonkeyPatch,
@@ -1215,6 +1248,42 @@ def test_update_delegates_the_rebuild_to_the_deployer(
     assert deployer.steps == ["Installing dependencies", "Building"]
     assert deployer.configured["package_manager"] == "pnpm"
     assert ("restart", "example-com") in services.calls
+
+
+def test_update_accepts_yarn(
+    cli_runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    store: StoreSpy,
+    services: ServiceSpy,
+    deployer: DeployerSpy,
+    tmp_path: Path,
+) -> None:
+    """'--package-manager yarn' was a usage error for the same reason '--pm yarn' was."""
+    app_path = tmp_path / "example-com"
+    (app_path / ".git").mkdir(parents=True)
+    store.apps["example.com"] = make_app(app_path=str(app_path))
+
+    monkeypatch.setattr(
+        lifecycle,
+        "SourceManager",
+        lambda verbose=False: SimpleNamespace(
+            pull=lambda path, branch=None: None,
+            fetch=lambda *a, **kw: None,
+        ),
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "RollbackManager",
+        lambda verbose=False: SimpleNamespace(create_pre_deploy_backup=lambda **kw: None),
+    )
+    monkeypatch.setattr(lifecycle.time, "sleep", lambda seconds: None)
+
+    result = cli_runner.invoke(
+        webapp.cli.commands["update"], ["example.com", "--package-manager", "yarn"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert deployer.configured["package_manager"] == "yarn"
 
 
 def test_update_rebuilds_a_monorepo_through_its_deployer(

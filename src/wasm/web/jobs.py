@@ -862,6 +862,7 @@ def deploy_app_job(
     memory_max_mb: int | None = None,
     cpu_quota_percent: int | None = None,
     tasks_max: int | None = None,
+    package_manager: str | None = None,
     job_context: JobContext | None = None,
 ) -> dict[str, Any]:
     """
@@ -899,6 +900,10 @@ def deploy_app_job(
         cpu_quota_percent: ``CPUQuota`` the unit is created with, in percent
             of one CPU.
         tasks_max: ``TasksMax`` the unit is created with.
+        package_manager: Node package manager to install and build with
+            (npm, pnpm, yarn, bun); None detects it from the project's lock
+            file. Ignored by deployers that do not use one (monorepo and
+            docker-compose install through their own tooling).
         job_context: Injected by the job manager.
 
     Returns:
@@ -939,6 +944,7 @@ def deploy_app_job(
         cpu_quota_percent=cpu_quota_percent,
         tasks_max=tasks_max,
         resource_limits_given=True,
+        package_manager=package_manager or "auto",
     )
 
     context.update("Deploying", 10)

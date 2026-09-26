@@ -489,7 +489,10 @@ def test_list_open_prints_the_configured_panel_url_without_a_display(
     result = _invoke(["cert", "list", "--open"])
 
     assert result.exit_code == 0
-    assert any("http://127.0.0.1:8080/certificates" in line for line in log)
+    # /certificates does not exist in the console; certificates are a tab of
+    # /domains, whose default tab already is "certificates" - the explicit
+    # query keeps the link correct even if that default ever changes.
+    assert any("http://127.0.0.1:8080/domains?tab=certificates" in line for line in log)
     assert not runner.calls_to("xdg-open")
 
 
@@ -508,7 +511,9 @@ def test_list_open_launches_xdg_open_when_a_display_is_present(
     result = _invoke(["cert", "list", "--open"])
 
     assert result.exit_code == 0
-    assert runner.calls_to("xdg-open") == [("xdg-open", "http://127.0.0.1:8080/certificates")]
+    assert runner.calls_to("xdg-open") == [
+        ("xdg-open", "http://127.0.0.1:8080/domains?tab=certificates")
+    ]
 
 
 def test_list_open_without_a_configured_panel_warns_and_exits_clean(

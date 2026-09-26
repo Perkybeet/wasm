@@ -471,7 +471,10 @@ def list_command(ctx: Context, open_panel: bool) -> None:
     """List the certificates this machine holds, with their expiry dates."""
     code = _list_certificates(_manager(ctx.verbose), ctx.logger)
     if open_panel and code == 0:
-        open_in_panel("/certificates", logger=ctx.logger)
+        # /certificates does not exist in the console: certificates are the
+        # default tab of /domains, not a page of their own. The explicit
+        # query keeps this link correct even if that default ever changes.
+        open_in_panel("/domains?tab=certificates", logger=ctx.logger)
 
 
 @cli.command("info", short_help="Show one certificate. Also 'show'.")

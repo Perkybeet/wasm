@@ -41,6 +41,7 @@ from wasm.deployers.base import BaseDeployer
 from wasm.deployers.helpers.app_env import read_app_env, write_app_env
 from wasm.deployers.helpers.env_manager import EnvManager, redact_url_credentials
 from wasm.deployers.helpers.layout import RELEASES
+from wasm.deployers.helpers.package_manager import SUPPORTED_PACKAGE_MANAGERS
 from wasm.deployers.inspect import inspect_source
 from wasm.deployers.lifecycle import activate_release, list_releases, set_resource_limits
 from wasm.deployers.migrate import MigrationPlan, migrate, plan_migration
@@ -240,6 +241,12 @@ class CreateAppRequest(BaseModel):
     tasks_max: int | None = Field(
         default=None,
         description="TasksMax for the unit, processes and threads; at least 16. Null: no limit",
+    )
+    package_manager: str | None = Field(
+        default=None,
+        description="Node package manager to install and build with (npm, pnpm, yarn, bun); "
+        "omitted or null detects it from the project's lock file. Ignored by app types that "
+        "do not use one (monorepo, docker-compose).",
     )
 
 
@@ -542,7 +549,8 @@ def create_app(
         DomainError: When the domain is not acceptable.
         ValidationError: A resource limit is out of range (400, with the
             range) - the same check ``PATCH .../limits`` runs, so a limit
-            given at creation cannot be more permissive than one set later.
+            given at creation cannot be more permissive than one set later -
+            or ``package_manager`` names one WASM does not drive.
     """
     domain = strict_domain(body.domain)
 
@@ -561,6 +569,13 @@ def create_app(
         cpu_quota_percent=body.cpu_quota_percent,
         tasks_max=body.tasks_max,
     ).validated()
+
+    if body.package_manager is not None and body.package_manager not in SUPPORTED_PACKAGE_MANAGERS:
+        raise ValidationError(
+            f"Unsupported package manager: {body.package_manager!r}",
+            details=f"Choose one of: {', '.join(SUPPORTED_PACKAGE_MANAGERS)}, "
+            "or omit it to detect automatically from the project's lock file.",
+        )
 
     job = get_job_manager().create_job(
         job_type=JobType.DEPLOY,
@@ -587,6 +602,7 @@ def create_app(
             "memory_max_mb": body.memory_max_mb,
             "cpu_quota_percent": body.cpu_quota_percent,
             "tasks_max": body.tasks_max,
+            "package_manager": body.package_manager,
         },
         metadata={"domain": domain, "app_type": body.app_type, "port": port},
         actor=actor_label(session),
@@ -951,7 +967,7 @@ def get_app_env(
                 action="apps.env.reveal",
                 result="success",
                 client_ip=get_client_ip(request),
-                actor=str(session.get("sid")),
+                actor=actor_label(session),
                 resource=f"/api/apps/{app.domain}/env",
                 detail=f"revealed {len(values)} variable(s) in clear",
             )
@@ -1011,7 +1027,7 @@ def update_app_env(
             action="apps.env.update",
             result="success",
             client_ip=get_client_ip(request),
-            actor=str(session.get("sid")),
+            actor=actor_label(session),
             resource=f"/api/apps/{app.domain}/env",
             detail=f"changed keys: {', '.join(changed)}" if changed else "no keys changed",
         )

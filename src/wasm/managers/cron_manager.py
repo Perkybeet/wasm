@@ -53,6 +53,7 @@ from wasm.core.fs import FileSystem, get_fs
 from wasm.core.logger import Logger
 from wasm.core.runner import CommandRunner, get_runner
 from wasm.core.store import get_store
+from wasm.deployers.helpers.layout import code_path_for
 from wasm.managers.backup_scheduler import SCHEDULE_ALIASES, validate_calendar
 from wasm.validators.environment import escape_systemd_value, validate_unit_value
 from wasm.validators.names import resolve_within, validate_app_name, validate_service_name
@@ -127,8 +128,9 @@ class CronJob:
         user: Unix user the command runs as. None means the configured
             ``service_user``.
         working_directory: Absolute directory the command runs in. None means
-            the associated application's directory when there is one,
-            otherwise systemd's default.
+            the associated application's runtime path when there is one -
+            ``current/`` on the releases layout, the application root in
+            place - otherwise systemd's default.
         app_domain: Domain of the application this job belongs to, when any.
     """
 
@@ -374,7 +376,10 @@ class CronManager:
         Returns:
             A new job with the name checked, the calendar expanded, the user
             defaulted to the configured ``service_user`` and the working
-            directory defaulted to the associated application's directory.
+            directory defaulted to the associated application's runtime path -
+            ``current/`` for an application on the releases layout, since that
+            is what every relative path the job's command uses is relative
+            to.
 
         Raises:
             ServiceError: When any value is not something WASM is willing to
@@ -401,7 +406,13 @@ class CronManager:
                     "application empty.",
                 )
             if working_directory is None:
-                working_directory = app.app_path
+                # code_path_for is the one layout helper: current/ for an
+                # application on the releases layout, the application root in
+                # place. Using app.app_path directly ran the job in the app
+                # root even on releases, where the root holds no code at all
+                # after the first deploy - only releases/ and current/ do -
+                # so every relative path the command used broke.
+                working_directory = str(code_path_for(app))
         if working_directory is not None:
             validate_unit_value(working_directory, field="WorkingDirectory")
             if not working_directory.startswith("/"):

@@ -193,7 +193,6 @@ class TestSecretsNeverLeave:
         config = client.get("/api/config").json()["config"]
 
         assert config["monitor"]["smtp"]["password"] == ""
-        assert config["monitor"]["openai"]["api_key"] == ""
 
     def test_reload_redacts_too(self, client: TestClient, stored_secrets: dict[str, str]) -> None:
         """The reload endpoint returns the same dump and must redact it."""
@@ -420,6 +419,56 @@ class TestUpdateSemantics:
 
         assert response.status_code == 200, response.text
         assert stored_value(config_path, "backup.max_per_app") == 7
+
+    def test_patch_coerces_a_string_boolean_for_a_key_with_no_default(
+        self, client: TestClient, config_path: Path
+    ) -> None:
+        """
+        A caller posting form-shaped data (everything a string) hits the same
+        coercion gap the CLI has: monitor.notify has no default, so
+        Config.set stored the literal string "false" until PATCH used the
+        same schema-aware coercion 'wasm config set' does.
+        """
+        response = client.patch("/api/config", json={"path": "monitor.notify", "value": "false"})
+
+        assert response.status_code == 200, response.text
+        assert stored_value(config_path, "monitor.notify") is False
+
+    def test_patch_leaves_an_already_typed_value_alone(
+        self, client: TestClient, config_path: Path
+    ) -> None:
+        """A JSON boolean sent as JSON must not be coerced a second time."""
+        response = client.patch("/api/config", json={"path": "monitor.notify", "value": True})
+
+        assert response.status_code == 200, response.text
+        assert stored_value(config_path, "monitor.notify") is True
+
+    def test_patch_normalises_the_deprecated_apps_directory_alias(
+        self, client: TestClient, config_path: Path
+    ) -> None:
+        """
+        'apps.directory' used to be a second, independent setting from the
+        flat 'apps_directory' every deployer reads. A PATCH addressed at the
+        alias must land on the canonical key, not create a separate 'apps'
+        container nothing reads.
+        """
+        response = client.patch(
+            "/api/config", json={"path": "apps.directory", "value": "/srv/apps"}
+        )
+
+        assert response.status_code == 200, response.text
+        assert stored_value(config_path, "apps_directory") == "/srv/apps"
+        assert stored_value(config_path, "apps") is None
+
+    def test_full_replace_folds_the_deprecated_apps_directory_alias(
+        self, client: TestClient, config_path: Path
+    ) -> None:
+        """A whole-config PUT written with the old nested shape is folded too."""
+        response = client.put("/api/config", json={"config": {"apps": {"directory": "/srv/apps"}}})
+
+        assert response.status_code == 200, response.text
+        assert stored_value(config_path, "apps_directory") == "/srv/apps"
+        assert stored_value(config_path, "apps") is None
 
     def test_apps_directory_round_trip(self, client: TestClient) -> None:
         """What was written must be what is read back."""

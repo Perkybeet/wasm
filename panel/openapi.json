@@ -1685,6 +1685,18 @@
             "description": "MemoryMax for the unit, in MB; at least 64. Null: no limit",
             "title": "Memory Max Mb"
           },
+          "package_manager": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Node package manager to install and build with (npm, pnpm, yarn, bun); omitted or null detects it from the project's lock file. Ignored by app types that do not use one (monorepo, docker-compose).",
+            "title": "Package Manager"
+          },
           "persistent_paths": {
             "anyOf": [
               {
@@ -6142,6 +6154,11 @@
             ],
             "title": "Release Url"
           },
+          "status": {
+            "default": "checked",
+            "title": "Status",
+            "type": "string"
+          },
           "update_command": {
             "anyOf": [
               {
@@ -6923,7 +6940,7 @@
   "info": {
     "description": "Web-based dashboard for WASM - Web App System Management",
     "title": "WASM Web Interface",
-    "version": "1.0.0"
+    "version": "unversioned"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -6949,7 +6966,7 @@
         ]
       },
       "post": {
-        "description": "Queue the deployment of a new application.\n\nArgs:\n    body: The deployment request.\n    session: The authenticated session.\n\nReturns:\n    The queued job.\n\nRaises:\n    HTTPException: 409 when the domain is already deployed, 503 when no\n        port is free.\n    PortError: When the requested port is not usable.\n    DomainError: When the domain is not acceptable.\n    ValidationError: A resource limit is out of range (400, with the\n        range) - the same check ``PATCH .../limits`` runs, so a limit\n        given at creation cannot be more permissive than one set later.",
+        "description": "Queue the deployment of a new application.\n\nArgs:\n    body: The deployment request.\n    session: The authenticated session.\n\nReturns:\n    The queued job.\n\nRaises:\n    HTTPException: 409 when the domain is already deployed, 503 when no\n        port is free.\n    PortError: When the requested port is not usable.\n    DomainError: When the domain is not acceptable.\n    ValidationError: A resource limit is out of range (400, with the\n        range) - the same check ``PATCH .../limits`` runs, so a limit\n        given at creation cannot be more permissive than one set later -\n        or ``package_manager`` names one WASM does not drive.",
         "operationId": "create_app_api_apps_post",
         "requestBody": {
           "content": {
@@ -8753,7 +8770,7 @@
     },
     "/api/auth/ws-ticket": {
       "post": {
-        "description": "Issue a single-use ticket for opening a WebSocket.\n\nBrowsers cannot set headers on a WebSocket handshake, so clients that\ncannot rely on cookies use this instead of putting a long-lived token in a\nquery string that proxies and access logs record.\n\nArgs:\n    request: The incoming request.\n    session: The authenticated session.\n\nReturns:\n    The ticket and its lifetime.",
+        "description": "Issue a single-use ticket for opening a WebSocket.\n\nBrowsers cannot set headers on a WebSocket handshake, so clients that\ncannot rely on cookies use this instead of putting a long-lived token in a\nquery string that proxies and access logs record.\n\nAny credential may ask: a session, the master token or an API token. The\nticket redeems as that same credential, with its scope, and only while it\nis still valid - see :meth:`wasm.web.auth.TokenManager.consume_ws_ticket`.\n\nArgs:\n    request: The incoming request.\n    session: The authenticated session.\n\nReturns:\n    The ticket and its lifetime.",
         "operationId": "create_ws_ticket_api_auth_ws_ticket_post",
         "responses": {
           "200": {
@@ -8837,7 +8854,7 @@
     },
     "/api/backup-schedules/{domain}": {
       "delete": {
-        "description": "Remove an application's backup schedule.\n\nArgs:\n    domain: Domain whose schedule is removed.\n    session: The authenticated session.\n\nReturns:\n    The action outcome.\n\nRaises:\n    HTTPException: 404 when no schedule exists for the domain, so deleting\n        a schedule that was never created does not report success.",
+        "description": "Remove an application's backup schedule.\n\nRemoving the units stops future backups from ever running, silently -\nD5's sudo mode list treats it the same as any other destructive delete,\nso a cookie session has to confirm itself first; an admin-scoped Bearer\ncredential is exempt, per :func:`wasm.web.api.deps.ensure_elevated`.\n\nArgs:\n    domain: Domain whose schedule is removed.\n    session: The authenticated, elevated session.\n\nReturns:\n    The action outcome.\n\nRaises:\n    HTTPException: 404 when no schedule exists for the domain, so deleting\n        a schedule that was never created does not report success.",
         "operationId": "delete_schedule_api_backup_schedules__domain__delete",
         "parameters": [
           {
@@ -9529,7 +9546,7 @@
         ]
       },
       "patch": {
-        "description": "Update a single configuration value addressed by a dotted path.\n\nThe stored value is echoed back redacted, so a secret does not travel twice.\n\nArgs:\n    body: Body carrying the dotted path and the new value.\n    request: The incoming request, for the audit record.\n    session: Authenticated session, injected by the dependency.\n\nReturns:\n    Confirmation message, the path written and the resulting value.\n\nRaises:\n    HTTPException: If the configuration cannot be written.",
+        "description": "Update a single configuration value addressed by a dotted path.\n\nThe stored value is echoed back redacted, so a secret does not travel twice.\n\nA string value is coerced against the key's schema exactly as ``wasm\nconfig set`` coerces argv: a key with a default is parsed as that\ndefault's type, and a key with none is parsed as a JSON scalar or list,\nfalling back to a plain string. Without it, a caller that posts\nform-shaped data - everything a string, such as a boolean field posted as\n\"false\" - would store the literal string rather than the value it looks\nlike. A value that already arrived as JSON's own boolean, number or array\nis left exactly as it was decoded.\n\nArgs:\n    body: Body carrying the dotted path and the new value.\n    request: The incoming request, for the audit record.\n    session: Authenticated session, injected by the dependency.\n\nReturns:\n    Confirmation message, the path written and the resulting value.\n\nRaises:\n    HTTPException: If the configuration cannot be written.",
         "operationId": "patch_config_api_config_patch",
         "requestBody": {
           "content": {
@@ -10114,7 +10131,7 @@
     },
     "/api/cron/{name}": {
       "delete": {
-        "description": "Remove a cron job's timer and service units.\n\nArgs:\n    name: Job name.\n    session: The authenticated session.\n\nReturns:\n    The action outcome.\n\nRaises:\n    HTTPException: 404 when no owned job exists for the name, so deleting\n        a job that was never created does not report success.\n    ServiceError: When the units are not WASM's.",
+        "description": "Remove a cron job's timer and service units.\n\nDeleting the units is as destructive as deleting the application they\nwere scheduled for - D5's sudo mode list treats it the same way, so a\ncookie session has to confirm itself first; an admin-scoped Bearer\ncredential is exempt, per :func:`wasm.web.api.deps.ensure_elevated`.\n\nArgs:\n    name: Job name.\n    session: The authenticated, elevated session.\n\nReturns:\n    The action outcome.\n\nRaises:\n    HTTPException: 404 when no owned job exists for the name, so deleting\n        a job that was never created does not report success.\n    ServiceError: When the units are not WASM's.",
         "operationId": "delete_job_api_cron__name__delete",
         "parameters": [
           {
@@ -10451,7 +10468,7 @@
     },
     "/api/databases/backups/restore": {
       "post": {
-        "description": "Restore a database from one of the engine's own dumps.\n\nThe dump is named, not pathed: the file is resolved inside the engine's\nbackup directory, so the endpoint cannot be talked into reading\n``/etc/shadow`` as the database superuser.\n\nArgs:\n    request: The restore request.\n    session: The authenticated session.\n\nReturns:\n    The action outcome.\n\nRaises:\n    HTTPException: 404 when the named dump does not exist.\n    DatabaseBackupError: When the restore fails.",
+        "description": "Restore a database from one of the engine's own dumps.\n\nThe dump is named, not pathed: the file is resolved inside the engine's\nbackup directory, so the endpoint cannot be talked into reading\n``/etc/shadow`` as the database superuser.\n\nRestoring overwrites whatever the target database currently holds - D5's\nsudo mode list treats it the same as dropping a database, so a cookie\nsession has to confirm itself first; an admin-scoped Bearer credential is\nexempt, per :func:`wasm.web.api.deps.ensure_elevated`.\n\nArgs:\n    request: The restore request.\n    session: The authenticated, elevated session.\n\nReturns:\n    The action outcome.\n\nRaises:\n    HTTPException: 404 when the named dump does not exist.\n    DatabaseBackupError: When the restore fails.",
         "operationId": "restore_backup_api_databases_backups_restore_post",
         "requestBody": {
           "content": {
@@ -11076,7 +11093,7 @@
     },
     "/api/databases/engines/{engine}/uninstall": {
       "post": {
-        "description": "Queue the removal of an engine.\n\nArgs:\n    engine: Engine name.\n    purge: Also remove configuration and data.\n    session: The authenticated session.\n\nReturns:\n    The queued job.",
+        "description": "Queue the removal of an engine.\n\nRemoving an engine can take every database it hosts with it - D5's sudo\nmode list treats it the same as dropping a single database, so a cookie\nsession has to confirm itself first; an admin-scoped Bearer credential is\nexempt, per :func:`wasm.web.api.deps.ensure_elevated`.\n\nArgs:\n    engine: Engine name.\n    purge: Also remove configuration and data.\n    session: The authenticated, elevated session.\n\nReturns:\n    The queued job.",
         "operationId": "uninstall_engine_api_databases_engines__engine__uninstall_post",
         "parameters": [
           {
@@ -13919,7 +13936,7 @@
     },
     "/api/system/version": {
       "get": {
-        "description": "Report the installed version and, when known, the released one.\n\nArgs:\n    session: The authenticated session.\n\nReturns:\n    The version comparison and how to update.",
+        "description": "Report the installed version and, when known, the released one.\n\nArgs:\n    session: The authenticated session.\n\nReturns:\n    The version comparison and how to update, or ``status=\"disabled\"``\n    and nothing else when the operator turned ``updates.check`` off.",
         "operationId": "check_version_api_system_version_get",
         "responses": {
           "200": {

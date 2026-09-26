@@ -389,7 +389,7 @@ def test_a_range_with_nothing_free_says_so_instead_of_suggesting_a_port(
 
 
 def test_a_loopback_panel_started_as_a_daemon_explains_how_to_reach_it(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """
     A backgrounded panel prints its address and returns the shell, so the
@@ -397,6 +397,7 @@ def test_a_loopback_panel_started_as_a_daemon_explains_how_to_reach_it(
 
     Args:
         monkeypatch: Patching helper, scoped to the test.
+        capsys: Captures the banner.
     """
     monkeypatch.setattr("wasm.core.net.server_address", lambda: "198.51.100.7")
     monkeypatch.setattr("wasm.core.net._current_user", lambda: "root")
@@ -406,17 +407,19 @@ def test_a_loopback_panel_started_as_a_daemon_explains_how_to_reach_it(
     monkeypatch.setattr(logger, "info", lines.append)
     monkeypatch.setattr(logger, "success", lines.append)
 
-    web._report_daemon_started(_loopback_config(8081), pid=4321, logger=logger)
+    web._report_daemon_started(_loopback_config(8081), 4321, "wasm_tok", logger)
 
-    assert "ssh -L 8081:127.0.0.1:8081 root@198.51.100.7" in "\n".join(lines)
+    output = capsys.readouterr().out + "\n".join(lines)
+    assert "ssh -L 8081:127.0.0.1:8081 root@198.51.100.7" in output
 
 
 def test_a_reachable_daemon_panel_is_not_given_tunnel_instructions(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """
     Args:
         monkeypatch: Patching helper, scoped to the test.
+        capsys: Captures the banner.
     """
     lines: list[str] = []
     logger = web.Logger(verbose=False)
@@ -426,9 +429,9 @@ def test_a_reachable_daemon_panel_is_not_given_tunnel_instructions(
     config = _loopback_config(8081)
     config.host = "198.51.100.7"
 
-    web._report_daemon_started(config, pid=4321, logger=logger)
+    web._report_daemon_started(config, 4321, "wasm_tok", logger)
 
-    assert "ssh -L" not in "\n".join(lines)
+    assert "ssh -L" not in capsys.readouterr().out + "\n".join(lines)
 
 
 def _loopback_config(port: int) -> Any:
@@ -1436,6 +1439,83 @@ def test_token_is_verified_by_the_manager_that_issued_it(
     )
 
     assert TokenManager(SecurityConfig()).verify_master_token(printed) is True
+
+
+@pytest.mark.parametrize("flag", ["--new", "--regenerate"])
+def test_issuing_a_token_tells_the_truth_about_a_running_console(
+    cli_runner: CliRunner, deps_present: None, state_dir: Path, flag: str
+) -> None:
+    """
+    The reported defect: the command said the old token no longer worked and
+    asked for a restart, while the running console kept accepting the old
+    token and a restart issued yet another one. A running console now obeys
+    the new token at once, so the message says so and asks for nothing.
+
+    Args:
+        flag: The spelling under test.
+    """
+    cli_runner.invoke(web.cli, ["token", "--new", "--yes"])
+
+    result = cli_runner.invoke(web.cli, ["token", flag, "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "restart" not in result.output.lower()
+    assert "already running" in result.output
+    assert "no longer works" in result.output
+
+
+def test_a_daemon_start_prints_the_token_it_issued(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """
+    The reported defect: ``wasm web start -d`` printed no token although its
+    help promised one, and the token it issued silently in the background
+    retired the one the operator held. The parent issues and prints it, the
+    same banner the foreground prints, before handing over to the child.
+
+    Args:
+        state_dir: Where the token hash is written.
+        monkeypatch: Patching helper, scoped to the test.
+        capsys: Captures the banner.
+    """
+    from wasm.web.auth import SecurityConfig, TokenManager
+
+    monkeypatch.setattr(web.os, "fork", lambda: 4321)
+
+    assert web._start_daemon(_loopback_config(8081), verbose=False) == 0
+
+    output = capsys.readouterr().out
+    printed = next(
+        line.split("Access Token:", 1)[1].strip()
+        for line in output.splitlines()
+        if "Access Token:" in line
+    )
+    assert "4321" in output
+    assert TokenManager(SecurityConfig()).verify_master_token(printed) is True
+
+
+def test_the_daemon_child_serves_the_token_its_parent_printed(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """
+    ``run_server(show_token=False)`` is what the daemon child runs: issuing a
+    token nobody sees would retire the one the parent just printed.
+
+    Args:
+        state_dir: Where the token hash is written.
+        monkeypatch: Patching helper, scoped to the test.
+        capsys: Captures anything printed.
+    """
+    from wasm.web.auth import SecurityConfig, TokenManager
+    from wasm.web.server import run_server
+
+    issued = TokenManager(SecurityConfig()).generate_master_token()
+    monkeypatch.setattr("uvicorn.run", lambda **kwargs: None)
+
+    run_server(host="127.0.0.1", port=8081, config=SecurityConfig(), show_token=False)
+
+    assert "Access Token:" not in capsys.readouterr().out
+    assert TokenManager(SecurityConfig()).verify_master_token(issued) is True
 
 
 def test_regenerate_rotates_the_signing_key(

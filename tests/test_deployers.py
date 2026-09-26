@@ -662,6 +662,94 @@ def test_get_deployer_rejects_an_unknown_type() -> None:
 
 
 # ---------------------------------------------------------------------------
+# --webserver apache: refused rather than silently ignored or half-done
+# ---------------------------------------------------------------------------
+
+
+def test_monorepo_configure_refuses_apache(tmp_path: Path) -> None:
+    """
+    _create_apache_sites was a stub (a warning and 'pass'): a monorepo
+    deployed with --webserver apache used to report success with no site
+    configuration at all. Refused at configure() time instead, before
+    anything is fetched or built.
+    """
+    deployer = MonorepoDeployer()
+
+    with pytest.raises(DeploymentError, match=r"(?i)apache"):
+        deployer.configure(
+            domain="app.example.com",
+            source="https://github.com/example/app.git",
+            app_path=tmp_path,
+            webserver="apache",
+        )
+
+
+def test_docker_compose_configure_refuses_apache(tmp_path: Path) -> None:
+    """
+    Every site-creation path in the Docker Compose deployer instantiates
+    NginxManager unconditionally, so --webserver apache used to deploy a
+    stack fronted by nginx anyway, silently ignoring what was asked for.
+    Refused at configure() time instead.
+    """
+    deployer = DockerComposeDeployer()
+
+    with pytest.raises(DeploymentError, match=r"(?i)apache"):
+        deployer.configure(
+            domain="app.example.com",
+            source="https://github.com/example/app.git",
+            app_path=tmp_path,
+            webserver="apache",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Resource limits at creation: refused for Compose, not silently dropped
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "limit_kwargs",
+    [
+        {"memory_max_mb": 512},
+        {"cpu_quota_percent": 50},
+        {"tasks_max": 100},
+    ],
+)
+def test_docker_compose_configure_refuses_resource_limits(
+    tmp_path: Path, limit_kwargs: dict[str, int]
+) -> None:
+    """
+    A Docker Compose stack's containers are not in its systemd unit's cgroup
+    (the unit only runs 'docker compose up -d' once and exits): a limit given
+    at creation used to be silently dropped rather than enforced or refused.
+    This mirrors the refusal wasm.deployers.lifecycle.set_resource_limits
+    already gives an existing Compose app's 'wasm app limits'.
+    """
+    deployer = DockerComposeDeployer()
+
+    with pytest.raises(DeploymentError, match=r"(?i)compose"):
+        deployer.configure(
+            domain="app.example.com",
+            source="https://github.com/example/app.git",
+            app_path=tmp_path,
+            **limit_kwargs,
+        )
+
+
+def test_docker_compose_configure_accepts_no_limits(tmp_path: Path) -> None:
+    """The ordinary case - no limits requested - is unaffected."""
+    deployer = DockerComposeDeployer()
+
+    deployer.configure(
+        domain="app.example.com",
+        source="https://github.com/example/app.git",
+        app_path=tmp_path,
+    )
+
+    assert deployer.domain == "app.example.com"
+
+
+# ---------------------------------------------------------------------------
 # Rollback
 # ---------------------------------------------------------------------------
 

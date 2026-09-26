@@ -39,15 +39,15 @@ Two defences, both applied, because each covers what the other cannot:
    them. Escaping is what keeps a caller that bypasses this module, or a future
    template, from reopening the hole.
 
-Why not ``EnvironmentFile=``
-----------------------------
-An ``EnvironmentFile=`` at mode 0600 would keep secrets out of ``systemctl
-show`` output and is the better long-term shape. It is not what this fix does,
-for two reasons: the file has its own, differently broken quoting rules (it is
-parsed shell-like, so an unvalidated value injects there too and still needs
-this validation), and it moves secret material to a second file that every
-backup, restore and delete path would have to learn about. Closing the
-injection hole does not depend on that migration, so it is done here first.
+The same rules for ``EnvironmentFile=``
+--------------------------------------
+An application's secrets are no longer written into its unit: the unit is
+0644 and ``systemctl show`` prints ``Environment=`` to any local user, so they
+live in the application's 0600 env file, which the unit loads with
+``EnvironmentFile=`` (see :mod:`wasm.managers.service_manager`). systemd reads
+that file line by line, so a newline in a value injects there as surely as in
+the unit: the deployers validate every variable with this module before they
+write it to the file.
 """
 
 from __future__ import annotations

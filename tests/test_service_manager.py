@@ -458,6 +458,48 @@ def test_create_writes_the_unit_and_registers_it(
     assert "example" in store.services
 
 
+def test_create_references_the_environment_file_and_keeps_secrets_out(
+    manager: ServiceManager, unit_dirs: dict[str, Path]
+) -> None:
+    """
+    The unit is 0644 and ``systemctl show`` prints ``Environment=`` to any
+    local user, so the secrets are loaded from a 0600 file instead.
+    """
+    manager.create_service(
+        name="example",
+        command="/usr/bin/node server.js",
+        working_directory="/var/www/apps/example",
+        environment={"PORT": "3000"},
+        environment_file="/var/www/apps/example/.env",
+    )
+
+    content = (unit_dirs["managed"] / "example.service").read_text()
+    assert "EnvironmentFile=-/var/www/apps/example/.env" in content
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["relative/.env", "/srv/app/.env\nExecStartPre=/bin/sh -c id"],
+    ids=["relative", "newline"],
+)
+def test_create_refuses_an_unusable_environment_file(
+    manager: ServiceManager, unit_dirs: dict[str, Path], path: str
+) -> None:
+    """
+    Args:
+        path: The path under test.
+    """
+    with pytest.raises(ValidationError):
+        manager.create_service(
+            name="example",
+            command="/usr/bin/true",
+            working_directory="/srv",
+            environment_file=path,
+        )
+
+    assert not (unit_dirs["managed"] / "example.service").exists()
+
+
 def test_create_refuses_an_existing_managed_unit(
     manager: ServiceManager, unit_dirs: dict[str, Path]
 ) -> None:

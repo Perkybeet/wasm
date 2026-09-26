@@ -39,7 +39,7 @@ from wasm.core.exceptions import DeploymentError, DomainError
 from wasm.core.store import DeploymentRecord, DeploymentTrigger, StoreError, get_store
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import WASMErrorRoute, strict_domain
-from wasm.web.auth import get_audit_logger, get_client_ip, record_auth_failure
+from wasm.web.auth import actor_label, get_audit_logger, get_client_ip, record_auth_failure
 from wasm.web.jobs import JobContext, JobType, get_job_manager, run_update
 from wasm.web.pydantic_compat import iso_offset_validator
 
@@ -353,7 +353,8 @@ async def deliver(domain: str, request: Request) -> JSONResponse:
         # and it can be brute forced the same way. Feeding it into the same
         # lockout the login form uses means an attacker cannot use the
         # deliberately unauthenticated hook surface as a side channel that
-        # never counts against them.
+        # never counts against them - and, once locked out, SecurityMiddleware
+        # refuses this route before it runs (AUTH_PATH_PREFIXES).
         record_auth_failure(
             get_client_ip(request), f"/hooks/deploy/{validated}", "webhook_signature"
         )
@@ -457,7 +458,7 @@ def create_webhook_secret(
             action="hooks.secret.mint",
             result="success",
             client_ip=get_client_ip(request),
-            actor=str(session.get("sid")),
+            actor=actor_label(session),
             resource=f"/api/apps/{validated}/webhook-secret",
             detail="webhook secret issued; shown once",
         )
@@ -498,7 +499,7 @@ def delete_webhook_secret(
             action="hooks.secret.disable",
             result="success",
             client_ip=get_client_ip(request),
-            actor=str(session.get("sid")),
+            actor=actor_label(session),
             resource=f"/api/apps/{validated}/webhook-secret",
             detail="webhook secret discarded",
         )

@@ -11,6 +11,7 @@ ask for credentials.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from argparse import ArgumentParser, Namespace
@@ -313,6 +314,72 @@ def test_secret_and_sessions_survive_a_restart(sandbox: Path) -> None:
     assert secret_file.stat().st_mode & 0o777 == 0o600
 
 
+def test_a_token_issued_elsewhere_retires_the_old_one_in_a_running_console(
+    sandbox: Path,
+) -> None:
+    """
+    ``wasm web token --new`` runs in its own process; the console must obey it.
+
+    The reported defect: a running console kept accepting the token it was
+    started with, from memory, until it restarted - and restarting issued yet
+    another token. The stored hash is the only record of the token, so the
+    running console has to answer from it.
+    """
+    running = TokenManager(make_config(sandbox))
+    old = running.generate_master_token()
+
+    issuer = TokenManager(make_config(sandbox))
+    new = issuer.generate_master_token()
+
+    assert running.verify_master_token(new) is True
+    assert running.verify_master_token(old) is False
+    issuer.sessions.close()
+    running.sessions.close()
+
+
+def test_regenerating_elsewhere_takes_effect_in_a_running_console(sandbox: Path) -> None:
+    """
+    ``--regenerate`` rotates the signing key the token hash is salted with.
+
+    Without picking the new key up, the running console would refuse the new
+    token (hashed under the new key) and keep signing sessions with the old
+    one, which the next restart would reject.
+    """
+    running = TokenManager(make_config(sandbox))
+    old = running.generate_master_token()
+    session = running.create_session("10.0.0.1")
+
+    issuer = TokenManager(make_config(sandbox))
+    new = issuer.rotate_secrets()
+
+    assert running.verify_master_token(new) is True
+    assert running.verify_master_token(old) is False
+    assert running.verify_session_token(session.token, "10.0.0.1") is None
+
+    # A session signed by the running console after the rotation verifies
+    # under the rotated key, the one the next start will load.
+    fresh = running.create_session("10.0.0.1")
+    assert issuer.verify_session_token(fresh.token, "10.0.0.1") is not None
+    issuer.sessions.close()
+    running.sessions.close()
+
+
+def test_a_rotated_token_is_refused_by_the_running_console_over_http(sandbox: Path) -> None:
+    """End to end: the old token stops working at once, the new one works at once."""
+    client = build_client(sandbox)
+    old = get_token_manager().generate_master_token()
+    assert client.get("/api/auth/verify", headers={"Authorization": f"Bearer {old}"}).is_success
+
+    issuer = TokenManager(make_config(sandbox))
+    new = issuer.generate_master_token()
+    issuer.sessions.close()
+
+    refused = client.get("/api/auth/verify", headers={"Authorization": f"Bearer {old}"})
+    accepted = client.get("/api/auth/verify", headers={"Authorization": f"Bearer {new}"})
+    assert refused.status_code == 401
+    assert accepted.status_code == 200
+
+
 def test_startup_fails_when_the_secret_cannot_be_persisted(sandbox: Path) -> None:
     """An unwritable state directory must abort startup, not degrade silently."""
     blocked = sandbox / "blocked"
@@ -378,6 +445,75 @@ def iter_api_routes(routes: list, prefix: str = "") -> list[tuple[str, APIRoute]
     return [
         (path, route) for path, route in iter_routes(routes, prefix) if isinstance(route, APIRoute)
     ]
+
+
+def test_every_lockout_path_is_a_real_route(sandbox: Path) -> None:
+    """
+    The reported defect: AUTH_PATHS named ``/api/auth/token``, which does not
+    exist, so the entry guarded nothing and read as if it did.
+    """
+    from wasm.web.server import AUTH_PATH_PREFIXES, AUTH_PATHS
+
+    app = create_app(make_config(sandbox))
+    posts = {path for path, route in iter_api_routes(app.routes) if "POST" in route.methods}
+
+    assert AUTH_PATHS <= posts, sorted(AUTH_PATHS - posts)
+    for prefix in AUTH_PATH_PREFIXES:
+        assert any(path.startswith(prefix) for path in posts), prefix
+
+
+def test_every_endpoint_that_counts_a_failure_is_behind_the_lockout() -> None:
+    """
+    Counting a wrong credential without ever refusing the next one is no limit.
+
+    Every handler that feeds :func:`record_auth_failure` names its path; each
+    of those paths has to be one the middleware refuses a locked-out address.
+    """
+    from wasm.web.server import AUTH_PATH_PREFIXES, AUTH_PATHS
+
+    api_dir = Path(auth_module.__file__).parent / "api"
+    counted = {
+        match
+        for source in api_dir.glob("*.py")
+        for match in re.findall(
+            r'record_auth_failure\(\s*client_ip,\s*"([^"]+)"', source.read_text(encoding="utf-8")
+        )
+    }
+
+    assert counted, "the scan found no call sites; the pattern is stale"
+    unguarded = {
+        path
+        for path in counted
+        if path not in AUTH_PATHS and not path.startswith(AUTH_PATH_PREFIXES)
+    }
+    assert not unguarded, sorted(unguarded)
+
+
+def test_a_locked_out_address_cannot_elevate_even_with_a_session(sandbox: Path) -> None:
+    """
+    Sudo mode asks for the master token or a second factor, and a wrong one
+    is counted. A session cookie must not turn that into an unlimited oracle.
+    """
+    client = build_client(sandbox, max_failed_attempts=3, lockout_duration=60)
+    token = get_token_manager().generate_master_token()
+    body = login(client, token)
+
+    from wasm.web.server import get_brute_force
+
+    for _ in range(3):
+        get_brute_force().record_failure("testclient")
+
+    response = client.post(
+        "/api/auth/elevate",
+        json={"token": token},
+        headers={CSRF_HEADER_NAME: body["csrf_token"]},
+    )
+
+    assert response.status_code == 429, response.text
+    assert response.json()["error"] == "locked_out"
+    # Browsing is not a credential guess: the operator is not locked out of
+    # their own panel, only out of the endpoints that check a credential.
+    assert client.get("/api/auth/sessions").status_code == 200
 
 
 def test_every_api_route_requires_authentication(sandbox: Path) -> None:
@@ -576,6 +712,30 @@ def test_mutations_are_audited(sandbox: Path) -> None:
     assert ticket_calls
     assert ticket_calls[-1]["result"] == "ok"
     assert ticket_calls[-1]["actor"] != "anonymous"
+
+
+def test_every_audit_record_names_the_actor_the_same_way(sandbox: Path) -> None:
+    """
+    The login, the endpoint's own record and the middleware's record of one
+    session all carry the one label :func:`actor_label` gives it, and a master
+    token Bearer is ``master`` - never ``unknown``, never a raw session id.
+    """
+    client = build_client(sandbox)
+    token = get_token_manager().generate_master_token()
+    body = login(client, token)
+    client.post("/api/auth/ws-ticket", headers={CSRF_HEADER_NAME: body["csrf_token"]})
+    client.cookies.clear()
+    client.post("/api/auth/ws-ticket", headers={"Authorization": f"Bearer {token}"})
+
+    entries = read_audit(sandbox)
+    login_actor = next(e["actor"] for e in entries if e["action"] == "auth.login")
+    tickets = [e["actor"] for e in entries if e["action"] == "auth.ws_ticket"]
+    posts = [e["actor"] for e in entries if e["resource"] == "/api/auth/ws-ticket"]
+
+    assert len(login_actor) == 12
+    assert tickets == [login_actor, "master"]
+    assert set(posts) == {login_actor, "master"}
+    assert all(e["actor"] != "unknown" for e in entries)
 
 
 def test_websocket_rejects_a_token_in_the_query_string(sandbox: Path) -> None:
@@ -1490,6 +1650,65 @@ def test_a_revoked_api_token_is_refused(sandbox: Path) -> None:
     assert any(e["action"] == "auth.token.revoke" and e["result"] == "success" for e in entries)
     raw = (sandbox / "state" / "web-audit.log").read_text()
     assert issued["token"] not in raw, "the clear token reached the audit log"
+
+
+def test_a_ticket_issued_to_an_api_token_opens_a_socket_as_that_token(sandbox: Path) -> None:
+    """
+    The reported defect: POST /api/auth/ws-ticket answered an API token with a
+    ticket that no handshake could ever redeem. A ticket now stands for the
+    credential that asked for it, scope included, and nothing more.
+    """
+    client = build_client(sandbox)
+    master = get_token_manager().generate_master_token()
+    csrf = login(client, master)["csrf_token"]
+    issued = issue_token(client, csrf, master, name="dashboard", scope="admin")
+    client.cookies.clear()
+
+    response = client.post("/api/auth/ws-ticket", headers=bearer(issued["token"]))
+    assert response.status_code == 200, response.text
+    ticket = response.json()["ticket"]
+
+    payload = get_token_manager().consume_ws_ticket(ticket, "testclient")
+    assert payload is not None
+    assert payload["type"] == "api_token"
+    assert payload["sid"] == "token:dashboard"
+    assert payload["scope"] == "admin"
+
+    second = client.post("/api/auth/ws-ticket", headers=bearer(issued["token"])).json()["ticket"]
+    with client.websocket_connect(f"/ws/events?ticket={second}") as ws:
+        assert ws.receive_json()["type"] == "connected"
+
+
+def test_a_ticket_dies_with_the_api_token_it_was_issued_to(sandbox: Path) -> None:
+    """Revoking a token inside a ticket's lifetime leaves nothing to redeem."""
+    client = build_client(sandbox)
+    master = get_token_manager().generate_master_token()
+    csrf = login(client, master)["csrf_token"]
+    issued = issue_token(client, csrf, master, name="doomed", scope="admin")
+    ticket = client.post("/api/auth/ws-ticket", headers=bearer(issued["token"])).json()["ticket"]
+
+    revoked = client.delete(f"/api/auth/tokens/{issued['id']}", headers={CSRF_HEADER_NAME: csrf})
+    assert revoked.status_code == 200, revoked.text
+
+    assert get_token_manager().consume_ws_ticket(ticket, "testclient") is None
+
+
+def test_a_ticket_issued_to_the_master_token_is_redeemable_until_it_rotates(
+    sandbox: Path,
+) -> None:
+    """The master token redeems as the master token, and rotating it spends it."""
+    client = build_client(sandbox)
+    master = get_token_manager().generate_master_token()
+
+    ticket = client.post("/api/auth/ws-ticket", headers=bearer(master)).json()["ticket"]
+    payload = get_token_manager().consume_ws_ticket(ticket, "testclient")
+    assert payload is not None
+    assert payload["type"] == "master"
+    assert payload["scope"] == "admin"
+
+    stale = client.post("/api/auth/ws-ticket", headers=bearer(master)).json()["ticket"]
+    get_token_manager().generate_master_token()
+    assert get_token_manager().consume_ws_ticket(stale, "testclient") is None
 
 
 def test_last_used_is_recorded_with_a_throttle(sandbox: Path) -> None:

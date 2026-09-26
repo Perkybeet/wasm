@@ -8,10 +8,12 @@ export DH_VERBOSE=1
 
 override_dh_auto_install:
 	dh_auto_install
-	# Create config directory
-	install -d debian/wasm/etc/wasm
-	# Install default config
-	install -m 644 debian/wasm.default.yaml debian/wasm/etc/wasm/config.yaml
+	# Config directory: owner-only, since config.yaml holds credentials and,
+	# when the panel is used, wasm.web.auth's signing key and token hash live
+	# here too.
+	install -d -m 0700 debian/wasm/etc/wasm
+	# Default config, owner-only: matches wasm.core.fs.SECRET_MODE.
+	install -m 0600 debian/wasm.default.yaml debian/wasm/etc/wasm/config.yaml
 	# Create apps directory
 	install -d debian/wasm/var/www/apps
 	# Create log directory
@@ -26,6 +28,15 @@ override_dh_auto_install:
 		debian/wasm/usr/share/zsh/vendor-completions/_wasm
 	install -Dm644 src/wasm/completions/wasm.fish \
 		debian/wasm/usr/share/fish/vendor_completions.d/wasm.fish
+
+override_dh_fixperms:
+	dh_fixperms
+	# dh_fixperms normalises every directory to 0755 and every file to 0644,
+	# undoing the modes set above. Re-tighten just these two paths afterwards
+	# so the shipped package still has them, regardless of dh_fixperms
+	# defaults on any debhelper version.
+	chmod 0700 debian/wasm/etc/wasm
+	chmod 0600 debian/wasm/etc/wasm/config.yaml
 
 override_dh_installsystemd:
 	dh_installsystemd --no-enable --no-start

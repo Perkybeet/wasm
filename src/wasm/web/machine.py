@@ -269,7 +269,9 @@ def _resolve_apps_root(apps_root: str | None) -> str:
 
     Args:
         apps_root: An explicit override, or None to read the configured
-            ``apps.directory``.
+            ``apps_directory`` - the same flat key every deployer reads, so
+            the meter reports on the filesystem applications are actually
+            deployed to.
 
     Returns:
         A directory path. Falls back to :data:`DEFAULT_APPS_ROOT` when no
@@ -282,10 +284,10 @@ def _resolve_apps_root(apps_root: str | None) -> str:
     from wasm.core.config import Config
 
     try:
-        return str(Config().get("apps.directory", DEFAULT_APPS_ROOT))
+        return str(Config().get("apps_directory", DEFAULT_APPS_ROOT))
     except (WASMError, OSError) as exc:
         log.warning(
-            "Could not read apps.directory from the configuration, using the default: %s", exc
+            "Could not read apps_directory from the configuration, using the default: %s", exc
         )
         return DEFAULT_APPS_ROOT
 
@@ -298,7 +300,7 @@ def read_machine(apps_root: str | None = None) -> MachineState:
         apps_root: Directory whose filesystem the disk meter reports on. The
             applications live there, so that is the space that runs out
             first and the space an operator cares about. None reads the
-            configured ``apps.directory``.
+            configured ``apps_directory``.
 
     Returns:
         A snapshot ready for ``dataclasses.asdict`` and ``MachineOut``.

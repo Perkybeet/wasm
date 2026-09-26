@@ -11,7 +11,7 @@ editor, on a file the operator can review before saving.
 
 ``get`` and ``set`` are the exception, addressed one dotted key at a time -
 the same shape the panel's own settings page tells an operator to use, for
-example ``wasm config set apps.directory /var/www/apps``. ``set`` goes through
+example ``wasm config set apps_directory /var/www/apps``. ``set`` goes through
 :meth:`~wasm.core.config.Config.set`, which carries the same rule
 :mod:`wasm.web.api.config` enforces on its own typed endpoints (a webserver
 WASM has no manager for, a port or timeout out of range), so a value the panel
@@ -22,7 +22,6 @@ does for the panel.
 
 from __future__ import annotations
 
-import json
 from argparse import Namespace
 from collections.abc import Callable
 from typing import Any, NoReturn
@@ -31,19 +30,22 @@ import click
 import yaml
 
 from wasm.cli.app import Context, enable_dry_run, pass_context
-from wasm.core.config import DEFAULT_CONFIG_PATH, Config, redact_secrets
+from wasm.core.config import (
+    DEFAULT_CONFIG_PATH,
+    NO_DEFAULT,
+    Config,
+    coerce_config_value,
+    redact_secrets,
+)
 from wasm.core.exceptions import ConfigError
 from wasm.core.logger import Logger, set_colors_disabled
 
 #: Marks "no default and no stored value" apart from a key genuinely holding
 #: None, since Config.get(key, default) cannot otherwise tell the two apart.
-_MISSING = object()
-
-#: Command line words a boolean setting accepts, compared case-insensitively.
-#: 'wasm config set' only ever has a string to work with, so a boolean key's
-#: current value is what tells 'true' apart from a new string setting.
-_TRUE_WORDS = frozenset({"1", "true", "yes", "on"})
-_FALSE_WORDS = frozenset({"0", "false", "no", "off"})
+#: The same sentinel :func:`~wasm.core.config.coerce_config_value` uses for
+#: "no schema to match", so a key with no default falls through to its JSON
+#: scalar/list parsing rather than being treated as a string.
+_MISSING = NO_DEFAULT
 
 #: How many added keys the upgrade lists before summarising the rest.
 MAX_LISTED_KEYS = 10
@@ -180,6 +182,12 @@ def _run_show(logger: Logger) -> int:
     """
     Print the configuration WASM is actually running with.
 
+    Dumps through :func:`~wasm.core.config.redact_secrets` first, the same
+    helper 'config get' and 'config set' already use: this prints the whole
+    tree at once, so skipping it would put every credential in the file - the
+    MySQL root password and the SMTP account included - on the operator's
+    terminal and in their shell history.
+
     Args:
         logger: Logger used to report progress.
 
@@ -187,7 +195,8 @@ def _run_show(logger: Logger) -> int:
         Exit code.
     """
     logger.header("Current Configuration")
-    click.echo(yaml.dump(Config().to_dict(), default_flow_style=False, sort_keys=False))
+    redacted = redact_secrets(Config().to_dict())
+    click.echo(yaml.dump(redacted, default_flow_style=False, sort_keys=False))
     return 0
 
 
@@ -227,7 +236,7 @@ def _run_get(key: str, logger: Logger) -> int:
     Print one configuration value, addressed by its dotted key.
 
     Args:
-        key: Dotted key, such as ``apps.directory`` or ``monitor.smtp.host``.
+        key: Dotted key, such as ``apps_directory`` or ``monitor.smtp.host``.
         logger: Logger for the error when the key does not exist.
 
     Returns:
@@ -270,7 +279,7 @@ def _parse_list_value(raw: str) -> list[str]:
 
 def _coerce_cli_value(existing: Any, raw: str) -> Any:
     """
-    Parse a command line value using the type the key already holds.
+    Parse a command line value using the key's schema.
 
     ``wasm config set`` only ever has a string to work with - argv has no other
     type - so a boolean, numeric or list setting has to be recovered from the
@@ -281,54 +290,29 @@ def _coerce_cli_value(existing: Any, raw: str) -> Any:
     '["a@example.com"]'``) without needing ``--list``, since argv already
     hands over one string a command line has no other way to shape.
 
+    A key with no default at all - ``existing`` is :data:`_MISSING` - is
+    parsed as a JSON scalar (``true``, ``false``, ``null``, a number) or a
+    JSON array instead, falling back to the plain string it looks like when it
+    is not valid JSON or parses to something else, such as an object. This is
+    the same coercion :func:`~wasm.web.api.config.patch_config` applies to a
+    string value arriving over ``PATCH /api/config``, so a key without a
+    schema does not behave differently depending on which front end wrote it.
+
     Args:
         existing: Current or default value for the key, or :data:`_MISSING`
             for a key with no default.
         raw: The value exactly as typed on the command line.
 
     Returns:
-        The value cast to match ``existing``, or ``raw`` unchanged when there
-        is nothing to match against, the key holds a string or a mapping, or
-        it holds a list and ``raw`` does not parse as a JSON array.
+        The value cast to match ``existing``, a JSON scalar or list recovered
+        from ``raw`` when there is no default to match, or ``raw`` unchanged
+        when nothing else applies.
 
     Raises:
         ConfigError: When ``existing`` is a boolean or a number and ``raw``
             cannot be parsed as one.
     """
-    if isinstance(existing, list):
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            return raw
-        return parsed if isinstance(parsed, list) else raw
-
-    if existing is _MISSING or isinstance(existing, (str, dict)):
-        return raw
-
-    if isinstance(existing, bool):
-        lowered = raw.strip().lower()
-        if lowered in _TRUE_WORDS:
-            return True
-        if lowered in _FALSE_WORDS:
-            return False
-        raise ConfigError(
-            f"Expected a boolean, got {raw!r}",
-            details=f"Use one of: {', '.join(sorted(_TRUE_WORDS | _FALSE_WORDS))}.",
-        )
-
-    if isinstance(existing, int):
-        try:
-            return int(raw)
-        except ValueError as exc:
-            raise ConfigError(f"Expected a whole number, got {raw!r}") from exc
-
-    if isinstance(existing, float):
-        try:
-            return float(raw)
-        except ValueError as exc:
-            raise ConfigError(f"Expected a number, got {raw!r}") from exc
-
-    return raw
+    return coerce_config_value(existing, raw)
 
 
 def _run_set(key: str, raw_value: str, logger: Logger, *, as_list: bool = False) -> int:
@@ -340,7 +324,7 @@ def _run_set(key: str, raw_value: str, logger: Logger, *, as_list: bool = False)
     out of range - is rejected here in the same words.
 
     Args:
-        key: Dotted key, such as ``apps.directory`` or ``web.port``.
+        key: Dotted key, such as ``apps_directory`` or ``web.port``.
         raw_value: The new value, exactly as typed on the command line.
         logger: Logger for progress and errors.
         as_list: Treat ``raw_value`` as a comma-separated list, for a key such
@@ -488,15 +472,24 @@ def set_(ctx: Context, key: str, value: str, as_list: bool) -> None:
     """
     Set one configuration value, addressed by its dotted key, and save it.
 
-    For example: 'wasm config set apps.directory /var/www/apps'. The value is
+    For example: 'wasm config set apps_directory /var/www/apps'. The value is
     checked against the same rule the panel applies to that key, when it has
     one, so an unsupported webserver or a port out of range is refused here
-    too rather than written and discovered later.
+    too rather than written and discovered later. 'apps.directory' is accepted
+    as a deprecated alias for 'apps_directory' and is normalised to it, on
+    both 'get' and 'set'.
 
     A key needing a list value takes it two ways: 'wasm config set
     notifications.allow_private_hosts internal.example,partner.example
     --list' splits VALUE on commas, and a key that already holds a list (for
     example monitor.email_recipients) also accepts a JSON array such as
     '["a@example.com"]' without --list.
+
+    VALUE is coerced by the key's schema: a key with a default is parsed as
+    that default's type (a boolean, a whole number, a decimal or a list), so
+    'wasm config set ssl.enabled false' stores False, not the string "false".
+    A key with no default, such as monitor.notify, is parsed as a JSON scalar
+    or list instead - true, false, null, a number, or a JSON array - and
+    falls back to a plain string when VALUE is not valid JSON.
     """
     _exit(_run_set(key, value, ctx.logger, as_list=as_list))

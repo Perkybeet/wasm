@@ -68,7 +68,6 @@ from wasm.core.net import (
     ALL_INTERFACES,
     host_addresses,
     is_loopback_host,
-    loopback_access_lines,
     normalize_host,
     strip_brackets,
 )
@@ -872,21 +871,26 @@ def _ensure_self_signed(host: str, logger: Logger, verbose: bool) -> None:
     )
 
 
-def _report_daemon_started(config: SecurityConfig, pid: int, logger: Logger) -> None:
+def _report_daemon_started(config: SecurityConfig, pid: int, token: str, logger: Logger) -> None:
     """
-    Report a backgrounded panel, and how to reach it.
+    Report a backgrounded panel: its token, how to reach it, how to stop it.
+
+    The banner is the one a foreground start prints, so the two front doors
+    hand the operator the same thing.
 
     Args:
         config: The configuration it was started with.
         pid: Process id of the panel.
+        token: The access token issued for this start.
         logger: Logger for the report.
     """
+    from wasm.web.server import banner_address, startup_banner
+
     scheme = "https" if config.require_https else "http"
 
+    print("\n".join(startup_banner(token, banner_address(config.host), config.port, scheme)))
+    print(flush=True)
     logger.success(f"Web server started in background (PID: {pid})")
-    logger.info(f"Server running at {scheme}://{config.host}:{config.port}")
-    for line in loopback_access_lines(config.host, config.port, scheme=scheme):
-        logger.info(line)
     logger.info("Use 'wasm web status' to check status")
     logger.info("Use 'wasm web stop' to stop the server")
 
@@ -1043,7 +1047,11 @@ def _start_foreground(config: SecurityConfig, *, insecure_http: bool = False) ->
 
 def _start_daemon(config: SecurityConfig, verbose: bool, *, insecure_http: bool = False) -> int:
     """
-    Start the web server as a daemon.
+    Start the web server as a daemon, printing the access token it serves.
+
+    The same banner a foreground start prints: ``wasm web start -d`` used to
+    print no token at all while the child issued one nobody saw, retiring the
+    one the operator held.
 
     Args:
         config: The security configuration to serve with.
@@ -1054,14 +1062,24 @@ def _start_daemon(config: SecurityConfig, verbose: bool, *, insecure_http: bool 
     Returns:
         Exit code.
     """
+    from wasm.web.auth import TokenManager
+
     logger = Logger(verbose=verbose)
 
-    # Fork process
+    # Issued here, before the fork, because the parent is the only process
+    # still attached to the terminal. The child serves this token and issues
+    # none of its own (show_token=False below).
+    manager = TokenManager(config)
+    try:
+        token = manager.generate_master_token()
+    finally:
+        # An SQLite connection must not cross a fork.
+        manager.sessions.close()
+
     pid = os.fork()
 
     if pid > 0:
-        # Parent process
-        _report_daemon_started(config, pid, logger)
+        _report_daemon_started(config, pid, token, logger)
         return 0
 
     # Child process
@@ -1384,12 +1402,20 @@ def _token(
     logger.blank()
     logger.info("Paste it into the login form. It is never accepted in a URL.")
 
+    # A running console reads the token hash and the signing key from the
+    # state directory on every verification, so both statements below hold
+    # from the moment this command returns, with no restart in between.
     if regenerate:
-        logger.warning("All existing sessions have been revoked")
+        logger.warning(
+            "All existing sessions have been revoked, and the token issued previously "
+            "no longer works, including in a console that is already running"
+        )
     else:
-        logger.warning("The token issued previously no longer works")
-
-    logger.info("Restart the web server to apply the new token")
+        logger.warning(
+            "The token issued previously no longer works, including in a console "
+            "that is already running"
+        )
+    logger.info("A console that is already running accepts the new token now.")
 
     return 0
 

@@ -18,6 +18,11 @@ from wasm import __version__
 
 logger = logging.getLogger(__name__)
 
+#: The dotted key that turns the GitHub check off. An operator on an
+#: airgapped or tightly firewalled server has no use for a request that can
+#: only time out, repeated on every command.
+CONFIG_KEY = "updates.check"
+
 
 class UpdateChecker:
     """Check for WASM updates on GitHub."""
@@ -32,6 +37,35 @@ class UpdateChecker:
     _update_version: str | None = None
 
     @classmethod
+    def enabled(cls) -> bool:
+        """
+        Report whether the operator has left the update check on.
+
+        Reads the configuration rather than caching the answer: ``wasm
+        config set updates.check false`` must take effect on the very next
+        command, not the next restart of a long-lived process.
+
+        Returns:
+            True unless ``updates.check`` is set to false. A configuration
+            that cannot be read must not turn a cosmetic check into a
+            command that fails to start, so this defaults to enabled.
+        """
+        try:
+            from wasm.core.config import Config
+
+            return bool(Config().get(CONFIG_KEY, True))
+        except OSError as exc:
+            # Config._load_config already contains its own OSError/YAMLError
+            # handling for a bad file; this is the belt for the one thing
+            # left outside it - Path.exists() propagating a permission or
+            # I/O error from an unreachable config directory (an NFS mount
+            # gone away, for instance) instead of returning False.
+            logger.debug(
+                "Could not read %s: %s; treating the update check as enabled", CONFIG_KEY, exc
+            )
+            return True
+
+    @classmethod
     def start_background_check(cls):
         """
         Start update check in background thread.
@@ -39,6 +73,10 @@ class UpdateChecker:
         Call this at the beginning of command execution.
         The check runs in parallel while the command executes.
         """
+        if not cls.enabled():
+            cls._update_version = None
+            return
+
         try:
             # First check cache synchronously (fast)
             if cls._is_cache_valid():

@@ -35,6 +35,7 @@ equivalent to a root shell. The design decisions that follow from that:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import ipaddress
@@ -44,6 +45,7 @@ import os
 import re
 import secrets
 import sqlite3
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -122,6 +124,11 @@ WS_TOKEN_PREFIX = "wasm.token."  # noqa: S105 - subprotocol prefix, not a creden
 #: the session store or the master token. The master token's own prefix is
 #: ``wasm_``, so the two are distinguishable at a glance in a config file.
 API_TOKEN_PREFIX = "wasm_tok_"  # noqa: S105 - a prefix, not a credential
+
+#: The ``sid`` of the master token's payload, and of a WebSocket ticket it was
+#: issued to. API tokens use ``token:<name>``; cookie sessions a random hex id.
+MASTER_SID = "master"
+API_TOKEN_SID_PREFIX = "token:"  # noqa: S105 - a prefix, not a credential
 
 #: API token scopes, weakest first. The order is the hierarchy: a scope
 #: satisfies every requirement at or below its own rank.
@@ -431,12 +438,23 @@ def write_private_file(path: Path, content: str) -> None:
     """
     ensure_state_dir(path.parent)
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, FILE_MODE)
+        # Written beside the destination and renamed over it: a running console
+        # re-reads the signing key and the token hash whenever they change (see
+        # TokenManager), and a truncate-then-write would let it read the empty
+        # file in between. mkstemp creates the file 0600 from the start.
+        fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
         try:
-            os.write(fd, content.encode())
-        finally:
-            os.close(fd)
-        os.chmod(path, FILE_MODE)
+            try:
+                os.write(fd, content.encode())
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.chmod(temporary, FILE_MODE)
+            os.replace(temporary, path)
+        except OSError:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temporary)
+            raise
     except OSError as exc:
         raise SecurityError(
             f"Cannot write {path}",
@@ -445,6 +463,25 @@ def write_private_file(path: Path, content: str) -> None:
                 f"{STATE_DIR_ENV} to a directory the current user owns."
             ),
         ) from exc
+
+
+def _file_stamp(path: Path) -> tuple[int, int, int, int] | None:
+    """
+    Identify one version of a state file without reading it.
+
+    Args:
+        path: The file to identify.
+
+    Returns:
+        Inode, size and modification and change times, which together change
+        on every :func:`write_private_file` (it renames a new file into
+        place), or None when the file cannot be stat'ed.
+    """
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    return (info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
 @dataclass
@@ -1064,6 +1101,25 @@ class SessionStore:
             ).fetchone()
         return dict(row) if row else None
 
+    def get_api_token_by_name(self, name: str) -> dict[str, Any] | None:
+        """
+        Fetch an unrevoked API token by its name.
+
+        Names are unique across every token ever issued, so a name names one
+        credential for good; a WebSocket ticket is bound to one this way.
+
+        Args:
+            name: The token's name.
+
+        Returns:
+            The token row as a dict, or None when unknown or revoked.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM api_tokens WHERE name = ? AND revoked_at IS NULL", (name,)
+            ).fetchone()
+        return dict(row) if row else None
+
     def touch_api_token(self, token_id: int, used_at: float) -> None:
         """
         Record when a token last authenticated a request.
@@ -1122,7 +1178,8 @@ class SessionStore:
 
         Args:
             ticket_hash: Hash of the ticket value.
-            sid: Session the ticket belongs to.
+            sid: The ``sid`` of the credential the ticket was issued to: a
+                session id, :data:`MASTER_SID` or ``token:<name>``.
             client_ip: IP the ticket was issued to.
             expires_at: Expiry as a UNIX timestamp.
         """
@@ -1132,6 +1189,16 @@ class SessionStore:
                 "VALUES (?, ?, ?, ?)",
                 (ticket_hash, sid, client_ip, expires_at),
             )
+
+    def revoke_tickets(self, sid: str) -> None:
+        """
+        Spend every outstanding WebSocket ticket issued to one credential.
+
+        Args:
+            sid: The ``sid`` the tickets were issued to.
+        """
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM ws_tickets WHERE sid = ?", (sid,))
 
     def consume_ticket(self, ticket_hash: str) -> dict[str, Any] | None:
         """
@@ -1230,7 +1297,8 @@ class AuditLogger:
             action: What was attempted, for example ``auth.login``.
             result: Outcome, for example ``success`` or ``denied``.
             client_ip: Address the request came from.
-            actor: Session id or ``master``/``anonymous``.
+            actor: Who acted, as :func:`actor_label` names them, or
+                ``anonymous`` before any credential was verified.
             resource: Target of the action, such as an API path.
             detail: Extra context. Must never contain a credential.
         """
@@ -1398,6 +1466,14 @@ class TokenManager:
     The signing key is generated once and persisted with mode 0600. It is never
     regenerated silently: a key that changes on restart invalidates every
     session and cannot be shared between workers.
+
+    The files in the state directory are the only record of the master token
+    and the key, and a running console answers from them, not from a copy it
+    took at start. ``wasm web token --new`` and ``--regenerate`` run in a
+    process of their own; if the console kept the token it issued in memory,
+    the token those commands retire would keep opening it until a restart -
+    and the restart would issue yet another token. So the token hash is read
+    on every verification and the key is re-read whenever its file changes.
     """
 
     def __init__(self, config: SecurityConfig | None = None) -> None:
@@ -1411,8 +1487,12 @@ class TokenManager:
             SecurityError: When secrets or sessions cannot be persisted.
         """
         self.config = config or SecurityConfig()
-        self._master_token: str | None = None
+        # Stamped before reading, so a rotation landing between the two makes
+        # the next _signing_key() call read again instead of being missed.
+        self._secret_stamp = _file_stamp(self.config.secret_file)
         self._secret_key: str = self._load_or_create_secret()
+        if self._secret_stamp is None:
+            self._secret_stamp = _file_stamp(self.config.secret_file)
         self.sessions = SessionStore(self.config.session_db)
         # Serialises read-modify-write cycles on the two-factor state file, so
         # two logins racing to consume the same backup code cannot both win.
@@ -1459,12 +1539,13 @@ class TokenManager:
         write_private_file(secret_file, secret)
         return secret
 
-    def generate_master_token(self, save: bool = True) -> str:
+    def generate_master_token(self) -> str:
         """
-        Generate a new master token.
+        Issue a new master token, retiring the previous one everywhere.
 
-        Args:
-            save: Whether to persist the token hash.
+        Only the hash is persisted, and every console verifies against it, so
+        the previous token stops working in a running console on its next
+        request, not on its next restart.
 
         Returns:
             The generated master token, which is shown to the operator once.
@@ -1472,10 +1553,49 @@ class TokenManager:
         Raises:
             SecurityError: When the token hash cannot be persisted.
         """
-        self._master_token = f"wasm_{secrets.token_urlsafe(TOKEN_LENGTH)}"
-        if save:
-            write_private_file(self.config.token_file, self._hash_token(self._master_token))
-        return self._master_token
+        token = f"wasm_{secrets.token_urlsafe(TOKEN_LENGTH)}"
+        write_private_file(self.config.token_file, self._hash_token(token))
+        # A ticket issued to the retired token would otherwise outlive it by
+        # up to WS_TICKET_TTL seconds. The table is shared with a running
+        # console, so this holds across processes too.
+        self.sessions.revoke_tickets(MASTER_SID)
+        return token
+
+    def _signing_key(self) -> str:
+        """
+        The signing key in force, re-read when another process rotated it.
+
+        ``wasm web token --regenerate`` rewrites the key file from its own
+        process. A console holding on to the key it loaded would refuse the
+        token issued under the new key and keep signing sessions that the next
+        start rejects. A stat per call is the price of noticing.
+
+        Returns:
+            The hex-encoded signing key.
+        """
+        secret_file = self.config.secret_file
+        stamp = _file_stamp(secret_file)
+        if stamp is None or stamp == self._secret_stamp:
+            # A key file that vanished is not a rotation: the key in memory
+            # stays in force until a new file appears, since inventing one
+            # here is exactly the silent regeneration _load_or_create_secret
+            # refuses.
+            return self._secret_key
+        # Recorded before reading so an unreadable or empty file is reported
+        # once, not on every request; any repair changes the stamp again.
+        self._secret_stamp = stamp
+        try:
+            key = secret_file.read_text().strip()
+        except OSError as exc:
+            logger.error("Cannot re-read the web signing key %s: %s", secret_file, exc)
+            return self._secret_key
+        if not key:
+            logger.error(
+                "The web signing key %s is empty; keeping the key already loaded", secret_file
+            )
+            return self._secret_key
+        self._secret_key = key
+        return key
 
     def _hash_token(self, token: str) -> str:
         """
@@ -1487,7 +1607,7 @@ class TokenManager:
         Returns:
             Hex digest of the token, salted with the signing key.
         """
-        return hashlib.sha256((token + self._secret_key).encode()).hexdigest()
+        return hashlib.sha256((token + self._signing_key()).encode()).hexdigest()
 
     def _load_master_token_hash(self) -> str | None:
         """
@@ -1506,25 +1626,23 @@ class TokenManager:
 
     def verify_master_token(self, token: str) -> bool:
         """
-        Verify a master token.
+        Verify a master token against the hash on record right now.
 
         Args:
             token: The token presented by the client.
 
         Returns:
-            True when the token matches the active master token.
+            True when the token matches the stored hash. The file is read on
+            every call, so a token issued by another process is accepted and
+            the one it replaced is refused from the next request on.
         """
         if not token:
             return False
 
-        if self._master_token and secrets.compare_digest(token, self._master_token):
-            return True
-
         stored_hash = self._load_master_token_hash()
-        if stored_hash:
-            return secrets.compare_digest(self._hash_token(token), stored_hash)
-
-        return False
+        if not stored_hash:
+            return False
+        return secrets.compare_digest(self._hash_token(token), stored_hash)
 
     # ------------------------------------------------------------------ TOTP
 
@@ -1595,7 +1713,7 @@ class TokenManager:
             Hex digest of the normalised code, salted with the signing key.
         """
         compact = code.strip().lower().replace("-", "").replace(" ", "")
-        return hashlib.sha256((compact + self._secret_key).encode()).hexdigest()
+        return hashlib.sha256((compact + self._signing_key()).encode()).hexdigest()
 
     def totp_enabled(self) -> bool:
         """
@@ -1912,6 +2030,24 @@ class TokenManager:
         if not hmac.compare_digest(str(record["token_hash"]), presented):
             return None
 
+        return self._api_token_payload(record, client_ip)
+
+    def _api_token_payload(
+        self, record: Mapping[str, Any], client_ip: str | None
+    ) -> dict[str, Any] | None:
+        """
+        Turn an unrevoked API token row into the payload it authenticates.
+
+        Shared by a Bearer token and a WebSocket ticket issued to one, so the
+        two cannot disagree about expiry or about the scope a token carries.
+
+        Args:
+            record: The token row, already known to be unrevoked.
+            client_ip: Address presenting the credential.
+
+        Returns:
+            The payload, or None when the token has expired.
+        """
         now = time.time()
         expires_at = record["expires_at"]
         if expires_at is not None and float(expires_at) <= now:
@@ -1923,7 +2059,7 @@ class TokenManager:
 
         return {
             "type": "api_token",
-            "sid": f"token:{record['name']}",
+            "sid": f"{API_TOKEN_SID_PREFIX}{record['name']}",
             "scope": str(record["scope"]),
             "ip": client_ip,
             "token_id": int(record["id"]),
@@ -1983,7 +2119,7 @@ class TokenManager:
             The signed token.
         """
         signature = hmac.new(
-            self._secret_key.encode(), session_id.encode(), hashlib.sha256
+            self._signing_key().encode(), session_id.encode(), hashlib.sha256
         ).hexdigest()
         return f"{session_id}.{signature}"
 
@@ -2002,7 +2138,7 @@ class TokenManager:
         if not session_id or not signature:
             return None
         expected = hmac.new(
-            self._secret_key.encode(), session_id.encode(), hashlib.sha256
+            self._signing_key().encode(), session_id.encode(), hashlib.sha256
         ).hexdigest()
         # Constant time: a timing oracle here would let an attacker forge a
         # signature one byte at a time.
@@ -2160,7 +2296,10 @@ class TokenManager:
         travels there must be worthless seconds later and unusable twice.
 
         Args:
-            session_id: Session the ticket is issued for.
+            session_id: The ``sid`` of the payload asking for the ticket: a
+                cookie or Bearer session's id, :data:`MASTER_SID`, or
+                ``token:<name>`` for an API token. The ticket redeems as that
+                credential and nothing more; see :meth:`consume_ws_ticket`.
             client_ip: Address the ticket is issued to.
 
         Returns:
@@ -2177,14 +2316,21 @@ class TokenManager:
 
     def consume_ws_ticket(self, ticket: str, client_ip: str | None = None) -> dict[str, Any] | None:
         """
-        Redeem a WebSocket ticket.
+        Redeem a WebSocket ticket as the credential it was issued to.
+
+        The credential is checked again here, not only when the ticket was
+        issued: a session revoked, an API token revoked or expired, or a master
+        token rotated inside the ticket's lifetime leaves nothing to redeem.
+        An API token's ticket carries that token's scope, so a ticket never
+        opens more than the token itself would.
 
         Args:
             ticket: The ticket value presented by the client.
             client_ip: Address presenting the ticket.
 
         Returns:
-            A session payload when the ticket is valid, None otherwise.
+            The payload of the credential the ticket was issued to when the
+            ticket and that credential are both still valid, None otherwise.
         """
         if not ticket:
             return None
@@ -2196,7 +2342,16 @@ class TokenManager:
         if self.config.bind_session_to_ip and client_ip and record["client_ip"] != client_ip:
             return None
 
-        session = self.sessions.get(record["sid"])
+        sid = str(record["sid"])
+        if sid == MASTER_SID:
+            # generate_master_token spends these tickets, so one that is still
+            # here was issued to the token in force.
+            return master_payload(record["client_ip"])
+        if sid.startswith(API_TOKEN_SID_PREFIX):
+            token = self.sessions.get_api_token_by_name(sid[len(API_TOKEN_SID_PREFIX) :])
+            return None if token is None else self._api_token_payload(token, record["client_ip"])
+
+        session = self.sessions.get(sid)
         if session is None or self._past_absolute_deadline(session):
             return None
 
@@ -2342,9 +2497,10 @@ class TokenManager:
         """
         self._secret_key = secrets.token_hex(SECRET_KEY_LENGTH)
         write_private_file(self.config.secret_file, self._secret_key)
+        self._secret_stamp = _file_stamp(self.config.secret_file)
         self.revoke_all_sessions()
         self.purge_expired_sessions()
-        return self.generate_master_token(save=True)
+        return self.generate_master_token()
 
 
 def _parse_networks(entries: list[str]) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
@@ -2689,14 +2845,19 @@ def actor_label(session: Mapping[str, Any]) -> str:
     """
     A short, non-secret label naming who is behind a session payload.
 
-    Used wherever an action records who did it: the audit log's call sites
-    already read ``session["sid"]`` directly, and jobs reuse the same source
-    of identity through this helper. An API token's payload already carries
-    a human name (``token:<name>``, set by
-    :meth:`TokenManager.verify_api_token`); the master token's is the literal
-    ``master``; a cookie session's id is an opaque, non-secret identifier -
-    the credential is the signed cookie value, not the id alone - shortened
-    here to keep a jobs list readable.
+    The one way an action records who did it: every audit record, every
+    audit log line and every job's actor go through here, so the Activity
+    page can filter the audit log by the same actor a job shows. Reading the
+    payload by hand is how three routers came to log ``session=unknown`` for
+    every call - they read a ``session_id`` key that payloads never had.
+
+    An API token's payload already carries a human name (``token:<name>``,
+    set by :meth:`TokenManager.verify_api_token`); the master token's is the
+    literal ``master``; a cookie session's id is an opaque, non-secret
+    identifier - the credential is the signed cookie value, not the id alone -
+    shortened here to keep a jobs list readable. Twelve characters still start
+    with the prefix ``GET /api/auth/sessions`` lists, so a line can be traced
+    to the session that wrote it.
 
     Args:
         session: The authenticated session payload, as :func:`require_auth`
@@ -2706,8 +2867,8 @@ def actor_label(session: Mapping[str, Any]) -> str:
         ``"master"``, ``"token:<name>"``, or the first 12 characters of a
         cookie session's id.
     """
-    sid = str(session.get("sid", "unknown"))
-    if sid in ("master", "unknown") or sid.startswith("token:"):
+    sid = str(session.get("sid") or "unknown")
+    if sid in (MASTER_SID, "unknown") or sid.startswith(API_TOKEN_SID_PREFIX):
         return sid
     return sid[:12]
 
@@ -2768,7 +2929,7 @@ def ensure_scope(request: Request, payload: dict[str, Any], required: str) -> No
             action="auth.scope",
             result="denied",
             client_ip=get_client_ip(request),
-            actor=str(payload.get("sid", "unknown")),
+            actor=actor_label(payload),
             resource=request.url.path,
             detail=f"scope '{granted}' below required '{required}'",
         )
@@ -2780,6 +2941,19 @@ def ensure_scope(request: Request, payload: dict[str, Any], required: str) -> No
             "right scope from Settings, or POST /api/auth/tokens."
         ),
     )
+
+
+def master_payload(client_ip: str | None) -> dict[str, Any]:
+    """
+    The payload the master token authenticates, wherever it is presented.
+
+    Args:
+        client_ip: Address presenting it.
+
+    Returns:
+        An ``admin`` payload named :data:`MASTER_SID`.
+    """
+    return {"type": "master", "sid": MASTER_SID, "ip": client_ip, "scope": "admin"}
 
 
 def check_credential(credential: str, client_ip: str) -> dict[str, Any] | None:
@@ -2807,7 +2981,7 @@ def check_credential(credential: str, client_ip: str) -> dict[str, Any] | None:
         return payload
 
     if manager.verify_master_token(credential):
-        return {"type": "master", "sid": "master", "ip": client_ip, "scope": "admin"}
+        return master_payload(client_ip)
 
     return None
 
@@ -2911,7 +3085,7 @@ def _check_csrf(request: Request, payload: dict[str, Any], client_ip: str) -> No
             action="auth.csrf",
             result="denied",
             client_ip=client_ip,
-            actor=payload.get("sid", "unknown"),
+            actor=actor_label(payload),
             resource=request.url.path,
             detail=f"missing or invalid {CSRF_HEADER_NAME} header",
         )

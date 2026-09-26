@@ -13,3 +13,9 @@
 {%- macro env_value(value) -%}
 {{ value | string | replace('\\', '\\\\') | replace('"', '\\"') | replace('%', '%%') | replace('\n', ' ') | replace('\r', ' ') | replace('\x00', '') }}
 {%- endmacro -%}
+
+{#- A path systemd resolves specifiers in, such as EnvironmentFile=: the line
+    rules, plus % doubled so it is not read as a specifier. -#}
+{%- macro path(value) -%}
+{{ line(value) | replace('%', '%%') }}
+{%- endmacro -%}

@@ -588,12 +588,21 @@ class EnvManager:
         """
         Quote a value only when writing it bare would change how it reads back.
 
+        The file is read by systemd too, through ``EnvironmentFile=``, and
+        systemd consumes a backslash in a bare or double-quoted value. Inside
+        single quotes it is literal to systemd, to dotenv and to
+        :meth:`read_env_file` alike, so a value holding one goes there - unless
+        it also holds a single quote, which no quoting represents for all
+        three.
+
         Args:
             value: The raw value to write.
 
         Returns:
-            ``value`` unchanged, or wrapped in double quotes.
+            ``value`` unchanged, or wrapped in single or double quotes.
         """
+        if "\\" in value and "'" not in value:
+            return f"'{value}'"
         has_surrounding_whitespace = value != value.strip()
         looks_pre_quoted = len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'")
         if has_surrounding_whitespace or looks_pre_quoted:

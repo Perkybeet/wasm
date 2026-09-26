@@ -2,8 +2,11 @@
 Monitor command handlers.
 
 ``wasm monitor`` drives observability, not enforcement: it reads resource
-metrics, the process table and systemd unit health, writes down what stands out
-and can mail a report. It never signals a process and never deletes a file.
+metrics, the process table and systemd unit health, and writes down what
+stands out. Raw observations can be mailed; disk, certificate and unit events
+also go through whichever notification channels are configured (webhook,
+Slack, Discord, Telegram or email). It never signals a process and never
+deletes a file.
 
 These handlers used to build a ``MonitorConfig`` with ``auto_terminate``,
 ``use_ai`` and ``dry_run``, settings that stopped existing when the monitor
@@ -513,8 +516,11 @@ def cli() -> None:
     Watch this server and write down what stands out.
 
     The monitor reads resource usage, the process table and the health of the
-    units you list, keeps what it noticed in a local database and can mail you
-    a report. It never stops a process and never deletes a file.
+    units you list, and keeps what it noticed in a local database. Raw
+    observations can be mailed to you; disk, certificate and unit events also
+    go through whichever notification channels you configure (webhook, Slack,
+    Discord, Telegram or email). It never stops a process and never deletes a
+    file.
     """
 
 

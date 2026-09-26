@@ -24,7 +24,7 @@ next caller, which is exactly how ``site delete`` lost its certificate cleanup.
 from __future__ import annotations
 
 import json
-import re
+import os
 import sys
 from argparse import Namespace
 from collections.abc import Callable
@@ -48,7 +48,9 @@ from wasm.core.store import DeploymentTrigger, get_store
 from wasm.core.utils import domain_to_app_name, remove_directory
 from wasm.deployers import get_deployer
 from wasm.deployers.docker_compose import DockerComposeDeployer
+from wasm.deployers.helpers.env_manager import EnvManager
 from wasm.deployers.helpers.layout import CONFIGURED, LAYOUTS, choose_layout
+from wasm.deployers.helpers.package_manager import SUPPORTED_PACKAGE_MANAGERS
 from wasm.deployers.lifecycle import update_app
 from wasm.deployers.monorepo import MonorepoDeployer
 from wasm.deployers.registry import available_types
@@ -58,12 +60,12 @@ from wasm.managers.nginx_manager import NginxManager
 from wasm.managers.service_manager import ServiceManager
 from wasm.managers.webserver import delete_site_completely
 from wasm.validators.domain import should_include_www, validate_domain
+from wasm.validators.environment import is_valid_env_name
 from wasm.validators.port import find_available_port, validate_port
 
-# Constants for .env file parsing
-MAX_ENV_FILE_SIZE = 1024 * 1024  # 1MB max
-MAX_ENV_LINE_LENGTH = 10000
-VALID_ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+#: Larger than any environment file a person writes; a bigger one is an
+#: archive or a build artefact passed by mistake.
+MAX_ENV_FILE_SIZE = 1024 * 1024
 
 #: Following logs is interactive and ends with Ctrl+C, but the runner insists
 #: on a deadline. A day is long enough to be indistinguishable from forever.
@@ -77,8 +79,11 @@ _COMPOSE_TIMEOUT = 1800
 #: that goes stale the first time a deployer is added, and it did.
 APP_TYPES = [entry["type"] for entry in available_types()]
 
-#: Node package managers ``create`` and ``update`` accept.
-PACKAGE_MANAGERS = ["npm", "pnpm", "bun", "auto"]
+#: Node package managers ``create`` and ``update`` accept. Derived from
+#: PackageManagerHelper's own list plus "auto" (detect from the lock file),
+#: so a manager it can drive - yarn among them - is never rejected here
+#: before it gets the chance to.
+PACKAGE_MANAGERS = [*SUPPORTED_PACKAGE_MANAGERS, "auto"]
 
 #: Web servers a site can be fronted by.
 WEBSERVERS = ["nginx", "apache"]
@@ -113,11 +118,14 @@ def _follow(argv: list[str], cwd: Path | None = None) -> CommandResult | None:
 
 def _read_env_file(env_file: Path, logger: Logger) -> dict[str, str]:
     """
-    Read KEY=value pairs from an environment file.
+    Read the variables of the file given to ``--env-file``.
 
-    Malformed lines are reported and skipped rather than aborting the
-    deployment, because one stray line in a long file should not cost the user
-    the whole run.
+    Parsed by :meth:`~wasm.deployers.helpers.env_manager.EnvManager.read_env_file`,
+    the grammar ``wasm env`` and the panel read the application's own env file
+    with, so ``export FOO=bar``, quotes and comments mean the same thing on the
+    way in as they do once deployed. A name that is not an environment
+    variable is reported and skipped rather than aborting the deployment,
+    because one stray line in a long file should not cost the user the run.
 
     Args:
         env_file: File to read.
@@ -127,8 +135,8 @@ def _read_env_file(env_file: Path, logger: Logger) -> dict[str, str]:
         The variables found, in file order.
 
     Raises:
-        DeploymentError: When the file is missing, too large to be an
-            environment file, or cannot be decoded.
+        DeploymentError: When the file is missing, unreadable, too large to be
+            an environment file, or not UTF-8.
     """
     if not env_file.exists():
         raise DeploymentError(
@@ -144,44 +152,29 @@ def _read_env_file(env_file: Path, logger: Logger) -> dict[str, str]:
             "not pass a build artefact or an archive by mistake.",
         )
 
-    env_vars: dict[str, str] = {}
+    # read_env_file treats an unreadable file as an empty one, which is right
+    # for an application that has no .env yet and wrong for a file the
+    # operator named on the command line.
+    if not os.access(env_file, os.R_OK):
+        raise DeploymentError(
+            f"Cannot read environment file {env_file}",
+            details="Check its permissions, or run the command as root.",
+        )
+
     try:
-        with open(env_file) as handle:
-            for line_num, raw_line in enumerate(handle, 1):
-                if len(raw_line) > MAX_ENV_LINE_LENGTH:
-                    logger.warning(f"Line {line_num} exceeds max length, skipping")
-                    continue
-
-                line = raw_line.strip()
-                if not line or line.startswith("#"):
-                    continue
-
-                if "=" not in line:
-                    logger.warning(f"Line {line_num}: invalid format (no '='), skipping")
-                    continue
-
-                key, value = line.split("=", 1)
-                key = key.strip()
-                value = value.strip()
-
-                if not VALID_ENV_KEY_PATTERN.match(key):
-                    logger.warning(f"Line {line_num}: invalid key '{key}', skipping")
-                    continue
-
-                # Quotes survive into systemd's Environment= and break it, so
-                # they are stripped here rather than at the service file.
-                if value.startswith('"') and value.endswith('"'):
-                    value = value[1:-1]
-                elif value.startswith("'") and value.endswith("'"):
-                    value = value[1:-1]
-
-                env_vars[key] = value
-    except (OSError, UnicodeDecodeError) as e:
+        values = EnvManager().read_env_file(env_file)
+    except UnicodeDecodeError as e:
         raise DeploymentError(
             f"Failed to read environment file {env_file}: {e}",
-            details="Check the file is readable and is UTF-8 text.",
+            details="Check the file is UTF-8 text.",
         ) from e
 
+    env_vars: dict[str, str] = {}
+    for key, value in values.items():
+        if not is_valid_env_name(key):
+            logger.warning(f"Invalid variable name '{key}' in {env_file}, skipping")
+            continue
+        env_vars[key] = value
     return env_vars
 
 
@@ -1669,8 +1662,12 @@ def update(
     """
     Pull the latest code, rebuild and restart an application.
 
-    A backup is taken first, and the service is only restarted once the new
-    build succeeded.
+    On the in-place layout, a backup is taken first and the service is only
+    restarted once the new build succeeded. On the releases layout, there is
+    no backup step: the release that was serving stays on disk, the new one
+    is built and activated behind a health gate, and a release that does not
+    answer is rolled back automatically - the previous release is the way
+    back.
     """
     _exit(
         _update_app(

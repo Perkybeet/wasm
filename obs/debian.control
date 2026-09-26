@@ -26,12 +26,18 @@ Depends: ${python3:Depends},
          ${misc:Depends},
          python3 (>= 3.10),
          python3-pip,
+         python3-venv,
          python3-yaml,
          python3-jinja2,
          python3-click,
          python3-rich,
          nginx | apache2,
          certbot
+# python3-venv: wasm.deployers.python creates each Python app's virtualenv
+# with 'python3 -m venv'. Debian and Ubuntu split venv (and the ensurepip
+# bootstrap it runs by default) out of the python3 package; without this,
+# every Python deployment fails at 'Creating virtual environment...'.
+#
 # python3-inquirer does not exist in Debian or Ubuntu, so the interactive mode
 # it gated never worked on those distributions. Prompts use questionary, which
 # is packaged from Debian 13 and Ubuntu 24.04 onwards.

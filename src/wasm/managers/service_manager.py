@@ -28,27 +28,29 @@ Every operation that reads or changes unit state goes through
 :meth:`ServiceManager.inspect_unit`, so the guard cannot be forgotten in one
 code path the way it was before.
 
-Why ``Environment=`` and not ``EnvironmentFile=``
-------------------------------------------------
-``EnvironmentFile=`` at mode 0600 would keep secrets out of ``systemctl show``
-output, which is the one real advantage it has, and it was evaluated here.
-It is not what this manager does:
+Secrets go in ``EnvironmentFile=``, not ``Environment=``
+------------------------------------------------------
+A unit file is 0644, and ``systemctl show <unit>`` prints its ``Environment=``
+to any local user, not only to root: an unprivileged account on the machine
+could read every DATABASE_URL and API key an application was deployed with.
+So an application's unit carries inline only what is not secret and is WASM's
+to decide (PORT, NODE_ENV), and loads the rest with ``EnvironmentFile=-`` from
+the application's env file - the one
+:func:`~wasm.deployers.helpers.layout.env_file_for` names, 0600 and owned by
+the service account, which backups, restores and deletes already know about
+because ``wasm env`` and the panel edit the same file.
 
-- The file is parsed shell-like, with its own quoting rules. CLAUDE.md records
-  that quoted values in ``.env`` files are a recurring source of breakage; an
-  ``EnvironmentFile`` moves that same class of failure into the unit's boot
-  path, where it fails at start time instead of at write time.
-- It turns one unit file into two pieces of state that every create, update,
-  delete, backup and restore path would have to keep in sync. A secret left
-  behind by a delete is worse than a secret visible to root in
-  ``systemctl show``, which is a root-only view of a root-owned machine anyway.
-- The injection risk it is sometimes credited with removing is already closed
-  at the boundary by :mod:`wasm.validators.environment` plus escaping at render
-  time, and that validation would still be required for an environment file.
+Two consequences the callers own. systemd lets ``EnvironmentFile=`` override
+``Environment=``, so the deployers keep PORT and NODE_ENV out of the file.
+And the file is parsed by systemd as well as by the application, so it is
+written in the one grammar both read the same way (see
+:class:`~wasm.deployers.helpers.env_manager.EnvManager`). A unit written by
+an earlier version, with the variables inline, keeps working as it is; the
+next deploy moves them into the file.
 
-The decision is therefore: keep ``Environment=`` in the unit, and make the
-validation in :meth:`ServiceManager.create_service` mandatory rather than
-optional, since this manager is the single step every caller must pass through.
+Everything still interpolated into a unit is validated in
+:meth:`ServiceManager.create_service` - mandatory, since this manager is the
+single step every caller must pass through - and escaped at render time.
 """
 
 from __future__ import annotations
@@ -913,6 +915,7 @@ class ServiceManager(BaseManager):
         description: str | None = None,
         template: str = "app",
         limits: ResourceLimits | None = None,
+        environment_file: str | None = None,
         **kwargs: Any,
     ) -> None:
         """
@@ -929,10 +932,14 @@ class ServiceManager(BaseManager):
             working_directory: Working directory for the service.
             user: User to run service as.
             group: Group to run service as.
-            environment: Environment variables.
+            environment: Environment variables written inline. Only what is
+                not secret: every local user can read them.
             description: Service description.
             template: Template name.
             limits: Memory, CPU and task limits, validated here. None for none.
+            environment_file: Absolute path of a 0600 file the unit loads the
+                rest of its environment from, or None for none. A missing file
+                is not an error: the unit references it with ``-``.
             **kwargs: Extra context variables passed to the template.
 
         Raises:
@@ -967,6 +974,7 @@ class ServiceManager(BaseManager):
             "user": validate_unit_value(user or self.config.service_user, field="User"),
             "group": validate_unit_value(group or self.config.service_group, field="Group"),
             "environment": env,
+            "environment_file": self._validated_environment_file(environment_file),
             "resource_limits": (limits or ResourceLimits()).validated().directives(),
         }
         ctx.update(kwargs)
@@ -994,6 +1002,31 @@ class ServiceManager(BaseManager):
             self.logger.debug(f"Could not register service in store: {exc}")
 
         self.logger.debug(f"Created service: {unit}")
+
+    @staticmethod
+    def _validated_environment_file(path: str | None) -> str | None:
+        """
+        Check an ``EnvironmentFile=`` path before it is written into a unit.
+
+        Args:
+            path: The path, or None.
+
+        Returns:
+            The path unchanged, or None.
+
+        Raises:
+            ValidationError: When the path is relative, or carries a character
+                that would end the directive.
+        """
+        if path is None:
+            return None
+        value = validate_unit_value(path, field="EnvironmentFile")
+        if not os.path.isabs(value):
+            raise ValidationError(
+                f"EnvironmentFile must be an absolute path, got {value!r}",
+                details="systemd refuses a relative EnvironmentFile= and would not start the unit.",
+            )
+        return value
 
     def create_from_unit(self, name: str, content: str) -> None:
         """

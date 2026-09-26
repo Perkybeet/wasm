@@ -17,6 +17,11 @@ WorkingDirectory={{ esc.line(working_directory) }}
 {% for key, value in environment.items() %}
 Environment="{{ esc.env_value(key) }}={{ esc.env_value(value) }}"
 {% endfor %}
+{% if environment_file | default(none) %}
+# Everything else, secrets included, from a file only root and the service
+# account can read: this unit is world-readable, and so is systemctl show.
+EnvironmentFile=-{{ esc.path(environment_file) }}
+{% endif %}
 
 # Command
 ExecStart={{ esc.line(command) }}

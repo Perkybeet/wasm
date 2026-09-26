@@ -40,7 +40,8 @@ from wasm.managers.backup_scheduler import (
     validate_calendar,
 )
 from wasm.web.api.auth import get_current_session
-from wasm.web.api.deps import WASMErrorRoute, strict_domain
+from wasm.web.api.deps import WASMErrorRoute, require_elevated, strict_domain
+from wasm.web.auth import actor_label
 from wasm.web.pydantic_compat import field_validator
 
 router = APIRouter(route_class=WASMErrorRoute)
@@ -210,7 +211,7 @@ def create_schedule(
         "create_backup_schedule domain=%s schedule=%s session=%s",
         domain,
         schedule.on_calendar,
-        session.get("session_id", "unknown"),
+        actor_label(session),
     )
     BackupScheduler(verbose=False).create_schedule(schedule)
 
@@ -233,14 +234,19 @@ def create_schedule(
 
 @router.delete("/{domain}", response_model=ScheduleActionResponse)
 def delete_schedule(
-    domain: str, session: Annotated[dict, Depends(get_current_session)]
+    domain: str, session: Annotated[dict, Depends(require_elevated)]
 ) -> ScheduleActionResponse:
     """
     Remove an application's backup schedule.
 
+    Removing the units stops future backups from ever running, silently -
+    D5's sudo mode list treats it the same as any other destructive delete,
+    so a cookie session has to confirm itself first; an admin-scoped Bearer
+    credential is exempt, per :func:`wasm.web.api.deps.ensure_elevated`.
+
     Args:
         domain: Domain whose schedule is removed.
-        session: The authenticated session.
+        session: The authenticated, elevated session.
 
     Returns:
         The action outcome.
@@ -257,7 +263,7 @@ def delete_schedule(
     audit_log.info(
         "delete_backup_schedule domain=%s session=%s",
         validated,
-        session.get("session_id", "unknown"),
+        actor_label(session),
     )
     scheduler.remove_schedule(validated)
 

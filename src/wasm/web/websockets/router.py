@@ -30,6 +30,7 @@ from wasm.web.auth import (
     WS_CLOSE_UNAUTHORIZED,
     WS_SUBPROTOCOL,
     WS_TOKEN_PREFIX,
+    actor_label,
     authenticate_connection,
     get_audit_logger,
     get_client_ip,
@@ -150,7 +151,7 @@ async def _accept(websocket: WebSocket, session: dict[str, Any], path: str) -> N
             action="ws.connect",
             result="success",
             client_ip=get_client_ip(websocket),
-            actor=str(session.get("sid")),
+            actor=actor_label(session),
             resource=path,
         )
 

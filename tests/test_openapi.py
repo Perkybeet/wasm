@@ -153,6 +153,37 @@ class TestDefaultsStayOptional:
         assert offenders == []
 
 
+class TestTheSchemaCarriesTheRealVersion:
+    """
+    The reported defect: ``info.version`` was the literal ``1.0.0`` whatever
+    release was running, so the schema an operator fetched from their panel
+    named a version that never existed.
+    """
+
+    def test_the_served_schema_names_the_running_release(self, app: FastAPI) -> None:
+        from wasm import __version__
+
+        assert app.openapi()["info"]["version"] == __version__
+
+    def test_the_export_does_not_depend_on_the_installed_version(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A committed file stamped with the version would go stale on every
+        release bump, and would differ between a development install and a
+        release build of the same API, so ``--check`` could never pass for
+        both. The export writes a placeholder instead.
+        """
+        from scripts.export_openapi import EXPORTED_VERSION, export_openapi
+
+        first = export_openapi(tmp_path / "a.json")
+        monkeypatch.setattr("wasm.web.server.__version__", "99.0.0.dev7")
+        second = export_openapi(tmp_path / "b.json")
+
+        assert first.read_bytes() == second.read_bytes()
+        assert json.loads(first.read_text())["info"]["version"] == EXPORTED_VERSION
+
+
 class TestExportIsDeterministic:
     """``scripts/export_openapi.py`` is the console's one source of truth."""
 

@@ -28,7 +28,7 @@ from wasm.core.exceptions import (
     ServiceError,
     WASMError,
 )
-from wasm.core.fs import SECRET_MODE, FileSystem
+from wasm.core.fs import FileSystem
 from wasm.core.logger import Icons
 from wasm.core.runner import CommandResult, CommandRunner, get_runner
 from wasm.core.store import (
@@ -44,6 +44,7 @@ from wasm.core.store import (
 )
 from wasm.core.utils import domain_to_app_name
 from wasm.deployers.helpers import (
+    EnvManager,
     PackageManagerHelper,
     PathResolver,
     PrismaHelper,
@@ -66,6 +67,7 @@ from wasm.managers.cert_manager import CertManager
 from wasm.managers.nginx_manager import NginxManager
 from wasm.managers.service_manager import ResourceLimits, ServiceManager
 from wasm.managers.source_manager import SourceManager
+from wasm.validators.environment import validate_environment
 
 #: Installs and builds in a monorepo touch every workspace; they need minutes,
 #: but they still need a deadline.
@@ -275,7 +277,20 @@ class MonorepoDeployer(AppDeployer):
                 subdomains, ``workspace_filter`` limits which workspaces deploy,
                 ``skip_database`` disables provisioning, and ``job_id`` is the
                 background job driving this deployment, when there is one.
+
+        Raises:
+            DeploymentError: When ``webserver`` is ``apache``, which this
+                deployer cannot configure yet.
         """
+        if webserver == "apache":
+            raise DeploymentError(
+                "Monorepo applications cannot be served through Apache yet",
+                details="Apache site configuration for a monorepo is not implemented: "
+                "each workspace needs its own reverse-proxied subdomain, which only the "
+                "nginx path builds today. Deploy with --webserver nginx (the default), "
+                "or configure Apache by hand outside WASM.",
+            )
+
         self.domain = domain
         self.source = source
         self.trigger = trigger
@@ -870,8 +885,7 @@ class MonorepoDeployer(AppDeployer):
             ws_env["PORT"] = str(ws.port)
             ws_env.update(ws.env_vars)
 
-            env_file = self.app_path / ws.path / ".env.production"
-            self._write_env_file(env_file, ws_env)
+            self._write_env_file(self._workspace_env_file(ws), ws_env)
             self.logger.substep(f"Created {ws.path}/.env.production")
 
         # Root .env for Prisma
@@ -883,17 +897,33 @@ class MonorepoDeployer(AppDeployer):
         """
         Write environment variables to a file.
 
+        The workspace units load these files with ``EnvironmentFile=``, so
+        they are written by the one writer whose quoting systemd and dotenv
+        read alike, owner-only, since they hold DATABASE_URL with the password
+        this deployer generated. The variables are validated first: they
+        include what ``--env-file`` or ``env_vars`` gave, and a newline in one
+        would add another variable to the service's environment.
+
         Args:
             path: File to write.
             env_vars: Variables to record, one per line.
+
+        Raises:
+            EnvironmentValidationError: When a name or a value is unusable.
         """
-        lines = []
-        for key, value in sorted(env_vars.items()):
-            # Don't quote values for systemd compatibility
-            lines.append(f"{key}={value}")
-        # SECRET_MODE: this file holds DATABASE_URL with the password this
-        # deployer just generated, plus whatever else .env.example asked for.
-        self.fs.write_text(path, "\n".join(lines) + "\n", mode=SECRET_MODE)
+        EnvManager(fs=self.fs).write_env_file(path, validate_environment(env_vars))
+
+    def _workspace_env_file(self, workspace: MonorepoWorkspace) -> Path:
+        """
+        Return the env file of one workspace, which its unit loads.
+
+        Args:
+            workspace: The workspace.
+
+        Returns:
+            ``<app>/<workspace>/.env.production``.
+        """
+        return self.app_path / workspace.path / ".env.production"
 
     def _install_dependencies(self) -> None:
         """Install dependencies using pnpm."""
@@ -1299,13 +1329,17 @@ class MonorepoDeployer(AppDeployer):
 
             self.logger.substep(f"Creating service: {service_name}")
 
-            # Build environment
-            env = self.env_vars.copy()
-            env["PORT"] = str(ws.port)
-            env["NODE_ENV"] = "production"
-            # HOME is needed for pnpm to write its cache
-            env["HOME"] = str(self.app_path)
-            env.update(ws.env_vars)
+            # Only what is not secret goes inline: a unit is 0644 and
+            # systemctl show prints Environment= to any local user. The
+            # create-time variables, the database URL and the workspace's own
+            # are in the 0600 file _configure_environment wrote, which the
+            # unit loads and which carries this same PORT.
+            env = {
+                "PORT": str(ws.port),
+                "NODE_ENV": "production",
+                # HOME is needed for pnpm to write its cache
+                "HOME": str(self.app_path),
+            }
 
             # Create service
             self.service_manager.create_service(
@@ -1313,6 +1347,7 @@ class MonorepoDeployer(AppDeployer):
                 command=start_command,
                 working_directory=str(working_dir),
                 environment=env,
+                environment_file=str(self._workspace_env_file(ws)),
                 description=f"WASM: {ws.subdomain}.{self.domain} ({ws.app_type})",
                 limits=ResourceLimits.of(self.store.get_app(self.domain)),
             )

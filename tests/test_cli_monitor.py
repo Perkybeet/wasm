@@ -411,6 +411,19 @@ def test_the_scan_help_does_not_promise_ai_or_termination() -> None:
     assert "terminate" not in output
 
 
+def test_the_group_help_does_not_claim_email_is_the_only_channel() -> None:
+    """
+    'can mail you a report' used to be the whole story the help text told, but
+    disk, certificate and unit events also reach webhook, Slack, Discord and
+    Telegram - whichever notification channels are configured - not only
+    email.
+    """
+    normalized = " ".join(invoke("--help").output.lower().split())
+
+    assert "notification channel" in normalized
+    assert "slack" in normalized
+
+
 def test_status_states_what_the_monitor_will_not_do(
     monitor_env: Any,
     cli_output: io.StringIO,

@@ -25,6 +25,7 @@ from wasm.web.auth import (
     CSRF_HEADER_NAME,
     SESSION_COOKIE_NAME,
     IssuedSession,
+    actor_label,
     bearer_token,
     check_credential,
     get_audit_logger,
@@ -366,7 +367,7 @@ async def login(request: Request, response: Response, body: LoginRequest) -> Log
             action="auth.login",
             result="success",
             client_ip=client_ip,
-            actor=session.session_id,
+            actor=actor_label({"sid": session.session_id}),
             resource="/api/auth/login",
         )
 
@@ -483,7 +484,7 @@ async def elevate(
             action="auth.elevate",
             result="success",
             client_ip=client_ip,
-            actor=str(session.get("sid")),
+            actor=actor_label(session),
             resource="/api/auth/elevate",
         )
 
@@ -520,7 +521,7 @@ async def logout(
             action="auth.logout",
             result="success",
             client_ip=get_client_ip(request),
-            actor=str(session_id),
+            actor=actor_label(session),
             resource="/api/auth/logout",
         )
 
@@ -556,6 +557,10 @@ async def create_ws_ticket(
     cannot rely on cookies use this instead of putting a long-lived token in a
     query string that proxies and access logs record.
 
+    Any credential may ask: a session, the master token or an API token. The
+    ticket redeems as that same credential, with its scope, and only while it
+    is still valid - see :meth:`wasm.web.auth.TokenManager.consume_ws_ticket`.
+
     Args:
         request: The incoming request.
         session: The authenticated session.
@@ -573,7 +578,7 @@ async def create_ws_ticket(
             action="auth.ws_ticket",
             result="success",
             client_ip=client_ip,
-            actor=str(session.get("sid")),
+            actor=actor_label(session),
             resource="/api/auth/ws-ticket",
         )
 
@@ -635,7 +640,7 @@ def revoke_all_sessions(
             action="auth.revoke_all",
             result="success",
             client_ip=get_client_ip(request),
-            actor=str(session.get("sid")),
+            actor=actor_label(session),
             resource="/api/auth/sessions/revoke-all",
         )
 
@@ -686,7 +691,7 @@ def revoke_other_sessions(
             action="auth.revoke_others",
             result="success",
             client_ip=get_client_ip(request),
-            actor=str(session.get("sid")),
+            actor=actor_label(session),
             resource="/api/auth/sessions/revoke-others",
             detail=f"revoked {revoked} session(s)",
         )
@@ -735,7 +740,7 @@ def revoke_one_session(
             action="auth.session.revoke",
             result="success",
             client_ip=get_client_ip(request),
-            actor=str(session.get("sid")),
+            actor=actor_label(session),
             resource=f"/api/auth/sessions/{revoked}",
             detail=f"revoked session {revoked}",
         )
@@ -856,7 +861,7 @@ def two_factor_enroll(
             action="auth.2fa.enroll",
             result="success",
             client_ip=get_client_ip(request),
-            actor=str(session.get("sid")),
+            actor=actor_label(session),
             resource="/api/auth/2fa/enroll",
         )
 
@@ -894,7 +899,7 @@ def two_factor_confirm(
                 action="auth.2fa.confirm",
                 result="failure",
                 client_ip=client_ip,
-                actor=str(session.get("sid")),
+                actor=actor_label(session),
                 resource="/api/auth/2fa/confirm",
                 detail="code did not match the pending secret",
             )
@@ -908,7 +913,7 @@ def two_factor_confirm(
             action="auth.2fa.confirm",
             result="success",
             client_ip=client_ip,
-            actor=str(session.get("sid")),
+            actor=actor_label(session),
             resource="/api/auth/2fa/confirm",
         )
 
@@ -954,7 +959,7 @@ def two_factor_disable(
             action="auth.2fa.disable",
             result="success",
             client_ip=client_ip,
-            actor=str(session.get("sid")),
+            actor=actor_label(session),
             resource="/api/auth/2fa/disable",
         )
 
@@ -993,7 +998,7 @@ def regenerate_backup_codes(
             action="auth.2fa.backup_codes",
             result="success",
             client_ip=get_client_ip(request),
-            actor=str(session.get("sid")),
+            actor=actor_label(session),
             resource="/api/auth/2fa/backup-codes",
         )
 
@@ -1133,7 +1138,7 @@ def create_api_token(
             action="auth.token.create",
             result="success",
             client_ip=get_client_ip(request),
-            actor=str(session.get("sid")),
+            actor=actor_label(session),
             resource="/api/auth/tokens",
             detail=f"issued token '{issued['name']}' with scope '{issued['scope']}'",
         )
@@ -1169,7 +1174,7 @@ def revoke_api_token(
             action="auth.token.revoke",
             result="success",
             client_ip=get_client_ip(request),
-            actor=str(session.get("sid")),
+            actor=actor_label(session),
             resource=f"/api/auth/tokens/{token_id}",
             detail=f"revoked token '{name}'",
         )

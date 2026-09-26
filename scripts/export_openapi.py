@@ -15,6 +15,13 @@ listening anywhere.
 instead of hand-maintained ones that drift from what the server actually
 returns.
 
+The served schema's ``info.version`` is the running release; the exported
+one carries :data:`EXPORTED_VERSION` instead. The committed file describes the
+shape of the API, which is what ``--check`` compares, and a version stamp in
+it would make ``--check`` fail on every release bump (``scripts/release.py``
+changes the version, not the API) and disagree between a development install
+and a release build of the very same code.
+
 Usage:
     scripts/export_openapi.py            Write panel/openapi.json.
     scripts/export_openapi.py --check    Fail if it is out of date. CI runs this.
@@ -33,6 +40,10 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT = ROOT / "panel" / "openapi.json"
 
+#: What the exported file says in ``info.version``. Not a version on purpose:
+#: see the module docstring.
+EXPORTED_VERSION = "unversioned"
+
 
 def _build_schema() -> dict[str, Any]:
     """
@@ -44,7 +55,8 @@ def _build_schema() -> dict[str, Any]:
     every route to build the schema.
 
     Returns:
-        The OpenAPI document, exactly as ``GET /api/openapi.json`` serves it.
+        The OpenAPI document as ``GET /api/openapi.json`` serves it, except
+        for ``info.version``, which is :data:`EXPORTED_VERSION`.
     """
     from wasm.web.auth import SecurityConfig
     from wasm.web.server import create_app
@@ -52,7 +64,11 @@ def _build_schema() -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="wasm-openapi-") as tmp_dir:
         config = SecurityConfig(state_dir=Path(tmp_dir) / "state", rate_limit_requests=5000)
         app = create_app(config)
-        return app.openapi()
+        # A copy: app.openapi() caches the document it returns, and the
+        # placeholder must not leak into what this process would serve.
+        schema = dict(app.openapi())
+        schema["info"] = {**schema["info"], "version": EXPORTED_VERSION}
+        return schema
 
 
 def _render(schema: dict[str, Any]) -> str:

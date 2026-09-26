@@ -17,6 +17,7 @@ from jinja2 import Environment, PackageLoader
 
 from wasm.core.store import App, Service, Site, WASMStore
 from wasm.deployers.base import BaseDeployer
+from wasm.deployers.helpers.env_manager import EnvManager
 from wasm.managers.service_manager import ServiceManager
 from wasm.validators.environment import (
     EnvironmentValidationError,
@@ -344,25 +345,34 @@ def _bare_deployer() -> _Deployer:
     deployer.port = 3000
     deployer.env_vars = {}
     deployer.config = MagicMock(service_user="www-data", service_group="www-data")
+    deployer._env_manager = MagicMock(spec=EnvManager)
+    deployer._env_manager.read_env_file.return_value = {}
     return deployer
 
 
-def test_create_service_rejects_injected_environment() -> None:
-    """A malicious env var must abort service creation, not reach the unit."""
+def test_injected_environment_is_refused_before_the_env_file_is_written() -> None:
+    """
+    A malicious env var aborts the deployment. Create-time variables go to
+    the env file, which systemd reads line by line, so the refusal happens
+    before that file is written - and so before any unit points at it.
+    """
     deployer = _bare_deployer()
     deployer.env_vars = {"EVIL": INJECTION_PAYLOAD}
-    deployer._resolve_absolute_path = lambda command: command
 
     with pytest.raises(EnvironmentValidationError):
-        deployer.create_service()
+        deployer._prepare_env()
 
-    deployer.service_manager.create_service.assert_not_called()
+    deployer._env_manager.write_env_file.assert_not_called()
 
 
-def test_create_service_passes_validated_environment() -> None:
-    """A well-formed environment reaches the service manager unchanged."""
+def test_create_service_writes_only_the_unit_s_own_variables_inline() -> None:
+    """
+    Create-time variables are in the env file; the unit carries PORT and
+    NODE_ENV inline and loads the rest from that file.
+    """
     deployer = _bare_deployer()
     deployer.env_vars = {"API_URL": "https://api.example.com"}
+    deployer._layout = "inplace"
     deployer._resolve_absolute_path = lambda command: command
     deployer.store.get_app.return_value = None
     deployer.store.get_service.return_value = None
@@ -370,11 +380,29 @@ def test_create_service_passes_validated_environment() -> None:
     assert deployer.create_service() is True
 
     kwargs = deployer.service_manager.create_service.call_args.kwargs
-    assert kwargs["environment"] == {
-        "API_URL": "https://api.example.com",
-        "PORT": "3000",
-        "NODE_ENV": "production",
-    }
+    assert kwargs["environment"] == {"PORT": "3000", "NODE_ENV": "production"}
+    assert kwargs["environment_file"] == "/var/www/apps/app-com/.env"
+
+
+def test_an_environment_file_is_referenced_optionally_and_escaped(jinja: Environment) -> None:
+    """
+    ``-`` because an application deployed without variables has no file,
+    and a missing file must not stop the unit. ``%`` is a specifier to
+    systemd in a path as much as in a value.
+    """
+    unit = jinja.get_template("app.service.j2").render(
+        name="app-com",
+        description="WASM: app.com",
+        command="/usr/bin/node server.js",
+        working_directory="/var/www/apps/app-com",
+        user="www-data",
+        environment={"PORT": "3000"},
+        environment_file="/var/www/apps/100%-app/.env",
+    )
+
+    assert _directive_lines(unit, "EnvironmentFile") == [
+        "EnvironmentFile=-/var/www/apps/100%%-app/.env"
+    ]
 
 
 def test_rollback_uses_the_service_status_method_that_exists(

@@ -698,6 +698,34 @@ class TestPackaging:
             + "\n".join(f"  {line}" for line in offenders)
         )
 
+    def test_the_packaged_default_config_names_no_dead_or_removed_setting(self):
+        """
+        obs/wasm.default.yaml is what a fresh package installs as
+        /etc/wasm/config.yaml, so it is a default like DEFAULT_CONFIG is.
+
+        It shipped ``use_ai: true`` and an OpenAI key slot for an AI
+        analysis that no longer exists, and ``auto_terminate: true`` for a
+        switch wasm.core.config refuses to read at all (REMOVED_KEYS).
+        """
+        import yaml
+
+        from wasm.core.config import REMOVED_KEYS
+
+        dead = {"monitor.use_ai", "monitor.ai_interval", "monitor.openai", "databases.backup_dir"}
+        packaged = yaml.safe_load((REPO / "obs/wasm.default.yaml").read_text(encoding="utf-8"))
+
+        def dotted(tree: dict, prefix: str = "") -> set[str]:
+            keys = set()
+            for key, value in tree.items():
+                name = f"{prefix}{key}"
+                keys.add(name)
+                if isinstance(value, dict):
+                    keys |= dotted(value, f"{name}.")
+            return keys
+
+        named = dotted(packaged)
+        assert not named & (dead | set(REMOVED_KEYS)), sorted(named & (dead | set(REMOVED_KEYS)))
+
     def test_version_is_consistent_across_packaging_files(self):
         """The version lives in six files; drift caused corrective releases."""
         import subprocess
@@ -715,6 +743,207 @@ class TestPackaging:
     test_version_is_consistent_across_packaging_files = pytest.mark.allow_subprocess(
         test_version_is_consistent_across_packaging_files
     )
+
+
+class TestMaintainerScripts:
+    """
+    Maintainer scripts run as root, unattended, on every install and upgrade.
+
+    A ``pip install`` there reaches outside the package manager's view entirely:
+    it is what put 'inquirer' in the system Python on every Debian upgrade,
+    unmanaged and unremovable by dpkg. A permission loosened there defeats what
+    wasm.core.config and wasm.web.auth enforce at runtime: /etc/wasm holds the
+    web panel's signing key and token hash next to config.yaml's credentials, so
+    both must land at 0700/0600, root:root, on every distribution and stay
+    there across upgrades.
+    """
+
+    #: Scripts dpkg invokes directly. Only the ones that exist are read.
+    DEBIAN_SCRIPTS = (
+        "obs/debian.preinst",
+        "obs/debian.postinst",
+        "obs/debian.prerm",
+        "obs/debian.postrm",
+    )
+
+    RPM_SCRIPTLET_NAMES = ("%pre", "%post", "%preun", "%postun")
+
+    PIP_INSTALL = re.compile(r"\bpip3?\s+install\b|\bpython3?\s+-m\s+pip\s+install\b")
+    CHMOD_LINE = re.compile(r"\bchmod\s+(?:-\w+\s+)?0?([0-7]{3})\s+(\S+)")
+    CHOWN_LINE = re.compile(r"\bch(?:own|grp)\s+(?:-\w+\s+)?(\S+)\s+(\S+)")
+    ATTR_LINE = re.compile(r"%attr\((\d+),\s*([^,]+),\s*([^)]+)\)(.*)")
+
+    def _existing_debian_scripts(self) -> dict[str, str]:
+        """
+        Read every maintainer script that is actually shipped.
+
+        Returns:
+            Mapping of repo-relative path to file content, for scripts that
+            exist. Debian ships preinst/prerm only when a package needs them.
+        """
+        found = {}
+        for name in self.DEBIAN_SCRIPTS:
+            path = REPO / name
+            if path.exists():
+                found[name] = path.read_text(encoding="utf-8")
+        return found
+
+    def _rpm_text(self) -> str:
+        return (REPO / "rpm/wasm.spec").read_text(encoding="utf-8")
+
+    def _rpm_scriptlets(self) -> dict[str, str]:
+        """
+        Split rpm/wasm.spec into the body of each %pre/%post/%preun/%postun.
+
+        Returns:
+            Mapping of "rpm/wasm.spec %scriptlet" to its body text, for every
+            scriptlet the spec actually defines.
+        """
+        sections: dict[str, list[str]] = {}
+        current: str | None = None
+        for line in self._rpm_text().splitlines():
+            stripped = line.strip()
+            head = stripped.split()[0] if stripped else ""
+            if head in self.RPM_SCRIPTLET_NAMES:
+                current = head
+                sections[current] = []
+                continue
+            if stripped.startswith("%"):
+                current = None
+                continue
+            if current is not None:
+                sections[current].append(line)
+        return {f"rpm/wasm.spec {name}": "\n".join(body) for name, body in sections.items()}
+
+    def test_no_maintainer_script_pip_installs(self):
+        """
+        WASM must never pip-install into the system Python from a packaging
+        script, in any spelling: pip, pip3, python -m pip, python3 -m pip.
+        """
+        offenders = []
+        sources = dict(self._existing_debian_scripts())
+        sources.update(self._rpm_scriptlets())
+
+        for name, text in sources.items():
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                if self.PIP_INSTALL.search(line):
+                    offenders.append(f"{name}:{lineno}: {line.strip()}")
+
+        assert not offenders, "pip install found in a maintainer script:\n" + "\n".join(
+            f"  {o}" for o in offenders
+        )
+
+    def test_etc_wasm_directory_is_always_0700_root(self):
+        """
+        /etc/wasm must be 0700, root:root, matching SECRET_DIR_MODE/DIR_MODE.
+
+        Every chmod naming the directory must set exactly 0700, and every
+        chown or chgrp naming it must leave it owned by the root group: a
+        script that ever sets it wider, even only until the next line
+        tightens it again, is a window a local attacker can race.
+        """
+        offenders = []
+        exists = []
+        sources = dict(self._existing_debian_scripts())
+        sources["obs/debian.rules"] = (REPO / "obs/debian.rules").read_text(encoding="utf-8")
+        sources.update(self._rpm_scriptlets())
+
+        for name, text in sources.items():
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                chmod = self.CHMOD_LINE.search(line)
+                if chmod and chmod.group(2).rstrip("/").endswith("etc/wasm"):
+                    exists.append(f"{name}:{lineno}")
+                    if int(chmod.group(1), 8) != 0o700:
+                        offenders.append(f"{name}:{lineno}: {line.strip()} (must be 0700)")
+                chown = self.CHOWN_LINE.search(line)
+                if chown and chown.group(2).rstrip("/").endswith("etc/wasm"):
+                    spec = chown.group(1)
+                    group = spec.split(":")[-1] if ":" in spec else spec
+                    if group != "root":
+                        offenders.append(
+                            f"{name}:{lineno}: {line.strip()} (group must be root, not {group})"
+                        )
+
+        for lineno, line in enumerate(self._rpm_text().splitlines(), start=1):
+            attr = self.ATTR_LINE.search(line)
+            if not attr:
+                continue
+            mode, owner, group, rest = attr.groups()
+            if "wasm" not in rest or "config.yaml" in rest:
+                continue
+            exists.append(f"rpm/wasm.spec:{lineno}")
+            if int(mode, 8) != 0o700:
+                offenders.append(f"rpm/wasm.spec:{lineno}: {line.strip()} (must be 0700)")
+            if owner.strip() != "root" or group.strip() != "root":
+                offenders.append(f"rpm/wasm.spec:{lineno}: {line.strip()} (must be root:root)")
+
+        assert exists, "no chmod/%attr for /etc/wasm found in any packaging script"
+        assert not offenders, "\n".join(f"  {o}" for o in offenders)
+
+    def test_config_yaml_is_always_0600_root_no_group_access(self):
+        """
+        config.yaml must be 0600, root:root, matching SECRET_MODE/FILE_MODE.
+
+        No script may grant a 'wasm' group (or any group) read access: the
+        bug this guards against chowned it root:wasm and chmod 640'd it "for
+        interactive mode", which made every credential in it world-readable
+        to any account added to that group.
+        """
+        offenders = []
+        exists = []
+        sources = dict(self._existing_debian_scripts())
+        sources["obs/debian.rules"] = (REPO / "obs/debian.rules").read_text(encoding="utf-8")
+        sources.update(self._rpm_scriptlets())
+
+        for name, text in sources.items():
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                chmod = self.CHMOD_LINE.search(line)
+                if chmod and chmod.group(2).rstrip("/").endswith("config.yaml"):
+                    exists.append(f"{name}:{lineno}")
+                    if int(chmod.group(1), 8) != 0o600:
+                        offenders.append(f"{name}:{lineno}: {line.strip()} (must be 0600)")
+                chown = self.CHOWN_LINE.search(line)
+                if chown and chown.group(2).rstrip("/").endswith("config.yaml"):
+                    spec = chown.group(1)
+                    group = spec.split(":")[-1] if ":" in spec else spec
+                    if group != "root":
+                        offenders.append(
+                            f"{name}:{lineno}: {line.strip()} (group must be root, not {group})"
+                        )
+
+        for lineno, line in enumerate(self._rpm_text().splitlines(), start=1):
+            attr = self.ATTR_LINE.search(line)
+            if not attr:
+                continue
+            mode, owner, group, rest = attr.groups()
+            if "config.yaml" not in rest:
+                continue
+            exists.append(f"rpm/wasm.spec:{lineno}")
+            if int(mode, 8) != 0o600:
+                offenders.append(f"rpm/wasm.spec:{lineno}: {line.strip()} (must be 0600)")
+            if owner.strip() != "root" or group.strip() != "root":
+                offenders.append(f"rpm/wasm.spec:{lineno}: {line.strip()} (must be root:root)")
+
+        assert exists, "no chmod/%attr for config.yaml found in any packaging script"
+        assert not offenders, "\n".join(f"  {o}" for o in offenders)
+
+    def test_python3_venv_is_a_debian_dependency(self):
+        """
+        wasm.deployers.python.PythonDeployer.pre_install runs
+        'python3 -m venv <path>'. On Debian and Ubuntu, venv (and the
+        ensurepip bootstrap it uses without --without-pip) ships in the
+        separate python3-venv package, not in python3 itself.
+        """
+        lines = (REPO / "obs/debian.control").read_text(encoding="utf-8").splitlines()
+        start = next(i for i, line in enumerate(lines) if line.startswith("Depends:"))
+        block = [lines[start]]
+        index = start + 1
+        while index < len(lines) and lines[index].startswith((" ", "\t")):
+            block.append(lines[index])
+            index += 1
+        depends_block = "\n".join(block)
+
+        assert "python3-venv" in depends_block, "obs/debian.control Depends is missing python3-venv"
 
 
 class TestImportable:

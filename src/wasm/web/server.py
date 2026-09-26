@@ -42,6 +42,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import HTTPConnection
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from wasm import __version__
 from wasm.core.exceptions import SecurityError, WASMError
 from wasm.core.net import host_addresses, is_loopback_host, local_address, loopback_access_lines
 from wasm.core.notifier import NotificationEvent
@@ -55,6 +56,7 @@ from wasm.web.auth import (
     RateLimiter,
     SecurityConfig,
     TokenManager,
+    actor_label,
     authenticate_connection,
     bearer_token,
     get_audit_logger,
@@ -200,11 +202,22 @@ def _spends_no_rate_budget(scope: Scope, path: str) -> bool:
     )
 
 
-#: Endpoints that exist to be given a credential by an anonymous client, and
-#: are therefore the ones a lockout has to guard even before authentication.
-#: The console signs in through ``/api/auth/login`` like any script does; there
-#: is no second, form-encoded sign-in route any more.
-AUTH_PATHS = frozenset({"/api/auth/login", "/api/auth/token"})
+#: Endpoints that check a credential carried in the request itself - the
+#: master token, a second factor - and count a wrong one against the lockout.
+#: A locked-out address is refused them before they run, whatever else it
+#: carries, a session cookie included: counting guesses without ever refusing
+#: the next one is no limit at all. The console signs in through
+#: ``/api/auth/login`` like any script does; sudo mode and turning two-factor
+#: off ask for a factor again from inside a session. tests/test_web_auth.py
+#: holds every path here to a real route, and every handler that calls
+#: :func:`~wasm.web.auth.record_auth_failure` to a path here.
+AUTH_PATHS = frozenset({"/api/auth/login", "/api/auth/elevate", "/api/auth/2fa/disable"})
+
+#: The same for credential-checking routes whose path carries a parameter.
+#: ``POST /hooks/deploy/{domain}`` verifies a forge's signature and counts a
+#: wrong one; it holds no session, so nothing else would stop a locked-out
+#: address from guessing on.
+AUTH_PATH_PREFIXES = ("/hooks/",)
 
 _token_manager: TokenManager | None = None
 _rate_limiter: RateLimiter | None = None
@@ -493,7 +506,10 @@ def create_app(config: SecurityConfig | None = None) -> FastAPI:
     app = FastAPI(
         title="WASM Web Interface",
         description="Web-based dashboard for WASM - Web App System Management",
-        version="1.0.0",
+        # The schema an operator fetches from GET /api/openapi.json describes
+        # the release that is running. scripts/export_openapi.py replaces it
+        # with a placeholder in the committed file; see EXPORTED_VERSION there.
+        version=__version__,
         docs_url=None,
         redoc_url=None,
         # The schema of an API that runs systemd as root is a map for an
@@ -817,10 +833,12 @@ class SecurityMiddleware:
         Report whether the lockout applies to this connection.
 
         The lockout exists to stop credential guessing, so it covers everything
-        that can carry a guess: the login endpoints, any request presenting a
-        Bearer token, and every WebSocket handshake. A browser that already
-        holds a valid session cookie is deliberately not blocked, so one
-        attacker cannot lock the operator out of their own panel.
+        that can carry a guess: the endpoints in :data:`AUTH_PATHS` and under
+        :data:`AUTH_PATH_PREFIXES` (login, sudo mode, the webhook), any request
+        presenting a Bearer token, and every WebSocket handshake. Anything else
+        a browser holding a valid session cookie does is deliberately not
+        blocked, so one attacker cannot lock the operator out of their own
+        panel - only out of the endpoints that check a credential.
 
         Args:
             scope: The ASGI connection scope.
@@ -832,7 +850,7 @@ class SecurityMiddleware:
         """
         if scope["type"] == "websocket":
             return True
-        if path in AUTH_PATHS:
+        if path in AUTH_PATHS or path.startswith(AUTH_PATH_PREFIXES):
             return True
         return bearer_token(connection) is not None
 
@@ -919,7 +937,7 @@ class SecurityMiddleware:
             action=f"api.{method.lower()}",
             result="ok" if status_code < 400 else f"error:{status_code}",
             client_ip=client_ip,
-            actor=str(session.get("sid")) if session else "anonymous",
+            actor=actor_label(session) if session else "anonymous",
             resource=path,
         )
 
@@ -1235,7 +1253,10 @@ def run_server(
         host: Host to bind to.
         port: Port to bind to.
         config: Security configuration.
-        show_token: Whether to print a freshly generated access token.
+        show_token: Whether to issue a new access token and print it. False
+            keeps the token on record: ``wasm web start -d`` issues and prints
+            one in the parent before forking, and issuing another that nobody
+            sees would only retire the one the operator was just handed.
         insecure_http: Whether cleartext beyond loopback was accepted in so
             many words. Only ever True when the CLI's ``--insecure-http``
             flag was given.
@@ -1275,10 +1296,8 @@ def run_server(
 
     app = create_app(config)
 
-    token_manager = get_token_manager()
-    master_token = token_manager.generate_master_token()
-
     if show_token:
+        master_token = get_token_manager().generate_master_token()
         scheme = "https" if ssl_certfile else "http"
         print("\n".join(startup_banner(master_token, banner_address(host), port, scheme)))
         print(flush=True)

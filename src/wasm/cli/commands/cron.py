@@ -85,7 +85,7 @@ def _list(*, logger: Logger) -> int:
         logger.info("  wasm cron create <name> '<command>' --schedule daily")
         return 0
 
-    headers = ["Name", "Schedule", "Enabled", "Last run", "Last result", "App"]
+    headers = ["Name", "Schedule", "Enabled", "Last run", "Last result", "App", "Directory"]
     rows: list[list[Any]] = []
     for job in jobs:
         rows.append(
@@ -96,6 +96,11 @@ def _list(*, logger: Logger) -> int:
                 job.get("last_run", "never"),
                 job.get("last_result", "never ran"),
                 job.get("app_domain") or styled("-", "dim"),
+                # Read back from the unit file's own WorkingDirectory=, so
+                # this is the directory the job actually runs in - current/
+                # for a releases application, not the app root a stale
+                # listing would imply.
+                job.get("working_directory") or styled("-", "dim"),
             ]
         )
     logger.table(headers, rows)
@@ -315,7 +320,10 @@ def list_jobs(ctx: Context) -> None:
     "--app",
     "app_domain",
     metavar="DOMAIN",
-    help="Associate the job with a deployed application; its directory becomes the default.",
+    help=(
+        "Associate the job with a deployed application; its runtime directory "
+        "(current/ for a releases application) becomes the default."
+    ),
 )
 @pass_context
 def create(

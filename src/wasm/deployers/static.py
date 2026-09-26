@@ -11,6 +11,7 @@ from wasm.core.runner import CommandRunner
 from wasm.deployers.base import BaseDeployer
 from wasm.deployers.pipeline import DeployStep
 from wasm.deployers.registry import DeployerRegistry
+from wasm.validators.environment import validate_environment
 
 
 class StaticDeployer(BaseDeployer):
@@ -131,6 +132,22 @@ class StaticDeployer(BaseDeployer):
             }
         )
         return context
+
+    def _prepare_env(self) -> None:
+        """
+        Keep the variables given at create time out of the site's directory.
+
+        A static site has no process to load an env file, and its directory
+        may be the one the web server serves: Apache does not refuse dotfiles,
+        so a ``.env`` written there - from ``--env-file`` or generated from
+        ``.env.example`` - would publish every secret in it. The build still
+        runs with the variables in its environment, so they are validated.
+
+        Raises:
+            EnvironmentValidationError: When a variable has an unusable name
+                or a control character in its value.
+        """
+        self.env_vars = validate_environment(self.env_vars)
 
     def create_service(self) -> bool:
         """No service needed for static sites."""

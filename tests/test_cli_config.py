@@ -368,6 +368,31 @@ def test_show_emits_parseable_yaml(wasm: Wasm, fake_config: dict[str, Any]) -> N
     assert yaml.safe_load(body)["webserver"] == "nginx"
 
 
+def test_show_redacts_a_secret(wasm: Wasm, fake_config: dict[str, Any]) -> None:
+    """
+    'config show' must never print a credential in the clear.
+
+    'config get' and 'config set' already redact through
+    :func:`~wasm.core.config.redact_secrets`; 'show' dumps the whole tree at
+    once and used to skip that helper entirely.
+    """
+    fake_config["values"] = {
+        "webserver": "nginx",
+        "monitor": {
+            "smtp": {"host": "smtp.example.com", "password": "hunter2"},
+        },
+        "notifications": {"channels": {"slack": {"webhook_url": "https://hooks/secret"}}},
+    }
+
+    result = wasm("config", "show")
+
+    assert result.exit_code == 0
+    assert "hunter2" not in result.output
+    assert "https://hooks/secret" not in result.output
+    assert "smtp.example.com" in result.output
+    assert "***" in result.output
+
+
 def test_path_reports_where_the_file_is(wasm: Wasm, fake_config: dict[str, Any]) -> None:
     """The path is printed whether or not the file exists yet."""
     result = wasm("config", "path")
@@ -526,14 +551,14 @@ def test_set_accepts_an_absolute_apps_directory(wasm: Wasm, real_config_path: Pa
     assert wasm("config", "get", "apps_directory").output.strip() == "/srv/apps"
 
 
-def test_set_refuses_a_relative_value_for_the_documented_apps_directory_command(
+def test_set_refuses_a_relative_value_for_the_deprecated_apps_directory_alias(
     wasm: Wasm, real_config_path: Path
 ) -> None:
-    """'apps.directory' is the exact command operators were told to run; it gets the same guard."""
+    """'apps.directory' is a deprecated alias for 'apps_directory'; it gets the same guard."""
     result = wasm("config", "set", "apps.directory", "relative/path")
 
     assert result.exit_code == 1
-    assert "apps.directory must be an absolute path" in result.output
+    assert "apps_directory must be an absolute path" in result.output
     assert not real_config_path.exists()
 
 
@@ -558,6 +583,47 @@ def test_set_rejects_a_boolean_that_does_not_parse(wasm: Wasm, real_config_path:
 
     assert result.exit_code == 1
     assert "Expected a boolean" in result.output
+
+
+def test_set_coerces_a_boolean_for_a_key_with_no_default(
+    wasm: Wasm, real_config_path: Path
+) -> None:
+    """
+    monitor.notify has no default in the schema; process_monitor.py reads it
+    with bool(get("monitor.notify", False)), so storing it as the truthy
+    string "false" is worse than not coercing a key with a default at all.
+    """
+    result = wasm("config", "set", "monitor.notify", "false")
+
+    assert result.exit_code == 0, result.output
+    assert yaml.safe_load(real_config_path.read_text())["monitor"]["notify"] is False
+
+
+def test_set_parses_a_json_number_for_a_key_with_no_default(
+    wasm: Wasm, real_config_path: Path
+) -> None:
+    """A key with no default still recognises a JSON scalar, not just a list."""
+    result = wasm("config", "set", "monitor.retention_days", "30")
+
+    assert result.exit_code == 0, result.output
+    assert yaml.safe_load(real_config_path.read_text())["monitor"]["retention_days"] == 30
+
+
+def test_set_parses_json_null_for_a_key_with_no_default(wasm: Wasm, real_config_path: Path) -> None:
+    result = wasm("config", "set", "monitor.some_new_setting", "null")
+
+    assert result.exit_code == 0, result.output
+    assert yaml.safe_load(real_config_path.read_text())["monitor"]["some_new_setting"] is None
+
+
+def test_set_falls_back_to_a_plain_string_for_a_key_with_no_default(
+    wasm: Wasm, real_config_path: Path
+) -> None:
+    """A value that is not valid JSON is still stored as the string it looks like."""
+    result = wasm("config", "set", "monitor.some_new_setting", "hello")
+
+    assert result.exit_code == 0, result.output
+    assert yaml.safe_load(real_config_path.read_text())["monitor"]["some_new_setting"] == "hello"
 
 
 def test_set_list_flag_splits_on_commas_for_a_key_with_no_default(
@@ -617,21 +683,34 @@ def test_set_get_round_trips_a_list_value(wasm: Wasm, real_config_path: Path) ->
     assert yaml.safe_load(result.output) == ["internal.example"]
 
 
-def test_the_panel_documented_apps_directory_command_works(
+def test_the_deprecated_apps_directory_alias_writes_the_canonical_key(
     wasm: Wasm, real_config_path: Path
 ) -> None:
     """
-    settings.html tells an operator to run exactly this command.
-
-    'apps.directory' is a real, separate, dotted key (distinct from the flat
-    'apps_directory' the deployers use) that wasm.web.machine reads for the
-    disk usage meter; this pins that the documented command actually reaches
-    it, round trip.
+    'apps.directory' used to be a real, separate, dotted key: every deployer
+    read the flat 'apps_directory' while wasm.web.machine's disk meter read
+    'apps.directory', so the meter never reflected the directory deployments
+    actually used. It is now a deprecated alias, normalised to
+    'apps_directory' on write, so there is exactly one setting on disk.
     """
-    result = wasm("config", "set", "apps.directory", "/var/www/apps")
+    result = wasm("config", "set", "apps.directory", "/srv/apps")
 
     assert result.exit_code == 0, result.output
-    assert wasm("config", "get", "apps.directory").output.strip() == "/var/www/apps"
+    stored = yaml.safe_load(real_config_path.read_text())
+    assert stored["apps_directory"] == "/srv/apps"
+    assert "apps" not in stored, "the alias must not create a separate 'apps' container"
+
+
+def test_the_deprecated_apps_directory_alias_reads_the_canonical_key(
+    wasm: Wasm, real_config_path: Path
+) -> None:
+    """Reading the alias must answer with what a deployer actually reads."""
+    assert wasm("config", "set", "apps_directory", "/srv/apps").exit_code == 0
+
+    result = wasm("config", "get", "apps.directory")
+
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "/srv/apps"
 
 
 def test_the_panel_documented_smtp_host_command_works(wasm: Wasm, real_config_path: Path) -> None:

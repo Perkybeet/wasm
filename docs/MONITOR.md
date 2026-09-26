@@ -2,16 +2,18 @@
 
 `wasm monitor` watches the machine and writes down what stands out: resource use, processes
 worth a look, units that stopped, certificates about to expire and full disks. It keeps what
-it noticed in a local database and can mail you a report.
+it noticed in a local database and can send you a report by email, or through any notification
+channel you configure.
 
 It reports and does nothing else:
 
 - it never signals, terminates or restarts a process;
 - it never deletes or modifies a file, except the systemd unit it installs;
 - it never decides anything from a process's command line;
-- nothing about the machine is sent to a third-party service. Reports go to your SMTP relay;
-  the disk, certificate and unit events also go through the notification channels you
-  configured (see [Notifications](#notifications)).
+- what it sends leaves the machine only through channels you configured: raw observations by
+  email when `monitor.notify` is on, and the disk, certificate and unit events through
+  whichever notification channels you set up - webhook, Slack, Discord, Telegram or email (see
+  [Notifications](#notifications)). Nothing is sent anywhere else.
 
 Before 1.0 the monitor sent process data to OpenAI and could kill processes and delete their
 files. All of that is gone. The flags `--force-ai` and `--all` on `wasm monitor scan` are

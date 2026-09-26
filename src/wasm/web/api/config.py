@@ -31,10 +31,10 @@ import yaml
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from wasm.core.config import DEFAULT_CONFIG, Config, redact_secrets
+from wasm.core.config import DEFAULT_CONFIG, NO_DEFAULT, Config, coerce_config_value, redact_secrets
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import WASMErrorRoute, require_elevated
-from wasm.web.auth import get_audit_logger, get_client_ip
+from wasm.web.auth import actor_label, get_audit_logger, get_client_ip
 
 if TYPE_CHECKING:
     from wasm.core.notifier import Notifier
@@ -109,7 +109,7 @@ def _audit_write(request: Request, session: dict[str, Any], *, changed: Sequence
         action="config.update",
         result="success",
         client_ip=get_client_ip(request),
-        actor=str(session.get("sid")),
+        actor=actor_label(session),
         resource=request.url.path,
         detail=f"changed keys: {', '.join(changed)}" if changed else "no keys changed",
     )
@@ -376,6 +376,15 @@ def patch_config(
 
     The stored value is echoed back redacted, so a secret does not travel twice.
 
+    A string value is coerced against the key's schema exactly as ``wasm
+    config set`` coerces argv: a key with a default is parsed as that
+    default's type, and a key with none is parsed as a JSON scalar or list,
+    falling back to a plain string. Without it, a caller that posts
+    form-shaped data - everything a string, such as a boolean field posted as
+    "false" - would store the literal string rather than the value it looks
+    like. A value that already arrived as JSON's own boolean, number or array
+    is left exactly as it was decoded.
+
     Args:
         body: Body carrying the dotted path and the new value.
         request: The incoming request, for the audit record.
@@ -388,7 +397,10 @@ def patch_config(
         HTTPException: If the configuration cannot be written.
     """
     config = load_config()
-    config.set(body.path, body.value)
+    value = body.value
+    if isinstance(value, str):
+        value = coerce_config_value(config.get(body.path, NO_DEFAULT), value)
+    config.set(body.path, value)
     path = persist(config)
     _audit_write(request, session, changed=[body.path.split(".", 1)[0]])
 
@@ -396,7 +408,7 @@ def patch_config(
     return ConfigPatchResponse(
         message=f"Configuration '{body.path}' updated",
         path=str(path),
-        value=redact_secrets({leaf: body.value})[leaf],
+        value=redact_secrets({leaf: value})[leaf],
     )
 
 

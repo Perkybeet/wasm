@@ -41,6 +41,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from wasm.core.config import Config
 from wasm.core.exceptions import ServiceError, WASMError
 from wasm.core.runner import FakeRunner
 from wasm.core.store import App, Service, WASMStore
@@ -54,6 +55,7 @@ from wasm.web.machine import (
     MachineState,
     MemorySnapshot,
     UnitTally,
+    _resolve_apps_root,
     classify_unit,
     fetch_service_states,
     read_machine,
@@ -459,3 +461,26 @@ def test_get_machine_demands_a_session(tmp_path: Path, runner: FakeRunner) -> No
     response = client.get("/api/system/machine")
 
     assert response.status_code == 401
+
+
+def test_the_disk_meter_reads_the_key_every_deployer_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Every deployer writes the flat 'apps_directory'; the meter used to read
+    the deprecated 'apps.directory' alias instead, which nothing ever wrote,
+    so it always reported the hard-coded default regardless of where
+    applications were actually deployed.
+    """
+    monkeypatch.setattr(
+        "wasm.core.config.DEFAULT_CONFIG_PATH", tmp_path / "etc" / "wasm" / "config.yaml"
+    )
+    Config.reset_instance()
+    try:
+        config = Config()
+        config.set("apps_directory", "/srv/apps")
+        assert config.save() is True
+
+        assert _resolve_apps_root(None) == "/srv/apps"
+    finally:
+        Config.reset_instance()

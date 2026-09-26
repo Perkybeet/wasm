@@ -63,6 +63,18 @@ Suggests:       python3-starlette
 Suggests:       python3-pydantic
 Suggests:       python3-uvicorn
 Suggests:       python3-psutil
+# No separate venv package is Required here: python3-libs, pulled in
+# transitively by python3 above, contains the venv module itself, which is
+# what wasm.deployers.python's 'python3 -m venv' needs. That call does not
+# pass --without-pip, so it also runs ensurepip to seed the new virtualenv
+# with pip; on Fedora, ensurepip's bundled wheels are unbundled into the
+# python3-pip-wheel package, but its presence is not otherwise guaranteed and
+# its availability across every RHEL derivative sharing this %if branch is
+# not confirmed. A Requires on a name that does not exist on one of them
+# breaks installation on all of them, so this is documented rather than
+# declared: if 'python3 -m venv' ever fails to seed pip on a supported
+# Fedora/RHEL release, install python3-pip-wheel (Fedora) or python3-pip
+# (RHEL) by hand and revisit this comment.
 %endif
 
 # openSUSE specific. The package names are capitalised there, and on Leap 15.x
@@ -87,6 +99,10 @@ Recommends:     python311-questionary
 Requires:       python3 >= 3.10
 Requires:       python3-questionary
 %endif
+# openSUSE does not split the venv module, or the ensurepip bootstrap it runs
+# by default, out of the base python3 (or python311, on Leap 15.x) package the
+# way Fedora does, so wasm.deployers.python's 'python3 -m venv' works with
+# nothing beyond the Requires already declared above.
 %endif
 
 # Runtime requirements (common)
@@ -168,8 +184,9 @@ install -Dm644 src/wasm/completions/wasm.fish %{buildroot}%{_datadir}/fish/vendo
 install -Dm644 src/wasm/completions/_wasm %{buildroot}%{_datadir}/zsh/site-functions/_wasm
 %endif
 
-# Install default configuration
-install -Dm644 %{SOURCE1} %{buildroot}%{_sysconfdir}/wasm/config.yaml
+# Install default configuration, owner-only: it holds credentials, matching
+# wasm.core.fs.SECRET_MODE (0600). The directory it lives in is 0700 below.
+install -Dm600 %{SOURCE1} %{buildroot}%{_sysconfdir}/wasm/config.yaml
 
 # Install man page
 install -Dm644 %{SOURCE2} %{buildroot}%{_mandir}/man1/wasm.1
@@ -190,13 +207,30 @@ install -d %{buildroot}/var/log/wasm
 %{_datadir}/fish/vendor_completions.d/wasm.fish
 %{_datadir}/zsh/site-functions/_wasm
 %endif
-%dir %{_sysconfdir}/wasm
-%config(noreplace) %{_sysconfdir}/wasm/config.yaml
+# /etc/wasm holds config.yaml's credentials and, when the panel is used,
+# wasm.web.auth's signing key and token hash. Both stay owner-only, matching
+# wasm.core.fs.SECRET_DIR_MODE/SECRET_MODE and wasm.web.auth.DIR_MODE/FILE_MODE.
+%attr(0700,root,root) %dir %{_sysconfdir}/wasm
+%attr(0600,root,root) %config(noreplace) %{_sysconfdir}/wasm/config.yaml
 %dir /var/log/wasm
 
 %post
 echo "WASM installed successfully!"
 echo "Run 'wasm setup' to configure the tool."
+
+# Belt and suspenders alongside the %attr entries above: /etc/wasm holds
+# config.yaml's credentials and, when the panel is used, wasm.web.auth's
+# signing key and token hash, so both are tightened unconditionally on every
+# install and upgrade. Setting the exact target mode can only ever narrow or
+# leave permissions unchanged, never widen them.
+if [ -d /etc/wasm ]; then
+    chown root:root /etc/wasm
+    chmod 0700 /etc/wasm
+fi
+if [ -f /etc/wasm/config.yaml ]; then
+    chown root:root /etc/wasm/config.yaml
+    chmod 0600 /etc/wasm/config.yaml
+fi
 
 # Upgrade config file with new defaults (preserves user values)
 if [ -f /etc/wasm/config.yaml ]; then

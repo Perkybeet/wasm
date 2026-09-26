@@ -658,16 +658,21 @@ def install_engine(
 @router.post("/engines/{engine}/uninstall", response_model=JobAcceptedResponse, status_code=202)
 def uninstall_engine(
     engine: str,
-    session: Annotated[dict, Depends(get_current_session)],
+    session: Annotated[dict, Depends(require_elevated)],
     purge: Annotated[bool, Query(description="Also remove configuration and data")] = False,
 ) -> JobAcceptedResponse:
     """
     Queue the removal of an engine.
 
+    Removing an engine can take every database it hosts with it - D5's sudo
+    mode list treats it the same as dropping a single database, so a cookie
+    session has to confirm itself first; an admin-scoped Bearer credential is
+    exempt, per :func:`wasm.web.api.deps.ensure_elevated`.
+
     Args:
         engine: Engine name.
         purge: Also remove configuration and data.
-        session: The authenticated session.
+        session: The authenticated, elevated session.
 
     Returns:
         The queued job.
@@ -908,7 +913,7 @@ def drop_database(
         "drop_database engine=%s database=%s session=%s",
         manager.ENGINE_NAME,
         validated,
-        session.get("session_id", "unknown"),
+        actor_label(session),
     )
     manager.drop_database(validated, force=force)
 
@@ -956,7 +961,7 @@ def create_user(
         manager.ENGINE_NAME,
         username,
         database or "-",
-        session.get("session_id", "unknown"),
+        actor_label(session),
     )
 
     return CreateUserResponse(
@@ -998,7 +1003,7 @@ def grant_privileges(
         username,
         database,
         request.privileges or "default",
-        session.get("session_id", "unknown"),
+        actor_label(session),
     )
 
     return ActionResponse(
@@ -1036,7 +1041,7 @@ def revoke_privileges(
         username,
         database,
         request.privileges or "default",
-        session.get("session_id", "unknown"),
+        actor_label(session),
     )
 
     return ActionResponse(
@@ -1107,7 +1112,7 @@ def delete_user(
         "drop_user engine=%s user=%s session=%s",
         manager.ENGINE_NAME,
         validated,
-        session.get("session_id", "unknown"),
+        actor_label(session),
     )
     manager.drop_user(validated, host=host)
 
@@ -1199,7 +1204,7 @@ def create_backup(
 
 @router.post("/backups/restore", response_model=ActionResponse)
 def restore_backup(
-    request: RestoreBackupRequest, session: Annotated[dict, Depends(get_current_session)]
+    request: RestoreBackupRequest, session: Annotated[dict, Depends(require_elevated)]
 ) -> ActionResponse:
     """
     Restore a database from one of the engine's own dumps.
@@ -1208,9 +1213,14 @@ def restore_backup(
     backup directory, so the endpoint cannot be talked into reading
     ``/etc/shadow`` as the database superuser.
 
+    Restoring overwrites whatever the target database currently holds - D5's
+    sudo mode list treats it the same as dropping a database, so a cookie
+    session has to confirm itself first; an admin-scoped Bearer credential is
+    exempt, per :func:`wasm.web.api.deps.ensure_elevated`.
+
     Args:
         request: The restore request.
-        session: The authenticated session.
+        session: The authenticated, elevated session.
 
     Returns:
         The action outcome.
@@ -1233,7 +1243,7 @@ def restore_backup(
         manager.ENGINE_NAME,
         database,
         backup_path.name,
-        session.get("session_id", "unknown"),
+        actor_label(session),
     )
     manager.restore(database=database, backup_path=backup_path, drop_existing=request.drop_existing)
 
@@ -1285,7 +1295,7 @@ def execute_query(
         manager.ENGINE_NAME,
         database,
         request.mode,
-        session.get("session_id", "unknown"),
+        actor_label(session),
         statement,
     )
 

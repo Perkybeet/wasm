@@ -23,6 +23,7 @@ from __future__ import annotations
 import ast
 import copy
 import json
+import logging
 import os
 import stat
 from pathlib import Path
@@ -385,6 +386,62 @@ class TestMonitorDefaults:
         assert "auto_terminate" not in saved["monitor"]
 
 
+class TestDeadConfigKeys:
+    """
+    ``monitor.use_ai``, ``monitor.ai_interval``, ``monitor.openai.*`` and
+    ``databases.backup_dir`` control nothing: the monitor never grew the AI
+    analysis it was meant to gate, and the backup manager reads
+    ``backup.directory``, a different key, for where dumps land. Unlike
+    :data:`~wasm.core.config.REMOVED_KEYS`, nothing here was ever a permissive
+    safety switch, so there is nothing to pin - a stale file mentioning one of
+    these keys is simply not read by anything, the same as any other key this
+    version does not recognise.
+    """
+
+    def test_dead_keys_are_not_in_the_defaults(self) -> None:
+        """Nothing reads these keys, so they must not ship as if something did."""
+        assert "use_ai" not in DEFAULT_CONFIG["monitor"]
+        assert "ai_interval" not in DEFAULT_CONFIG["monitor"]
+        assert "openai" not in DEFAULT_CONFIG["monitor"]
+        assert "backup_dir" not in DEFAULT_CONFIG["databases"]
+
+    def test_old_config_with_dead_keys_loads_without_warning(
+        self, config_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A file an older version wrote must still load, quietly."""
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "webserver": "apache",
+                    "monitor": {
+                        "use_ai": True,
+                        "ai_interval": 1800,
+                        "openai": {"api_key": "sk-old-live", "model": "gpt-4o-mini"},
+                    },
+                    "databases": {"backup_dir": "/srv/old-backups"},
+                }
+            )
+        )
+
+        with caplog.at_level(logging.WARNING, logger="wasm.core.config"):
+            config = Config()
+
+        assert config.get("webserver") == "apache"
+        assert caplog.records == []
+
+    def test_old_openai_api_key_is_still_redacted(self, config_path: Path) -> None:
+        """A key this version no longer ships must still never print in clear."""
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(yaml.safe_dump({"monitor": {"openai": {"api_key": "sk-old-live"}}}))
+
+        config = Config()
+
+        assert config.get("monitor.openai.api_key") == "sk-old-live"
+        dumped = yaml.safe_dump(redact_secrets(config.to_dict()))
+        assert "sk-old-live" not in dumped
+
+
 def secret_paths(node: object, prefix: str = "") -> list[str]:
     """
     List the dotted paths of every scalar setting whose key names a secret.
@@ -454,7 +511,6 @@ class TestSecretInventory:
         paths = set(secret_paths(DEFAULT_CONFIG))
 
         assert paths >= {
-            "monitor.openai.api_key",
             "monitor.smtp.password",
             "databases.credentials.mysql.password",
             "databases.credentials.postgresql.password",
@@ -489,7 +545,6 @@ class TestSecretInventory:
             path for path in _flat_paths(filled) if _lookup(redacted, path) != _lookup(filled, path)
         }
         assert changed == {
-            "monitor.openai.api_key",
             "monitor.smtp.password",
             "databases.credentials.mysql.password",
             "databases.credentials.postgresql.password",

@@ -50,14 +50,13 @@ python:
   use_venv: true
 
 # =============================================================================
-# AI-Powered Process Monitor Configuration
+# Process Monitor Configuration
 # =============================================================================
-# The process monitor scans running processes to detect and neutralize
-# suspicious or malicious activity (e.g., cryptocurrency miners, reverse shells)
+# The process monitor records machine metrics, processes over a resource
+# threshold or carrying a known malware name, and the state of watched units,
+# and notifies you. It never signals a process or deletes a file.
 #
-# IMPORTANT: This feature requires additional dependencies:
-#   - psutil (pip install psutil)
-#   - httpx or requests (pip install httpx)
+# Requires psutil (python3-psutil).
 
 monitor:
   # Enable/disable the monitor (default: false)
@@ -71,24 +70,8 @@ monitor:
   cpu_threshold: 80.0      # Processes using more than this % CPU
   memory_threshold: 80.0   # Processes using more than this % memory
   
-  # Automatic termination settings
-  auto_terminate: true           # Automatically terminate detected threats
-  terminate_malicious_only: true # Only terminate "malicious" (not "suspicious")
-  
-  # AI Analysis using OpenAI
-  use_ai: true
-  
-  # Dry run mode - log actions without actually terminating processes
-  dry_run: false
-  
   # Monitor log file
   log_file: /var/log/wasm/monitor.log
-  
-  # OpenAI API Configuration
-  # Get your API key from: https://platform.openai.com/api-keys
-  openai:
-    api_key: ""              # Your OpenAI API key
-    model: "gpt-4o-mini"     # Model to use for analysis
   
   # SMTP Configuration for Email Notifications
   # Sends alerts when threats are detected and after mitigation

@@ -46,7 +46,7 @@ from wasm.core.exceptions import (
     ValidationError,
     WASMError,
 )
-from wasm.core.fs import DryRunFileSystem, FileSystem
+from wasm.core.fs import SECRET_MODE, DryRunFileSystem, FileSystem
 from wasm.core.logger import Icons
 from wasm.core.runner import CommandResult, CommandRunner, get_runner
 from wasm.core.store import (
@@ -72,7 +72,7 @@ from wasm.deployers.helpers.health import failure_output, wait_until_healthy
 from wasm.deployers.helpers.health_gate import HealthGate
 from wasm.deployers.helpers.layout import RELEASES, choose_layout, env_file_in
 from wasm.deployers.helpers.nginx_config import NginxAdvancedConfig
-from wasm.deployers.helpers.permissions import hand_over_tree
+from wasm.deployers.helpers.permissions import hand_over_file, hand_over_tree
 from wasm.deployers.helpers.registration import StoreRegistrar
 from wasm.deployers.helpers.release_build import (
     REPO_CACHE_DIR,
@@ -824,33 +824,130 @@ class BaseDeployer(AppDeployer):
         # Check for .env.example
         return (self.build_path / ".env.example").exists()
 
-    def _configure_env(self) -> None:
+    def _generated_env(self) -> dict[str, str]:
         """
-        Auto-configure environment variables using EnvManager.
+        Fill in what ``.env.example`` asks for, without asking anyone.
 
-        Discovers variables from .env.example, fills them
-        non-interactively (defaults + auto-generated secrets),
-        and writes the .env file: into the application directory in place,
-        into ``shared/`` on releases, from where every release links it.
+        Returns:
+            Defaults from the example, with a generated secret wherever the
+            example names one and leaves it empty.
         """
         variables = self._env_manager.discover(self.build_path)
         if not variables:
+            return {}
+        self.logger.debug(f"Discovered {len(variables)} env variables")
+        return self._env_manager.prompt_non_interactive(variables)
+
+    def _unit_environment(self) -> dict[str, str]:
+        """
+        The variables the unit sets inline, and the only ones it carries.
+
+        They are not secret and they are WASM's to decide: PORT is the port the
+        site proxies to. Everything else - what ``--env-file`` or ``env_vars``
+        gave, what ``.env.example`` generated - goes to the env file, because a
+        unit is 0644 and ``systemctl show`` prints its ``Environment=`` to any
+        local user.
+
+        Returns:
+            Variable name to value.
+        """
+        return {"PORT": str(self.port), "NODE_ENV": "production"}
+
+    def _prepare_env(self) -> None:
+        """
+        Write the variables given at create time into the env file, before the build.
+
+        The variables from ``--env-file`` or ``POST /api/apps`` are merged over
+        what the file already holds; when none were given and the source ships
+        a ``.env.example``, it is filled in instead. The build runs after this,
+        so a build that reads ``DATABASE_URL`` from ``.env`` finds it, and the
+        build commands keep seeing the variables in their own environment too.
+
+        Raises:
+            EnvironmentValidationError: When a variable given at create time
+                has an unusable name or a control character in its value,
+                before anything is written.
+        """
+        given = validate_environment(self.env_vars)
+        generated = self._generated_env() if self._should_configure_env() else {}
+        if not (given or generated):
             return
 
-        self.logger.debug(f"Discovered {len(variables)} env variables")
+        owned = self._unit_environment()
+        for key in sorted(given.keys() & owned.keys()):
+            if given[key] != owned[key]:
+                self.logger.warning(
+                    f"{key}={given[key]} is not used: WASM sets {key}={owned[key]} in the unit"
+                )
 
-        # Use non-interactive mode (defaults + auto-generated secrets)
-        values = self._env_manager.prompt_non_interactive(variables)
+        current = self._env_manager.read_env_file(self._env_file())
+        self._write_env_file({**current, **generated, **given})
+        if generated:
+            self.logger.substep("Created .env from .env.example")
+        self.env_vars = {**generated, **given}
 
-        # Merge with any existing env vars (CLI-provided take precedence)
-        for key, val in self.env_vars.items():
-            values[key] = val
+    def _write_env_file(self, values: Mapping[str, str]) -> None:
+        """
+        Replace the env file with these variables, minus the ones the unit sets.
 
-        self._env_manager.write_env_file(self._env_file(), values)
-        self.logger.substep("Created .env from .env.example")
+        systemd lets ``EnvironmentFile=`` override ``Environment=``, the
+        opposite of dotenv, which never overrode what the unit set. So the file
+        must not carry PORT or NODE_ENV: a PORT=3000 copied from
+        ``.env.example`` would move the second application on a server onto
+        the first one's port.
 
-        # Update env_vars so they're available for systemd
-        self.env_vars.update(values)
+        Args:
+            values: The complete set of variables.
+        """
+        owned = self._unit_environment()
+        kept = {key: value for key, value in values.items() if key not in owned}
+        self._env_manager.write_env_file(self._env_file(), kept)
+
+    def _settle_env_file(self) -> Path:
+        """
+        Make the env file what the unit about to be written expects.
+
+        Two things can be wrong with it on a redeploy. The unit an earlier
+        version wrote carried the variables inline, and the application ran
+        with them: rewriting the unit without them would drop them, so they
+        move into the file first, winning over what the file says, since theirs
+        were the values in force. And the file may set PORT or NODE_ENV, which
+        the new unit would let override its own. The file is only rewritten
+        when one of the two applies.
+
+        Returns:
+            The env file the unit references.
+        """
+        env_file = self._env_file()
+        owned = self._unit_environment()
+        previous = self.store.get_service(self.app_name) if self.app_name else None
+        inline = {
+            key: value
+            for key, value in (previous.environment if previous else {}).items()
+            if key not in owned
+        }
+        current = self._env_manager.read_env_file(env_file)
+        moved = sorted(key for key, value in inline.items() if current.get(key) != value)
+        conflicting = sorted(key for key in owned if key in current and current[key] != owned[key])
+        if not (moved or conflicting):
+            return env_file
+
+        if moved:
+            self.logger.substep(f"Moved {', '.join(moved)} from the unit to {env_file}")
+        if conflicting:
+            self.logger.substep(
+                f"Removed {', '.join(conflicting)} from {env_file}: the unit sets it"
+            )
+        self._write_env_file({**current, **inline})
+        hand_over_file(
+            env_file,
+            user=self.config.service_user,
+            group=self.config.service_group,
+            mode=SECRET_MODE,
+            runner=self.runner,
+            logger=self.logger,
+        )
+        return env_file
 
     def _env_file(self) -> Path:
         """
@@ -1378,15 +1475,12 @@ class BaseDeployer(AppDeployer):
         self.logger.substep(f"Service: {self.app_name}")
         self.logger.substep(f"Command: {start_command}")
 
-        # Build environment with PORT
-        env = self.env_vars.copy()
-        env["PORT"] = str(self.port)
-        env["NODE_ENV"] = "production"
-
-        # Everything below is interpolated into a systemd unit, where a newline
-        # starts a new directive. env_vars arrives unfiltered from the CLI and
-        # from POST /api/apps, so it is validated before it can reach the unit.
-        env = validate_environment(env)
+        # Only what the unit decides itself is written into it; the variables
+        # given at create time are in the env file _prepare_env wrote, which the
+        # unit loads. Everything interpolated into a unit is still validated:
+        # a newline there starts a new directive.
+        env = validate_environment(self._unit_environment())
+        env_file = self._settle_env_file()
         start_command = validate_unit_value(start_command, field="ExecStart")
         working_directory = validate_unit_value(str(self.runtime_path), field="WorkingDirectory")
         description = validate_unit_value(
@@ -1398,6 +1492,7 @@ class BaseDeployer(AppDeployer):
             command=start_command,
             working_directory=working_directory,
             environment=env,
+            environment_file=str(env_file),
             description=description,
             # The application's settings, not this deployment's: a redeploy
             # writes a new unit and must not drop the limits set on the old.
@@ -1675,8 +1770,7 @@ class BaseDeployer(AppDeployer):
 
         # Both describe the code that was just fetched.
         self._detect_nginx_config()
-        if self._should_configure_env():
-            self._configure_env()
+        self._prepare_env()
 
         links = staged.manager.link_shared(staged.path, self._persistent_paths())
         for path in links.linked:
@@ -1963,8 +2057,7 @@ class BaseDeployer(AppDeployer):
         # Both of these describe the code that was just fetched, so they cannot
         # run any earlier.
         self._detect_nginx_config()
-        if self._should_configure_env():
-            self._configure_env()
+        self._prepare_env()
 
     def _step_certificate(self) -> None:
         """

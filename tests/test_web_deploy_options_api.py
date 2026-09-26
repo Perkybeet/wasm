@@ -307,3 +307,91 @@ def test_the_job_hands_www_paths_and_limits_to_the_deployer(
     assert captured["cpu_quota_percent"] == 50
     assert captured["tasks_max"] == 64
     assert captured["resource_limits_given"] is True
+
+
+def test_a_package_manager_request_carries_it_to_the_job(
+    client: TestClient, queued: list[dict[str, Any]]
+) -> None:
+    """
+    PACKAGE_MANAGERS in the CLI's --pm used to lack yarn even though
+    PackageManagerHelper fully supports it; the API had no field for it at
+    all. Both now derive from the same list.
+    """
+    response = client.post("/api/apps", json={**FORM, "package_manager": "yarn"})
+
+    assert response.status_code == 202, response.text
+    assert queued[0]["kwargs"]["package_manager"] == "yarn"
+
+
+def test_an_unsupported_package_manager_is_refused_before_queueing(
+    client: TestClient, queued: list[dict[str, Any]]
+) -> None:
+    """A name PackageManagerHelper does not know is refused, not queued to fail later."""
+    response = client.post("/api/apps", json={**FORM, "package_manager": "cobol-pm"})
+
+    assert response.status_code == 400, response.text
+    assert response.json()["error"] == "validationerror"
+    assert not queued
+
+
+def test_the_job_hands_the_package_manager_to_the_deployer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """deploy_app_job forwards package_manager to configure(), defaulting to auto."""
+    from wasm.web.jobs import Job, JobContext, JobType, deploy_app_job
+
+    captured: dict[str, Any] = {}
+
+    class FakeDeployer:
+        """Records how it was configured and deploys nothing."""
+
+        last_deployment_id = None
+
+        def configure(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        def deploy(self) -> bool:
+            return True
+
+    monkeypatch.setattr("wasm.deployers.get_deployer", lambda *a, **k: FakeDeployer())
+
+    job = Job(id="job-test", type=JobType.DEPLOY, name="deploy", description="")
+    deploy_app_job(
+        "pm.example.com",
+        "https://github.com/you/app",
+        "nodejs",
+        package_manager="yarn",
+        job_context=JobContext(job, lambda _job: None),
+    )
+
+    assert captured["package_manager"] == "yarn"
+
+
+def test_the_job_defaults_the_package_manager_to_auto(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Omitting package_manager entirely must not hand configure() a bare None."""
+    from wasm.web.jobs import Job, JobContext, JobType, deploy_app_job
+
+    captured: dict[str, Any] = {}
+
+    class FakeDeployer:
+        """Records how it was configured and deploys nothing."""
+
+        last_deployment_id = None
+
+        def configure(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        def deploy(self) -> bool:
+            return True
+
+    monkeypatch.setattr("wasm.deployers.get_deployer", lambda *a, **k: FakeDeployer())
+
+    job = Job(id="job-test", type=JobType.DEPLOY, name="deploy", description="")
+    deploy_app_job(
+        "pm2.example.com",
+        "https://github.com/you/app",
+        "nodejs",
+        job_context=JobContext(job, lambda _job: None),
+    )
+
+    assert captured["package_manager"] == "auto"

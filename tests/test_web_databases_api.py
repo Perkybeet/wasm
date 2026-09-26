@@ -409,6 +409,77 @@ def test_installing_an_installed_engine_is_refused(client: TestClient, db) -> No
     assert "already installed" in response.text
 
 
+def _capture_queued_jobs(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """
+    Stand in for the job manager, so uninstalling an engine never really runs.
+
+    Args:
+        monkeypatch: Patching helper, scoped to the test.
+
+    Returns:
+        The keyword arguments of every job the endpoint tried to queue - empty
+        when a request never got past the elevation gate.
+    """
+    import wasm.web.api.databases as db_api
+
+    created: list[dict[str, Any]] = []
+
+    def create_job(**kwargs: Any) -> SimpleNamespace:
+        created.append(kwargs)
+        return SimpleNamespace(
+            id="job-42",
+            status=SimpleNamespace(value="pending"),
+            to_dict=lambda: {"id": "job-42", "status": "pending"},
+        )
+
+    monkeypatch.setattr(db_api, "get_job_manager", lambda: SimpleNamespace(create_job=create_job))
+    return created
+
+
+def test_uninstalling_an_engine_requires_elevation(
+    client: TestClient, engines, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Removing an engine can take its data with it and needs a recent sudo confirmation."""
+    created = _capture_queued_jobs(monkeypatch)
+
+    response = client.post("/api/databases/engines/postgresql/uninstall")
+
+    assert response.status_code == 403, response.text
+    assert response.json()["error"] == "elevation_required"
+    assert not created
+
+
+def test_uninstalling_an_engine_queues_the_job_once_elevated(
+    client: TestClient, engines, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Elevating opens the window uninstalling an engine needs."""
+    created = _capture_queued_jobs(monkeypatch)
+    elevate(client)
+
+    response = client.post("/api/databases/engines/postgresql/uninstall?purge=true")
+
+    assert response.status_code == 202, response.text
+    assert created
+    assert created[0]["kwargs"] == {"engine": "postgresql", "action": "uninstall", "purge": True}
+
+
+def test_uninstalling_an_engine_with_the_master_token_is_exempt(
+    app: FastAPI, engines, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Automation presenting the master token needs no elevation either."""
+    created = _capture_queued_jobs(monkeypatch)
+    token = get_token_manager().generate_master_token()
+    anon = TestClient(app, client=("testclient", 50000), follow_redirects=False)
+
+    response = anon.post(
+        "/api/databases/engines/postgresql/uninstall",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 202, response.text
+    assert created
+
+
 # --------------------------------------------------------------- databases
 
 
@@ -656,8 +727,26 @@ def test_backing_up_a_database_reports_the_dump(client: TestClient, db) -> None:
     assert response.json()["path"].endswith("postgresql-appdb-20260101_120000.sql.gz")
 
 
+def test_restoring_requires_elevation(client: TestClient, db) -> None:
+    """Overwriting a live database is as destructive as dropping one."""
+    db.BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    dump = "postgresql-appdb-20260101_120000.sql.gz"
+    (db.BACKUP_DIR / dump).write_bytes(b"not really a dump")
+
+    response = client.post(
+        "/api/databases/backups/restore",
+        json={"database": "appdb", "engine": "postgresql", "backup_name": dump},
+    )
+
+    assert response.status_code == 403, response.text
+    assert response.json()["error"] == "elevation_required"
+    assert not [call for call in db.calls if call[0] == "restore"]
+
+
 def test_restoring_needs_a_backup_that_actually_exists(client: TestClient, db) -> None:
     """A backup name that resolves nowhere on disk is a 404, not a restore."""
+    elevate(client)
+
     response = client.post(
         "/api/databases/backups/restore",
         json={
@@ -673,6 +762,7 @@ def test_restoring_needs_a_backup_that_actually_exists(client: TestClient, db) -
 
 def test_restoring_an_existing_backup_reaches_the_manager(client: TestClient, db) -> None:
     """The named dump, once it is really on disk, is restored through the manager."""
+    elevate(client)
     db.BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     dump = "postgresql-appdb-20260101_120000.sql.gz"
     (db.BACKUP_DIR / dump).write_bytes(b"not really a dump")
@@ -680,6 +770,24 @@ def test_restoring_an_existing_backup_reaches_the_manager(client: TestClient, db
     response = client.post(
         "/api/databases/backups/restore",
         json={"database": "appdb", "engine": "postgresql", "backup_name": dump},
+    )
+
+    assert response.status_code == 200, response.text
+    assert ("restore", "appdb", dump, False) in db.calls
+
+
+def test_restoring_with_the_master_token_is_exempt(app: FastAPI, db) -> None:
+    """Automation presenting the master token needs no elevation either."""
+    db.BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    dump = "postgresql-appdb-20260101_120000.sql.gz"
+    (db.BACKUP_DIR / dump).write_bytes(b"not really a dump")
+    token = get_token_manager().generate_master_token()
+    anon = TestClient(app, client=("testclient", 50000), follow_redirects=False)
+
+    response = anon.post(
+        "/api/databases/backups/restore",
+        json={"database": "appdb", "engine": "postgresql", "backup_name": dump},
+        headers={"Authorization": f"Bearer {token}"},
     )
 
     assert response.status_code == 200, response.text

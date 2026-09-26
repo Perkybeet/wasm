@@ -344,6 +344,35 @@ def test_an_associated_app_supplies_the_working_directory(
     assert "# Application: example.com" in text
 
 
+def test_a_releases_app_runs_its_job_in_current_not_the_app_root(
+    runner: FakeRunner, systemd_dir: Path, store: WASMStore
+) -> None:
+    """
+    A releases application's root holds releases/ and current/, not the
+    running code itself, so a job that defaults to it - rather than
+    current/ - sees none of the relative paths its command expects.
+    """
+    store.create_app(
+        App(
+            domain="example.com",
+            app_type="nextjs",
+            source="https://github.com/you/app",
+            branch="main",
+            port=3000,
+            app_path="/var/www/apps/example.com",
+            status="running",
+            layout="releases",
+        )
+    )
+
+    CronManager().create_job(job(working_directory=None, app_domain="example.com"))
+
+    _, service = written_units(systemd_dir)
+    text = service.read_text()
+    assert "WorkingDirectory=/var/www/apps/example.com/current" in text
+    assert "# Application: example.com" in text
+
+
 def test_an_unknown_app_is_refused(runner: FakeRunner, systemd_dir: Path, store: WASMStore) -> None:
     """Associating with a domain nothing is deployed at is an error."""
     with pytest.raises(ServiceError, match="No application"):

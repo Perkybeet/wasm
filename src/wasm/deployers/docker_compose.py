@@ -254,10 +254,40 @@ class DockerComposeDeployer(AppDeployer):
             include_www: Ignored; compose stacks are proxied on one hostname.
             trigger: What initiated this deployment, recorded in the history.
             **options: ``compose_file`` selects a specific compose file,
-                ``compose_profiles`` activates Docker Compose profiles, and
-                ``job_id`` is the background job driving this deployment,
-                when there is one.
+                ``compose_profiles`` activates Docker Compose profiles,
+                ``job_id`` is the background job driving this deployment, when
+                there is one, and ``memory_max_mb``, ``cpu_quota_percent`` and
+                ``tasks_max`` are refused rather than accepted (see raises).
+
+        Raises:
+            DeploymentError: When ``webserver`` is ``apache``, which every
+                site-creation path here builds through nginx regardless of
+                what is asked for; or when a memory, CPU or task limit is
+                given, since this stack's containers are not in the systemd
+                unit's cgroup for it to limit - the unit only runs
+                ``docker compose up -d`` once and exits.
         """
+        if webserver == "apache":
+            raise DeploymentError(
+                "Docker Compose applications can only be served through nginx",
+                details="Every site this deployer creates - the simple proxy and the "
+                "multi-service advanced config - is built with nginx; there is no Apache "
+                "equivalent yet. Deploy with --webserver nginx (the default), or configure "
+                "Apache by hand outside WASM.",
+            )
+        given_limits = {
+            key: options.get(key)
+            for key in ("memory_max_mb", "cpu_quota_percent", "tasks_max")
+            if options.get(key) is not None
+        }
+        if given_limits:
+            raise DeploymentError(
+                f"{domain} runs in Docker containers, which its systemd unit's limits do not reach",
+                details="The unit only runs 'docker compose up -d' and exits; the containers "
+                "are not in its cgroup. Set deploy.resources.limits for each service in the "
+                "compose file instead of passing memory, CPU or task limits at creation.",
+            )
+
         self.domain = domain
         self.source = source
         self.trigger = trigger

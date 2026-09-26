@@ -34,7 +34,8 @@ from wasm.core.exceptions import ServiceError
 from wasm.managers.backup_scheduler import SCHEDULE_ALIASES
 from wasm.managers.cron_manager import CronJob, CronManager, validate_cron_calendar
 from wasm.web.api.auth import get_current_session
-from wasm.web.api.deps import WASMErrorRoute
+from wasm.web.api.deps import WASMErrorRoute, require_elevated
+from wasm.web.auth import actor_label
 from wasm.web.pydantic_compat import field_validator
 
 router = APIRouter(route_class=WASMErrorRoute)
@@ -279,7 +280,7 @@ def create_job(
         "create_cron_job name=%s schedule=%s session=%s",
         data.name,
         data.schedule,
-        session.get("session_id", "unknown"),
+        actor_label(session),
     )
     manager = CronManager(verbose=False)
     created = manager.create_job(
@@ -329,14 +330,19 @@ def preview_schedule(
 
 @router.delete("/{name}", response_model=CronActionResponse)
 def delete_job(
-    name: str, session: Annotated[dict, Depends(get_current_session)]
+    name: str, session: Annotated[dict, Depends(require_elevated)]
 ) -> CronActionResponse:
     """
     Remove a cron job's timer and service units.
 
+    Deleting the units is as destructive as deleting the application they
+    were scheduled for - D5's sudo mode list treats it the same way, so a
+    cookie session has to confirm itself first; an admin-scoped Bearer
+    credential is exempt, per :func:`wasm.web.api.deps.ensure_elevated`.
+
     Args:
         name: Job name.
-        session: The authenticated session.
+        session: The authenticated, elevated session.
 
     Returns:
         The action outcome.
@@ -350,7 +356,7 @@ def delete_job(
     if manager.get_job(name) is None:
         raise HTTPException(status_code=404, detail=f"No cron job named {name}")
 
-    audit_log.info("delete_cron_job name=%s session=%s", name, session.get("session_id", "unknown"))
+    audit_log.info("delete_cron_job name=%s session=%s", name, actor_label(session))
     manager.delete_job(name)
 
     return CronActionResponse(success=True, message=f"Cron job {name} deleted")
@@ -374,7 +380,7 @@ def run_job(
     Raises:
         ServiceError: When the job is unknown, foreign, or refuses to start.
     """
-    audit_log.info("run_cron_job name=%s session=%s", name, session.get("session_id", "unknown"))
+    audit_log.info("run_cron_job name=%s session=%s", name, actor_label(session))
     unit = CronManager(verbose=False).run_now(name)
     return CronActionResponse(success=True, message=f"Started {unit}")
 
@@ -396,7 +402,7 @@ def enable_job(
     Raises:
         ServiceError: When the job is unknown, foreign, or systemd refuses.
     """
-    audit_log.info("enable_cron_job name=%s session=%s", name, session.get("session_id", "unknown"))
+    audit_log.info("enable_cron_job name=%s session=%s", name, actor_label(session))
     unit = CronManager(verbose=False).enable_job(name)
     return CronActionResponse(success=True, message=f"Enabled {unit}")
 
@@ -418,9 +424,7 @@ def disable_job(
     Raises:
         ServiceError: When the job is unknown, foreign, or systemd refuses.
     """
-    audit_log.info(
-        "disable_cron_job name=%s session=%s", name, session.get("session_id", "unknown")
-    )
+    audit_log.info("disable_cron_job name=%s session=%s", name, actor_label(session))
     unit = CronManager(verbose=False).disable_job(name)
     return CronActionResponse(success=True, message=f"Disabled {unit}")
 

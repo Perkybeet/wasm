@@ -64,6 +64,7 @@ from wasm.core.exceptions import (
 from wasm.validators.domain import validate_domain
 from wasm.web.auth import (
     SCOPE_RANK,
+    actor_label,
     ensure_scope,
     get_audit_logger,
     get_client_ip,
@@ -511,7 +512,7 @@ def ensure_elevated(request: Request, session: dict[str, Any]) -> None:
             action="auth.elevation",
             result="denied",
             client_ip=get_client_ip(request),
-            actor=str(session.get("sid", "unknown")),
+            actor=actor_label(session),
             resource=request.url.path,
             detail="session is not elevated",
         )

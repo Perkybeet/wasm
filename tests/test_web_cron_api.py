@@ -114,6 +114,19 @@ def client(app: FastAPI) -> TestClient:
     return signed_in
 
 
+def elevate(client: TestClient) -> None:
+    """
+    Confirm sudo mode for the signed-in client.
+
+    Args:
+        client: A signed-in client.
+    """
+    response = client.post(
+        "/api/auth/elevate", json={"token": get_token_manager().generate_master_token()}
+    )
+    assert response.status_code == 200, response.text
+
+
 @pytest.fixture
 def anonymous(app: FastAPI) -> TestClient:
     """
@@ -376,12 +389,27 @@ def test_enable_and_disable_drive_the_timer(
     assert "Enabled" in enabled.json()["message"]
 
 
+def test_deleting_a_job_requires_elevation(
+    client: TestClient, runner: FakeRunner, systemd_dir: Path
+) -> None:
+    """Removing a job's units needs a recent sudo confirmation, like any other delete."""
+    write_owned_pair(systemd_dir)
+    scripted_job(runner)
+
+    response = client.delete("/api/cron/cleanup")
+
+    assert response.status_code == 403, response.text
+    assert response.json()["error"] == "elevation_required"
+    assert not any(call[:2] == ("systemctl", "stop") for call in runner.calls)
+
+
 def test_deleting_removes_both_units_and_stops_the_timer(
     client: TestClient, runner: FakeRunner, systemd_dir: Path
 ) -> None:
-    """DELETE tears down exactly what create built."""
+    """DELETE tears down exactly what create built, once elevated."""
     timer, service = write_owned_pair(systemd_dir)
     scripted_job(runner)
+    elevate(client)
 
     response = client.delete("/api/cron/cleanup")
 
@@ -394,11 +422,28 @@ def test_deleting_a_job_that_does_not_exist_answers_404(
     client: TestClient, runner: FakeRunner, systemd_dir: Path
 ) -> None:
     """A delete that removed nothing must not report success."""
+    elevate(client)
+
     response = client.delete("/api/cron/ghost")
 
     assert response.status_code == 404
     assert "ghost" in response.text
     assert not any(call[:2] == ("systemctl", "stop") for call in runner.calls)
+
+
+def test_deleting_a_job_with_the_master_token_is_exempt(
+    app: FastAPI, runner: FakeRunner, systemd_dir: Path
+) -> None:
+    """Automation presenting the master token needs no elevation either."""
+    timer, service = write_owned_pair(systemd_dir)
+    scripted_job(runner)
+    token = get_token_manager().generate_master_token()
+    anon = TestClient(app, client=("testclient", 50000), follow_redirects=False)
+
+    response = anon.delete("/api/cron/cleanup", headers={"Authorization": f"Bearer {token}"})
+
+    assert response.status_code == 200, response.text
+    assert not timer.exists() and not service.exists()
 
 
 def test_a_foreign_unit_is_refused_from_the_api_too(

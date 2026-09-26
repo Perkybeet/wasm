@@ -25,6 +25,14 @@ from wasm.core.runner import CommandRunner, get_runner
 
 PackageManager = Literal["npm", "pnpm", "bun", "yarn", "auto"]
 
+#: Every Node package manager WASM knows how to drive. The one list: the
+#: CLI's ``--pm`` choices and the API's ``package_manager`` field both derive
+#: from it, so a manager this helper supports - yarn, historically - cannot
+#: be rejected by a front end before it ever reaches here. "auto" is not one
+#: of them: it means "detect from the lock file", so it is added beside this
+#: constant by whichever caller offers it, not included in it.
+SUPPORTED_PACKAGE_MANAGERS: tuple[str, ...] = ("npm", "pnpm", "yarn", "bun")
+
 
 class PackageManagerHelper:
     """
@@ -165,7 +173,7 @@ class PackageManagerHelper:
             List of installed package manager names.
         """
         available = []
-        for pm in ["npm", "pnpm", "yarn", "bun"]:
+        for pm in SUPPORTED_PACKAGE_MANAGERS:
             if self.runner.exists(pm):
                 available.append(pm)
         return available
