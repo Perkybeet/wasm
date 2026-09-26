@@ -18,12 +18,14 @@ wasm web status
 wasm web stop
 ```
 
-Every start issues a new access token. In the foreground it is printed once, in a banner that
-also says how to reach the console. In the background nothing is printed; run
-`wasm web token --new` to get one. `wasm web token` without options only reports whether a
-token is issued: the token itself is stored as a salted hash and cannot be shown again. A
-running console keeps accepting the token it was started with until it restarts; see
-[security.md](security.md#authentication) for retiring a token that may have leaked.
+Every start issues a new access token and prints it once, in the same banner whether it runs
+in the foreground or, with `-d`, in the background: the parent process prints it before
+handing the server over to the child, so it is never silently issued unseen. `wasm web
+token` without options only reports whether a token is issued: the token itself is stored as
+a salted hash and cannot be shown again. A running console reads the token from disk on
+every request, so issuing a new one with `wasm web token --new` retires the old one at once,
+with no restart needed; see [security.md](security.md#authentication) for more, including
+what `--regenerate` invalidates beyond the token itself.
 
 `wasm web start -d` runs the console as a background process, with its log in
 `/var/log/wasm/web.log` and its PID in `/var/run/wasm-web.pid`. It is not a systemd unit and

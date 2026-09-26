@@ -59,6 +59,19 @@ PLAIN_PASSWORD = "correcthorsebatterystaple42"
 PSQL_PREFIX = ("runuser", "-u", "postgres", "--", "psql")
 
 
+def _command_strings(call: tuple[str, ...]) -> list[str]:
+    """
+    Extract the values of every ``-c`` option in a recorded argv.
+
+    Args:
+        call: A recorded argv.
+
+    Returns:
+        The command strings, in order.
+    """
+    return [call[i + 1] for i, arg in enumerate(call[:-1]) if arg == "-c"]
+
+
 class StubConfig:
     """A configuration that answers with whatever the test put in it."""
 
@@ -317,6 +330,7 @@ def test_postgres_statement_argv_is_stdin_only(
         "postgres",
         "-t",
         "-A",
+        "-X",
         "-f",
         "-",
     )
@@ -412,6 +426,7 @@ def test_postgres_restore_stages_the_dump_for_the_postgres_account(
         "shop",
         "-t",
         "-A",
+        "-X",
         "-f",
         staged,
     )
@@ -1319,16 +1334,16 @@ class TestReadOnlyEnforcement:
             read_only=True,
         )
 
-        sent = runner.inputs[-1]
-        assert sent.startswith("BEGIN READ ONLY;")
-        assert sent.rstrip().endswith("COMMIT;")
+        sent = _command_strings(runner.calls[-1])
+        assert sent[0] == "BEGIN READ ONLY"
+        assert sent[-1] == "COMMIT"
 
     def test_postgres_does_not_wrap_a_write(self, postgres, runner):
         runner.script(["runuser", "-u", "postgres", "--", "psql"], stdout="1\n")
 
         postgres.execute_query(database="app", query="DELETE FROM t", read_only=False)
 
-        assert "BEGIN READ ONLY" not in (runner.inputs[-1] or "")
+        assert _command_strings(runner.calls[-1]) == ["DELETE FROM t"]
 
     def test_mysql_wraps_a_read_in_a_read_only_transaction(self, mysql, runner):
         runner.script(["mysql"], stdout="app\n")
@@ -1400,10 +1415,10 @@ class TestStructuredQuery:
 
         postgres.execute_query_structured(database="app", query="SELECT 1", read_only=True)
 
-        sent = runner.inputs[-1]
-        assert sent.startswith("BEGIN READ ONLY;")
-        assert "SET ROLE" in sent
-        assert sent.rstrip().endswith("COMMIT;")
+        sent = _command_strings(runner.calls[-1])
+        assert sent[0] == "BEGIN READ ONLY"
+        assert sent[1].startswith("SET ROLE ")
+        assert sent[-1] == "COMMIT"
 
     def test_postgres_caps_rows_and_reports_truncation(self, postgres, runner):
         runner.script(["runuser", "-u", "postgres", "--", "psql"], stdout="1\n")

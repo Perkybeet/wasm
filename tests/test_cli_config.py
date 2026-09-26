@@ -713,6 +713,35 @@ def test_the_deprecated_apps_directory_alias_reads_the_canonical_key(
     assert result.output.strip() == "/srv/apps"
 
 
+def test_the_deprecated_logging_directory_alias_writes_the_canonical_key(
+    wasm: Wasm, real_config_path: Path
+) -> None:
+    """
+    obs/wasm.default.yaml shipped 'logging.directory' while DEFAULT_CONFIG
+    named the setting 'logging.file'; a packaged install and the code
+    disagreed about which key held the log location. It is now a deprecated
+    alias, normalised to 'logging.file' on write.
+    """
+    result = wasm("config", "set", "logging.directory", "/var/log/wasm/wasm.log")
+
+    assert result.exit_code == 0, result.output
+    stored = yaml.safe_load(real_config_path.read_text())
+    assert stored["logging"]["file"] == "/var/log/wasm/wasm.log"
+    assert "directory" not in stored["logging"], "the alias must not leave a second setting behind"
+
+
+def test_the_deprecated_logging_directory_alias_reads_the_canonical_key(
+    wasm: Wasm, real_config_path: Path
+) -> None:
+    """Reading the alias must answer with what the canonical key holds."""
+    assert wasm("config", "set", "logging.file", "/srv/logs/wasm.log").exit_code == 0
+
+    result = wasm("config", "get", "logging.directory")
+
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "/srv/logs/wasm.log"
+
+
 def test_the_panel_documented_smtp_host_command_works(wasm: Wasm, real_config_path: Path) -> None:
     """settings_form_notifications.html tells an operator to run exactly this command."""
     result = wasm("config", "set", "monitor.smtp.host", "smtp.example.com")

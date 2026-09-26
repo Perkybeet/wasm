@@ -47,10 +47,18 @@
         Options -Indexes +FollowSymLinks
         AllowOverride All
         Require all granted
-        
-        # SPA support - rewrite to index.html
+
         RewriteEngine On
         RewriteBase /
+
+        # Deny hidden files and directories (.git, .env, .htpasswd, ...):
+        # Apache serves whatever is in the document root, dotfiles included,
+        # unless something tells it not to. ACME's HTTP-01 challenge lives
+        # under .well-known/ and must stay reachable.
+        RewriteCond %{REQUEST_URI} !^/\.well-known/
+        RewriteRule (^|/)\. - [F]
+
+        # SPA support - rewrite to index.html
         RewriteRule ^index\.html$ - [L]
         RewriteCond %{REQUEST_FILENAME} !-f
         RewriteCond %{REQUEST_FILENAME} !-d

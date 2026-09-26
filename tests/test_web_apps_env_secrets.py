@@ -218,12 +218,12 @@ def test_put_app_env_rewrites_the_file_and_reports_restart_required(
 
     response = client.put(
         "/api/apps/example.com/env",
-        json={"variables": {"API_KEY": "new", "PORT": "3000"}},
+        json={"variables": {"API_KEY": "new", "FEATURE_FLAG": "on"}},
     )
 
     assert response.status_code == 200, response.text
     assert response.json() == {"domain": "example.com", "restart_required": True}
-    assert (app_dir / ".env").read_text(encoding="utf-8") == "API_KEY=new\nPORT=3000\n"
+    assert (app_dir / ".env").read_text(encoding="utf-8") == "API_KEY=new\nFEATURE_FLAG=on\n"
     assert stat.S_IMODE((app_dir / ".env").stat().st_mode) == 0o600
 
 
@@ -238,6 +238,78 @@ def test_put_app_env_rejects_an_invalid_name_with_422(
 
     assert response.status_code == 422, response.text
     assert "Invalid environment variable name" in response.text
+    assert (app_dir / ".env").read_text(encoding="utf-8") == "API_KEY=old\n"
+
+
+@pytest.mark.parametrize(("name", "value"), [("PORT", "9999"), ("NODE_ENV", "development")])
+def test_put_app_env_rejects_a_variable_wasm_manages(
+    client: TestClient, store: WASMStore, tmp_path: Path, name: str, value: str
+) -> None:
+    """
+    The unit loads the env file with ``EnvironmentFile=``, which overrides its
+    own ``Environment=``. The console's editor and the API must not be able to
+    move an application off the port systemd and nginx expect, or off the
+    NODE_ENV WASM fixes in the unit.
+    """
+    app_dir = deployed_env(store, tmp_path, env_text="API_KEY=old\n")
+    elevate(client)
+
+    response = client.put(
+        "/api/apps/example.com/env", json={"variables": {"API_KEY": "old", name: value}}
+    )
+
+    assert response.status_code == 422, response.text
+    assert name in response.text
+    assert (app_dir / ".env").read_text(encoding="utf-8") == "API_KEY=old\n"
+
+
+def test_put_app_env_rejecting_port_names_the_real_command_to_change_it(
+    client: TestClient, store: WASMStore, tmp_path: Path
+) -> None:
+    """The refusal must be actionable, not just a dead end."""
+    deployed_env(store, tmp_path, env_text="API_KEY=old\n")
+    elevate(client)
+
+    response = client.put("/api/apps/example.com/env", json={"variables": {"PORT": "9999"}})
+
+    assert response.status_code == 422, response.text
+    assert "wasm create" in response.text
+    assert "--port" in response.text
+
+
+def test_put_app_env_allows_an_unchanged_port_alongside_an_unrelated_edit(
+    client: TestClient, store: WASMStore, tmp_path: Path
+) -> None:
+    """
+    A 1.x application can already have PORT sitting in its .env. The guard
+    only refuses adding or changing it, so an unrelated edit that carries the
+    same PORT through unchanged must still succeed.
+    """
+    app_dir = deployed_env(store, tmp_path, env_text="PORT=3000\nAPI_KEY=old\n")
+    elevate(client)
+
+    response = client.put(
+        "/api/apps/example.com/env",
+        json={"variables": {"PORT": "3000", "API_KEY": "new"}},
+    )
+
+    assert response.status_code == 200, response.text
+    assert (app_dir / ".env").read_text(encoding="utf-8") == "API_KEY=new\nPORT=3000\n"
+
+
+def test_put_app_env_rejects_a_newline_in_a_value_with_422(
+    client: TestClient, store: WASMStore, tmp_path: Path
+) -> None:
+    """A newline in a value would inject a second variable into the file."""
+    app_dir = deployed_env(store, tmp_path, env_text="API_KEY=old\n")
+    elevate(client)
+
+    response = client.put(
+        "/api/apps/example.com/env",
+        json={"variables": {"EVIL": "a\nEVIL2=1"}},
+    )
+
+    assert response.status_code == 422, response.text
     assert (app_dir / ".env").read_text(encoding="utf-8") == "API_KEY=old\n"
 
 

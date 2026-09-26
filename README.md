@@ -157,9 +157,11 @@ wasm releases rollback shop.example.com                           # back to the 
 application answers. When the repository has an `.env.example`, a `.env` is generated from
 it, with random values for secrets. Useful options: `--type`, `--port`, `--branch`, `--www`,
 `--webserver apache`, `--no-ssl`, `--persist storage`, `--env-file` (its variables are
-written into the systemd unit, which local users can read; keep secrets in the `.env`). For a
-private repository, create a deploy key with `wasm setup ssh --generate --show` and use the
-SSH URL.
+written into the application's `.env`, `0600` and loaded by the unit with
+`EnvironmentFile=`; only `PORT` and `NODE_ENV` stay inline in the unit, which local users can
+read). To change the port later, redeploy with `--port` rather than editing the `.env` - the
+unit's own `PORT` would otherwise win over one written there. For a private repository,
+create a deploy key with `wasm setup ssh --generate --show` and use the SSH URL.
 
 Run `wasm` with a command and `--help` for its options, or `wasm -i` for an interactive menu.
 `--dry-run` before any command rehearses it without changing anything, and `--json` gives
@@ -182,8 +184,9 @@ ssh -L 8080:127.0.0.1:8080 root@server.example.com    # then open http://localho
 To expose it, serve TLS (`--host 0.0.0.0 --tls-cert ... --tls-key ...`, or `--self-signed`),
 or put it behind a reverse proxy that terminates TLS and declare it with `--trusted-proxy`.
 Binding beyond loopback without TLS is refused unless you pass `--insecure-http`.
-`wasm web start -d` runs it in the background; it then prints no token, so issue one with
-`wasm web token --new`.
+`wasm web start -d` runs it in the background, printing its access token the same way a
+foreground start does. A running console reads the token from disk on every request, so
+`wasm web token --new` retires the old one at once, with no restart needed.
 
 Sign in with the access token, plus a code when two-factor authentication is on
 (`wasm 2fa enroll`). Destructive actions ask you to confirm it is you (sudo mode) and stay

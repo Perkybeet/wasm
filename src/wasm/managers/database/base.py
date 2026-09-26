@@ -43,6 +43,7 @@ from wasm.core.exceptions import (
     DatabaseBackupError,
     DatabaseEngineError,
     DatabaseError,
+    DatabaseQueryError,
     DatabaseUserError,
 )
 from wasm.core.fs import SECRET_MODE
@@ -413,6 +414,51 @@ def parse_tabular_query_output(
     columns, data = lines[0], lines[1:]
     truncated = len(data) > max_rows
     return columns, data[:max_rows], truncated
+
+
+def console_statement(query: str, *, read_only: bool) -> str:
+    """
+    Check an operator's console text before any client sees it.
+
+    The engine-neutral half of the console guard; each SQL manager adds the
+    rule for its own client's command syntax. Read mode is held to one
+    statement here, at the manager, and not only by the API and the CLI: a
+    second statement can close the read-only transaction and drop the
+    least-privilege role (``SELECT 1; COMMIT; RESET ROLE; ...``), and a guard
+    kept in the callers has as many holes as there are callers.
+
+    Args:
+        query: The statement as the operator typed it.
+        read_only: Whether the statement is run in read mode.
+
+    Returns:
+        The statement. In read mode, stripped and without its one optional
+        trailing semicolon, so a wrapper can add its own terminator.
+
+    Raises:
+        DatabaseQueryError: When the text is empty, holds a NUL byte, or, in
+            read mode, holds more than one statement.
+    """
+    if not query.strip():
+        raise DatabaseQueryError("Empty statement", details="Send the statement to run.")
+    if "\x00" in query:
+        raise DatabaseQueryError(
+            "The statement contains a NUL byte",
+            details="Remove the NUL character; no SQL statement needs one.",
+        )
+    if not read_only:
+        return query
+
+    statement = query.strip().removesuffix(";").rstrip()
+    # A ';' inside a string literal is refused too. Telling the two apart
+    # needs the engine's own lexer, and a false refusal costs the operator a
+    # rewrite while a false acceptance costs the read-only guarantee.
+    if ";" in statement:
+        raise DatabaseQueryError(
+            "Read mode runs one statement at a time",
+            details="Remove the embedded ';' and send the statements one by one.",
+        )
+    return statement
 
 
 class BaseDatabaseManager(BaseManager):

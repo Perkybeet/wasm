@@ -5,10 +5,13 @@
 """
 PostgreSQL manager.
 
-Statements are fed to ``psql`` on stdin, never with ``-c``: a CREATE ROLE
-carries a password, and everything in argv is visible in ``ps``. Dumps are
-streamed to disk by the runner, so a dump containing quotes or binary bytes
-arrives intact.
+Statements WASM builds are fed to ``psql`` on stdin, never with ``-c``: a
+CREATE ROLE carries a password, and everything in argv is visible in ``ps``.
+The console's statement is the one exception, and goes the other way for a
+reason: psql reads stdin as a script and runs its meta-commands (``\\!`` is a
+shell) wherever they appear, while a ``-c`` string is sent to the server as it
+is. See :meth:`PostgresManager._console_argv`. Dumps are streamed to disk by
+the runner, so a dump containing quotes or binary bytes arrives intact.
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ from wasm.managers.database.base import (
     DatabaseInfo,
     StructuredQueryResult,
     UserInfo,
+    console_statement,
     format_size,
     parse_tabular_query_output,
     quote_identifier,
@@ -182,6 +186,8 @@ class PostgresManager(BaseDatabaseManager):
             database,
             "-t",
             "-A",
+            # No psqlrc: a startup file is a script psql would run first.
+            "-X",
             *tail,
         ]
 
@@ -949,32 +955,98 @@ class PostgresManager(BaseDatabaseManager):
 
         Raises:
             DatabaseNotFoundError: When the database does not exist.
-            DatabaseQueryError: When the statement fails.
+            DatabaseQueryError: When the statement is refused before it runs
+                (see :meth:`_console_argv`) or fails.
         """
+        argv, env = self._console_argv(database, query, read_only=read_only, csv=False)
+        result = self._exec(argv, env=env, timeout=QUERY_TIMEOUT, user=self.SUPERUSER)
+        if not result.success:
+            raise DatabaseQueryError("Query failed", details=result.stderr.strip())
+        return True, result.stdout
+
+    def _console_argv(
+        self, database: str, query: str, *, read_only: bool, csv: bool
+    ) -> tuple[list[str], dict[str, str] | None]:
+        """
+        Build the psql invocation that runs an operator's console statement.
+
+        psql parses stdin, ``-f`` files and psqlrc as scripts, running a
+        meta-command wherever one appears: ``\\! id`` is a shell as the
+        ``postgres`` account even in the middle of a line, ``\\o`` writes a
+        file, ``\\i`` reads one. A ``-c`` string is different - psql sends it
+        to the server as it is, with no meta-command or variable handling -
+        unless its very first character is a backslash, in which case it is
+        one meta-command. So the statement travels as its own ``-c``, a
+        leading backslash is refused, and ``-X`` keeps psqlrc out.
+
+        The trade-off is that the statement is in argv, visible in ``ps`` for
+        as long as it runs. That is acceptable for the operator's own query,
+        which is not a credential: the connection itself still authenticates
+        by peer as :data:`SUPERUSER`, with nothing secret on the command line.
+        A statement that embeds a password (``ALTER ROLE ... PASSWORD``) is
+        better sent through ``wasm db user``, which keeps it on stdin.
+
+        Read mode wraps the statement in a read-only transaction under the
+        least-privilege role, one ``-c`` per statement rather than one string:
+        psql before 15 prints only the last result of a multi-statement
+        ``-c``, which would be COMMIT's empty one instead of the rows.
+
+        A read-only transaction rejects INSERT, UPDATE, DELETE, DDL and
+        data-modifying CTEs alike, and cannot be escalated from inside because
+        SET TRANSACTION READ WRITE is refused once the session default is
+        read-only. It does not, by itself, stop a read: the cluster superuser
+        this connects as could still run ``SELECT pg_read_file(...)`` or
+        ``pg_ls_dir('/')``, which are reads as far as the transaction mode is
+        concerned. SET ROLE closes that for the rest of the session, leaving
+        only what ``wasm_ro_<database>`` was granted - which is also why read
+        mode is held to a single statement by :func:`console_statement`.
+
+        Args:
+            database: Database to connect to.
+            query: The operator's statement.
+            read_only: Wrap it in the read-only transaction and role.
+            csv: Print CSV with a header row, for the structured result.
+
+        Returns:
+            The argument vector and the extra environment for psql.
+
+        Raises:
+            DatabaseNotFoundError: When the database does not exist.
+            DatabaseQueryError: When the statement is refused, or the
+                read-only role cannot be provisioned.
+        """
+        statement = console_statement(query, read_only=read_only)
+        if statement.lstrip().startswith("\\"):
+            raise DatabaseQueryError(
+                "psql client commands are not accepted by the console",
+                details=(
+                    "A statement starting with a backslash is a psql meta-command "
+                    "(\\! runs a shell, \\o writes a file), not SQL. Send SQL only; "
+                    "use 'wasm db connect' for an interactive psql session."
+                ),
+            )
         if not self.database_exists(database):
             raise DatabaseNotFoundError(f"Database '{database}' does not exist")
 
         if read_only:
-            # A read-only transaction rejects INSERT, UPDATE, DELETE, DDL and
-            # data-modifying CTEs alike, and it cannot be escalated from inside
-            # because SET TRANSACTION READ WRITE is refused once the session
-            # default is read-only. It does not, by itself, stop a read: the
-            # cluster superuser this connects as can still run
-            # SELECT pg_read_file('/etc/shadow') or SELECT * FROM
-            # pg_ls_dir('/') inside a read-only transaction, because those
-            # are reads as far as the transaction mode is concerned. SET ROLE
-            # closes that: it drops every superuser privilege for the rest of
-            # the session, leaving only what wasm_ro_<database> was granted.
             role = self._ensure_read_only_role(database)
-            sql = f"BEGIN READ ONLY;\nSET ROLE {self._escape_identifier(role)};\n{query}\nCOMMIT;\n"
-            env = {"PGOPTIONS": "-c default_transaction_read_only=on"}
+            commands = [
+                "BEGIN READ ONLY",
+                f"SET ROLE {self._escape_identifier(role)}",
+                statement,
+                "COMMIT",
+            ]
+            env: dict[str, str] | None = {"PGOPTIONS": "-c default_transaction_read_only=on"}
         else:
-            sql, env = query, None
+            commands, env = [statement], None
 
-        success, output = self._execute_sql(sql, database=database, env=env)
-        if not success:
-            raise DatabaseQueryError("Query failed", details=output.strip())
-        return success, output
+        tail = [arg for command in commands for arg in ("-c", command)]
+        if csv:
+            return self._psql_csv_argv(database, *tail), env
+        # -q drops the BEGIN/SET/COMMIT status lines the wrapper would
+        # otherwise print around the rows.
+        quiet = ["-q"] if read_only else []
+        return self._psql_argv(database, *quiet, *tail), env
 
     def _psql_csv_argv(self, database: str, *tail: str) -> list[str]:
         """
@@ -992,7 +1064,7 @@ class PostgresManager(BaseDatabaseManager):
         Returns:
             The argument vector.
         """
-        return ["psql", "-v", "ON_ERROR_STOP=1", "-d", database, "--csv", "-q", *tail]
+        return ["psql", "-v", "ON_ERROR_STOP=1", "-d", database, "--csv", "-q", "-X", *tail]
 
     def execute_query_structured(
         self,
@@ -1024,25 +1096,11 @@ class PostgresManager(BaseDatabaseManager):
 
         Raises:
             DatabaseNotFoundError: When the database does not exist.
-            DatabaseQueryError: When the statement fails.
+            DatabaseQueryError: When the statement is refused before it runs
+                (see :meth:`_console_argv`) or fails.
         """
-        if not self.database_exists(database):
-            raise DatabaseNotFoundError(f"Database '{database}' does not exist")
-
-        if read_only:
-            role = self._ensure_read_only_role(database)
-            sql = f"BEGIN READ ONLY;\nSET ROLE {self._escape_identifier(role)};\n{query}\nCOMMIT;\n"
-            env = {"PGOPTIONS": "-c default_transaction_read_only=on"}
-        else:
-            sql, env = query, None
-
-        result = self._exec(
-            self._psql_csv_argv(database, "-f", "-"),
-            input=sql,
-            timeout=QUERY_TIMEOUT,
-            env=env,
-            user=self.SUPERUSER,
-        )
+        argv, env = self._console_argv(database, query, read_only=read_only, csv=True)
+        result = self._exec(argv, timeout=QUERY_TIMEOUT, env=env, user=self.SUPERUSER)
         if not result.success:
             raise DatabaseQueryError(
                 "Query failed", details=(result.stderr or result.stdout).strip()

@@ -35,6 +35,64 @@ from wasm.deployers.helpers.layout import (
 )
 from wasm.deployers.helpers.permissions import hand_over_file
 from wasm.deployers.releases import ReleaseManager
+from wasm.validators.environment import EnvironmentValidationError, validate_environment
+
+#: Variables the unit sets inline with ``Environment=`` (see
+#: :meth:`~wasm.deployers.base.BaseDeployer._unit_environment`). systemd lets
+#: ``EnvironmentFile=`` override ``Environment=``, so an edit here would
+#: silently take over from what the unit - and nginx, which proxies to the
+#: port WASM recorded - expect. A fresh deploy already keeps them out of the
+#: file it generates; this is the guard for every edit made after that, where
+#: silently dropping the value would look like it was accepted.
+_MANAGED_ENV_VAR_HINTS: dict[str, str] = {
+    "PORT": (
+        "PORT is managed by WASM: the unit loads it with Environment=, which "
+        "EnvironmentFile= would override if the .env file set it too, silently "
+        "moving the application off the port nginx and systemd expect. Change "
+        "the port by redeploying, for example 'wasm create -d <domain> -s <source> "
+        "--port <port>' (or POST /api/apps with the new port)."
+    ),
+    "NODE_ENV": (
+        "NODE_ENV is managed by WASM and fixed to 'production' in the unit; "
+        "EnvironmentFile= would override that Environment= the same way, so it "
+        "cannot be set from the environment file either."
+    ),
+}
+
+
+def _reject_managed_vars(values: Mapping[str, str], current: Mapping[str, str]) -> None:
+    """
+    Refuse a write that would introduce or change a variable the unit already owns.
+
+    An application deployed before this guard existed, or one whose
+    ``.env.example`` declares PORT, can already have PORT or NODE_ENV sitting
+    in its ``.env``. Refusing every future edit of that file over a setting
+    nobody is trying to change would make the environment of every such
+    application permanently uneditable - the operator adding an unrelated
+    ``API_KEY`` would be blocked by a PORT they never touched. So only a save
+    that adds the key or gives it a value different from what is already on
+    disk is refused; the value already there, carried through unchanged,
+    passes.
+
+    Args:
+        values: The complete set of variables about to be written.
+        current: What the file holds right now.
+
+    Raises:
+        EnvironmentValidationError: If values adds PORT or NODE_ENV, or gives
+            either one a value that differs from what is already stored.
+    """
+    offenders = [
+        name
+        for name in ("PORT", "NODE_ENV")
+        if name in values and values[name] != current.get(name)
+    ]
+    if not offenders:
+        return
+    raise EnvironmentValidationError(
+        f"{' and '.join(offenders)} cannot be set from the environment file",
+        details=" ".join(_MANAGED_ENV_VAR_HINTS[name] for name in offenders),
+    )
 
 
 def find_app(domain: str) -> App | None:
@@ -92,6 +150,13 @@ def write_app_env(
     it yet (it was deployed before there was a ``.env``), linked in, so a
     restart picks it up without a redeploy.
 
+    Every name and value is validated against what can safely reach a
+    systemd unit and the ``EnvironmentFile=`` it is loaded from - a POSIX
+    identifier with no control character in its value, a newline included -
+    before anything is written, so a caller that skips its own check (an
+    older CLI path did) cannot smuggle a second directive into the file this
+    unit and every other reader of it trusts.
+
     Args:
         app: The application.
         values: The complete set of variables.
@@ -104,12 +169,21 @@ def write_app_env(
         The file written.
 
     Raises:
+        EnvironmentValidationError: If a name or value is not safe to write
+            (see :func:`~wasm.validators.environment.validate_environment`),
+            or if values adds PORT or NODE_ENV, or changes one already on
+            disk; both are loaded into the unit inline and
+            ``EnvironmentFile=`` would let this file silently override them.
         SecurityError: If the destination is a symlink.
         OSError: If the file cannot be written.
     """
     log = logger or Logger()
     env_file = env_file_for(app)
-    (manager or EnvManager(fs=fs)).write_env_file(env_file, dict(values))
+    writer = manager or EnvManager(fs=fs)
+    current = writer.read_env_file(env_file)
+    clean = validate_environment(values)
+    _reject_managed_vars(clean, current)
+    writer.write_env_file(env_file, clean)
 
     config = Config()
     hand_over_file(

@@ -1130,6 +1130,39 @@ def test_rendered_configuration_matches_the_snapshot(
     assert rendered == snapshot(name=f"{backend}-{case}")
 
 
+@pytest.mark.parametrize("backend", ["nginx", "apache"])
+def test_a_static_site_denies_dotfiles_but_keeps_well_known_reachable(
+    managers: dict[str, WebServerManager], backend: str
+) -> None:
+    """
+    A static site's document root is served straight off disk: a stray
+    ``.git``, ``.env`` or ``.htpasswd`` must never reach a browser. ACME's
+    HTTP-01 challenge - and anything else under ``.well-known/`` - has to
+    stay reachable through the very same rule.
+    """
+    rendered = managers[backend].render_config(
+        "example.com", "static", {"ssl": False, "static_dir": "/var/www/apps/example.com/dist"}
+    )
+
+    if backend == "nginx":
+        assert "location ~ /\\. {" in rendered
+        assert "deny all;" in rendered
+        # nginx checks a regex location ahead of a plain prefix one, in the
+        # order they appear in the file - without ^~ on both .well-known
+        # locations, the deny rule above would also swallow ACME's own
+        # challenge path, because ".well-known" itself starts with a dot.
+        assert "location ^~ /.well-known/acme-challenge/ {" in rendered
+        assert "location ^~ /.well-known/ {" in rendered
+    else:
+        guard = (
+            "        RewriteCond %{REQUEST_URI} !^/\\.well-known/\n"
+            "        RewriteRule (^|/)\\. - [F]\n"
+        )
+        # The exclusion must be the condition immediately above the deny
+        # rule, or mod_rewrite would apply it unconditionally.
+        assert guard in rendered
+
+
 def test_www_alias_reaches_both_templates(
     managers: dict[str, WebServerManager],
 ) -> None:

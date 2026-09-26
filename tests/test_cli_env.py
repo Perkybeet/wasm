@@ -27,6 +27,7 @@ import pytest
 from click.testing import CliRunner
 
 from wasm.cli import app as app_module
+from wasm.cli.app import main
 from wasm.cli.commands import env as env_module
 from wasm.core.config import REDACTED
 from wasm.core.exceptions import EnvConfigError
@@ -36,6 +37,7 @@ from wasm.core.runner import FakeRunner
 from wasm.core.store import App, WASMStore
 from wasm.deployers.helpers import app_env as app_env_module
 from wasm.deployers.helpers.env_manager import EnvManager, EnvVariable
+from wasm.validators.environment import EnvironmentValidationError
 
 #: Flags the root group owns. A subcommand that declares one of them again is
 #: the shadowing defect the Click migration exists to remove.
@@ -348,6 +350,163 @@ def test_configure_writes_an_owner_only_env_file(
     env_file = deployed / ".env"
     assert env_file.read_text(encoding="utf-8") == "API_KEY=ak_live_9f3c\n"
     assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("name", ["PORT", "NODE_ENV"])
+def test_configure_refuses_to_write_a_variable_wasm_manages(
+    deployed: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """
+    Units now load the env file with ``EnvironmentFile=``, which overrides the
+    unit's own ``Environment=``. Writing PORT or NODE_ENV here would silently
+    move the application off the port systemd and nginx expect, so the write
+    is refused rather than accepted and forgotten.
+    """
+    monkeypatch.setattr(EnvManager, "discover", lambda self, path: [EnvVariable(name=name)])
+    monkeypatch.setattr(
+        EnvManager,
+        "prompt_variables",
+        lambda self, variables, existing: {name: "9999" if name == "PORT" else "development"},
+    )
+
+    with pytest.raises(EnvironmentValidationError) as excinfo:
+        env_module._env_configure("example.com", verbose=False)
+
+    assert name in excinfo.value.message
+    assert not (deployed / ".env").exists()
+
+
+def test_an_unchanged_managed_var_already_on_disk_passes_through(
+    deployed: Path, store: WASMStore
+) -> None:
+    """
+    A 1.x application, or one whose .env.example declared PORT, can already
+    have PORT sitting in its .env. Refusing every future edit over a setting
+    nobody is trying to change would make that application's environment
+    permanently uneditable, so only adding or changing the value is refused;
+    the value already on disk, carried through unchanged, passes.
+    """
+    (deployed / ".env").write_text("PORT=3000\nAPI_KEY=old\n", encoding="utf-8")
+    app = app_env_module.find_app("example.com")
+    assert app is not None
+
+    written = app_env_module.write_app_env(app, {"PORT": "3000", "API_KEY": "new"})
+
+    assert app_env_module.EnvManager().read_env_file(written) == {
+        "PORT": "3000",
+        "API_KEY": "new",
+    }
+
+
+def test_changing_a_managed_var_already_on_disk_is_still_refused(
+    deployed: Path, store: WASMStore
+) -> None:
+    """The pass-through is for the unchanged value only, not a licence to edit it."""
+    (deployed / ".env").write_text("PORT=3000\nAPI_KEY=old\n", encoding="utf-8")
+    app = app_env_module.find_app("example.com")
+    assert app is not None
+
+    with pytest.raises(EnvironmentValidationError):
+        app_env_module.write_app_env(app, {"PORT": "9999", "API_KEY": "old"})
+
+    assert (deployed / ".env").read_text(encoding="utf-8") == "PORT=3000\nAPI_KEY=old\n"
+
+
+def test_write_app_env_refuses_an_unsafe_name_directly(deployed: Path, store: WASMStore) -> None:
+    """
+    validate_environment now runs inside write_app_env itself, the one
+    chokepoint every writer - CLI, API, and any future caller - goes
+    through, rather than each caller having to remember its own check.
+    """
+    app = app_env_module.find_app("example.com")
+    assert app is not None
+
+    with pytest.raises(EnvironmentValidationError):
+        app_env_module.write_app_env(app, {"BAD NAME": "x"})
+
+    assert not (deployed / ".env").exists()
+
+
+def test_write_app_env_refuses_a_newline_in_a_value(deployed: Path, store: WASMStore) -> None:
+    """
+    The env file is read line by line by systemd (EnvironmentFile=) and by
+    EnvManager alike, so a newline in a value must never reach it: it would
+    inject a second variable nobody asked for.
+    """
+    app = app_env_module.find_app("example.com")
+    assert app is not None
+
+    with pytest.raises(EnvironmentValidationError):
+        app_env_module.write_app_env(app, {"EVIL": "a\nEVIL2=1"})
+
+    assert not (deployed / ".env").exists()
+
+
+def test_write_app_env_round_trips_a_value_with_special_characters(
+    deployed: Path, store: WASMStore
+) -> None:
+    """A value safe to write must come back exactly as given, quoting included."""
+    app = app_env_module.find_app("example.com")
+    assert app is not None
+
+    written = app_env_module.write_app_env(app, {"PASSWORD": "pa\\ss w'ord"})
+
+    assert app_env_module.EnvManager().read_env_file(written) == {"PASSWORD": "pa\\ss w'ord"}
+
+
+def test_configure_refusal_names_the_real_command_to_change_the_port(
+    deployed: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The error must point at how a port is actually changed, not just refuse."""
+    monkeypatch.setattr(EnvManager, "discover", lambda self, path: [EnvVariable(name="PORT")])
+    monkeypatch.setattr(
+        EnvManager, "prompt_variables", lambda self, variables, existing: {"PORT": "9999"}
+    )
+
+    with pytest.raises(EnvironmentValidationError) as excinfo:
+        env_module._env_configure("example.com", verbose=False)
+
+    assert "wasm create" in excinfo.value.details
+    assert "--port" in excinfo.value.details
+
+
+def test_configure_refusal_leaves_other_variables_unwritten_too(
+    deployed: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The write is one file, all or nothing: a refused key must not lose the rest."""
+    (deployed / ".env").write_text("API_KEY=old\n", encoding="utf-8")
+    monkeypatch.setattr(
+        EnvManager,
+        "discover",
+        lambda self, path: [EnvVariable(name="API_KEY"), EnvVariable(name="PORT")],
+    )
+    monkeypatch.setattr(
+        EnvManager,
+        "prompt_variables",
+        lambda self, variables, existing: {"API_KEY": "new", "PORT": "9999"},
+    )
+
+    with pytest.raises(EnvironmentValidationError):
+        env_module._env_configure("example.com", verbose=False)
+
+    assert (deployed / ".env").read_text(encoding="utf-8") == "API_KEY=old\n"
+
+
+def test_env_command_reports_the_refusal_and_the_fix(
+    monkeypatch: pytest.MonkeyPatch, deployed: Path
+) -> None:
+    """End to end through the real CLI boundary: exit 1, message and hint both shown."""
+    lines: list[str] = []
+    monkeypatch.setattr(Logger, "_write", lambda self, message, newline=True: lines.append(message))
+    monkeypatch.setattr(EnvManager, "discover", lambda self, path: [EnvVariable(name="PORT")])
+    monkeypatch.setattr(
+        EnvManager, "prompt_variables", lambda self, variables, existing: {"PORT": "9999"}
+    )
+
+    assert main(["env", "configure", "example.com"]) == 1
+
+    assert any("PORT" in line for line in lines)
+    assert any("wasm create" in line for line in lines)
 
 
 def test_configure_stops_when_the_project_declares_nothing(

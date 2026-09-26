@@ -390,8 +390,15 @@ def _validate_known_values_in(tree: dict[str, Any]) -> None:
 # Both Config.get and Config.set resolve an alias to its canonical key before
 # doing anything else, so there is exactly one setting on disk and every
 # reader agrees on it, whichever spelling wrote it.
+#
+# "logging.directory" is the same defect in miniature: obs/wasm.default.yaml
+# shipped it while DEFAULT_CONFIG named the setting "logging.file", so a
+# packaged install and the code disagreed about which key held the log
+# location. A config.yaml written by that packaging keeps loading - and
+# keeps meaning what it said - because it resolves here too.
 KEY_ALIASES: dict[str, str] = {
     "apps.directory": "apps_directory",
+    "logging.directory": "logging.file",
 }
 
 
@@ -422,7 +429,10 @@ def _fold_aliases(tree: dict[str, Any]) -> dict[str, Any]:
 
     A canonical key already present in the tree wins over the alias, the same
     precedence a caller setting both in one request should expect from the
-    more specific, current spelling.
+    more specific, current spelling. The canonical key itself may be nested
+    (``"logging.directory"`` folds into ``"logging.file"``, not just into a
+    flat top-level key), the same shape :meth:`Config.get` and
+    :meth:`Config.set` already navigate.
 
     Args:
         tree: Configuration about to be stored. Not modified.
@@ -446,8 +456,15 @@ def _fold_aliases(tree: dict[str, Any]) -> dict[str, Any]:
             continue
 
         value = node.pop(leaf)
-        if canonical not in resolved:
-            resolved[canonical] = value
+
+        *canonical_parents, canonical_leaf = canonical.split(".")
+        target = resolved
+        for part in canonical_parents:
+            if not isinstance(target.get(part), dict):
+                target[part] = {}
+            target = target[part]
+        if canonical_leaf not in target:
+            target[canonical_leaf] = value
 
         # An alias container left empty by the pop is not a setting either;
         # leaving it behind would still be a second, if empty, place the

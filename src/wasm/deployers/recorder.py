@@ -23,20 +23,25 @@ Two guarantees shape everything here:
   before it is printed unless ``--verbose`` was given. :class:`CapturingLogger`
   therefore mirrors the suppressed detail to the recording sink as well, so the
   file always holds what the operator will need after a failure.
+- **What is recorded carries no secret.** The build runs with the
+  application's environment, and the log and the error text are readable with
+  the panel's ``read`` scope. Every line and the error pass through a
+  :class:`~wasm.core.redact.Scrubber` on their way to disk and to the store.
 """
 
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol, TextIO
+from typing import Any, Protocol, TextIO
 
 from wasm.core.exceptions import WASMError
 from wasm.core.fs import DryRunFileSystem, FileSystem, get_fs
 from wasm.core.logger import Icons, Logger
+from wasm.core.redact import Scrubber, app_secret_values, scrubber_for, secret_env_values
 from wasm.core.store import DeploymentStatus, WASMStore
 
 #: How many history rows, and their log files, survive per domain.
@@ -49,6 +54,9 @@ LOG_FILE_MODE = 0o640
 
 #: Answers ``(git_commit, git_branch)`` for the deployed tree, or Nones.
 GitInfo = Callable[[], tuple[str | None, str | None]]
+
+#: Answers the environment the deployment's commands currently run with.
+EnvSource = Callable[[], Mapping[str, Any] | None]
 
 #: What the recorder treats as "the history could not be written": the store's
 #: own errors, the SQLite errors underneath it, and filesystem trouble around
@@ -194,6 +202,7 @@ class DeploymentRecorder:
         job_id: str | None = None,
         log_root: Path | None = None,
         keep: int = DEFAULT_KEEP,
+        env: EnvSource | None = None,
     ) -> None:
         """
         Initialize the recorder for one deployment attempt.
@@ -224,6 +233,12 @@ class DeploymentRecorder:
                 on a system install and inside ``tmp_path`` in a test, without
                 either having to say so.
             keep: How many history rows and log files survive per domain.
+            env: Optional callable answering the environment the deployment's
+                commands run with, asked again before every captured line:
+                a fresh deploy replaces it mid-pipeline with what it generated
+                from ``.env.example``, and the build that follows prints from
+                the new one. The application's stored ``.env`` and WASM's own
+                credentials are scrubbed whether or not this is given.
         """
         self._store = store
         self._domain = domain
@@ -241,6 +256,9 @@ class DeploymentRecorder:
         self._handle: TextIO | None = None
         self._captured: list[CapturingLogger] = []
         self._finished = False
+        self._env_source = env
+        self._scrubbed_env: Mapping[str, Any] | None = None
+        self._scrubber = Scrubber()
 
     @property
     def deployment_id(self) -> int | None:
@@ -259,6 +277,7 @@ class DeploymentRecorder:
             self._logger.debug("Rehearsal: deployment history is not recorded")
             return
 
+        self._scrubber = scrubber_for(self._domain)
         try:
             deployment_id = self._store.record_deployment_start(
                 self._domain, self._trigger, git_branch=git_branch, job_id=self._job_id
@@ -331,11 +350,14 @@ class DeploymentRecorder:
         Close the recording with a ``failed`` outcome and rotate.
 
         Args:
-            error: What the failing step raised. Stored verbatim - for a
-                :class:`~wasm.core.exceptions.WASMError` that includes its
-                details, which carry the build tool's own output.
+            error: What the failing step raised. Stored verbatim but for its
+                secrets - for a :class:`~wasm.core.exceptions.WASMError` that
+                includes its details, which carry the build tool's own output.
         """
-        self._finish(DeploymentStatus.FAILED.value, str(error))
+        # A fresh deploy wrote its .env during the run; read it again so a
+        # value generated there is known before the error is stored.
+        self._scrubber.add(app_secret_values(self._domain))
+        self._finish(DeploymentStatus.FAILED.value, self._scrub(str(error)))
 
     # Internals -------------------------------------------------------------
 
@@ -362,9 +384,28 @@ class DeploymentRecorder:
         self._handle = path.open("a", encoding="utf-8")
         self._store.annotate_deployment(deployment_id, log_path=str(path))
 
+    def _scrub(self, text: str) -> str:
+        """
+        Remove every secret this recording knows of from a piece of text.
+
+        Args:
+            text: A log line or the failure text.
+
+        Returns:
+            The text with each secret value replaced.
+        """
+        current = self._env_source() if self._env_source is not None else None
+        # Identity, not equality: the pipeline replaces the mapping when it
+        # changes it, and classifying every variable again for each of the
+        # thousands of lines an npm install prints would be the slow part.
+        if current is not None and current is not self._scrubbed_env:
+            self._scrubber.add(secret_env_values(current))
+            self._scrubbed_env = current
+        return self._scrubber.scrub(text)
+
     def _write_line(self, line: str) -> None:
         """
-        Append one timestamped line to the captured log.
+        Append one timestamped, scrubbed line to the captured log.
 
         Args:
             line: The line, colour codes already stripped.
@@ -372,6 +413,7 @@ class DeploymentRecorder:
         if self._handle is None:
             return
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = self._scrub(line)
         try:
             # A rendered table or rule arrives as one multi-line message;
             # every line of the file gets its own timestamp regardless.
@@ -600,7 +642,8 @@ def recorder_for(
 
     Returns:
         A recorder wired to the deployer's store, logger, filesystem and the
-        job that started it, if any.
+        job that started it, if any, scrubbing the environment the deployer's
+        commands run with.
     """
     return DeploymentRecorder(
         deployer.store,
@@ -612,6 +655,9 @@ def recorder_for(
         commit_message=commit_message,
         release_id=release_id,
         job_id=deployer.job_id,
+        # getattr: env_vars is what every real deployer passes its commands,
+        # but a duck-typed test double is Recordable without it.
+        env=lambda: getattr(deployer, "env_vars", None),
     )
 
 

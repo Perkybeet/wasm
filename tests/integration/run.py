@@ -24,6 +24,7 @@ filesystem bind-mounted. run.py wires all of that itself.
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import re
 import secrets
@@ -62,6 +63,36 @@ RELEASE_ROOT = "/var/www/apps/rel-test"
 #: The store, wherever this install put it: the system location when
 #: /var/lib/wasm exists, root's own otherwise.
 WASM_DB = "$(ls /var/lib/wasm/wasm.db /root/.local/share/wasm/wasm.db 2>/dev/null | head -1)"
+
+#: The released version the upgrade rehearsal (--upgrade) starts from. This is
+#: the most important pre-release scenario for 2.0: a real 1.x server, with
+#: real applications, upgraded in place with nothing but `pip install` over
+#: the same venv, exactly as docs/UPGRADING-2.0.md describes.
+UPGRADE_FROM_VERSION = "1.6.5"
+
+UPGRADE_NODE_DOMAIN = "upg-node.test"
+UPGRADE_NODE_APP = "upg-node-test"
+UPGRADE_NODE_ROOT = f"/var/www/apps/{UPGRADE_NODE_APP}"
+
+UPGRADE_STATIC_DOMAIN = "upg-static.test"
+UPGRADE_STATIC_APP = "upg-static-test"
+UPGRADE_STATIC_ROOT = f"/var/www/apps/{UPGRADE_STATIC_APP}"
+
+UPGRADE_COMPOSE_DOMAIN = "upg-compose.test"
+UPGRADE_COMPOSE_APP = "upg-compose-test"
+UPGRADE_COMPOSE_ROOT = f"/var/www/apps/{UPGRADE_COMPOSE_APP}"
+
+#: The query behind :func:`_store_apps_snapshot`: columns that exist in both
+#: the 1.6.5 (schema v3) and 2.0 (schema v8) apps table, in a stable order, so
+#: the row for each application can be compared byte-for-byte across the
+#: upgrade. `layout` and the other v5+ columns are checked separately, since
+#: 1.6.5 does not have them. A plain literal - not built with an f-string -
+#: like every other query in this file, so ruff's hardcoded-sql check (S608,
+#: which cannot tell a literal from an injection) has nothing to flag.
+APPS_SNAPSHOT_QUERY = (
+    "SELECT domain, app_type, source, branch, port, webserver, ssl_enabled, status, "
+    "is_static, created_at, deployed_at FROM apps ORDER BY domain"
+)
 
 
 class HarnessError(RuntimeError):
@@ -265,6 +296,65 @@ def install_fixtures(name: str) -> None:
     print(f"[setup] {RELEASE_REPO} is served at {RELEASE_URL}")
 
 
+def install_wasm_from_pypi(name: str, version: str) -> None:
+    """Install a released version of WASM from PyPI: the upgrade rehearsal's starting point.
+
+    Mirrors :func:`install_wasm`, but pulls the package straight from the
+    index instead of copying in a locally built wheel, because the point of
+    ``--upgrade`` is to start from what an operator actually has installed
+    today.
+
+    Args:
+        name: Container name.
+        version: The exact ``wasm-cli`` version to install, e.g. "1.6.5".
+    """
+    print(f"[setup] creating /opt/wasm venv and installing wasm-cli=={version} from PyPI")
+    docker_exec(name, "python3 -m venv /opt/wasm", timeout=60)
+    docker_exec(name, "/opt/wasm/bin/pip install --quiet --upgrade pip", timeout=120)
+    docker_exec(
+        name,
+        f"/opt/wasm/bin/pip install --quiet 'wasm-cli[all]=={version}'",
+        timeout=PIP_INSTALL_TIMEOUT,
+    )
+    docker_exec(name, "ln -sf /opt/wasm/bin/wasm /usr/local/bin/wasm", timeout=15)
+    result = docker_exec(name, "wasm --version", timeout=30)
+    print(f"[setup] installed {result.stdout.strip()}")
+
+
+def upgrade_wasm_to_wheel(name: str, wheel: Path) -> None:
+    """Upgrade the venv in place to the locally built wheel, the way an operator would.
+
+    On a real release the wheel's version is newer than what PyPI serves and
+    a plain ``pip install --upgrade 'wasm-cli[all]'`` replaces it. This
+    working tree's ``pyproject.toml`` has not been bumped past
+    :data:`UPGRADE_FROM_VERSION` yet (see the final report), so the wheel
+    built from it can carry the *same* version number as the PyPI release
+    already installed; a bare ``pip install`` of a same-version local file is
+    a no-op ("Requirement already satisfied"), which would leave the old
+    package in place and silently turn this whole rehearsal into a no-op too.
+    ``--force-reinstall`` makes the replacement happen regardless of what the
+    version string says, which is what actually matters here: whether the
+    new code runs correctly over data the old code created.
+    ``--no-deps`` is safe because the two versions declare the exact same
+    ``[all]`` dependencies (checked against 1.6.5's METADATA before writing
+    this), so nothing new needs fetching; without it every upgrade run would
+    re-resolve and reinstall fastapi/uvicorn/etc. for no reason.
+
+    Args:
+        name: Container name.
+        wheel: Path to the wheel built from the working tree, on the host.
+    """
+    print(f"[setup] copying {wheel.name} into the container for the upgrade")
+    sh(["docker", "cp", str(wheel), f"{name}:/tmp/{wheel.name}"], timeout=60)
+    docker_exec(
+        name,
+        f"/opt/wasm/bin/pip install --quiet --force-reinstall --no-deps '/tmp/{wheel.name}[all]'",
+        timeout=PIP_INSTALL_TIMEOUT,
+    )
+    result = docker_exec(name, "wasm --version", timeout=30)
+    print(f"[setup] upgraded to {result.stdout.strip()}")
+
+
 def remove_container(name: str) -> None:
     """Best-effort container teardown; never raises."""
     subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True, timeout=60)
@@ -353,6 +443,40 @@ def scenario_static_site(sc: Scenario) -> None:
     sc.check(
         code == "200" and int(size or "0") > 0,
         f"image fetch failed or was empty: {image.stdout!r}",
+    )
+
+    # Planted in the served tree so this proves nginx itself refuses them, not just
+    # that nothing happens to be there. Written here rather than shipped in the fixture
+    # because git cannot track a file inside a directory named .git.
+    sc.run(
+        "root=$(readlink -e /var/www/apps/static-test/current || echo /var/www/apps/static-test) && "
+        'echo SECRET=integration > "$root/.env" && '
+        'mkdir -p "$root/.git" && echo \'[core]\' > "$root/.git/config"',
+        timeout=30,
+        label="plant .env and .git/config in the served tree",
+    )
+    for path in ("/.env", "/.git/config"):
+        hidden = sc.run(
+            f"curl -sS -o /dev/null -w '%{{http_code}}' -H 'Host: static.test' "
+            f"http://127.0.0.1{path}",
+            timeout=30,
+            label=f"curl -H 'Host: static.test' http://127.0.0.1{path}",
+        )
+        sc.check(
+            hidden.stdout.strip() in ("403", "404"),
+            f"{path} must answer 403 or 404, got {hidden.stdout.strip()!r}",
+        )
+
+    challenge = sc.run(
+        "mkdir -p /var/www/html/.well-known/acme-challenge && "
+        "echo wasm-integration-token > /var/www/html/.well-known/acme-challenge/probe && "
+        "curl -sS -H 'Host: static.test' http://127.0.0.1/.well-known/acme-challenge/probe",
+        timeout=30,
+        label="curl -H 'Host: static.test' http://127.0.0.1/.well-known/acme-challenge/probe",
+    )
+    sc.check(
+        "wasm-integration-token" in challenge.stdout,
+        f"ACME's own well-known path must stay reachable: {challenge.stdout!r}",
     )
 
 
@@ -1249,6 +1373,585 @@ def scenario_domains(sc: Scenario) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Upgrade rehearsal: 1.6.5 -> 2.0 (--upgrade mode; not part of the default suite)
+# ---------------------------------------------------------------------------
+#
+# This is the most important pre-release scenario for 2.0: a real 1.6.5
+# server, with real applications, upgraded in place. It needs a different
+# setup sequence to every scenario above (install the released package
+# first, upgrade to the working tree's wheel second), so it runs in its own
+# container through `run.py --upgrade` instead of being one more entry in
+# SCENARIOS: a plain `run.py` invocation, and CI, keep running exactly the
+# scenarios they always have.
+
+
+@dataclass
+class UpgradeApp:
+    """One application the upgrade rehearsal deploys with 1.6.5 and re-checks after 2.0."""
+
+    label: str
+    domain: str
+    app_name: str
+    root: str
+    #: Static sites have no process and therefore no systemd unit
+    #: (deployers/static.py: create_service "No service needed").
+    has_unit: bool = True
+
+    @property
+    def unit(self) -> str:
+        return self.app_name
+
+
+def _app_tree_checksums(sc: Scenario, root: str, label: str) -> str:
+    """Sorted sha256sum of every regular file under root, node_modules and .git excluded."""
+    return sc.run(
+        f"find {root} -type f -not -path '*/node_modules/*' -not -path '*/node_modules' "
+        "-not -path '*/.git/*' -not -path '*/.git' "
+        "-print0 | sort -z | xargs -0 sha256sum",
+        timeout=60,
+        label=label,
+    ).stdout
+
+
+def _app_tree_ownership(sc: Scenario, root: str, label: str) -> str:
+    """user:group:mode for every entry under root, node_modules and .git excluded."""
+    return sc.run(
+        f"find {root} -not -path '*/node_modules/*' -not -path '*/node_modules' "
+        "-not -path '*/.git/*' -not -path '*/.git' "
+        "-printf '%u:%g:%m %P\\n' | sort",
+        timeout=30,
+        label=label,
+    ).stdout
+
+
+def _unified_diff(before: str, after: str, label: str) -> str:
+    """A unified diff between two snapshots, or an explicit statement that there is none."""
+    diff = "".join(
+        difflib.unified_diff(
+            before.splitlines(keepends=True),
+            after.splitlines(keepends=True),
+            fromfile=f"1.6.5/{label}",
+            tofile=f"2.0/{label}",
+        )
+    )
+    return diff if diff else f"(no differences: {label})"
+
+
+def _snapshot_app(sc: Scenario, app: UpgradeApp, when: str) -> dict[str, str]:
+    """Capture the nginx site, the unit (if any), ownership and checksums of one app."""
+    nginx = sc.run(
+        f"cat /etc/nginx/sites-available/{app.domain}",
+        timeout=15,
+        label=f"[{when}] cat /etc/nginx/sites-available/{app.domain}",
+    ).stdout
+    unit = ""
+    if app.has_unit:
+        unit = sc.run(
+            f"systemctl cat {app.unit}",
+            timeout=15,
+            label=f"[{when}] systemctl cat {app.unit}",
+        ).stdout
+    ownership = _app_tree_ownership(sc, app.root, f"[{when}] ownership of {app.root}")
+    checksums = _app_tree_checksums(
+        sc, app.root, f"[{when}] sha256sum of {app.root} (node_modules excluded)"
+    )
+    return {"nginx": nginx, "unit": unit, "ownership": ownership, "checksums": checksums}
+
+
+def _store_apps_snapshot(sc: Scenario, label: str) -> str:
+    """A dump of every app row's columns shared by schema v3 (1.6.5) and v8 (2.0)."""
+    return sc.run(store_query(APPS_SNAPSHOT_QUERY), timeout=15, label=label).stdout
+
+
+def run_upgrade_rehearsal(sc: Scenario, wheel: Path) -> None:
+    """Deploy with 1.6.5, upgrade to the local 2.0 wheel in place, and check every promise.
+
+    Deploys a Node app with an uploads directory and an in-place ``.env``, a
+    static site served on the apex and ``www``, and - only when Docker is
+    reachable inside the container - a Docker Compose app, all with the
+    released 1.6.5 CLI. Snapshots nginx, the unit, ownership and a checksum
+    of each application's tree, and the store. Upgrades the very same venv to
+    the wheel built from this working tree, exactly as ``pip install
+    --upgrade`` would on a real server. Then checks, with real commands
+    against real nginx, real systemd and the real store: nothing was
+    converted implicitly, every application still serves, its tree and
+    configuration are byte-identical unless the change is one
+    docs/UPGRADING-2.0.md documents, and the store migrated without losing a
+    row. Finally it exercises what 2.0 adds for a 1.x application - `wasm
+    update` still works in place, and `wasm app migrate` moves it onto the
+    release layout keeping its uploads - and starts the console for the
+    first time on this "upgraded" server.
+
+    Args:
+        sc: Scenario the rehearsal runs its commands and checks through.
+        wheel: Path to the wheel built from the working tree, on the host.
+    """
+    container = sc.container
+
+    apps = [
+        UpgradeApp("node", UPGRADE_NODE_DOMAIN, UPGRADE_NODE_APP, UPGRADE_NODE_ROOT),
+        UpgradeApp(
+            "static", UPGRADE_STATIC_DOMAIN, UPGRADE_STATIC_APP, UPGRADE_STATIC_ROOT, has_unit=False
+        ),
+    ]
+
+    # --- Deploy every application with the released 1.6.5 CLI --------------
+
+    sc.run(
+        f"wasm create -d {UPGRADE_NODE_DOMAIN} -s /root/fixtures/node-app -t nodejs --no-ssl",
+        timeout=DEPLOY_TIMEOUT,
+        label=f"[1.6.5] wasm create -d {UPGRADE_NODE_DOMAIN} -s /root/fixtures/node-app "
+        "-t nodejs --no-ssl",
+    )
+    page = sc.run(
+        f"curl -sS -H 'Host: {UPGRADE_NODE_DOMAIN}' http://127.0.0.1/",
+        timeout=30,
+        label=f"[1.6.5] curl -H 'Host: {UPGRADE_NODE_DOMAIN}' http://127.0.0.1/",
+    )
+    sc.check(page.stdout.strip() == "ok 1", f"expected 'ok 1', got {page.stdout!r}")
+    sc.check(
+        sc.run(
+            f"test -f {UPGRADE_NODE_ROOT}/.env && echo present",
+            timeout=15,
+            check=False,
+            label=f"[1.6.5] test -f {UPGRADE_NODE_ROOT}/.env",
+        ).stdout.strip()
+        == "present",
+        ".env was not created from .env.example on deploy",
+    )
+    upload = sc.run(
+        f"curl -sS -H 'Host: {UPGRADE_NODE_DOMAIN}' --data-binary 'pre-upgrade-upload' "
+        "http://127.0.0.1/upload",
+        timeout=30,
+        label=f"[1.6.5] curl -H 'Host: {UPGRADE_NODE_DOMAIN}' --data-binary ... http://127.0.0.1/upload",
+    )
+    sc.check("uploaded" in upload.stdout, f"upload did not succeed: {upload.stdout!r}")
+
+    sc.run(
+        f"wasm create -d {UPGRADE_STATIC_DOMAIN} -s /root/fixtures/static-site -t static "
+        "--no-ssl --www",
+        timeout=DEPLOY_TIMEOUT,
+        label=f"[1.6.5] wasm create -d {UPGRADE_STATIC_DOMAIN} -s /root/fixtures/static-site "
+        "-t static --no-ssl --www",
+    )
+    apex = sc.run(
+        f"curl -sS -H 'Host: {UPGRADE_STATIC_DOMAIN}' http://127.0.0.1/",
+        timeout=30,
+        label=f"[1.6.5] curl -H 'Host: {UPGRADE_STATIC_DOMAIN}' http://127.0.0.1/",
+    )
+    sc.check(
+        "WASM Integration Static Fixture" in apex.stdout,
+        f"the apex did not serve the fixture: {apex.stdout!r}",
+    )
+    www = sc.run(
+        f"curl -sS -H 'Host: www.{UPGRADE_STATIC_DOMAIN}' http://127.0.0.1/",
+        timeout=30,
+        label=f"[1.6.5] curl -H 'Host: www.{UPGRADE_STATIC_DOMAIN}' http://127.0.0.1/",
+    )
+    sc.check(
+        "WASM Integration Static Fixture" in www.stdout,
+        f"--www did not also serve the fixture on 1.6.5: {www.stdout!r}",
+    )
+
+    docker_probe = sc.run(
+        "command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 "
+        "&& echo available || echo unavailable",
+        timeout=30,
+        check=False,
+        label="check whether Docker is reachable inside the container",
+    )
+    docker_available = docker_probe.stdout.strip() == "available"
+    if docker_available:
+        sc.run(
+            "mkdir -p /root/fixtures/compose-app/html && "
+            "cat > /root/fixtures/compose-app/docker-compose.yml <<'EOF'\n"
+            "services:\n"
+            "  web:\n"
+            "    image: nginx:alpine\n"
+            "    ports:\n"
+            '      - "18090:80"\n'
+            "    volumes:\n"
+            "      - ./html:/usr/share/nginx/html:ro\n"
+            "EOF\n"
+            "printf '<h1>compose-ok</h1>' > /root/fixtures/compose-app/html/index.html",
+            timeout=30,
+            label="write the docker-compose fixture (Docker is available)",
+        )
+        sc.run(
+            f"wasm create -d {UPGRADE_COMPOSE_DOMAIN} -s /root/fixtures/compose-app "
+            "-t docker-compose --no-ssl",
+            timeout=DEPLOY_TIMEOUT,
+            label=f"[1.6.5] wasm create -d {UPGRADE_COMPOSE_DOMAIN} -s /root/fixtures/compose-app "
+            "-t docker-compose --no-ssl",
+        )
+        compose_page = sc.run(
+            f"curl -sS -H 'Host: {UPGRADE_COMPOSE_DOMAIN}' http://127.0.0.1/",
+            timeout=30,
+            label=f"[1.6.5] curl -H 'Host: {UPGRADE_COMPOSE_DOMAIN}' http://127.0.0.1/",
+        )
+        sc.check(
+            "compose-ok" in compose_page.stdout,
+            f"the docker-compose app did not serve: {compose_page.stdout!r}",
+        )
+        apps.append(
+            UpgradeApp(
+                "docker-compose", UPGRADE_COMPOSE_DOMAIN, UPGRADE_COMPOSE_APP, UPGRADE_COMPOSE_ROOT
+            )
+        )
+    else:
+        sc.evidence.append(
+            "NOTE: Docker is not reachable inside the integration container "
+            "(tests/integration/Dockerfile.systemd does not install it), so the "
+            "docker-compose leg of the upgrade rehearsal is SKIPPED, as instructed. "
+            "The deploy, checksum, ownership, nginx/unit diff, `wasm status` and "
+            "serving checks below run for the Node and static-site applications only."
+        )
+
+    # --- Snapshot everything before touching the package --------------------
+
+    before_snapshots = {app.label: _snapshot_app(sc, app, "1.6.5") for app in apps}
+    before_apps_rows = _store_apps_snapshot(sc, "[1.6.5] SELECT every app row's shared columns")
+    sc.run(
+        f"sha256sum {WASM_DB}",
+        timeout=15,
+        label="[1.6.5] sha256sum of the store (recorded as evidence; the migration below "
+        "rewrites the file, so this is not compared against the post-upgrade checksum)",
+    )
+
+    # --- Upgrade -------------------------------------------------------------
+
+    upgrade_wasm_to_wheel(container, wheel)
+    version_after = sc.run("wasm --version", timeout=30, label="[2.0] wasm --version").stdout
+
+    listing = sc.run("wasm list", timeout=30, label="[2.0] wasm list")
+    for app in apps:
+        sc.check(
+            app.domain in listing.stdout,
+            f"wasm list does not mention {app.domain}: {listing.stdout!r}",
+        )
+
+    health = sc.run("wasm health", timeout=60, check=False, label="[2.0] wasm health")
+    sc.check(
+        health.returncode == 0,
+        f"wasm health reported issues after the upgrade:\n{health.stdout}\n{health.stderr}",
+    )
+
+    for app in apps:
+        status = sc.run(
+            f"wasm status {app.domain}", timeout=30, label=f"[2.0] wasm status {app.domain}"
+        )
+        sc.check(status.returncode == 0, f"wasm status {app.domain} failed after the upgrade")
+
+    # --- Every application still serves, unchanged ---------------------------
+
+    page = sc.run(
+        f"curl -sS -H 'Host: {UPGRADE_NODE_DOMAIN}' http://127.0.0.1/",
+        timeout=30,
+        label=f"[2.0] curl -H 'Host: {UPGRADE_NODE_DOMAIN}' http://127.0.0.1/",
+    )
+    sc.check(
+        page.stdout.strip() == "ok 1",
+        f"the node app stopped serving after the upgrade: {page.stdout!r}",
+    )
+    apex = sc.run(
+        f"curl -sS -H 'Host: {UPGRADE_STATIC_DOMAIN}' http://127.0.0.1/",
+        timeout=30,
+        label=f"[2.0] curl -H 'Host: {UPGRADE_STATIC_DOMAIN}' http://127.0.0.1/",
+    )
+    sc.check(
+        "WASM Integration Static Fixture" in apex.stdout,
+        f"the apex stopped serving after the upgrade: {apex.stdout!r}",
+    )
+    www = sc.run(
+        f"curl -sS -H 'Host: www.{UPGRADE_STATIC_DOMAIN}' http://127.0.0.1/",
+        timeout=30,
+        label=f"[2.0] curl -H 'Host: www.{UPGRADE_STATIC_DOMAIN}' http://127.0.0.1/",
+    )
+    sc.check(
+        "WASM Integration Static Fixture" in www.stdout,
+        f"www stopped serving after the upgrade: {www.stdout!r}",
+    )
+    if docker_available:
+        compose_page = sc.run(
+            f"curl -sS -H 'Host: {UPGRADE_COMPOSE_DOMAIN}' http://127.0.0.1/",
+            timeout=30,
+            label=f"[2.0] curl -H 'Host: {UPGRADE_COMPOSE_DOMAIN}' http://127.0.0.1/",
+        )
+        sc.check(
+            "compose-ok" in compose_page.stdout,
+            f"the docker-compose app stopped serving after the upgrade: {compose_page.stdout!r}",
+        )
+
+    # --- nginx, units and app trees: unchanged, or print the diff verbatim ---
+
+    after_snapshots = {app.label: _snapshot_app(sc, app, "2.0") for app in apps}
+    for app in apps:
+        before = before_snapshots[app.label]
+        after = after_snapshots[app.label]
+        for key in ("nginx", "unit", "ownership", "checksums"):
+            if key == "unit" and not app.has_unit:
+                continue
+            diff = _unified_diff(before[key], after[key], f"{app.label}/{key}")
+            sc.evidence.append(f"$ diff {app.label}/{key} (1.6.5 vs 2.0)\n{diff}")
+            sc.check(
+                not diff.startswith("---"),
+                f"{app.label}'s {key} changed across the upgrade, and that is not one of the "
+                f"changes docs/UPGRADING-2.0.md documents:\n{diff}",
+            )
+
+    # --- The store migrated: schema version, rows intact, layout=inplace ----
+
+    schema = sc.run(
+        store_query("SELECT MAX(version) FROM schema_version"),
+        timeout=15,
+        label="[2.0] SELECT MAX(version) FROM schema_version",
+    )
+    sc.check(
+        schema.stdout.strip() == "8", f"the store did not migrate to schema v8: {schema.stdout!r}"
+    )
+
+    after_apps_rows = _store_apps_snapshot(sc, "[2.0] SELECT every app row's shared columns")
+    sc.check(
+        after_apps_rows == before_apps_rows,
+        "app rows changed across the upgrade in a column common to both schemas:\n"
+        f"before:\n{before_apps_rows}\nafter:\n{after_apps_rows}",
+    )
+
+    layouts = sc.run(
+        store_query("SELECT domain || '=' || layout FROM apps ORDER BY domain"),
+        timeout=15,
+        label="[2.0] SELECT domain, layout FROM apps ORDER BY domain",
+    )
+    for app in apps:
+        sc.check(
+            f"{app.domain}=inplace" in layouts.stdout.split(),
+            f"{app.domain} was not migrated onto layout=inplace: {layouts.stdout!r}",
+        )
+
+    # --- `wasm update` still works in place on a 1.x application -------------
+
+    sc.run(
+        "cd /root/fixtures/node-app && echo 2 > VERSION && "
+        "git add VERSION && git commit -q -m 'bump version to 2 (post-upgrade)'",
+        timeout=30,
+        label="(fixture repo) echo 2 > VERSION; git commit",
+    )
+    sc.run(
+        f"wasm update {UPGRADE_NODE_DOMAIN}",
+        timeout=DEPLOY_TIMEOUT,
+        label=f"[2.0] wasm update {UPGRADE_NODE_DOMAIN}",
+    )
+    page = sc.run(
+        f"curl -sS -H 'Host: {UPGRADE_NODE_DOMAIN}' http://127.0.0.1/",
+        timeout=30,
+        label=f"[2.0] curl -H 'Host: {UPGRADE_NODE_DOMAIN}' http://127.0.0.1/ (after wasm update)",
+    )
+    sc.check(
+        page.stdout.strip() == "ok 2", f"expected 'ok 2' after the update, got {page.stdout!r}"
+    )
+
+    upload_after = sc.run(
+        f"cat {UPGRADE_NODE_ROOT}/uploads/upload.txt",
+        timeout=15,
+        check=False,
+        label=f"cat {UPGRADE_NODE_ROOT}/uploads/upload.txt (after wasm update)",
+    )
+    sc.check(
+        upload_after.returncode == 0 and "pre-upgrade-upload" in upload_after.stdout,
+        "the pre-upgrade upload did not survive `wasm update`",
+    )
+    sc.check(
+        sc.run(
+            f"test -f {UPGRADE_NODE_ROOT}/.env && echo present",
+            timeout=15,
+            check=False,
+            label=f"test -f {UPGRADE_NODE_ROOT}/.env (after wasm update)",
+        ).stdout.strip()
+        == "present",
+        ".env did not survive `wasm update`",
+    )
+    layout_after_update = sc.run(
+        store_query("SELECT layout FROM apps WHERE domain = 'upg-node.test'"),
+        timeout=15,
+        label="[2.0] SELECT layout FROM apps WHERE domain = upg-node.test (after wasm update)",
+    )
+    sc.check(
+        layout_after_update.stdout.strip() == "inplace",
+        f"wasm update moved the in-place app onto releases by itself: {layout_after_update.stdout!r}",
+    )
+
+    # --- `--dry-run app migrate` changes nothing ------------------------------
+
+    before_listing = sc.run(
+        f"ls -A {UPGRADE_NODE_ROOT}",
+        timeout=15,
+        label=f"ls -A {UPGRADE_NODE_ROOT} (before the migration rehearsal)",
+    ).stdout
+    sc.run(
+        f"wasm --dry-run app migrate {UPGRADE_NODE_DOMAIN}",
+        timeout=60,
+        label=f"[2.0] wasm --dry-run app migrate {UPGRADE_NODE_DOMAIN}",
+    )
+    after_listing = sc.run(
+        f"ls -A {UPGRADE_NODE_ROOT}",
+        timeout=15,
+        label=f"ls -A {UPGRADE_NODE_ROOT} (after the migration rehearsal)",
+    ).stdout
+    sc.check(
+        after_listing == before_listing,
+        "the --dry-run migration rehearsal changed the app directory",
+    )
+
+    # --- `app migrate --yes` moves it onto releases, keeping uploads and serving --
+
+    sc.run(
+        f"wasm app migrate {UPGRADE_NODE_DOMAIN} --yes",
+        timeout=DEPLOY_TIMEOUT,
+        label=f"[2.0] wasm app migrate {UPGRADE_NODE_DOMAIN} --yes",
+    )
+    tree = sc.run(
+        f"ls -A {UPGRADE_NODE_ROOT}; readlink {UPGRADE_NODE_ROOT}/current "
+        f"{UPGRADE_NODE_ROOT}/current/uploads {UPGRADE_NODE_ROOT}/current/.env; "
+        f"cat {UPGRADE_NODE_ROOT}/shared/uploads/upload.txt",
+        timeout=15,
+        label="the migrated tree: entries, links and the upload in shared/",
+    )
+    for expected in ("current", "releases", "shared", "../../shared/uploads", "../../shared/.env"):
+        sc.check(
+            expected in tree.stdout.split(),
+            f"{expected} missing after the migration: {tree.stdout!r}",
+        )
+    sc.check("pre-upgrade-upload" in tree.stdout, "the pre-upgrade upload is not in shared/uploads")
+
+    page = sc.run(
+        f"curl -sS -H 'Host: {UPGRADE_NODE_DOMAIN}' http://127.0.0.1/",
+        timeout=30,
+        label=f"[2.0] curl -H 'Host: {UPGRADE_NODE_DOMAIN}' http://127.0.0.1/ (after app migrate)",
+    )
+    sc.check(
+        page.stdout.strip() == "ok 2", f"expected 'ok 2' after the migration, got {page.stdout!r}"
+    )
+
+    layout_after_migrate = sc.run(
+        store_query("SELECT layout FROM apps WHERE domain = 'upg-node.test'"),
+        timeout=15,
+        label="[2.0] SELECT layout FROM apps WHERE domain = upg-node.test (after app migrate --yes)",
+    )
+    sc.check(
+        layout_after_migrate.stdout.strip() == "releases",
+        f"the store still says inplace after app migrate: {layout_after_migrate.stdout!r}",
+    )
+
+    # --- `wasm web start` and the console load --------------------------------
+
+    sc.run("wasm web start --daemon", timeout=60, label="[2.0] wasm web start --daemon")
+    try:
+        health_probe: subprocess.CompletedProcess[str] | None = None
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            health_probe = sc.run(
+                f"curl -sS -o /dev/null -w '%{{http_code}}' {PANEL_URL}/health",
+                timeout=15,
+                check=False,
+                label=f"curl -o /dev/null -w '%{{http_code}}' {PANEL_URL}/health",
+            )
+            if health_probe.stdout.strip() == "200":
+                break
+            time.sleep(1)
+        sc.check(
+            health_probe is not None and health_probe.stdout.strip() == "200",
+            f"panel /health did not return 200 within 30s: "
+            f"{health_probe.stdout if health_probe else None!r}",
+        )
+
+        status, headers, html = http_head_and_body(sc, "/")
+        sc.check(status == 200, f"GET / answered {status}")
+        sc.check('<div id="root">' in html, f"GET / is not the console: {html[:200]!r}")
+        csp = headers.get("content-security-policy", "")
+        sc.check(
+            csp.startswith(CONSOLE_CSP) and "unsafe-inline" not in csp,
+            f"GET / is not served under the strict policy: {csp!r}",
+        )
+
+        session_status, _, session_body = http_head_and_body(sc, "/api/auth/session")
+        sc.check(session_status == 200, f"GET /api/auth/session answered {session_status}")
+        session = json.loads(session_body)
+        sc.check(
+            session.get("authenticated") is False,
+            f"/api/auth/session did not say authenticated=false for an anonymous caller: "
+            f"{session_body!r}",
+        )
+    finally:
+        sc.run("wasm web stop", timeout=30, check=False, label="[2.0] wasm web stop")
+
+    sc.evidence.append(
+        f"NOTE: `wasm --version` after the upgrade: {version_after.strip()!r}. This working "
+        f"tree's pyproject.toml is still at {UPGRADE_FROM_VERSION} (not yet bumped for the 2.0 "
+        "release - see scripts/release.py and the Releasing section of CLAUDE.md), so the "
+        "version string genuinely does not change across this rehearsal even though the code "
+        "does; see upgrade_wasm_to_wheel's docstring for how the upgrade step compensates."
+    )
+
+
+def run_upgrade_mode(wheel: Path, *, keep: bool) -> int:
+    """Run the 1.6.5 -> 2.0 upgrade rehearsal (see :func:`run_upgrade_rehearsal`) end to end.
+
+    Args:
+        wheel: Path to the wheel built from the working tree, on the host.
+        keep: Do not remove the container when done.
+
+    Returns:
+        0 if the rehearsal passed, 1 otherwise.
+    """
+    started_at = time.monotonic()
+    name = random_container_name()
+    sc = Scenario(container=name)
+    failed = False
+    error: str | None = None
+    setup_error: str | None = None
+
+    try:
+        try:
+            start_container(name)
+            wait_for_systemd(name)
+            install_fixtures(name)
+            install_wasm_from_pypi(name, UPGRADE_FROM_VERSION)
+        except HarnessError as exc:
+            setup_error = str(exc)
+        else:
+            print("\n=== upgrade_1_6_5_to_2_0 ===")
+            try:
+                run_upgrade_rehearsal(sc, wheel)
+            except AssertionError as exc:
+                failed = True
+                error = str(exc)
+            except HarnessError as exc:
+                failed = True
+                error = str(exc)
+            else:
+                print("PASS: upgrade_1_6_5_to_2_0")
+    finally:
+        if sc.evidence:
+            print("--- evidence ---")
+            print("\n\n".join(sc.evidence))
+        if keep:
+            print(f"\n[teardown] --keep given, leaving container {name} running")
+        else:
+            print(f"\n[teardown] removing container {name}")
+            remove_container(name)
+
+    elapsed = time.monotonic() - started_at
+    if setup_error is not None:
+        print(f"\n[setup] FAILED before the rehearsal ran: {setup_error}")
+        print(f"\n[summary] 0/0 scenario(s) run, setup failed, {elapsed:.1f}s total")
+        return 1
+    if failed:
+        print(f"FAIL: upgrade_1_6_5_to_2_0: {error}")
+    print(f"\n[summary] 1 scenario(s) run, {1 if failed else 0} failure(s), {elapsed:.1f}s total")
+    return 1 if failed else 0
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
@@ -1278,6 +1981,14 @@ def parse_args() -> argparse.Namespace:
         "--skip-image-build",
         action="store_true",
         help=f"Reuse the existing {IMAGE_TAG} image instead of rebuilding it.",
+    )
+    parser.add_argument(
+        "--upgrade",
+        action="store_true",
+        help=(
+            "Run only the 1.6.5 -> 2.0 upgrade rehearsal, in its own container, instead of "
+            "the regular scenario suite. --scenario is ignored when this is given."
+        ),
     )
     return parser.parse_args()
 
@@ -1311,6 +2022,9 @@ def main() -> int:
         build_image()
     else:
         print(f"[setup] reusing existing image {IMAGE_TAG}")
+
+    if args.upgrade:
+        return run_upgrade_mode(wheel, keep=args.keep)
 
     name = random_container_name()
     failures = 0

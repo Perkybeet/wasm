@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import os
 import secrets as secrets_module
+import shutil
 import tempfile
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -34,6 +35,7 @@ from wasm.core.exceptions import (
     DatabaseQueryError,
     DatabaseUserError,
 )
+from wasm.core.runner import CommandResult
 from wasm.managers.database.base import (
     QUERY_TIMEOUT,
     TRANSFER_TIMEOUT,
@@ -42,6 +44,7 @@ from wasm.managers.database.base import (
     DatabaseInfo,
     StructuredQueryResult,
     UserInfo,
+    console_statement,
     format_size,
     parse_tabular_query_output,
     quote_identifier,
@@ -150,6 +153,46 @@ _READ_ONLY_USER_PREFIX = "wasm_ro_"
 
 #: MySQL and MariaDB both cap a user name at 32 characters.
 _USER_NAME_MAX_LENGTH = 32
+
+#: Client commands that reach the host instead of the database: a shell, a
+#: file read, a file write, a shell through the pager, an editor. The console
+#: runs with ``--binary-mode``, which already disables them; refusing them by
+#: name as well turns a client error into an actionable one, and keeps the
+#: guarantee if a client ever ships without that switch honoured.
+_HOST_CLIENT_COMMANDS = frozenset({"system", "source", "tee", "pager", "edit"})
+
+
+def _refuse_client_commands(statement: str) -> None:
+    """
+    Refuse console text that is a mysql client command rather than SQL.
+
+    The client recognises a named command (``system id``) only at the start
+    of a statement and a backslash command (``\\! id``) anywhere outside a
+    string, so those are the positions checked. A column called ``status``
+    or ``source`` on a later line of a SELECT is not a command and is not
+    refused.
+
+    Args:
+        statement: The operator's statement.
+
+    Raises:
+        DatabaseQueryError: When the text starts with a backslash command,
+            contains ``\\!``, or begins a statement with a host command.
+    """
+    starts = [chunk.split(None, 1)[0].lower() for chunk in statement.split(";") if chunk.split()]
+    if (
+        statement.lstrip().startswith("\\")
+        or "\\!" in statement
+        or any(word in _HOST_CLIENT_COMMANDS for word in starts)
+    ):
+        raise DatabaseQueryError(
+            "mysql client commands are not accepted by the console",
+            details=(
+                "system, source, tee, pager, edit and backslash commands such as \\! "
+                "act on the server's filesystem, not the database. Send SQL only; use "
+                "'wasm db connect' for an interactive mysql session."
+            ),
+        )
 
 
 def _read_only_user_name(database: str) -> str:
@@ -387,16 +430,27 @@ class MySQLManager(BaseDatabaseManager):
         return username, password
 
     @contextmanager
-    def _read_only_credentials(self, database: str) -> Iterator[list[str]]:
+    def _read_only_credentials(self, database: str) -> Iterator[tuple[list[str], dict[str, str]]]:
         """
         Provision and hand back the read-only console's own credentials.
+
+        The client must not be able to end up connected as anyone else, and
+        an option file alone does not ensure that: ``--defaults-extra-file`` is
+        read *before* the invoking user's ``~/.my.cnf`` (and MySQL's
+        ``.mylogin.cnf``), so root's own ``user=root`` there would silently win
+        and the "read-only" console would run as root. The account name is
+        therefore also given on the command line - it is not a secret, and
+        argv beats every option file - and ``HOME`` points at a private
+        directory holding nothing but this option file, so root's files are
+        not read at all and cannot even turn the connection into an
+        authentication failure.
 
         Args:
             database: The database the account is scoped to.
 
         Yields:
-            Arguments to place immediately after the program name, exactly
-            like :meth:`_credentials`.
+            The arguments to place immediately after the program name, and
+            the environment the client must run with.
 
         Raises:
             DatabaseQueryError: When the account cannot be provisioned.
@@ -408,13 +462,22 @@ class MySQLManager(BaseDatabaseManager):
             f"user={escape_option_file_value(username)}\n"
             f"password={escape_option_file_value(password)}\n"
         )
-        fd, path = tempfile.mkstemp(prefix="wasm_mysql_ro_", suffix=".cnf")
+        # mkdtemp creates the directory 0700 and the file is created 0600
+        # inside it, so the password is never briefly readable by anyone else.
+        home = tempfile.mkdtemp(prefix="wasm_mysql_ro_")
+        path = Path(home) / "client.cnf"
         try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "w") as handle:
                 handle.write(content)
-            yield [f"--defaults-extra-file={path}"]
+            env = {
+                "HOME": home,
+                # MySQL looks for the login path file here before $HOME.
+                "MYSQL_TEST_LOGIN_FILE": str(Path(home) / ".mylogin.cnf"),
+            }
+            yield [f"--defaults-extra-file={path}", f"--user={username}"], env
         finally:
-            Path(path).unlink(missing_ok=True)
+            shutil.rmtree(home, ignore_errors=True)
 
     def _client_argv(
         self, credentials: Sequence[str], database: str | None = None, *, headers: bool = False
@@ -999,26 +1062,67 @@ class MySQLManager(BaseDatabaseManager):
 
         Raises:
             DatabaseNotFoundError: When the database does not exist.
-            DatabaseQueryError: When the statement fails, or the read-only
-                account cannot be provisioned.
+            DatabaseQueryError: When the statement is refused before it runs
+                (see :meth:`_console_exec`) or fails, or the read-only account
+                cannot be provisioned.
         """
+        result = self._console_exec(database, query, read_only=read_only, headers=False)
+        if not result.success:
+            raise DatabaseQueryError("Query failed", details=result.stderr.strip())
+        return True, result.stdout
+
+    def _console_exec(
+        self, database: str, query: str, *, read_only: bool, headers: bool
+    ) -> CommandResult:
+        """
+        Run an operator's console statement with client commands disabled.
+
+        The statement reaches the client on stdin - off the command line, so
+        a write that carries a password is not in ``ps`` - and stdin is a
+        script to mysql: ``system``/``\\!`` run a shell as root, ``source``
+        reads a file, ``tee`` writes one, wherever a statement begins.
+        ``--binary-mode`` is the switch that turns every client command but
+        ``charset`` and ``delimiter`` off for non-interactive input (MySQL
+        and MariaDB alike); :func:`_refuse_client_commands` refuses them by
+        name first, with an error that says why.
+
+        Args:
+            database: Database to select.
+            query: The operator's statement.
+            read_only: Run it inside a read-only transaction as the
+                least-privilege account, never as the configured one.
+            headers: Keep the column header row, for the structured result.
+
+        Returns:
+            The client's outcome.
+
+        Raises:
+            DatabaseNotFoundError: When the database does not exist.
+            DatabaseQueryError: When the statement is refused, or the
+                read-only account cannot be provisioned.
+        """
+        statement = console_statement(query, read_only=read_only)
+        _refuse_client_commands(statement)
         if not self.database_exists(database):
             raise DatabaseNotFoundError(f"Database '{database}' does not exist")
 
         if read_only:
-            sql = f"START TRANSACTION READ ONLY;\n{query}\nCOMMIT;\n"
-            with self._read_only_credentials(database) as credentials:
-                result = self._exec(
-                    self._client_argv(credentials, database),
+            # The terminator sits on its own line: a statement ending in a
+            # "-- comment" would otherwise swallow it and merge with COMMIT.
+            sql = f"START TRANSACTION READ ONLY;\n{statement}\n;\nCOMMIT;\n"
+            with self._read_only_credentials(database) as (credentials, env):
+                return self._exec(
+                    [*self._client_argv(credentials, database, headers=headers), "--binary-mode"],
                     input=sql,
+                    env=env,
                     timeout=QUERY_TIMEOUT,
                 )
-            success, output = result.success, result.stdout if result.success else result.stderr
-        else:
-            success, output = self._execute_sql(query, database=database)
-        if not success:
-            raise DatabaseQueryError("Query failed", details=output.strip())
-        return success, output
+        with self._credentials() as credentials:
+            return self._exec(
+                [*self._client_argv(credentials, database, headers=headers), "--binary-mode"],
+                input=statement,
+                timeout=QUERY_TIMEOUT,
+            )
 
     def execute_query_structured(
         self,
@@ -1049,28 +1153,11 @@ class MySQLManager(BaseDatabaseManager):
 
         Raises:
             DatabaseNotFoundError: When the database does not exist.
-            DatabaseQueryError: When the statement fails, or the read-only
-                account cannot be provisioned.
+            DatabaseQueryError: When the statement is refused before it runs
+                (see :meth:`_console_exec`) or fails, or the read-only account
+                cannot be provisioned.
         """
-        if not self.database_exists(database):
-            raise DatabaseNotFoundError(f"Database '{database}' does not exist")
-
-        if read_only:
-            sql = f"START TRANSACTION READ ONLY;\n{query}\nCOMMIT;\n"
-            with self._read_only_credentials(database) as credentials:
-                result = self._exec(
-                    self._client_argv(credentials, database, headers=True),
-                    input=sql,
-                    timeout=QUERY_TIMEOUT,
-                )
-        else:
-            with self._credentials() as credentials:
-                result = self._exec(
-                    self._client_argv(credentials, database, headers=True),
-                    input=query,
-                    timeout=QUERY_TIMEOUT,
-                )
-
+        result = self._console_exec(database, query, read_only=read_only, headers=True)
         if not result.success:
             raise DatabaseQueryError(
                 "Query failed", details=(result.stderr or result.stdout).strip()

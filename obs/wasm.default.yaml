@@ -19,7 +19,7 @@ ssl:
 # Logging configuration
 logging:
   level: info
-  directory: /var/log/wasm
+  file: /var/log/wasm/wasm.log
 
 # =============================================================================
 # Node.js Configuration

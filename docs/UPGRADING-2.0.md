@@ -38,9 +38,10 @@ you create from now on.
 ### The panel is replaced by the console
 
 - `wasm web start` and its options, the address it listens on, and the state in `/etc/wasm`
-  (signing key, sessions, two-factor enrolment, audit log) carry over. As in 1.6.4, every
-  start issues a new access token; in the background (`-d`) run `wasm web token --new` to get
-  one.
+  (signing key, sessions, two-factor enrolment, audit log) carry over. Every start issues a
+  new access token and prints it once, in the same banner whether it runs in the foreground
+  or, with `-d`, in the background - unlike 1.6.4, which printed nothing for a background
+  start.
 - The server-rendered pages, the `/login` form and the htmx fragments are gone. The console
   is a single-page application served from the same address. A bookmark to a 1.x page may
   land on "Page not found"; certificates and sites are now under Domains and certificates.
@@ -275,7 +276,12 @@ What does not come back:
 - `--pm` accepts `npm`, `pnpm` and `bun`; Yarn is used when detected from `yarn.lock` but
   cannot be forced. `POST /api/apps` has no package manager field.
 - Variables given with `wasm create --env-file` (or `env_vars` on `POST /api/apps`) are
-  written into the systemd unit, which local users can read. Keep secrets in the `.env`.
+  written into the application's `.env` file, and the unit loads it with `EnvironmentFile=`.
+  Only `PORT` and `NODE_ENV` stay inline in the unit, which local users can read; `wasm env
+  configure` and the console's Environment tab both refuse to set either from the `.env`
+  file, since that would silently override what the unit and nginx expect. A unit from
+  before this change, with every variable inline, keeps working as it is: the next `wasm
+  update` or redeploy moves them into the `.env` file, once, automatically.
 - Python applications need the `venv` module (`python3-venv` on Debian and Ubuntu), which the
   package does not pull in.
 
@@ -288,10 +294,13 @@ What does not come back:
 **Console and API**
 
 - `wasm web start -d` is a background process, not a systemd unit: it does not start again
-  after a reboot, and it prints no token (use `wasm web token --new`). A running console
-  keeps accepting the token it started with until it restarts.
-- WebSocket tickets from `POST /api/auth/ws-ticket` only work for browser sessions; scripts
-  authenticate the handshake with `Authorization: Bearer`.
+  after a reboot. It now prints its access token the same way a foreground start does, and a
+  running console reads the token from disk on every request, so issuing a new one with
+  `wasm web token --new` retires the old one at once, with no restart needed.
+- WebSocket tickets from `POST /api/auth/ws-ticket` now also work for an API token, not only
+  a browser session: the ticket redeems as that same token, its scope included (admin or
+  otherwise). Before, the endpoint accepted the request but no handshake could ever redeem
+  the ticket it issued.
 - Webhook secrets are created from the console or the API only; there is no CLI command.
 - Every CLI run checks GitHub for a newer release at most every five minutes, and there is
   no setting to turn that off.

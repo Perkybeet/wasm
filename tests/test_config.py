@@ -87,3 +87,24 @@ def test_a_second_caller_waits_for_the_first_to_finish_loading(
     assert len(calls) == 1
     assert second_result[0] is Config._instance
     assert second_result[0].get("webserver") == "nginx"
+
+
+def test_a_config_file_written_by_the_old_packaged_default_still_loads(
+    config_path: Path,
+) -> None:
+    """
+    obs/wasm.default.yaml used to ship 'logging.directory' while the code's
+    own default named the setting 'logging.file'. An installed config.yaml
+    from that packaging is not rewritten on upgrade, so it must keep loading
+    without error, and every other setting in it must still read back.
+    """
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "apps_directory: /var/www/apps\nlogging:\n  level: info\n  directory: /var/log/wasm\n",
+        encoding="utf-8",
+    )
+
+    config = Config()
+
+    assert config.get("logging.level") == "info"
+    assert config.get("apps_directory") == "/var/www/apps"

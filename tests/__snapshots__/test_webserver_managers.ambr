@@ -413,10 +413,18 @@
           Options -Indexes +FollowSymLinks
           AllowOverride All
           Require all granted
-          
-          # SPA support - rewrite to index.html
+  
           RewriteEngine On
           RewriteBase /
+  
+          # Deny hidden files and directories (.git, .env, .htpasswd, ...):
+          # Apache serves whatever is in the document root, dotfiles included,
+          # unless something tells it not to. ACME's HTTP-01 challenge lives
+          # under .well-known/ and must stay reachable.
+          RewriteCond %{REQUEST_URI} !^/\.well-known/
+          RewriteRule (^|/)\. - [F]
+  
+          # SPA support - rewrite to index.html
           RewriteRule ^index\.html$ - [L]
           RewriteCond %{REQUEST_FILENAME} !-f
           RewriteCond %{REQUEST_FILENAME} !-d
@@ -462,10 +470,18 @@
           Options -Indexes +FollowSymLinks
           AllowOverride All
           Require all granted
-          
-          # SPA support - rewrite to index.html
+  
           RewriteEngine On
           RewriteBase /
+  
+          # Deny hidden files and directories (.git, .env, .htpasswd, ...):
+          # Apache serves whatever is in the document root, dotfiles included,
+          # unless something tells it not to. ACME's HTTP-01 challenge lives
+          # under .well-known/ and must stay reachable.
+          RewriteCond %{REQUEST_URI} !^/\.well-known/
+          RewriteRule (^|/)\. - [F]
+  
+          # SPA support - rewrite to index.html
           RewriteRule ^index\.html$ - [L]
           RewriteCond %{REQUEST_FILENAME} !-f
           RewriteCond %{REQUEST_FILENAME} !-d
@@ -1072,8 +1088,11 @@
       listen [::]:80;
       server_name example.com shop.example.com;
   
-      # ACME challenge location for Let's Encrypt (webroot method)
-      location /.well-known/acme-challenge/ {
+      # ACME challenge location for Let's Encrypt (webroot method). ^~ stops
+      # nginx from even considering the hidden-files regex below for this
+      # path: a plain prefix location loses to any matching regex location,
+      # checked in file order, and ".well-known" itself starts with a dot.
+      location ^~ /.well-known/acme-challenge/ {
           root /var/www/html;
           allow all;
       }
@@ -1135,7 +1154,14 @@
           try_files $uri $uri/ /index.html;
       }
   
-      # Deny access to hidden files
+      # Other well-known resources (security.txt, apple-app-site-association,
+      # a renewal's ACME check, ...) must stay reachable too: ^~ here keeps
+      # this whole prefix out of the hidden-files regex below, the same way
+      # the acme-challenge location above does.
+      location ^~ /.well-known/ {
+      }
+  
+      # Deny access to hidden files and directories, except /.well-known/ above.
       location ~ /\. {
           deny all;
           access_log off;
@@ -1154,8 +1180,11 @@
       listen [::]:80;
       server_name example.com;
   
-      # ACME challenge location for Let's Encrypt (webroot method)
-      location /.well-known/acme-challenge/ {
+      # ACME challenge location for Let's Encrypt (webroot method). ^~ stops
+      # nginx from even considering the hidden-files regex below for this
+      # path: a plain prefix location loses to any matching regex location,
+      # checked in file order, and ".well-known" itself starts with a dot.
+      location ^~ /.well-known/acme-challenge/ {
           root /var/www/html;
           allow all;
       }
@@ -1194,7 +1223,14 @@
           try_files $uri $uri/ /index.html;
       }
   
-      # Deny access to hidden files
+      # Other well-known resources (security.txt, apple-app-site-association,
+      # a renewal's ACME check, ...) must stay reachable too: ^~ here keeps
+      # this whole prefix out of the hidden-files regex below, the same way
+      # the acme-challenge location above does.
+      location ^~ /.well-known/ {
+      }
+  
+      # Deny access to hidden files and directories, except /.well-known/ above.
       location ~ /\. {
           deny all;
           access_log off;
