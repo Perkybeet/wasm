@@ -12,14 +12,27 @@ reason: psql reads stdin as a script and runs its meta-commands (``\\!`` is a
 shell) wherever they appear, while a ``-c`` string is sent to the server as it
 is. See :meth:`PostgresManager._console_argv`. Dumps are streamed to disk by
 the runner, so a dump containing quotes or binary bytes arrives intact.
+
+The read-only console is the one connection that does not run as the cluster
+superuser. It signs in over TCP as ``wasm_ro_<database>``, a role that holds
+nothing but ``SELECT``: a superuser session that merely switched roles can
+switch back from inside a single SELECT (``set_config('role', ...)``), so the
+limit has to be the login itself. See :meth:`PostgresManager._ensure_read_only_role`.
 """
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import hmac
+import os
+import re
+import secrets
+import stat
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
+from wasm.core.config import secure_write
 from wasm.core.exceptions import (
     DatabaseBackupError,
     DatabaseError,
@@ -28,7 +41,7 @@ from wasm.core.exceptions import (
     DatabaseQueryError,
     DatabaseUserError,
 )
-from wasm.core.runner import runuser_prefix
+from wasm.core.runner import CommandResult, runuser_prefix
 from wasm.managers.database.base import (
     QUERY_TIMEOUT,
     TRANSFER_TIMEOUT,
@@ -43,6 +56,7 @@ from wasm.managers.database.base import (
     quote_identifier,
     validate_name,
 )
+from wasm.managers.database.psql_script import check_plain_dump
 from wasm.managers.database.registry import DatabaseRegistry
 
 #: Privileges PostgreSQL accepts on a DATABASE object.
@@ -82,6 +96,32 @@ _READ_ONLY_ROLE_PREFIX = "wasm_ro_"
 #: PostgreSQL's NAMEDATALEN limit for an identifier, minus the terminator.
 _IDENTIFIER_MAX_LENGTH = 63
 
+#: The only address the read-only console signs in from. Password logins are
+#: scoped to it in pg_hba.conf, so nothing but a local process can use them.
+READ_ONLY_HOST = "127.0.0.1"
+
+#: Where each read-only role's password is kept, under the store's directory:
+#: ``/var/lib/wasm/secrets/postgresql`` on a server.
+_READ_ONLY_SECRETS_PATH = ("secrets", "postgresql")
+
+#: What :func:`secrets.token_urlsafe` produces. A stored value that is anything
+#: else was not written by WASM and is replaced rather than used.
+_STORED_PASSWORD = re.compile(r"[A-Za-z0-9_-]{32,128}")
+
+#: psql's exit status when it could not connect (EXIT_BADCONN), as opposed to 3
+#: for a statement that failed under ON_ERROR_STOP.
+_PSQL_EXIT_BADCONN = 2
+
+#: How libpq words a connection attempt that failed: ``connection to server at
+#: "127.0.0.1", port 5432 failed: FATAL: ...`` since PostgreSQL 14, ``could
+#: not connect to server`` or a bare ``psql: FATAL:`` before it.
+_SIGN_IN_FAILURE = re.compile(
+    r"connection to server at .* failed|could not connect to server|^psql: FATAL:", re.M
+)
+
+#: SCRAM-SHA-256 iteration count, PostgreSQL's own default (scram_iterations).
+_SCRAM_ITERATIONS = 4096
+
 
 def _read_only_role_name(database: str) -> str:
     """
@@ -108,6 +148,55 @@ def _read_only_role_name(database: str) -> str:
     digest = hashlib.sha256(database.encode()).hexdigest()[:8]
     budget = _IDENTIFIER_MAX_LENGTH - len(_READ_ONLY_ROLE_PREFIX) - len(digest) - 1
     return f"{_READ_ONLY_ROLE_PREFIX}{database[:budget]}_{digest}"
+
+
+def _scram_sha256_verifier(password: str) -> str:
+    """
+    Hash a password into the SCRAM-SHA-256 verifier PostgreSQL stores.
+
+    ``ALTER ROLE ... PASSWORD`` stores a value in this format as it is, so the
+    statement that sets the read-only role's password never carries the
+    password itself: with ``log_statement = 'ddl'`` the server log, and
+    ``pg_stat_activity`` while it runs, only ever show the verifier, which
+    cannot be turned back into the password. The algorithm is RFC 5802 with
+    the RFC 7677 hash, the same one libpq's ``PQencryptPasswordConn`` runs.
+    SASLprep is the identity for the ASCII passwords WASM generates.
+
+    Args:
+        password: The plaintext password.
+
+    Returns:
+        ``SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>``.
+    """
+    salt = os.urandom(16)
+    salted = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, _SCRAM_ITERATIONS)
+    client_key = hmac.new(salted, b"Client Key", hashlib.sha256).digest()
+    stored_key = hashlib.sha256(client_key).digest()
+    server_key = hmac.new(salted, b"Server Key", hashlib.sha256).digest()
+
+    def encode(value: bytes) -> str:
+        return base64.b64encode(value).decode("ascii")
+
+    return (
+        f"SCRAM-SHA-256${_SCRAM_ITERATIONS}:{encode(salt)}"
+        f"${encode(stored_key)}:{encode(server_key)}"
+    )
+
+
+def _sign_in_failed(result: CommandResult) -> bool:
+    """
+    Tell a psql that never got a session apart from a statement that failed.
+
+    Args:
+        result: psql's result.
+
+    Returns:
+        True when psql exited with EXIT_BADCONN and libpq reported the
+        connection attempt itself failing: refused by pg_hba.conf, a rejected
+        password, nothing listening. A session lost halfway also exits 2, but
+        says so differently and is reported as a failed query.
+    """
+    return result.exit_code == _PSQL_EXIT_BADCONN and bool(_SIGN_IN_FAILURE.search(result.stderr))
 
 
 class PostgresManager(BaseDatabaseManager):
@@ -879,6 +968,17 @@ class PostgresManager(BaseDatabaseManager):
         """
         Restore a database from a plain or gzipped dump.
 
+        A restore trusts the dump's SQL: it runs as :data:`SUPERUSER`, which
+        is what ``ALTER ... OWNER TO``, ``CREATE EXTENSION`` and the rest of a
+        real dump need, and which also includes ``COPY ... TO PROGRAM``. That
+        is why it is an elevated, audited action. What it does not trust is
+        the client: psql reads a plain dump with ``-f``, where it would run
+        ``\\!``, ``\\o`` or ``\\set`` as happily as SQL, so the dump is checked
+        by :func:`~wasm.managers.database.psql_script.check_plain_dump` first,
+        before the database is touched, and refused if psql would find a
+        meta-command in it outside COPY data. pg_restore, for the custom
+        format, has no such commands.
+
         Args:
             database: Target database name.
             backup_path: Path to the backup file.
@@ -886,7 +986,8 @@ class PostgresManager(BaseDatabaseManager):
             **kwargs: Accepts ``format`` (plain or custom).
 
         Raises:
-            DatabaseBackupError: When the file is missing or the restore fails.
+            DatabaseBackupError: When the file is missing, a plain dump holds
+                psql meta-commands, or the restore fails.
         """
         self.validate_database_name(database)
         backup_path = Path(backup_path)
@@ -896,12 +997,16 @@ class PostgresManager(BaseDatabaseManager):
                 details="Run 'wasm db backups' to list the backups WASM knows about.",
             )
 
+        dump_format = kwargs.get("format", "plain")
+        if dump_format != "custom":
+            # Before anything is dropped, so a refused dump costs nothing.
+            check_plain_dump(backup_path)
+
         if drop_existing and self.database_exists(database):
             self.drop_database(database, force=True)
         if not self.database_exists(database):
             self.create_database(database)
 
-        dump_format = kwargs.get("format", "plain")
         staged_name = f"{self.ENGINE_NAME}-restore-{database}{self.BACKUP_SUFFIX}"
 
         # psql and pg_restore open the file themselves, as the postgres account,
@@ -947,7 +1052,9 @@ class PostgresManager(BaseDatabaseManager):
                 the server's, not a keyword allowlist: PostgreSQL lets a
                 data-modifying CTE hide behind a leading ``WITH``, so
                 ``WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x`` reads
-                as a SELECT to any parser simple enough to be trustworthy.
+                as a SELECT to any parser simple enough to be trustworthy. The
+                session is signed in as ``wasm_ro_<database>``; see
+                :meth:`_run_console`.
             **kwargs: Unused.
 
         Returns:
@@ -956,64 +1063,45 @@ class PostgresManager(BaseDatabaseManager):
         Raises:
             DatabaseNotFoundError: When the database does not exist.
             DatabaseQueryError: When the statement is refused before it runs
-                (see :meth:`_console_argv`) or fails.
+                (see :meth:`_console_statement`), the read-only role cannot
+                sign in, or the statement fails.
         """
-        argv, env = self._console_argv(database, query, read_only=read_only, csv=False)
-        result = self._exec(argv, env=env, timeout=QUERY_TIMEOUT, user=self.SUPERUSER)
+        result = self._run_console(database, query, read_only=read_only, csv=False)
         if not result.success:
             raise DatabaseQueryError("Query failed", details=result.stderr.strip())
         return True, result.stdout
 
-    def _console_argv(
-        self, database: str, query: str, *, read_only: bool, csv: bool
-    ) -> tuple[list[str], dict[str, str] | None]:
+    def _console_statement(self, database: str, query: str, *, read_only: bool) -> str:
         """
-        Build the psql invocation that runs an operator's console statement.
+        Check an operator's console statement before any psql runs it.
 
         psql parses stdin, ``-f`` files and psqlrc as scripts, running a
-        meta-command wherever one appears: ``\\! id`` is a shell as the
-        ``postgres`` account even in the middle of a line, ``\\o`` writes a
-        file, ``\\i`` reads one. A ``-c`` string is different - psql sends it
-        to the server as it is, with no meta-command or variable handling -
-        unless its very first character is a backslash, in which case it is
-        one meta-command. So the statement travels as its own ``-c``, a
-        leading backslash is refused, and ``-X`` keeps psqlrc out.
+        meta-command wherever one appears: ``\\! id`` is a shell even in the
+        middle of a line, ``\\o`` writes a file, ``\\i`` reads one. A ``-c``
+        string is different - psql sends it to the server as it is, with no
+        meta-command or variable handling - unless its very first character
+        is a backslash, in which case it is one meta-command. So the statement
+        travels as its own ``-c``, a leading backslash is refused here, and
+        ``-X`` keeps psqlrc out.
 
         The trade-off is that the statement is in argv, visible in ``ps`` for
         as long as it runs. That is acceptable for the operator's own query,
-        which is not a credential: the connection itself still authenticates
-        by peer as :data:`SUPERUSER`, with nothing secret on the command line.
-        A statement that embeds a password (``ALTER ROLE ... PASSWORD``) is
-        better sent through ``wasm db user``, which keeps it on stdin.
-
-        Read mode wraps the statement in a read-only transaction under the
-        least-privilege role, one ``-c`` per statement rather than one string:
-        psql before 15 prints only the last result of a multi-statement
-        ``-c``, which would be COMMIT's empty one instead of the rows.
-
-        A read-only transaction rejects INSERT, UPDATE, DELETE, DDL and
-        data-modifying CTEs alike, and cannot be escalated from inside because
-        SET TRANSACTION READ WRITE is refused once the session default is
-        read-only. It does not, by itself, stop a read: the cluster superuser
-        this connects as could still run ``SELECT pg_read_file(...)`` or
-        ``pg_ls_dir('/')``, which are reads as far as the transaction mode is
-        concerned. SET ROLE closes that for the rest of the session, leaving
-        only what ``wasm_ro_<database>`` was granted - which is also why read
-        mode is held to a single statement by :func:`console_statement`.
+        which is not a credential. A statement that embeds a password
+        (``ALTER ROLE ... PASSWORD``) is better sent through ``wasm db user``,
+        which keeps it on stdin.
 
         Args:
-            database: Database to connect to.
+            database: Database the statement is for.
             query: The operator's statement.
-            read_only: Wrap it in the read-only transaction and role.
-            csv: Print CSV with a header row, for the structured result.
+            read_only: Whether it runs in read mode, which accepts one
+                statement only (see :func:`console_statement`).
 
         Returns:
-            The argument vector and the extra environment for psql.
+            The statement, normalised by :func:`console_statement`.
 
         Raises:
             DatabaseNotFoundError: When the database does not exist.
-            DatabaseQueryError: When the statement is refused, or the
-                read-only role cannot be provisioned.
+            DatabaseQueryError: When the statement is refused.
         """
         statement = console_statement(query, read_only=read_only)
         if statement.lstrip().startswith("\\"):
@@ -1027,26 +1115,179 @@ class PostgresManager(BaseDatabaseManager):
             )
         if not self.database_exists(database):
             raise DatabaseNotFoundError(f"Database '{database}' does not exist")
+        return statement
 
-        if read_only:
-            role = self._ensure_read_only_role(database)
-            commands = [
-                "BEGIN READ ONLY",
-                f"SET ROLE {self._escape_identifier(role)}",
-                statement,
-                "COMMIT",
-            ]
-            env: dict[str, str] | None = {"PGOPTIONS": "-c default_transaction_read_only=on"}
-        else:
-            commands, env = [statement], None
+    def _run_console(
+        self, database: str, query: str, *, read_only: bool, csv: bool
+    ) -> CommandResult:
+        """
+        Run an operator's console statement, in write or read mode.
 
-        tail = [arg for command in commands for arg in ("-c", command)]
+        Write mode runs the statement as :data:`SUPERUSER` over the peer
+        socket, like every other operation here: it is sudo-gated, and it is
+        meant to be able to do anything.
+
+        Read mode never touches the superuser session. It signs in over TCP
+        to :data:`READ_ONLY_HOST` as ``wasm_ro_<database>``, a role that is
+        not a superuser and holds only ``CONNECT``, ``USAGE`` and ``SELECT``,
+        and runs the statement in a read-only transaction, one ``-c`` per
+        statement (psql before 15 prints only the last result of a
+        multi-statement ``-c``, which would be COMMIT's empty one). An earlier
+        build connected as the superuser and ran ``SET ROLE`` first, which
+        is no limit at all: the session user is still a superuser, so
+        ``SELECT set_config('role', 'postgres', true), query_to_xml('select
+        pg_read_file(...)', ...)`` put superuser back inside one read-only
+        SELECT, and ``RESET ROLE`` or ``SET SESSION AUTHORIZATION`` would
+        have done the same. Signing in as the role leaves the server nothing
+        to switch back to.
+
+        A password the server rejects is rotated once and the sign-in
+        retried: that heals a stored password that no longer matches, such as
+        after two first reads raced to set it. Any other refusal - pg_hba.conf
+        allowing no password login on the loopback, the server not listening
+        on TCP - is reported with the exact fix, and never answered by falling
+        back to the superuser session.
+
+        Args:
+            database: Database to connect to.
+            query: The operator's statement.
+            read_only: Run it in read mode.
+            csv: Print CSV with a header row, for the structured result.
+
+        Returns:
+            psql's result.
+
+        Raises:
+            DatabaseNotFoundError: When the database does not exist.
+            DatabaseQueryError: When the statement is refused, the read-only
+                role cannot be provisioned, or it cannot sign in.
+        """
+        statement = self._console_statement(database, query, read_only=read_only)
+        if not read_only:
+            argv = self._console_argv(database, ["-c", statement], csv=csv)
+            return self._exec(argv, timeout=QUERY_TIMEOUT, user=self.SUPERUSER)
+
+        tail = [
+            arg for command in ("BEGIN READ ONLY", statement, "COMMIT") for arg in ("-c", command)
+        ]
+        for rotate in (False, True):
+            role, password = self._ensure_read_only_role(database, rotate=rotate)
+            argv = self._console_argv(
+                database,
+                [
+                    "-h",
+                    READ_ONLY_HOST,
+                    "-p",
+                    str(self._port()),
+                    "-U",
+                    role,
+                    # Never prompt: a password psql asks the terminal for would
+                    # hang the CLI and cannot be answered by the web console.
+                    "-w",
+                    # -q drops the BEGIN/COMMIT status lines the wrapper would
+                    # otherwise print around the rows (--csv carries its own).
+                    *([] if csv else ["-q"]),
+                    *tail,
+                ],
+                csv=csv,
+            )
+            env = {
+                "PGPASSWORD": password,
+                "PGOPTIONS": "-c default_transaction_read_only=on",
+                "PGCONNECT_TIMEOUT": "10",
+            }
+            result = self._exec(argv, env=env, timeout=QUERY_TIMEOUT, secrets=(password,))
+            if result.success or not _sign_in_failed(result):
+                return result
+            if not rotate and "password authentication failed" in result.stderr:
+                self.logger.info(
+                    f"PostgreSQL rejected the stored password of {role}; setting a new one"
+                )
+                continue
+            break
+        raise self._sign_in_refused(database, role, result)
+
+    def _console_argv(self, database: str, tail: Sequence[str], *, csv: bool) -> list[str]:
+        """
+        Build the psql invocation for a console statement.
+
+        Args:
+            database: Database to connect to.
+            tail: Connection options and the ``-c`` strings.
+            csv: Print CSV with a header row instead of bare tuples.
+
+        Returns:
+            The argument vector.
+        """
         if csv:
-            return self._psql_csv_argv(database, *tail), env
-        # -q drops the BEGIN/SET/COMMIT status lines the wrapper would
-        # otherwise print around the rows.
-        quiet = ["-q"] if read_only else []
-        return self._psql_argv(database, *quiet, *tail), env
+            return self._psql_csv_argv(database, *tail)
+        return self._psql_argv(database, *tail)
+
+    def _port(self) -> int:
+        """
+        Return the TCP port the read-only console signs in on.
+
+        Returns:
+            ``databases.credentials.postgresql.port`` from the configuration,
+            or :data:`DEFAULT_PORT`.
+
+        Raises:
+            DatabaseQueryError: When the configured port is not a TCP port.
+        """
+        settings = self.config.get("databases", {}).get("credentials", {}).get("postgresql", {})
+        configured = settings.get("port") if isinstance(settings, dict) else None
+        if configured in (None, ""):
+            return self.DEFAULT_PORT
+        try:
+            port = int(configured)
+        except (TypeError, ValueError):
+            port = 0
+        if not 0 < port < 65536:
+            raise DatabaseQueryError(
+                f"Invalid PostgreSQL port in the configuration: {configured!r}",
+                details=(
+                    "Set databases.credentials.postgresql.port in /etc/wasm/config.yaml "
+                    "to the port PostgreSQL listens on, or remove it to use 5432."
+                ),
+            )
+        return port
+
+    def _sign_in_refused(
+        self, database: str, role: str, result: CommandResult
+    ) -> DatabaseQueryError:
+        """
+        Build the error for a read-only console that could not sign in.
+
+        Args:
+            database: Database the console was reading.
+            role: The read-only role.
+            result: psql's failed result.
+
+        Returns:
+            An error that says what happened, carries psql's own output
+            verbatim and gives the pg_hba.conf line that fixes it.
+        """
+        hba_line = f"host {database} {role} {READ_ONLY_HOST}/32 scram-sha-256"
+        port = self._port()
+        if "Connection refused" in result.stderr:
+            steps = (
+                f"PostgreSQL is not accepting TCP connections on {READ_ONLY_HOST}:{port}. "
+                "Set listen_addresses = 'localhost' in postgresql.conf and restart "
+                "PostgreSQL (systemctl restart postgresql). Then make sure pg_hba.conf "
+                f"allows this role a password login:\n  {hba_line}"
+            )
+        else:
+            steps = (
+                "Read mode signs in as its own least-privilege role with a password "
+                f"over {READ_ONLY_HOST}, and never falls back to the superuser. Add this "
+                "line to pg_hba.conf, above any broader 'host' line, then reload "
+                f"PostgreSQL (systemctl reload postgresql):\n  {hba_line}"
+            )
+        return DatabaseQueryError(
+            f"The read-only console could not sign in to PostgreSQL as {role}",
+            details=steps,
+            output=result.stderr.strip(),
+        )
 
     def _psql_csv_argv(self, database: str, *tail: str) -> list[str]:
         """
@@ -1086,9 +1327,9 @@ class PostgresManager(BaseDatabaseManager):
         Args:
             database: Database name.
             query: The statement.
-            read_only: Same enforcement as :meth:`execute_query`: a
-                least-privilege role via ``SET ROLE`` inside a read-only
-                transaction, provisioned by :meth:`_ensure_read_only_role`.
+            read_only: Same enforcement as :meth:`execute_query`: a session
+                signed in as the least-privilege role, inside a read-only
+                transaction. See :meth:`_run_console`.
             max_rows: Data rows kept before the rest are dropped.
 
         Returns:
@@ -1097,10 +1338,10 @@ class PostgresManager(BaseDatabaseManager):
         Raises:
             DatabaseNotFoundError: When the database does not exist.
             DatabaseQueryError: When the statement is refused before it runs
-                (see :meth:`_console_argv`) or fails.
+                (see :meth:`_console_statement`), the read-only role cannot
+                sign in, or the statement fails.
         """
-        argv, env = self._console_argv(database, query, read_only=read_only, csv=True)
-        result = self._exec(argv, timeout=QUERY_TIMEOUT, env=env, user=self.SUPERUSER)
+        result = self._run_console(database, query, read_only=read_only, csv=True)
         if not result.success:
             raise DatabaseQueryError(
                 "Query failed", details=(result.stderr or result.stdout).strip()
@@ -1118,47 +1359,125 @@ class PostgresManager(BaseDatabaseManager):
             truncated=truncated,
         )
 
-    def _ensure_read_only_role(self, database: str) -> str:
-        """
-        Create, idempotently, the role the read-only console runs as.
+    # ==================== Read-only console role ====================
 
-        Closes ``SELECT pg_read_file('/etc/shadow')``,
-        ``SELECT * FROM pg_ls_dir('/')`` and every other
-        ``pg_read_server_files``-gated function or superuser-only catalog
-        being reachable from a "read-only" console query: the role is
-        ``NOSUPERUSER`` and is never logged into directly - the console
-        always authenticates as :data:`SUPERUSER` over the local peer
-        socket, the same as every other operation here, and only reaches
-        this role with ``SET ROLE`` inside the read-only transaction, which
-        a superuser may do to any role regardless of membership and which
-        drops every superuser privilege for the rest of the session. The
-        role itself holds nothing but ``CONNECT`` on this database,
-        ``USAGE`` on its schemas and ``SELECT`` on its tables - re-granted on
-        every call, so a table created after the role's first use is covered
-        by the next read instead of needing a separate migration step.
+    def _read_only_password_file(self, role: str) -> Path:
+        """
+        Return where a read-only role's password is kept.
+
+        Beside the store, like the lock files and the job logs: under
+        ``/var/lib/wasm`` on a server, inside the test's own directory in a
+        test, inside the sandbox under ``scripts/console_server.py``.
+
+        Args:
+            role: The read-only role.
+
+        Returns:
+            The path of its password file.
+        """
+        # Imported here: the store imports a great deal, and nothing else in
+        # this module needs it.
+        from wasm.core.store import get_store
+
+        return get_store().db_path.parent.joinpath(*_READ_ONLY_SECRETS_PATH, f"{role}.password")
+
+    def _stored_password(self, path: Path) -> str | None:
+        """
+        Read a read-only role's stored password, if WASM wrote a usable one.
+
+        The file is opened without following a symlink and must be a regular
+        file owned by this user with no group or other access; anything else
+        was not left by :func:`~wasm.core.config.secure_write` and is
+        replaced, not trusted.
+
+        Args:
+            path: The password file.
+
+        Returns:
+            The password, or None when there is none to use.
+        """
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            self.logger.warning(f"Not using the read-only console password at {path}: {exc}")
+            return None
+        with os.fdopen(fd, encoding="ascii", errors="replace") as handle:
+            info = os.fstat(handle.fileno())
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or info.st_mode & 0o077
+            ):
+                self.logger.warning(
+                    f"Not using the read-only console password at {path}: it is not a "
+                    "private file of this user; a new one will be set"
+                )
+                return None
+            value = handle.read(256).strip()
+        return value if _STORED_PASSWORD.fullmatch(value) else None
+
+    def _ensure_read_only_role(self, database: str, *, rotate: bool = False) -> tuple[str, str]:
+        """
+        Create, idempotently, the role the read-only console signs in as.
+
+        The role is ``NOSUPERUSER`` and holds nothing but ``CONNECT`` on this
+        database, ``USAGE`` on its schemas and ``SELECT`` on its tables -
+        re-granted on every call, so a table created after the role's first
+        use is covered by the next read instead of needing a separate
+        migration step. Its attributes are re-applied on every call too, and
+        ``default_transaction_read_only`` is set on the role itself, so a
+        session signed in with its password is read-only even without the
+        console's own ``BEGIN READ ONLY``.
+
+        It can sign in (``LOGIN``) with a random password kept in a 0600 file
+        beside the store (:meth:`_read_only_password_file`). The password is
+        set - as a SCRAM verifier, never in clear - when there is no stored
+        one, which is also how a role provisioned by an earlier 2.0 build,
+        created ``NOLOGIN`` and reached with ``SET ROLE``, gets one; and when
+        ``rotate`` asks for it. The server is told first and the file written
+        after, so a failure in between leaves a role whose password nobody
+        knows and the next call sets a new one, never a stored password the
+        role does not have.
 
         Args:
             database: The database the role is scoped to.
+            rotate: Set a new password even when one is stored.
 
         Returns:
-            The role name.
+            The role name and its password.
 
         Raises:
-            DatabaseQueryError: When the role cannot be created or granted.
+            DatabaseQueryError: When the role cannot be created, granted or
+                given its password, or the password cannot be stored.
         """
         role = _read_only_role_name(database)
         role_literal = self._escape_literal(role)
         role_identifier = self._escape_identifier(role)
+        path = self._read_only_password_file(role)
+
+        password = None if rotate else self._stored_password(path)
+        verifier = None
+        if password is None:
+            password = secrets.token_urlsafe(32)
+            verifier = _scram_sha256_verifier(password)
+        set_password = f" PASSWORD {self._escape_literal(verifier)}" if verifier else ""
+
         provision = (
             "DO $wasm_ro_role$\n"  # noqa: S608 - quoted literal, not interpolated data
             "BEGIN\n"
             f"  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = {role_literal}) "
             "THEN\n"
-            f"    CREATE ROLE {role_identifier} "
-            "NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOLOGIN;\n"
+            # Created without LOGIN and given it below with its password, so
+            # a role whose ALTER failed halfway is one nobody can sign in as.
+            f"    CREATE ROLE {role_identifier} NOLOGIN;\n"
             "  END IF;\n"
             "END\n"
             "$wasm_ro_role$;\n"
+            f"ALTER ROLE {role_identifier} NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT "
+            f"NOREPLICATION NOBYPASSRLS LOGIN{set_password};\n"
+            f"ALTER ROLE {role_identifier} SET default_transaction_read_only = on;\n"
             f"GRANT CONNECT ON DATABASE {self._escape_identifier(database)} TO {role_identifier};\n"
             "DO $wasm_ro_grants$\n"
             "DECLARE\n"
@@ -1176,13 +1495,24 @@ class PostgresManager(BaseDatabaseManager):
             "END\n"
             "$wasm_ro_grants$;\n"
         )
-        success, output = self._execute_sql(provision, database=database)
+        success, output = self._execute_sql(
+            provision, database=database, secrets=(verifier,) if verifier else ()
+        )
         if not success:
             raise DatabaseQueryError(
                 f"Could not provision the read-only console role for '{database}'",
                 details=output.strip(),
             )
-        return role
+
+        if verifier is not None:
+            try:
+                secure_write(path, password + "\n")
+            except OSError as exc:
+                raise DatabaseQueryError(
+                    f"Could not store the password of the read-only role {role}",
+                    details=f"{exc}. Check that {path.parent} is writable by root and retry.",
+                ) from exc
+        return role, password
 
     def get_connection_string(
         self,

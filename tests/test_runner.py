@@ -225,6 +225,32 @@ class TestSecrets:
 
         assert result.output == "HUNTER2"
 
+    def test_feeds_a_file_to_stdin_byte_for_byte(self, real: SubprocessRunner, tmp_path):
+        """A dump reaches the client as its stdin, never named in a command it parses."""
+        data = b"line one\n\x00\xff binary\n"
+        source = tmp_path / "dump.sql"
+        source.write_bytes(data)
+        script = "import sys; sys.stdout.write(sys.stdin.buffer.read().hex())"
+
+        result = real.run([sys.executable, "-c", script], stdin_path=source)
+
+        assert result.output == data.hex()
+
+    def test_input_and_stdin_path_are_exclusive(self, real: SubprocessRunner, tmp_path):
+        source = tmp_path / "dump.sql"
+        source.write_text("x")
+
+        with pytest.raises(ValueError):
+            real.run([sys.executable, "-c", "pass"], input="x", stdin_path=source)
+
+    def test_the_fake_records_the_stdin_file(self, tmp_path):
+        fake = FakeRunner()
+        source = tmp_path / "dump.sql"
+
+        fake.run(["mysql"], stdin_path=source)
+
+        assert fake.stdin_paths == [source]
+
     def test_the_secret_never_appears_in_argv(self, real: SubprocessRunner):
         result = real.run([sys.executable, "-c", "pass"], input="hunter2")
 

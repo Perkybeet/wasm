@@ -49,7 +49,6 @@ from wasm.managers.database.base import (
     parse_tabular_query_output,
     quote_identifier,
     validate_name,
-    validate_path,
 )
 from wasm.managers.database.registry import DatabaseRegistry
 
@@ -989,10 +988,14 @@ class MySQLManager(BaseDatabaseManager):
         """
         Restore a database from a plain or gzipped dump.
 
-        The client has no argv option for "read this file", so the staged dump is
-        named in a ``source`` command sent on stdin. The path is checked against
-        a conservative character set first, because that command is parsed by the
-        client.
+        The staged dump is the client's stdin, read in ``--binary-mode``. Named
+        in a ``source`` command instead, the client read it as a script, and a
+        ``system`` or ``\\!`` line in a restored dump ran a shell as root. Binary
+        mode turns off every client command except ``charset`` and ``delimiter``
+        (which mysqldump's routines and triggers need), ``source`` included,
+        which is why the file cannot be named and is handed over as stdin. The
+        SQL itself still runs with the administrative account's privileges: a
+        restore trusts the dump's SQL, which is why it needs sudo mode.
 
         Args:
             database: Target database name.
@@ -1018,11 +1021,10 @@ class MySQLManager(BaseDatabaseManager):
 
         staged_name = f"{self.ENGINE_NAME}-restore-{database}{self.BACKUP_SUFFIX}"
         with self._staged_backup(backup_path, staged_name) as staged:
-            validate_path(staged, purpose="a MySQL restore")
             with self._credentials() as credentials:
                 result = self._exec(
-                    self._client_argv(credentials, database),
-                    input=f"source {staged}\n",
+                    [*self._client_argv(credentials, database), "--binary-mode"],
+                    stdin_path=staged,
                     timeout=TRANSFER_TIMEOUT,
                 )
 

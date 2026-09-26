@@ -434,16 +434,19 @@ class TestWebhookSignatureFailuresLockTheApplication:
 class TestPostgresReadOnlyRole:
     """See wasm.managers.database.postgres.PostgresManager._ensure_read_only_role."""
 
-    def test_read_mode_runs_the_query_after_set_role(
-        self, postgres: Any, runner: FakeRunner
-    ) -> None:
+    def test_read_mode_signs_in_as_the_role(self, postgres: Any, runner: FakeRunner) -> None:
         runner.script(PSQL_PREFIX, stdout="1\n")
 
         postgres.execute_query(database="shop", query="SELECT 1", read_only=True)
 
+        # Not a superuser session that switched roles, which one SELECT can
+        # switch back (set_config('role', ...)): the login is the role.
         call = runner.calls[-1]
         sent = [call[i + 1] for i, arg in enumerate(call[:-1]) if arg == "-c"]
-        assert sent == ["BEGIN READ ONLY", 'SET ROLE "wasm_ro_shop"', "SELECT 1", "COMMIT"]
+        assert sent == ["BEGIN READ ONLY", "SELECT 1", "COMMIT"]
+        assert call[0] == "psql"
+        assert call[call.index("-U") + 1] == "wasm_ro_shop"
+        assert call[call.index("-h") + 1] == "127.0.0.1"
 
     def test_the_role_is_provisioned_least_privilege(
         self, postgres: Any, runner: FakeRunner
@@ -456,15 +459,15 @@ class TestPostgresReadOnlyRole:
         provisioning = runner.inputs[-2]
         assert "CREATE ROLE" in provisioning
         assert "NOSUPERUSER" in provisioning
-        assert "NOLOGIN" in provisioning
+        assert "LOGIN PASSWORD 'SCRAM-SHA-256$" in provisioning
         assert 'GRANT CONNECT ON DATABASE "shop" TO "wasm_ro_shop";' in provisioning
         assert "GRANT USAGE ON SCHEMA" in provisioning
         assert "GRANT SELECT ON ALL TABLES IN SCHEMA" in provisioning
         # Nothing here reaches for a file-reading, superuser-only function:
-        # pg_read_file/pg_ls_dir are refused by SET ROLE dropping superuser,
-        # not by this statement, but the role it creates asks for none of the
-        # broader grants (ALL PRIVILEGES, pg_read_server_files membership)
-        # that would defeat the point.
+        # pg_read_file/pg_ls_dir are refused because the session signs in as
+        # this role, not by this statement, but the role it creates asks for
+        # none of the broader grants (ALL PRIVILEGES, pg_read_server_files
+        # membership) that would defeat the point.
         assert "ALL PRIVILEGES" not in provisioning
         assert len(runner.calls) == 3
 
@@ -486,8 +489,8 @@ class TestPostgresReadOnlyRole:
 
         postgres.execute_query(database=long_name, query="SELECT 1", read_only=True)
 
-        set_role = next(arg for arg in runner.calls[-1] if arg.startswith("SET ROLE "))
-        role = set_role.removeprefix("SET ROLE ").strip('"')
+        call = runner.calls[-1]
+        role = call[call.index("-U") + 1]
         assert len(role) <= 63
 
 

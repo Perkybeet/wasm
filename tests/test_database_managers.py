@@ -9,10 +9,12 @@ no password is ever visible in ``ps``.
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import re
 import stat
 import tarfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -25,13 +27,12 @@ from wasm.core.exceptions import (
     DatabaseUserError,
 )
 from wasm.core.runner import FakeRunner, SubprocessRunner, set_runner
+from wasm.core.store import WASMStore
 from wasm.managers.database.base import (
     NAME_PATTERN,
     PRIVILEGE_PATTERN,
-    SAFE_PATH_PATTERN,
     quote_identifier,
     validate_name,
-    validate_path,
 )
 from wasm.managers.database.mongodb import MongoDBManager
 from wasm.managers.database.mysql import MySQLManager, escape_option_file_value
@@ -97,20 +98,30 @@ class StubConfig:
 
 
 @pytest.fixture
-def postgres(runner: FakeRunner, tmp_path: Path) -> PostgresManager:
+def postgres(runner: FakeRunner, tmp_path: Path) -> Iterator[PostgresManager]:
     """
     Provide a PostgreSQL manager whose backups land in a temporary directory.
+
+    The store is reopened for the test, because the read-only console keeps
+    its role passwords beside it and the store is a process-wide singleton:
+    without this, one test would read the password another test stored.
 
     Args:
         runner: The fake runner installed process-wide.
         tmp_path: Per-test temporary directory.
 
-    Returns:
+    Yields:
         A configured manager.
     """
+    WASMStore.reset_instance()
     manager = PostgresManager()
     manager.BACKUP_DIR = tmp_path / "backups"
-    return manager
+    # The host's own /etc/wasm/config.yaml must not leak into the argv tables.
+    manager.config = StubConfig({})
+    try:
+        yield manager
+    finally:
+        WASMStore.reset_instance()
 
 
 @pytest.fixture
@@ -463,7 +474,7 @@ def test_postgres_gzipped_restore_decompresses_without_a_pipe(
     """Decompression is a program with arguments, not a shell redirection."""
     runner.script(PSQL_PREFIX, stdout="1")
     dump = tmp_path / "dump.sql.gz"
-    dump.write_bytes(b"gzipped")
+    dump.write_bytes(gzip.compress(NASTY_DUMP.encode("latin-1")))
 
     postgres.restore("shop", dump)
 
@@ -512,7 +523,15 @@ def test_mysql_backup_argv(mysql: MySQLManager, runner: FakeRunner) -> None:
 def test_mysql_restore_reads_the_staged_file_through_the_client(
     mysql: MySQLManager, runner: FakeRunner, tmp_path: Path
 ) -> None:
-    """The dump is named in a source command on stdin, never in argv."""
+    """
+    The dump is the client's stdin in binary mode, so client commands in it do not run.
+
+    Named in a ``source`` command, the client read the dump as a script: a
+    ``system`` or ``\\!`` line in a restored dump ran a shell as root.
+    ``--binary-mode`` turns every client command except ``charset`` and
+    ``delimiter`` off, and ``source`` with them, which is why the file is
+    handed over as stdin instead.
+    """
     existing_database(mysql)
     dump = tmp_path / "dump.sql"
     dump.write_text(NASTY_DUMP)
@@ -520,8 +539,9 @@ def test_mysql_restore_reads_the_staged_file_through_the_client(
     mysql.restore("shop", dump)
 
     staged = mysql.BACKUP_DIR / ".staging" / "mysql-restore-shop.sql"
-    assert runner.calls[-1] == ("mysql", "-N", "-B", "-D", "shop")
-    assert runner.inputs[-1] == f"source {staged}\n"
+    assert runner.calls[-1] == ("mysql", "-N", "-B", "-D", "shop", "--binary-mode")
+    assert runner.inputs[-1] is None
+    assert runner.stdin_paths[-1] == staged
 
 
 def test_mysql_install_argv(mysql: MySQLManager, runner: FakeRunner) -> None:
@@ -834,14 +854,6 @@ def test_validate_name_reports_the_limit_it_enforces() -> None:
     assert "at most 64" in str(excinfo.value)
 
 
-def test_validate_path_refuses_a_path_a_client_would_reparse() -> None:
-    """A path handed to a client command may not carry quoting or separators."""
-    with pytest.raises(Exception) as excinfo:
-        validate_path(Path("/backups/dump';DROP.sql"), purpose="a MySQL restore")
-
-    assert "Unsafe path" in str(excinfo.value)
-
-
 # ==================== Passwords stay out of argv ====================
 
 
@@ -1027,15 +1039,6 @@ def test_validate_name_refuses_a_trailing_newline(name: str) -> None:
         validate_name(name, kind="database", engine="PostgreSQL", max_length=63)
 
 
-@pytest.mark.parametrize(
-    "path", ["/backups/dump.sql\n", "/backups/dump.sql\n/etc/passwd", "/backups/dump.sql\r"]
-)
-def test_validate_path_refuses_a_trailing_newline(path: str) -> None:
-    """A newline ends a client command line, so it may not pass the path check."""
-    with pytest.raises(DatabaseBackupError):
-        validate_path(Path(path), purpose="a MySQL restore")
-
-
 @pytest.mark.parametrize("rule", ["+@all\n", "-@admin\r", "~cache:*\n", "&events.*\n"])
 def test_redis_acl_rules_refuse_a_trailing_newline(redis: RedisManager, rule: str) -> None:
     """The ACL grammar is anchored at both ends, newline included."""
@@ -1047,7 +1050,6 @@ def test_redis_acl_rules_refuse_a_trailing_newline(redis: RedisManager, rule: st
     ("pattern", "accepted"),
     [
         (NAME_PATTERN, "shop"),
-        (SAFE_PATH_PATTERN, "/backups/dump.sql"),
         (PRIVILEGE_PATTERN, "ALL PRIVILEGES"),
         (ACL_COMMAND_PATTERN, "+@all"),
         (ACL_PATTERN_RULE, "~cache:*"),
@@ -1416,9 +1418,11 @@ class TestStructuredQuery:
         postgres.execute_query_structured(database="app", query="SELECT 1", read_only=True)
 
         sent = _command_strings(runner.calls[-1])
-        assert sent[0] == "BEGIN READ ONLY"
-        assert sent[1].startswith("SET ROLE ")
-        assert sent[-1] == "COMMIT"
+        assert sent == ["BEGIN READ ONLY", "SELECT 1", "COMMIT"]
+        # Signed in as the read-only role, not a superuser session that
+        # switched roles: see tests/test_database_console_injection.py.
+        assert runner.calls[-1][0] == "psql"
+        assert runner.calls[-1][runner.calls[-1].index("-U") + 1] == "wasm_ro_app"
 
     def test_postgres_caps_rows_and_reports_truncation(self, postgres, runner):
         runner.script(["runuser", "-u", "postgres", "--", "psql"], stdout="1\n")

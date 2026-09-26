@@ -263,9 +263,17 @@ TLS. Everything is `Cache-Control: no-store` except the content-hashed files und
 The console's SQL runner is read-only unless told otherwise, and that is enforced by the
 database server, not by inspecting the statement:
 
-- **PostgreSQL**: the statement runs in a `READ ONLY` transaction under a dedicated role with
-  no superuser rights, reached with `SET ROLE`, and granted only `CONNECT`, `USAGE` and
-  `SELECT`. Superuser-only functions such as `pg_read_file` are out of reach.
+- **PostgreSQL**: the statement runs in a `READ ONLY` transaction in a session that signs in
+  over `127.0.0.1`, with a password, as a dedicated role `wasm_ro_<database>`: not a
+  superuser, `default_transaction_read_only` on, granted only `CONNECT`, `USAGE` and `SELECT`.
+  Because the login itself is the limit, `SET ROLE`, `RESET ROLE`, `set_config('role', ...)`
+  and `SET SESSION AUTHORIZATION` have nothing to return to, and the server refuses
+  superuser-only functions such as `pg_read_file` and `COPY ... TO PROGRAM`. The password is
+  random, set as a SCRAM verifier, and kept in a 0600 root-owned file under
+  `/var/lib/wasm/secrets/postgresql/`. `pg_hba.conf` must allow
+  `host <database> wasm_ro_<database> 127.0.0.1/32 scram-sha-256` (the Debian and Ubuntu
+  default `host all all 127.0.0.1/32` line does); if it does not, read mode fails with that
+  line in the error and never falls back to the superuser.
 - **MySQL and MariaDB**: the statement runs in a `READ ONLY` transaction as a dedicated
   account with `SELECT` on that one database and nothing else (no `FILE`, so no
   `LOAD_FILE()` or `INTO OUTFILE`). Its password is rotated on every call and never stored.
@@ -274,6 +282,18 @@ database server, not by inspecting the statement:
 
 Only one statement is accepted per request. The statement text is logged by the console
 process (logger `wasm.audit`); the request itself is in the audit log like every mutation.
+
+The statement reaches the client as data, never as a script: psql gets it as a `-c` string
+(a leading backslash is refused) and mysql reads it in `--binary-mode` with its client
+commands (`system`, `\!`, `source`, `tee`, `pager`) refused, so no shell escape is reachable
+from the console.
+
+Restoring a dump runs its SQL with the engine's administrative account, so a restore trusts
+the dump's SQL; it needs sudo mode and is audited. The client never reads the dump as a
+script: a PostgreSQL plain dump with psql meta-commands (`\!`, `\o`, `\set`, `\connect`)
+outside its COPY data is refused before anything is dropped, pg_dump's own
+`\restrict`/`\unrestrict` excepted; MySQL and MariaDB read the dump on stdin in
+`--binary-mode`, where `system`, `\!` and `source` are off.
 
 ## Outbound requests
 

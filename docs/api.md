@@ -419,8 +419,9 @@ Request and response bodies are in `/api/openapi.json`.
 | `DELETE /api/databases/databases/{engine}/{name}` | sudo |
 | `POST /api/databases/users`, `/users/grant`, `/users/revoke`; `GET /api/databases/users/{engine}` | |
 | `DELETE /api/databases/users/{engine}/{username}` | sudo |
-| `GET`, `POST /api/databases/backups`; `POST /api/databases/backups/restore` | |
-| `POST /api/databases/query` | One statement; `mode: "write"` needs sudo |
+| `GET`, `POST /api/databases/backups` | |
+| `POST /api/databases/backups/restore` | sudo. A PostgreSQL plain dump holding a psql meta-command (`\!`, `\o`, `\connect`...) outside COPY data is refused before anything is dropped |
+| `POST /api/databases/query` | One statement; `mode: "write"` needs sudo. PostgreSQL read mode signs in over `127.0.0.1` as `wasm_ro_<database>` with a password, so `pg_hba.conf` must allow `host <database> wasm_ro_<database> 127.0.0.1/32 scram-sha-256` (Debian and Ubuntu's default `host all all 127.0.0.1/32` line does) |
 | `POST /api/databases/connection-string` | |
 
 ### Machine, monitor, configuration, audit, authentication

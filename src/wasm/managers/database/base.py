@@ -89,9 +89,6 @@ STAGING_DIR_MODE = 0o711
 #: that needs quoting to be safe is a name nobody wants to type.
 NAME_PATTERN = re.compile(r"\A[A-Za-z0-9_][A-Za-z0-9_$-]*\Z")
 
-#: Filesystem paths that may be handed to a client's own file-reading command.
-SAFE_PATH_PATTERN = re.compile(r"\A[A-Za-z0-9_./-]+\Z")
-
 #: Privileges are keywords, optionally multi-word ("ALL PRIVILEGES"). Anything
 #: with punctuation is an injection attempt, not a privilege.
 PRIVILEGE_PATTERN = re.compile(r"\A[A-Z]+(?: [A-Z]+)*\Z")
@@ -208,37 +205,6 @@ def validate_privileges(
             details=f"Allowed {engine} privileges: {', '.join(sorted(allowed))}.",
         )
     return tuple(seen)
-
-
-def validate_path(path: Path, *, purpose: str) -> Path:
-    """
-    Check that a path may be embedded in a client's own file-reading command.
-
-    Some clients (the MySQL shell, for one) have no argv option for "read this
-    file", only an in-band ``source`` command. Such a path must not contain
-    anything that the client's parser could read as syntax.
-
-    Args:
-        path: Candidate path.
-        purpose: What the path is for, used in the error message.
-
-    Returns:
-        The path, unchanged.
-
-    Raises:
-        DatabaseBackupError: When the path contains anything but letters,
-            digits, dot, slash, dash or underscore. A newline anywhere, final
-            one included, is what would end the command and start another.
-    """
-    if not SAFE_PATH_PATTERN.match(str(path)):
-        raise DatabaseBackupError(
-            f"Unsafe path for {purpose}: {path}",
-            details=(
-                "Move the file to a path made only of letters, digits and the characters "
-                "._-/ before retrying."
-            ),
-        )
-    return path
 
 
 @dataclass
@@ -423,9 +389,11 @@ def console_statement(query: str, *, read_only: bool) -> str:
     The engine-neutral half of the console guard; each SQL manager adds the
     rule for its own client's command syntax. Read mode is held to one
     statement here, at the manager, and not only by the API and the CLI: a
-    second statement can close the read-only transaction and drop the
-    least-privilege role (``SELECT 1; COMMIT; RESET ROLE; ...``), and a guard
-    kept in the callers has as many holes as there are callers.
+    second statement can close the read-only transaction
+    (``SELECT 1; COMMIT; DELETE ...``). The least-privilege account the
+    session signs in as would still refuse the write, but each limit is
+    kept whole on its own, and a guard kept in the callers has as many holes
+    as there are callers.
 
     Args:
         query: The statement as the operator typed it.
@@ -516,6 +484,7 @@ class BaseDatabaseManager(BaseManager):
         argv: Sequence[str],
         *,
         input: str | None = None,
+        stdin_path: Path | None = None,
         env: Mapping[str, str] | None = None,
         timeout: int = QUERY_TIMEOUT,
         secrets: Sequence[str] = (),
@@ -528,6 +497,8 @@ class BaseDatabaseManager(BaseManager):
             argv: Program and arguments. Never a shell string.
             input: Data written to the process stdin. Statements carrying a
                 password go here instead of into argv.
+            stdin_path: A file given to the process as its stdin, for a dump
+                the client must read as data rather than name in a command.
             env: Extra environment variables.
             timeout: Deadline in seconds.
             secrets: Values to keep out of the logs.
@@ -541,7 +512,13 @@ class BaseDatabaseManager(BaseManager):
             The command outcome.
         """
         return self.runner.run(
-            argv, input=input, env=env, timeout=timeout, secrets=secrets, user=user
+            argv,
+            input=input,
+            stdin_path=stdin_path,
+            env=env,
+            timeout=timeout,
+            secrets=secrets,
+            user=user,
         )
 
     # ==================== Passwords ====================

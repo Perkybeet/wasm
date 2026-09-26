@@ -25,6 +25,7 @@ class that this module exists to make impossible:
 
 from __future__ import annotations
 
+import contextlib
 import os
 import queue
 import shutil
@@ -200,6 +201,7 @@ class CommandRunner(ABC):
         env: Mapping[str, str] | None = None,
         timeout: int = DEFAULT_TIMEOUT,
         input: str | None = None,
+        stdin_path: Path | None = None,
         user: str | None = None,
         check: bool = False,
         secrets: Sequence[str] = (),
@@ -214,6 +216,9 @@ class CommandRunner(ABC):
             timeout: Deadline in seconds.
             input: Data written to the process stdin, then closed. This is how
                 secrets are passed to programs that accept them on stdin.
+            stdin_path: A file given to the process as its stdin, byte for byte.
+                How a dump reaches a client without being named in a command
+                the client would parse as a script. Exclusive with ``input``.
             user: Run as this account instead of the current one.
             check: Raise CommandError instead of returning a failed result.
             secrets: Literal values to redact from the recorded command line.
@@ -356,23 +361,29 @@ class SubprocessRunner(CommandRunner):
         env: Mapping[str, str] | None = None,
         timeout: int = DEFAULT_TIMEOUT,
         input: str | None = None,
+        stdin_path: Path | None = None,
         user: str | None = None,
         check: bool = False,
         secrets: Sequence[str] = (),
     ) -> CommandResult:
+        if input is not None and stdin_path is not None:
+            raise ValueError("input and stdin_path are exclusive: a process has one stdin")
         args, run_env, redacted = self._prepare(argv, env, user, secrets)
         started = time.monotonic()
         try:
-            completed = subprocess.run(
-                args,
-                cwd=str(cwd) if cwd else None,
-                env=run_env,
-                input=input,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
+            with contextlib.ExitStack() as stack:
+                stdin = stack.enter_context(open(stdin_path, "rb")) if stdin_path else None
+                completed = subprocess.run(
+                    args,
+                    cwd=str(cwd) if cwd else None,
+                    env=run_env,
+                    input=input,
+                    stdin=stdin,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    check=False,
+                )
         except subprocess.TimeoutExpired:
             result = CommandResult(
                 argv=redacted,
@@ -698,6 +709,7 @@ class DryRunRunner(CommandRunner):
         env: Mapping[str, str] | None = None,
         timeout: int = DEFAULT_TIMEOUT,
         input: str | None = None,
+        stdin_path: Path | None = None,
         user: str | None = None,
         check: bool = False,
         secrets: Sequence[str] = (),
@@ -709,6 +721,7 @@ class DryRunRunner(CommandRunner):
                 env=env,
                 timeout=timeout,
                 input=input,
+                stdin_path=stdin_path,
                 user=user,
                 check=check,
                 secrets=secrets,
@@ -773,6 +786,7 @@ class FakeRunner(CommandRunner):
         """
         self.calls: list[tuple[str, ...]] = []
         self.inputs: list[str | None] = []
+        self.stdin_paths: list[Path] = []
         self.written: dict[Path, tuple[str, ...]] = {}
         self._scripted: list[FakeCommand] = []
         self._default_exit_code = default_exit_code
@@ -864,11 +878,14 @@ class FakeRunner(CommandRunner):
         env: Mapping[str, str] | None = None,
         timeout: int = DEFAULT_TIMEOUT,
         input: str | None = None,
+        stdin_path: Path | None = None,
         user: str | None = None,
         check: bool = False,
         secrets: Sequence[str] = (),
     ) -> CommandResult:
         self.inputs.append(input)
+        if stdin_path is not None:
+            self.stdin_paths.append(stdin_path)
         result = self._lookup(argv, user)
         return result.check() if check else result
 
