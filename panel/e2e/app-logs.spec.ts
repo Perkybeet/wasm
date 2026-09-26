@@ -8,6 +8,7 @@
 import { expect, expectNoA11yViolations, settle, signIn, test } from "./fixtures";
 
 const DOMAIN = "tienda.cittek.es";
+const PHONE = { width: 390, height: 844 };
 
 test("the journal streams in, `/` searches it and counts the matches", async ({ page, consoleServer }) => {
   await signIn(page, consoleServer, `/apps/${DOMAIN}/logs`);
@@ -33,6 +34,27 @@ test("the journal streams in, `/` searches it and counts the matches", async ({ 
 
   await settle(page);
   await expectNoA11yViolations(page, "an app's journal");
+});
+
+test("on a phone the journal wraps by default and the toolbar stays on screen", async ({ page, consoleServer }) => {
+  await page.setViewportSize(PHONE);
+  await signIn(page, consoleServer, `/apps/${DOMAIN}/logs`);
+  const journal = page.getByRole("region", { name: `Journal of ${DOMAIN}` });
+  await expect(journal.getByText(/tienda-cittek-es\[\d+\]: /).first()).toBeVisible();
+  await expect(page.getByRole("button", { name: "Wrap lines" })).toHaveAttribute("aria-pressed", "true");
+
+  // The fullest toolbar state: an active search shows the match counter and step buttons
+  // alongside follow, wrap, copy and download, and none of it may push the page sideways.
+  await journal.click();
+  await page.keyboard.press("/");
+  await expect(page.getByRole("searchbox", { name: "Search output" })).toBeFocused();
+  await page.keyboard.type("ECONNREFUSED");
+  await expect(page.getByText(/^1 of \d+$/)).toBeVisible();
+
+  await settle(page);
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  expect(overflow).toBeLessThanOrEqual(0);
+  await expectNoA11yViolations(page, "an app's journal on a phone");
 });
 
 test("a static site says it has no process to log", async ({ page, consoleServer }) => {

@@ -1,9 +1,8 @@
 import { createFileRoute } from "@tanstack/react-router";
 
 import type { MetricWindow } from "../../api/queries/metrics";
+import { WINDOWS } from "../../features/overview/MachineCharts";
 import { OverviewPage } from "../../features/overview/OverviewPage";
-
-const WINDOWS: readonly MetricWindow[] = ["1h", "24h", "30d"];
 
 interface OverviewSearch {
   /** The machine charts' time range; the last hour when absent. */
@@ -12,7 +11,8 @@ interface OverviewSearch {
 
 function validateSearch(search: Record<string, unknown>): OverviewSearch {
   const window = search["window"];
-  return typeof window === "string" && (WINDOWS as readonly string[]).includes(window) ? { window: window as MetricWindow } : {};
+  const known = WINDOWS.find((option) => option.value === window);
+  return known === undefined ? {} : { window: known.value };
 }
 
 export const Route = createFileRoute("/_console/")({

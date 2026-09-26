@@ -51,7 +51,7 @@ describe("a session that expires while the console is open", () => {
     const { expire, revive } = expiringBackend();
     const path = "/apps/shop.example.com/environment";
     const { user, location, queryClient } = renderConsole(path);
-    await screen.findByText("Environment variables");
+    await screen.findByRole("heading", { level: 2, name: "Variables" });
     queryClient.setQueryData(appKeys.list, { apps: [], total: 0 });
 
     expire();
@@ -75,7 +75,7 @@ describe("a session that expires while the console is open", () => {
     revive();
     await user.type(screen.getByLabelText("Access token"), "wasm_token");
     await user.click(screen.getByRole("button", { name: "Sign in" }));
-    await screen.findByText("Environment variables");
+    await screen.findByRole("heading", { level: 2, name: "Variables" });
     expect(location().pathname).toBe(path);
   });
 

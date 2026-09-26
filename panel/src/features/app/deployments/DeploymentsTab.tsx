@@ -12,6 +12,7 @@ import { ErrorBlock } from "../../../components/page/QueryState";
 import { RelativeTime } from "../../../components/page/RelativeTime";
 import { Section } from "../../../components/page/Section";
 import { Button } from "../../../components/ui/Button";
+import { Badge } from "../../../components/ui/Badge";
 import { DataTable } from "../../../components/ui/DataTable";
 import type { Column } from "../../../components/ui/DataTable";
 import { EmptyState } from "../../../components/ui/EmptyState";
@@ -66,20 +67,27 @@ function columns(domain: string): Column<Deployment>[] {
       cell: (row) => {
         const commit = shortCommit(row.git_commit);
         return (
-          <span className="flex min-w-0 items-baseline gap-2">
-            {commit ? (
-              <span translate="no" className="mono text-12 text-fg">
-                {commit}
-              </span>
-            ) : (
-              <span className="text-12 text-fg-faint">No commit</span>
-            )}
-            {row.git_branch ? (
-              <span translate="no" className="mono hidden truncate text-12 text-fg-faint sm:inline">
-                {row.git_branch}
+          <div className="flex min-w-0 flex-col py-1.5 leading-4">
+            <span className="flex min-w-0 items-baseline gap-2">
+              {commit ? (
+                <span translate="no" className="mono text-12 text-fg">
+                  {commit}
+                </span>
+              ) : (
+                <span className="text-12 text-fg-faint">No commit</span>
+              )}
+              {row.git_branch ? (
+                <span translate="no" className="mono hidden truncate text-12 text-fg-faint sm:inline">
+                  {row.git_branch}
+                </span>
+              ) : null}
+            </span>
+            {row.commit_message ? (
+              <span title={row.commit_message} className="hidden max-w-[24rem] truncate text-12 text-fg-faint md:block">
+                {row.commit_message}
               </span>
             ) : null}
-          </span>
+          </div>
         );
       },
     },
@@ -133,10 +141,11 @@ function History({ domain }: { domain: string }) {
       description="Every deploy and update of this app, newest first. Each one opens its build log."
       badge={
         pages.data ? (
-          <span className="mono text-12 text-fg-faint">
+          // The same count badge every section title carries.
+          <Badge>
             {formatCount(total)}
             <span className="sr-only"> in total</span>
-          </span>
+          </Badge>
         ) : undefined
       }
     >

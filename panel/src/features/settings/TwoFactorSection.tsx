@@ -1,13 +1,14 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Download, ShieldCheck, ShieldOff, TriangleAlert } from "lucide-react";
 import { useId, useRef, useState } from "react";
-import type { SyntheticEvent } from "react";
+import type { RefObject, SyntheticEvent } from "react";
 
 import {
   authKeys,
   confirmTwoFactor,
   disableTwoFactor,
   enrollTwoFactor,
+  regenerateBackupCodes,
   sessionQuery,
   twoFactorQuery,
 } from "../../api/queries/auth";
@@ -104,64 +105,20 @@ function EnrollDialog({ open, enrollment, onClose }: EnrollDialogProps) {
 
   if (codes !== null) {
     return (
-      <Dialog
+      <BackupCodesDialog
         open={open}
-        onOpenChange={onOpenChange}
-        size="md"
-        title="Save your backup codes"
+        codes={codes}
+        hostname={hostname}
         description="Two-factor authentication is on. Each backup code signs in once if your authenticator is lost. WASM keeps only their hashes, so this is the only time they are shown."
-        footer={
-          <Button
-            variant="primary"
-            disabled={!saved}
-            onClick={() => {
-              onOpenChange(false);
-            }}
-          >
-            Done
-          </Button>
-        }
-      >
-        <div className="flex flex-col gap-4">
-          <ul aria-label="Backup codes" className="grid grid-cols-2 gap-x-6 gap-y-2 rounded-control border border-border bg-bg-sunken px-4 py-3">
-            {codes.map((backup) => (
-              <li key={backup} translate="no" className="mono text-14 tracking-wide text-fg select-all">
-                {backup}
-              </li>
-            ))}
-          </ul>
-          <div className="flex flex-wrap items-center gap-2">
-            <CopyTextButton value={codes.join("\n")} size="sm">
-              Copy codes
-            </CopyTextButton>
-            <Button
-              size="sm"
-              icon={<Download aria-hidden="true" />}
-              onClick={() => {
-                downloadText(`wasm-backup-codes-${hostname}.txt`, backupCodesFile(codes, hostname));
-              }}
-            >
-              Download as text
-            </Button>
-          </div>
-          <div ref={savedRef} className={cx("rounded-control border p-3", nudge ? "border-warn/50 bg-warn-soft" : "border-transparent")}>
-            <Checkbox
-              label="I have saved these codes somewhere safe"
-              checked={saved}
-              onCheckedChange={(next) => {
-                setSaved(next);
-                if (next) setNudge(false);
-              }}
-            />
-            {nudge ? (
-              <p role="alert" className="mt-2 flex items-start gap-2 text-13 text-fg">
-                <TriangleAlert aria-hidden="true" className="mt-0.5 size-3.5 shrink-0 text-warn" />
-                Save the codes and tick the box first. They cannot be shown again.
-              </p>
-            ) : null}
-          </div>
-        </div>
-      </Dialog>
+        saved={saved}
+        nudge={nudge}
+        savedRef={savedRef}
+        onSavedChange={(next) => {
+          setSaved(next);
+          if (next) setNudge(false);
+        }}
+        onOpenChange={onOpenChange}
+      />
     );
   }
 
@@ -243,6 +200,168 @@ function EnrollDialog({ open, enrollment, onClose }: EnrollDialogProps) {
           </li>
         </ol>
       ) : null}
+    </Dialog>
+  );
+}
+
+// ---------------------------------------------------------------------------------------
+// Backup codes, shown once
+
+interface BackupCodesDialogProps {
+  open: boolean;
+  codes: readonly string[];
+  hostname: string;
+  description: string;
+  saved: boolean;
+  /** The operator tried to close without ticking the box: say why they cannot yet. */
+  nudge: boolean;
+  savedRef: RefObject<HTMLDivElement | null>;
+  onSavedChange: (saved: boolean) => void;
+  onOpenChange: (open: boolean) => void;
+}
+
+/**
+ * A set of backup codes, the only time it is shown: copy, download, and a box to tick before
+ * the dialog lets go, since closing it loses the codes for good. Used when two-factor is turned
+ * on and when a new set replaces the old one.
+ */
+function BackupCodesDialog({ open, codes, hostname, description, saved, nudge, savedRef, onSavedChange, onOpenChange }: BackupCodesDialogProps) {
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={onOpenChange}
+      size="md"
+      title="Save your backup codes"
+      description={description}
+      footer={
+        <Button
+          variant="primary"
+          disabled={!saved}
+          onClick={() => {
+            onOpenChange(false);
+          }}
+        >
+          Done
+        </Button>
+      }
+    >
+      <div className="flex flex-col gap-4">
+        <ul aria-label="Backup codes" className="grid grid-cols-2 gap-x-6 gap-y-2 rounded-control border border-border bg-bg-sunken px-4 py-3">
+          {codes.map((backup) => (
+            <li key={backup} translate="no" className="mono text-14 tracking-wide text-fg select-all">
+              {backup}
+            </li>
+          ))}
+        </ul>
+        <div className="flex flex-wrap items-center gap-2">
+          <CopyTextButton value={codes.join("\n")} size="sm">
+            Copy codes
+          </CopyTextButton>
+          <Button
+            size="sm"
+            icon={<Download aria-hidden="true" />}
+            onClick={() => {
+              downloadText(`wasm-backup-codes-${hostname}.txt`, backupCodesFile(codes, hostname));
+            }}
+          >
+            Download as text
+          </Button>
+        </div>
+        <div ref={savedRef} className={cx("rounded-control border p-3", nudge ? "border-warn/50 bg-warn-soft" : "border-transparent")}>
+          <Checkbox label="I have saved these codes somewhere safe" checked={saved} onCheckedChange={onSavedChange} />
+          {nudge ? (
+            <p role="alert" className="mt-2 flex items-start gap-2 text-13 text-fg">
+              <TriangleAlert aria-hidden="true" className="mt-0.5 size-3.5 shrink-0 text-warn" />
+              Save the codes and tick the box first. They cannot be shown again.
+            </p>
+          ) : null}
+        </div>
+      </div>
+    </Dialog>
+  );
+}
+
+/**
+ * A new set of backup codes: asked for first (the old codes stop working), then the server
+ * asks for "Confirm it's you" if the session is not elevated, then the new set, shown once.
+ */
+function RegenerateCodesDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const refresh = useRefreshTwoFactor();
+  const { data: session } = useQuery(sessionQuery());
+  const hostname = session?.hostname ?? "this server";
+  const [codes, setCodes] = useState<readonly string[] | null>(null);
+  const [saved, setSaved] = useState(false);
+  const [nudge, setNudge] = useState(false);
+  const savedRef = useRef<HTMLDivElement>(null);
+
+  const regenerate = useMutation({
+    mutationFn: regenerateBackupCodes,
+    onSuccess: (result) => {
+      setCodes(result.backup_codes);
+      refresh();
+    },
+  });
+
+  const onOpenChange = (next: boolean): void => {
+    if (next || regenerate.isPending) return;
+    if (codes !== null && !saved) {
+      setNudge(true);
+      savedRef.current?.querySelector<HTMLElement>("[role=checkbox]")?.focus();
+      return;
+    }
+    if (codes !== null) toast.success("Replaced the backup codes");
+    onClose();
+  };
+
+  if (codes !== null) {
+    return (
+      <BackupCodesDialog
+        open={open}
+        codes={codes}
+        hostname={hostname}
+        description="The old codes no longer work. Each of these signs in once if your authenticator is lost; this is the only time they are shown."
+        saved={saved}
+        nudge={nudge}
+        savedRef={savedRef}
+        onSavedChange={(next) => {
+          setSaved(next);
+          if (next) setNudge(false);
+        }}
+        onOpenChange={onOpenChange}
+      />
+    );
+  }
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={onOpenChange}
+      size="sm"
+      title="Replace your backup codes?"
+      description="A new set of backup codes is made and the old ones stop working, used or not. Keep the new set somewhere safe."
+      footer={
+        <>
+          <Button
+            disabled={regenerate.isPending}
+            onClick={() => {
+              onOpenChange(false);
+            }}
+          >
+            Cancel
+          </Button>
+          <Button
+            variant="primary"
+            loading={regenerate.isPending}
+            onClick={() => {
+              regenerate.mutate();
+            }}
+          >
+            Replace backup codes
+          </Button>
+        </>
+      }
+    >
+      {regenerate.isError ? <ErrorBlock live compact error={regenerate.error} title="The backup codes were not replaced" /> : null}
     </Dialog>
   );
 }
@@ -349,9 +468,7 @@ function Status({ status }: { status: TwoFactorStatus }) {
               {`${String(status.backup_codes_remaining)} of ${String(BACKUP_CODES)} backup codes left`}
             </span>
           </p>
-          {few ? (
-            <p className="text-13 text-fg-muted">For a new set, turn two-factor authentication off and set it up again.</p>
-          ) : null}
+          {few ? <p className="text-13 text-fg-muted">Replace them with a new set before they run out.</p> : null}
         </div>
       </div>
     );
@@ -376,6 +493,7 @@ export function TwoFactorSection() {
   const [enrollment, setEnrollment] = useState<TwoFactorEnrollment | null>(null);
   const [enrolling, setEnrolling] = useState(false);
   const [disabling, setDisabling] = useState(false);
+  const [regenerating, setRegenerating] = useState(false);
   const enroll = useMutation({
     mutationFn: enrollTwoFactor,
     onSuccess: (result) => {
@@ -393,15 +511,24 @@ export function TwoFactorSection() {
     body = (
       <div className="flex flex-col gap-4 rounded-card border border-border bg-surface p-5 shadow-raised sm:flex-row sm:items-start sm:justify-between">
         <Status status={status} />
-        <div className="shrink-0">
+        <div className="flex shrink-0 flex-wrap gap-2">
           {status.enabled ? (
-            <Button
-              onClick={() => {
-                setDisabling(true);
-              }}
-            >
-              Turn off
-            </Button>
+            <>
+              <Button
+                onClick={() => {
+                  setRegenerating(true);
+                }}
+              >
+                New backup codes
+              </Button>
+              <Button
+                onClick={() => {
+                  setDisabling(true);
+                }}
+              >
+                Turn off
+              </Button>
+            </>
           ) : (
             <Button
               variant="primary"
@@ -458,6 +585,15 @@ export function TwoFactorSection() {
           setDisabling(false);
         }}
       />
+      {/* Mounted per opening: every replacement starts from a clean state. */}
+      {regenerating ? (
+        <RegenerateCodesDialog
+          open
+          onClose={() => {
+            setRegenerating(false);
+          }}
+        />
+      ) : null}
     </SettingsSection>
   );
 }

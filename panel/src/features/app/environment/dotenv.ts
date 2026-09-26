@@ -11,10 +11,15 @@
  * The grammar, in Python's terms: the text is read with universal newlines (`\r\n` and a
  * lone `\r` become `\n`), split with `str.splitlines()`, and each line `str.strip()`ped.
  * Blank lines and lines starting with `#` are skipped, so is a line without `=`. The line is
- * split at its first `=`; name and value are stripped again, and one pair of matching quotes
- * (`"..."` or `'...'`) around the value is removed. Nothing else: no escapes, no `export`
- * keyword, no inline comments. A later line for the same name replaces the value and keeps
- * the name's first position.
+ * split at its first `=`; name and value are stripped again, a leading `export` keyword (the
+ * lowercase word and the spaces or tabs after it) is dropped from the name the way a shell
+ * sourcing the file would, and one pair of matching quotes (`"..."` or `'...'`) around the value
+ * is removed. Nothing else: no escapes, no inline comments. A later line for the same name
+ * replaces the value and keeps the name's first position.
+ *
+ * The writer quotes a value only when writing it bare would change how it reads back
+ * (surrounding spaces, or a value that is itself wrapped in a pair of quotes), so every value
+ * the API accepts is read back exactly as it was saved.
  */
 
 /** Characters Python's `str.isspace()` is true for: what `str.strip()` removes. */
@@ -41,6 +46,13 @@ function unquote(value: string): string {
   const first = value[0];
   const last = value[value.length - 1];
   return (first === '"' && last === '"') || (first === "'" && last === "'") ? value.slice(1, -1) : value;
+}
+
+/** `EnvManager._EXPORT_PREFIX`: `export` and at least one space or tab, consumed whole. */
+const EXPORT_PREFIX = /^export[ \t]+(.*)$/s;
+
+function withoutExport(name: string): string {
+  return EXPORT_PREFIX.exec(name)?.[1] ?? name;
 }
 
 export interface ParsedLine {
@@ -80,7 +92,7 @@ export function parseDotenv(text: string): ParsedDotenv {
       skipped.push({ line: index + 1, name: line, value: "" });
       return;
     }
-    const name = pythonStrip(line.slice(0, at));
+    const name = withoutExport(pythonStrip(line.slice(0, at)));
     const value = unquote(pythonStrip(line.slice(at + 1)));
     variables.set(name, value);
     assignments.push({ line: index + 1, name, value });
@@ -113,9 +125,6 @@ export function isValidName(name: string): boolean {
 export function nameProblem(name: string): string | null {
   if (isValidName(name)) return null;
   if (name === "") return "A line has a value but no name before the =.";
-  if (/^export\s+/.test(name)) {
-    return `"${name}" is not a variable name: WASM reads .env files literally and does not strip "export".`;
-  }
   return `"${name}" is not a variable name. Names start with a letter or underscore and hold only letters, digits and underscores.`;
 }
 
@@ -126,25 +135,4 @@ export function valueProblem(value: string): string | null {
   const char = match[0];
   const code = char.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0");
   return `The value contains ${CONTROL_NAMES[char] ?? `the control character U+${code}`}, which a systemd unit cannot hold.`;
-}
-
-/** Lines that start with `export `, the shell form WASM does not understand. */
-const EXPORT_LINE = /^([^\S\r\n]*)export[^\S\r\n]+(?=[^\s=]+[^\S\r\n]*=)/gm;
-
-export function hasExportPrefixes(text: string): boolean {
-  EXPORT_LINE.lastIndex = 0;
-  return EXPORT_LINE.test(text);
-}
-
-/** The same text with every `export ` prefix removed, and nothing else changed. */
-export function removeExportPrefixes(text: string): string {
-  return text.replace(EXPORT_LINE, "$1");
-}
-
-/**
- * What WASM will read back after writing this value. The writer puts `NAME=value` on a line
- * unquoted, so a value with surrounding spaces or quotes comes back different.
- */
-export function readBack(value: string): string {
-  return parseDotenv(`X=${value}\n`).variables.get("X") ?? "";
 }

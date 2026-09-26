@@ -2,7 +2,7 @@ import { FolderOpen, GitBranch, GitCommitHorizontal } from "lucide-react";
 
 import { Badge } from "../../components/ui/Badge";
 import { sourceKind, typeName } from "./wizard";
-import type { Inspection } from "./wizard";
+import type { AppTypeOption, Inspection } from "./wizard";
 
 function Command({ step, argv, none }: { step: string; argv: string | null; none: string }) {
   return (
@@ -28,7 +28,7 @@ function Command({ step, argv, none }: { step: string; argv: string | null; none
  * What the inspection found, before any choice: the source and revision, and the commands the
  * detected type's deployer would run, exactly as it would run them.
  */
-export function InspectionReadout({ inspection, source }: { inspection: Inspection; source: string }) {
+export function InspectionReadout({ inspection, types, source }: { inspection: Inspection; types: readonly AppTypeOption[]; source: string }) {
   const local = sourceKind(source) === "local";
   const keys = inspection.env_keys;
   const required = keys.filter((key) => key.required).length;
@@ -75,7 +75,7 @@ export function InspectionReadout({ inspection, source }: { inspection: Inspecti
       ) : (
         <div className="flex flex-col gap-3 px-4 py-3">
           <p className="text-13 text-pretty text-fg">
-            {`Looks like a ${typeName(inspection.app_type)} app`}
+            {`Looks like a ${typeName(types, inspection.app_type)} app`}
             {inspection.package_manager ? (
               <>
                 {" using "}
@@ -83,7 +83,7 @@ export function InspectionReadout({ inspection, source }: { inspection: Inspecti
               </>
             ) : null}
             {others.length > 0 ? (
-              <span className="text-fg-muted">{`. It also matches ${others.map(typeName).join(", ")}.`}</span>
+              <span className="text-fg-muted">{`. It also matches ${others.map((type) => typeName(types, type)).join(", ")}.`}</span>
             ) : (
               "."
             )}

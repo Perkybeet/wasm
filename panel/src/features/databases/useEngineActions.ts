@@ -5,46 +5,39 @@
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 
 import { request } from "../../api/client";
 import { databaseKeys } from "../../api/queries/databases";
-import { activeJobsQuery, jobKeys, jobQuery } from "../../api/queries/jobs";
+import { activeJobsQuery, isJobFinished, jobKeys, useFollowedJob } from "../../api/queries/jobs";
 import type { Job } from "../../api/queries/jobs";
 import { toast } from "../../components/ui/toast";
 import { reportActionError } from "../apps/useAppActions";
 
 const RUNNING = new Set(["pending", "running"]);
-const TERMINAL = new Set(["completed", "failed", "cancelled"]);
 
 /**
  * The install job running on one engine, from here or from anywhere else - the same shape
- * `features/app/useAppJob.ts` tracks a deploy with, keyed by engine instead of domain. An
- * install changes the engines list itself (installed, a version, a port to reach), which
- * nothing else invalidates once the job settles, so this refreshes it directly.
+ * `features/app/useAppJob.ts` tracks a deploy with, keyed by engine instead of domain, and
+ * followed to its end by the shared useFollowedJob. An install changes the engines list itself
+ * (installed, a version, a port to reach), which nothing else invalidates once the job
+ * settles, so this refreshes it directly.
  */
 export function useEngineJob(engine: string) {
   const queryClient = useQueryClient();
-  const [trackedId, setTrackedId] = useState<string | null>(null);
   const active = useQuery(activeJobsQuery());
-  const tracked = useQuery({ ...jobQuery(trackedId ?? ""), enabled: trackedId !== null });
+  const followed = useFollowedJob();
 
-  const mine = trackedId !== null ? tracked.data : undefined;
+  const mine = followed.job ?? undefined;
   const elsewhere = active.data?.jobs.find((job) => job.metadata?.["engine"] === engine && RUNNING.has(job.status));
   const running = mine !== undefined && RUNNING.has(mine.status) ? mine : (elsewhere ?? null);
 
+  const ended = mine !== undefined && isJobFinished(mine);
   useEffect(() => {
-    if (mine !== undefined && TERMINAL.has(mine.status)) {
-      void queryClient.invalidateQueries({ queryKey: databaseKeys.engines });
-    }
-  }, [mine, queryClient]);
+    if (ended) void queryClient.invalidateQueries({ queryKey: databaseKeys.engines });
+  }, [ended, queryClient]);
 
-  return {
-    running,
-    track: (job: Job): void => {
-      setTrackedId(job.id);
-    },
-  };
+  return { running, track: (job: Job): void => followed.follow(job) };
 }
 
 export function useEngineActions() {

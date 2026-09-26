@@ -37,3 +37,18 @@ export function latest(points: Points | undefined): number | null {
   const last = points?.at(-1);
   return last === undefined ? null : last[1];
 }
+
+/**
+ * How far apart a history read's points are, in words, from the endpoint's `resolution`: a
+ * week is hour means, not samples, and a chart should say so. Nothing for raw samples.
+ */
+export function resolutionWords(resolution: string | undefined): string | null {
+  switch (resolution) {
+    case "minute":
+      return "minute averages";
+    case "hour":
+      return "hourly averages";
+    default:
+      return null;
+  }
+}

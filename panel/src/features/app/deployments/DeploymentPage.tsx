@@ -9,7 +9,7 @@ import { appQuery, releasesQuery } from "../../../api/queries/apps";
 import type { Release } from "../../../api/queries/apps";
 import { deploymentLogQuery, deploymentQuery, deploymentsQuery } from "../../../api/queries/deployments";
 import type { Deployment } from "../../../api/queries/deployments";
-import { jobQuery } from "../../../api/queries/jobs";
+import { isJobFinished, jobQuery } from "../../../api/queries/jobs";
 import { useDocumentTitle } from "../../../app/documentTitle";
 import { DeployStatePill } from "../../../components/page/AppStatePill";
 import { useNow } from "../../../components/page/clock";
@@ -40,8 +40,6 @@ const RUNNING = new Set(["queued", "running"]);
 const DEFAULT_TAIL = 512 * 1024;
 /** Bytes asked for when the operator wants the whole log. */
 const WHOLE_LOG = 64 * 1024 * 1024;
-/** How long Redeploy waits for the new deployment to show up before saying so. */
-const REDEPLOY_WAIT_MS = 30_000;
 
 const LINK =
   "rounded-[4px] text-13 font-medium text-accent-fg hover:underline hover:underline-offset-2 focus-visible:outline-2 focus-visible:outline-focus";
@@ -102,17 +100,24 @@ function Facts({ deployment }: { deployment: Deployment }) {
     <dl className="grid grid-cols-2 gap-x-6 gap-y-4 rounded-card border border-border bg-surface px-4 py-3.5 shadow-raised sm:grid-cols-4">
       <Fact term="Commit">
         {commit ? (
-          <>
-            <span translate="no" className="mono text-12">
-              {commit}
-            </span>
-            {deployment.git_branch ? (
-              <span translate="no" className="mono truncate text-12 text-fg-muted">
-                {deployment.git_branch}
+          <div className="flex min-w-0 flex-col gap-1">
+            <div className="flex min-w-0 items-center gap-1.5">
+              <span translate="no" className="mono text-12">
+                {commit}
               </span>
+              {deployment.git_branch ? (
+                <span translate="no" className="mono truncate text-12 text-fg-muted">
+                  {deployment.git_branch}
+                </span>
+              ) : null}
+              <CopyButton value={deployment.git_commit ?? commit} label="Copy commit" className="-my-1" />
+            </div>
+            {deployment.commit_message ? (
+              <p title={deployment.commit_message} className="truncate text-12 text-fg-muted">
+                {deployment.commit_message}
+              </p>
             ) : null}
-            <CopyButton value={deployment.git_commit ?? commit} label="Copy commit" className="-my-1" />
-          </>
+          </div>
         ) : (
           <span className="text-fg-faint">Not a git checkout</span>
         )}
@@ -132,27 +137,28 @@ function Facts({ deployment }: { deployment: Deployment }) {
 }
 
 /**
- * Queues an update of the app and, once the deploy it starts is recorded, opens it: the
- * operator lands on the new build log, not on a list to find it in.
+ * Queues an update of the app and, once the deploy it queued has written its own deployment
+ * row - found by the job's id, its `job_id`, never by timing - opens it: the operator lands on
+ * the new build log, not on a list to find it in.
  */
 function useRedeploy(domain: string) {
   const navigate = useNavigate();
-  const [waiting, setWaiting] = useState<{ after: number; jobId: string; since: number } | null>(null);
-  const newest = useQuery({
-    ...deploymentsQuery({ domain, limit: 1 }),
+  const [waiting, setWaiting] = useState<{ jobId: string } | null>(null);
+  const deployments = useQuery({
+    ...deploymentsQuery({ domain, limit: 10 }),
     refetchInterval: waiting === null ? false : 1_000,
   });
-  const job = useQuery({ ...jobQuery(waiting?.jobId ?? ""), enabled: waiting !== null, refetchInterval: waiting === null ? false : 2_000 });
+  const job = useQuery({ ...jobQuery(waiting?.jobId ?? ""), enabled: waiting !== null });
   const { update } = useAppActions(domain, {
     onJobQueued: (queued) => {
-      setWaiting({ after: newest.data?.items[0]?.id ?? 0, jobId: queued.id, since: Date.now() });
+      setWaiting({ jobId: queued.id });
     },
   });
 
-  const arrived = waiting !== null ? newest.data?.items.find((item) => item.id > waiting.after) : undefined;
+  const arrived = waiting !== null ? deployments.data?.items.find((item) => item.job_id === waiting.jobId) : undefined;
   const failed = waiting !== null && job.data?.status === "failed" ? job.data : null;
-  const now = useNow(() => (waiting === null ? 3_600_000 : 1_000));
-  const timedOut = waiting !== null && arrived === undefined && failed === null && now - waiting.since > REDEPLOY_WAIT_MS;
+  // The job ended without ever writing a deployment we can find: recording it must have failed.
+  const stuck = waiting !== null && arrived === undefined && failed === null && job.data !== undefined && isJobFinished(job.data);
 
   useEffect(() => {
     if (arrived !== undefined) void navigate({ to: "/apps/$domain/deployments/$id", params: { domain, id: String(arrived.id) } });
@@ -162,9 +168,9 @@ function useRedeploy(domain: string) {
     start: () => {
       update.mutate();
     },
-    busy: update.isPending || (waiting !== null && failed === null && !timedOut),
+    busy: update.isPending || (waiting !== null && arrived === undefined && failed === null && !stuck),
     failed,
-    timedOut,
+    timedOut: stuck,
   };
 }
 
@@ -173,10 +179,10 @@ function RollbackAction({ domain, deployment, layout }: { domain: string; deploy
   const [open, setOpen] = useState(false);
   const releases = useQuery({ ...releasesQuery(domain), enabled: layout === "releases" });
   const own: Release | undefined = releases.data?.items.find(
-    (release) => !release.active && release.on_disk && deployment.git_commit !== null && release.commit === shortCommit(deployment.git_commit),
+    (release) => !release.active && release.on_disk && deployment.release_id !== null && release.id === deployment.release_id,
   );
   const serving = releases.data?.items.find((release) => release.active);
-  const ownIsServing = serving !== undefined && deployment.git_commit !== null && serving.commit === shortCommit(deployment.git_commit);
+  const ownIsServing = serving !== undefined && deployment.release_id !== null && serving.id === deployment.release_id;
   return (
     <>
       <Button icon={<History aria-hidden="true" />} onClick={() => setOpen(true)}>
@@ -201,8 +207,8 @@ function Actions({ domain, deployment }: { domain: string; deployment: Deploymen
     <div className="flex flex-col items-end gap-2">
       <div className="flex flex-wrap items-center gap-2">
         {app.data && !running ? <RollbackAction domain={domain} deployment={deployment} layout={app.data.layout} /> : null}
+        {/* Secondary: the header's Update is the page's one primary action. */}
         <Button
-          variant="primary"
           icon={<CircleArrowUp aria-hidden="true" />}
           loading={redeploy.busy}
           disabled={running}
@@ -236,6 +242,11 @@ function useBuildLog(deployment: Deployment) {
   return { log, lines, tail, setTail };
 }
 
+const LOG_ROW_PX = 20;
+const LOG_CHROME_PX = 60;
+/** The smaller of the usual frames (26rem): a log taller than this gets the usual frame and scrolls. */
+const LOG_FRAME_PX = 416;
+
 function LogSection({
   domain,
   deployment,
@@ -254,6 +265,10 @@ function LogSection({
   const running = RUNNING.has(deployment.status);
   const missing = log.data?.missing_reason ?? null;
   const shown = lines.length > 0 ? lines : fallback;
+  // Rows of 20px, the toolbar and the padding: a finished log shorter than the usual frame
+  // gets a frame its own height (never under 12rem), instead of a well of empty space.
+  const natural = shown.length * LOG_ROW_PX + LOG_CHROME_PX;
+  const fitted = !running && natural < LOG_FRAME_PX ? Math.max(natural, 192) : null;
   return (
     <Section
       title="Build log"
@@ -289,11 +304,22 @@ function LogSection({
           </p>
           <pre className="text-12 whitespace-pre-wrap text-fg-muted">{missing}</pre>
         </div>
+      ) : fitted !== null ? (
+        // A finished deploy with a short log: the viewer is as tall as what it holds.
+        <LogViewer
+          lines={shown}
+          height={fitted}
+          pageSearch
+          label={`Build log of deployment ${String(deployment.id)} of ${domain}`}
+          filename={`${domain}-deployment-${String(deployment.id)}.log`}
+          emptyMessage="The log is empty."
+        />
       ) : (
         <div className="h-[26rem] lg:h-[34rem]">
           <LogViewer
             lines={shown}
             height="fill"
+            pageSearch
             label={`Build log of deployment ${String(deployment.id)} of ${domain}`}
             filename={`${domain}-deployment-${String(deployment.id)}.log`}
             emptyMessage={running ? "Waiting for the first line." : "The log is empty."}
@@ -331,7 +357,7 @@ function Deploy({ domain, deployment }: { domain: string; deployment: Deployment
   const running = RUNNING.has(deployment.status);
   const outcome = outcomeOf(deployment.status);
   const { log, lines, setTail } = useBuildLog(deployment);
-  const job = useDeploymentJob(domain, deployment);
+  const job = useDeploymentJob(deployment);
   const now = useNow(() => (running ? 1_000 : 3_600_000));
 
   const events = mergeEvents(buildLogEvents(lines), jobEvents(job.entries));

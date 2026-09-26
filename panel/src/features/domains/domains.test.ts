@@ -4,10 +4,10 @@ import { ApiError } from "../../api/errors";
 import type { Job } from "../../api/queries/jobs";
 import { createSiteBody } from "./CreateSiteDialog";
 import { issueRequest } from "./IssueCertificateDialog";
-import { byUrgency, certificateJobFor, certificateView, covers } from "./certificates";
+import { byUrgency, certificateJobFor, certificateView, covers, issuerName } from "./certificates";
 import { configRejection, failingLine, lineOffset } from "./configErrors";
 import { dnsVerdict, isPrivateAddress, recordsToCreate } from "./dns";
-import { domainProblem, parseNames, wwwOf } from "./names";
+import { domainProblem, parseNames, truncatedNames, wwwOf } from "./names";
 
 describe("domain names", () => {
   it("accepts ordinary and internationalised names, trimmed and lowercased", () => {
@@ -41,6 +41,13 @@ describe("domain names", () => {
     expect(wwwOf("Example.com")).toBe("www.example.com");
     expect(wwwOf("www.example.com")).toBeNull();
   });
+
+  it("shows the first few names of a list and counts the rest", () => {
+    expect(truncatedNames(["a.com", "b.com", "c.com", "d.com"])).toEqual({ shown: "a.com, b.com, c.com", rest: 1 });
+    expect(truncatedNames(["a.com", "b.com"])).toEqual({ shown: "a.com, b.com", rest: 0 });
+    expect(truncatedNames(["a.com", "b.com", "c.com"], 2)).toEqual({ shown: "a.com, b.com", rest: 1 });
+    expect(truncatedNames([])).toEqual({ shown: "", rest: 0 });
+  });
 });
 
 describe("certificate state", () => {
@@ -73,6 +80,12 @@ describe("certificate state", () => {
     expect(covers(cert, "www.a.com")).toBe(true);
     expect(covers(cert, "blog.a.com")).toBe(false);
     expect(covers(null, "a.com")).toBe(false);
+  });
+
+  it("reads the organisation and common name out of the issuer's distinguished name", () => {
+    expect(issuerName("C = US, O = Let's Encrypt, CN = R11")).toBe("Let's Encrypt R11");
+    expect(issuerName("CN=example-ca")).toBe("example-ca");
+    expect(issuerName("not a distinguished name")).toBe("not a distinguished name");
   });
 });
 
@@ -112,7 +125,15 @@ describe("configuration test failures", () => {
   });
 
   it("reads a refusal from the API error: the backend's sentence and the server's words", () => {
-    const refused = new ApiError(400, "validationerror", "nginx rejected the configuration for example.com", 'nginx: [emerg] unknown directive "lisen" in /tmp/x/example.com:3\n');
+    const refused = new ApiError(
+      400,
+      "validationerror",
+      "nginx rejected the configuration for example.com",
+      null,
+      null,
+      null,
+      'nginx: [emerg] unknown directive "lisen" in /tmp/x/example.com:3\n',
+    );
     expect(configRejection(refused)).toEqual({
       summary: "nginx rejected the configuration for example.com",
       output: 'nginx: [emerg] unknown directive "lisen" in /tmp/x/example.com:3\n',
@@ -172,6 +193,13 @@ describe("creating a site", () => {
   it("sends the proxy's port, and the default for static files", () => {
     expect(createSiteBody(form)).toEqual({ body: { domain: "status.example.com", webserver: "nginx", template: "proxy", port: 4000, ssl: true, enable: true } });
     expect(createSiteBody({ ...form, template: "static", port: "" })).toMatchObject({ body: { template: "static", port: 3000 } });
+  });
+
+  it("asks for a port for any template but static, not a fixed list of names", () => {
+    expect(createSiteBody({ ...form, template: "advanced", port: "" })).toEqual({
+      errors: { port: expect.stringMatching(/between 1 and 65535/) as string },
+    });
+    expect(createSiteBody({ ...form, template: "monorepo" })).toMatchObject({ body: { template: "monorepo", port: 4000 } });
   });
 
   it("refuses a bad domain and a bad port", () => {

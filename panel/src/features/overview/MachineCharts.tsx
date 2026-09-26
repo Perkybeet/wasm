@@ -9,18 +9,20 @@ import { SegmentedControl } from "../../components/page/SegmentedControl";
 import { Chart } from "../../components/ui/Chart";
 import { Skeleton } from "../../components/ui/Skeleton";
 import { formatBytes, formatBytesRate, formatPercent } from "../../lib/format";
-import { alignSeries, latest } from "./series";
+import { alignSeries, latest, resolutionWords } from "./series";
 import type { Points } from "./series";
 
 export const WINDOWS: readonly { value: MetricWindow; label: string }[] = [
   { value: "1h", label: "1h" },
   { value: "24h", label: "24h" },
+  { value: "7d", label: "7d" },
   { value: "30d", label: "30d" },
 ];
 
 const WINDOW_WORDS: Record<MetricWindow, string> = {
   "1h": "Last hour",
   "24h": "Last 24 hours",
+  "7d": "Last 7 days",
   "30d": "Last 30 days",
 };
 
@@ -103,7 +105,10 @@ function MetricChart({ spec, window }: { spec: ChartSpec; window: MetricWindow }
   const points: Points[] = queries.map((query) => query.data?.points ?? []);
   const aligned = alignSeries(points);
   const max = spec.ceiling ? latest(ceiling.data?.points) : null;
-  const description = max !== null ? `${WINDOW_WORDS[window]}, of ${spec.format(max)}` : WINDOW_WORDS[window];
+  const spacing = resolutionWords(queries[0]?.data?.resolution);
+  const description = [WINDOW_WORDS[window], spacing, max !== null ? `of ${spec.format(max)}` : null]
+    .filter((part) => part !== null)
+    .join(", ");
 
   // One point is not a line: a panel that just started has a sample or two, and a chart of
   // them would be an empty frame with a collapsed time axis.

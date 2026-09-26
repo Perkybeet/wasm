@@ -147,6 +147,15 @@ export async function signIn(page: Page, server: ConsoleServer, next?: string): 
   await expect(page.getByRole("heading", { level: 1 })).toBeVisible();
 }
 
+/**
+ * The toasts on screen. A toast is announced by living in a live region, and the page's own
+ * announcer may say a related sentence too, so tests look for a toast here, deliberately,
+ * never with a bare getByText that would also find the words in a live region.
+ */
+export function toasts(page: Page) {
+  return page.getByRole("region", { name: "Notifications" });
+}
+
 /** Tags of the rules axe runs: WCAG 2.0, 2.1 and 2.2 at levels A and AA. */
 const WCAG_TAGS = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22a", "wcag22aa"];
 
@@ -166,10 +175,25 @@ export async function expectNoA11yViolations(page: Page, label?: string): Promis
   expect(report, `axe found WCAG 2.2 AA violations${label === undefined ? "" : ` on ${label}`}:\n${report.join("\n")}`).toEqual([]);
 }
 
+/**
+ * Waits for every finite animation and transition to end, so axe never measures a colour
+ * mid-fade (a toast leaving, a dialog arriving) and a screenshot never catches one. Spinners
+ * and pulses run forever and are left alone.
+ */
+export async function stillness(page: Page): Promise<void> {
+  await page.waitForFunction(() =>
+    document.getAnimations().every((animation) => {
+      const iterations = animation.effect?.getComputedTiming().iterations;
+      return animation.playState !== "running" || iterations === Infinity;
+    }),
+  );
+}
+
 /** Waits until fonts are in and the page has stopped moving, for axe and screenshots. */
 export async function settle(page: Page): Promise<void> {
   await page.evaluate(() => document.fonts.ready.then(() => undefined));
   await page.waitForLoadState("networkidle").catch(() => undefined);
+  await stillness(page);
 }
 
 export interface PageProblems {

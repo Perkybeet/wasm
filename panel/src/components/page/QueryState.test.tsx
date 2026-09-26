@@ -1,6 +1,6 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ApiError } from "../../api/errors";
 import { expectNoAxeViolations } from "../../test/axe";
@@ -37,6 +37,10 @@ function renderState(state: QueryLike<string[]>) {
     </QueryState>,
   );
 }
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe("QueryState", () => {
   it("shows the skeleton while loading, busy and named for screen readers", () => {
@@ -98,6 +102,15 @@ describe("QueryState", () => {
 });
 
 describe("ErrorBlock", () => {
+  it("makes long system output scrollable from the keyboard, named after the failure", async () => {
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(192);
+    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(900);
+    render(<ErrorBlock error={FAILURE} title="Renewal of shop.example.com failed" />);
+    const output = await screen.findByRole("region", { name: "Renewal of shop.example.com failed: what the system said" });
+    expect(output.tagName).toBe("PRE");
+    expect(output).toHaveAttribute("tabindex", "0");
+  });
+
   it("interrupts only when it reports something the operator just did", () => {
     const { rerender } = render(<ErrorBlock error={FAILURE} title="Restart failed" />);
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();

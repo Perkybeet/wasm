@@ -9,12 +9,11 @@ import { databaseBackupsQuery } from "../../api/queries/databases";
 import { ErrorBlock, QueryState } from "../../components/page/QueryState";
 import { RelativeTime } from "../../components/page/RelativeTime";
 import { Section } from "../../components/page/Section";
-import { Badge } from "../../components/ui/Badge";
 import { Button } from "../../components/ui/Button";
 import { Checkbox } from "../../components/ui/Checkbox";
 import { DataTable } from "../../components/ui/DataTable";
 import type { Column } from "../../components/ui/DataTable";
-import { BACKDROP, DialogFrame, MODAL_POPUP } from "../../components/ui/Dialog";
+import { BACKDROP, DialogFrame, MODAL_POPUP, MODAL_VIEWPORT } from "../../components/ui/Dialog";
 import { EmptyState } from "../../components/ui/EmptyState";
 import { IconButton } from "../../components/ui/IconButton";
 import { Input } from "../../components/ui/Input";
@@ -70,7 +69,7 @@ function RestoreDialog({
     <AlertDialog.Root open={open} onOpenChange={(next: boolean) => close(next)}>
       <AlertDialog.Portal>
         <AlertDialog.Backdrop className={BACKDROP} />
-        <AlertDialog.Viewport className="fixed inset-0 z-50 flex items-center justify-center p-4 sm:items-start sm:pt-[12vh]">
+        <AlertDialog.Viewport className={MODAL_VIEWPORT}>
           <AlertDialog.Popup initialFocus={inputRef} className={cx(MODAL_POPUP, "sm:max-w-[460px]")}>
             <form onSubmit={submit} className="contents">
               <DialogFrame
@@ -154,7 +153,8 @@ export function DatabaseBackups({ engine, database }: { engine: string; database
       id: "compressed",
       header: "Compressed",
       width: "w-28",
-      cell: (row) => (row.compressed ? <Badge tone="ok">Yes</Badge> : <Badge>No</Badge>),
+      // A fact, not a state: no colour.
+      cell: (row) => <span className="text-fg-muted">{row.compressed ? "Yes" : "No"}</span>,
     },
   ];
 
@@ -162,16 +162,18 @@ export function DatabaseBackups({ engine, database }: { engine: string; database
     <Section
       title="Backups"
       description="Dumps of this database only, kept beside every other engine's dumps."
+      // The empty state offers the same action; said once.
       actions={
-        <Button
-          size="sm"
-          variant="primary"
-          icon={<Archive aria-hidden="true" />}
-          loading={createBackup.isPending}
-          onClick={() => createBackup.mutate({ engine, database, compress: true })}
-        >
-          Create backup
-        </Button>
+        backups.data !== undefined && backups.data.backups.length > 0 ? (
+          <Button
+            size="sm"
+            icon={<Archive aria-hidden="true" />}
+            loading={createBackup.isPending}
+            onClick={() => createBackup.mutate({ engine, database, compress: true })}
+          >
+            Create backup
+          </Button>
+        ) : undefined
       }
     >
       <QueryState

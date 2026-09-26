@@ -8,7 +8,7 @@ import { Mono } from "../../components/ui/Mono";
 import { StatusPill } from "../../components/ui/StatusPill";
 import { parseTimestamp } from "../../lib/format";
 import type { CronJob } from "./data";
-import { runStatus } from "./data";
+import { runStatus, scheduleWords } from "./data";
 
 function Nothing({ reason }: { reason: string }) {
   return (
@@ -38,6 +38,8 @@ export function CronJobsTable({ jobs, caption, loading = false, empty, onRowActi
       id: "enabled",
       header: "State",
       width: "w-24",
+      // On a phone the next run says it instead ("Disabled" when there is none).
+      hideBelow: "sm",
       cell: (row) => <StatusPill state={row.enabled ? "running" : "stopped"} label={row.enabled ? "Enabled" : "Disabled"} appearance="inline" size="sm" />,
       sortValue: (row) => (row.enabled ? 0 : 1),
     },
@@ -57,7 +59,7 @@ export function CronJobsTable({ jobs, caption, loading = false, empty, onRowActi
       hideBelow: "sm",
       cell: (row) => (
         <span className="flex flex-col">
-          <span className="text-fg-muted capitalize">{row.schedule}</span>
+          <span className="text-fg-muted">{scheduleWords(row.schedule, row.on_calendar)}</span>
           <Mono tone="faint" truncate className="text-12">
             {row.on_calendar}
           </Mono>
@@ -69,7 +71,6 @@ export function CronJobsTable({ jobs, caption, loading = false, empty, onRowActi
       id: "next_run",
       header: "Next run",
       width: "w-40",
-      hideBelow: "md",
       cell: (row) =>
         row.enabled ? <RelativeTime value={row.next_run} fallback={row.next_run} /> : <Nothing reason="Disabled" />,
       sortValue: (row) => parseTimestamp(row.next_run)?.getTime() ?? null,
@@ -80,7 +81,12 @@ export function CronJobsTable({ jobs, caption, loading = false, empty, onRowActi
       width: "w-36",
       cell: (row) => {
         const view = runStatus(row.last_result);
-        return <StatusPill state={view.state} label={view.label} appearance="inline" size="sm" />;
+        return (
+          <span className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
+            <StatusPill state={view.state} label={view.label} appearance="inline" size="sm" />
+            {view.detail !== undefined ? <span className="mono text-12 text-fg-faint">{view.detail}</span> : null}
+          </span>
+        );
       },
       sortValue: (row) => STATE_RANK[runStatus(row.last_result).state],
     },

@@ -71,6 +71,13 @@ export function useServiceActions(name: string) {
     },
   });
 
+  // Silent on purpose: its result feeds the unit editor's own pass/fail block, and a save that
+  // goes on to succeed already toasts through updateConfig above - a second toast here would
+  // just repeat it.
+  const verifyUnit = useMutation({
+    mutationFn: (content: string) => request("post", "/api/services/verify", { body: { content } }),
+  });
+
   const remove = useMutation({
     mutationFn: () => request("delete", "/api/services/{name}", { params: { name } }),
     onSuccess: () => {
@@ -79,5 +86,5 @@ export function useServiceActions(name: string) {
     },
   });
 
-  return { start, stop, restart, enable, disable, updateConfig, remove };
+  return { start, stop, restart, enable, disable, updateConfig, verifyUnit, remove };
 }

@@ -47,6 +47,15 @@ async function appAt(extra: Record<string, RouteHandler> = {}, path = `/apps/${D
         next_before_id: null,
       }),
     [`GET /api/apps/${DOMAIN}/webhook/deliveries`]: () => json(200, { items: [], total: 0 }),
+    [`GET /api/apps/${DOMAIN}/domains`]: () =>
+      json(200, {
+        app: DOMAIN,
+        domains: [
+          { domain: DOMAIN, kind: "primary", created_at: "2026-09-20T10:00:00+00:00" },
+          { domain: `www.${DOMAIN}`, kind: "redirect", created_at: "2026-09-20T10:00:00+00:00" },
+          { domain: `blog.${DOMAIN}`, kind: "alias", created_at: "2026-09-24T10:00:00+00:00" },
+        ],
+      }),
     "GET /api/jobs/active": () => json(200, { jobs: [], total: 0, active: 0 }),
     "POST /api/jobs/update": () => json(202, { message: "Update job created", job: JOB }),
     [`GET /api/jobs/${JOB.id}`]: () => json(200, JOB),
@@ -191,14 +200,47 @@ describe("an application's page", () => {
       expect(await screen.findByText("29 days left")).toBeInTheDocument();
     });
 
-    it("lists the domains the certificate covers and the runtime facts", async () => {
+    it("lists the app's domains with what the certificate does for each, and the runtime facts", async () => {
       await appAt();
       const domains = await screen.findByRole("region", { name: "Domains" });
-      expect(await within(domains).findByRole("link", { name: /^www\.shop\.example\.com/ })).toBeInTheDocument();
-      expect(within(domains).getAllByText("Certificate valid for 29 days")).toHaveLength(2);
+      const www = (await within(domains).findByRole("link", { name: /^www\.shop\.example\.com/ })).closest("li");
+      if (!www) throw new Error("no row for www");
+      expect(within(www).getByText("Redirect")).toBeInTheDocument();
+      expect(within(domains).getAllByText("Covered")).toHaveLength(2);
+      // Served, and not on the certificate yet: said, not hidden.
+      const blog = within(domains).getByRole("link", { name: /^blog\.shop\.example\.com/ }).closest("li");
+      if (!blog) throw new Error("no row for blog");
+      expect(within(blog).getByText("Not covered")).toBeInTheDocument();
+      expect(within(blog).getByRole("link", { name: /^blog/ })).toHaveAttribute("href", "http://blog.shop.example.com");
       const runtime = screen.getByRole("region", { name: "Runtime" });
       expect(within(runtime).getByText("Port")).toBeInTheDocument();
       expect(within(runtime).getByText("In place")).toBeInTheDocument();
+      // Not recorded for this seeded app: the labels still show, read as "None".
+      expect(within(runtime).getByText("Source")).toBeInTheDocument();
+      expect(within(runtime).getByText("Branch")).toBeInTheDocument();
+    });
+
+    it("shows what the app runs from when the source and branch are recorded", async () => {
+      await appAt({
+        [`GET /api/apps/${DOMAIN}`]: () =>
+          json(200, {
+            domain: DOMAIN,
+            name: "shop",
+            app_type: "nextjs",
+            status: "running",
+            active: true,
+            enabled: true,
+            port: 3000,
+            layout: "inplace",
+            source: "https://github.com/shop/storefront.git",
+            branch: "main",
+          }),
+      });
+      const runtime = await screen.findByRole("region", { name: "Runtime" });
+      const repo = within(runtime).getByRole("link", { name: /^https:\/\/github\.com\/shop\/storefront\.git/ });
+      expect(repo).toHaveAttribute("href", "https://github.com/shop/storefront.git");
+      expect(repo).toHaveAttribute("target", "_blank");
+      expect(within(runtime).getByText("main")).toBeInTheDocument();
     });
 
     it("has no accessibility violations", async () => {

@@ -15,6 +15,7 @@ import { Section, Sections } from "../../../components/page/Section";
 import { Button } from "../../../components/ui/Button";
 import { Skeleton } from "../../../components/ui/Skeleton";
 import { Spinner } from "../../../components/ui/Spinner";
+import { SystemOutput } from "../../../components/ui/SystemOutput";
 import { cx } from "../../../lib/cx";
 import { formatCount } from "../../../lib/format";
 import { causeFallback, checkLabel, checkStatus, opensByDefault, tally, verdictAnnouncement, verdictView } from "./view";
@@ -185,12 +186,13 @@ function CheckRow({ check, domain }: { check: Check; domain: string }) {
           </span>
         </summary>
         <div className="flex flex-col gap-2 px-4 pb-4 sm:pl-[calc(6rem+2rem)]">
-          <pre
-            translate="no"
-            className="max-h-72 overflow-auto rounded-control border border-border bg-bg-sunken px-3 py-2 text-12 leading-5 whitespace-pre-wrap break-words text-fg scroll-thin"
+          <SystemOutput
+            label={`Output of the ${checkLabel(check.name).toLowerCase()} check`}
+            maxHeight="max-h-72"
+            className="rounded-control border border-border bg-bg-sunken px-3 py-2 leading-5"
           >
             {check.evidence}
-          </pre>
+          </SystemOutput>
           {next !== null ? <div>{next}</div> : null}
         </div>
       </details>

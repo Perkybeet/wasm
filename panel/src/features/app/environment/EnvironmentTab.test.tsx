@@ -144,19 +144,19 @@ describe("the environment tab", () => {
     });
   });
 
-  it("refuses a name the API refuses, and fixes export prefixes in the pasted text", async () => {
+  it("reads export prefixes as a shell would, and refuses a name the API refuses", async () => {
     const { user } = await environmentTab();
     await user.click(screen.getByRole("button", { name: "Paste .env" }));
     const paste = await screen.findByRole("dialog", { name: "Paste a .env file" });
     const textarea = within(paste).getByLabelText(".env contents");
     await user.click(textarea);
     await user.paste("export NODE_ENV=production\nPORT=3000\n");
-    expect(within(paste).getByText(/Line 1: "export NODE_ENV" is not a variable name/)).toBeInTheDocument();
-    expect(within(paste).getByRole("button", { name: "Stage 2 variables" })).toBeDisabled();
-
-    await user.click(within(paste).getByRole("button", { name: "Remove the export prefixes" }));
-    expect(textarea).toHaveValue("NODE_ENV=production\nPORT=3000\n");
     expect(within(paste).getByRole("button", { name: "Stage 2 variables" })).toBeEnabled();
+
+    await user.clear(textarea);
+    await user.paste("MY VAR=1\nPORT=3000\n");
+    expect(within(paste).getByText(/Line 1: "MY VAR" is not a variable name/)).toBeInTheDocument();
+    expect(within(paste).getByRole("button", { name: "Stage 2 variables" })).toBeDisabled();
   });
 
   it("shows the API's refusal verbatim and keeps the draft", async () => {

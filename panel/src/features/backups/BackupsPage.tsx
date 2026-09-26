@@ -104,7 +104,7 @@ export function BackupsPage({ search, onSearchChange }: BackupsPageProps) {
               </div>
               <BackupsTable
                 backups={shown}
-                caption={filtered ? "Backups matching the filters" : "Backups"}
+                caption={filtered ? "Backups matching the filters" : "Every backup"}
                 loading={backups.isPending}
                 empty={
                   <EmptyState

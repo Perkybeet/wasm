@@ -1,17 +1,16 @@
 /**
  * What the Cron page reads beyond the raw API shape: a run's outcome in the console's state
- * language, and the calendar presets the editor offers.
+ * language, the calendar presets the editor offers, and the formatting its live preview needs.
  *
- * There is no endpoint that previews a calendar expression's next runs before saving one - the
- * only next run WASM computes is `next_run` on the job systemd already has, returned by
- * `POST /api/cron` and `GET /api/cron` after the fact. The editor therefore does not attempt a
- * live "next five runs" preview (that would mean re-implementing systemd's calendar engine in
- * TypeScript, which drifts from the real thing by construction); it shows what the backend
- * validates on save, and the single next run the saved job reports.
+ * The preset values double as the `schedule` the API takes (`hourly`, `daily`, `weekly`,
+ * `monthly`): `CronManager` expands the alias itself (`SCHEDULE_ALIASES`), so the dialog sends
+ * the alias rather than keeping its own copy of what each one expands to - one implementation,
+ * and it is `POST /api/cron/preview` that shows the operator what the alias actually means.
  */
 
 import type { Status } from "../../components/ui/StatusPill";
 import type { CronJobList } from "../../api/queries/cron";
+import { parseTimestamp } from "../../lib/format";
 
 export type CronJob = CronJobList["jobs"][number];
 
@@ -28,6 +27,8 @@ export const SCHEDULE_PRESETS: readonly { value: Schedule; label: string }[] = [
 export interface RunView {
   state: Status;
   label: string;
+  /** Systemd's own word for how a failed run ended (`exit-code`, `timeout`), shown in mono. */
+  detail?: string;
 }
 
 /**
@@ -40,7 +41,21 @@ export function runStatus(result: string | null | undefined): RunView {
   if (word === "" || word === "never ran") return { state: "unknown", label: "Never run" };
   if (word === "success") return { state: "running", label: "Succeeded" };
   if (word === "unknown") return { state: "unknown", label: "Unknown" };
-  return { state: "failed", label: result ?? "Failed" };
+  // The state word is the state; systemd's reason goes beside it, as the services list does.
+  return { state: "failed", label: "Failed", detail: word };
+}
+
+/**
+ * A schedule in words: the preset's name, or for an expression the one shape worth naming
+ * ("*-*-* 03:30:00" is every day at 03:30); anything else is "Custom", with the expression
+ * itself shown beside it.
+ */
+export function scheduleWords(schedule: string, onCalendar: string): string {
+  const preset = SCHEDULE_PRESETS.find((option) => option.value === schedule.trim().toLowerCase() && option.value !== "custom");
+  if (preset) return preset.label;
+  const daily = /^\*-\*-\*\s+(\d{1,2}):(\d{2})(?::00)?$/.exec(onCalendar.trim());
+  if (daily) return `Every day at ${(daily[1] ?? "").padStart(2, "0")}:${daily[2] ?? ""}`;
+  return "Custom";
 }
 
 export interface CronSearch {
@@ -67,4 +82,25 @@ export function filterJobs(jobs: readonly CronJob[], search: CronSearch): CronJo
   const needle = search.q?.toLowerCase();
   if (needle === undefined) return [...jobs];
   return jobs.filter((job) => `${job.name} ${job.command}`.toLowerCase().includes(needle));
+}
+
+/**
+ * One of the preview's next runs, in full: unambiguous regardless of the reader's own zone,
+ * the way a next-run list should read next to the relative time the rest of the console uses.
+ * Falls back to the raw value on anything `parseTimestamp` cannot place in time.
+ */
+export function absoluteWithOffset(value: string): string {
+  const date = parseTimestamp(value);
+  if (date === null) return value;
+  // Explicit fields, not `dateStyle`/`timeStyle`: mixed with `timeZoneName` those throw
+  // ("Invalid option") on the ICU build this ships with, even though both are valid alone.
+  return new Intl.DateTimeFormat(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZoneName: "shortOffset",
+  }).format(date);
 }

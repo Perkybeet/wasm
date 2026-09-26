@@ -5,7 +5,7 @@ import { Button } from "../../../components/ui/Button";
 import { Dialog } from "../../../components/ui/Dialog";
 import { Field } from "../../../components/ui/Field";
 import { Input } from "../../../components/ui/Input";
-import { nameProblem, readBack, valueProblem } from "./dotenv";
+import { nameProblem, valueProblem } from "./dotenv";
 
 export type VariableTarget = { mode: "add" } | { mode: "edit"; name: string; value: string };
 
@@ -35,7 +35,6 @@ function VariableForm({ formId, target, existing, onSubmit }: FormProps) {
   const duplicate = !editing && existing.has(trimmedName) ? `${trimmedName} is already set. Edit its row instead.` : null;
   const nameError = trimmedName === "" && !submitted ? null : (nameProblem(trimmedName) ?? duplicate);
   const valueError = valueProblem(value);
-  const back = readBack(value);
 
   const submit = (event: SyntheticEvent<HTMLFormElement>): void => {
     event.preventDefault();
@@ -67,11 +66,7 @@ function VariableForm({ formId, target, existing, onSubmit }: FormProps) {
       <Field
         label="Value"
         error={valueError}
-        description={
-          valueError === null && back !== value
-            ? `WASM writes values without quotes, so this one is read back as "${back}".`
-            : "Stored as typed. Leave it empty for an empty value."
-        }
+        description="Stored exactly as typed, spaces and quotes included. Leave it empty for an empty value."
       >
         <Input
           mono

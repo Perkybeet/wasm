@@ -92,6 +92,14 @@ export function confirmTwoFactor(code: string) {
   return request("post", "/api/auth/2fa/confirm", { body: { code } });
 }
 
+/**
+ * Replaces the backup codes with a new set, answered once; the old ones stop working. Needs a
+ * recent "Confirm it's you", which the client asks for when the server says so.
+ */
+export function regenerateBackupCodes() {
+  return request("post", "/api/auth/2fa/backup-codes");
+}
+
 /** Turns the second factor off. Needs a code and a recent "Confirm it's you". */
 export function disableTwoFactor(code: string) {
   return request("post", "/api/auth/2fa/disable", { body: { code } });
@@ -100,6 +108,15 @@ export function disableTwoFactor(code: string) {
 /** Signs one other session out, named by the prefix the list shows. */
 export function revokeSession(sidPrefix: string) {
   return request("delete", "/api/auth/sessions/{sid_prefix}", { params: { sid_prefix: sidPrefix } });
+}
+
+/**
+ * Signs out every session but the caller's, in one call. Answers 400 when the caller's own
+ * credential is not a browser session (a Bearer or the master token), which has no "other
+ * session" to leave signed in.
+ */
+export function revokeOtherSessions() {
+  return request("post", "/api/auth/sessions/revoke-others");
 }
 
 /** Issues a named, scoped token, returned in clear exactly once. Needs "Confirm it's you". */

@@ -8,7 +8,6 @@ import type { ResponseOf } from "../../../api/client";
 import { appKeys } from "../../../api/queries/apps";
 import type { App } from "../../../api/queries/apps";
 import { systemInfoQuery } from "../../../api/queries/system";
-import { announce } from "../../../app/Announcer";
 import { CommandHint } from "../../../components/page/CommandHint";
 import { ErrorBlock } from "../../../components/page/QueryState";
 import { Section } from "../../../components/page/Section";
@@ -113,9 +112,8 @@ export function LimitsSection({ app }: { app: App }) {
       );
       void queryClient.invalidateQueries({ queryKey: appKeys.detail(domain) });
       void queryClient.invalidateQueries({ queryKey: appKeys.list, exact: true });
-      const said = `Saved the limits of ${domain}`;
-      announce(said);
-      toast.success(said);
+      // The toast is announced; saying it again would read it twice.
+      toast.success(`Saved the limits of ${domain}`);
     },
   });
 

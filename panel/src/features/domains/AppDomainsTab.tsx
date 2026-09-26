@@ -5,10 +5,9 @@ import { useState } from "react";
 
 import { request } from "../../api/client";
 import { certsQuery } from "../../api/queries/certs";
-import type { CertEntry } from "../../api/queries/certs";
 import { appDomainsQuery, dnsCheckQuery, domainKeys } from "../../api/queries/domains";
 import type { AppDomain, AppDomainChange, AppDomainList } from "../../api/queries/domains";
-import { activeJobsQuery } from "../../api/queries/jobs";
+import { activeJobsQuery, isJobFinished, useFollowedJob } from "../../api/queries/jobs";
 import { useDocumentTitle } from "../../app/documentTitle";
 import { CommandHint } from "../../components/page/CommandHint";
 import { ErrorBlock } from "../../components/page/QueryState";
@@ -30,27 +29,11 @@ import { reportActionError } from "../apps/useAppActions";
 import { AddDomainDialog } from "./AddDomainDialog";
 import { CertificateStatus } from "./CertificateStatus";
 import { DnsVerdict } from "./DnsVerdict";
-import { certificateJobFor, certificateView, covers } from "./certificates";
-import type { CertTone } from "./certificates";
+import { certificateJobFor, certificateView, coverageOf, covers, issuerName } from "./certificates";
 import { JobBanner } from "./JobBanner";
-import { isFinished, useCertificateRefresh, useFollowedJob } from "./useCertificateJobs";
+import { useCertificateRefresh } from "./useCertificateJobs";
 
 const KIND_LABEL: Record<string, string> = { primary: "Primary", alias: "Alias", redirect: "Redirect" };
-
-/** What the certificate does for one name of the app. */
-export function coverageOf(
-  name: string,
-  lineage: CertEntry | null | undefined,
-  extending: boolean,
-): { tone: CertTone; label: string } {
-  if (lineage === undefined) return { tone: "idle", label: "Checking" };
-  if (lineage === null) return { tone: "idle", label: "No certificate, HTTP only" };
-  if (!covers(lineage, name)) {
-    return extending ? { tone: "busy", label: "Extending the certificate" } : { tone: "warn", label: "Not covered" };
-  }
-  const view = certificateView(lineage);
-  return { tone: view.tone, label: view.tone === "ok" ? "Covered" : view.label };
-}
 
 function Role({ entry, app }: { entry: AppDomain; app: string }) {
   if (entry.kind !== "redirect") return <Badge>{KIND_LABEL[entry.kind] ?? entry.kind}</Badge>;
@@ -139,7 +122,7 @@ export function AppDomainsTab({ domain }: { domain: string }) {
 
   const lineage = certs.isError && certs.data === undefined ? null : findCertificate(certs.data, domain);
   const running = certificateJobFor(active.data?.jobs, domain);
-  const extending = running !== null || (followed.job !== null && !isFinished(followed.job)) || (followed.id !== null && followed.job === null);
+  const extending = running !== null || (followed.job !== null && !isJobFinished(followed.job)) || (followed.id !== null && followed.job === null);
 
   const applyChange = (change: AppDomainChange): void => {
     queryClient.setQueryData<AppDomainList>(domainKeys.list(domain), { app: change.app, domains: change.domains });
@@ -215,7 +198,7 @@ export function AppDomainsTab({ domain }: { domain: string }) {
         title="Domains"
         description={`The names ${domain} answers on. Aliases serve the app; redirects send visitors to ${domain}.`}
         actions={
-          <Button variant="primary" icon={<Plus aria-hidden="true" />} onClick={() => setAdding(true)}>
+          <Button icon={<Plus aria-hidden="true" />} onClick={() => setAdding(true)}>
             Add domain
           </Button>
         }
@@ -300,6 +283,7 @@ export function AppDomainsTab({ domain }: { domain: string }) {
             <div className="flex min-w-0 flex-col gap-1">
               <CertificateStatus {...certificateView(lineage)} className="text-14" />
               <p className="text-13 text-fg-muted">
+                {lineage.issuer ? `Issued by ${issuerName(lineage.issuer)}. ` : ""}
                 {lineage.expires_on ? `Valid until ${lineage.expires_on}. ` : ""}
                 {lineage.auto_renew ? "Renews on its own before it expires." : "Does not renew on its own."}
               </p>

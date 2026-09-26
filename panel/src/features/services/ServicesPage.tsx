@@ -10,6 +10,7 @@ import { Button } from "../../components/ui/Button";
 import { EmptyState } from "../../components/ui/EmptyState";
 import { Input } from "../../components/ui/Input";
 import { Kbd } from "../../components/ui/Kbd";
+import { Switch } from "../../components/ui/Switch";
 import { CreateServiceDialog } from "./CreateServiceDialog";
 import { ServiceRowActions } from "./ServiceRowActions";
 import { ServicesTable } from "./ServicesTable";
@@ -26,31 +27,41 @@ export interface ServicesPageProps {
 
 /**
  * Every systemd unit WASM created on this machine, searchable and acted on from its own row.
- * `GET /api/services` only ever answers what the store tracks (see `./data`), so unlike the
- * applications list there is no state or type filter to offer: every row is WASM's.
+ * "Show all units" widens the request to `wasm_only=false`: a unit another package created
+ * appears too, marked "Foreign" and read-only (see `ServiceRowActions`).
  */
 export function ServicesPage({ search, onSearchChange }: ServicesPageProps) {
-  const services = useQuery(servicesQuery());
+  const showAll = search.all === true;
+  const services = useQuery(servicesQuery(!showAll));
   const [createOpen, setCreateOpen] = useState(false);
 
-  const all = useMemo(() => services.data?.services ?? [], [services.data]);
-  const shown = useMemo(() => filterServices(all, search), [all, search]);
+  const fetched = useMemo(() => services.data?.services ?? [], [services.data]);
+  const shown = useMemo(() => filterServices(fetched, search), [fetched, search]);
 
   const set = (patch: SearchPatch, replace = false): void => {
     const next: SearchPatch = { ...search, ...patch };
     const clean: ServicesSearch = {};
     if (next.q) clean.q = next.q;
+    if (next.all) clean.all = true;
     onSearchChange(clean, { replace });
   };
 
+  // "Clear filters" only ever clears the text search: "Show all units" is a scope, not a
+  // filter on what came back, so clearing one leaves the other as the operator set it.
+  const clearTextFilter = (): void => onSearchChange(showAll ? { all: true } : {});
+
   const filtered = isFiltered(search);
-  const count = services.data ? (filtered ? `${String(shown.length)} of ${String(all.length)}` : String(all.length)) : null;
+  const count = services.data
+    ? filtered
+      ? `${String(shown.length)} of ${String(fetched.length)}`
+      : String(fetched.length)
+    : null;
 
   return (
     <>
       <PageHeader
         title="Services"
-        description="The systemd units WASM manages on this machine: units created by other packages are not listed here today."
+        description={'Every systemd unit WASM manages on this machine. Turn on "Show all units" to see what other packages created too, read-only.'}
         actions={
           <Button variant="primary" icon={<Plus aria-hidden="true" />} onClick={() => setCreateOpen(true)}>
             New service
@@ -65,7 +76,7 @@ export function ServicesPage({ search, onSearchChange }: ServicesPageProps) {
           onRetry={() => void services.refetch()}
           retrying={services.isRefetching}
         />
-      ) : services.data !== undefined && all.length === 0 ? (
+      ) : services.data !== undefined && fetched.length === 0 ? (
         <EmptyState
           level={2}
           icon={<Cog />}
@@ -81,7 +92,7 @@ export function ServicesPage({ search, onSearchChange }: ServicesPageProps) {
         />
       ) : (
         <div className="flex flex-col gap-4">
-          <div role="search" aria-label="Filter services" className="flex flex-wrap items-end gap-2">
+          <div role="search" aria-label="Filter services" className="flex flex-wrap items-center gap-x-4 gap-y-2">
             <Input
               type="search"
               aria-label="Search services"
@@ -95,13 +106,18 @@ export function ServicesPage({ search, onSearchChange }: ServicesPageProps) {
               autoComplete="off"
               spellCheck={false}
             />
+            <Switch
+              label="Show all units"
+              checked={showAll}
+              onCheckedChange={(checked) => set({ all: checked ? true : undefined }, true)}
+            />
             {filtered ? (
-              <Button variant="ghost" icon={<X aria-hidden="true" />} onClick={() => onSearchChange({})}>
+              <Button variant="ghost" icon={<X aria-hidden="true" />} onClick={clearTextFilter}>
                 Clear filters
               </Button>
             ) : null}
             <p role="status" className="ml-auto self-center text-13 text-fg-muted">
-              {count === null ? "" : `${count} ${all.length === 1 && !filtered ? "service" : "services"}`}
+              {count === null ? "" : `${count} ${fetched.length === 1 && !filtered ? "service" : "services"}`}
             </p>
           </div>
 
@@ -115,7 +131,7 @@ export function ServicesPage({ search, onSearchChange }: ServicesPageProps) {
                 title="No service matches"
                 description="Nothing on this machine matches these filters."
                 action={
-                  <Button icon={<X aria-hidden="true" />} onClick={() => onSearchChange({})}>
+                  <Button icon={<X aria-hidden="true" />} onClick={clearTextFilter}>
                     Clear filters
                   </Button>
                 }

@@ -50,3 +50,12 @@ export function wwwOf(domain: string): string | null {
   const name = normalizeDomain(domain);
   return name.startsWith("www.") ? null : `www.${name}`;
 }
+
+/**
+ * A list of names for a dense cell: the first `max`, joined, and how many more there are.
+ * The full list belongs in a tooltip; this only decides what fits inline.
+ */
+export function truncatedNames(names: readonly string[], max = 3): { shown: string; rest: number } {
+  const shown = names.slice(0, max);
+  return { shown: shown.join(", "), rest: names.length - shown.length };
+}

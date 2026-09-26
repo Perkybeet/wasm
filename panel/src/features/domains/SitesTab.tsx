@@ -19,6 +19,7 @@ import { Menu, MenuItem, MenuSeparator } from "../../components/ui/Menu";
 import { StatusPill } from "../../components/ui/StatusPill";
 import { toast } from "../../components/ui/toast";
 import { CreateSiteDialog } from "./CreateSiteDialog";
+import { truncatedNames } from "./names";
 import { useSiteActions } from "./useSiteActions";
 
 /** Whether a site serves HTTPS, as an attribute of it rather than a state: no colour. */
@@ -35,6 +36,21 @@ export function Tls({ secure }: { secure: boolean }) {
 
 export function SiteState({ enabled }: { enabled: boolean }) {
   return <StatusPill state={enabled ? "running" : "stopped"} label={enabled ? "Enabled" : "Disabled"} appearance="inline" size="sm" />;
+}
+
+/** The names a site's configuration answers on, mono and joined, truncated past three with a
+ * "+N more" tail; the full list is always in the title. */
+function ServedNames({ names }: { names: readonly string[] }) {
+  if (names.length === 0) return <span className="text-fg-faint">Unknown</span>;
+  const { shown, rest } = truncatedNames(names);
+  return (
+    <span className="flex min-w-0 items-center gap-1.5" title={names.join(", ")}>
+      <span translate="no" className="mono truncate text-12 text-fg-muted">
+        {shown}
+      </span>
+      {rest > 0 ? <span className="shrink-0 text-12 text-fg-faint">{`+${String(rest)} more`}</span> : null}
+    </span>
+  );
 }
 
 /**
@@ -58,20 +74,21 @@ export function SitesTab() {
   };
 
   const columns: Column<SiteEntry>[] = [
-    { id: "name", header: "Site", cell: (site) => <span translate="no">{site.name}</span>, sortValue: (site) => site.name },
+    {
+      id: "name",
+      header: "Site",
+      cell: (site) => (
+        <span translate="no" className="whitespace-nowrap">
+          {site.name}
+        </span>
+      ),
+      sortValue: (site) => site.name,
+    },
     { id: "server", header: "Server", mono: true, hideBelow: "sm", cell: (site) => site.webserver, sortValue: (site) => site.webserver },
     { id: "state", header: "State", cell: (site) => <SiteState enabled={site.enabled} />, sortValue: (site) => (site.enabled ? 0 : 1) },
     { id: "tls", header: "Serves", hideBelow: "md", cell: (site) => <Tls secure={site.has_ssl} />, sortValue: (site) => (site.has_ssl ? 0 : 1) },
-    {
-      id: "file",
-      header: "Configuration file",
-      hideBelow: "lg",
-      cell: (site) => (
-        <span translate="no" title={site.config_path} className="mono block max-w-80 truncate text-12 text-fg-muted">
-          {site.config_path || "Unknown"}
-        </span>
-      ),
-    },
+    // The file each site lives in is on the site's own page: here the width goes to the names.
+    { id: "names", header: "Names", hideBelow: "lg", cell: (site) => <ServedNames names={site.server_names} /> },
   ];
 
   const createButton = (

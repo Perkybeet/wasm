@@ -7,25 +7,12 @@
 
 import type { Page } from "@playwright/test";
 
-import { expect, expectNoA11yViolations, settle, signIn, test, totpCode } from "./fixtures";
+import { expect, expectNoA11yViolations, settle, signIn, stillness, test, toasts, totpCode } from "./fixtures";
 
 const DOMAIN = "picconia.com";
 
 function header(page: Page) {
   return page.locator("main header").filter({ has: page.getByRole("heading", { level: 1 }) });
-}
-
-/**
- * Waits for every finite animation to end. A state change pulses the pill's opacity once, and
- * axe measuring contrast mid-pulse reports a colour that is on screen for a few frames.
- */
-async function stillness(page: Page): Promise<void> {
-  await page.waitForFunction(() =>
-    document.getAnimations().every((animation) => {
-      const iterations = animation.effect?.getComputedTiming().iterations;
-      return animation.playState !== "running" || iterations === Infinity;
-    }),
-  );
 }
 
 /** The header's state pill: the element that carries data-state. */
@@ -124,7 +111,7 @@ test("Stop asks first; the header follows the unit down and back up", async ({ p
   await dialog.getByRole("button", { name: "Stop application" }).click();
   await expect(dialog).toBeHidden();
   await expect(pill(page)).toHaveAttribute("data-state", "stopped");
-  await expect(page.getByText(`Stopped ${domain}`)).toBeVisible();
+  await expect(toasts(page).getByText(`Stopped ${domain}`)).toBeVisible();
 
   await header(page).getByRole("button", { name: "More actions" }).click();
   await page.getByRole("menuitem", { name: "Start" }).click();
@@ -174,15 +161,25 @@ test("Roll back lists the backups of an app deployed in place", async ({ page, c
 });
 
 test("the overview tab shows the deploys as dots that open each deploy, and the runtime", async ({ page, consoleServer }) => {
-  await signIn(page, consoleServer, "/apps/clientes.arennalabs.com");
+  const domain = "clientes.arennalabs.com";
+  await signIn(page, consoleServer, `/apps/${domain}`);
   const dots = page.getByRole("list", { name: /^Last \d+ deploys, oldest first$/ });
   const newest = dots.getByRole("link").last();
   await expect(newest).toHaveAccessibleName(/^Deploy \d+: Failed c07d5e3/);
   // Its unit is the one systemd gave up on.
   await expect(pill(page)).toHaveAttribute("data-state", "failed");
 
+  const facts = (await (await page.request.get(`/api/apps/${domain}`)).json()) as { source: string | null; branch: string | null };
   const runtime = page.getByRole("region", { name: "Runtime" });
   await expect(runtime.getByText("/var/www/apps/clientes.arennalabs.com")).toBeVisible();
+  if (facts.source !== null) {
+    const repo = runtime.getByRole("link", { name: new RegExp(`^${facts.source.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`) });
+    if (facts.source.startsWith("https://")) await expect(repo).toHaveAttribute("href", facts.source);
+    else await expect(runtime.getByText(facts.source, { exact: true })).toBeVisible();
+  }
+  if (facts.branch !== null) await expect(runtime.getByText(facts.branch, { exact: true })).toBeVisible();
+  // Not every seeded app has a recorded branch: the row still shows, and says so.
+  else await expect(runtime.getByText("Not recorded").first()).toBeVisible();
   await expect(page.getByRole("region", { name: "Domains" }).getByText("No certificate").first()).toBeVisible();
 
   await newest.click();

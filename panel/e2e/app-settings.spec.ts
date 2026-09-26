@@ -13,7 +13,7 @@ import type { Page, TestInfo } from "@playwright/test";
 import path from "node:path";
 
 import type { ConsoleServer } from "./fixtures";
-import { expect, expectNoA11yViolations, settle, signIn, test, totpCode } from "./fixtures";
+import { expect, expectNoA11yViolations, settle, signIn, stillness, test, totpCode } from "./fixtures";
 
 const RELEASE_APP = "tienda.cittek.es";
 const IN_PLACE_APP = "pedidos.cittek.es";
@@ -32,25 +32,29 @@ async function confirmItsYou(page: Page, server: ConsoleServer): Promise<void> {
   await expect(dialog).toBeHidden();
 }
 
-/**
- * Waits for every finite animation to end: a dialog fades in, and axe measuring contrast
- * mid-fade reports a colour that is on screen for a few frames only.
- */
-async function stillness(page: Page): Promise<void> {
-  await page.waitForFunction(() =>
-    document.getAnimations().every((animation) => {
-      const iterations = animation.effect?.getComputedTiming().iterations;
-      return animation.playState !== "running" || iterations === Infinity;
-    }),
-  );
-}
-
 /** A screenshot for review, when asked for: `WASM_TABS_SCREENS=/tmp/console-tabs`. */
 async function review(page: Page, testInfo: TestInfo, name: string): Promise<void> {
   const out = process.env.WASM_TABS_SCREENS;
   if (!out) return;
   await settle(page);
   await page.screenshot({ path: path.join(out, testInfo.project.name, `${name}.png`), fullPage: false });
+}
+
+/** Escapes a string for use inside a `RegExp`, so a URL's dots and slashes match literally. */
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+interface AppFacts {
+  source: string | null;
+  branch: string | null;
+  build_command: string[];
+  start_command: string | null;
+  keep_releases: number;
+}
+
+async function factsOf(page: Page, domain: string): Promise<AppFacts> {
+  return (await (await page.request.get(`/api/apps/${domain}`)).json()) as AppFacts;
 }
 
 test("the webhook lists its deliveries and shows a new secret once", async ({ page, consoleServer }, testInfo) => {
@@ -83,6 +87,43 @@ test("the webhook lists its deliveries and shows a new secret once", async ({ pa
 
   await shown.getByRole("button", { name: "Hide the secret" }).click();
   await expect(webhook.getByText(body.secret, { exact: true })).toHaveCount(0);
+});
+
+test("the source, branch, build and start commands read what the API records", async ({ page, consoleServer }) => {
+  await signIn(page, consoleServer, `/apps/${RELEASE_APP}/settings`);
+  const facts = await factsOf(page, RELEASE_APP);
+  if (facts.source === null) throw new Error(`${RELEASE_APP} has no recorded source to assert against`);
+  const source = region(page, "Source and runtime");
+
+  const repo = source.getByRole("link", { name: new RegExp(`^${escapeRegExp(facts.source)}`) });
+  await expect(repo).toHaveAttribute("href", facts.source);
+  await expect(repo).toHaveAttribute("target", "_blank");
+  if (facts.branch !== null) await expect(source.getByText(facts.branch, { exact: true })).toBeVisible();
+  const build = facts.build_command.length > 0 ? facts.build_command.join(" ") : "None";
+  await expect(source.getByText(build, { exact: true })).toBeVisible();
+  if (facts.start_command !== null) await expect(source.getByText(facts.start_command, { exact: true })).toBeVisible();
+
+  const releases = region(page, "Releases");
+  const kept = `${String(facts.keep_releases)} ${facts.keep_releases === 1 ? "release" : "releases"}`;
+  await expect(releases.getByText(kept, { exact: true })).toBeVisible();
+  await expectNoA11yViolations(page, "the source, branch and command facts");
+});
+
+test("a static site has nothing to build or start, and the facts it does have", async ({ page, consoleServer }) => {
+  const domain = "bodas.arennalabs.com";
+  await signIn(page, consoleServer, `/apps/${domain}/settings`);
+  const facts = await factsOf(page, domain);
+  const source = region(page, "Source and runtime");
+
+  await expect(source.getByText("Build command")).toBeVisible();
+  await expect(source.getByText(facts.build_command.length > 0 ? facts.build_command.join(" ") : "None", { exact: true })).toBeVisible();
+  await expect(source.getByText("Start command")).toHaveCount(0);
+  await expect(source.getByText("Port")).toHaveCount(0);
+  await expect(source.getByText("The web server, no process", { exact: true })).toBeVisible();
+  if (facts.source?.startsWith("https://")) {
+    await expect(source.getByRole("link", { name: new RegExp(`^${escapeRegExp(facts.source)}`) })).toBeVisible();
+  }
+  await expectNoA11yViolations(page, "a static site's source and runtime facts");
 });
 
 test("limits are refused as the backend would, then saved with exactly what the form says", async ({ page, consoleServer }, testInfo) => {

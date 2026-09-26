@@ -5,7 +5,7 @@ import { useMemo, useState } from "react";
 import { request } from "../../api/client";
 import { certKeys, certsQuery } from "../../api/queries/certs";
 import type { CertEntry } from "../../api/queries/certs";
-import { activeJobsQuery } from "../../api/queries/jobs";
+import { activeJobsQuery, useFollowedJob } from "../../api/queries/jobs";
 import type { Job } from "../../api/queries/jobs";
 import { CommandHint } from "../../components/page/CommandHint";
 import { KeyValueList } from "../../components/page/KeyValueList";
@@ -25,8 +25,9 @@ import { CertificateStatus } from "./CertificateStatus";
 import { IssueCertificateDialog } from "./IssueCertificateDialog";
 import { JobBanner } from "./JobBanner";
 import type { JobWords } from "./JobBanner";
-import { byUrgency, certificateJobFor, certificateView } from "./certificates";
-import { useCertificateRefresh, useFollowedJob } from "./useCertificateJobs";
+import { byUrgency, certificateJobFor, certificateView, issuerName } from "./certificates";
+import { truncatedNames } from "./names";
+import { useCertificateRefresh } from "./useCertificateJobs";
 
 /** The state a row shows: the job working on it, or what its expiry means. */
 function rowState(cert: CertEntry, job: Job | null): { tone: "ok" | "warn" | "fail" | "idle" | "busy"; label: string } {
@@ -42,12 +43,11 @@ function otherNames(cert: CertEntry): string[] {
 function Names({ cert }: { cert: CertEntry }) {
   const others = otherNames(cert);
   if (others.length === 0) return <span className="text-fg-faint">Only this name</span>;
-  const shown = others.slice(0, 2);
-  const rest = others.length - shown.length;
+  const { shown, rest } = truncatedNames(others, 2);
   return (
     <span className="flex min-w-0 items-center gap-1.5" title={others.join(", ")}>
       <span translate="no" className="mono truncate text-12 text-fg-muted">
-        {shown.join(", ")}
+        {shown}
       </span>
       {rest > 0 ? <span className="shrink-0 text-12 text-fg-faint">{`+${String(rest)} more`}</span> : null}
     </span>
@@ -92,6 +92,7 @@ function CertificateDrawer({
                 copy: cert.domains.join(" "),
                 hint: `${String(cert.domains.length)} ${cert.domains.length === 1 ? "name" : "names"}`,
               },
+              { label: "Issuer", value: cert.issuer ? issuerName(cert.issuer) : null, mono: false },
               { label: "Expires", value: cert.expires_on ?? null },
               { label: "Certbot says", value: cert.valid_until ?? null },
               { label: "Renewal", value: cert.auto_renew ? "Automatic" : "Manual", mono: false, copy: false },
@@ -187,6 +188,12 @@ export function CertificatesTab() {
       header: "State",
       cell: (cert) => <CertificateStatus {...rowState(cert, certificateJobFor(jobs, cert.domain))} />,
       sortValue: (cert) => cert.days_remaining ?? null,
+    },
+    {
+      id: "issuer",
+      header: "Issuer",
+      hideBelow: "lg",
+      cell: (cert) => <span className="text-fg-muted">{cert.issuer ? issuerName(cert.issuer) : "Unknown"}</span>,
     },
     {
       id: "renewal",

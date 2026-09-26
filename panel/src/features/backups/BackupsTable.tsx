@@ -1,5 +1,5 @@
 import { Link } from "@tanstack/react-router";
-import { CircleCheck, CircleX, MoreHorizontal, RotateCcw, ShieldCheck, Trash2 } from "lucide-react";
+import { MoreHorizontal, RotateCcw, ShieldCheck, Trash2 } from "lucide-react";
 import type { ReactNode } from "react";
 import { useState } from "react";
 
@@ -11,6 +11,7 @@ import { DataTable } from "../../components/ui/DataTable";
 import type { Column } from "../../components/ui/DataTable";
 import { IconButton } from "../../components/ui/IconButton";
 import { Menu, MenuItem } from "../../components/ui/Menu";
+import { StatusPill } from "../../components/ui/StatusPill";
 import { toast } from "../../components/ui/toast";
 import { describeError } from "../../lib/errors";
 import { RestoreBackupDialog } from "./RestoreBackupDialog";
@@ -32,34 +33,39 @@ function includesOf(backup: BackupRow): Includes[] {
   ];
 }
 
-type VerifyState = "unknown" | "checking" | "valid" | "invalid";
-
-function VerifiedCell({ state }: { state: VerifyState }) {
-  if (state === "checking") return <span className="text-fg-faint">Checking...</span>;
-  if (state === "valid")
+/**
+ * What the backup itself last recorded (`last_verified_at`, `verified_ok`), plus the moment
+ * this session is waiting on a fresh check. The server, not the session, is the source of
+ * truth: a page reload shows the same verdict, not "not checked" again.
+ */
+function VerifiedCell({ backup, checking }: { backup: BackupRow; checking: boolean }) {
+  if (checking) return <StatusPill state="deploying" label="Checking" appearance="inline" size="sm" />;
+  if (backup.verified_ok === true) {
     return (
-      <span className="inline-flex items-center gap-1 text-ok">
-        <CircleCheck aria-hidden="true" className="size-3.5" />
-        Verified
+      <span className="flex flex-col gap-0.5">
+        <StatusPill state="running" label="Verified" appearance="inline" size="sm" />
+        <RelativeTime value={backup.last_verified_at} className="text-12 text-fg-faint" />
       </span>
     );
-  if (state === "invalid")
+  }
+  if (backup.verified_ok === false) {
     return (
-      <span className="inline-flex items-center gap-1 text-fail">
-        <CircleX aria-hidden="true" className="size-3.5" />
-        Failed
+      <span className="flex flex-col gap-0.5">
+        <StatusPill state="failed" label="Verification failed" appearance="inline" size="sm" />
+        <RelativeTime value={backup.last_verified_at} className="text-12 text-fg-faint" />
       </span>
     );
-  return <span className="text-fg-faint">Not checked</span>;
+  }
+  return <StatusPill state="stopped" label="Never verified" appearance="inline" size="sm" />;
 }
 
 function RowActions({
   backup,
-  verifyState,
+  checking,
   onVerify,
 }: {
   backup: BackupRow;
-  verifyState: VerifyState;
+  checking: boolean;
   onVerify: () => void;
 }) {
   const { remove } = useBackupActions();
@@ -69,7 +75,7 @@ function RowActions({
   return (
     <>
       <Menu align="end" trigger={<IconButton label={`Actions for ${backup.backup_id}`} icon={<MoreHorizontal />} size="sm" tooltip={false} />}>
-        <MenuItem icon={<ShieldCheck />} disabled={verifyState === "checking"} onClick={onVerify}>
+        <MenuItem icon={<ShieldCheck />} disabled={checking} onClick={onVerify}>
           Verify
         </MenuItem>
         <MenuItem icon={<RotateCcw />} onClick={() => setRestoreOpen(true)}>
@@ -103,19 +109,23 @@ export interface BackupsTableProps {
 }
 
 /**
- * Every backup, newest first: what app, when, its size, what it includes, and whether it was
- * verified against its checksum this session (the backend keeps no verified flag to list - see
- * `useBackupActions.verify` - so the state resets on reload rather than claiming to remember).
+ * Every backup, newest first: what app, when, its size, what it includes, and its last
+ * verification against its checksum - `last_verified_at` and `verified_ok`, as the backup
+ * itself records them, so the state survives a reload instead of resetting to "not checked".
  */
 export function BackupsTable({ backups, caption, loading = false, empty }: BackupsTableProps) {
   const { verify } = useBackupActions();
-  const [verifications, setVerifications] = useState<ReadonlyMap<string, VerifyState>>(new Map());
+  const [checking, setChecking] = useState<ReadonlySet<string>>(new Set());
 
   const onVerify = (backup: Backup): void => {
-    setVerifications((current) => new Map(current).set(backup.backup_id, "checking"));
+    setChecking((current) => new Set(current).add(backup.backup_id));
     verify.mutate(backup.backup_id, {
       onSuccess: (result) => {
-        setVerifications((current) => new Map(current).set(backup.backup_id, result.valid ? "valid" : "invalid"));
+        setChecking((current) => {
+          const next = new Set(current);
+          next.delete(backup.backup_id);
+          return next;
+        });
         if (result.valid) {
           toast.success(`${backup.backup_id} verified`);
         } else {
@@ -125,7 +135,11 @@ export function BackupsTable({ backups, caption, loading = false, empty }: Backu
         }
       },
       onError: (error) => {
-        setVerifications((current) => new Map(current).set(backup.backup_id, "unknown"));
+        setChecking((current) => {
+          const next = new Set(current);
+          next.delete(backup.backup_id);
+          return next;
+        });
         toast.error(`Could not verify ${backup.backup_id}`, { detail: describeError(error).detail });
       },
     });
@@ -159,12 +173,15 @@ export function BackupsTable({ backups, caption, loading = false, empty }: Backu
       align: "end",
       mono: true,
       width: "w-24",
+      // On a phone the row keeps what, when and whether it was verified.
+      hideBelow: "sm",
       cell: (row) => row.size_human,
       sortValue: (row) => row.size,
     },
     {
       id: "includes",
       header: "Includes",
+      hideBelow: "md",
       cell: (row) => (
         <span className="flex flex-wrap gap-1">
           {includesOf(row)
@@ -180,8 +197,8 @@ export function BackupsTable({ backups, caption, loading = false, empty }: Backu
     {
       id: "verified",
       header: "Verified",
-      width: "w-28",
-      cell: (row) => <VerifiedCell state={verifications.get(row.backup_id) ?? "unknown"} />,
+      width: "w-36",
+      cell: (row) => <VerifiedCell backup={row} checking={checking.has(row.backup_id)} />,
     },
   ];
 
@@ -194,7 +211,7 @@ export function BackupsTable({ backups, caption, loading = false, empty }: Backu
       loading={loading}
       {...(empty !== undefined ? { empty } : {})}
       rowActions={(row) => (
-        <RowActions backup={row} verifyState={verifications.get(row.backup_id) ?? "unknown"} onVerify={() => onVerify(row)} />
+        <RowActions backup={row} checking={checking.has(row.backup_id)} onVerify={() => onVerify(row)} />
       )}
       defaultSort={{ column: "created", direction: "descending" }}
     />

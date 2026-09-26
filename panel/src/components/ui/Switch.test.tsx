@@ -23,6 +23,14 @@ describe("Switch", () => {
     expect(screen.getByRole("switch", { name: "Maintenance page" })).toHaveAttribute("aria-checked", "true");
   });
 
+  it("is named by its label and described by its second line", async () => {
+    render(<Switch label="Deploy on push" description="Build when main receives a commit." />);
+    const control = screen.getByRole("switch", { name: "Deploy on push" });
+    expect(control).toHaveAccessibleDescription("Build when main receives a commit.");
+    await userEvent.click(screen.getByText("Build when main receives a commit."));
+    expect(control).toHaveAttribute("aria-checked", "true");
+  });
+
   it("has no accessibility violations", async () => {
     const { container } = render(
       <div>

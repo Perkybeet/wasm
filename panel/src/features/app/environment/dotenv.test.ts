@@ -1,13 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  hasExportPrefixes,
   nameProblem,
   parseDotenv,
   pythonLines,
   pythonStrip,
-  readBack,
-  removeExportPrefixes,
   valueProblem,
 } from "./dotenv";
 
@@ -66,8 +63,14 @@ describe("parseDotenv", () => {
     expect(parseDotenv("# ok\nnot an assignment\nA=1").skipped).toEqual([{ line: 2, name: "not an assignment", value: "" }]);
   });
 
-  it("does not strip export, as WASM does not", () => {
-    expect([...parseDotenv("export FOO=bar").variables.keys()]).toEqual(["export FOO"]);
+  it("drops a leading export keyword from the name, as a shell would", () => {
+    expect([...parseDotenv("export FOO=bar\nexport\t\tBAR=1\nexported=yes\nEXPORT_DIR=/x\nexport=2").variables.keys()]).toEqual([
+      "FOO",
+      "BAR",
+      "exported",
+      "EXPORT_DIR",
+      "export",
+    ]);
   });
 });
 
@@ -87,7 +90,7 @@ describe("Python's string rules", () => {
 describe("what the API accepts", () => {
   it("names a bad name and says how to fix it", () => {
     expect(nameProblem("API_URL")).toBeNull();
-    expect(nameProblem("export FOO")).toMatch(/does not strip "export"/);
+    expect(nameProblem("MY VAR")).toMatch(/is not a variable name/);
     expect(nameProblem("")).toMatch(/no name/);
     expect(nameProblem("2FA")).toMatch(/start with a letter/);
   });
@@ -96,30 +99,5 @@ describe("what the API accepts", () => {
     expect(valueProblem("caf\xe9")).toBeNull();
     expect(valueProblem("a\tb")).toMatch(/a tab/);
     expect(valueProblem("a\x7fb")).toMatch(/U\+007F/);
-  });
-});
-
-describe("export prefixes", () => {
-  it("are found only where they start an assignment", () => {
-    expect(hasExportPrefixes("export A=1")).toBe(true);
-    expect(hasExportPrefixes("exported=1\n# export A=1\nEXPORT_DIR=/x")).toBe(false);
-  });
-
-  it("are removed without touching anything else", () => {
-    expect(removeExportPrefixes("export A=1\n  export\tB='x'\nexported=1\nC=export D=2")).toBe(
-      "A=1\n  B='x'\nexported=1\nC=export D=2",
-    );
-  });
-});
-
-describe("readBack", () => {
-  it("is the value when the unquoted writer can keep it", () => {
-    expect(readBack("postgres://u:p@h/db")).toBe("postgres://u:p@h/db");
-    expect(readBack("hola # not a comment")).toBe("hola # not a comment");
-  });
-
-  it("shows what a value with surrounding spaces or quotes becomes", () => {
-    expect(readBack("  padded  ")).toBe("padded");
-    expect(readBack("'quoted'")).toBe("quoted");
   });
 });

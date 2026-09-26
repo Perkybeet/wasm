@@ -1,5 +1,6 @@
 import { Checkbox as BaseCheckbox } from "@base-ui/react/checkbox";
 import { Check, Minus } from "lucide-react";
+import { useId } from "react";
 import type { ReactNode } from "react";
 
 import { cx } from "../../lib/cx";
@@ -33,12 +34,16 @@ export function Checkbox({
   name,
   className,
 }: CheckboxProps) {
+  const labelId = useId();
+  const descriptionId = useId();
+  const described = label !== undefined && description !== undefined;
   const box = (
     <BaseCheckbox.Root
       {...(checked !== undefined ? { checked } : {})}
       {...(defaultChecked !== undefined ? { defaultChecked } : {})}
       {...(onCheckedChange ? { onCheckedChange: (next: boolean) => onCheckedChange(next) } : {})}
       {...(ariaLabel !== undefined ? { "aria-label": ariaLabel } : {})}
+      {...(described ? { "aria-labelledby": labelId, "aria-describedby": descriptionId } : {})}
       {...(name !== undefined ? { name } : {})}
       indeterminate={indeterminate}
       disabled={disabled}
@@ -73,8 +78,14 @@ export function Checkbox({
     >
       {box}
       <span className="flex flex-col">
-        <span>{label}</span>
-        {description !== undefined ? <span className="text-13 text-fg-muted">{description}</span> : null}
+        <span id={labelId}>{label}</span>
+        {/* The enclosing label would read both lines as the name; the second is the
+            consequence of ticking, so it is named apart and read as the description. */}
+        {description !== undefined ? (
+          <span id={descriptionId} className="text-13 text-fg-muted">
+            {description}
+          </span>
+        ) : null}
       </span>
     </label>
   );

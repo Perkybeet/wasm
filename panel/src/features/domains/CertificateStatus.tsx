@@ -1,5 +1,3 @@
-import { TriangleAlert } from "lucide-react";
-
 import { StatusGlyph } from "../../components/ui/StatusPill";
 import { cx } from "../../lib/cx";
 import type { CertTone } from "./certificates";
@@ -21,14 +19,10 @@ export function CertificateStatus({ tone, label, className }: { tone: CertTone; 
   return (
     <span data-tone={tone} className={cx("inline-flex min-w-0 items-center gap-1.5 text-13", className)}>
       <span className={cx("flex shrink-0", TONE_TEXT[tone])}>
-        {tone === "warn" ? (
-          <TriangleAlert aria-hidden="true" className="size-3.5" />
-        ) : (
-          <StatusGlyph
-            state={tone === "ok" ? "running" : tone === "fail" ? "failed" : tone === "busy" ? "deploying" : "stopped"}
-            size={12}
-          />
-        )}
+        <StatusGlyph
+          state={tone === "ok" ? "running" : tone === "warn" ? "warning" : tone === "fail" ? "failed" : tone === "busy" ? "deploying" : "stopped"}
+          size={12}
+        />
       </span>
       <span className={cx("truncate", tone === "idle" ? "text-fg-muted" : "text-fg")}>{label}</span>
     </span>

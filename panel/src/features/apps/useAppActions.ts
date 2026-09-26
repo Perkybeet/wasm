@@ -89,9 +89,14 @@ export function useAppActions(domain: string, { onJobQueued }: AppActionOptions 
     // only fills an empty entry, never overwrites a newer one.
     queryClient.setQueryData<Job>(jobKeys.detail(job.id), (current) => current ?? job);
     void queryClient.invalidateQueries({ queryKey: jobKeys.active });
-    announce(`${verb} of ${domain} queued`);
-    if (onJobQueued) onJobQueued(job);
-    else toast.info(`${verb} of ${domain} queued`, { description: "You will be told when it finishes." });
+    // Said once: the toast is itself announced (it lives in a live region); a caller that takes
+    // the operator somewhere instead of toasting gets the sentence spoken here.
+    if (onJobQueued) {
+      announce(`${verb} of ${domain} queued`);
+      onJobQueued(job);
+    } else {
+      toast.info(`${verb} of ${domain} queued`, { description: "You will be told when it finishes." });
+    }
   };
 
   const restart = useUnitAction(domain, "restart", refresh);

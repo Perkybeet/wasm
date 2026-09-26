@@ -11,6 +11,7 @@ import { Button } from "./Button";
 import { CopyButton } from "./CopyButton";
 import { IconButton } from "./IconButton";
 import { Input } from "./Input";
+import { Kbd } from "./Kbd";
 
 export interface LogLine {
   id: number;
@@ -26,6 +27,19 @@ export interface LogViewerProps {
   /** Pixel height, or "fill" to take the height of a flex parent. */
   height?: number | "fill";
   searchable?: boolean;
+  /**
+   * Registers this viewer's search box as the page's `/` target: sets `data-page-search` on
+   * the input (see the shell's `/` shortcut) and shows a `/` hint in it while it is empty.
+   * Set this on at most one `LogViewer` per page - with more than one, `/` focuses whichever
+   * the shortcut's selector finds first, which is not a choice this component can make for you.
+   */
+  pageSearch?: boolean;
+  /**
+   * Initial wrapped state. Left unset, lines start wrapped when the viewport is at most 639px
+   * wide (Tailwind's `sm` breakpoint) and unwrapped otherwise; the wrap button always overrides
+   * this afterwards, and resizing the window never overrides an operator's explicit choice.
+   */
+  wrap?: boolean;
   /** Called when the reader scrolls to the top, to prepend older lines. */
   onLoadMore?: () => void;
   /** Accessible name of the output region: "Build log for example.com". */
@@ -38,6 +52,14 @@ export interface LogViewerProps {
 
 const ROW_HEIGHT = 20;
 const BOTTOM_SLACK = 4;
+
+// Tailwind's `sm` breakpoint: below it, unwrapped output usually just means horizontal scrolling
+// with nothing else visible, so wrapping is the more useful default there.
+const NARROW_VIEWPORT = "(max-width: 639px)";
+
+function prefersWrap(): boolean {
+  return typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia(NARROW_VIEWPORT).matches;
+}
 
 interface ParsedLine {
   segments: AnsiSegment[];
@@ -165,6 +187,8 @@ export function LogViewer({
   follow = true,
   height = 360,
   searchable = true,
+  pageSearch = false,
+  wrap: initialWrap,
   onLoadMore,
   label = "Log output",
   filename = "wasm.log",
@@ -180,7 +204,7 @@ export function LogViewer({
   const [following, setFollowing] = useState(follow);
   const [atBottom, setAtBottom] = useState(true);
   const [pausedAt, setPausedAt] = useState<number | null>(null);
-  const [wrap, setWrap] = useState(false);
+  const [wrap, setWrap] = useState(() => initialWrap ?? prefersWrap());
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
 
@@ -214,13 +238,17 @@ export function LogViewer({
     return map;
   }, [matches, current]);
 
-  // Pinned to the newest line while following.
+  // Pinned to the newest line while following. Wrapped rows have a measured, variable height:
+  // the virtualizer's total size only settles once its rows have mounted and measured
+  // themselves, one render after this one, so it is a dependency here too - otherwise the
+  // first pin would land short, on the still-estimated height, and stay short.
+  const totalSize = virtualizer.getTotalSize();
   useLayoutEffect(() => {
     const el = scrollRef.current;
     if (!el || !following) return;
     el.scrollTop = el.scrollHeight;
     lastTop.current = el.scrollTop;
-  }, [lines.length, following, wrap]);
+  }, [lines.length, following, wrap, totalSize]);
 
   // Older lines prepended: keep the reader's place instead of jumping.
   useLayoutEffect(() => {
@@ -311,7 +339,10 @@ export function LogViewer({
     }
   };
 
-  const plainText = (): string => lines.map((line) => parsed(line).plain).join("\n");
+  // The same columns the viewer shows: the time when the line has one, never the line-number
+  // gutter (that is a position in this view, not part of the log).
+  const plainText = (): string =>
+    lines.map((line) => (line.ts !== undefined ? `${line.ts} ${parsed(line).plain}` : parsed(line).plain)).join("\n");
   const newLines = pausedAt !== null ? Math.max(0, lines.length - pausedAt) : 0;
   const showJump = !following && !atBottom && lines.length > 0;
 
@@ -327,9 +358,16 @@ export function LogViewer({
       )}
       style={height === "fill" ? undefined : { height }}
     >
-      <div className="flex shrink-0 items-center gap-2 border-b border-border bg-surface px-2 py-1.5">
+      {/* Wraps onto a second row rather than clipping or overlapping: on a narrow viewport with
+          an active search (counter plus step buttons), the single-row toolbar does not fit
+          next to follow/wrap/copy/download. The search group deliberately keeps its automatic
+          min-width (no `min-w-0`) so that minimum - the search box's own floor plus its
+          shrink-0 counter and step buttons - is what the wrap decision above is based on;
+          `min-w-0` here would let the flex algorithm shrink the group past what its children
+          can actually fit in, which overflows them into the next group instead of wrapping. */}
+      <div className="flex flex-wrap shrink-0 items-center gap-2 border-b border-border bg-surface px-2 py-1.5">
         {searchable ? (
-          <div className="flex min-w-0 flex-1 items-center gap-2">
+          <div className="flex flex-1 items-center gap-2">
             <Input
               ref={searchRef}
               size="sm"
@@ -341,6 +379,8 @@ export function LogViewer({
               onValueChange={onQueryChange}
               onKeyDown={onSearchKey}
               className="w-full max-w-64 min-w-28"
+              suffix={pageSearch && query === "" ? <Kbd className="pointer-coarse:hidden">/</Kbd> : undefined}
+              {...(pageSearch ? { "data-page-search": "" } : {})}
             />
             <span role="status" className="mono shrink-0 text-12 whitespace-nowrap text-fg-muted">
               {needle === "" ? "" : matches.length === 0 ? "No matches" : `${String(current + 1)} of ${String(matches.length)}`}

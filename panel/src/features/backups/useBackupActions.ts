@@ -80,6 +80,9 @@ export function useBackupActions() {
 
   const verify = useMutation({
     mutationFn: (backupId: string) => request("post", "/api/backups/{backup_id}/verify", { params: { backup_id: backupId } }),
+    // The manager records last_verified_at and verified_ok against the backup itself; refetch
+    // so the row reflects the server's own verdict instead of a client-only, session-lived one.
+    onSuccess: refreshList,
   });
 
   const restore = useMutation({

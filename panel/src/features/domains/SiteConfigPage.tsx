@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useBlocker, useNavigate } from "@tanstack/react-router";
-import { CircleAlert, CornerDownRight, FileX, MoreHorizontal, Play, RotateCw, ShieldCheck, Square, Trash2, Undo2 } from "lucide-react";
+import { CircleAlert, CornerDownRight, FileX, FlaskConical, MoreHorizontal, Play, RotateCw, ShieldCheck, Square, Trash2, Undo2 } from "lucide-react";
 import { useId, useRef, useState } from "react";
 
 import { ElevationCancelledError, isApiError, request } from "../../api/client";
@@ -17,17 +17,22 @@ import { EmptyState } from "../../components/ui/EmptyState";
 import { IconButton } from "../../components/ui/IconButton";
 import { Menu, MenuItem } from "../../components/ui/Menu";
 import { Skeleton } from "../../components/ui/Skeleton";
+import { SystemOutput } from "../../components/ui/SystemOutput";
 import { toast } from "../../components/ui/toast";
 import { ConfigEditor } from "./ConfigEditor";
 import type { ConfigEditorHandle } from "./ConfigEditor";
 import { SiteState, Tls } from "./SitesTab";
-import { configRejection } from "./configErrors";
+import { configRejection, failingLine } from "./configErrors";
 import type { ConfigRejection } from "./configErrors";
 import { useSiteActions } from "./useSiteActions";
 
 const BREADCRUMBS = [{ label: "Domains and certificates", to: "/domains" }] as const;
 
-type Outcome = { kind: "saved"; webserver: string } | { kind: "rejected"; rejection: ConfigRejection } | null;
+type Outcome =
+  | { kind: "saved"; webserver: string }
+  | { kind: "rejected"; rejection: ConfigRejection }
+  | { kind: "tested"; ok: boolean; output: string; line: number | null }
+  | null;
 
 function Rejected({ rejection, id, onGoToLine }: { rejection: ConfigRejection; id: string; onGoToLine: (line: number) => void }) {
   return (
@@ -41,11 +46,9 @@ function Rejected({ rejection, id, onGoToLine }: { rejection: ConfigRejection; i
           </p>
         </div>
       </div>
-      {/* Focusable: a long output scrolls, and a keyboard scrolls what has focus. */}
-      {/* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex */}
-      <pre tabIndex={0} className="max-h-56 overflow-auto rounded-control border border-border bg-surface px-3 py-2 text-12 whitespace-pre-wrap break-words text-fg scroll-thin">
+      <SystemOutput label="What the configuration test said" maxHeight="max-h-56" className="rounded-control border border-border bg-surface px-3 py-2">
         {rejection.output.trim() === "" ? rejection.summary : rejection.output.trimEnd()}
-      </pre>
+      </SystemOutput>
       {rejection.line !== null ? (
         <div>
           <Button size="sm" icon={<CornerDownRight aria-hidden="true" />} onClick={() => onGoToLine(rejection.line ?? 1)}>
@@ -69,6 +72,39 @@ function Saved({ webserver, id, onReload, reloading }: { webserver: string; id: 
       <Button icon={<RotateCw aria-hidden="true" />} loading={reloading} onClick={onReload} className="self-start sm:self-auto">
         {`Reload ${webserver}`}
       </Button>
+    </div>
+  );
+}
+
+/** The reload after a save's own test passed, itself refused by the web server: rare (the
+ * configuration changed again between the two calls), but its output is shown verbatim, the
+ * same as any other test failure. */
+function ReloadFailed({ webserver, output }: { webserver: string; output: string }) {
+  return (
+    <div role="alert" className="flex flex-col gap-2 rounded-card border border-fail/30 bg-fail-soft/50 p-4">
+      <div className="flex items-start gap-2">
+        <CircleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-fail" />
+        <p className="text-13 text-pretty text-fg">{`${webserver} was not reloaded; it keeps serving the configuration from before this save.`}</p>
+      </div>
+      <SystemOutput label={`What ${webserver}'s reload said`} maxHeight="max-h-56" className="rounded-control border border-border bg-surface px-3 py-2">
+        {output.trim() === "" ? `${webserver} printed nothing.` : output.trimEnd()}
+      </SystemOutput>
+    </div>
+  );
+}
+
+/** A candidate configuration tested without saving it, and found acceptable. Nothing on disk
+ * changed: the web server's own confirmation is shown so the operator knows it is safe to save. */
+function TestPassed({ webserver, output, id }: { webserver: string; output: string; id: string }) {
+  return (
+    <div id={id} role="status" className="flex flex-col gap-2 rounded-card border border-ok/30 bg-ok-soft/40 p-4">
+      <div className="flex items-start gap-2">
+        <ShieldCheck aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-ok" />
+        <p className="text-13 text-pretty text-fg">{`This passed ${webserver}'s configuration test. Nothing was saved yet.`}</p>
+      </div>
+      <SystemOutput label="What the configuration test said" maxHeight="max-h-56" className="rounded-control border border-border bg-surface px-3 py-2">
+        {output.trim() === "" ? `${webserver} printed nothing.` : output.trimEnd()}
+      </SystemOutput>
     </div>
   );
 }
@@ -121,6 +157,7 @@ export function SiteConfigPage({ site }: { site: string }) {
     mutationFn: (next: string) => request("put", "/api/sites/{domain}/config", { params: { domain: site }, body: { config: next } }),
     onMutate: () => {
       setOutcome(null);
+      reload.reset();
     },
     onSuccess: (_result, next) => {
       queryClient.setQueryData<SiteConfig>(siteKeys.config(site), (current) => (current ? { ...current, config: next } : current));
@@ -134,9 +171,23 @@ export function SiteConfigPage({ site }: { site: string }) {
     },
   });
 
+  // A candidate configuration tried against the web server without saving it: same test the
+  // save path runs, without the side effect. The endpoint never touches the file on disk.
+  const test = useMutation({
+    mutationFn: (content: string) => request("post", "/api/sites/{domain}/config/test", { params: { domain: site }, body: { content } }),
+    onMutate: () => {
+      setOutcome(null);
+    },
+    onSuccess: (result) => {
+      setOutcome({ kind: "tested", ok: result.ok, output: result.output, line: result.ok ? null : failingLine(result.output) });
+    },
+  });
+
   const onChange = (value: string): void => {
     setDraft(value);
-    if (outcome?.kind === "saved") setOutcome(null);
+    // A refusal (from testing or saving) stays up while the operator fixes the line it names;
+    // an affirmative result about to be outdated by the edit does not.
+    if (outcome?.kind === "saved" || (outcome?.kind === "tested" && outcome.ok)) setOutcome(null);
   };
 
   if ((info.isError && isApiError(info.error) && info.error.status === 404) || (config.isError && isApiError(config.error) && config.error.status === 404)) {
@@ -218,6 +269,14 @@ export function SiteConfigPage({ site }: { site: string }) {
             <EditorSkeleton />
           ) : (
             <div className="flex flex-col gap-3">
+              {info.data && info.data.server_names.length > 0 ? (
+                <p className="flex min-w-0 items-center gap-2 text-12 text-fg-muted">
+                  <span className="shrink-0">Serves</span>
+                  <span translate="no" className="mono truncate text-fg" title={info.data.server_names.join(", ")}>
+                    {info.data.server_names.join(", ")}
+                  </span>
+                </p>
+              ) : null}
               <p id={pathId} className="flex min-w-0 items-center gap-2 text-12 text-fg-muted">
                 <span className="shrink-0">File</span>
                 <code translate="no" className="truncate text-fg" title={config.data.path}>
@@ -230,30 +289,62 @@ export function SiteConfigPage({ site }: { site: string }) {
                 onChange={onChange}
                 label={`Configuration of ${site}`}
                 describedBy={describedBy}
-                errorLine={outcome?.kind === "rejected" ? outcome.rejection.line : null}
-                disabled={save.isPending}
+                errorLine={outcome?.kind === "rejected" ? outcome.rejection.line : outcome?.kind === "tested" ? outcome.line : null}
+                disabled={save.isPending || test.isPending}
               />
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <p role="status" className="text-13 text-fg-muted">
                   {dirty ? "Unsaved changes" : outcome?.kind === "saved" ? "" : "No changes"}
                 </p>
                 <div className="flex flex-wrap items-center gap-2">
-                  <Button variant="ghost" icon={<Undo2 aria-hidden="true" />} disabled={!dirty || save.isPending} onClick={() => { setDraft(null); setOutcome(null); }}>
+                  <Button
+                    variant="ghost"
+                    icon={<Undo2 aria-hidden="true" />}
+                    disabled={!dirty || save.isPending || test.isPending}
+                    onClick={() => {
+                      setDraft(null);
+                      setOutcome(null);
+                    }}
+                  >
                     Discard changes
                   </Button>
-                  <Button variant="primary" disabled={!dirty} loading={save.isPending} onClick={() => save.mutate(text)}>
+                  <Button variant="secondary" icon={<FlaskConical aria-hidden="true" />} disabled={save.isPending} loading={test.isPending} onClick={() => test.mutate(text)}>
+                    Test
+                  </Button>
+                  <Button variant="primary" disabled={!dirty || test.isPending} loading={save.isPending} onClick={() => save.mutate(text)}>
                     Test and save
                   </Button>
                 </div>
               </div>
               {outcome?.kind === "rejected" ? (
                 <Rejected rejection={outcome.rejection} id={outcomeId} onGoToLine={(line) => editor.current?.goToLine(line)} />
+              ) : outcome?.kind === "tested" ? (
+                outcome.ok ? (
+                  <TestPassed webserver={webserver} output={outcome.output} id={outcomeId} />
+                ) : (
+                  <Rejected
+                    rejection={{ summary: `${webserver} rejected this configuration`, output: outcome.output, line: outcome.line }}
+                    id={outcomeId}
+                    onGoToLine={(line) => editor.current?.goToLine(line)}
+                  />
+                )
               ) : outcome?.kind === "saved" ? (
-                <Saved webserver={outcome.webserver} id={outcomeId} onReload={() => reload.mutate()} reloading={reload.isPending} />
+                <>
+                  <Saved webserver={outcome.webserver} id={outcomeId} onReload={() => reload.mutate()} reloading={reload.isPending} />
+                  {reload.isError ? (
+                    isApiError(reload.error) && reload.error.output ? (
+                      <ReloadFailed webserver={webserver} output={reload.error.output} />
+                    ) : (
+                      <ErrorBlock live error={reload.error} title={`${webserver} was not reloaded`} />
+                    )
+                  ) : null}
+                </>
               ) : save.isError && !(save.error instanceof ElevationCancelledError) ? (
                 <ErrorBlock live error={save.error} title="The configuration was not saved" />
               ) : save.error instanceof ElevationCancelledError ? (
                 <p role="status" className="text-13 text-fg-muted">{save.error.detail}</p>
+              ) : test.isError ? (
+                <ErrorBlock live error={test.error} title="The configuration could not be tested" />
               ) : null}
             </div>
           )}

@@ -1,5 +1,4 @@
 import { Archive, FolderGit2, FolderOpen, GitBranch, Search, X } from "lucide-react";
-import { useRef } from "react";
 import type { ReactNode, Ref, SyntheticEvent } from "react";
 
 import { CommandHint } from "../../components/page/CommandHint";
@@ -11,7 +10,6 @@ import { Field } from "../../components/ui/Field";
 import { Input } from "../../components/ui/Input";
 import { Skeleton } from "../../components/ui/Skeleton";
 import { Spinner } from "../../components/ui/Spinner";
-import { useKeyboardScrollable } from "../domains/useKeyboardScrollable";
 import { SOURCE_WORDS, sourceKind } from "./wizard";
 import type { SourceErrors, SourceForm, SourceKind } from "./wizard";
 
@@ -61,8 +59,6 @@ const FETCH_HINT = "Check the address and that this server can reach it. A priva
  * but matched no type can still be deployed: the operator picks the type.
  */
 function InspectFailure({ failure, source, onManual }: { failure: unknown; source: string; onManual: () => void }) {
-  const output = useRef<HTMLDivElement>(null);
-  useKeyboardScrollable(output);
   let block: ReactNode;
   if (isApiError(failure) && failure.error === "sourceerror") {
     if (failure.hint === null) return null;
@@ -80,7 +76,7 @@ function InspectFailure({ failure, source, onManual }: { failure: unknown; sourc
     block = <ErrorBlock live error={failure} title={`Could not inspect ${source}`} hint={FETCH_HINT} />;
   }
   return (
-    <div ref={output} className="flex flex-col gap-3">
+    <div className="flex flex-col gap-3">
       {block}
     </div>
   );

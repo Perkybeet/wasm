@@ -40,7 +40,20 @@ test("the expiring certificate and the failed unit are named too", async ({ page
   // The seed's arennalabs.com certificate expires in twelve days.
   const cert = attention.getByRole("listitem").filter({ has: page.getByRole("link", { name: "arennalabs.com", exact: true }) });
   await expect(cert.getByText(/^Certificate expires in \d+ days$/)).toBeVisible();
-  await expect(attention.getByText(/^systemd reports 1 failed WASM unit$/)).toBeVisible();
+
+  // A failed app names its own unit; each failed WASM unit beyond those is named and links to it.
+  const services = (await (await page.request.get("/api/services")).json()) as {
+    services: { name: string; managed: boolean; active_state?: string | null }[];
+  };
+  const apps = (await (await page.request.get("/api/apps")).json()) as { apps: { unit?: string | null }[] };
+  const appUnits = new Set(apps.apps.map((app) => app.unit));
+  const orphans = services.services.filter((unit) => unit.managed && unit.active_state === "failed" && !appUnits.has(unit.name));
+  expect(orphans.length, "the seed has a failed unit that belongs to no app").toBeGreaterThan(0);
+  for (const unit of orphans) {
+    await expect(attention.getByRole("link", { name: unit.name, exact: true })).toHaveAttribute("href", `/services/${unit.name}`);
+    const item = attention.getByRole("listitem").filter({ has: page.getByRole("link", { name: unit.name, exact: true }) });
+    await expect(item.getByText("The unit has failed")).toBeVisible();
+  }
 });
 
 test("the machine, the applications and the recent deploys fill in from the API", async ({ page, consoleServer }) => {
@@ -58,11 +71,16 @@ test("the machine, the applications and the recent deploys fill in from the API"
   const total = ((await (await page.request.get("/api/apps")).json()) as { total: number }).total;
   await expect(apps.getByRole("row")).toHaveCount(total + 1);
   const failedRow = apps.getByRole("row").filter({ has: page.getByRole("link", { name: FAILED, exact: true }) });
-  await expect(failedRow.getByText("Failed")).toHaveCount(1);
+  // The state cell, not the last deploy's "Failed, 2m ago" beside it.
+  await expect(failedRow.getByRole("cell", { name: "Failed", exact: true })).toHaveCount(1);
 
+  // The newest deploys, as the API has them now: other tests in this worker deploy too.
   const recent = page.getByRole("region", { name: "Recent deployments, newest first" });
-  await expect(recent.getByRole("row")).toHaveCount(9);
-  await expect(recent.getByRole("row").nth(1).getByText("Failed")).toBeVisible();
+  const history = (await (await page.request.get("/api/deployments?limit=8")).json()) as { items: { domain: string }[] };
+  await expect(recent.getByRole("row")).toHaveCount(history.items.length + 1);
+  const newest = history.items[0];
+  if (newest === undefined) throw new Error("the seed has deployments");
+  await expect(recent.getByRole("row").nth(1).getByRole("link", { name: newest.domain, exact: true })).toBeVisible();
 });
 
 test("the chart range is part of the URL", async ({ page, consoleServer }) => {
@@ -74,10 +92,11 @@ test("the chart range is part of the URL", async ({ page, consoleServer }) => {
 
   await page.reload();
   await expect(page.getByRole("radio", { name: "24h" })).toHaveAttribute("aria-checked", "true");
-  // Arrow keys move the choice, as in any radio group.
+  // Arrow keys move the choice, as in any radio group; a week is its own window.
   await page.getByRole("radio", { name: "24h" }).focus();
   await page.keyboard.press("ArrowRight");
-  await expect(page).toHaveURL(/\/\?window=30d$/);
+  await expect(page).toHaveURL(/\/\?window=7d$/);
+  await expect(page.getByText(/^Last 7 days/).first()).toBeVisible();
 });
 
 test("on a phone the page never scrolls sideways; wide tables scroll inside themselves", async ({ page, consoleServer }) => {

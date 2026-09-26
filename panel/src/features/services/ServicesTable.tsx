@@ -3,7 +3,6 @@ import type { ReactNode } from "react";
 
 import { RelativeTime } from "../../components/page/RelativeTime";
 import { STATE_RANK } from "../../components/page/status";
-import { Badge } from "../../components/ui/Badge";
 import { DataTable } from "../../components/ui/DataTable";
 import type { Column } from "../../components/ui/DataTable";
 import { StatusPill } from "../../components/ui/StatusPill";
@@ -39,34 +38,45 @@ export interface ServicesTableProps {
 }
 
 /**
- * Every systemd unit WASM created: its state, whether it starts at boot and its live
- * readings. Every row is WASM-managed - see the module docstring in `./data` for why a
- * foreign unit cannot appear here today.
+ * Systemd units: their state, whether they start at boot and their live readings. WASM's own
+ * by default; with every unit listed, a column says which are WASM's and which are foreign
+ * (read-only: see `./data`).
  */
 export function ServicesTable({ services, caption, loading = false, empty, rowActions, className }: ServicesTableProps) {
+  // Only worth a column when the list mixes both: otherwise every row would say "WASM".
+  const mixed = services.some((service) => !service.managed);
   const columns: Column<ServiceInfo>[] = [
     {
       id: "state",
       header: "State",
       width: "w-28",
       cell: (row) => {
-        const state = serviceState(row);
-        return <StatusPill state={state} label={state === "running" ? "Running" : "Stopped"} appearance="inline" size="sm" />;
+        const view = serviceState(row);
+        return (
+          <span className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
+            <StatusPill state={view.state} label={view.label} appearance="inline" size="sm" />
+            {view.detail !== undefined ? <span className="mono text-12 text-fg-faint">{view.detail}</span> : null}
+          </span>
+        );
       },
-      sortValue: (row) => STATE_RANK[serviceState(row)],
+      sortValue: (row) => STATE_RANK[serviceState(row).state],
     },
     {
       id: "name",
       header: "Unit",
       cell: (row) => (
-        <Link
-          to="/services/$name"
-          params={{ name: row.name }}
-          translate="no"
-          className="-mx-1 rounded-[4px] px-1 py-0.5 font-medium text-fg mono text-12 hover:underline hover:underline-offset-2 focus-visible:outline-2 focus-visible:outline-focus"
-        >
-          {row.name}
-        </Link>
+        <span className="flex min-w-0 items-baseline gap-2">
+          <Link
+            to="/services/$name"
+            params={{ name: row.name }}
+            translate="no"
+            className="-mx-1 rounded-[4px] px-1 py-0.5 font-medium text-fg mono text-12 hover:underline hover:underline-offset-2 focus-visible:outline-2 focus-visible:outline-focus"
+          >
+            {row.name}
+          </Link>
+          {/* On a phone the Managed column is hidden: a foreign unit still says so. */}
+          {row.managed ? null : <span className="text-12 text-fg-muted sm:hidden">Foreign</span>}
+        </span>
       ),
       sortValue: (row) => row.name,
     },
@@ -78,15 +88,19 @@ export function ServicesTable({ services, caption, loading = false, empty, rowAc
       cell: (row) => (row.description ? <span className="truncate text-fg-muted" title={row.description}>{row.description}</span> : <Nothing reason="No command recorded" />),
       sortValue: (row) => row.description ?? null,
     },
-    {
-      id: "managed",
-      header: "Managed",
-      width: "w-28",
-      hideBelow: "sm",
-      // Every row this endpoint can return is WASM's own; see ./data for the gap that keeps a
-      // foreign unit from ever appearing here to contrast it against.
-      cell: () => <Badge tone="accent">WASM</Badge>,
-    },
+    ...(mixed
+      ? [
+          {
+            id: "managed",
+            header: "Managed",
+            width: "w-28",
+            hideBelow: "sm" as const,
+            // Words, not colour: nothing here is a state or something to act on.
+            cell: (row: ServiceInfo) => <span className={row.managed ? "text-fg" : "text-fg-muted"}>{row.managed ? "WASM" : "Foreign"}</span>,
+            sortValue: (row: ServiceInfo) => (row.managed ? 0 : 1),
+          },
+        ]
+      : []),
     {
       id: "enabled",
       header: "Boot",

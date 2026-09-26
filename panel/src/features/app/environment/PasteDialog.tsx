@@ -1,4 +1,4 @@
-import { CircleAlert, Info, TriangleAlert } from "lucide-react";
+import { CircleAlert, TriangleAlert } from "lucide-react";
 import { useId, useMemo, useState } from "react";
 
 import { SegmentedControl } from "../../../components/page/SegmentedControl";
@@ -9,7 +9,7 @@ import { Textarea } from "../../../components/ui/Textarea";
 import { cx } from "../../../lib/cx";
 import { formatCount } from "../../../lib/format";
 import type { DraftOp, EnvMap } from "./draft";
-import { hasExportPrefixes, nameProblem, parseDotenv, removeExportPrefixes, valueProblem } from "./dotenv";
+import { nameProblem, parseDotenv, valueProblem } from "./dotenv";
 
 export type PasteMode = "merge" | "replace";
 
@@ -68,7 +68,6 @@ export function PasteDialog({ open, onOpenChange, current, onStage }: PasteDialo
   const [text, setText] = useState("");
   const [mode, setMode] = useState<PasteMode>("merge");
   const { problems, count, parsed } = useMemo(() => problemsOf(text), [text]);
-  const exported = hasExportPrefixes(text);
   const blocking = problems.some((problem) => problem.blocking);
 
   const removals = mode === "replace" ? [...current.keys()].filter((name) => !parsed.variables.has(name)).length : 0;
@@ -191,26 +190,6 @@ export function PasteDialog({ open, onOpenChange, current, onStage }: PasteDialo
           </section>
         </div>
 
-        {exported ? (
-          <div className="flex flex-col gap-2 rounded-card border border-border bg-bg-sunken px-3.5 py-2.5 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
-            <p className="flex items-start gap-2 text-13 text-fg">
-              <Info aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-fg-muted" />
-              <span>
-                Some lines start with <code className="text-12">export</code>, which WASM does not strip, so it would be
-                part of the name.
-              </span>
-            </p>
-            <Button
-              size="sm"
-              onClick={() => {
-                setText((value) => removeExportPrefixes(value));
-              }}
-              className="self-start sm:self-auto"
-            >
-              Remove the export prefixes
-            </Button>
-          </div>
-        ) : null}
 
         <div className="flex flex-col gap-1.5">
           <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2">

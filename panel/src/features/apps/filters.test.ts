@@ -4,7 +4,7 @@ import type { AppInfo } from "./data";
 import { appTypes, filterApps, isFiltered, validateAppsSearch } from "./filters";
 
 function app(domain: string, status: string, type: string | null): AppInfo {
-  return { domain, name: domain, status, active: status === "running", enabled: true, app_type: type, layout: "inplace", webhook_enabled: false };
+  return { domain, name: domain, status, active: status === "running", enabled: true, app_type: type, layout: "inplace", webhook_enabled: false, keep_releases: 5 };
 }
 
 const APPS = [

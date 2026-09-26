@@ -1,4 +1,5 @@
 import { Switch as BaseSwitch } from "@base-ui/react/switch";
+import { useId } from "react";
 import type { ReactNode } from "react";
 
 import { cx } from "../../lib/cx";
@@ -28,12 +29,16 @@ export function Switch({
   name,
   className,
 }: SwitchProps) {
+  const labelId = useId();
+  const descriptionId = useId();
+  const described = label !== undefined && description !== undefined;
   const control = (
     <BaseSwitch.Root
       {...(checked !== undefined ? { checked } : {})}
       {...(defaultChecked !== undefined ? { defaultChecked } : {})}
       {...(onCheckedChange ? { onCheckedChange: (next: boolean) => onCheckedChange(next) } : {})}
       {...(ariaLabel !== undefined ? { "aria-label": ariaLabel } : {})}
+      {...(described ? { "aria-labelledby": labelId, "aria-describedby": descriptionId } : {})}
       {...(name !== undefined ? { name } : {})}
       disabled={disabled}
       className={cx(
@@ -62,8 +67,13 @@ export function Switch({
       )}
     >
       <span className="flex flex-col">
-        <span>{label}</span>
-        {description !== undefined ? <span className="text-13 text-fg-muted">{description}</span> : null}
+        <span id={labelId}>{label}</span>
+        {/* Named apart from the label, as the Checkbox does: read as the description. */}
+        {description !== undefined ? (
+          <span id={descriptionId} className="text-13 text-fg-muted">
+            {description}
+          </span>
+        ) : null}
       </span>
       <span className="mt-0.5 flex">{control}</span>
     </label>

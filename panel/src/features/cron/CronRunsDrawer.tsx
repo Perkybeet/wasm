@@ -6,6 +6,7 @@ import { ErrorBlock } from "../../components/page/QueryState";
 import { Drawer } from "../../components/ui/Drawer";
 import { Skeleton } from "../../components/ui/Skeleton";
 import { StatusPill } from "../../components/ui/StatusPill";
+import { SystemOutput } from "../../components/ui/SystemOutput";
 
 function runView(success: boolean | null): { state: "running" | "failed" | "unknown"; label: string } {
   if (success === true) return { state: "running", label: "Succeeded" };
@@ -59,9 +60,9 @@ export function CronRunsDrawer({ name, onOpenChange }: CronRunsDrawerProps) {
                 {run.output.trim() !== "" ? (
                   <details className="mt-2">
                     <summary className="cursor-pointer text-12 text-fg-muted hover:text-fg">Output</summary>
-                    <pre className="mono mt-1.5 max-h-48 overflow-auto rounded-control border border-border bg-bg-sunken px-2.5 py-2 text-12 whitespace-pre-wrap break-words text-fg scroll-thin">
-                      {run.output}
-                    </pre>
+                    <div className="mt-1.5 rounded-control border border-border bg-bg-sunken px-2.5 py-2">
+                      <SystemOutput label={`Output of this run of ${name}`}>{run.output}</SystemOutput>
+                    </div>
                   </details>
                 ) : null}
               </li>

@@ -97,10 +97,13 @@ export function SchedulesSection() {
     <Section
       title="Schedules"
       description="Automatic backups, one per application, on a systemd timer."
+      // Secondary: the page's primary is New backup. Hidden while the empty state offers it.
       actions={
-        <Button size="sm" variant="primary" icon={<Plus aria-hidden="true" />} onClick={() => setCreateOpen(true)}>
-          New schedule
-        </Button>
+        schedules.data !== undefined && schedules.data.schedules.length > 0 ? (
+          <Button size="sm" icon={<Plus aria-hidden="true" />} onClick={() => setCreateOpen(true)}>
+            New schedule
+          </Button>
+        ) : undefined
       }
     >
       <QueryState
@@ -120,7 +123,7 @@ export function SchedulesSection() {
             title="No scheduled backups"
             description="Set an application to back itself up on a schedule, without anyone starting it by hand."
             action={
-              <Button variant="primary" icon={<Plus aria-hidden="true" />} onClick={() => setCreateOpen(true)}>
+              <Button icon={<Plus aria-hidden="true" />} onClick={() => setCreateOpen(true)}>
                 New schedule
               </Button>
             }

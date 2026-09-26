@@ -1,4 +1,4 @@
-import { Badge, StatusGlyph, StatusPill } from "../components/ui";
+import { Badge, StatusGlyph, StatusPill, stateTextClass } from "../components/ui";
 import type { Status } from "../components/ui";
 import { contrastRatio, readThemeTokens } from "../lib/contrast";
 import { cx } from "../lib/cx";
@@ -188,7 +188,7 @@ function Elevation() {
   );
 }
 
-const STATES: Status[] = ["running", "deploying", "failed", "stopped", "static", "unknown"];
+const STATES: Status[] = ["running", "deploying", "warning", "failed", "stopped", "static", "unknown"];
 
 function StateLanguage() {
   return (
@@ -198,7 +198,7 @@ function StateLanguage() {
           <ul className="grid grid-cols-3 gap-x-4 gap-y-5">
             {STATES.map((state) => (
               <li key={state} className="flex flex-col items-start gap-2">
-                <StatusGlyph state={state} size={24} className={toneOf(state)} />
+                <StatusGlyph state={state} size={24} className={stateTextClass(state)} />
                 <StatusPill state={state} />
               </li>
             ))}
@@ -209,12 +209,6 @@ function StateLanguage() {
   );
 }
 
-function toneOf(state: Status): string {
-  if (state === "running" || state === "static") return "text-ok";
-  if (state === "deploying") return "text-warn";
-  if (state === "failed") return "text-fail";
-  return "text-idle";
-}
 
 export function Foundations() {
   return (

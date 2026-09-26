@@ -91,6 +91,40 @@ describe("Settings > General", () => {
     expect(backend.callsTo("PUT /api/config/backup")[1]?.body).toEqual({ directory: "/var/backups/wasm", max_per_app: 12 });
   });
 
+  it("asks to confirm it's you before the first write of the session, then saves", { timeout: 20_000 }, async () => {
+    let elevated = false;
+    let stored = { directory: "/var/backups/wasm", max_per_app: 10 };
+    const backend = fakeBackend(
+      generalRoutes({
+        "GET /api/config/backup": () => json(200, stored),
+        "PUT /api/config/backup": (call) => {
+          if (!elevated) return problem(403, "elevation_required", "Confirm it's you to continue.");
+          stored = call.body as typeof stored;
+          return json(200, { message: "Backup configuration updated" });
+        },
+        "POST /api/auth/elevate": () => {
+          elevated = true;
+          return json(200, { elevated_until: new Date(Date.now() + 600_000).toISOString() });
+        },
+      }),
+    );
+    const { user } = renderConsole("/settings");
+    const retention = await screen.findByLabelText("Backups kept per application");
+    const backups = section("Backups");
+
+    await user.clear(retention);
+    await user.type(retention, "20");
+    await user.click(within(backups).getByRole("button", { name: "Save changes" }));
+
+    const confirm = await screen.findByRole("dialog", { name: "Confirm it's you" });
+    await user.type(within(confirm).getByLabelText("Authentication code"), "123456");
+    await user.click(within(confirm).getByRole("button", { name: "Confirm" }));
+
+    await expectToast("Saved the backup settings");
+    expect(backend.callsTo("PUT /api/config/backup")).toHaveLength(2);
+    expect(backend.callsTo("PUT /api/config/backup")[1]?.body).toEqual({ directory: "/var/backups/wasm", max_per_app: 20 });
+  });
+
   it("gives a one-field section a refusal that names no field, with the server's fix", async () => {
     fakeBackend(
       generalRoutes({

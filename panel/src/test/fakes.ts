@@ -48,14 +48,18 @@ export function json(status: number, body: unknown, headers: Record<string, stri
   });
 }
 
-/** A failure in the API's contract: {error, detail, hint, fields}. */
+/** A failure in the API's contract: {error, detail, hint, fields, output}. */
 export function problem(
   status: number,
   error: string,
   detail: string,
-  extra: { hint?: string; fields?: Record<string, string>; headers?: Record<string, string> } = {},
+  extra: { hint?: string; fields?: Record<string, string>; output?: string; headers?: Record<string, string> } = {},
 ): Response {
-  return json(status, { error, detail, hint: extra.hint ?? null, fields: extra.fields ?? null }, extra.headers);
+  return json(
+    status,
+    { error, detail, hint: extra.hint ?? null, fields: extra.fields ?? null, output: extra.output ?? null },
+    extra.headers,
+  );
 }
 
 export interface RecordedCall {

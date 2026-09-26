@@ -36,6 +36,19 @@ describe("Checkbox", () => {
     expect(onCheckedChange).not.toHaveBeenCalled();
   });
 
+  it("is named by its label and described by its second line", async () => {
+    render(<Checkbox label="Include www" description="Redirect www to the apex." />);
+    const box = screen.getByRole("checkbox", { name: "Include www" });
+    expect(box).toHaveAccessibleDescription("Redirect www to the apex.");
+    await userEvent.click(screen.getByText("Redirect www to the apex."));
+    expect(box).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("has no description when it has no second line", () => {
+    render(<Checkbox label="Encrypt" />);
+    expect(screen.getByRole("checkbox", { name: "Encrypt" })).not.toHaveAttribute("aria-describedby");
+  });
+
   it("has no accessibility violations", async () => {
     const { container } = render(
       <div>

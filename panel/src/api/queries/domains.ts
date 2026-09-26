@@ -39,3 +39,16 @@ export const dnsCheckQuery = (app: string, name: string) =>
     staleTime: 0,
     gcTime: 60_000,
   });
+
+/**
+ * Whether a name resolves to this server, before it is any application's - the same check
+ * `dnsCheckQuery` runs for a domain already added to one, through the same backend function,
+ * for the new-app wizard, which has no application yet to hang the path off.
+ */
+export const bareDnsCheckQuery = (name: string) =>
+  queryOptions({
+    queryKey: ["domains", "dns", "bare", name] as const,
+    queryFn: ({ signal }) => request("get", "/api/domains/dns", { query: { name }, signal }),
+    staleTime: 0,
+    gcTime: 60_000,
+  });

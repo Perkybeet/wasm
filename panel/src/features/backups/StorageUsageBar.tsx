@@ -34,14 +34,14 @@ export function StorageUsageBar() {
     <div className="flex flex-col gap-3 rounded-card border border-border bg-surface px-4 py-3.5 shadow-raised">
       {diskTotal !== null && diskTotal > 0 ? (
         <Meter
-          label="Backups"
+          label="Storage"
           value={data.total_size}
           max={diskTotal}
-          valueText={`${data.total_size_human} of ${formatBytes(diskTotal)} disk`}
+          valueText={`${data.total_size_human} of ${formatBytes(diskTotal)}`}
         />
       ) : (
         <div className="flex items-baseline justify-between gap-3">
-          <span className="text-13 text-fg-muted">Backups</span>
+          <span className="text-13 text-fg-muted">Storage</span>
           <span className="mono text-13 text-fg">{data.total_size_human}</span>
         </div>
       )}

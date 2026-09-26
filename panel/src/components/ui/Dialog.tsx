@@ -1,9 +1,11 @@
 import { Dialog as BaseDialog } from "@base-ui/react/dialog";
 import { X } from "lucide-react";
+import { useId, useRef } from "react";
 import type { ComponentType, ReactElement, ReactNode, RefObject } from "react";
 
 import { cx } from "../../lib/cx";
 import { IconButton } from "./IconButton";
+import { useNeedsScrollFocus } from "./scrollable";
 
 export type DialogSize = "sm" | "md" | "lg";
 
@@ -17,8 +19,16 @@ export const BACKDROP =
   "fixed inset-0 z-40 bg-backdrop transition-opacity duration-(--duration-base) ease-out " +
   "data-starting-style:opacity-0 data-ending-style:opacity-0";
 
+/**
+ * Where a modal sits: centred on a phone, a little below the top on anything wider, so it reads
+ * as over the page rather than in it. The popup's height cap below is the space this leaves.
+ */
+export const MODAL_VIEWPORT = "fixed inset-0 z-50 flex items-center justify-center p-4 sm:items-start sm:pt-[12dvh]";
+
+// The cap is the viewport less the offset above the popup and the 16px margin below it, so the
+// footer (the dialog's actions) is always on screen and the body scrolls instead.
 export const MODAL_POPUP =
-  "relative flex max-h-[calc(100dvh-2rem)] w-full flex-col overflow-hidden rounded-card border border-border bg-surface-raised text-fg shadow-overlay outline-none " +
+  "relative flex max-h-[calc(100dvh-2rem)] w-full flex-col overflow-hidden rounded-card border border-border bg-surface-raised text-fg shadow-overlay outline-none sm:max-h-[calc(88dvh-1rem)] " +
   "transition-[opacity,scale] duration-(--duration-base) ease-out " +
   "data-starting-style:scale-[0.98] data-starting-style:opacity-0 data-ending-style:scale-[0.98] data-ending-style:opacity-0";
 
@@ -38,6 +48,25 @@ export interface DialogProps {
   initialFocus?: RefObject<HTMLElement | null>;
 }
 
+/**
+ * The dialog's body: the part that scrolls when the dialog is taller than the screen. When it
+ * scrolls and holds nothing focusable (a long read-only report), it takes focus itself, named
+ * by the dialog's title, so a keyboard can scroll it.
+ */
+function DialogBody({ children, titleId }: { children: ReactNode; titleId: string }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const scrolls = useNeedsScrollFocus(ref);
+  return (
+    <div
+      ref={ref}
+      {...(scrolls ? { tabIndex: 0, role: "region", "aria-labelledby": titleId } : {})}
+      className="min-h-0 flex-1 overflow-y-auto px-5 py-4 scroll-thin focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-focus"
+    >
+      {children}
+    </div>
+  );
+}
+
 /** Shared frame of Dialog and ConfirmDialog: header, scrolling body, footer bar. */
 export function DialogFrame({
   title,
@@ -52,24 +81,27 @@ export function DialogFrame({
   description?: ReactNode;
   children?: ReactNode;
   footer?: ReactNode;
-  Title: ComponentType<{ className?: string; children?: ReactNode }>;
+  Title: ComponentType<{ id?: string; className?: string; children?: ReactNode }>;
   Description: ComponentType<{ className?: string; children?: ReactNode }>;
   close?: ReactNode;
 }) {
+  const titleId = useId();
   return (
     <>
-      <header className="flex items-start gap-4 px-5 pt-5 pb-1">
+      <header className="flex shrink-0 items-start gap-4 px-5 pt-5 pb-1">
         <div className="min-w-0 flex-1">
-          <Title className="title text-16 text-fg">{title}</Title>
+          <Title id={titleId} className="title text-16 text-fg">
+            {title}
+          </Title>
           {description !== undefined ? (
             <Description className="mt-1 text-14 text-pretty text-fg-muted">{description}</Description>
           ) : null}
         </div>
         {close}
       </header>
-      {children !== undefined ? <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4 scroll-thin">{children}</div> : <div className="h-4" />}
+      {children !== undefined ? <DialogBody titleId={titleId}>{children}</DialogBody> : <div className="h-4 shrink-0" />}
       {footer !== undefined ? (
-        <footer className="flex flex-wrap items-center justify-end gap-2 border-t border-border bg-bg-sunken px-5 py-3">
+        <footer className="flex shrink-0 flex-wrap items-center justify-end gap-2 border-t border-border bg-bg-sunken px-5 py-3">
           {footer}
         </footer>
       ) : null}
@@ -99,7 +131,7 @@ export function Dialog({
       {trigger !== undefined ? <BaseDialog.Trigger render={trigger} /> : null}
       <BaseDialog.Portal>
         <BaseDialog.Backdrop className={BACKDROP} />
-        <BaseDialog.Viewport className="fixed inset-0 z-50 flex items-center justify-center p-4 sm:items-start sm:pt-[12vh]">
+        <BaseDialog.Viewport className={MODAL_VIEWPORT}>
           <BaseDialog.Popup
             {...(initialFocus ? { initialFocus } : {})}
             className={cx(MODAL_POPUP, WIDTHS[size])}

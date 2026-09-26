@@ -237,10 +237,13 @@ def seed_panel_state(
             first = store.record_deployment_start(
                 domain, "cli", git_commit="9f2c41a", git_branch="main"
             )
+            # The subject git log gives the commit, as a real deploy records it.
+            store.annotate_deployment(first, commit_message="Add the order history page")
             store.finish_deployment(first, "success")
             second = store.record_deployment_start(
                 domain, "panel", git_commit="c07d5e3", git_branch="main"
             )
+            store.annotate_deployment(second, commit_message="Upgrade Next.js to 15.2")
             if is_failing:
                 store.finish_deployment(
                     second,
@@ -318,6 +321,10 @@ def seed_console_state(store: WASMStore) -> SeededState:
                 app_type="static",
                 source="https://github.com/you/landing",
                 port=None,
+                # What a real static deploy records (no start command): the state
+                # resolver reads it and never asks systemd about a unit that does
+                # not exist, so the site reads Static rather than Stopped.
+                is_static=True,
                 app_path=f"/var/www/apps/{domain}",
                 status=AppStatus.RUNNING.value,
                 ssl_enabled=True,
@@ -378,12 +385,28 @@ def seed_console_state(store: WASMStore) -> SeededState:
         state.database_names.append(name)
 
     now = datetime.now()
-    for offset, (job_type, status, domain, error) in enumerate(
+    # Worded the way the job manager words them (web/api/jobs.py), and started by
+    # whoever starts such jobs on a real machine: the console, a token, the timer.
+    for offset, (job_type, status, domain, error, description, actor) in enumerate(
         (
-            ("deploy", "completed", first, None),
-            ("backup", "completed", second, None),
-            ("cert_renew", "completed", "all", None),
-            ("update", "failed", state.failed_domains[0], "npm ERR! code ELIFECYCLE"),
+            ("deploy", "completed", first, None, f"Deploying {first}", "master"),
+            (
+                "backup",
+                "completed",
+                second,
+                None,
+                f"Creating a backup of {second}",
+                "token:nightly-backup",
+            ),
+            ("cert_renew", "completed", "all", None, "Renewing every certificate due", None),
+            (
+                "update",
+                "failed",
+                state.failed_domains[0],
+                "npm ERR! code ELIFECYCLE",
+                f"Updating the application at {state.failed_domains[0]}",
+                "webhook",
+            ),
         )
     ):
         started = now - timedelta(hours=offset + 1)
@@ -392,7 +415,8 @@ def seed_console_state(store: WASMStore) -> SeededState:
                 id=f"seed{offset:04d}",
                 type=job_type,
                 name=f"{job_type.replace('_', ' ').capitalize()} {domain}",
-                description=f"Seeded {job_type} job",
+                description=description,
+                actor=actor,
                 status=status,
                 progress=100,
                 domain=domain,

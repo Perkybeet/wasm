@@ -14,21 +14,32 @@ import { Section } from "../../../components/page/Section";
 import { SegmentedControl } from "../../../components/page/SegmentedControl";
 import { appStatus, deployStatus } from "../../../components/page/status";
 import { Chart } from "../../../components/ui/Chart";
+import type { ChartMarker } from "../../../components/ui/Chart";
 import { EmptyState } from "../../../components/ui/EmptyState";
 import { Skeleton } from "../../../components/ui/Skeleton";
 import { STATUS, StatusGlyph } from "../../../components/ui/StatusPill";
 import { cx } from "../../../lib/cx";
 import { formatBytes, formatPercent, parseTimestamp } from "../../../lib/format";
 import { appLimits } from "../../apps/data";
-import { alignSeries } from "../../overview/series";
-import { DeployMarkers } from "./DeployMarkers";
-import type { DeployMark } from "./DeployMarkers";
+import { alignSeries, resolutionWords } from "../../overview/series";
 import { RANGES, clip, momentWords, rangeSpec, sentence, summarise } from "./ranges";
 import type { MetricRange, Points } from "./ranges";
 
 const CHART_HEIGHT = 180;
 
 const TONE_TEXT = { ok: "text-ok", warn: "text-warn", fail: "text-fail", idle: "text-idle" } as const;
+
+/** One deploy in the range: what the chart's markers and the list below the charts both say. */
+interface DeployMark {
+  id: number;
+  /** Unix seconds. */
+  at: number;
+  status: string;
+  /** When, as short as the range allows: "19:42", "Sep 25, 19:42". */
+  when: string;
+  /** Everything, for assistive technology and the tooltip: "Deploy 25, succeeded, Sep 25, 19:42". */
+  label: string;
+}
 
 interface ChartSpec {
   title: string;
@@ -80,13 +91,13 @@ function MetricChart({
   spec,
   app,
   range,
-  marks,
+  markers,
   now,
 }: {
   spec: ChartSpec;
   app: App;
   range: MetricRange;
-  marks: readonly DeployMark[];
+  markers: readonly ChartMarker[];
   now: number;
 }) {
   const detail = rangeSpec(range);
@@ -127,22 +138,19 @@ function MetricChart({
     { label: spec.title, values },
     ...(drawLimit ? [{ label: "Limit", values: values.map(() => limit) }] : []),
   ];
-  const from = aligned.timestamps[0] ?? 0;
-  const to = aligned.timestamps.at(-1) ?? 0;
 
   return (
     <Frame>
       <div className="flex flex-col gap-3">
-        <DeployMarkers domain={app.domain} marks={marks} from={from} to={to}>
-          <Chart
-            title={spec.title}
-            description={`${detail.words}. ${spec.unit}.`}
-            timestamps={aligned.timestamps}
-            series={lines}
-            formatValue={spec.format}
-            height={CHART_HEIGHT}
-          />
-        </DeployMarkers>
+        <Chart
+          title={spec.title}
+          description={`${[detail.words, resolutionWords(series.data.resolution)].filter((part) => part !== null).join(", ")}. ${spec.unit}.`}
+          timestamps={aligned.timestamps}
+          series={lines}
+          formatValue={spec.format}
+          height={CHART_HEIGHT}
+          markers={markers}
+        />
         <p className="border-t border-border pt-3 text-12 text-pretty text-fg-muted" data-summary="">
           <span className="sr-only">{`${spec.title}: `}</span>
           {sentence(summary, range, spec.format, limit)}
@@ -243,6 +251,25 @@ export function MetricsTab({ domain, range, onRangeChange }: MetricsTabProps) {
   });
   marks.sort((a, b) => a.at - b.at);
 
+  // The chart draws each mark itself: a hairline and a focusable state glyph linking to the
+  // deploy. Chart does not import the router, so the link is built here and handed in.
+  const chartMarkers: ChartMarker[] = marks.map((mark) => ({
+    at: mark.at,
+    label: mark.label,
+    state: deployStatus(mark.status).state,
+    renderMarker: (marker, children, linkProps) => (
+      <Link
+        to="/apps/$domain/deployments/$id"
+        params={{ domain, id: String(mark.id) }}
+        aria-label={marker.label}
+        className={linkProps.className}
+        style={linkProps.style}
+      >
+        {children}
+      </Link>
+    ),
+  }));
+
   return (
     <Section
       title="CPU and memory"
@@ -258,7 +285,7 @@ export function MetricsTab({ domain, range, onRangeChange }: MetricsTabProps) {
     >
       <div className="grid min-w-0 gap-4 xl:grid-cols-2">
         {CHARTS.map((spec) => (
-          <MetricChart key={spec.title} spec={spec} app={app.data} range={range} marks={marks} now={now} />
+          <MetricChart key={spec.title} spec={spec} app={app.data} range={range} markers={chartMarkers} now={now} />
         ))}
       </div>
       <DeployList domain={domain} marks={marks} />

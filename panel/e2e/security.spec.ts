@@ -84,6 +84,40 @@ test("create a read token, see it once, use it, revoke it", async ({ page, conso
   await api.dispose();
 });
 
+test("signing out other sessions leaves this browser in and signs every other one out", async ({ page, consoleServer, browser }) => {
+  await signIn(page, consoleServer, "/settings/security");
+  const table = page.getByRole("region", { name: "Active sessions" });
+  const dataRows = () => table.getByRole("row").filter({ hasNot: page.getByRole("columnheader") });
+  // The worker's server may already carry sessions from earlier tests; only the count going up
+  // by the one about to sign in, and every one of them but this browser's own leaving, is asserted.
+  await expect(dataRows()).not.toHaveCount(0);
+  const before = await dataRows().count();
+
+  const otherContext = await browser.newContext({ baseURL: consoleServer.url });
+  const otherPage = await otherContext.newPage();
+  await signIn(otherPage, consoleServer, "/settings/security");
+
+  await page.reload();
+  await expect(dataRows()).toHaveCount(before + 1);
+
+  await page.getByRole("button", { name: "Sign out other sessions" }).click();
+  const dialog = page.getByRole("dialog", { name: "Sign out other sessions?" });
+  await expect(dialog).toBeVisible();
+  await expectNoA11yViolations(page, "the sign out other sessions confirmation");
+  await dialog.getByRole("button", { name: "Sign out other sessions" }).click();
+  await expect(toastSaying(page, /^Signed out \d+ other sessions?$/)).toBeVisible();
+  await expect(dialog).toBeHidden();
+  await expect(dataRows()).toHaveCount(1);
+  await expect(dataRows().getByText("This browser")).toBeVisible();
+  await settle(page);
+  await expectNoA11yViolations(page, "the sessions list after signing others out");
+
+  // The other browser is signed out at its next request.
+  await otherPage.reload();
+  await expect(otherPage).toHaveURL(/\/login/);
+  await otherContext.close();
+});
+
 test("a failure toast is announced once and stays reachable from the keyboard", async ({ page, consoleServer, problems }) => {
   problems.expect(/status of 404 .* \/api\/auth\/sessions\/[0-9a-f]+$/);
   const other = await otherSession(consoleServer);
@@ -104,6 +138,29 @@ test("a failure toast is announced once and stays reachable from the keyboard", 
   await stillness(page);
   await expectNoA11yViolations(page, "a page with a failure toast");
   await expectAccessibleToast(page, `Could not sign out session ${prefix}`, "assertive");
+});
+
+test("new backup codes replace the old ones after confirming it's you, and are shown once", async ({ page, consoleServer, problems }) => {
+  // The first ask is refused until the operator confirms it's them, as designed.
+  problems.expect(/status of 403 .* \/api\/auth\/2fa\/backup-codes$/);
+  await signIn(page, consoleServer, "/settings/security");
+  await page.getByRole("button", { name: "New backup codes" }).click();
+  const ask = page.getByRole("dialog", { name: "Replace your backup codes?" });
+  await expect(ask).toBeVisible();
+  await stillness(page);
+  await expectNoA11yViolations(page, "the replace backup codes question");
+  await ask.getByRole("button", { name: "Replace backup codes" }).click();
+  await confirmItsYou(page, consoleServer);
+
+  const shown = page.getByRole("dialog", { name: "Save your backup codes" });
+  await expect(shown.getByRole("list", { name: "Backup codes" }).getByRole("listitem")).toHaveCount(8);
+  await expect(shown.getByRole("button", { name: "Done" })).toBeDisabled();
+  await stillness(page);
+  await expectNoA11yViolations(page, "the new backup codes");
+  await shown.getByRole("checkbox", { name: "I have saved these codes somewhere safe" }).click();
+  await shown.getByRole("button", { name: "Done" }).click();
+  await expect(toastSaying(page, "Replaced the backup codes")).toBeVisible();
+  await expect(page.getByText(/^8 of 8 backup codes left$/)).toBeVisible();
 });
 
 // ---------------------------------------------------------------------------------------

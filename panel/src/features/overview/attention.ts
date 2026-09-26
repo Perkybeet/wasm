@@ -10,6 +10,8 @@ import type { Machine } from "../../api/queries/system";
 import { appStatus, deployStatus } from "../../components/page/status";
 import type { AppInfo, Deployment } from "../apps/data";
 import { deployMoment, latestDeployByDomain } from "../apps/data";
+import { serviceState } from "../services/data";
+import type { ServiceInfo } from "../services/data";
 
 type Cert = CertList["certificates"][number];
 type Observation = ObservationList["observations"][number];
@@ -37,6 +39,7 @@ export type AttentionSubject =
   | { kind: "app"; domain: string }
   | { kind: "certificate"; domain: string }
   | { kind: "units" }
+  | { kind: "unit"; name: string }
   | { kind: "monitor"; process: string; pid: number };
 
 export interface AttentionItem {
@@ -56,6 +59,8 @@ export interface AttentionSources {
   certificates?: readonly Cert[] | undefined;
   observations?: readonly Observation[] | undefined;
   machine?: Machine | undefined;
+  /** WASM's own units (GET /api/services): names the failed ones no app accounts for. */
+  units?: readonly ServiceInfo[] | undefined;
 }
 
 /** The first line of a multi-line error, which is where tools put the error itself. */
@@ -70,16 +75,26 @@ function firstLine(text: string | null | undefined): string | undefined {
 const RANK: Record<Severity, number> = { fail: 0, warn: 1 };
 
 /**
+ * The names an app's unit can have, for an app whose record does not name it: the current one
+ * (`domain_to_app_name`) and the one apps deployed before v0.14.1 kept (`legacy_app_name`).
+ */
+export function appUnitNames(domain: string): string[] {
+  const name = domain.toLowerCase().replace(/[^a-z0-9-]/g, "-");
+  return [name, `wasm-${name}`];
+}
+
+/**
  * Everything that needs an operator, grouped by subject:
  *
  * - an app whose state is a problem (failed, crash-looping, not answering);
  * - an app whose newest deploy failed or was rolled back;
  * - a certificate expiring within 21 days, or expired;
- * - systemd units WASM manages that failed, beyond those already named by an app's state
- *   (the tally counts units; the apps' own state names them when the backend reports it);
+ * - systemd units WASM manages that failed or keep crashing, beyond the apps' own units (an
+ *   app's state already names those): each by name when the unit list is known, otherwise as
+ *   a count from the machine's tally;
  * - an open monitor observation.
  */
-export function collectAttention({ apps, deployments, certificates, observations, machine }: AttentionSources): AttentionItem[] {
+export function collectAttention({ apps, deployments, certificates, observations, machine, units }: AttentionSources): AttentionItem[] {
   const byDomain = new Map<string, AttentionItem>();
   const add = (domain: string, subject: AttentionSubject, reason: AttentionReason): void => {
     const known = byDomain.get(domain);
@@ -140,8 +155,33 @@ export function collectAttention({ apps, deployments, certificates, observations
 
   const items = [...byDomain.values()];
 
+  if (units !== undefined) {
+    const appUnits = new Set(apps?.flatMap((app) => [app.unit ?? "", ...appUnitNames(app.domain)]));
+    for (const unit of units) {
+      if (!unit.managed || appUnits.has(unit.name)) continue;
+      const view = serviceState(unit);
+      const failed = view.state === "failed";
+      if (!failed && view.state !== "warning") continue;
+      const result = (unit.result ?? "").trim();
+      items.push({
+        id: `unit:${unit.name}`,
+        subject: { kind: "unit", name: unit.name },
+        title: unit.name,
+        severity: failed ? "fail" : "warn",
+        reasons: [
+          {
+            kind: "units",
+            severity: failed ? "fail" : "warn",
+            summary: failed ? "The unit has failed" : "systemd keeps restarting the unit",
+            ...(result !== "" && result !== "success" ? { detail: `Result=${result}` } : {}),
+          },
+        ],
+      });
+    }
+  }
+
   const failedUnits = machine?.units.failed ?? 0;
-  if (failedUnits > failedByState) {
+  if (units === undefined && failedUnits > failedByState) {
     const extra = failedUnits - failedByState;
     items.push({
       id: "units",

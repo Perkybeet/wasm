@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { FileText } from "lucide-react";
-import { useEffect, useMemo, useRef } from "react";
+import { useMemo } from "react";
 
 import { appQuery } from "../../../api/queries/apps";
 import { useDocumentTitle } from "../../../app/documentTitle";
@@ -67,13 +67,7 @@ function withLevel(line: LogLine): LogLine {
 function Journal({ domain, failed }: { domain: string; failed: boolean }) {
   const stream = useLogStream(domain, { lines: BACKLOG, cap: LOG_CAP });
   const lines = useMemo(() => stream.lines.map(withLevel), [stream.lines]);
-  const host = useRef<HTMLDivElement>(null);
   const connection = CONNECTION[stream.status];
-
-  // `/` searches the page's own content first: here, the journal.
-  useEffect(() => {
-    host.current?.querySelector('input[type="search"]')?.setAttribute("data-page-search", "");
-  });
 
   return (
     <div className="flex flex-col gap-3">
@@ -118,10 +112,11 @@ function Journal({ domain, failed }: { domain: string; failed: boolean }) {
         </p>
       ) : null}
 
-      <div ref={host} className="h-[max(24rem,calc(100dvh-22rem))]">
+      <div className="h-[max(24rem,calc(100dvh-22rem))]">
         <LogViewer
           lines={lines}
           height="fill"
+          pageSearch
           label={`Journal of ${domain}`}
           filename={`${domain}-journal.log`}
           emptyMessage={stream.status === "open" ? "The journal has no lines for this unit yet." : "Connecting to the journal."}

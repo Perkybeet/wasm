@@ -1,23 +1,20 @@
 import { useState } from "react";
 
-import { ErrorBlock } from "../../components/page/QueryState";
+import { isApiError } from "../../api/client";
 import { RelativeTime } from "../../components/page/RelativeTime";
+import { ErrorBlock } from "../../components/page/QueryState";
 import { Button } from "../../components/ui/Button";
 import { Dialog } from "../../components/ui/Dialog";
 import { Field } from "../../components/ui/Field";
 import { Input } from "../../components/ui/Input";
 import { Select } from "../../components/ui/Select";
+import { Skeleton } from "../../components/ui/Skeleton";
+import { SystemOutput } from "../../components/ui/SystemOutput";
 import type { CronJob, Schedule } from "./data";
-import { SCHEDULE_PRESETS } from "./data";
+import { SCHEDULE_PRESETS, absoluteWithOffset } from "./data";
 import type { CreateCronJobBody } from "./useCronActions";
 import { useCronActions } from "./useCronActions";
-
-const PRESET_CALENDAR: Record<Exclude<Schedule, "custom">, string> = {
-  hourly: "*-*-* *:00:00",
-  daily: "*-*-* 02:00:00",
-  weekly: "Mon *-*-* 02:00:00",
-  monthly: "*-*-01 02:00:00",
-};
+import { useCronPreview } from "./useCronPreview";
 
 export interface CronJobDialogProps {
   open: boolean;
@@ -27,10 +24,75 @@ export interface CronJobDialogProps {
 }
 
 /**
- * Creates a cron job, or rewrites one WASM already owns - `POST /api/cron` does both. There is
- * no endpoint to preview a calendar expression's upcoming runs before saving (see
- * `features/cron/data.ts`), so this shows what the backend validates on submit and, once
- * saved, the one next run the job reports.
+ * The refusal `POST /api/cron/preview` answered with, in the shape that fits: a schedule too
+ * short, too long, or built from the wrong characters never reaches systemd - the request
+ * model's own field validator refuses it first, as a 422 whose per-field message carries the
+ * words (the response's `detail` is only ever the generic "Validation failed" for that shape);
+ * an expression systemd itself rejects raises past the request model, and `detail`/`hint` carry
+ * its own message and output instead.
+ */
+function schedulePreviewError(error: unknown): { message: string; output: string | null } | null {
+  if (!isApiError(error)) return null;
+  const fieldMessage = error.fields?.["schedule"];
+  if (fieldMessage !== undefined) return { message: fieldMessage, output: null };
+  return { message: error.detail, output: error.hint };
+}
+
+/** The calendar and next runs `POST /api/cron/preview` answered, or why it refused to. */
+function SchedulePreview({ schedule }: { schedule: string }) {
+  const preview = useCronPreview(schedule);
+
+  if (schedule.trim() === "") return null;
+
+  if (preview.isError) {
+    const refusal = schedulePreviewError(preview.error) ?? { message: "The schedule could not be checked.", output: null };
+    return (
+      <div role="alert" className="flex flex-col gap-1.5">
+        <p className="text-13 text-fail">{refusal.message}</p>
+        {refusal.output !== null && refusal.output.trim() !== "" ? (
+          <SystemOutput label="What systemd said" maxHeight="max-h-28">
+            {refusal.output}
+          </SystemOutput>
+        ) : null}
+      </div>
+    );
+  }
+
+  if (preview.data === undefined) {
+    return (
+      <div aria-busy="true" className="flex flex-col gap-1.5">
+        <span className="sr-only">Checking the schedule</span>
+        <Skeleton className="h-3.5 w-48" />
+        <Skeleton className="h-3.5 w-64" />
+        <Skeleton className="h-3.5 w-56" />
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-2 rounded-control border border-border bg-bg-sunken p-3">
+      <p className="mono text-12 text-fg-muted">{preview.data.calendar}</p>
+      {preview.data.next_runs.length === 0 ? (
+        <p className="text-13 text-fg-muted">This schedule has no future run.</p>
+      ) : (
+        <ul className="flex flex-col gap-1">
+          {preview.data.next_runs.map((run) => (
+            <li key={run} className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5 text-13">
+              <span className="mono text-12 text-fg-muted">{absoluteWithOffset(run)}</span>
+              <RelativeTime value={run} />
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Creates a cron job, or rewrites one WASM already owns - `POST /api/cron` does both. The
+ * schedule previews live through `POST /api/cron/preview` as it is typed or a preset is
+ * chosen (`SchedulePreview`, debounced by `useCronPreview`): the normalised calendar and next
+ * runs when it validates, systemd's own refusal when it does not.
  */
 export function CronJobDialog({ open, onOpenChange, job }: CronJobDialogProps) {
   const editing = job !== undefined;
@@ -48,7 +110,9 @@ export function CronJobDialog({ open, onOpenChange, job }: CronJobDialogProps) {
     if (!next) create.reset();
   };
 
-  const schedule = preset === "custom" ? calendar.trim() : PRESET_CALENDAR[preset];
+  // The alias travels as-is: CronManager expands hourly/daily/weekly/monthly itself
+  // (SCHEDULE_ALIASES), so the dialog does not keep its own copy of what each one means.
+  const schedule = preset === "custom" ? calendar.trim() : preset;
   const valid = name.trim() !== "" && command.trim() !== "" && schedule !== "";
 
   const submit = (): void => {
@@ -104,37 +168,21 @@ export function CronJobDialog({ open, onOpenChange, job }: CronJobDialogProps) {
           />
         </Field>
         <Field label="Schedule" name="schedule" nativeLabel={false}>
-          <div className="flex flex-col gap-2">
-            <Select
-              aria-label="Schedule preset"
-              value={preset}
-              onValueChange={setPreset}
-              options={SCHEDULE_PRESETS}
-            />
-            {preset === "custom" ? (
-              <Input
-                aria-label="Calendar expression"
-                value={calendar}
-                onValueChange={setCalendar}
-                mono
-                placeholder="Mon..Fri *-*-* 09:00:00"
-                autoComplete="off"
-                spellCheck={false}
-              />
-            ) : (
-              <p className="mono text-12 text-fg-faint">{PRESET_CALENDAR[preset]}</p>
-            )}
-          </div>
+          <Select value={preset} onValueChange={setPreset} options={SCHEDULE_PRESETS} />
         </Field>
-        <p className="text-12 text-fg-muted">
-          WASM does not preview upcoming runs before saving - the systemd calendar engine is the only implementation
-          of what a schedule means, and the panel defers to it. The next run appears below once the job is saved.
-        </p>
-        {editing && job.enabled ? (
-          <p className="text-13 text-fg">
-            Next run: <RelativeTime value={job.next_run} fallback={job.next_run} />
-          </p>
+        {preset === "custom" ? (
+          <Field label="Calendar expression" name="calendar" description="A systemd OnCalendar expression.">
+            <Input
+              value={calendar}
+              onValueChange={setCalendar}
+              mono
+              placeholder="Mon..Fri *-*-* 09:00:00"
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </Field>
         ) : null}
+        <SchedulePreview schedule={schedule} />
         <div className="grid gap-4 sm:grid-cols-2">
           <Field label="User" name="user" optional description="Defaults to the configured service user.">
             <Input value={user} onValueChange={setUser} mono autoComplete="off" spellCheck={false} />

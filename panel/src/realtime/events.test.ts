@@ -177,4 +177,31 @@ describe("useServerEvents", () => {
       expect(onSessionExpired).toHaveBeenCalledOnce();
     });
   });
+
+  it("reads everything again once the stream is back: events said while it was down are lost", async () => {
+    const { renderHook } = await import("@testing-library/react");
+    const { QueryClientProvider } = await import("@tanstack/react-query");
+    const { createElement } = await import("react");
+    const { useServerEvents } = await import("./events");
+
+    vi.useFakeTimers();
+    try {
+      fakeBackend({ "GET /api/auth/session": () => json(200, { ...ANONYMOUS, authenticated: true }) });
+      const client = new QueryClient();
+      client.setQueryData(jobKeys.detail("j1"), { id: "j1", status: "running" });
+      renderHook(() => {
+        useServerEvents((url) => new FakeEventSource(url));
+      }, { wrapper: ({ children }) => createElement(QueryClientProvider, { client }, children) });
+
+      FakeEventSource.latest().open();
+      expect(client.getQueryState(jobKeys.detail("j1"))?.isInvalidated).toBe(false);
+
+      FakeEventSource.latest().fail();
+      await vi.advanceTimersByTimeAsync(RECONNECT.initialMs);
+      FakeEventSource.latest().open();
+      expect(client.getQueryState(jobKeys.detail("j1"))?.isInvalidated).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

@@ -9,18 +9,8 @@
 
 import type { Page } from "@playwright/test";
 
-import { expect, expectNoA11yViolations, settle, signIn, test, totpCode } from "./fixtures";
+import { expect, expectNoA11yViolations, settle, signIn, stillness, test, totpCode } from "./fixtures";
 import type { ConsoleServer } from "./fixtures";
-
-/** Waits for every finite animation to end, so axe never measures a colour mid-transition. */
-async function stillness(page: Page): Promise<void> {
-  await page.waitForFunction(() =>
-    document.getAnimations().every((animation) => {
-      const iterations = animation.effect?.getComputedTiming().iterations;
-      return animation.playState !== "running" || iterations === Infinity;
-    }),
-  );
-}
 
 /** Answers "Confirm it's you" with a fresh two-factor code. */
 async function confirmItsYou(page: Page, server: ConsoleServer): Promise<void> {
@@ -131,9 +121,34 @@ test("a configuration nginx rejects is not saved, and nginx's output says why", 
   await settle(page);
   await expectNoA11yViolations(page, "a site's configuration editor");
 
+  // "Test" asks the same question saving would, without saving or asking to confirm it's you:
+  // the untouched file passes.
+  const passed = page.waitForResponse((response) => response.url().endsWith(`/api/sites/${site}/config/test`));
+  await page.getByRole("button", { name: "Test", exact: true }).click();
+  expect((await passed).status()).toBe(200);
+  await expect(page.getByText("This passed nginx's configuration test. Nothing was saved yet.")).toBeVisible();
+  await expect(page.locator("pre").filter({ hasText: "syntax is ok" })).toBeVisible();
+  await stillness(page);
+  await expectNoA11yViolations(page, "a passed configuration test");
+
   // A lost semicolon at the end of the file.
   await editor.fill(`${original}    listen 8080\n`);
   await expect(page.getByText("Unsaved changes")).toBeVisible();
+
+  const tested = page.waitForResponse((response) => response.url().endsWith(`/api/sites/${site}/config/test`));
+  await page.getByRole("button", { name: "Test", exact: true }).click();
+  expect((await tested).status()).toBe(200);
+  await expect(page.getByText("Nothing was saved: the configuration test failed.")).toBeVisible();
+  const testOutput = page.locator("pre").filter({ hasText: 'nginx: [emerg] unexpected end of file, expecting ";" or "}"' });
+  await expect(testOutput).toContainText(/test failed/);
+  await expect(editor).toHaveAttribute("aria-invalid", "true");
+  await stillness(page);
+  await expectNoA11yViolations(page, "a failed configuration test");
+
+  // Testing never touches the file, saving or not.
+  const stillOriginal = (await (await page.request.get(`/api/sites/${site}/config`)).json()) as { config: string };
+  expect(stillOriginal.config).toBe(original);
+
   const saved = page.waitForResponse(
     (response) => response.url().endsWith(`/api/sites/${site}/config`) && response.request().method() === "PUT" && response.status() !== 403,
   );
@@ -166,13 +181,16 @@ test("the certificates and sites tabs: the most urgent certificate first, renewi
   await expect(certificates.getByRole("row").nth(1)).toContainText("arennalabs.com");
   await expect(certificates.getByRole("row").nth(1)).toContainText(/Expires in 1[12] days/);
   await expect(certificates.getByRole("row").nth(1)).toContainText(/Expires in \d+ days/);
+  // CertInfo.issuer, in words rather than the raw "C = US, O = Let's Encrypt, CN = R11".
+  await expect(certificates.getByRole("row").nth(1)).toContainText("Let's Encrypt R11");
   await settle(page);
   await expectNoA11yViolations(page, "the certificates tab");
 
   const renewal = row(page, "Certificates", "bodas.arennalabs.com");
   await renewal.getByRole("button", { name: "Actions for bodas.arennalabs.com" }).click();
   await page.getByRole("menuitem", { name: "Renew now" }).click();
-  await expect(page.getByText("Renewed bodas.arennalabs.com")).toBeVisible({ timeout: 20_000 });
+  // The job's own banner on the page (the live region may say the same words).
+  await expect(page.getByRole("main").getByText("Renewed bodas.arennalabs.com")).toBeVisible({ timeout: 20_000 });
   await expect(renewal).toContainText(/Valid for (89|90) days/);
 
   await page.getByRole("button", { name: "Issue certificate" }).click();
@@ -185,15 +203,88 @@ test("the certificates and sites tabs: the most urgent certificate first, renewi
 
   await page.getByRole("tab", { name: /Sites/ }).click();
   await expect(page).toHaveURL(/\/domains\?tab=sites$/);
-  const sites = page.getByRole("region", { name: "Sites" });
+  await expect(page.getByRole("region", { name: "Sites" })).toBeVisible();
   await expect(row(page, "Sites", "convertidordepdf.com")).toContainText("Disabled");
+
+  // SiteInfo.server_names: qrboda.com's site was seeded to answer on more than its own name.
+  // Another test may since have added an alias to it too, so the expectation comes from the
+  // API rather than a fixed list.
+  const qrboda = (await (await page.request.get("/api/sites/qrboda.com")).json()) as { server_names: string[] };
+  expect(qrboda.server_names.length).toBeGreaterThan(1);
+  const qrbodaRow = row(page, "Sites", "qrboda.com");
+  const shownNames = qrboda.server_names.slice(0, 3).join(", ");
+  await expect(qrbodaRow).toContainText(shownNames);
+  const hiddenCount = qrboda.server_names.length - 3;
+  if (hiddenCount > 0) await expect(qrbodaRow).toContainText(`+${String(hiddenCount)} more`);
   await dismissToasts(page);
   await settle(page);
   await expectNoA11yViolations(page, "the sites tab");
+});
 
-  await sites.getByRole("button", { name: "qrboda.com", exact: true }).click();
-  await expect(page).toHaveURL(/\/domains\/sites\/qrboda\.com$/);
+test("a site's own page lists every name it serves, and a template is offered from the API", async ({ page, consoleServer }) => {
+  await signIn(page, consoleServer, "/domains?tab=sites");
+  const sites = page.getByRole("region", { name: "Sites" });
+  await expect(sites).toBeVisible();
+
+  // GET /api/sites/templates, not a list the dialog invents: every template it names is one
+  // this call actually returned. The button sits in the toolbar above the table, not inside
+  // the table's own scrollable region.
+  const templatesResponse = page.waitForResponse((response) => response.url().endsWith("/api/sites/templates"));
+  await page.getByRole("button", { name: "Create site" }).click();
+  const createDialog = page.getByRole("dialog", { name: "Create a site" });
+  await expect(createDialog).toBeVisible();
+  const { templates: offeredTemplates } = (await (await templatesResponse).json()) as { templates: string[] };
+  expect(offeredTemplates.length).toBeGreaterThan(0);
+  for (const name of offeredTemplates) {
+    // The template's own name is the radio's value; two labels can share a word ("Advanced
+    // proxy", "Reverse proxy"), so the value is what is unambiguous.
+    await expect(createDialog.locator(`input[type="radio"][value="${name}"]`)).toBeAttached();
+  }
+  await stillness(page);
+  await expectNoA11yViolations(page, "the create site dialog");
+  await page.keyboard.press("Escape");
+  await expect(createDialog).toBeHidden();
+
+  const qrboda = (await (await page.request.get("/api/sites/qrboda.com")).json()) as { server_names: string[] };
+  await page.goto("/domains/sites/qrboda.com");
   await expect(page.getByRole("heading", { level: 1 })).toHaveText("qrboda.com");
+  await expect(page.getByText(qrboda.server_names.join(", "))).toBeVisible();
+  await settle(page);
+  await expectNoA11yViolations(page, "a site's own page with the names it serves");
+});
+
+test("deleting a certificate needs the operator to confirm it's them", async ({ page, consoleServer, problems }) => {
+  await signIn(page, consoleServer, "/domains");
+
+  // Other tests here rely on arennalabs.com, cittek.es, qrboda.com and bodas.arennalabs.com
+  // keeping their certificates; picked from the API so whichever other seeded certificate
+  // exists works, rather than assuming one by name. Revoking is not exercised on top of this:
+  // CertManager.revoke() asks certbot for --delete-after-revoke, so a revoked certificate is
+  // already gone - the two are not independently sequenceable on one lineage, and this is the
+  // one every "Revoke" ends as anyway.
+  const reserved = new Set(["arennalabs.com", "cittek.es", "qrboda.com", "bodas.arennalabs.com"]);
+  const certs = (await (await page.request.get("/api/certs")).json()) as { certificates: { domain: string }[] };
+  const target = certs.certificates.find((cert) => !reserved.has(cert.domain));
+  if (!target) throw new Error("No certificate free of other tests' use was seeded to delete.");
+  const domain = target.domain;
+  const escaped = domain.replace(/\./g, "\\.");
+  problems.expect(new RegExp(`status of 403 .* /api/certs/${escaped}$`));
+  const certRow = row(page, "Certificates", domain);
+
+  await certRow.getByRole("button", { name: `Actions for ${domain}` }).click();
+  await page.getByRole("menuitem", { name: "Delete" }).click();
+  const confirm = page.getByRole("alertdialog", { name: `Delete ${domain}` });
+  await confirm.getByRole("textbox").fill(domain);
+  const deleted = page.waitForResponse(
+    (response) => response.url().endsWith(`/api/certs/${domain}`) && response.request().method() === "DELETE" && response.status() !== 403,
+  );
+  await confirm.getByRole("button", { name: "Delete certificate" }).click();
+  await confirmItsYou(page, consoleServer);
+  expect((await deleted).status()).toBe(200);
+  await expect(confirm).toBeHidden();
+  await expect(page.getByText(`Deleted ${domain}`)).toBeVisible();
+  await stillness(page);
+  await expectNoA11yViolations(page, "a deleted certificate");
 });
 
 test("on a phone the domains pages keep to the screen", async ({ page, consoleServer }) => {

@@ -14,7 +14,7 @@
 import type { Page } from "@playwright/test";
 import path from "node:path";
 
-import { expect, settle, signIn, test, totpCode } from "./fixtures";
+import { expect, settle, signIn, stillness, test, totpCode } from "./fixtures";
 import type { ConsoleServer } from "./fixtures";
 import { wizardSource } from "./wizard-sources";
 
@@ -30,16 +30,6 @@ interface Screen {
   act?: (page: Page, server: ConsoleServer) => Promise<void>;
   /** A console error the state causes on purpose. */
   expect?: RegExp;
-}
-
-/** Waits for every finite animation to end: a dialog opening, a state pulsing once. */
-async function stillness(page: Page): Promise<void> {
-  await page.waitForFunction(() =>
-    document.getAnimations().every((animation) => {
-      const iterations = animation.effect?.getComputedTiming().iterations;
-      return animation.playState !== "running" || iterations === Infinity;
-    }),
-  );
 }
 
 async function inspected(page: Page): Promise<void> {
@@ -66,9 +56,9 @@ const SCREENS: readonly Screen[] = [
   {
     name: "wizard-inspect-error",
     path: "/apps/new",
-    // The API answers a source that cannot be fetched with a 500 (SourceError has no status of
-    // its own in deps._STATUS_BY_ERROR), which Chromium logs as a failed resource.
-    expect: /status of 500 .* \/api\/apps\/inspect$/,
+    // The API answers a source that cannot be fetched with 400, in the error contract, which
+    // Chromium still logs as a failed resource.
+    expect: /status of 400 .* \/api\/apps\/inspect$/,
     act: async (page) => {
       await page.getByLabel("Repository or directory").fill("/var/www/src/does-not-exist");
       await page.getByRole("button", { name: "Inspect source" }).click();

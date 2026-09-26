@@ -10,6 +10,7 @@ import { announce } from "../../app/Announcer";
 import { Button } from "../../components/ui/Button";
 import { Field } from "../../components/ui/Field";
 import { Input } from "../../components/ui/Input";
+import { SystemOutput } from "../../components/ui/SystemOutput";
 import { describeError } from "../../lib/errors";
 import type { DescribedError } from "../../lib/errors";
 
@@ -167,7 +168,9 @@ export function LoginForm({ next, expired }: LoginFormProps) {
       {shownFailure !== null ? (
         <div role="alert" className="flex flex-col gap-2 rounded-control border border-fail/30 bg-fail-soft p-3">
           <p className="text-13 font-medium text-fail">{shownFailure.hint ?? "Signing in failed. The server said:"}</p>
-          <pre className="max-h-40 overflow-auto text-12 whitespace-pre-wrap text-fg scroll-thin">{shownFailure.detail}</pre>
+          <SystemOutput label="What the server said" maxHeight="max-h-40">
+            {shownFailure.detail}
+          </SystemOutput>
         </div>
       ) : null}
 

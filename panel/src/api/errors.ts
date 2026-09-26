@@ -1,10 +1,12 @@
 /**
  * The API's error contract, as the console receives it.
  *
- * Every route under /api answers a failure as `{error, detail, hint, fields}` (the backend's
- * `wasm.web.api.deps.ErrorResponse`). `error` is the machine-readable code the console
- * branches on; `detail` is the system's own words and is shown verbatim; `hint` is the fix,
- * shown above it; `fields` maps a form field to its validation message.
+ * Every route under /api answers a failure as `{error, detail, hint, fields, output}` (the
+ * backend's `wasm.web.api.deps.ErrorResponse`). `error` is the machine-readable code the
+ * console branches on; `detail` is the system's own words and is shown verbatim; `hint` is
+ * the fix, shown above it; `fields` maps a form field to its validation message; `output` is
+ * a failing tool's own output verbatim (a rejected web server configuration, for example),
+ * present only for the errors that carry one.
  */
 
 /**
@@ -28,6 +30,8 @@ export class ApiError extends Error {
   readonly fields: Readonly<Record<string, string>> | null;
   /** Seconds the server asked the client to wait (Retry-After), for a 429. */
   readonly retryAfter: number | null;
+  /** A failing tool's own output, verbatim, when the error carries one. Never paraphrase it. */
+  readonly output: string | null;
 
   constructor(
     status: number,
@@ -36,6 +40,7 @@ export class ApiError extends Error {
     hint: string | null = null,
     fields: Record<string, string> | null = null,
     retryAfter: number | null = null,
+    output: string | null = null,
   ) {
     super(detail);
     this.name = "ApiError";
@@ -45,6 +50,7 @@ export class ApiError extends Error {
     this.hint = hint;
     this.fields = fields;
     this.retryAfter = retryAfter;
+    this.output = output;
   }
 
   /** True when the session is gone, not when a typed credential was wrong. */
@@ -133,6 +139,7 @@ export async function errorFromResponse(response: Response): Promise<ApiError> {
       stringOrNull(record["hint"]),
       fieldMap(record["fields"]),
       retryAfter,
+      stringOrNull(record["output"]),
     );
   }
 

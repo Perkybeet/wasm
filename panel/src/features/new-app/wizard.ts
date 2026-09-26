@@ -6,20 +6,14 @@
 
 import { isApiError } from "../../api/client";
 import type { BodyOf, ResponseOf } from "../../api/client";
+import { draftOf, parseLimits } from "../app/settings/limits";
+import type { LimitsDraft } from "../app/settings/limits";
 import { domainProblem, normalizeDomain } from "../domains/names";
 
 export type Inspection = ResponseOf<"/api/apps/inspect", "post">;
 export type EnvKey = Inspection["env_keys"][number];
 export type CreateAppBody = BodyOf<"/api/apps", "post">;
-
-/**
- * What the deployers take that `POST /api/apps` does not accept yet: the `www` redirect,
- * persistent paths and resource limits. The wizard does not offer what the API would ignore;
- * the day the API takes one, this stops compiling, and the Review step should offer it.
- */
-type NotAcceptedYet = "include_www" | "persistent_paths" | "memory_max_mb" | "cpu_quota_percent" | "tasks_max";
-type Assert<T extends true> = T;
-export type CreateAppFieldsNotOfferedYet = Assert<[Extract<keyof CreateAppBody, NotAcceptedYet>] extends [never] ? true : false>;
+export type AppTypeOption = ResponseOf<"/api/apps/types", "get">["types"][number];
 
 export type Step = "source" | "review" | "deploy";
 
@@ -104,34 +98,29 @@ export function manualInspection(source: SourceForm): Inspection {
 // ---------------------------------------------------------------------------------------
 // The review
 
-/** The registry's display names (`DISPLAY_NAME`), for the types it knows today. */
-const TYPE_NAMES: Readonly<Record<string, string>> = {
-  nextjs: "Next.js",
-  nodejs: "Node.js",
-  vite: "Vite",
-  python: "Python",
-  static: "Static site",
-  monorepo: "Monorepo",
-  "docker-compose": "Docker Compose",
-};
-
-export function typeName(type: string): string {
-  return TYPE_NAMES[type] ?? type;
+/**
+ * The registry's display name (`DISPLAY_NAME`) for a type, from `GET /api/apps/types` - the
+ * one source of truth for what WASM can deploy (`available_types`). Falls back to the raw
+ * identifier while the list has not loaded yet, or for a type the wizard has not seen.
+ */
+export function typeName(types: readonly AppTypeOption[], type: string): string {
+  return types.find((entry) => entry.type === type)?.name ?? type;
 }
 
 /**
  * Every type the operator can choose, the detected ones first in the order the registry
- * matched them, then the rest. The first is what WASM would deploy as.
+ * matched them, then the rest as the API ordered them (alphabetical, `auto` last). The first
+ * is what WASM would deploy as.
  */
-export function typeOptions(detected: readonly string[]): { value: string; label: string; hint?: string }[] {
-  const rest = Object.keys(TYPE_NAMES).filter((type) => !detected.includes(type));
+export function typeOptions(types: readonly AppTypeOption[], detected: readonly string[]): { value: string; label: string; hint?: string }[] {
+  const rest = types.filter((entry) => !detected.includes(entry.type));
   return [
     ...detected.map((type, index) => ({
       value: type,
-      label: typeName(type),
+      label: typeName(types, type),
       hint: index === 0 ? "Detected, the closest match" : "Also matches this repository",
     })),
-    ...rest.map((type) => ({ value: type, label: typeName(type) })),
+    ...rest.map((entry) => ({ value: entry.type, label: entry.name })),
   ];
 }
 
@@ -156,14 +145,35 @@ export interface EnvRow {
 export type Layout = "releases" | "inplace";
 export type WebServer = "nginx" | "apache";
 
+export interface PathRow {
+  /** Stable across edits, for React keys and error names. */
+  id: string;
+  value: string;
+}
+
 export interface ReviewForm {
   appType: string;
   domain: string;
+  /** Also answer on www.<domain>, as a redirect to it. Only offered where that means anything. */
+  includeWww: boolean;
   webserver: WebServer;
   ssl: boolean;
   port: string;
   layout: Layout;
+  /** Releases only: paths kept in shared/ and linked into every release. */
+  persistentPaths: PathRow[];
+  limits: LimitsDraft;
   env: EnvRow[];
+}
+
+/**
+ * Whether "Also serve www" would do anything for this domain: `should_include_www` on the
+ * server folds it to false for a subdomain or a name that already is `www.*`, and offering a
+ * toggle that a deploy would silently ignore is worse than not offering it.
+ */
+export function canIncludeWww(domain: string): boolean {
+  const parts = normalizeDomain(domain).split(".");
+  return parts.length === 2 && parts[0] !== "www";
 }
 
 export function envRowsFrom(keys: readonly EnvKey[]): EnvRow[] {
@@ -203,10 +213,13 @@ export function initialReview(
     return {
       appType: inspection.app_type,
       domain: "",
+      includeWww: false,
       webserver: defaults.webserver,
       ssl: true,
       port: String(proposedPort(inspection.default_port, defaults.taken)),
       layout: "releases",
+      persistentPaths: [],
+      limits: draftOf({}),
       env,
     };
   }
@@ -228,6 +241,8 @@ export interface ReviewContext {
   domains: ReadonlySet<string>;
   /** Ports already taken by an app, and by which. */
   ports: ReadonlyMap<number, string>;
+  /** CPUs of this machine, for the CPU quota's upper bound; null while unknown. */
+  cores: number | null;
 }
 
 export type ReviewErrors = Record<string, string>;
@@ -242,6 +257,30 @@ export function envField(row: Pick<EnvRow, "id">): string {
 /** Field name of an added variable's name in ReviewErrors. */
 export function envNameField(row: Pick<EnvRow, "id">): string {
   return `env-name:${row.id}`;
+}
+
+/** Field name of a persistent path in ReviewErrors. */
+export function pathField(row: Pick<PathRow, "id">): string {
+  return `path:${row.id}`;
+}
+
+/** Field name of a resource limit in ReviewErrors. */
+export function limitField(name: keyof LimitsDraft): string {
+  return `limit:${name}`;
+}
+
+/**
+ * A persistent path from the operator, or why the deployer would refuse it - the same check
+ * `wasm.deployers.releases.persistent_path` runs when the deploy links `shared/`, run here
+ * first so a typo is caught before the build rather than after.
+ */
+export function persistentPathProblem(raw: string): string | null {
+  const value = raw.trim();
+  if (value === "") return "Enter a path, such as storage or public/uploads.";
+  if (value.startsWith("/") || value.split("/").some((part) => part === "..")) {
+    return "A persistent path is relative to the application, such as storage or public/uploads, and cannot start with / or contain '..'.";
+  }
+  return null;
 }
 
 /** The port the operator typed, or why it is not one the server will take. */
@@ -285,6 +324,31 @@ export function reviewProblems(form: ReviewForm, context: ReviewContext): Review
       errors[envField(row)] = ".env.example gives it no value, so the app expects one.";
     }
   }
+
+  if (form.layout === "releases") {
+    const paths = new Set<string>();
+    for (const row of form.persistentPaths) {
+      const value = row.value.trim();
+      if (value === "") continue;
+      const problem = persistentPathProblem(value);
+      if (problem !== null) {
+        errors[pathField(row)] = problem;
+        continue;
+      }
+      if (paths.has(value)) {
+        errors[pathField(row)] = `${value} is listed twice.`;
+        continue;
+      }
+      paths.add(value);
+    }
+  }
+
+  const limitErrors = parseLimits(form.limits, context.cores).errors;
+  for (const name of Object.keys(limitErrors) as (keyof LimitsDraft)[]) {
+    const message = limitErrors[name];
+    if (message !== undefined) errors[limitField(name)] = message;
+  }
+
   return errors;
 }
 
@@ -297,6 +361,8 @@ export function createAppBody(source: SourceForm, form: ReviewForm): CreateAppBo
     env[name] = row.value;
   }
   const branch = source.branch.trim();
+  const paths = form.layout === "releases" ? form.persistentPaths.map((row) => row.value.trim()).filter((value) => value !== "") : [];
+  const limits = parseLimits(form.limits, null).values;
   return {
     domain: normalizeDomain(form.domain),
     source: source.source.trim(),
@@ -306,6 +372,11 @@ export function createAppBody(source: SourceForm, form: ReviewForm): CreateAppBo
     webserver: form.webserver,
     ssl: form.ssl,
     layout: form.layout,
+    include_www: form.includeWww && canIncludeWww(form.domain),
+    ...(paths.length > 0 ? { persistent_paths: paths } : {}),
+    memory_max_mb: limits.memory_max_mb,
+    cpu_quota_percent: limits.cpu_quota_percent,
+    tasks_max: limits.tasks_max,
     env_vars: env,
     skip_database: false,
   };
@@ -330,6 +401,11 @@ const REVIEW_FIELDS: Readonly<Record<string, string>> = {
   webserver: "webserver",
   ssl: "ssl",
   layout: "layout",
+  include_www: "includeWww",
+  persistent_paths: "persistentPaths",
+  memory_max_mb: limitField("memory"),
+  cpu_quota_percent: limitField("cpu"),
+  tasks_max: limitField("tasks"),
 };
 
 /**

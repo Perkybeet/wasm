@@ -4,7 +4,7 @@ import { Cog, MoreHorizontal, Play, RotateCw, Square, Trash2 } from "lucide-reac
 import { useState } from "react";
 
 import { isApiError } from "../../api/client";
-import { serviceQuery } from "../../api/queries/services";
+import { serviceQuery, servicesQuery } from "../../api/queries/services";
 import { PageHeader } from "../../app/PageHeader";
 import { CommandHint } from "../../components/page/CommandHint";
 import { DangerAction, DangerZone } from "../../components/page/DangerZone";
@@ -13,7 +13,6 @@ import type { KeyValueItem } from "../../components/page/KeyValueList";
 import { ErrorBlock } from "../../components/page/QueryState";
 import { RelativeTime } from "../../components/page/RelativeTime";
 import { Section } from "../../components/page/Section";
-import { Badge } from "../../components/ui/Badge";
 import { Button, buttonClassName } from "../../components/ui/Button";
 import { ConfirmDialog } from "../../components/ui/ConfirmDialog";
 import { Dialog } from "../../components/ui/Dialog";
@@ -26,6 +25,7 @@ import { StatusPill } from "../../components/ui/StatusPill";
 import { formatBytes } from "../../lib/format";
 import { useLogStream } from "../../realtime/sockets";
 import { UnitEditor } from "./UnitEditor";
+import type { ServiceInfo } from "./data";
 import { serviceState } from "./data";
 import { useServiceActions } from "./useServiceActions";
 
@@ -52,6 +52,39 @@ function NotFound({ name }: { name: string }) {
   );
 }
 
+/**
+ * A unit that exists on this machine but that WASM did not create: found only through the
+ * show-all-units listing (`GET /api/services?wasm_only=false`), since the per-name read
+ * (`GET /api/services/{name}`) only ever answers what the store tracks and 404s for it.
+ * Read-only - no editor, no actions, nothing destructive - the way a foreign row's own menu
+ * is already withheld in the list (`ServiceRowActions`).
+ */
+function ForeignUnit({ name, service }: { name: string; service: ServiceInfo }) {
+  const view = serviceState(service);
+  return (
+    <>
+      <PageHeader
+        title={name}
+        breadcrumbs={BREADCRUMBS}
+        description={
+          <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <StatusPill state={view.state} label={view.label} />
+            {view.detail !== undefined ? <span className="mono text-13 text-fg-muted">{view.detail}</span> : null}
+          </span>
+        }
+      />
+      <EmptyState
+        level={2}
+        icon={<Cog />}
+        title="WASM did not create this unit"
+        description="It runs on this machine, but its unit file belongs to another package. WASM only manages what it created, so nothing here can edit, restart or delete it."
+        command={`systemctl status ${name}`}
+        className="py-16"
+      />
+    </>
+  );
+}
+
 /** The live journal of the unit, followed while the page is open. */
 function ServiceLogs({ name }: { name: string }) {
   const stream = useLogStream(name);
@@ -71,7 +104,7 @@ function ServiceLogs({ name }: { name: string }) {
       }
     >
       {stream.error !== null ? <ErrorBlock compact error={{ detail: stream.error }} title="The log stream failed" /> : null}
-      <LogViewer lines={stream.lines} label={`Logs for ${name}`} filename={`${name}.log`} height={360} />
+      <LogViewer lines={stream.lines} label={`Logs for ${name}`} filename={`${name}.log`} height={360} pageSearch />
       {stream.truncated ? <p className="text-12 text-fg-faint">Older lines were dropped to stay under 10,000 lines.</p> : null}
     </Section>
   );
@@ -88,7 +121,18 @@ export function ServiceDetailPage({ name }: { name: string }) {
   const [deleteOpen, setDeleteOpen] = useState(false);
   const navigate = useNavigate();
 
-  if (service.isError && isApiError(service.error) && service.error.status === 404) return <NotFound name={name} />;
+  // `GET /api/services/{name}` only ever answers what the store tracks and 404s for a unit
+  // WASM did not create; the all-units listing is the only way to tell that unit apart from
+  // one that never existed at all, so it is fetched only once the plain read has 404d.
+  const notFound = service.isError && isApiError(service.error) && service.error.status === 404;
+  const allServices = useQuery({ ...servicesQuery(false), enabled: notFound });
+  const foreign = notFound ? allServices.data?.services.find((candidate) => candidate.name === name) : undefined;
+
+  if (notFound) {
+    if (foreign) return <ForeignUnit name={name} service={foreign} />;
+    if (allServices.isPending) return <PageHeader title={name} breadcrumbs={BREADCRUMBS} description={<Skeleton className="h-6 w-20 rounded-pill" />} />;
+    return <NotFound name={name} />;
+  }
 
   const data = service.data;
   const state = data ? serviceState(data) : null;
@@ -116,7 +160,10 @@ export function ServiceDetailPage({ name }: { name: string }) {
         breadcrumbs={BREADCRUMBS}
         description={
           data && state ? (
-            <StatusPill state={state} label={state === "running" ? "Running" : "Stopped"} />
+            <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
+              <StatusPill state={state.state} label={state.label} />
+              {state.detail !== undefined ? <span className="mono text-13 text-fg-muted">{state.detail}</span> : null}
+            </span>
           ) : (
             <Skeleton className="h-6 w-20 rounded-pill" />
           )
@@ -167,7 +214,7 @@ export function ServiceDetailPage({ name }: { name: string }) {
         </div>
       ) : (
         <div className="flex flex-col gap-8">
-          <Section title="Overview" badge={<Badge tone="accent">WASM-managed</Badge>}>
+          <Section title="Overview">
             <div className="rounded-card border border-border bg-surface px-4 py-1">
               <KeyValueList items={items} />
             </div>

@@ -5,8 +5,9 @@ import type { ReactElement, ReactNode, SyntheticEvent } from "react";
 import { cx } from "../../lib/cx";
 import { describeError } from "../../lib/errors";
 import { Button } from "./Button";
-import { BACKDROP, DialogFrame, MODAL_POPUP } from "./Dialog";
+import { BACKDROP, DialogFrame, MODAL_POPUP, MODAL_VIEWPORT } from "./Dialog";
 import { Input } from "./Input";
+import { SystemOutput } from "./SystemOutput";
 
 export interface ConfirmDialogProps {
   title: string;
@@ -82,7 +83,7 @@ export function ConfirmDialog({
       {trigger !== undefined ? <AlertDialog.Trigger render={trigger} /> : null}
       <AlertDialog.Portal>
         <AlertDialog.Backdrop className={BACKDROP} />
-        <AlertDialog.Viewport className="fixed inset-0 z-50 flex items-center justify-center p-4 sm:items-start sm:pt-[12vh]">
+        <AlertDialog.Viewport className={MODAL_VIEWPORT}>
           <AlertDialog.Popup initialFocus={inputRef} className={cx(MODAL_POPUP, "sm:max-w-[440px]")}>
             <form onSubmit={(event) => void submit(event)} className="contents">
               <DialogFrame
@@ -127,9 +128,9 @@ export function ConfirmDialog({
                 {failure !== null ? (
                   <div role="alert" className="mt-4 flex flex-col gap-2 rounded-control border border-fail/30 bg-fail-soft p-3">
                     <p className="text-13 font-medium text-fail">{failure.hint ?? "The action failed. The system said:"}</p>
-                    <pre className="max-h-40 overflow-auto text-12 whitespace-pre-wrap text-fg scroll-thin">
+                    <SystemOutput label="What the system said" maxHeight="max-h-40">
                       {failure.detail}
-                    </pre>
+                    </SystemOutput>
                   </div>
                 ) : null}
               </DialogFrame>

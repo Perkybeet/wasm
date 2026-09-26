@@ -4,7 +4,7 @@
  * Every settings page passes axe and the CSP and console gates, in both themes.
  */
 
-import { expect, expectNoA11yViolations, settle, signIn, test } from "./fixtures";
+import { expect, expectNoA11yViolations, settle, signIn, test, totpCode } from "./fixtures";
 import { expectAccessibleToast, holdToast, stillness } from "./settings.helpers";
 
 const PAGES = [
@@ -31,6 +31,8 @@ test("every settings page loads its sections and passes axe", async ({ page, con
 });
 
 test("a refused value is shown beside its field, verbatim; the fixed value saves", async ({ page, consoleServer, problems }) => {
+  // Saving configuration is sudo mode (D5): the first write of the session asks to confirm it's you.
+  problems.expect(/status of 403 .* \/api\/config\/backup$/);
   problems.expect(/status of 422 .* \/api\/config\/backup$/);
   problems.expect(/status of 400 .* \/api\/config\/apps-directory$/);
   await signIn(page, consoleServer, "/settings");
@@ -44,9 +46,16 @@ test("a refused value is shown beside its field, verbatim; the fixed value saves
   await retention.fill("500");
   await expect(backups.getByText("Unsaved changes")).toBeVisible();
   await expect(backups.getByText("wasm config set backup.max_per_app 500")).toBeVisible();
-  const refused = page.waitForResponse((response) => response.url().endsWith("/api/config/backup") && response.request().method() === "PUT");
   await save.click();
+
+  const elevate = page.getByRole("dialog", { name: "Confirm it's you" });
+  await expect(elevate).toBeVisible();
+  await expectNoA11yViolations(page, "the elevation dialog");
+  await elevate.getByLabel("Authentication code").fill(totpCode(consoleServer.totpSecret ?? ""));
+  const refused = page.waitForResponse((response) => response.url().endsWith("/api/config/backup") && response.request().method() === "PUT");
+  await elevate.getByRole("button", { name: "Confirm" }).click();
   expect((await refused).status()).toBe(422);
+  await expect(elevate).toBeHidden();
 
   // pydantic's words, whichever major version the server runs.
   const message = backups.getByText(/less than or equal to 100/);

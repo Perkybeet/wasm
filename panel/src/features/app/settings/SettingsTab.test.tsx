@@ -16,12 +16,30 @@ const RELEASE_APP = {
   ...BASE,
   path: "/var/www/apps/shop-example-com",
   layout: "releases",
+  keep_releases: 5,
+  source: "https://github.com/shop/storefront.git",
+  branch: "main",
+  build_command: ["npm", "run", "build"],
+  start_command: "npm run start",
   memory_max_mb: 512,
   cpu_quota_percent: 150,
   tasks_max: 256,
 };
 
 const IN_PLACE_APP = { ...BASE, path: "/var/www/apps/shop-example-com", layout: "inplace" };
+
+const STATIC_APP = {
+  ...BASE,
+  app_type: "static",
+  status: "static",
+  port: null,
+  path: "/var/www/apps/landing",
+  layout: "inplace",
+  source: "https://github.com/you/landing",
+  branch: null,
+  build_command: [],
+  start_command: null,
+};
 
 const RELEASES = {
   domain: DOMAIN,
@@ -81,20 +99,53 @@ function section(name: string): HTMLElement {
 }
 
 describe("the Settings tab", () => {
-  it("states what the app is and points to the terminal for what the API does not serve", async () => {
+  it("states what the app is, its source, branch and commands, linking an HTTPS repository", async () => {
     await settingsOf(RELEASE_APP);
     const source = section("Source and runtime");
     expect(within(source).getByText("nextjs")).toBeInTheDocument();
     expect(within(source).getByText("/var/www/apps/shop-example-com")).toBeInTheDocument();
-    expect(within(source).getByText(`wasm status ${DOMAIN}`)).toBeInTheDocument();
+    const repo = within(source).getByRole("link", { name: /^https:\/\/github\.com\/shop\/storefront\.git/ });
+    expect(repo).toHaveAttribute("href", RELEASE_APP.source);
+    expect(repo).toHaveAttribute("target", "_blank");
+    expect(within(source).getByText("main")).toBeInTheDocument();
+    expect(within(source).getByText("npm run build")).toBeInTheDocument();
+    expect(within(source).getByText("npm run start")).toBeInTheDocument();
+    expect(within(source).getByText(`wasm update ${DOMAIN} --branch <branch>`)).toBeInTheDocument();
+    expect(within(source).queryByText(`wasm status ${DOMAIN}`)).not.toBeInTheDocument();
   });
 
-  it("shows the release serving and how many are on disk", async () => {
+  it("shows a local path as plain text, not a link", async () => {
+    await settingsOf({ ...RELEASE_APP, source: "/var/www/sources/shop", branch: "develop" });
+    const source = section("Source and runtime");
+    expect(within(source).getByText("/var/www/sources/shop")).toBeInTheDocument();
+    expect(within(source).queryByRole("link", { name: /var\/www\/sources/ })).not.toBeInTheDocument();
+    expect(within(source).getByText("develop")).toBeInTheDocument();
+  });
+
+  it("reads 'Not recorded' for the source, branch and start command an older app never got", async () => {
+    await settingsOf(IN_PLACE_APP);
+    const source = section("Source and runtime");
+    expect(within(source).getAllByText("Not recorded").length).toBeGreaterThanOrEqual(3);
+    expect(within(source).getByText("None")).toBeInTheDocument();
+  });
+
+  it("has nothing to build or start on a static site", async () => {
+    await settingsOf(STATIC_APP);
+    const source = section("Source and runtime");
+    expect(within(source).getByText("Build command")).toBeInTheDocument();
+    expect(within(source).getByText("None")).toBeInTheDocument();
+    expect(within(source).queryByText("Start command")).not.toBeInTheDocument();
+    expect(within(source).queryByText("Port")).not.toBeInTheDocument();
+    expect(within(source).getByText("The web server, no process")).toBeInTheDocument();
+  });
+
+  it("shows the release serving, how many are on disk and how many are kept", async () => {
     await settingsOf(RELEASE_APP);
     const releases = section("Releases");
     expect(await within(releases).findByText("20260925-184247-2a8b7c4")).toBeInTheDocument();
     expect(within(releases).getByText("2 releases")).toBeInTheDocument();
     expect(within(releases).getByText("1 more listed whose build failed and was removed")).toBeInTheDocument();
+    expect(within(releases).getByText("5 releases")).toBeInTheDocument();
     expect(within(releases).getByRole("link", { name: "Roll back from the Deployments tab" })).toHaveAttribute("href", `/apps/${DOMAIN}/deployments`);
   });
 

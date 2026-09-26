@@ -40,17 +40,23 @@ const COLUMNS: readonly Column<Deployment>[] = [
   {
     id: "commit",
     header: "Commit",
-    mono: true,
     cell: (row) => (
-      <Link
-        to="/apps/$domain/deployments/$id"
-        params={{ domain: row.domain, id: String(row.id) }}
-        className={`${LINK} text-fg-muted`}
-      >
-        <span className="text-fg">{row.git_commit?.slice(0, 7) ?? `#${String(row.id)}`}</span>
-        {row.git_branch ? <span className="text-fg-faint">{` ${row.git_branch}`}</span> : null}
-        <span className="sr-only">{`, deploy ${String(row.id)} of ${row.domain}`}</span>
-      </Link>
+      <div className="flex min-w-0 flex-col py-1.5 leading-4">
+        <Link
+          to="/apps/$domain/deployments/$id"
+          params={{ domain: row.domain, id: String(row.id) }}
+          className={`${LINK} mono text-12 text-fg-muted`}
+        >
+          <span className="text-fg">{row.git_commit?.slice(0, 7) ?? `#${String(row.id)}`}</span>
+          {row.git_branch ? <span className="text-fg-faint">{` ${row.git_branch}`}</span> : null}
+          <span className="sr-only">{`, deploy ${String(row.id)} of ${row.domain}`}</span>
+        </Link>
+        {row.commit_message ? (
+          <span title={row.commit_message} className="hidden max-w-[18rem] truncate text-12 text-fg-faint lg:block">
+            {row.commit_message}
+          </span>
+        ) : null}
+      </div>
     ),
   },
   {

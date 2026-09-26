@@ -1,7 +1,9 @@
 import { Tabs as BaseTabs } from "@base-ui/react/tabs";
+import { useRef } from "react";
 import type { ReactNode } from "react";
 
 import { cx } from "../../lib/cx";
+import { useTabStrip } from "./tabStrip";
 
 export interface TabsProps<V extends string = string> {
   value?: V;
@@ -32,13 +34,19 @@ export interface TabListProps {
   className?: string;
 }
 
-/** The row of tabs, with the selection marked by an accent rule under the active tab. */
+/**
+ * The row of tabs, with the selection marked by an accent rule under the active tab. Wider than
+ * a phone, it scrolls sideways and keeps the active tab in view.
+ */
 export function TabList({ "aria-label": ariaLabel, children, className }: TabListProps) {
+  const ref = useRef<HTMLDivElement>(null);
+  useTabStrip(ref, "[data-active]", "data-active");
   return (
     <BaseTabs.List
+      ref={ref}
       aria-label={ariaLabel}
       className={cx(
-        "relative z-0 flex items-stretch gap-1 overflow-x-auto border-b border-border scroll-thin [scrollbar-width:none]",
+        "tab-strip relative z-0 flex items-stretch gap-1 overflow-x-auto border-b border-border scroll-thin [scrollbar-width:none]",
         className,
       )}
     >

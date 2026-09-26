@@ -3,11 +3,11 @@ import { useBlocker } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { request } from "../../api/client";
-import { appKeys, appsQuery } from "../../api/queries/apps";
+import { appKeys, appsQuery, appTypesQuery } from "../../api/queries/apps";
 import { webserverQuery } from "../../api/queries/config";
-import { deploymentsQuery } from "../../api/queries/deployments";
-import { jobKeys } from "../../api/queries/jobs";
+import { jobKeys, useFollowedJob } from "../../api/queries/jobs";
 import type { Job } from "../../api/queries/jobs";
+import { systemInfoQuery } from "../../api/queries/system";
 import { announce } from "../../app/Announcer";
 import { PageHeader } from "../../app/PageHeader";
 import { Button } from "../../components/ui/Button";
@@ -40,6 +40,9 @@ export function NewAppWizard() {
   const queryClient = useQueryClient();
   const apps = useQuery(appsQuery());
   const webserver = useQuery(webserverQuery());
+  const types = useQuery(appTypesQuery());
+  const system = useQuery({ ...systemInfoQuery(), staleTime: 10 * 60_000, refetchOnWindowFocus: false });
+  const followedJob = useFollowedJob();
 
   const [step, setStep] = useState<Step>("source");
   const [source, setSource] = useState<SourceForm>({ source: "", branch: "" });
@@ -69,13 +72,15 @@ export function NewAppWizard() {
     heading.current?.scrollIntoView({ block: "nearest" });
   }, [step]);
 
+  const cores = system.data?.cpu.cores ?? null;
   const context = useMemo(() => {
     const list = apps.data?.apps ?? [];
     return {
       domains: new Set(list.map((app) => app.domain)),
       ports: new Map(list.filter((app) => app.port !== null && app.port !== undefined).map((app) => [Number(app.port), app.domain])),
+      cores,
     };
-  }, [apps.data]);
+  }, [apps.data, cores]);
 
   const defaultWebserver: WebServer = webserver.data?.webserver === "apache" ? "apache" : "nginx";
 
@@ -110,19 +115,13 @@ export function NewAppWizard() {
   });
 
   const create = useMutation({
-    mutationFn: async ({ form, body }: { form: ReviewForm; body: ReturnType<typeof createAppBody> }) => {
-      // The newest deployment of this domain before the deploy, so the deploy's own row is
-      // recognised as the first one after it (a deleted app's history can linger).
-      const before = await queryClient.query({ ...deploymentsQuery({ domain: body.domain, limit: 1 }), staleTime: 0 });
-      const accepted = await request("post", "/api/apps", { body });
-      return { accepted, after: before.items[0]?.id ?? 0, form };
-    },
-    onSuccess: ({ accepted, after }, { body }) => {
-      queryClient.setQueryData<Job>(jobKeys.detail(accepted.job_id), (current) => current ?? (accepted.job as unknown as Job));
+    mutationFn: (body: ReturnType<typeof createAppBody>) => request("post", "/api/apps", { body }),
+    onSuccess: (accepted, body) => {
+      followedJob.follow(accepted.job as unknown as Job);
       void queryClient.invalidateQueries({ queryKey: jobKeys.active });
       void queryClient.invalidateQueries({ queryKey: appKeys.list, exact: true });
       announce(`Deploy of ${body.domain} queued`);
-      setTarget({ domain: body.domain, jobId: accepted.job_id, after });
+      setTarget({ domain: body.domain, jobId: accepted.job_id });
     },
     onError: (error) => {
       const refusal = refusalOf(error);
@@ -176,7 +175,7 @@ export function NewAppWizard() {
 
   const deploy = (): void => {
     if (review === null || inspected === null) return;
-    create.mutate({ form: review, body: createAppBody(inspected.for, review) });
+    create.mutate(createAppBody(inspected.for, review));
   };
 
   const notes: Partial<Record<Step, string>> = {
@@ -237,7 +236,9 @@ export function NewAppWizard() {
           {step === "review" && inspected !== null && review !== null ? (
             <ReviewStep
               taken={context.ports}
+              cores={cores}
               inspection={inspected.inspection}
+              types={types.data?.types ?? []}
               source={inspected.for.source.trim()}
               form={review}
               errors={reviewErrors}
@@ -254,13 +255,16 @@ export function NewAppWizard() {
             <DeployStep
               source={inspected.for}
               inspection={inspected.inspection}
+              types={types.data?.types ?? []}
               form={review}
               onDeploy={deploy}
               deploying={create.isPending}
               failure={createFailure}
               target={target}
+              followedJob={followedJob}
               onBack={() => {
                 setTarget(null);
+                followedJob.dismiss();
                 create.reset();
                 go("review");
               }}

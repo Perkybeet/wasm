@@ -5,27 +5,18 @@ import { networkQuery, processesQuery, systemHealthQuery, systemInfoQuery, versi
 import { PageHeader } from "../../app/PageHeader";
 import { CommandHint } from "../../components/page/CommandHint";
 import { ErrorBlock } from "../../components/page/QueryState";
-import { ResourceMeter } from "../../components/page/ResourceMeter";
 import { Section } from "../../components/page/Section";
 import { StatTile } from "../../components/page/StatTile";
 import { DataTable } from "../../components/ui/DataTable";
 import type { Column } from "../../components/ui/DataTable";
 import { Select } from "../../components/ui/Select";
 import { Skeleton } from "../../components/ui/Skeleton";
-import { StatusGlyph, StatusPill } from "../../components/ui/StatusPill";
-import { formatBytes, formatCount, formatPercent } from "../../lib/format";
+import { StatusGlyph, StatusPill, stateTextClass } from "../../components/ui/StatusPill";
+import { formatBytes, formatPercent } from "../../lib/format";
 import { MonitorCard } from "./MonitorCard";
-import { checkView, verdictView } from "./data";
+import { checkName, checkView, verdictView } from "./data";
 import type { HealthCheck } from "./data";
 
-const TONE_TEXT = {
-  running: "text-ok",
-  deploying: "text-warn",
-  failed: "text-fail",
-  stopped: "text-idle",
-  static: "text-ok",
-  unknown: "text-fg-faint",
-} as const;
 
 function HealthChecks({ checks }: { checks: readonly HealthCheck[] }) {
   return (
@@ -33,12 +24,12 @@ function HealthChecks({ checks }: { checks: readonly HealthCheck[] }) {
       {checks.map((check) => {
         const view = checkView(check.status);
         return (
-          <li key={check.name} className="flex items-center justify-between gap-3 py-2">
-            <span className="flex items-center gap-2 text-13 text-fg">
-              <StatusGlyph state={view.state} size={10} className={TONE_TEXT[view.state]} />
-              {check.name}
+          <li key={check.name} className="flex items-start justify-between gap-3 py-2">
+            <span className="flex shrink-0 items-center gap-2 text-13 whitespace-nowrap text-fg">
+              <StatusGlyph state={view.state} size={10} className={stateTextClass(view.state)} />
+              {checkName(check.name)}
             </span>
-            <span className="text-13 text-fg-muted">{check.value}</span>
+            <span className="min-w-0 text-right text-13 text-pretty text-fg-muted">{check.value}</span>
           </li>
         );
       })}
@@ -94,7 +85,7 @@ function SystemInfo() {
   if (info.data === undefined) {
     return (
       <Section title="System">
-        <div aria-hidden="true" className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <div aria-hidden="true" className="grid grid-cols-2 gap-3 lg:grid-cols-3 xl:grid-cols-5">
           {[0, 1, 2, 3, 4].map((i) => (
             <Skeleton key={i} className="h-20 rounded-card" />
           ))}
@@ -105,24 +96,21 @@ function SystemInfo() {
   const { hostname, os, kernel, uptime, cpu, memory, disks } = info.data;
   return (
     <Section title="System">
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <StatTile label="Host" value={hostname} mono detail={os} />
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-3 xl:grid-cols-5">
+        {/* Two columns on a phone make five tiles an orphan: the host takes a row of its own. */}
+        <StatTile label="Host" value={hostname} mono detail={os} className="col-span-2 lg:col-span-1" />
         <StatTile label="Kernel" value={kernel} mono detail={`Up ${uptime}`} />
         <StatTile
           label="CPU"
           value={formatPercent(cpu.percent)}
           detail={`${String(cpu.cores)} cores, load ${cpu.load_1min.toFixed(2)} ${cpu.load_5min.toFixed(2)} ${cpu.load_15min.toFixed(2)}`}
         />
-        <StatTile label="Memory" value={formatPercent(memory.percent_used)} detail={`${String(memory.used_gb)} of ${String(memory.total_gb)} GB`} />
-        <VersionTile />
-      </div>
-      <div className="rounded-card border border-border bg-surface px-4 py-3.5 shadow-raised">
-        <ResourceMeter
+        <StatTile
           label="Memory"
-          value={memory.used_gb * 1024 ** 3}
-          limit={memory.total_gb * 1024 ** 3}
-          format={formatBytes}
+          value={formatPercent(memory.percent_used)}
+          detail={`${formatBytes(memory.used_gb * 1024 ** 3)} of ${formatBytes(memory.total_gb * 1024 ** 3)}`}
         />
+        <VersionTile />
       </div>
       <Disks disks={disks} />
     </Section>
@@ -131,14 +119,26 @@ function SystemInfo() {
 
 function Disks({ disks }: { disks: readonly { device: string; mount_point: string; total_gb: number; used_gb: number; percent_used: number }[] }) {
   const columns: Column<(typeof disks)[number]>[] = [
-    { id: "mount", header: "Mount", mono: true, cell: (row) => row.mount_point, sortValue: (row) => row.mount_point },
+    {
+      id: "mount",
+      header: "Mount",
+      mono: true,
+      // Container runtimes mount paths a hundred characters long; the row keeps its numbers in
+      // view and the whole path stays in the text (and on hover).
+      cell: (row) => (
+        <span title={row.mount_point} className="block max-w-[10rem] truncate sm:max-w-[28rem]">
+          {row.mount_point}
+        </span>
+      ),
+      sortValue: (row) => row.mount_point,
+    },
     { id: "device", header: "Device", mono: true, hideBelow: "sm", cell: (row) => row.device, sortValue: (row) => row.device },
     {
       id: "used",
       header: "Used",
       align: "end",
       mono: true,
-      cell: (row) => `${String(row.used_gb)} GB`,
+      cell: (row) => formatBytes(row.used_gb * 1024 ** 3),
       sortValue: (row) => row.used_gb,
     },
     {
@@ -147,7 +147,7 @@ function Disks({ disks }: { disks: readonly { device: string; mount_point: strin
       align: "end",
       mono: true,
       hideBelow: "sm",
-      cell: (row) => `${String(row.total_gb)} GB`,
+      cell: (row) => formatBytes(row.total_gb * 1024 ** 3),
       sortValue: (row) => row.total_gb,
     },
     {
@@ -234,7 +234,18 @@ function Processes() {
     { id: "name", header: "Process", mono: true, cell: (row) => row.name },
     { id: "user", header: "User", mono: true, hideBelow: "sm", cell: (row) => row.user },
     { id: "cpu", header: "CPU", align: "end", mono: true, cell: (row) => formatPercent(row.cpu_percent) },
-    { id: "memory", header: "Memory", align: "end", mono: true, hideBelow: "sm", cell: (row) => `${formatPercent(row.memory_percent)} - ${formatCount(row.memory_mb)} MB` },
+    {
+      id: "memory",
+      header: "Memory",
+      align: "end",
+      mono: true,
+      hideBelow: "sm",
+      cell: (row) => (
+        <span>
+          {formatBytes(row.memory_mb * 1024 ** 2)} <span className="text-fg-faint">{formatPercent(row.memory_percent)}</span>
+        </span>
+      ),
+    },
   ];
   return (
     <Section

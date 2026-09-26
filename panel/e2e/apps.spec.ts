@@ -6,12 +6,22 @@
 
 import type { Page } from "@playwright/test";
 
-import { expect, expectNoA11yViolations, settle, signIn, test } from "./fixtures";
+import { expect, expectNoA11yViolations, settle, signIn, test, toasts } from "./fixtures";
+
+interface SeededApp {
+  domain: string;
+  status: string;
+}
+
+/** The seeded machine's apps, as the API lists them: what every count here is taken from. */
+async function seededApps(page: Page): Promise<SeededApp[]> {
+  const response = await page.request.get("/api/apps");
+  return ((await response.json()) as { apps: SeededApp[] }).apps;
+}
 
 /** How many apps the seeded machine has, as the API counts them. */
 async function seeded(page: Page): Promise<number> {
-  const response = await page.request.get("/api/apps");
-  return ((await response.json()) as { total: number }).total;
+  return (await seededApps(page)).length;
 }
 
 /** Rows of the table, header excluded. */
@@ -38,8 +48,11 @@ test("every seeded app is listed with its state, and the page passes axe", async
 
 test("/ focuses the search, and the search lives in the URL", async ({ page, consoleServer }) => {
   await signIn(page, consoleServer, "/apps");
-  const total = await seeded(page);
+  const apps = await seededApps(page);
+  const total = apps.length;
   await expect(rows(page)).toHaveCount(total);
+  const matching = apps.filter((app) => app.domain.includes("arennalabs")).length;
+  expect(matching).toBeGreaterThan(1);
 
   await page.getByRole("heading", { level: 1 }).click();
   await page.keyboard.press("/");
@@ -47,8 +60,8 @@ test("/ focuses the search, and the search lives in the URL", async ({ page, con
   await expect(search).toBeFocused();
   await search.fill("arennalabs");
   await expect(page).toHaveURL(/\/apps\?q=arennalabs$/);
-  await expect(rows(page)).toHaveCount(4);
-  await expect(page.getByText(`4 of ${String(total)} applications`)).toBeVisible();
+  await expect(rows(page)).toHaveCount(matching);
+  await expect(page.getByText(`${String(matching)} of ${String(total)} applications`)).toBeVisible();
 
   // A shared link opens the same view.
   await page.goto("/apps?q=nothing-matches-this");
@@ -60,13 +73,16 @@ test("/ focuses the search, and the search lives in the URL", async ({ page, con
 
 test("the state filter narrows the list and Back undoes it", async ({ page, consoleServer }) => {
   await signIn(page, consoleServer, "/apps");
-  const total = await seeded(page);
+  const apps = await seededApps(page);
+  const total = apps.length;
   await expect(rows(page)).toHaveCount(total);
+  const statics = apps.filter((app) => app.status === "static").length;
+  expect(statics).toBeGreaterThan(0);
 
   await page.getByRole("combobox", { name: "State" }).click();
   await page.getByRole("option", { name: "Static" }).click();
   await expect(page).toHaveURL(/\/apps\?state=static$/);
-  await expect(rows(page)).toHaveCount(2);
+  await expect(rows(page)).toHaveCount(statics);
   await expectNoA11yViolations(page, "a filtered list");
 
   await page.goBack();
@@ -83,13 +99,13 @@ test("a row's menu restarts the app and queues an update through the API", async
   const restarted = page.waitForResponse((response) => response.url().endsWith("/api/apps/picconia.com/restart"));
   await page.getByRole("menuitem", { name: "Restart" }).click();
   expect((await restarted).status()).toBe(200);
-  await expect(page.getByText("Restarted picconia.com")).toBeVisible();
+  await expect(toasts(page).getByText("Restarted picconia.com")).toBeVisible();
 
   await page.getByRole("button", { name: "Actions for picconia.com" }).click();
   const queued = page.waitForRequest((request) => request.url().endsWith("/api/jobs/update") && request.method() === "POST");
   await page.getByRole("menuitem", { name: "Update" }).click();
   expect((await queued).postDataJSON()).toEqual({ domain: "picconia.com" });
-  await expect(page.getByText("Update of picconia.com queued")).toBeVisible();
+  await expect(toasts(page).getByText("Update of picconia.com queued")).toBeVisible();
 });
 
 test("a static site has nothing to restart", async ({ page, consoleServer }) => {

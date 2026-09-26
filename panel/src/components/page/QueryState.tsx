@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import { cx } from "../../lib/cx";
 import { describeError } from "../../lib/errors";
 import { Button } from "../ui/Button";
+import { SystemOutput } from "../ui/SystemOutput";
 
 export interface ErrorBlockProps {
   error: unknown;
@@ -45,9 +46,9 @@ export function ErrorBlock({ error, title, hint, onRetry, retrying = false, live
           {fix !== undefined ? <p className="text-13 text-pretty text-fg-muted">{fix}</p> : null}
         </div>
       </div>
-      <pre className="max-h-48 overflow-auto rounded-control border border-border bg-surface px-3 py-2 text-12 whitespace-pre-wrap break-words text-fg scroll-thin">
+      <SystemOutput label={`${title}: what the system said`} className="rounded-control border border-border bg-surface px-3 py-2">
         {described.detail}
-      </pre>
+      </SystemOutput>
       {onRetry !== undefined ? (
         <div>
           <Button size="sm" icon={<RotateCw aria-hidden="true" />} loading={retrying} onClick={onRetry}>

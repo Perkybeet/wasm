@@ -59,8 +59,47 @@ export function certificateJobFor(jobs: readonly Job[] | undefined, name: string
   );
 }
 
+/**
+ * A certificate's issuer, the way an operator reads it, from the distinguished name openssl
+ * prints ("C = US, O = Let's Encrypt, CN = R11"): the organisation and common name, in that
+ * order ("Let's Encrypt R11"). Falls back to the raw string when it does not parse as a DN, so
+ * nothing is ever hidden.
+ */
+export function issuerName(distinguishedName: string): string {
+  const fields = new Map<string, string>();
+  for (const part of distinguishedName.split(",")) {
+    const at = part.indexOf("=");
+    if (at === -1) continue;
+    const key = part.slice(0, at).trim().toUpperCase();
+    const value = part.slice(at + 1).trim();
+    if (key !== "" && value !== "") fields.set(key, value);
+  }
+  const named = [fields.get("O"), fields.get("CN")].filter((part): part is string => part !== undefined);
+  return named.length > 0 ? named.join(" ") : distinguishedName;
+}
+
 /** Whether a certificate lists a name among the ones it covers. */
 export function covers(cert: Pick<CertEntry, "domain" | "domains"> | null | undefined, name: string): boolean {
   if (!cert) return false;
   return cert.domain === name || cert.domains.includes(name);
+}
+
+/**
+ * What the certificate does for one name of an app: covers it (with the certificate's own state),
+ * does not (the name is served over HTTP until the certificate is extended), or is being
+ * extended to it. `lineage` is the app's certificate: undefined while unknown, null when it has
+ * none.
+ */
+export function coverageOf(
+  name: string,
+  lineage: CertEntry | null | undefined,
+  extending: boolean,
+): { tone: CertTone; label: string } {
+  if (lineage === undefined) return { tone: "idle", label: "Checking" };
+  if (lineage === null) return { tone: "idle", label: "No certificate, HTTP only" };
+  if (!covers(lineage, name)) {
+    return extending ? { tone: "busy", label: "Extending the certificate" } : { tone: "warn", label: "Not covered" };
+  }
+  const view = certificateView(lineage);
+  return { tone: view.tone, label: view.tone === "ok" ? "Covered" : view.label };
 }

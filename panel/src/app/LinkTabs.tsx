@@ -1,5 +1,7 @@
 import { Link } from "@tanstack/react-router";
+import { useRef } from "react";
 
+import { useTabStrip } from "../components/ui/tabStrip";
 import { cx } from "../lib/cx";
 import type { TabItem } from "./nav";
 
@@ -16,9 +18,12 @@ export interface LinkTabsProps {
  * (`data-keep-focus`) instead of jumping to the page heading.
  */
 export function LinkTabs({ label, tabs, className }: LinkTabsProps) {
+  const ref = useRef<HTMLUListElement>(null);
+  // On a phone the row is wider than the screen: the current section stays in view.
+  useTabStrip(ref, '[data-status="active"]', "data-status");
   return (
     <nav aria-label={label} data-keep-focus="" className={cx("border-b border-border", className)}>
-      <ul className="-mb-px flex gap-1 overflow-x-auto [scrollbar-width:none]">
+      <ul ref={ref} className="tab-strip -mb-px flex gap-1 overflow-x-auto [scrollbar-width:none]">
         {tabs.map((tab) => (
           <li key={tab.to} className="shrink-0">
             <Link

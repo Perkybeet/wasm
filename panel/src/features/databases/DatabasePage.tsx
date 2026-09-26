@@ -76,11 +76,12 @@ export function DatabasePage({ engine, name }: { engine: string; name: string })
           <CommandHint command={`wasm db info ${name} --engine ${engine}`} label="From a terminal" />
         </Section>
 
+        {/* The console is what this page is opened for most: right under what the database is. */}
+        <SqlConsole engine={engine} database={name} />
+
         <DatabaseBackups engine={engine} database={name} />
 
         <ConnectionString engine={engine} database={name} />
-
-        <SqlConsole engine={engine} database={name} />
       </div>
 
       <ConfirmDialog

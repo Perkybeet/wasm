@@ -9,6 +9,7 @@ import { Button } from "../../components/ui/Button";
 import { Dialog } from "../../components/ui/Dialog";
 import { Field } from "../../components/ui/Field";
 import { Input } from "../../components/ui/Input";
+import { SystemOutput } from "../../components/ui/SystemOutput";
 import { describeError } from "../../lib/errors";
 import type { DescribedError } from "../../lib/errors";
 import { cancelElevation, resolveElevation, useElevationRequested } from "./elevation";
@@ -121,7 +122,9 @@ export function ElevateDialog() {
         {failure !== null ? (
           <div role="alert" className="flex flex-col gap-2 rounded-control border border-fail/30 bg-fail-soft p-3">
             <p className="text-13 font-medium text-fail">{failure.hint ?? "The confirmation failed. The system said:"}</p>
-            <pre className="max-h-40 overflow-auto text-12 whitespace-pre-wrap text-fg scroll-thin">{failure.detail}</pre>
+            <SystemOutput label="What the system said" maxHeight="max-h-40">
+              {failure.detail}
+            </SystemOutput>
           </div>
         ) : null}
       </form>

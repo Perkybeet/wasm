@@ -1,5 +1,5 @@
 import { useMutation } from "@tanstack/react-query";
-import { CircleCheck, Minus, Pencil, Plus, TriangleAlert } from "lucide-react";
+import { CircleCheck, Minus, Pencil, Plus } from "lucide-react";
 import { useState } from "react";
 import type { ReactNode } from "react";
 
@@ -70,22 +70,6 @@ function ChangeRow({ change, shown }: { change: EnvChange; shown: boolean }) {
           )}
         </span>
       </div>
-      {change.readsBackAs !== null ? (
-        <p className="flex items-start gap-1.5 pl-0 text-12 text-fg-muted sm:pl-[7.25rem]">
-          <TriangleAlert aria-hidden="true" className="mt-0.5 size-3.5 shrink-0 text-warn" />
-          <span>
-            WASM writes values without quotes, so this one is read back as{" "}
-            {shown ? (
-              <code translate="no" className="text-fg">
-                {change.readsBackAs === "" ? "an empty value" : change.readsBackAs}
-              </code>
-            ) : (
-              "something else (show the values to see it)"
-            )}
-            .
-          </span>
-        </p>
-      ) : null}
     </li>
   );
 }

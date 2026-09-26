@@ -6,7 +6,7 @@ import type { Backup } from "../../api/queries/backups";
 import { ErrorBlock } from "../../components/page/QueryState";
 import { Button } from "../../components/ui/Button";
 import { Checkbox } from "../../components/ui/Checkbox";
-import { BACKDROP, DialogFrame, MODAL_POPUP } from "../../components/ui/Dialog";
+import { BACKDROP, DialogFrame, MODAL_POPUP, MODAL_VIEWPORT } from "../../components/ui/Dialog";
 import { Input } from "../../components/ui/Input";
 import { cx } from "../../lib/cx";
 import { useBackupActions } from "./useBackupActions";
@@ -62,7 +62,7 @@ export function RestoreBackupDialog({ backup, open, onOpenChange }: RestoreBacku
     <AlertDialog.Root open={open} onOpenChange={(next: boolean) => close(next)}>
       <AlertDialog.Portal>
         <AlertDialog.Backdrop className={BACKDROP} />
-        <AlertDialog.Viewport className="fixed inset-0 z-50 flex items-center justify-center p-4 sm:items-start sm:pt-[12vh]">
+        <AlertDialog.Viewport className={MODAL_VIEWPORT}>
           <AlertDialog.Popup className={cx(MODAL_POPUP, "sm:max-w-[480px]")}>
             <form onSubmit={submit} className="contents">
               <DialogFrame

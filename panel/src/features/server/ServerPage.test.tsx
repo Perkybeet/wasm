@@ -5,6 +5,7 @@ import type { ObservationList } from "../../api/queries/monitor";
 import { expectNoAxeViolations } from "../../test/axe";
 import { renderConsole } from "../../test/console";
 import { SYSTEM_HEALTH, fakeBackend, json, signedInRoutes } from "../../test/fakes";
+import { checkName } from "./data";
 
 const XMRIG_OBSERVATION: ObservationList["observations"][number] = {
   id: 91,
@@ -49,7 +50,7 @@ describe("the server page", () => {
     if (!section) throw new Error("no section");
     expect(within(section).getByText("Healthy")).toBeInTheDocument();
     for (const check of SYSTEM_HEALTH.checks) {
-      expect(within(section).getByText(check.name)).toBeInTheDocument();
+      expect(within(section).getByText(checkName(check.name))).toBeInTheDocument();
     }
   });
 

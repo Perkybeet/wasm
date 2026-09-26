@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { CronJob } from "./data";
-import { filterJobs, isFiltered, runStatus, validateCronSearch } from "./data";
+import { filterJobs, isFiltered, runStatus, scheduleWords, validateCronSearch } from "./data";
 
 function job(name: string, command: string): CronJob {
   return {
@@ -32,9 +32,9 @@ describe("runStatus", () => {
   });
 
   it("reads any other systemd Result as failed, keeping the word", () => {
-    expect(runStatus("exit-code")).toEqual({ state: "failed", label: "exit-code" });
-    expect(runStatus("timeout")).toEqual({ state: "failed", label: "timeout" });
-    expect(runStatus("signal")).toEqual({ state: "failed", label: "signal" });
+    expect(runStatus("exit-code")).toEqual({ state: "failed", label: "Failed", detail: "exit-code" });
+    expect(runStatus("timeout")).toEqual({ state: "failed", label: "Failed", detail: "timeout" });
+    expect(runStatus("signal")).toEqual({ state: "failed", label: "Failed", detail: "signal" });
   });
 });
 
@@ -58,5 +58,14 @@ describe("filterJobs", () => {
     expect(filterJobs(jobs, {})).toHaveLength(2);
     expect(isFiltered({})).toBe(false);
     expect(isFiltered({ q: "x" })).toBe(true);
+  });
+});
+
+describe("scheduleWords", () => {
+  it("names a preset, a daily time, and calls anything else custom", () => {
+    expect(scheduleWords("daily", "*-*-* 02:00:00")).toBe("Daily");
+    expect(scheduleWords("custom", "*-*-* 03:30:00")).toBe("Every day at 03:30");
+    expect(scheduleWords("custom", "*-*-* 3:05")).toBe("Every day at 03:05");
+    expect(scheduleWords("custom", "Mon..Fri *-*-* 09:00:00")).toBe("Custom");
   });
 });

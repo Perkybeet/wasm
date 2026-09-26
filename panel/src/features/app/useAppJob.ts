@@ -1,7 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
 
-import { activeJobsQuery, jobQuery } from "../../api/queries/jobs";
+import { activeJobsQuery, useFollowedJob } from "../../api/queries/jobs";
 import type { Job } from "../../api/queries/jobs";
 
 /** How a job on an app is named while it runs and when it ends (the backend's JobType). */
@@ -39,26 +38,21 @@ export interface AppJob {
 /**
  * What is being done to one app right now. Any running job on it counts (a deploy from the
  * CLI, an update from another tab: the active jobs list names them); the job this page queued
- * is followed to its end, so its failure stays on screen until the operator dismisses it.
- * Both are kept current by the `job` events, which write into the same cache entries.
+ * is followed to its end (useFollowedJob: events, and a poll as the guarantee), so its failure
+ * stays on screen until the operator dismisses it.
  */
 export function useAppJob(domain: string): AppJob {
-  const [trackedId, setTrackedId] = useState<string | null>(null);
   const active = useQuery(activeJobsQuery());
-  const tracked = useQuery({ ...jobQuery(trackedId ?? ""), enabled: trackedId !== null });
+  const followed = useFollowedJob();
 
-  const mine = trackedId !== null ? tracked.data : undefined;
+  const mine = followed.job ?? undefined;
   const elsewhere = active.data?.jobs.find((job) => job.metadata?.["domain"] === domain && RUNNING.has(job.status));
   const running = mine !== undefined && RUNNING.has(mine.status) ? mine : (elsewhere ?? null);
 
   return {
     running,
     failed: mine?.status === "failed" ? mine : null,
-    track: (job) => {
-      setTrackedId(job.id);
-    },
-    dismiss: () => {
-      setTrackedId(null);
-    },
+    track: followed.follow,
+    dismiss: followed.dismiss,
   };
 }

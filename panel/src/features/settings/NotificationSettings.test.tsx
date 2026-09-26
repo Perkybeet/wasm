@@ -131,6 +131,27 @@ describe("Settings > Notifications", () => {
     });
   });
 
+  it("tells a configured channel from an unconfigured one, and disables its test", async () => {
+    notificationsBackend();
+    const { container } = renderConsole("/settings/notifications");
+    await screen.findByRole("switch", { name: /Send notifications/ });
+
+    // Webhook has a stored "***": configured, its secret field says so, and it can be tested.
+    const webhook = channel("Webhook");
+    expect(within(webhook).getByText("Configured")).toBeInTheDocument();
+    expect(within(webhook).getByLabelText("Endpoint URL")).toHaveAttribute("placeholder", "Set - leave blank to keep it");
+    expect(within(webhook).getByRole("button", { name: "Send test" })).toBeEnabled();
+
+    // Email's destination is the monitor's SMTP host, which the seed leaves blank.
+    const email = channel("Email");
+    expect(within(email).getByText("Not configured")).toBeInTheDocument();
+    const emailTest = within(email).getByRole("button", { name: "Send test" });
+    expect(emailTest).toBeDisabled();
+    expect(within(email).getByText("Set up the SMTP server to test it.")).toBeInTheDocument();
+
+    await expectNoAxeViolations(container);
+  });
+
   it("turns delivery on and saves the events as one map", { timeout: 20_000 }, async () => {
     const backend = notificationsBackend();
     const { user } = renderConsole("/settings/notifications");

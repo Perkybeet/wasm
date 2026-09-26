@@ -3,6 +3,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { RouterProvider } from "@tanstack/react-router";
 
 import { isApiError } from "../api/client";
+import { jobKeys, keepFinishedJob } from "../api/queries/jobs";
 import { ToastProvider } from "../components/ui/Toast";
 import { TooltipProvider } from "../components/ui/Tooltip";
 import { ElevateDialog } from "../features/auth/ElevateDialog";
@@ -15,7 +16,7 @@ import type { AppRouter } from "./router";
  * retried; an unreachable or failing server gets two more tries.
  */
 export function createQueryClient(): QueryClient {
-  return new QueryClient({
+  const client = new QueryClient({
     defaultOptions: {
       queries: {
         staleTime: 10_000,
@@ -27,6 +28,10 @@ export function createQueryClient(): QueryClient {
       mutations: { retry: false },
     },
   });
+  // For every job entry, however it is written (an event can create it before any page
+  // asks), so an ended job never reads as running again.
+  client.setQueryDefaults(jobKeys.details, { structuralSharing: keepFinishedJob });
+  return client;
 }
 
 /**

@@ -15,14 +15,15 @@ import { Field } from "../../components/ui/Field";
 import { IconButton } from "../../components/ui/IconButton";
 import { Input } from "../../components/ui/Input";
 import { Skeleton } from "../../components/ui/Skeleton";
-import { StatusGlyph } from "../../components/ui/StatusPill";
+import { StatusGlyph, StatusPill } from "../../components/ui/StatusPill";
+import { SystemOutput } from "../../components/ui/SystemOutput";
 import { Switch } from "../../components/ui/Switch";
 import { Textarea } from "../../components/ui/Textarea";
 import { toast } from "../../components/ui/toast";
 import { cx } from "../../lib/cx";
 import { reportActionError } from "../apps/useAppActions";
 import { splitErrors } from "./formErrors";
-import { CHANNELS, EVENTS, channelValue, parseHostList, readNotificationSettings } from "./notifications";
+import { CHANNELS, EVENTS, REDACTED, channelValue, isChannelConfigured, parseHostList, readNotificationSettings } from "./notifications";
 import type { ChannelField, ChannelSpec, NotificationSettings as Settings } from "./notifications";
 import { configSetCommand } from "./shell";
 import { SettingsFormCard, SettingsSection } from "./SettingsForm";
@@ -100,9 +101,9 @@ function TestOutcome({ result, error }: { result: NotificationTestResult | undef
         <StatusGlyph state="failed" className="text-fail" />
         The test failed. The server said:
       </p>
-      <pre className="max-h-40 overflow-auto rounded-control border border-border bg-bg-sunken px-3 py-2 text-12 whitespace-pre-wrap break-words text-fg scroll-thin">
+      <SystemOutput label="What the server said" maxHeight="max-h-40" className="rounded-control border border-border bg-bg-sunken px-3 py-2">
         {result.detail}
-      </pre>
+      </SystemOutput>
     </div>
   );
 }
@@ -111,11 +112,14 @@ function TestOutcome({ result, error }: { result: NotificationTestResult | undef
 function SecretInput({
   field,
   value,
+  configured,
   onChange,
   disabled,
 }: {
   field: ChannelField;
   value: string;
+  /** Whether a value is already stored, so the placeholder says so instead of showing the format hint. */
+  configured: boolean;
   onChange: (value: string) => void;
   disabled: boolean;
 }) {
@@ -127,7 +131,7 @@ function SecretInput({
       autoComplete="off"
       autoCapitalize="off"
       spellCheck={false}
-      placeholder={field.placeholder}
+      placeholder={configured ? "Set - leave blank to keep it" : field.placeholder}
       value={value}
       disabled={disabled}
       onValueChange={(next: string) => {
@@ -152,33 +156,64 @@ function useChannelTest(channel: string) {
   return useMutation({ mutationFn: () => testNotificationChannel(channel) });
 }
 
-function TestButton({ test, dirty }: { test: ReturnType<typeof useChannelTest>; dirty: boolean }) {
+/** Sending a test needs a destination to send to; a dirty form needs saving before it means anything. */
+function TestButton({ test, disabled, reason }: { test: ReturnType<typeof useChannelTest>; disabled: boolean; reason?: string }) {
+  const reasonId = useId();
   return (
-    <Button
-      size="sm"
-      icon={<Send aria-hidden="true" />}
-      loading={test.isPending}
-      disabled={dirty}
-      onClick={() => {
-        test.mutate();
-      }}
-    >
-      Send test
-    </Button>
+    <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
+      {reason !== undefined ? (
+        <span id={reasonId} className="text-12 text-fg-faint">
+          {reason}
+        </span>
+      ) : null}
+      <Button
+        size="sm"
+        icon={<Send aria-hidden="true" />}
+        loading={test.isPending}
+        disabled={disabled}
+        {...(reason !== undefined ? { "aria-describedby": reasonId } : {})}
+        onClick={() => {
+          test.mutate();
+        }}
+      >
+        Send test
+      </Button>
+    </span>
   );
 }
 
-/** A channel's name, what it does, and the actions that do not need its form. */
-function ChannelHeader({ id, label, description, actions }: { id: string; label: string; description: string; actions: ReactNode }) {
+/** A channel's name, whether it has a destination, what it does, and the actions that do not need its form. */
+function ChannelHeader({
+  id,
+  label,
+  description,
+  configured,
+  actions,
+}: {
+  id: string;
+  label: string;
+  description: string;
+  configured: boolean;
+  actions: ReactNode;
+}) {
   return (
     <header className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
       <div className="min-w-0 flex-1 basis-60">
-        <h3 id={id} className="text-14 font-semibold text-fg">
-          {label}
-        </h3>
+        <div className="flex flex-wrap items-center gap-2">
+          <h3 id={id} className="text-14 font-semibold text-fg">
+            {label}
+          </h3>
+          <StatusPill
+            state={configured ? "running" : "stopped"}
+            label={configured ? "Configured" : "Not configured"}
+            appearance="inline"
+            size="sm"
+          />
+        </div>
         <p className="max-w-[60ch] text-13 text-fg-muted">{description}</p>
       </div>
-      <div className="flex shrink-0 items-center gap-1">{actions}</div>
+      {/* Wraps on a phone: a reason, Remove and Send test do not fit one narrow row. */}
+      <div className="flex max-w-full min-w-0 flex-wrap items-center gap-1">{actions}</div>
     </header>
   );
 }
@@ -210,9 +245,11 @@ function HttpChannel({ spec, stored }: { spec: ChannelSpec; stored: Readonly<Rec
   const dirty = spec.fields.some((field) =>
     field.secret ? (draft[field.key] ?? "").trim() !== "" : field.key in draft && draft[field.key] !== stored[field.key],
   );
+  const configured = isChannelConfigured(spec, stored);
 
   const save = useMutation({
-    mutationFn: (cleared: ReadonlySet<string>) => patchConfig(`notifications.channels.${spec.id}`, channelValue(spec, draft, cleared)),
+    mutationFn: (cleared: ReadonlySet<string>) =>
+      patchConfig(`notifications.channels.${spec.id}`, channelValue(spec, stored, draft, cleared)),
     onSuccess: async (_, cleared) => {
       setDraft({});
       test.reset();
@@ -228,26 +265,32 @@ function HttpChannel({ spec, stored }: { spec: ChannelSpec; stored: Readonly<Rec
     if (dirty && !save.isPending) save.mutate(new Set());
   };
 
+  const testReason = !configured ? "Add a destination to test it." : dirty ? "Save your changes first." : undefined;
+
   return (
     <article aria-labelledby={headingId} className="flex min-w-0 flex-col gap-3 px-5 py-4">
       <ChannelHeader
         id={headingId}
         label={spec.label}
         description={spec.description}
+        configured={configured}
         actions={
           <>
-            <Button
-              size="sm"
-              variant="ghost"
-              disabled={save.isPending && !removing}
-              loading={removing}
-              onClick={() => {
-                save.mutate(new Set(secretKeys));
-              }}
-            >
-              Remove destination
-            </Button>
-            <TestButton test={test} dirty={dirty} />
+            {/* Nothing to remove until a destination is saved. */}
+            {configured || removing ? (
+              <Button
+                size="sm"
+                variant="ghost"
+                disabled={save.isPending && !removing}
+                loading={removing}
+                onClick={() => {
+                  save.mutate(new Set(secretKeys));
+                }}
+              >
+                Remove destination
+              </Button>
+            ) : null}
+            <TestButton test={test} disabled={dirty || !configured} {...(testReason !== undefined ? { reason: testReason } : {})} />
           </>
         }
       />
@@ -260,6 +303,7 @@ function HttpChannel({ spec, stored }: { spec: ChannelSpec; stored: Readonly<Rec
                 <SecretInput
                   field={field}
                   value={draft[field.key] ?? ""}
+                  configured={stored[field.key] === REDACTED}
                   disabled={save.isPending}
                   onChange={(value) => {
                     setDraft((current) => ({ ...current, [field.key]: value }));
@@ -316,13 +360,15 @@ function EmailChannel({ settings }: { settings: Settings }) {
   });
   const { smtp } = settings;
   const configured = smtp.host !== "";
+  const testReason = !configured ? "Set up the SMTP server to test it." : dirty ? "Save your changes first." : undefined;
   return (
     <article aria-labelledby={headingId} className="flex min-w-0 flex-col gap-3 px-5 py-4">
       <ChannelHeader
         id={headingId}
         label="Email"
         description="Sent through the monitor's SMTP account to its recipients."
-        actions={<TestButton test={test} dirty={dirty} />}
+        configured={configured}
+        actions={<TestButton test={test} disabled={dirty || !configured} {...(testReason !== undefined ? { reason: testReason } : {})} />}
       />
       <form
         noValidate

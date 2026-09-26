@@ -213,3 +213,34 @@ test("a locked-out address is told how long to wait", async ({ page, problems })
     await server.stop();
   }
 });
+
+for (const viewport of [
+  { name: "a short desktop", width: 1280, height: 520 },
+  { name: "a phone held sideways", width: 844, height: 390 },
+  { name: "a phone", width: 390, height: 600 },
+]) {
+  test(`a dialog taller than ${viewport.name} keeps its actions on screen and scrolls its body`, async ({ page, consoleServer }) => {
+    await page.setViewportSize({ width: viewport.width, height: viewport.height });
+    await signIn(page, consoleServer, "/backups");
+    await page.getByRole("button", { name: "New backup" }).click();
+    const dialog = page.getByRole("dialog", { name: "Create backup" });
+    await expect(dialog).toBeVisible();
+    await settle(page);
+
+    // Taller than the screen, so the body scrolls (otherwise this proves nothing)...
+    const scrolls = await dialog.evaluate((popup) =>
+      [...popup.querySelectorAll<HTMLElement>("*")].some(
+        (element) => getComputedStyle(element).overflowY === "auto" && element.scrollHeight > element.clientHeight + 1,
+      ),
+    );
+    expect(scrolls).toBe(true);
+    // ...and the whole popup is inside the viewport, footer included: the offset above counts.
+    const box = await dialog.boundingBox();
+    if (box === null) throw new Error("the dialog has no box");
+    expect(box.y).toBeGreaterThanOrEqual(0);
+    expect(box.y + box.height).toBeLessThanOrEqual(viewport.height);
+    const action = dialog.getByRole("button", { name: "Create backup" });
+    await expect(action).toBeInViewport({ ratio: 1 });
+    await expect(dialog.getByRole("button", { name: "Cancel" })).toBeInViewport({ ratio: 1 });
+  });
+}

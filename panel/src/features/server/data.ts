@@ -20,7 +20,7 @@ export function verdictView(verdict: string): VerdictView {
     case "healthy":
       return { state: "running", label: "Healthy" };
     case "warning":
-      return { state: "deploying", label: "Needs attention" };
+      return { state: "warning", label: "Needs attention" };
     case "error":
       return { state: "failed", label: "Critical" };
     default:
@@ -34,10 +34,23 @@ export function checkView(status: string): VerdictView {
     case "ok":
       return { state: "running", label: "OK" };
     case "warning":
-      return { state: "deploying", label: "Warning" };
+      return { state: "warning", label: "Warning" };
     case "error":
       return { state: "failed", label: "Error" };
     default:
       return { state: "unknown", label: "Info" };
   }
+}
+
+/**
+ * `wasm health` names its checks in Title Case for the terminal ("Disk Space"); the console
+ * writes labels in sentence case. Known names are reworded, anything else is shown as sent.
+ */
+const CHECK_NAMES: Readonly<Record<string, string>> = {
+  "Disk Space": "Disk space",
+  "SSL Certificates": "SSL certificates",
+};
+
+export function checkName(name: string): string {
+  return CHECK_NAMES[name] ?? name;
 }

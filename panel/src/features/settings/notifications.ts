@@ -2,9 +2,12 @@
  * The `notifications` block of the configuration, read into something a form can hold.
  *
  * GET /api/config answers the whole file as an untyped tree with every secret replaced by
- * "***" - empty ones included, so the answer never says whether a webhook URL is set. The
- * console follows the same rule back: a secret field left untouched is sent as "***", which
- * the server resolves to the stored value (wasm.core.config.restore_redacted).
+ * "" when nothing is stored and "***" when something is (wasm.core.config.redact_secrets) -
+ * so the answer says whether a channel has a destination without ever showing it. The console
+ * follows the same rule back: a secret field left untouched is sent as "***", which the server
+ * resolves to the stored value (wasm.core.config.restore_redacted); a field the operator never
+ * touched is otherwise sent back exactly as it was read, so saving one field never blanks
+ * another it shares a channel with.
  */
 
 import type { ConsoleConfig } from "../../api/queries/config";
@@ -162,24 +165,38 @@ export function readNotificationSettings(config: ConsoleConfig["config"]): Notif
   };
 }
 
+/** Whether a channel has a destination: one of its secret fields is a stored "***". */
+export function isChannelConfigured(spec: ChannelSpec, stored: Readonly<Record<string, string>>): boolean {
+  return spec.fields.some((field) => field.secret && stored[field.key] === REDACTED);
+}
+
 /**
- * The value to write at `notifications.channels.<channel>` for a form's fields: what was typed,
- * or "***" for a secret left empty so the server keeps the stored one.
+ * The value to write at `notifications.channels.<channel>` for a form's fields: what the
+ * operator typed, or, for whatever they left alone, exactly what is already stored - so saving
+ * one field of a multi-field channel (Telegram's chat ID beside its bot token) never sends the
+ * other back blank. A secret left untouched is sent as "***", which the server resolves to the
+ * stored value (wasm.core.config.restore_redacted) instead of the literal three characters.
  *
+ * @param stored What the channel holds now, as `readNotificationSettings` read it: secrets
+ *   already redacted, everything else in clear.
  * @param cleared Secret fields the operator chose to remove: written as "", which turns the
  *   channel off.
  */
 export function channelValue(
   spec: ChannelSpec,
+  stored: Readonly<Record<string, string>>,
   draft: Readonly<Record<string, string>>,
   cleared: ReadonlySet<string> = new Set(),
 ): Record<string, string> {
   return Object.fromEntries(
     spec.fields.map((field) => {
-      const typed = (draft[field.key] ?? "").trim();
       if (cleared.has(field.key)) return [field.key, ""];
-      if (field.secret) return [field.key, typed === "" ? REDACTED : typed];
-      return [field.key, typed];
+      if (field.secret) {
+        const typed = (draft[field.key] ?? "").trim();
+        return [field.key, typed === "" ? REDACTED : typed];
+      }
+      const typed = draft[field.key]?.trim();
+      return [field.key, typed ?? stored[field.key] ?? ""];
     }),
   );
 }

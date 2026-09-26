@@ -6,11 +6,17 @@ import { Menu, MenuItem, MenuSeparator } from "../../components/ui/Menu";
 import type { ServiceInfo } from "./data";
 import { useServiceActions } from "./useServiceActions";
 
-/** The menu at the end of a service's row: open it, or act on the unit directly. */
+/**
+ * The menu at the end of a service's row: open it, or act on the unit directly. A unit WASM
+ * did not create has no menu at all - read-only is enforced here, at the one place every row
+ * of every services table gets its actions from, not left to each caller to remember.
+ */
 export function ServiceRowActions({ service }: { service: ServiceInfo }) {
   const navigate = useNavigate();
   const name = service.name;
   const { start, stop, restart, enable, disable } = useServiceActions(name);
+
+  if (!service.managed) return null;
 
   return (
     <Menu

@@ -1,13 +1,11 @@
 import { X } from "lucide-react";
-import { useRef } from "react";
 
 import { ErrorBlock } from "../../components/page/QueryState";
 import { IconButton } from "../../components/ui/IconButton";
 import { Spinner } from "../../components/ui/Spinner";
 import { CertificateStatus } from "./CertificateStatus";
-import { isFinished } from "./useCertificateJobs";
-import { useKeyboardScrollable } from "./useKeyboardScrollable";
-import type { FollowedJob } from "./useCertificateJobs";
+import { isJobFinished } from "../../api/queries/jobs";
+import type { FollowedJob } from "../../api/queries/jobs";
 
 export interface JobWords {
   /** While it runs: "Extending the certificate to shop.example.com". */
@@ -26,11 +24,9 @@ export interface JobWords {
  * outcomes stay until dismissed; the live region says each once.
  */
 export function JobBanner({ followed, words }: { followed: FollowedJob; words: JobWords }) {
-  const failure = useRef<HTMLDivElement>(null);
-  useKeyboardScrollable(failure);
   const job = followed.job;
   if (followed.id === null) return null;
-  if (job === null || !isFinished(job)) {
+  if (job === null || !isJobFinished(job)) {
     const step = job?.current_step ?? null;
     return (
       <div
@@ -59,7 +55,7 @@ export function JobBanner({ followed, words }: { followed: FollowedJob; words: J
     );
   }
   return (
-    <div ref={failure} className="relative">
+    <div className="relative">
       <ErrorBlock
         live
         error={{

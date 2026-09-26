@@ -5,21 +5,12 @@
 
 import type { Page } from "@playwright/test";
 
-import { expect, totpCode } from "./fixtures";
+import { expect, stillness, totpCode } from "./fixtures";
 import type { ConsoleServer } from "./fixtures";
 
-/**
- * Waits for every finite animation to end. Dialogs and toasts fade in, and axe measuring
- * contrast mid-fade reports a colour that is on screen for a few frames only.
- */
-export async function stillness(page: Page): Promise<void> {
-  await page.waitForFunction(() =>
-    document.getAnimations().every((animation) => {
-      const iterations = animation.effect?.getComputedTiming().iterations;
-      return animation.playState !== "running" || iterations === Infinity;
-    }),
-  );
-}
+// stillness is fixtures.ts's own (it also waits inside settle()); re-exported here so specs
+// that already import it from this module keep working with one implementation behind it.
+export { stillness };
 
 /** Answers "Confirm it's you" with a code for the server's second factor, or its token. */
 export async function confirmItsYou(page: Page, server: ConsoleServer, secret: string | null = server.totpSecret): Promise<void> {

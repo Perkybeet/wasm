@@ -1,15 +1,69 @@
 import { screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
+import type { ServiceList } from "../../api/queries/services";
 import { expectNoAxeViolations } from "../../test/axe";
 import { renderConsole } from "../../test/console";
 import { fakeBackend, json, signedInRoutes } from "../../test/fakes";
 import type { RouteHandler } from "../../test/fakes";
 
-const SERVICES = [
-  { name: "wasm-shop-example-com", description: "/usr/bin/node server.js", active: true, enabled: true, status: "running", pid: 4213, uptime: "Wed 2026-09-24 10:00:00 UTC", memory: "104857600" },
-  { name: "wasm-admin-example-com", description: "/usr/bin/node server.js", active: false, enabled: false, status: "stopped", pid: null, uptime: null, memory: null },
+const SERVICES: ServiceList["services"] = [
+  {
+    name: "wasm-shop-example-com",
+    description: "/usr/bin/node server.js",
+    active: true,
+    enabled: true,
+    status: "running",
+    pid: 4213,
+    uptime: "Wed 2026-09-24 10:00:00 UTC",
+    memory: "104857600",
+    managed: true,
+    active_state: "active",
+    sub_state: "running",
+    result: "success",
+  },
+  {
+    name: "wasm-admin-example-com",
+    description: "/usr/bin/node server.js",
+    active: false,
+    enabled: false,
+    status: "stopped",
+    pid: null,
+    uptime: null,
+    memory: null,
+    managed: true,
+    active_state: "inactive",
+    sub_state: "dead",
+    result: "success",
+  },
 ];
+
+/** The machine's units, once "Show all units" asks for `wasm_only=false`: WASM's own, plus one it did not create. */
+const ALL_SERVICES: ServiceList["services"] = [
+  ...SERVICES,
+  {
+    name: "postgresql",
+    description: null,
+    active: true,
+    enabled: true,
+    status: "running",
+    pid: 908,
+    uptime: "Wed 2026-09-24 09:00:00 UTC",
+    memory: "31457280",
+    managed: false,
+    active_state: "active",
+    sub_state: "running",
+    result: "success",
+  },
+];
+
+/** Answers `GET /api/services` scoped by `wasm_only`, the way the real endpoint does. */
+function scopedServicesRoute(): RouteHandler {
+  return (call) =>
+    call.search.get("wasm_only") === "false"
+      ? json(200, { services: ALL_SERVICES, total: ALL_SERVICES.length })
+      : json(200, { services: SERVICES, total: SERVICES.length });
+}
 
 async function servicesAt(path = "/services", extra: Record<string, RouteHandler> = {}) {
   const backend = fakeBackend({
@@ -74,9 +128,51 @@ describe("the services list", () => {
     expect(await screen.findByRole("heading", { level: 2, name: "Create your first service" })).toBeInTheDocument();
   });
 
+  it("scopes the request to WASM's own units by default", async () => {
+    const { backend, table } = await servicesAt("/services", { "GET /api/services": scopedServicesRoute() });
+    await within(table).findByText("wasm-shop-example-com");
+    await waitFor(() => {
+      expect(backend.callsTo("GET /api/services").some((call) => call.search.get("wasm_only") === "true")).toBe(true);
+    });
+    expect(within(table).queryByText("postgresql")).not.toBeInTheDocument();
+    // Every row is WASM's: a column saying so on each would say nothing.
+    expect(within(table).queryByRole("columnheader", { name: /Managed/ })).not.toBeInTheDocument();
+  });
+
+  it("shows every unit, including a foreign one read-only, behind the show-all-units toggle", async () => {
+    const { user, backend, table, location } = await servicesAt("/services", { "GET /api/services": scopedServicesRoute() });
+    await within(table).findByText("wasm-shop-example-com");
+
+    await user.click(screen.getByRole("switch", { name: "Show all units" }));
+
+    await waitFor(() => {
+      expect(backend.callsTo("GET /api/services").some((call) => call.search.get("wasm_only") === "false")).toBe(true);
+    });
+    expect(location().search).toEqual({ all: true });
+
+    const foreignRow = (await within(table).findByText("postgresql")).closest("tr");
+    expect(within(table).getByRole("columnheader", { name: /Managed/ })).toBeInTheDocument();
+    if (!foreignRow) throw new Error("no row");
+    // Once in its Managed column, once beside its name for phones (CSS shows one or the other).
+    expect(within(foreignRow).getAllByText("Foreign")).toHaveLength(2);
+    expect(within(foreignRow).queryByRole("button", { name: /Actions for/ })).not.toBeInTheDocument();
+
+    const managedRow = within(table).getByText("wasm-shop-example-com").closest("tr");
+    if (!managedRow) throw new Error("no row");
+    expect(within(managedRow).getByRole("button", { name: /Actions for/ })).toBeInTheDocument();
+  });
+
   it("has no accessibility violations", async () => {
     const { table } = await servicesAt();
     await within(table).findByText("wasm-shop-example-com");
+    await expectNoAxeViolations(screen.getByRole("main"));
+  });
+
+  it("has no accessibility violations with every unit shown", async () => {
+    const { user, table } = await servicesAt("/services", { "GET /api/services": scopedServicesRoute() });
+    await within(table).findByText("wasm-shop-example-com");
+    await user.click(screen.getByRole("switch", { name: "Show all units" }));
+    await within(table).findByText("postgresql");
     await expectNoAxeViolations(screen.getByRole("main"));
   });
 });

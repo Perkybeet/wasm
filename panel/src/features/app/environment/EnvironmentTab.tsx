@@ -323,7 +323,8 @@ export function EnvironmentTab({ domain }: { domain: string }) {
             Secret values are hidden by the server. Revealing or editing one asks you to confirm it&apos;s you.
           </p>
         ) : null}
-        <CommandHint command={`wasm env show ${domain}`} label="From a terminal" />
+        {/* The empty state carries the same command; said once. */}
+        {rows.length > 0 || env.data === undefined ? <CommandHint command={`wasm env show ${domain}`} label="From a terminal" /> : null}
       </Section>
 
       <VariableDialog

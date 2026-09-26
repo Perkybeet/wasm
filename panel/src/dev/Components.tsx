@@ -63,7 +63,7 @@ import {
 import type { Column, LogLine, Status } from "../components/ui";
 import { Item, Row, Section, Stage } from "./gallery";
 import type { SampleApp } from "./sample";
-import { SAMPLE_APPS, SAMPLE_BUILD_LOG, ago, nextJournalLine, sampleMetrics } from "./sample";
+import { SAMPLE_APPS, SAMPLE_BUILD_LOG, ago, nextJournalLine, sampleMetrics, sampleWeekMetrics } from "./sample";
 
 const STATES: Status[] = ["running", "deploying", "failed", "stopped", "static", "unknown"];
 
@@ -293,6 +293,28 @@ function Overlays() {
               trigger={<Button icon={<Power />}>Stop</Button>}
             />
           </Item>
+          <Item label="Taller than the screen">
+            <Dialog
+              title="Migrate shop.arenna.dev to releases"
+              description="What moves where. Nothing is deleted; the old tree is kept until you remove it."
+              trigger={<Button data-testid="open-long-dialog">Review the plan</Button>}
+              footer={
+                <>
+                  <DialogClose render={<Button>Cancel</Button>} />
+                  <Button variant="primary">Migrate</Button>
+                </>
+              }
+            >
+              {/* Read-only and taller than a phone: the body scrolls, the footer stays. */}
+              <ol className="flex list-decimal flex-col gap-2 pl-5 text-13 text-fg-muted">
+                {Array.from({ length: 24 }, (_, index) => (
+                  <li key={index}>
+                    Move <Mono>{`public/uploads/${String(2014 + (index % 12))}`}</Mono> to <Mono>shared/</Mono> and link it back.
+                  </li>
+                ))}
+              </ol>
+            </Dialog>
+          </Item>
           <Item label="Drawer">
             <Drawer
               title={
@@ -358,6 +380,26 @@ function Navigation() {
             </TabPanel>
           ))}
         </Tabs>
+      </Stage>
+      <Stage plain>
+        {/* A phone's width, deep-linked to a tab near the end: it is brought into view, and
+            the end that hides tabs fades. */}
+        <div className="max-w-[358px] rounded-card border border-border bg-surface px-3">
+          <Tabs defaultValue="diagnose">
+            <TabList aria-label="Application sections on a phone">
+              {["Overview", "Deployments", "Logs", "Metrics", "Environment", "Domains", "Diagnose", "Settings"].map((label) => (
+                <Tab key={label} value={label.toLowerCase()}>
+                  {label}
+                </Tab>
+              ))}
+            </TabList>
+            {["overview", "deployments", "logs", "metrics", "environment", "domains", "diagnose", "settings"].map((value) => (
+              <TabPanel key={value} value={value} className="pb-4">
+                <p className="text-13 text-fg-muted">{`The ${value} view, on a phone.`}</p>
+              </TabPanel>
+            ))}
+          </Tabs>
+        </div>
       </Stage>
       <Stage>
         <Row>
@@ -716,11 +758,17 @@ function Tables() {
 
 function Charts() {
   const metrics = sampleMetrics();
+  const week = sampleWeekMetrics();
+  const weekMarkers = [
+    { at: week.timestamps[24] ?? 0, label: "Deploy 118, succeeded, Sep 19, 14:00", state: "running" as const, href: "#deploy-118" },
+    { at: week.timestamps[96] ?? 0, label: "Deploy 121, failed, Sep 22, 14:00", state: "failed" as const, href: "#deploy-121" },
+    { at: week.timestamps[144] ?? 0, label: "Deploy 124, in progress, Sep 24, 14:00", state: "deploying" as const, href: "#deploy-124" },
+  ];
   return (
     <Section
       id="chart"
       title="Chart"
-      description="Canvas for speed, but never only canvas: each chart is an image with a written summary and turns into a table on request. Series differ by line style as well as colour."
+      description="Canvas for speed, but never only canvas: each chart is an image with a written summary and turns into a table on request. Series differ by line style as well as colour. Deploys and other events are markers the chart draws and positions itself, with a state glyph, a tooltip and a link."
     >
       <div className="grid gap-6 lg:grid-cols-2">
         <Card>
@@ -743,6 +791,17 @@ function Charts() {
               { label: "Limit", values: metrics.timestamps.map(() => 640) },
             ]}
             formatValue={(v) => `${v.toFixed(0)} MB`}
+          />
+        </Card>
+        <Card className="lg:col-span-2">
+          <Chart
+            title="CPU"
+            description="Last 7 days"
+            timestamps={week.timestamps}
+            series={[{ label: "shop.arenna.dev", values: week.cpu }]}
+            formatValue={(v) => `${v.toFixed(0)}%`}
+            yRange={[0, 100]}
+            markers={weekMarkers}
           />
         </Card>
       </div>
@@ -769,14 +828,14 @@ function Logs() {
     <Section
       id="logs"
       title="Log viewer"
-      description="Output stays text: select it, search it, copy it, download it. Program colours map onto state tokens. Following pauses as soon as you scroll up and offers the way back."
+      description="Output stays text: select it, search it, copy it, download it. Program colours map onto state tokens. Following pauses as soon as you scroll up and offers the way back. Timestamped lines keep their time column in the copy and the download; below the sm breakpoint (639px) lines start wrapped. At most one viewer per page sets pageSearch, so the page's `/` shortcut lands here."
     >
       <LogViewer lines={SAMPLE_BUILD_LOG} height={420} label="Build log for shop.arenna.dev" filename="shop-a1b2c3d.log" />
       <div className="flex flex-col gap-3">
         <Row>
           <Switch label="Stream journal lines" checked={streaming} onCheckedChange={setStreaming} />
         </Row>
-        <LogViewer lines={lines} height={300} label="Journal for shop.arenna.dev" filename="shop-journal.log" />
+        <LogViewer lines={lines} height={300} label="Journal for shop.arenna.dev" filename="shop-journal.log" pageSearch />
       </div>
       <LogViewer lines={[]} height={140} label="Empty log" />
     </Section>

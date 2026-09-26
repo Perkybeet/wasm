@@ -111,7 +111,7 @@ export function UsersPanel({ engines, engine, onEngineChange }: UsersPanelProps)
           <CreateUserDialog
             engines={runnable}
             trigger={
-              <Button size="sm" variant="primary" icon={<Plus aria-hidden="true" />} disabled={runnable.length === 0}>
+              <Button size="sm" icon={<Plus aria-hidden="true" />} disabled={runnable.length === 0}>
                 New user
               </Button>
             }

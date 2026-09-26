@@ -235,12 +235,11 @@ export function WebhookSection({ app }: { app: App }) {
                 <Button variant="ghost" onClick={() => setConfirm("disable")}>
                   Disable webhook
                 </Button>
-                <Button variant={secret ? "secondary" : "primary"} onClick={() => setConfirm("regenerate")}>
-                  Regenerate secret
-                </Button>
+                <Button onClick={() => setConfirm("regenerate")}>Regenerate secret</Button>
               </>
             ) : (
-              <Button variant="primary" loading={create.isPending} onClick={() => create.mutate()}>
+              // Secondary, like every action inside a tab: the page's one primary is Update.
+              <Button loading={create.isPending} onClick={() => create.mutate()}>
                 Enable webhook
               </Button>
             )}

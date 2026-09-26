@@ -1,9 +1,10 @@
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { useId, useState } from "react";
 import type { SyntheticEvent } from "react";
 
 import { isApiError, request } from "../../api/client";
 import type { BodyOf } from "../../api/client";
+import { siteTemplatesQuery } from "../../api/queries/sites";
 import { ErrorBlock } from "../../components/page/QueryState";
 import { SegmentedControl } from "../../components/page/SegmentedControl";
 import { Button } from "../../components/ui/Button";
@@ -11,26 +12,45 @@ import { Checkbox } from "../../components/ui/Checkbox";
 import { Dialog } from "../../components/ui/Dialog";
 import { Field } from "../../components/ui/Field";
 import { Input } from "../../components/ui/Input";
+import { Skeleton } from "../../components/ui/Skeleton";
 import { cx } from "../../lib/cx";
 import { domainProblem, normalizeDomain } from "./names";
 
-type Template = "proxy" | "static";
 type WebServer = "nginx" | "apache";
 export type CreateSiteBody = BodyOf<"/api/sites", "post">;
 
-const TEMPLATES: readonly { value: Template; label: string; description: (domain: string) => string }[] = [
-  { value: "proxy", label: "Reverse proxy", description: () => "Passes every request to an app listening on a local port." },
-  {
-    value: "static",
+/**
+ * Copy for the templates WASM ships, keyed by name. `GET /api/sites/templates` is the source
+ * of truth for which templates exist; this only dresses up the ones it recognises. A template
+ * this machine offers but this map does not know yet still shows, titled from its own name.
+ */
+const TEMPLATE_COPY: Readonly<Record<string, { label: string; description: (domain: string) => string }>> = {
+  proxy: { label: "Reverse proxy", description: () => "Passes every request to an app listening on a local port." },
+  static: {
     label: "Static files",
     description: (domain) => `Serves the files in /var/www/apps/${domain || "<domain>"} as they are.`,
   },
-];
+  advanced: { label: "Advanced proxy", description: () => "A reverse proxy with rate limiting and security headers, for more than one upstream." },
+  monorepo: { label: "Monorepo", description: () => "One certificate for the domain and a subdomain per workspace, each routed to its own port." },
+};
+
+function templateLabel(name: string): string {
+  return TEMPLATE_COPY[name]?.label ?? (name.charAt(0).toUpperCase() + name.slice(1));
+}
+
+function templateDescription(name: string, domain: string): string {
+  return TEMPLATE_COPY[name]?.description(domain) ?? `Renders WASM's "${name}" template.`;
+}
+
+/** Every template but the static one names a port the request is proxied to. */
+function templateNeedsPort(name: string): boolean {
+  return name !== "static";
+}
 
 export interface CreateSiteForm {
   domain: string;
   webserver: WebServer;
-  template: Template;
+  template: string;
   port: string;
   ssl: boolean;
   enable: boolean;
@@ -45,7 +65,7 @@ export function createSiteBody(form: CreateSiteForm): { body: CreateSiteBody } |
   const problem = domainProblem(domain);
   if (problem !== null) errors.domain = problem;
   const port = Number(form.port);
-  if (form.template === "proxy" && (!/^\d+$/.test(form.port.trim()) || port < 1 || port > 65535)) {
+  if (templateNeedsPort(form.template) && (!/^\d+$/.test(form.port.trim()) || port < 1 || port > 65535)) {
     errors.port = "Enter the port the app listens on, between 1 and 65535.";
   }
   if (Object.keys(errors).length > 0) return { errors };
@@ -54,7 +74,7 @@ export function createSiteBody(form: CreateSiteForm): { body: CreateSiteBody } |
       domain,
       webserver: form.webserver,
       template: form.template,
-      port: form.template === "proxy" ? port : 3000,
+      port: templateNeedsPort(form.template) ? port : 3000,
       ssl: form.ssl,
       enable: form.enable,
     },
@@ -88,6 +108,16 @@ export function CreateSiteDialog({ open, onOpenChange, detected, onCreated }: Cr
   const formId = useId();
   const templateName = useId();
 
+  // Fetched only while the dialog is open: the list rarely changes, and a create dialog that
+  // is never opened should never be the reason this call went out.
+  const templates = useQuery({ ...siteTemplatesQuery(), enabled: open });
+  const available = templates.data?.templates ?? [];
+
+  // The initial guess ("proxy") holds until the real list answers; once it does, whatever the
+  // machine actually offers wins if that guess was wrong (a host with no "proxy" template, for
+  // instance), without ever storing a value the operator did not choose.
+  const template = available.length === 0 || available.includes(form.template) ? form.template : (available[0] ?? form.template);
+
   const create = useMutation({
     mutationFn: (body: CreateSiteBody) => request("post", "/api/sites", { body }),
     onSuccess: (result) => {
@@ -115,7 +145,7 @@ export function CreateSiteDialog({ open, onOpenChange, detected, onCreated }: Cr
 
   const submit = (event: SyntheticEvent<HTMLFormElement>): void => {
     event.preventDefault();
-    const result = createSiteBody(form);
+    const result = createSiteBody({ ...form, template });
     if ("errors" in result) {
       setErrors(result.errors);
       return;
@@ -138,7 +168,7 @@ export function CreateSiteDialog({ open, onOpenChange, detected, onCreated }: Cr
           <Button disabled={create.isPending} onClick={() => close(false)}>
             Cancel
           </Button>
-          <Button type="submit" form={formId} variant="primary" loading={create.isPending}>
+          <Button type="submit" form={formId} variant="primary" loading={create.isPending} disabled={available.length === 0}>
             {form.ssl ? "Create site and certificate" : "Create site"}
           </Button>
         </>
@@ -174,31 +204,42 @@ export function CreateSiteDialog({ open, onOpenChange, detected, onCreated }: Cr
         </div>
         <fieldset className="flex flex-col gap-2">
           <legend className="mb-1.5 text-13 font-medium text-fg">Template</legend>
-          <div className="grid gap-2 sm:grid-cols-2">
-            {TEMPLATES.map((template) => (
-              <label
-                key={template.value}
-                className={cx(
-                  "grid cursor-pointer grid-cols-[auto_minmax(0,1fr)] content-start items-start gap-x-2.5 gap-y-0.5 rounded-control border px-3 py-2.5",
-                  "has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-1 has-[:focus-visible]:outline-focus",
-                  form.template === template.value ? "border-accent bg-accent-soft" : "border-border hover:bg-surface-hover",
-                )}
-              >
-                <input
-                  type="radio"
-                  name={templateName}
-                  value={template.value}
-                  checked={form.template === template.value}
-                  onChange={() => set({ template: template.value })}
-                  className="row-span-2 mt-0.5 size-4 shrink-0 accent-accent"
-                />
-                <span className="text-13 font-medium text-fg">{template.label}</span>
-                <span className="col-start-2 text-12 text-pretty text-fg-muted">{template.description(domain)}</span>
-              </label>
-            ))}
-          </div>
+          {templates.isError && available.length === 0 ? (
+            <ErrorBlock compact error={templates.error} title="Could not list this machine's templates" onRetry={() => void templates.refetch()} retrying={templates.isRefetching} />
+          ) : available.length === 0 ? (
+            <div aria-hidden="true" className="grid gap-2 sm:grid-cols-2">
+              <Skeleton className="h-16 rounded-control" />
+              <Skeleton className="h-16 rounded-control" />
+            </div>
+          ) : (
+            <div className="grid gap-2 sm:grid-cols-2">
+              {available.map((name) => (
+                <label
+                  key={name}
+                  className={cx(
+                    "grid cursor-pointer grid-cols-[auto_minmax(0,1fr)] content-start items-start gap-x-2.5 gap-y-0.5 rounded-control border px-3 py-2.5",
+                    "has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-1 has-[:focus-visible]:outline-focus",
+                    template === name ? "border-accent bg-accent-soft" : "border-border hover:bg-surface-hover",
+                  )}
+                >
+                  <input
+                    type="radio"
+                    name={templateName}
+                    value={name}
+                    checked={template === name}
+                    onChange={() => set({ template: name })}
+                    className="row-span-2 mt-0.5 size-4 shrink-0 accent-accent"
+                  />
+                  <span translate="no" className="text-13 font-medium text-fg">
+                    {templateLabel(name)}
+                  </span>
+                  <span className="col-start-2 text-12 text-pretty text-fg-muted">{templateDescription(name, domain)}</span>
+                </label>
+              ))}
+            </div>
+          )}
         </fieldset>
-        {form.template === "proxy" ? (
+        {templateNeedsPort(template) ? (
           <Field label="Port" error={errors.port ?? server["port"]} description="Where the app listens on this machine." className="sm:max-w-40">
             <Input mono inputMode="numeric" value={form.port} onValueChange={(value: string) => set({ port: value })} />
           </Field>

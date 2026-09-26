@@ -84,15 +84,15 @@ describe("diffEnv", () => {
     ]);
     const diff = diffEnv(CLEAR, next);
     expect(diff.changes).toEqual([
-      { name: "PORT", kind: "added", before: null, after: "3000", readsBackAs: null },
-      { name: "NODE_ENV", kind: "removed", before: "production", after: null, readsBackAs: null },
+      { name: "PORT", kind: "added", before: null, after: "3000" },
+      { name: "NODE_ENV", kind: "removed", before: "production", after: null },
     ]);
     expect(diff.unchanged).toBe(2);
   });
 
-  it("warns about a value the unquoting writer cannot keep", () => {
+  it("keeps a value with surrounding spaces as it is: the writer quotes what needs it", () => {
     const diff = diffEnv(new Map(), new Map([["GREETING", "  hola  "]]));
-    expect(diff.changes[0]?.readsBackAs).toBe("hola");
+    expect(diff.changes[0]).toEqual({ name: "GREETING", kind: "added", before: null, after: "  hola  " });
   });
 });
 

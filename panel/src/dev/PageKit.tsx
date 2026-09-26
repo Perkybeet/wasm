@@ -146,6 +146,19 @@ const FAILURE = new ApiError(
   "Check that this machine can reach the internet on port 443, then try again.",
 );
 
+// A failure whose output is taller than the block: the output scrolls, and takes focus (named)
+// so a keyboard can scroll it too.
+const LONG_FAILURE = new ApiError(
+  422,
+  "configtesterror",
+  Array.from({ length: 14 }, (_, index) =>
+    index === 9
+      ? 'nginx: [emerg] unknown directive "proxy_passs" in /etc/nginx/sites-enabled/shop.arenna.dev:23'
+      : `nginx: [warn] the "listen ... http2" directive is deprecated, use the "http2" directive instead in /etc/nginx/sites-enabled/site-${String(index)}:4`,
+  ).join("\n") + "\nnginx: configuration file /etc/nginx/nginx.conf test failed",
+  "Fix the line nginx names, then save again. The file on disk is unchanged.",
+);
+
 function States() {
   const [shown, setShown] = useState<Shown>("loading");
   const query: QueryLike<string[]> = {
@@ -197,6 +210,7 @@ function States() {
             )}
           </QueryState>
           <ErrorBlock live compact error={FAILURE} title="Renewal of shop.arenna.dev failed" />
+          <ErrorBlock compact error={LONG_FAILURE} title="The configuration test failed" />
         </div>
       </Stage>
     </Section>

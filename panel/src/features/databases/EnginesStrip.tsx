@@ -41,7 +41,6 @@ function EngineTile({ engine }: { engine: Engine }) {
     actions = (
       <Button
         size="sm"
-        variant="primary"
         icon={<Download aria-hidden="true" />}
         loading={install.isPending}
         onClick={() =>
@@ -68,7 +67,7 @@ function EngineTile({ engine }: { engine: Engine }) {
     );
   } else {
     actions = (
-      <Button size="sm" variant="primary" icon={<Play aria-hidden="true" />} loading={start.isPending} onClick={() => start.mutate(engine.name)}>
+      <Button size="sm" icon={<Play aria-hidden="true" />} loading={start.isPending} onClick={() => start.mutate(engine.name)}>
         Start
       </Button>
     );

@@ -1,9 +1,9 @@
 /**
  * The time ranges of an app's charts, and what the charts say in words.
  *
- * The history endpoint reads three windows, matching the store's tiers: an hour of raw
- * samples, a day of minute means, thirty days of hour means. A week is the thirty-day read cut
- * to its last seven days: the same hour means, not a resampling and not an invention.
+ * The history endpoint reads each range as a window of its own, from the store's tiers: an hour
+ * of raw samples, a day of minute means, a week and a month of hour means. It says which in
+ * `resolution`, and the charts say it in words.
  */
 
 import type { MetricWindow } from "../../../api/queries/metrics";
@@ -23,7 +23,7 @@ export interface RangeSpec {
 const SPECS: Readonly<Record<MetricRange, RangeSpec>> = {
   "1h": { value: "1h", label: "1h", words: "Last hour", seconds: 3_600, window: "1h" },
   "24h": { value: "24h", label: "24h", words: "Last 24 hours", seconds: 86_400, window: "24h" },
-  "7d": { value: "7d", label: "7d", words: "Last 7 days", seconds: 7 * 86_400, window: "30d" },
+  "7d": { value: "7d", label: "7d", words: "Last 7 days", seconds: 7 * 86_400, window: "7d" },
   "30d": { value: "30d", label: "30d", words: "Last 30 days", seconds: 30 * 86_400, window: "30d" },
 };
 

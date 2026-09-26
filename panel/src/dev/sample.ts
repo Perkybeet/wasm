@@ -107,3 +107,18 @@ export function sampleMetrics(): { timestamps: number[]; cpu: number[]; memory: 
   }
   return { timestamps, cpu, memory };
 }
+
+/** Seven days of hourly samples, for the chart demo's adaptive date labels. */
+export function sampleWeekMetrics(): { timestamps: number[]; cpu: number[] } {
+  const end = Date.UTC(2026, 8, 25, 14, 0) / 1000;
+  const start = end - 7 * 86_400;
+  const timestamps: number[] = [];
+  const cpu: number[] = [];
+  for (let i = 0; i <= 7 * 24; i++) {
+    const t = start + i * 3_600;
+    timestamps.push(t);
+    const daily = Math.sin((t % 86_400) / 86_400 * 2 * Math.PI - Math.PI / 2) * 8;
+    cpu.push(Math.max(2, Math.round((20 + daily + Math.sin(i / 9) * 6) * 10) / 10));
+  }
+  return { timestamps, cpu };
+}

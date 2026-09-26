@@ -14,6 +14,8 @@ export type WebhookDeliveries = ResponseOf<"/api/apps/{domain}/webhook/deliverie
 export type WebhookDelivery = WebhookDeliveries["items"][number];
 export type Diagnosis = ResponseOf<"/api/apps/{domain}/diagnose", "get">;
 export type MigrationPlan = ResponseOf<"/api/apps/{domain}/migrate/plan", "get">;
+export type AppTypesResponse = ResponseOf<"/api/apps/types", "get">;
+export type AppTypeInfo = AppTypesResponse["types"][number];
 
 /**
  * Keys of the application queries. The list and each app are separate entries so that a
@@ -45,6 +47,18 @@ export const appQuery = (domain: string) =>
   queryOptions({
     queryKey: appKeys.detail(domain),
     queryFn: ({ signal }) => request("get", "/api/apps/{domain}", { params: { domain }, signal }),
+  });
+
+/**
+ * Every application type the deployer registry knows, most specific first and `auto` last -
+ * the new-app wizard's one source for what "Deploy as" may offer, instead of a list hand-kept
+ * in the console that a new deployer would never reach.
+ */
+export const appTypesQuery = () =>
+  queryOptions({
+    queryKey: ["app-types"] as const,
+    queryFn: ({ signal }) => request("get", "/api/apps/types", { signal }),
+    staleTime: 5 * 60_000,
   });
 
 /**

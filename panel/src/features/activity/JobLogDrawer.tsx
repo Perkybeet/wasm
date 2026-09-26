@@ -8,7 +8,7 @@ import { LogViewer } from "../../components/ui/LogViewer";
 import type { LogLine } from "../../components/ui/LogViewer";
 import { Skeleton } from "../../components/ui/Skeleton";
 import { DeployStatePill } from "../../components/page/AppStatePill";
-import { actionLabel, jobResource } from "./data";
+import { jobActionLabel, jobResource } from "./data";
 import type { ActivityJob } from "./data";
 import { jobLogQuery } from "./queries";
 
@@ -41,7 +41,7 @@ export function JobLogDrawer({ job, onOpenChange }: JobLogDrawerProps) {
         job ? (
           <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
             <DeployStatePill status={job.status} appearance="inline" size="sm" />
-            <span>{actionLabel(job.type)}</span>
+            <span>{jobActionLabel(job.type)}</span>
             {resource ? <span translate="no" className="mono">{resource}</span> : null}
             <RelativeTime value={job.started_at ?? job.created_at} />
           </span>

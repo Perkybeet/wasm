@@ -1,7 +1,7 @@
 /**
  * Reading a web server's refusal: the backend answers a configuration test that failed with
- * a 400 whose `detail` says which server refused it and whose `hint` carries the server's
- * own output, verbatim (`ValidationError.details`). Pure.
+ * a 400 whose `detail` says which server refused it and whose `output` carries the server's
+ * own output, verbatim (`ValidationError.output`). Pure.
  */
 
 import { isApiError } from "../../api/client";
@@ -32,7 +32,7 @@ export function failingLine(output: string): number | null {
 /** The web server's refusal in an API error, or null for any other failure. */
 export function configRejection(error: unknown): ConfigRejection | null {
   if (!isApiError(error) || error.status !== 400 || error.error !== "validationerror") return null;
-  const output = error.hint ?? "";
+  const output = error.output ?? "";
   return { summary: error.detail, output, line: failingLine(output) };
 }
 

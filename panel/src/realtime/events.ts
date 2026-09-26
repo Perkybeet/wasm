@@ -240,13 +240,23 @@ export function useServerEvents(connect?: (url: string) => EventSourceLike): voi
   const connectRef = useRef(connect);
 
   useEffect(() => {
+    // Whatever happened while the stream was down (a job ending, an app failing) was said on
+    // a connection nobody held: once it is back, everything on screen is read again.
+    let dropped = false;
     const stream = new EventStream({
       ...(connectRef.current ? { connect: connectRef.current } : {}),
       onEvent: (name, data) => {
         applyServerEvent(queryClient, name, data);
         publish(name, data);
       },
-      onStatus: setStreamStatus,
+      onStatus: (status) => {
+        setStreamStatus(status);
+        if (status === "reconnecting") dropped = true;
+        else if (status === "live" && dropped) {
+          dropped = false;
+          void queryClient.invalidateQueries();
+        }
+      },
       onDrop: () => {
         // The stream cannot tell a restarting panel from an expired session. The session
         // endpoint can: it answers 200 either way, saying which.

@@ -7,7 +7,7 @@
 
 import type { Page } from "@playwright/test";
 
-import { expect, expectNoA11yViolations, settle, signIn, test, totpCode } from "./fixtures";
+import { expect, expectNoA11yViolations, settle, signIn, stillness, test, totpCode } from "./fixtures";
 import type { ConsoleServer } from "./fixtures";
 import { wizardSource } from "./wizard-sources";
 
@@ -49,16 +49,6 @@ async function forgetApp(page: Page, server: ConsoleServer, domain: string): Pro
   await expect.poll(async () => (await page.request.get(`/api/apps/${domain}`)).status(), { timeout: 60_000 }).toBe(404);
 }
 
-/** Waits for every finite animation to end, so axe never measures a colour mid-transition. */
-async function stillness(page: Page): Promise<void> {
-  await page.waitForFunction(() =>
-    document.getAnimations().every((animation) => {
-      const iterations = animation.effect?.getComputedTiming().iterations;
-      return animation.playState !== "running" || iterations === Infinity;
-    }),
-  );
-}
-
 async function inspect(page: Page, source: string): Promise<void> {
   await page.getByLabel("Repository or directory").fill(source);
   await page.getByRole("button", { name: "Inspect source" }).click();
@@ -92,6 +82,8 @@ test("inspects a directory on the server, deploys it and lands on its deployment
   await expect(page.getByLabel(/^LOG_LEVEL/)).toHaveValue("info");
   await expect(page.getByLabel(/^NEXTAUTH_SECRET/)).toHaveAttribute("type", "password");
   await page.getByLabel("Domain", { exact: true }).fill(domain);
+  // Checked as it is typed: qrboda.com is a seeded zone, so this name resolves here.
+  await expect(page.getByText(`${domain} points here`)).toBeVisible();
   await page.getByLabel(/^DATABASE_URL/).fill("postgres://storefront@localhost/storefront");
   for (const name of ["NEXTAUTH_SECRET", "STRIPE_SECRET_KEY", "SMTP_PASSWORD"]) {
     await page.getByRole("button", { name: `Generate ${name}` }).click();
@@ -142,14 +134,76 @@ test("a taken domain and the variables without a default keep the operator on Re
 });
 
 test("a directory that does not exist is refused on its field, in the server's words", async ({ page, consoleServer, problems }) => {
-  // The API answers an unfetchable source with a 500 (SourceError has no status of its own),
-  // which Chromium logs as a failed resource.
-  problems.expect(/status of 500 .* \/api\/apps\/inspect$/);
+  // SourceError now answers 400, in the API's error contract, not the unqualified 500 an
+  // earlier build gave it - Chromium still logs the failed resource either way.
+  problems.expect(/status of 400 .* \/api\/apps\/inspect$/);
   await signIn(page, consoleServer, "/apps/new");
   await page.getByLabel("Repository or directory").fill("/var/www/src/does-not-exist");
+  const inspected = page.waitForResponse((response) => response.url().endsWith("/api/apps/inspect"));
   await page.getByRole("button", { name: "Inspect source" }).click();
+  expect((await inspected).status()).toBe(400);
   await expect(page.getByText("Source path does not exist: /var/www/src/does-not-exist")).toBeVisible();
   await expect(page.getByLabel("Repository or directory")).toHaveAttribute("aria-invalid", "true");
   await settle(page);
   await expectNoA11yViolations(page, "a refused source");
+});
+
+test("the type select lists every type the deployer registry knows, not a hand-kept copy", async ({ page, consoleServer }) => {
+  await signIn(page, consoleServer, "/apps/new");
+  await inspect(page, await wizardSource(page, "storefront"));
+  await page.getByRole("combobox", { name: "Deploy as" }).click();
+  // Detected first, the closest match on top.
+  const options = page.getByRole("listbox").getByRole("option");
+  await expect(options.first()).toHaveText(/Next\.js/);
+  // auto is real, registered type this build did not have a hand-kept label for before.
+  await expect(page.getByRole("option", { name: "Auto-detect" })).toBeVisible();
+  await expect(page.getByRole("option", { name: "Docker Compose" })).toBeVisible();
+  await page.keyboard.press("Escape");
+});
+
+test("a domain that resolves elsewhere warns instead of blocking the deploy", async ({ page, consoleServer }) => {
+  await signIn(page, consoleServer, "/apps/new");
+  await inspect(page, await wizardSource(page, "storefront"));
+  // old.qrboda.com is modelled as pointing at another server.
+  await page.getByLabel("Domain", { exact: true }).fill("old.qrboda.com");
+  await expect(page.getByText("old.qrboda.com points somewhere else")).toBeVisible();
+  await page.getByLabel(/^DATABASE_URL/).fill("x");
+  for (const name of ["NEXTAUTH_SECRET", "STRIPE_SECRET_KEY", "SMTP_PASSWORD"]) {
+    await page.getByRole("button", { name: `Generate ${name}` }).click();
+  }
+  await settle(page);
+  await expectNoA11yViolations(page, "a domain that resolves elsewhere");
+  await page.getByRole("button", { name: "Continue" }).click();
+  await expect(page.getByRole("heading", { level: 2, name: "Deploy" })).toBeFocused();
+});
+
+test("also serving www and resource limits reach the deploy request", async ({ page, consoleServer }) => {
+  test.setTimeout(120_000);
+  // A bare two-label domain outside any seeded zone: www only ever means something for one of
+  // these, and this one deliberately has no DNS record, which is not a reason to refuse it.
+  const domain = "wasm-e2e-wizard.example";
+  await signIn(page, consoleServer, "/apps/new");
+  await inspect(page, await wizardSource(page, "landing"));
+  await page.getByLabel("Domain", { exact: true }).fill(domain);
+  await expect(page.getByText(`${domain} has no DNS record yet`)).toBeVisible();
+  await page.getByRole("checkbox", { name: "Also serve www" }).check();
+  // The static source has no port and no environment; HTTPS is turned off so the deploy does
+  // not also wait on a certificate order that a domain with no DNS record cannot complete.
+  await page.getByRole("checkbox", { name: "Serve it over HTTPS" }).uncheck();
+  await page.getByText("Resource limits").click();
+  const limits = page.getByText("Resource limits").locator("xpath=ancestor::details");
+  await limits.getByLabel("Memory").fill("256");
+  await limits.getByLabel("Tasks").fill("64");
+  await settle(page);
+  await expectNoA11yViolations(page, "www and resource limits on the review step");
+
+  await page.getByRole("button", { name: "Continue" }).click();
+  await expect(page.getByRole("heading", { level: 2, name: "Deploy" })).toBeFocused();
+
+  const queued = page.waitForRequest((request) => request.url().endsWith("/api/apps") && request.method() === "POST");
+  await page.getByRole("button", { name: `Deploy ${domain}` }).click();
+  const body = (await queued).postDataJSON() as Record<string, unknown>;
+  expect(body).toMatchObject({ domain, ssl: false, include_www: true, memory_max_mb: 256, cpu_quota_percent: null, tasks_max: 64 });
+
+  await forgetApp(page, consoleServer, domain);
 });

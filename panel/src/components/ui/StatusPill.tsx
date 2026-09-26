@@ -2,9 +2,9 @@ import { useState } from "react";
 
 import { cx } from "../../lib/cx";
 
-export type Status = "running" | "deploying" | "failed" | "stopped" | "static" | "unknown";
+export type Status = "running" | "deploying" | "warning" | "failed" | "stopped" | "static" | "unknown";
 
-type Glyph = "dot" | "arc" | "cross" | "ring" | "square" | "question";
+type Glyph = "dot" | "arc" | "triangle" | "cross" | "ring" | "square" | "question";
 type Tone = "ok" | "warn" | "fail" | "idle";
 
 interface StatusSpec {
@@ -20,13 +20,16 @@ interface StatusSpec {
 export const STATUS: Record<Status, StatusSpec> = {
   running: { label: "Running", tone: "ok", glyph: "dot" },
   deploying: { label: "Deploying", tone: "warn", glyph: "arc" },
+  // Amber like work in progress, but still: something to look at (an expiring certificate, a
+  // health check that warns), which a spinning arc would misread as "busy".
+  warning: { label: "Warning", tone: "warn", glyph: "triangle" },
   failed: { label: "Failed", tone: "fail", glyph: "cross" },
   stopped: { label: "Stopped", tone: "idle", glyph: "ring" },
   static: { label: "Static", tone: "ok", glyph: "square" },
   unknown: { label: "Unknown", tone: "idle", glyph: "question" },
 };
 
-const TONE_TEXT: Record<Tone, string> = {
+export const TONE_TEXT: Record<Tone, string> = {
   ok: "text-ok",
   warn: "text-warn",
   fail: "text-fail",
@@ -39,6 +42,11 @@ const TONE_SOFT: Record<Tone, string> = {
   fail: "bg-fail-soft",
   idle: "bg-idle-soft",
 };
+
+/** The text colour of a state, for a glyph or word drawn outside a pill. */
+export function stateTextClass(state: Status): string {
+  return TONE_TEXT[STATUS[state].tone];
+}
 
 /** The glyph alone, for places that already print the state as text nearby. */
 export function StatusGlyph({ state, size = 12, className }: { state: Status; size?: number; className?: string }) {
@@ -58,6 +66,13 @@ export function StatusGlyph({ state, size = 12, className }: { state: Status; si
       {glyph === "square" && <rect x="2.75" y="2.75" width="6.5" height="6.5" rx="1" fill="currentColor" />}
       {glyph === "arc" && (
         <path d="M6 2.25A3.75 3.75 0 1 1 2.25 6" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+      )}
+      {glyph === "triangle" && (
+        <>
+          <path d="M6 1.9 10.6 10H1.4Z" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
+          <path d="M6 5.1v2" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+          <circle cx="6" cy="8.55" r="0.7" fill="currentColor" />
+        </>
       )}
       {glyph === "cross" && (
         <path d="M3.25 3.25l5.5 5.5M8.75 3.25l-5.5 5.5" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" />

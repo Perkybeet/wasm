@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 
 import { cx } from "../../lib/cx";
 import { buttonClassName } from "./Button";
+import { SystemOutput } from "./SystemOutput";
 import type { ToastData, ToastKind } from "./toast";
 import { isUrgent, toastManager } from "./toast";
 
@@ -47,9 +48,9 @@ function ToastList({ urgent }: { urgent: boolean }) {
               <Toast.Title render={<div />} className="text-13 font-semibold text-fg" />
               <Toast.Description className="text-13 text-fg-muted" />
               {item.data?.detail !== undefined ? (
-                <pre className="mt-1.5 max-h-28 overflow-auto rounded-control bg-bg-sunken px-2 py-1.5 text-12 whitespace-pre-wrap text-fg scroll-thin">
+                <SystemOutput label="What the system said" maxHeight="max-h-28" className="mt-1.5 rounded-control bg-bg-sunken px-2 py-1.5">
                   {item.data.detail}
-                </pre>
+                </SystemOutput>
               ) : null}
               {item.actionProps ? <Toast.Action className={buttonClassName("secondary", "sm", "mt-2 self-start")} /> : null}
             </div>

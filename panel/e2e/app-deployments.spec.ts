@@ -11,7 +11,7 @@
 
 import type { Page } from "@playwright/test";
 
-import { expect, expectNoA11yViolations, settle, signIn, test } from "./fixtures";
+import { expect, expectNoA11yViolations, settle, signIn, stillness, test } from "./fixtures";
 
 const RELEASES_APP = "tienda.cittek.es";
 const LIVE_APP = "pedidos.cittek.es";
@@ -20,6 +20,7 @@ interface Row {
   id: number;
   status: string;
   error: string | null;
+  commit_message: string | null;
 }
 
 async function deployment(page: Page, domain: string, pick: (row: Row) => boolean): Promise<number> {
@@ -28,19 +29,6 @@ async function deployment(page: Page, domain: string, pick: (row: Row) => boolea
   const row = body.items.find(pick);
   if (!row) throw new Error(`no seeded deployment of ${domain} matches`);
   return row.id;
-}
-
-/**
- * Waits for every finite animation to end. A state change pulses the pill's opacity once, and
- * axe measuring contrast mid-pulse reports a colour that is on screen for a few frames.
- */
-async function stillness(page: Page): Promise<void> {
-  await page.waitForFunction(() =>
-    document.getAnimations().every((animation) => {
-      const iterations = animation.effect?.getComputedTiming().iterations;
-      return animation.playState !== "running" || iterations === Infinity;
-    }),
-  );
 }
 
 /** Dismisses the toasts a job's end raises, which axe would judge instead of the page. */
@@ -77,6 +65,17 @@ test("the history pages by keyset, links each deploy to its page, and passes axe
 
   await first.click();
   await expect(page.getByRole("heading", { level: 2, name: /^Deployment \d+$/ })).toBeVisible();
+});
+
+test("the table shows each deploy's commit message beside its hash", async ({ page, consoleServer }) => {
+  await signIn(page, consoleServer, `/apps/${RELEASES_APP}/deployments`);
+  const response = await page.request.get(`/api/deployments?domain=${RELEASES_APP}&limit=50`);
+  const body = (await response.json()) as { items: Row[] };
+  const row = body.items.find((item) => item.commit_message !== null);
+  if (!row?.commit_message) throw new Error(`no seeded deployment of ${RELEASES_APP} has a commit message`);
+  const table = page.getByRole("region", { name: `Deploys of ${RELEASES_APP}, newest first` });
+  // Truncated in the table, but the full subject line is there on hover, in the title attribute.
+  await expect(table.getByTitle(row.commit_message)).toBeVisible();
 });
 
 test("a failed deploy says where it stopped, the fix above and the error verbatim", async ({ page, consoleServer }) => {

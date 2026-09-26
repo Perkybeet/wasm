@@ -7,6 +7,7 @@ import type { ReactNode } from "react";
 import { appsQuery } from "../../api/queries/apps";
 import { certsQuery } from "../../api/queries/certs";
 import { observationsQuery } from "../../api/queries/monitor";
+import { servicesQuery } from "../../api/queries/services";
 import { machineQuery } from "../../api/queries/system";
 import { ErrorBlock } from "../../components/page/QueryState";
 import { RelativeTime } from "../../components/page/RelativeTime";
@@ -25,11 +26,7 @@ const LINK =
   "rounded-[4px] font-medium text-accent-fg hover:underline hover:underline-offset-2 focus-visible:outline-2 focus-visible:outline-focus";
 
 function SeverityGlyph({ severity }: { severity: Severity }) {
-  return severity === "fail" ? (
-    <StatusGlyph state="failed" size={14} className="text-fail" />
-  ) : (
-    <TriangleAlert aria-hidden="true" className="size-3.5 shrink-0 text-warn" />
-  );
+  return <StatusGlyph state={severity === "fail" ? "failed" : "warning"} size={14} className={severity === "fail" ? "text-fail" : "text-warn"} />;
 }
 
 /** The page the item's title opens: the app, or the page that owns what it is about. */
@@ -54,6 +51,12 @@ function SubjectLink({ item }: { item: AttentionItem }) {
       return (
         <Link to="/services" className={className}>
           {item.title}
+        </Link>
+      );
+    case "unit":
+      return (
+        <Link to="/services/$name" params={{ name: item.subject.name }} className={cx(className, "mono text-13")}>
+          {label}
         </Link>
       );
     case "monitor":
@@ -174,6 +177,7 @@ export function NeedsAttention() {
   const certs = useQuery(certsQuery());
   const observations = useQuery(observationsQuery(false));
   const machine = useQuery(machineQuery());
+  const units = useQuery(servicesQuery());
 
   const items = useMemo(
     () =>
@@ -183,8 +187,9 @@ export function NeedsAttention() {
         certificates: certs.data?.certificates,
         observations: observations.data?.observations,
         machine: machine.data,
+        units: units.data?.services,
       }),
-    [apps.data, deploys.data, certs.data, observations.data, machine.data],
+    [apps.data, deploys.data, certs.data, observations.data, machine.data, units.data],
   );
 
   const loading = apps.isPending || deploys.isPending;

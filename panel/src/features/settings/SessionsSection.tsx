@@ -1,7 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { LogOut } from "lucide-react";
+import { useState } from "react";
 
-import { authKeys, revokeSession, sessionsQuery } from "../../api/queries/auth";
+import { isApiError } from "../../api/client";
+import { authKeys, revokeOtherSessions, revokeSession, sessionsQuery } from "../../api/queries/auth";
 import type { ActiveSession } from "../../api/queries/auth";
 import { QueryState } from "../../components/page/QueryState";
 import { RelativeTime } from "../../components/page/RelativeTime";
@@ -9,27 +11,21 @@ import { Badge } from "../../components/ui/Badge";
 import { Button } from "../../components/ui/Button";
 import { DataTable } from "../../components/ui/DataTable";
 import type { Column } from "../../components/ui/DataTable";
+import { Dialog } from "../../components/ui/Dialog";
+import { SystemOutput } from "../../components/ui/SystemOutput";
 import { toast } from "../../components/ui/toast";
 import { reportActionError } from "../apps/useAppActions";
 import { RowAction } from "./RowAction";
 import { SettingsSection } from "./SettingsForm";
 
-/** Signs out the given sessions one by one: the per-session endpoint is the one chokepoint. */
-async function revokeEach(prefixes: readonly string[]): Promise<{ revoked: number; failed: unknown }> {
-  let revoked = 0;
-  for (const prefix of prefixes) {
-    try {
-      await revokeSession(prefix);
-      revoked += 1;
-    } catch (error: unknown) {
-      return { revoked, failed: error };
-    }
-  }
-  return { revoked, failed: null };
-}
-
 function plural(count: number, one: string, many: string): string {
   return `${String(count)} ${count === 1 ? one : many}`;
+}
+
+/** How many sessions the server reports revoked, from `POST /api/auth/sessions/revoke-others`'s own words. */
+function countRevoked(message: string): number | null {
+  const match = /(\d+)/.exec(message);
+  return match ? Number(match[1]) : null;
 }
 
 /** Everyone signed in to this console right now, and signing them out. */
@@ -53,17 +49,37 @@ export function SessionsSection() {
   });
 
   const others = (query.data?.sessions ?? []).filter((session) => !session.is_current);
+  const [confirming, setConfirming] = useState(false);
+  const [failure, setFailure] = useState<{ hint: string; detail: string } | null>(null);
+
   const revokeOthers = useMutation({
-    mutationFn: () => revokeEach(others.map((session) => session.sid_prefix)),
-    onSuccess: ({ revoked, failed }) => {
+    mutationFn: revokeOtherSessions,
+    onSuccess: (result) => {
       refresh();
-      if (failed !== null) {
-        reportActionError(`Signed out ${plural(revoked, "session", "sessions")}, then stopped`, failed);
+      setConfirming(false);
+      const count = countRevoked(result.message);
+      toast.success(count === null ? result.message : `Signed out ${plural(count, "other session", "other sessions")}`);
+    },
+    onError: (error: unknown) => {
+      // The one credential this cannot apply to: a Bearer or the master token, which never
+      // had a browser tab of its own. The backend answers a bare 400 with no hint of its own.
+      if (isApiError(error) && error.status === 400) {
+        setFailure({
+          hint: "This console is signed in with an API token, not a browser session. Sign in through the browser to use this.",
+          detail: error.detail,
+        });
         return;
       }
-      toast.success(`Signed out ${plural(revoked, "other session", "other sessions")}`);
+      setConfirming(false);
+      reportActionError("Could not sign out other sessions", error);
     },
   });
+
+  const closeConfirm = (next: boolean): void => {
+    if (!next && revokeOthers.isPending) return;
+    setConfirming(next);
+    if (!next) setFailure(null);
+  };
 
   const columns: Column<ActiveSession>[] = [
     {
@@ -143,15 +159,47 @@ export function SessionsSection() {
             <Button
               icon={<LogOut aria-hidden="true" />}
               disabled={others.length === 0}
-              loading={revokeOthers.isPending}
               onClick={() => {
-                revokeOthers.mutate();
+                setFailure(null);
+                setConfirming(true);
               }}
             >
               Sign out other sessions
             </Button>
           </div>
         ) : null}
+        <Dialog
+          open={confirming}
+          onOpenChange={closeConfirm}
+          size="sm"
+          title="Sign out other sessions?"
+          description={`Ends every session but this one${others.length > 0 ? ` — ${plural(others.length, "session", "sessions")}` : ""}. Anyone using them will need to sign in again.`}
+          footer={
+            <>
+              <Button disabled={revokeOthers.isPending} onClick={() => closeConfirm(false)}>
+                Cancel
+              </Button>
+              <Button
+                variant="primary"
+                loading={revokeOthers.isPending}
+                onClick={() => {
+                  revokeOthers.mutate();
+                }}
+              >
+                Sign out other sessions
+              </Button>
+            </>
+          }
+        >
+          {failure !== null ? (
+            <div role="alert" className="flex flex-col gap-2 rounded-control border border-fail/30 bg-fail-soft p-3">
+              <p className="text-13 font-medium text-fail">{failure.hint}</p>
+              <SystemOutput label="What the server said" maxHeight="max-h-40">
+                {failure.detail}
+              </SystemOutput>
+            </div>
+          ) : undefined}
+        </Dialog>
       </div>
     </SettingsSection>
   );

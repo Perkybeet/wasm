@@ -145,11 +145,47 @@ describe("Settings > Security", () => {
     expect(backend.callsTo("POST /api/auth/elevate")[0]?.body).toEqual({ code: "654321" });
   });
 
+  it("replaces the backup codes after asking, confirming it's you, and shows the new set once", { timeout: 20_000 }, async () => {
+    const NEW_CODES = CODES.map((code) => code.split("").reverse().join(""));
+    let elevated = false;
+    const backend = fakeBackend(
+      securityRoutes({ enabled: true }, {
+        "POST /api/auth/2fa/backup-codes": () => {
+          if (!elevated) return problem(403, "elevation_required", "Confirm it's you to continue.");
+          return json(200, { success: true, backup_codes: NEW_CODES });
+        },
+        "POST /api/auth/elevate": () => {
+          elevated = true;
+          return json(200, { elevated_until: new Date(Date.now() + 600_000).toISOString() });
+        },
+      }),
+    );
+    const { user } = renderConsole("/settings/security");
+    await user.click(await screen.findByRole("button", { name: "New backup codes" }));
+    const ask = await screen.findByRole("dialog", { name: "Replace your backup codes?" });
+    expect(ask).toHaveAccessibleDescription(/old ones stop working/);
+    await user.click(within(ask).getByRole("button", { name: "Replace backup codes" }));
+
+    const confirm = await screen.findByRole("dialog", { name: "Confirm it's you" });
+    await user.type(within(confirm).getByLabelText("Authentication code"), "654321");
+    await user.click(within(confirm).getByRole("button", { name: "Confirm" }));
+
+    const shown = await screen.findByRole("dialog", { name: "Save your backup codes" });
+    const list = within(shown).getByRole("list", { name: "Backup codes" });
+    expect(within(list).getAllByRole("listitem").map((item) => item.textContent)).toEqual(NEW_CODES);
+    // Done waits for the box: closing now would lose the only copy.
+    expect(within(shown).getByRole("button", { name: "Done" })).toBeDisabled();
+    await user.click(within(shown).getByRole("checkbox", { name: "I have saved these codes somewhere safe" }));
+    await user.click(within(shown).getByRole("button", { name: "Done" }));
+    await expectToast("Replaced the backup codes");
+    expect(backend.callsTo("POST /api/auth/2fa/backup-codes")).toHaveLength(2);
+  });
+
   it("lists the sessions with this browser marked, and signs the others out", { timeout: 20_000 }, async () => {
     const backend = fakeBackend(
       securityRoutes({ enabled: true }, {
         "DELETE /api/auth/sessions/a1b2c3d4": () => json(200, { success: true, revoked: "a1b2c3d4" }),
-        "DELETE /api/auth/sessions/e5f6a7b8": () => json(200, { success: true, revoked: "e5f6a7b8" }),
+        "POST /api/auth/sessions/revoke-others": () => json(200, { success: true, message: "Revoked 1 other session(s)" }),
       }),
     );
     const { user, container } = renderConsole("/settings/security");
@@ -164,12 +200,35 @@ describe("Settings > Security", () => {
     await expectToast("Signed out session a1b2c3d4");
 
     await user.click(screen.getByRole("button", { name: "Sign out other sessions" }));
-    await expectToast("Signed out 2 other sessions");
+    const dialog = await screen.findByRole("dialog", { name: "Sign out other sessions?" });
+    await expectNoAxeViolations(dialog);
+    await user.click(within(dialog).getByRole("button", { name: "Sign out other sessions" }));
+    await expectToast("Signed out 1 other session");
+    expect(screen.queryByRole("dialog", { name: "Sign out other sessions?" })).not.toBeInTheDocument();
     expect(backend.calls.filter((call) => call.method === "DELETE").map((call) => call.path)).toEqual([
       "/api/auth/sessions/a1b2c3d4",
-      "/api/auth/sessions/a1b2c3d4",
-      "/api/auth/sessions/e5f6a7b8",
     ]);
+    expect(backend.callsTo("POST /api/auth/sessions/revoke-others")).toHaveLength(1);
+  });
+
+  it("shows a token credential's refusal to sign out other sessions, verbatim with a hint", async () => {
+    fakeBackend(
+      securityRoutes({ enabled: true }, {
+        "POST /api/auth/sessions/revoke-others": () =>
+          problem(400, "validation_error", "This credential is not a browser session; there is no other session to leave signed in."),
+      }),
+    );
+    const { user } = renderConsole("/settings/security");
+    await user.click(await screen.findByRole("button", { name: "Sign out other sessions" }));
+    const dialog = await screen.findByRole("dialog", { name: "Sign out other sessions?" });
+    await user.click(within(dialog).getByRole("button", { name: "Sign out other sessions" }));
+
+    expect(
+      await within(dialog).findByText("This credential is not a browser session; there is no other session to leave signed in."),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText(/Sign in through the browser/)).toBeInTheDocument();
+    // The dialog stays open: nothing was signed out, so there is nothing to dismiss it for.
+    expect(screen.getByRole("dialog", { name: "Sign out other sessions?" })).toBeInTheDocument();
   });
 
   it("states the lockout policy as configured", async () => {

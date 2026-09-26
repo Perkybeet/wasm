@@ -87,8 +87,9 @@ export function deployStatus(status: string | null | undefined): StatusView {
 export const STATE_RANK: Readonly<Record<Status, number>> = {
   failed: 0,
   unknown: 1,
-  deploying: 2,
-  running: 3,
-  static: 4,
-  stopped: 5,
+  warning: 2,
+  deploying: 3,
+  running: 4,
+  static: 5,
+  stopped: 6,
 };

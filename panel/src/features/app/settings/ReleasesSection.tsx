@@ -8,7 +8,6 @@ import { ElevationCancelledError } from "../../../api/errors";
 import { appKeys, migrationPlanQuery, releasesQuery } from "../../../api/queries/apps";
 import type { App, MigrationPlan } from "../../../api/queries/apps";
 import type { ResponseOf } from "../../../api/client";
-import { announce } from "../../../app/Announcer";
 import { CommandHint } from "../../../components/page/CommandHint";
 import { KeyValueList, KeyValueListSkeleton } from "../../../components/page/KeyValueList";
 import { ErrorBlock } from "../../../components/page/QueryState";
@@ -26,8 +25,8 @@ import { LINK, PANEL } from "./panel";
 
 type MigrationResult = ResponseOf<"/api/apps/{domain}/migrate", "post">;
 
-/** What the app has on the release layout: the release serving, how many are on disk. */
-function ReleasesFacts({ domain }: { domain: string }) {
+/** What the app has on the release layout: the release serving, how many are on disk, how many are kept. */
+function ReleasesFacts({ domain, keepReleases }: { domain: string; keepReleases: number }) {
   const releases = useQuery(releasesQuery(domain));
   if (releases.isPending) return <KeyValueListSkeleton rows={4} />;
   if (releases.isError) {
@@ -64,10 +63,10 @@ function ReleasesFacts({ domain }: { domain: string }) {
         },
         {
           label: "Kept",
-          value: "Not reported",
+          value: `${formatCount(keepReleases)} ${keepReleases === 1 ? "release" : "releases"}`,
           mono: false,
           copy: false,
-          hint: "WASM keeps the newest 5 releases unless this app was set to keep another number",
+          hint: "Older releases are removed once a new one activates",
         },
       ]}
     />
@@ -140,7 +139,7 @@ function MigrationCard({ app, onMigrated }: { app: App; onMigrated: (result: Mig
       void queryClient.invalidateQueries({ queryKey: appKeys.releases(domain) });
       void queryClient.invalidateQueries({ queryKey: appKeys.rollbackPoints(domain) });
       void queryClient.invalidateQueries({ queryKey: appKeys.list, exact: true });
-      announce(`${domain} migrated to releases`);
+      // The toast is announced; saying it again would read it twice.
       toast.success(`Migrated ${domain} to releases`);
     },
   });
@@ -263,7 +262,7 @@ export function ReleasesSection({ app }: { app: App }) {
       <div className={PANEL}>
         {onReleases ? (
           <div className="px-4 py-1">
-            <ReleasesFacts domain={app.domain} />
+            <ReleasesFacts domain={app.domain} keepReleases={app.keep_releases} />
           </div>
         ) : (
           <MigrationCard app={app} onMigrated={setMigrated} />

@@ -6,14 +6,8 @@
  * of the `problems` fixture; each test that changes the page checks axe once.
  */
 
-import type { Page } from "@playwright/test";
 
-import { expect, expectNoA11yViolations, settle, signIn, test, totpCode } from "./fixtures";
-
-/** The visible toast queue, scoped so it never collides with the page's own aria-live echo. */
-function toasts(page: Page) {
-  return page.getByRole("region", { name: "Notifications" });
-}
+import { expect, expectNoA11yViolations, settle, signIn, test, toasts, totpCode } from "./fixtures";
 
 test("engines, databases and users are listed, and the page passes axe", async ({ page, consoleServer }) => {
   await signIn(page, consoleServer, "/databases");
@@ -94,9 +88,12 @@ test("a read query against the SQL console renders as a grid", async ({ page, co
   const body = (await response.json()) as { mode: string };
   expect(body.mode).toBe("read");
 
-  await expect(console_.getByText(/^3 rows/)).toBeVisible();
+  await expect(console_.getByText(/^3 rows in \d/)).toBeVisible();
+  await expect(console_.getByRole("columnheader", { name: "email" })).toBeVisible();
   await expect(console_.getByRole("cell", { name: "maria@example.com" })).toBeVisible();
   await expect(console_.getByRole("cell", { name: "129.90" })).toBeVisible();
+  // The grid scrolls horizontally under its own name, reachable without a mouse.
+  await expect(console_.getByRole("region", { name: "Query result" })).toHaveAttribute("tabindex", "0");
 
   await settle(page);
   await expectNoA11yViolations(page, "the SQL console with results");
@@ -124,4 +121,44 @@ test("write mode asks the operator to confirm it's them before it runs", async (
   expect((await retried).status()).toBe(200);
   await expect(elevate).not.toBeVisible();
   await expect(console_.getByText("The statement returned no rows.")).toBeVisible();
+});
+
+test("the grant dialog offers the engine's own privileges, not a fixed list", async ({ page, consoleServer }) => {
+  await signIn(page, consoleServer, "/databases");
+
+  const users = page.getByRole("region", { name: "Users" });
+  // Explicit, rather than relying on which engine the panel selects by default.
+  await users.getByRole("combobox", { name: "Engine" }).click();
+  await page.getByRole("option", { name: "PostgreSQL" }).click();
+
+  await users.getByRole("button", { name: "Actions for wasm_app" }).click();
+  await page.getByRole("menuitem", { name: "Grant privileges" }).click();
+  const dialog = page.getByRole("dialog", { name: "Grant privileges to wasm_app" });
+
+  // PostgreSQL's own whitelist (wasm.managers.database.postgres.PostgresManager.VALID_PRIVILEGES),
+  // read from the server rather than kept as a copy in the console.
+  await expect(dialog.getByRole("checkbox", { name: "SELECT" })).toBeVisible();
+  await expect(dialog.getByRole("checkbox", { name: "ALL PRIVILEGES" })).toBeVisible();
+  // MySQL-only privileges must not leak into PostgreSQL's list.
+  await expect(dialog.getByRole("checkbox", { name: "LOCK TABLES" })).toHaveCount(0);
+
+  await settle(page);
+  await expectNoA11yViolations(page, "the grant dialog");
+
+  await dialog.getByRole("combobox", { name: "Database" }).click();
+  await page.getByRole("option", { name: "arennalabs_production" }).click();
+  await dialog.getByRole("checkbox", { name: "SELECT" }).click();
+
+  const granted = page.waitForRequest(
+    (request) => request.url().endsWith("/api/databases/users/grant") && request.method() === "POST",
+  );
+  await dialog.getByRole("button", { name: "Grant" }).click();
+  expect((await granted).postDataJSON()).toEqual({
+    engine: "postgresql",
+    username: "wasm_app",
+    database: "arennalabs_production",
+    host: "localhost",
+    privileges: ["SELECT"],
+  });
+  await expect(dialog).not.toBeVisible();
 });

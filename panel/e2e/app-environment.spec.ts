@@ -15,7 +15,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 
 import type { ConsoleServer } from "./fixtures";
-import { expect, expectNoA11yViolations, settle, signIn, test, totpCode } from "./fixtures";
+import { expect, expectNoA11yViolations, settle, signIn, test, toasts, totpCode } from "./fixtures";
 
 const FIXTURES = path.resolve(import.meta.dirname, "..", "..", "tests", "fixtures", "env");
 const MESSY = readFileSync(path.join(FIXTURES, "messy.env"), "utf8");
@@ -74,7 +74,7 @@ test("a messy .env pasted in is saved as exactly what EnvManager reads from it",
   await expect(saved).toBeVisible();
   await saved.getByRole("button", { name: "Restart now" }).click();
   await expect(saved).toBeHidden();
-  await expect(page.getByRole("region", { name: "Notifications" }).getByText(`Restarted ${domain}`)).toBeVisible();
+  await expect(toasts(page).getByText(`Restarted ${domain}`)).toBeVisible();
 
   // The file on disk now reads back as the pasted map: what the table shows comes from it.
   await expect(table(page, domain).getByRole("cell", { name: "GREETING", exact: true })).toBeVisible();
@@ -123,7 +123,7 @@ test.describe("environment dialogs @screens", () => {
     await settle(page);
     await page.screenshot({ path: path.join(dir, "environment-paste-390.png") });
 
-    await paste.getByRole("button", { name: "Remove the export prefixes" }).click();
+    // `export` is read the way a shell reads it: nothing to fix before staging.
     await paste.getByRole("button", { name: /^Stage \d+ variables$/ }).click();
     await page.setViewportSize(DESKTOP);
     await page.getByRole("button", { name: "Review and save" }).click();

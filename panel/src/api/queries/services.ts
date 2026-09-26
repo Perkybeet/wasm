@@ -7,6 +7,7 @@ export type ServiceList = ResponseOf<"/api/services", "get">;
 export type Service = ResponseOf<"/api/services/{name}", "get">;
 export type ServiceLogs = ResponseOf<"/api/services/{name}/logs", "get">;
 export type ServiceConfig = ResponseOf<"/api/services/{name}/config", "get">;
+export type VerifyUnitResult = ResponseOf<"/api/services/verify", "post">;
 
 export const serviceKeys = {
   all: ["services"] as const,
@@ -16,7 +17,8 @@ export const serviceKeys = {
   config: (name: string) => ["service", name, "config"] as const,
 };
 
-export const servicesQuery = (wasmOnly = false) =>
+/** Scoped to WASM's own units by default, the same default `GET /api/services` itself has. */
+export const servicesQuery = (wasmOnly = true) =>
   queryOptions({
     queryKey: serviceKeys.list(wasmOnly),
     queryFn: ({ signal }) => request("get", "/api/services", { query: { wasm_only: wasmOnly }, signal }),

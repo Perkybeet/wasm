@@ -56,7 +56,7 @@ import time
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
@@ -461,6 +461,59 @@ class Unit:
         return {"active": "running", "failed": "failed"}.get(self.active, "dead")
 
 
+def _foreign_unit_lines(units: dict[str, Unit], patterns: list[str]) -> list[str]:
+    """
+    Extra ``systemctl list-units`` lines for the machine's non-WASM units.
+
+    ``_list_units`` only walks units WASM would create (it skips
+    ``unit.managed is False`` entries): the model's postgresql/mysql/redis-server/nginx
+    exist for direct queries such as ``is-active nginx``, not for a full listing. The
+    show-all-units toggle (``GET /api/services?wasm_only=false``) asks
+    ``ServiceManager.list_services(all_services=True)``, which lists with
+    ``patterns=["*"]`` and does its own managed/foreign split in Python, so it needs those
+    units to appear here too - this is the console's only foreign, always-visible unit for
+    that flow.
+
+    Args:
+        units: The modelled machine's units.
+        patterns: The patterns ``systemctl list-units`` was called with.
+
+    Returns:
+        One ``systemctl list-units`` line per foreign unit, when ``patterns`` is the
+        unrestricted ``["*"]`` an all-units listing sends; empty otherwise, so a scoped
+        listing (``wasm-*`` and friends) is unaffected.
+    """
+    if patterns != ["*"]:
+        return []
+    return [
+        f"{name}.service loaded {unit.active} {unit.sub} {name}"
+        for name, unit in sorted(units.items())
+        if not unit.managed
+    ]
+
+
+def _git_commit_subject_line(args: tuple[str, ...]) -> str | None:
+    """
+    Fake ``git log -1 --format=%s``, which the deploy pipeline runs to record
+    a deployment's ``commit_message``.
+
+    The modelled machine never really clones anything - every seeded app's
+    checkout already exists on disk without a real ``.git`` history - so a
+    fixed sentence is enough to answer the one invocation that matters:
+    demoing that a deployment's history carries a commit subject at all.
+    Nothing here reads it back for content.
+
+    Args:
+        args: The full argv the runner was asked to execute.
+
+    Returns:
+        The fake subject line, or None when ``args`` is not this exact call.
+    """
+    if args[:4] == ("git", "log", "-1", "--format=%s"):
+        return "Seed data for the console demo"
+    return None
+
+
 #: Programs the modelled machine has on PATH.
 INSTALLED_PROGRAMS = (
     "systemctl",
@@ -468,6 +521,7 @@ INSTALLED_PROGRAMS = (
     "journalctl",
     "nginx",
     "certbot",
+    "openssl",
     "git",
     "node",
     "npm",
@@ -537,7 +591,9 @@ _PG_USERS = (
 
 #: A read the SQL console can run against any PostgreSQL database, pipe-separated
 #: the way `psql -t -A` prints it (no header row: see databases.py's docstring).
-_PG_DEMO_ROWS = "1024|maria@example.com|129.90\n1025|jon@example.com|54.00\n1026|priya@example.com|312.40\n"
+_PG_DEMO_ROWS = (
+    "1024|maria@example.com|129.90\n1025|jon@example.com|54.00\n1026|priya@example.com|312.40\n"
+)
 
 #: The same read, in the structured console's shape: a header row, comma
 #: separated, the way `psql --csv` prints it (see execute_query_structured).
@@ -716,12 +772,22 @@ def make_runner(
                 return ok(args, self._certificates())
             if program == "certbot" and "--version" in args:
                 return ok(args, "certbot 2.9.0\n")
+            if program == "openssl" and "-issuer" in args:
+                # CertManager reads the issuer straight from the certificate
+                # file through openssl; the model answers the same line real
+                # Let's Encrypt leaf certificates carry, regardless of which
+                # file it was pointed at.
+                return ok(args, "issuer=C = US, O = Let's Encrypt, CN = R11\n")
             if program == "systemd-analyze" and args[1:2] == ("calendar",):
                 return ok(args, self._systemd_analyze_calendar(args))
             if program == "systemd-analyze" and args[1:2] == ("verify",):
                 return self._systemd_analyze_verify(args)
             if program == "systemd-analyze" and "--version" in args:
                 return ok(args, "systemd 255 (255.4-1ubuntu8)\n")
+            if program == "git":
+                subject = _git_commit_subject_line(args)
+                if subject is not None:
+                    return ok(args, subject + "\n")
             return ok(args)
 
         def _systemctl(self, args: tuple[str, ...]) -> CommandResult:
@@ -739,7 +805,11 @@ def make_runner(
                 state = unit.active if unit else "inactive"
                 return ok(args, f"{state}\n", 0 if state == "active" else 3)
             if verb == "is-enabled":
-                enabled = unit.enabled if unit is not None else enabled_overrides.get(base_name(name), True)
+                enabled = (
+                    unit.enabled
+                    if unit is not None
+                    else enabled_overrides.get(base_name(name), True)
+                )
                 return ok(args, "enabled\n" if enabled else "disabled\n", 0 if enabled else 1)
             if verb == "show":
                 if "-p" in args:
@@ -787,7 +857,9 @@ def make_runner(
                 if (systemd_dir / f"{name}.service").exists():
                     return "LoadState=loaded\nActiveState=inactive\nSubState=dead\nMainPID=0\nMemoryCurrent=0\nResult=success\n"
                 return "LoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=0\n"
-            since = unit.since.strftime("%a %Y-%m-%d %H:%M:%S UTC")
+            # `since` is local wall-clock time; systemd's answer here is labelled UTC, so it is
+            # converted first rather than relabelled (off by the machine's offset otherwise).
+            since = unit.since.astimezone(timezone.utc).strftime("%a %Y-%m-%d %H:%M:%S UTC")
             return (
                 f"Id={name}.service\n"
                 "LoadState=loaded\n"
@@ -819,9 +891,14 @@ def make_runner(
             # WHERE literal ("datistemplate = false" instead of "datname = '...'")
             # and must be checked first, or its listing query would be mistaken for
             # a lookup of one database and answer as though `name` were None.
-            if program == "psql" and "d.datdba = r.oid" in statement and "datistemplate" in statement:
+            if (
+                program == "psql"
+                and "d.datdba = r.oid" in statement
+                and "datistemplate" in statement
+            ):
                 return "".join(
-                    f"{name}|UTF8|{size}|{owner}\n" for name, (owner, size) in self._pg_databases.items()
+                    f"{name}|UTF8|{size}|{owner}\n"
+                    for name, (owner, size) in self._pg_databases.items()
                 )
             if program == "psql" and "d.datdba = r.oid" in statement:
                 name = _sql_literal(statement)
@@ -850,7 +927,9 @@ def make_runner(
             if program == "psql" and "FROM demo_orders" in statement:
                 return _PG_DEMO_ROWS_CSV if headers else _PG_DEMO_ROWS
             if program == "psql" and "pg_database" in statement:
-                return "".join(f"{name}|UTF8|{size}\n" for name, (_owner, size) in self._pg_databases.items())
+                return "".join(
+                    f"{name}|UTF8|{size}\n" for name, (_owner, size) in self._pg_databases.items()
+                )
             # Same reasoning for MySQL: get_database_info's size query sums
             # bare "DATA_LENGTH + INDEX_LENGTH" columns (single table, no
             # alias needed); list_databases()'s own query joins
@@ -859,7 +938,8 @@ def make_runner(
             # separately, checked first since the alias makes it more specific.
             if program == "mysql" and "t.DATA_LENGTH + t.INDEX_LENGTH" in statement:
                 seeded = "".join(
-                    f"{name}\tutf8mb4\t{size}\n" for name, (size, _tables) in self._mysql_databases.items()
+                    f"{name}\tutf8mb4\t{size}\n"
+                    for name, (size, _tables) in self._mysql_databases.items()
                 )
                 return "information_schema\tutf8mb3\t0\nmysql\tutf8mb4\t0\n" + seeded
             if program == "mysql" and "DATA_LENGTH + INDEX_LENGTH" in statement:
@@ -868,7 +948,9 @@ def make_runner(
             if program == "mysql" and statement.lstrip().startswith("SELECT SCHEMA_NAME FROM"):
                 name = _sql_literal(statement)
                 return f"{name}\n" if name in self._mysql_databases else ""
-            if program == "mysql" and statement.lstrip().startswith("SELECT DEFAULT_CHARACTER_SET_NAME"):
+            if program == "mysql" and statement.lstrip().startswith(
+                "SELECT DEFAULT_CHARACTER_SET_NAME"
+            ):
                 return "utf8mb4\n"
             if program == "mysql" and statement.lstrip().startswith("CREATE DATABASE"):
                 name = _sql_identifier(statement, "`")
@@ -955,7 +1037,9 @@ def make_runner(
             for path in sorted(systemd_dir.glob("*")):
                 if patterns and not any(fnmatch(path.name, p) for p in patterns):
                     continue
-                state = "enabled" if enabled_overrides.get(base_name(path.name), True) else "disabled"
+                state = (
+                    "enabled" if enabled_overrides.get(base_name(path.name), True) else "disabled"
+                )
                 lines.append(f"{path.name} {state} {state}")
             return "\n".join(lines) + "\n"
 
@@ -998,6 +1082,7 @@ def make_runner(
                     continue
                 description = domains.get(name, name)
                 lines.append(f"{name}.service loaded {unit.active} {unit.sub} {description}")
+            lines.extend(_foreign_unit_lines(units, patterns))
             return "\n".join(lines) + "\n"
 
         @staticmethod
@@ -1065,6 +1150,7 @@ def seed_machine(
     store = get_store(sandbox.store_file)
     # First, so the tabs' old deploys get lower ids than the ones seeded as of now.
     tabs_history = seed_app_tabs_history(store)
+    seed_deploylinks_commit_messages(store)
     state = seed_console_state(store)
 
     units: dict[str, Unit] = {}
@@ -1111,11 +1197,58 @@ def seed_machine(
 
     seed_backups(sandbox, state.backup_domains + state.static_domains[:1])
     seed_cron(state.domains[0])
+    seed_overview_failed_worker(sandbox, store, units)
     seed_monitor(sandbox, units)
     seed_job_history(sandbox, store, state.domains[0])
+    seed_activity_audit_log(sandbox, state.domains[0])
     seed_app_tabs(sandbox, store, units, ports, domains, tabs_history)
     seed_domains_and_sources(sandbox, store, units, list(state.cert_domains))
     return units, ports, domains, list(state.cert_domains)
+
+
+def seed_overview_failed_worker(sandbox: Sandbox, store: Any, units: dict[str, Unit]) -> None:
+    """
+    Seed a WASM unit that belongs to no application and has failed.
+
+    A worker created with ``wasm service create`` (a queue consumer, a mailer)
+    fails without any application's state saying so. The overview names the
+    failed units beyond those an application already accounts for, and this
+    is the one that makes that count non-zero on the seeded machine.
+
+    Args:
+        sandbox: The sandbox whose unit directory receives the unit file.
+        store: The seeded store, which tracks the service.
+        units: The unit model the runner answers from; gains the worker.
+    """
+    from wasm.core.store import Service
+    from wasm.managers.service_manager import WASM_UNIT_MARKER
+
+    name = "queue-worker"
+    command = "/usr/bin/node /var/www/apps/arennalabs.com/current/worker.js"
+    store.create_service(
+        Service(
+            name=name,
+            unit_file=str(sandbox.systemd_dir / f"{name}.service"),
+            working_directory="/var/www/apps/arennalabs.com/current",
+            command=command,
+            status="failed",
+        )
+    )
+    units[name] = Unit(
+        active="failed",
+        since=datetime.now() - timedelta(minutes=42),
+        restarts=5,
+    )
+    (sandbox.systemd_dir / f"{name}.service").write_text(
+        f"# {WASM_UNIT_MARKER}\n"
+        "[Unit]\n"
+        "Description=Queue worker for arennalabs.com\n\n"
+        "[Service]\n"
+        "WorkingDirectory=/var/www/apps/arennalabs.com/current\n"
+        f"ExecStart={command}\n"
+        "Restart=on-failure\n",
+        encoding="utf-8",
+    )
 
 
 def seed_backups(sandbox: Sandbox, domains: list[str]) -> None:
@@ -1312,6 +1445,48 @@ def seed_monitor(sandbox: Sandbox, units: dict[str, Unit]) -> None:
     store.acknowledge(acknowledged_id)
 
 
+def seed_activity_audit_log(sandbox: Sandbox, domain: str) -> None:
+    """
+    Write a few audit entries beyond what a real session generates.
+
+    Every E2E test that signs in produces one real ``auth.login`` entry
+    through the actual login endpoint, but that alone is only ever one actor
+    and one result. This adds the mix an operator actually sees on the
+    Activity page - a refusal, and an API token acting instead of a browser
+    session - written through :class:`wasm.web.auth.AuditLogger`, the same
+    writer the API server installs, at the path :class:`SecurityConfig`
+    resolves. This runs before :func:`wasm.web.server.create_app` replaces
+    the global logger with its own instance over that same file, so these
+    are simply older lines already in the log the server reads from - never
+    a hand-written format.
+
+    Args:
+        sandbox: The sandbox.
+        domain: An application named in the denied action's resource.
+    """
+    from wasm.web.auth import AuditLogger, SecurityConfig
+
+    audit = AuditLogger(SecurityConfig(state_dir=sandbox.state_dir).audit_log)
+    # The real refusal a deploy-scoped token gets from require_scope() (auth.py) when it
+    # reaches an admin-only endpoint - deleting an app needs "admin", not "deploy".
+    audit.record(
+        action="auth.scope",
+        result="denied",
+        client_ip="203.0.113.7",
+        actor="token:ci-deploy",
+        resource=f"/api/apps/{domain}",
+        detail="scope 'deploy' below required 'admin'",
+    )
+    audit.record(
+        action="config.update",
+        result="success",
+        client_ip="127.0.0.1",
+        actor="master",
+        resource="/api/config",
+        detail="updated ssl.email",
+    )
+
+
 def seed_job_history(sandbox: Sandbox, store: Any, domain: str) -> None:
     """
     Add one job with a captured log, for the Activity page's log drawer.
@@ -1354,7 +1529,8 @@ def seed_job_history(sandbox: Sandbox, store: Any, domain: str) -> None:
             id="c0ffee01",
             type="update",
             name=f"Update {domain}",
-            description=f"Seeded update of {domain} with a captured log",
+            description=f"Updating the application at {domain}",
+            actor="master",
             status="completed",
             progress=100,
             domain=domain,
@@ -1942,6 +2118,56 @@ def seed_app_tabs_history(store: Any) -> dict[str, _TabsApp]:
             seeded.deploys.append((started, commit, "ok", "success", ""))
         apps[domain] = seeded
     return apps
+
+
+#: Commit subjects for the tabs apps' seeded history, keyed by the short hash
+#: each row already carries. Real deploys and updates learn theirs from
+#: ``git log -1 --format=%s`` on a real checkout (see
+#: ``_commit_message_for_recording``); the fake ``git`` handler above answers
+#: that for anything the sandbox actually runs. The tabs' history predates the
+#: sandbox entirely - :func:`_tabs_deployment` writes each row straight
+#: through the store - so nothing ever asks git for theirs.
+_TABS_COMMIT_MESSAGES: dict[str, str] = {
+    "3c1e9a0": "Add product search filters",
+    "7f2d4b1": "Fix checkout total rounding",
+    "a94c0e2": "Add order CSV export",
+    "b1e7f93": "Bump Next.js to 15.2",
+    "c5d2a61": "Rework the cart summary layout",
+    "d08e4f7": "Add Stripe webhook retries",
+    "e3b9c12": "Cache product listings",
+    "f41a8d3": "Add a wishlist page",
+    "0c7e5b9": "Tune image loader sizes",
+    "19d3f6e": "Update footer legal links",
+    "2a8b7c4": "Add gift card redemption",
+    "4e1f2a7": "Add delivery tracking page",
+    "8b3c9d0": "Fix invoice PDF totals",
+    "5a7e1c3": "Add an order status webhook",
+    "9d4e2b8": "Initial import",
+}
+
+
+def seed_deploylinks_commit_messages(store: Any) -> None:
+    """
+    Back-fill ``commit_message`` on the tabs apps' seeded deployment history.
+
+    :func:`_tabs_deployment` records each row directly through the store, not
+    through the deploy pipeline that would normally learn the subject line
+    from git and annotate it: without this, every one of those rows would be
+    the one case in the modelled machine where a deployment has a commit but
+    no message, unlike a deploy or update actually run through the sandbox.
+    This calls the same store method the real pipeline does, keyed by the
+    commit each row was already written with.
+
+    Args:
+        store: The seeded store, after :func:`seed_app_tabs_history` ran.
+    """
+    for domain in (TABS_RELEASE_APP, TABS_LIVE_APP, *TABS_MIGRATE_APPS):
+        for record in store.list_deployments(domain=domain, limit=100):
+            if record.id is None or record.commit_message is not None:
+                continue
+            message = _TABS_COMMIT_MESSAGES.get(record.git_commit or "")
+            if message is not None:
+                store.annotate_deployment(record.id, commit_message=message)
 
 
 def _tabs_release_app(
@@ -3074,6 +3300,34 @@ def _domains_site_files(store: Any) -> None:
             manager.enable_site(site.domain)
 
 
+def seed_sites_server_names(domain: str, extra: Sequence[str]) -> None:
+    """
+    Give an already-written site's configuration more names to answer on.
+
+    Every seeded site otherwise answers on its bare domain only, which never
+    exercises ``SiteInfo.server_names`` beyond a single-element list. This
+    edits the file ``_domains_site_files`` already wrote, in place, the same
+    way an operator's own ``server_name`` edit would: no store row is added,
+    since these are extra names of a *site*, not an application's own domains
+    (``wasm.web.api.domains``, seeded separately).
+
+    Args:
+        domain: Domain of an already-written nginx site.
+        extra: Names to add beside it, unqualified (``www``, not
+            ``www.<domain>``).
+    """
+    from wasm.managers.nginx_manager import NginxManager
+
+    manager = NginxManager(verbose=False)
+    if not manager.site_exists(domain):
+        return
+    config = manager.get_site_config(domain) or ""
+    names = " ".join([domain, *(f"{name}.{domain}" for name in extra)])
+    updated = config.replace(f"server_name {domain};", f"server_name {names};")
+    if updated != config:
+        manager.replace_site_config(domain, updated)
+
+
 def _domains_wizard_sources(sandbox: Sandbox) -> None:
     """
     Write the projects the new-app wizard is pointed at, in /var/www/src.
@@ -3210,6 +3464,7 @@ def seed_domains_and_sources(
     )
 
     _domains_site_files(store)
+    seed_sites_server_names("qrboda.com", ["www", "shop", "status"])
     _domains_wizard_sources(sandbox)
 
 

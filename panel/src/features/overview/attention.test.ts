@@ -5,7 +5,7 @@ import type { AppInfo, Deployment } from "../apps/data";
 import { collectAttention } from "./attention";
 
 function app(domain: string, status: string): AppInfo {
-  return { domain, name: domain, status, active: status === "running", enabled: true, app_type: "nextjs", layout: "inplace", webhook_enabled: false };
+  return { domain, name: domain, status, active: status === "running", enabled: true, app_type: "nextjs", layout: "inplace", webhook_enabled: false, keep_releases: 5 };
 }
 
 function deploy(id: number, domain: string, status: string, error: string | null = null): Deployment {
@@ -115,6 +115,40 @@ describe("collectAttention", () => {
     );
     const named = collectAttention({ apps: [app("x.example.com", "failed"), app("y.example.com", "failed")], machine });
     expect(named.some((item) => item.subject.kind === "units")).toBe(false);
+  });
+
+  it("names each failed or crash-looping WASM unit that belongs to no app, and links it", () => {
+    const unit = (name: string, active_state: string, sub_state: string, result = "success") => ({
+      name,
+      status: "stopped",
+      active: false,
+      enabled: true,
+      managed: true,
+      active_state,
+      sub_state,
+      result,
+    });
+    const items = collectAttention({
+      apps: [{ ...app("shop.example.com", "failed"), unit: "shop-example-com" }, app("old.example.com", "running")],
+      machine: { ...MACHINE, units: { running: 1, failed: 3, stopped: 0 } },
+      units: [
+        // The apps' own units: their state already says it, under the app's name.
+        unit("shop-example-com", "failed", "failed", "exit-code"),
+        unit("wasm-old-example-com", "failed", "failed", "exit-code"),
+        unit("queue-worker", "failed", "failed", "exit-code"),
+        unit("mailer", "activating", "auto-restart"),
+        unit("cron-cleanup", "inactive", "dead"),
+        { ...unit("sshd", "failed", "failed"), managed: false },
+      ],
+    });
+    const units = items.filter((item) => item.subject.kind === "unit");
+    expect(units.map((item) => [item.title, item.severity, item.reasons[0]?.summary, item.reasons[0]?.detail])).toEqual([
+      ["queue-worker", "fail", "The unit has failed", "Result=exit-code"],
+      ["mailer", "warn", "systemd keeps restarting the unit", undefined],
+    ]);
+    expect(units[0]?.subject).toEqual({ kind: "unit", name: "queue-worker" });
+    // Named, so the machine's bare count is not repeated.
+    expect(items.some((item) => item.subject.kind === "units")).toBe(false);
   });
 
   it("lists open monitor findings, not acknowledged ones", () => {

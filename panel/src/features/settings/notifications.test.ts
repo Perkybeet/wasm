@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { CHANNELS, REDACTED, channelValue, parseHostList, readNotificationSettings } from "./notifications";
+import { CHANNELS, REDACTED, channelValue, isChannelConfigured, parseHostList, readNotificationSettings } from "./notifications";
 import type { ChannelSpec } from "./notifications";
 
 /** GET /api/config's notifications block as the sandboxed server answers it. */
@@ -45,15 +45,36 @@ describe("the notification settings", () => {
   });
 
   it("sends a secret left empty back as the placeholder, so the stored one is kept", () => {
-    expect(channelValue(spec("slack"), {})).toEqual({ webhook_url: REDACTED });
-    expect(channelValue(spec("telegram"), { chat_id: " 42 " })).toEqual({ bot_token: REDACTED, chat_id: "42" });
+    expect(channelValue(spec("slack"), { webhook_url: "" }, {})).toEqual({ webhook_url: REDACTED });
+    expect(channelValue(spec("telegram"), { bot_token: REDACTED, chat_id: "-1001234" }, { chat_id: " 42 " })).toEqual({
+      bot_token: REDACTED,
+      chat_id: "42",
+    });
   });
 
   it("sends what was typed, and clears on request", () => {
-    expect(channelValue(spec("webhook"), { webhook_url: "https://hooks.example.com/x " })).toEqual({
+    expect(channelValue(spec("webhook"), { webhook_url: "" }, { webhook_url: "https://hooks.example.com/x " })).toEqual({
       webhook_url: "https://hooks.example.com/x",
     });
-    expect(channelValue(spec("telegram"), { chat_id: "42" }, new Set(["bot_token"]))).toEqual({ bot_token: "", chat_id: "42" });
+    expect(
+      channelValue(spec("telegram"), { bot_token: REDACTED, chat_id: "-1001234" }, { chat_id: "42" }, new Set(["bot_token"])),
+    ).toEqual({ bot_token: "", chat_id: "42" });
+  });
+
+  it("keeps a field the operator left alone, even when a sibling field in the same channel changed", () => {
+    const stored = { bot_token: REDACTED, chat_id: "-1001234" };
+    // Only the token was touched: the chat ID must round-trip untouched, not blank.
+    expect(channelValue(spec("telegram"), stored, { bot_token: "a-fresh-token" })).toEqual({
+      bot_token: "a-fresh-token",
+      chat_id: "-1001234",
+    });
+  });
+
+  it("reports whether a channel has a destination configured, from the redacted secret alone", () => {
+    expect(isChannelConfigured(spec("slack"), { webhook_url: "" })).toBe(false);
+    expect(isChannelConfigured(spec("slack"), { webhook_url: REDACTED })).toBe(true);
+    expect(isChannelConfigured(spec("telegram"), { bot_token: "", chat_id: "-1001234" })).toBe(false);
+    expect(isChannelConfigured(spec("telegram"), { bot_token: REDACTED, chat_id: "-1001234" })).toBe(true);
   });
 
   it("reads a list of hosts typed one per line or with commas", () => {

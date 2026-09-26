@@ -6,6 +6,7 @@ import type { ReactNode } from "react";
 import { appQuery, releasesQuery, webhookDeliveriesQuery } from "../../api/queries/apps";
 import type { App } from "../../api/queries/apps";
 import { certsQuery } from "../../api/queries/certs";
+import { appDomainsQuery } from "../../api/queries/domains";
 import type { Cert } from "../../api/queries/certs";
 import { deploymentsQuery } from "../../api/queries/deployments";
 import { sitesQuery } from "../../api/queries/sites";
@@ -21,6 +22,7 @@ import { Section } from "../../components/page/Section";
 import { StatTile } from "../../components/page/StatTile";
 import { useNow } from "../../components/page/clock";
 import { appStatus, deployStatus } from "../../components/page/status";
+import { Badge } from "../../components/ui/Badge";
 import { Skeleton } from "../../components/ui/Skeleton";
 import { STATUS, StatusGlyph } from "../../components/ui/StatusPill";
 import { Tooltip } from "../../components/ui/Tooltip";
@@ -29,7 +31,10 @@ import { formatBytes, formatCount, formatDateTime, formatDuration, formatPercent
 import type { Deployment } from "../apps/data";
 import { appLimits, appReading, deployMoment, useLatestMetrics } from "../apps/data";
 import { CERT_WARNING_DAYS } from "../overview/attention";
+import { CertificateStatus } from "../domains/CertificateStatus";
+import { coverageOf, covers } from "../domains/certificates";
 import { findCertificate, findSite } from "./lookups";
+import { sourceLink } from "./SourceLink";
 
 const TONE_TEXT = { ok: "text-ok", warn: "text-warn", fail: "text-fail", idle: "text-idle" } as const;
 const LINK =
@@ -259,26 +264,17 @@ function LastDeployFailed({ domain }: { domain: string }) {
 // ---------------------------------------------------------------------------------------
 // The sections
 
+const KIND_WORD: Record<string, string> = { primary: "Primary", alias: "Alias", redirect: "Redirect" };
+
+/** The names the app answers on, each with what the certificate does for it. */
 function Domains({ app }: { app: App }) {
   const domain = app.domain;
+  const domains = useQuery(appDomainsQuery(domain));
   const certs = useQuery(certsQuery());
   const sites = useQuery(sitesQuery());
-  const cert = findCertificate(certs.data, domain);
+  const lineage = certs.isError && certs.data === undefined ? null : findCertificate(certs.data, domain);
   const site = findSite(sites.data, domain);
-
-  const names = cert?.domains.length ? cert.domains : [domain];
-  const days = cert?.days_remaining ?? null;
-  const certState: { tone: keyof typeof TONE_TEXT; text: string } =
-    cert === null
-      ? { tone: "idle", text: "No certificate" }
-      : days === null
-        ? { tone: "ok", text: "Certificate issued" }
-        : days < 0
-          ? { tone: "fail", text: "Certificate expired" }
-          : days < CERT_WARNING_DAYS
-            ? { tone: "warn", text: `Certificate expires in ${String(days)} days` }
-            : { tone: "ok", text: `Certificate valid for ${String(days)} days` };
-  const certMissing = cert === null;
+  const entries = domains.data?.domains ?? [];
 
   return (
     <Section
@@ -290,28 +286,34 @@ function Domains({ app }: { app: App }) {
       }
     >
       <Panel className="py-1">
-        {cert === undefined && certs.isPending ? (
+        {domains.isError && domains.data === undefined ? (
+          <ErrorBlock compact error={domains.error} title="Could not load the domains" className="my-3" />
+        ) : domains.data === undefined ? (
           <KeyValueListSkeleton rows={2} />
         ) : (
           <ul className="flex flex-col divide-y divide-border">
-            {names.map((name) => (
-              <li key={name} className="flex min-h-10 flex-wrap items-center justify-between gap-x-4 gap-y-1 py-2">
-                <a
-                  href={`${certMissing ? "http" : "https"}://${name}`}
-                  target="_blank"
-                  rel="noreferrer"
-                  translate="no"
-                  className="rounded-[4px] text-13 font-medium text-fg hover:underline hover:underline-offset-2 focus-visible:outline-2 focus-visible:outline-focus"
-                >
-                  {name}
-                  <span className="sr-only"> (opens in a new tab)</span>
-                </a>
-                <span className={cx("flex items-center gap-1.5 text-12", TONE_TEXT[certState.tone])}>
-                  <StatusGlyph state={certState.tone === "ok" ? "running" : certState.tone === "fail" ? "failed" : "stopped"} size={10} />
-                  <span className={certState.tone === "idle" ? "text-fg-muted" : "text-fg"}>{certState.text}</span>
-                </span>
-              </li>
-            ))}
+            {entries.map((entry) => {
+              const coverage = coverageOf(entry.domain, lineage, false);
+              const secure = lineage !== null && lineage !== undefined && covers(lineage, entry.domain);
+              return (
+                <li key={entry.domain} className="flex min-h-10 flex-wrap items-center justify-between gap-x-4 gap-y-1 py-2">
+                  <span className="flex min-w-0 items-center gap-2">
+                    <a
+                      href={`${secure ? "https" : "http"}://${entry.domain}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      translate="no"
+                      className="min-w-0 truncate rounded-[4px] text-13 font-medium text-fg hover:underline hover:underline-offset-2 focus-visible:outline-2 focus-visible:outline-focus"
+                    >
+                      {entry.domain}
+                      <span className="sr-only"> (opens in a new tab)</span>
+                    </a>
+                    {entry.kind !== "primary" ? <Badge>{KIND_WORD[entry.kind] ?? entry.kind}</Badge> : null}
+                  </span>
+                  <CertificateStatus tone={coverage.tone} label={coverage.label} className="text-12" />
+                </li>
+              );
+            })}
           </ul>
         )}
       </Panel>
@@ -321,7 +323,7 @@ function Domains({ app }: { app: App }) {
           : site === null
             ? "No web server site is configured for this domain. "
             : ""}
-        {cert?.auto_renew ? "The certificate renews automatically." : ""}
+        {lineage?.auto_renew ? "The certificate renews automatically." : ""}
       </p>
     </Section>
   );
@@ -372,6 +374,8 @@ function Runtime({ app }: { app: App }) {
   const staticSite = appStatus(app.status).state === "static";
   const items: KeyValueItem[] = [
     ...(staticSite ? [] : [{ label: "Port", value: app.port ?? null }]),
+    { label: "Source", value: sourceLink(app.source ?? null), mono: true, copy: app.source ?? false },
+    { label: "Branch", value: app.branch ?? null },
     ...(app.active && app.pid ? [{ label: "Main PID", value: app.pid }] : []),
     ...(staticSite ? [] : [{ label: "Starts at boot", value: app.enabled ? "Yes" : "No", mono: false, copy: false as const }]),
     {
@@ -386,7 +390,8 @@ function Runtime({ app }: { app: App }) {
   return (
     <Section title="Runtime">
       <Panel className="py-1">
-        <KeyValueList empty="None" items={items} />
+        {/* A fact WASM has no record of (an app deployed before it kept one), as Settings says. */}
+        <KeyValueList empty="Not recorded" items={items} />
       </Panel>
       <CommandHint command={`wasm status ${app.domain}`} label="From a terminal" />
     </Section>

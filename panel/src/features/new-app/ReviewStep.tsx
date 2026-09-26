@@ -2,6 +2,7 @@ import { TriangleAlert } from "lucide-react";
 import { useId } from "react";
 import type { ReactNode, Ref, SyntheticEvent } from "react";
 
+import { ErrorBlock } from "../../components/page/QueryState";
 import { Section } from "../../components/page/Section";
 import { SegmentedControl } from "../../components/page/SegmentedControl";
 import { Button } from "../../components/ui/Button";
@@ -9,12 +10,17 @@ import { Checkbox } from "../../components/ui/Checkbox";
 import { Field } from "../../components/ui/Field";
 import { Input } from "../../components/ui/Input";
 import { Select } from "../../components/ui/Select";
+import { Skeleton } from "../../components/ui/Skeleton";
 import { cx } from "../../lib/cx";
+import { DnsVerdict } from "../domains/DnsVerdict";
 import { normalizeDomain } from "../domains/names";
 import { EnvironmentFields } from "./EnvironmentFields";
 import { InspectionReadout } from "./InspectionReadout";
-import { hasPort, typeName, typeOptions } from "./wizard";
-import type { Inspection, Layout, ReviewErrors, ReviewForm, WebServer } from "./wizard";
+import { PersistentPathsField } from "./PersistentPathsField";
+import { ResourceLimitsFields } from "./ResourceLimitsFields";
+import { useDomainDnsCheck } from "./useDomainDnsCheck";
+import { canIncludeWww, hasPort, typeName, typeOptions } from "./wizard";
+import type { AppTypeOption, Inspection, Layout, ReviewErrors, ReviewForm, WebServer } from "./wizard";
 
 const LAYOUTS: readonly { value: Layout; label: string; description: string }[] = [
   {
@@ -77,13 +83,13 @@ function Choice<V extends string>({
 }
 
 /** Where the proposed port came from, so a number that is not the framework's default is explained. */
-function portNote(inspection: Inspection, taken: ReadonlyMap<number, string>): string {
+function portNote(inspection: Inspection, types: readonly AppTypeOption[], taken: ReadonlyMap<number, string>): string {
   const preferred = inspection.default_port;
   const owner = taken.get(preferred);
   const base = "The app listens here and the web server passes requests to it.";
   if (inspection.detected_types.length === 0) return base;
-  if (owner === undefined) return `${base} ${typeName(inspection.app_type)} uses ${String(preferred)} by default.`;
-  return `${base} ${typeName(inspection.app_type)} uses ${String(preferred)} by default, which ${owner} has, so the next free one is proposed.`;
+  if (owner === undefined) return `${base} ${typeName(types, inspection.app_type)} uses ${String(preferred)} by default.`;
+  return `${base} ${typeName(types, inspection.app_type)} uses ${String(preferred)} by default, which ${owner} has, so the next free one is proposed.`;
 }
 
 function Group({ title, description, children }: { title: string; description?: ReactNode; children: ReactNode }) {
@@ -94,10 +100,27 @@ function Group({ title, description, children }: { title: string; description?: 
   );
 }
 
+function DnsSkeleton() {
+  return (
+    <div aria-busy="true" className="flex flex-col gap-3 rounded-card border border-border p-3">
+      <span className="sr-only">Checking where it points</span>
+      <Skeleton className="h-4 w-56" />
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Skeleton className="h-10" />
+        <Skeleton className="h-10" />
+      </div>
+    </div>
+  );
+}
+
 export interface ReviewStepProps {
   inspection: Inspection;
+  /** Every type the deployer registry knows, for the "Deploy as" select and its labels. */
+  types: readonly AppTypeOption[];
   /** Ports other apps on this machine hold, and which. */
   taken: ReadonlyMap<number, string>;
+  /** CPUs of this machine, for the resource limits' description; null while unknown. */
+  cores: number | null;
   source: string;
   form: ReviewForm;
   errors: ReviewErrors;
@@ -112,17 +135,20 @@ export interface ReviewStepProps {
  * choice, never a silent guess; the commands are shown as they will run; the environment is a
  * form generated from `.env.example`. The source is not asked again.
  */
-export function ReviewStep({ inspection, taken, source, form, errors, onChange, onBack, onContinue, headingRef }: ReviewStepProps) {
+export function ReviewStep({ inspection, types, taken, cores, source, form, errors, onChange, onBack, onContinue, headingRef }: ReviewStepProps) {
   const set = (patch: Partial<ReviewForm>): void => {
     onChange({ ...form, ...patch });
   };
+  const dns = useDomainDnsCheck(form.domain);
   const submit = (event: SyntheticEvent<HTMLFormElement>): void => {
     event.preventDefault();
+    dns.checkNow();
     onContinue();
   };
   const detected = inspection.detected_types.length > 0;
   const chosenElsewhere = detected && form.appType !== inspection.app_type;
   const domain = normalizeDomain(form.domain);
+  const offerWww = canIncludeWww(form.domain);
 
   return (
     <form onSubmit={submit} noValidate className="flex flex-col gap-6">
@@ -133,7 +159,7 @@ export function ReviewStep({ inspection, taken, source, form, errors, onChange, 
         <p className="text-14 text-pretty text-fg-muted">Check what WASM found and fill in what only you know. Everything here can be changed later.</p>
       </header>
 
-      <InspectionReadout inspection={inspection} source={source} />
+      <InspectionReadout inspection={inspection} types={types} source={source} />
 
       <Field
         label="Deploy as"
@@ -143,7 +169,7 @@ export function ReviewStep({ inspection, taken, source, form, errors, onChange, 
         className="sm:max-w-96"
       >
         <Select
-          options={typeOptions(inspection.detected_types)}
+          options={typeOptions(types, inspection.detected_types)}
           value={form.appType === "" ? null : form.appType}
           placeholder="Choose a type"
           onValueChange={(appType) => set({ appType })}
@@ -153,17 +179,13 @@ export function ReviewStep({ inspection, taken, source, form, errors, onChange, 
       {chosenElsewhere ? (
         <p className="-mt-3 flex items-start gap-2 text-13 text-pretty text-fg">
           <TriangleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warn" />
-          {`The commands above are ${typeName(inspection.app_type)}'s. Deployed as ${typeName(form.appType)}, the app is installed, built and started the ${typeName(form.appType)} way instead.`}
+          {`The commands above are ${typeName(types, inspection.app_type)}'s. Deployed as ${typeName(types, form.appType)}, the app is installed, built and started the ${typeName(types, form.appType)} way instead.`}
         </p>
       ) : null}
 
       <Group title="Address" description="Where the app answers, and how.">
         <div className="flex flex-col gap-5">
-          <Field
-            label="Domain"
-            error={errors["domain"]}
-            description="Other names, such as the www one, are added from the app's Domains tab once it is deployed."
-          >
+          <Field label="Domain" error={errors["domain"]} description="Every other name, such as an alias or a redirect, is added from the app's Domains tab once it is deployed.">
             <Input
               mono
               value={form.domain}
@@ -175,6 +197,23 @@ export function ReviewStep({ inspection, taken, source, form, errors, onChange, 
               inputMode="url"
             />
           </Field>
+          <div aria-live="polite" className="flex flex-col gap-2">
+            {dns.data ? (
+              <DnsVerdict check={dns.data} />
+            ) : dns.isError ? (
+              <ErrorBlock compact error={dns.error} title={`Could not resolve ${domain || "the domain"}`} />
+            ) : dns.isFetching ? (
+              <DnsSkeleton />
+            ) : null}
+          </div>
+          {offerWww ? (
+            <Checkbox
+              label="Also serve www"
+              description={`Adds www.${domain || "the domain"} too, as a redirect to it.`}
+              checked={form.includeWww}
+              onCheckedChange={(includeWww) => set({ includeWww })}
+            />
+          ) : null}
           <Checkbox
             label="Serve it over HTTPS"
             description={`Orders a Let's Encrypt certificate for ${domain || "the domain"} once the site is up. The domain has to point to this server already.`}
@@ -205,7 +244,7 @@ export function ReviewStep({ inspection, taken, source, form, errors, onChange, 
             <Field
               label="Port"
               error={errors["port"]}
-              description={portNote(inspection, taken)}
+              description={portNote(inspection, types, taken)}
               className="sm:max-w-80"
             >
               <Input mono inputMode="numeric" value={form.port} onValueChange={(value: string) => set({ port: value })} autoComplete="off" />
@@ -218,7 +257,19 @@ export function ReviewStep({ inspection, taken, source, form, errors, onChange, 
             onChange={(layout) => set({ layout })}
             badge={{ releases: "Recommended" }}
           />
-          <p className="text-12 text-pretty text-fg-muted">Memory, CPU and task limits are set from the app's Settings once it exists.</p>
+          {form.layout === "releases" ? (
+            <div className="flex flex-col gap-2">
+              <div className="flex flex-col gap-0.5">
+                <span className="text-13 font-medium text-fg">Persistent paths</span>
+                <span className="text-12 text-fg-muted">
+                  Kept across every release, linked from <code translate="no">shared/</code>: uploads, a SQLite file. Most apps need
+                  none.
+                </span>
+              </div>
+              <PersistentPathsField rows={form.persistentPaths} errors={errors} onChange={(persistentPaths) => set({ persistentPaths })} />
+            </div>
+          ) : null}
+          <ResourceLimitsFields draft={form.limits} cores={cores} errors={errors} onChange={(limits) => set({ limits })} />
         </div>
       </Group>
 

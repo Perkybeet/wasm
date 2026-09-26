@@ -3,14 +3,7 @@
  * running one now, enabling and disabling it, and its run history.
  */
 
-import type { Page } from "@playwright/test";
-
-import { expect, expectNoA11yViolations, settle, signIn, test } from "./fixtures";
-
-/** The visible toast queue, scoped so it never collides with the page's own aria-live echo. */
-function toasts(page: Page) {
-  return page.getByRole("region", { name: "Notifications" });
-}
+import { expect, expectNoA11yViolations, settle, signIn, test, toasts } from "./fixtures";
 
 test("lists the seeded jobs with their schedule and next run, and passes axe", async ({ page, consoleServer }) => {
   await signIn(page, consoleServer, "/cron");
@@ -44,6 +37,32 @@ test("creates a job with a daily preset and sees it listed with a next run", asy
   const row = page.getByRole("row").filter({ has: page.getByText("e2e-report", { exact: true }) });
   await expect(row).toBeVisible();
   await expect(row.getByText("Enabled")).toBeVisible();
+});
+
+test("previews the schedule live before saving: normalised calendar, next runs, and a refusal inline", async ({ page, consoleServer, problems }) => {
+  // The invalid custom expression below is refused by the request model's own character-set
+  // check, expected here the same way an elevation-gated save's first, refused attempt is.
+  problems.expect(/status of 422 .*\/api\/cron\/preview$/);
+  await signIn(page, consoleServer, "/cron");
+  await page.getByRole("button", { name: "New job" }).click();
+  const dialog = page.getByRole("dialog", { name: "New cron job" });
+
+  // Daily is the default preset; the preview fires without anything else being filled in.
+  await expect(dialog.getByText("*-*-* 02:00:00", { exact: true })).toBeVisible();
+  await expect(dialog.getByRole("listitem")).toHaveCount(5);
+  await expectNoA11yViolations(page, "the new job dialog with a schedule preview");
+
+  await dialog.getByRole("combobox", { name: "Schedule" }).click();
+  await page.getByRole("option", { name: "Hourly" }).click();
+  await expect(dialog.getByText("*-*-* *:00:00", { exact: true })).toBeVisible();
+
+  await dialog.getByRole("combobox", { name: "Schedule" }).click();
+  await page.getByRole("option", { name: "Custom" }).click();
+  // Character-set validation, not systemd's own: refused before it is ever asked to parse it.
+  await dialog.getByLabel("Calendar expression", { exact: true }).fill("bogus!");
+  await expect(dialog.getByText(/Invalid cron schedule/)).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "Create job" })).toBeVisible();
+  await expectNoA11yViolations(page, "the new job dialog with an invalid schedule");
 });
 
 test("runs a job now, and its history opens with the run", async ({ page, consoleServer }) => {

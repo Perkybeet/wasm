@@ -5,6 +5,7 @@ import { Component } from "react";
 import type { ErrorInfo, ReactNode } from "react";
 
 import { Button } from "../components/ui/Button";
+import { SystemOutput } from "../components/ui/SystemOutput";
 import { describeError } from "../lib/errors";
 
 /**
@@ -22,9 +23,9 @@ export function PageError({ error, onRetry }: { error: unknown; onRetry?: () => 
       <p className="text-14 text-fg-muted">
         {hint ?? "Reload to try again. If it fails the same way, the message below is what to report."}
       </p>
-      <pre className="overflow-x-auto rounded-control border border-border bg-bg-sunken px-3 py-2.5 text-13 whitespace-pre-wrap text-fg scroll-thin">
+      <SystemOutput label="The error" maxHeight="max-h-96" className="rounded-control border border-border bg-bg-sunken px-3 py-2.5 text-13">
         {detail}
-      </pre>
+      </SystemOutput>
       <div className="flex gap-2 pt-1">
         <Button
           variant="secondary"

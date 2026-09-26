@@ -26,7 +26,8 @@ export function PageHeader({ title, description, actions, breadcrumbs }: PageHea
   useDocumentTitle(title);
   return (
     <header className="mb-8 flex flex-wrap items-end justify-between gap-x-6 gap-y-4">
-      <div className="min-w-0 flex-1 basis-80">
+      {/* 240px before the actions wrap under: a phone keeps a lone menu button beside the title. */}
+      <div className="min-w-0 flex-1 basis-60">
         {breadcrumbs && breadcrumbs.length > 0 ? (
           <nav aria-label="Breadcrumb" className="mb-2">
             <ol className="flex flex-wrap items-center gap-1 text-13 text-fg-muted">

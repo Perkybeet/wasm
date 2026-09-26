@@ -359,9 +359,11 @@ function ConfigFileLine() {
   if (data === undefined) return <Skeleton className="h-4 w-72" />;
   return (
     <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-13 text-fg-muted">
-      <FileCog aria-hidden="true" className="size-4 text-fg-faint" />
-      <span>
-        Saved to <span className="mono text-12 text-fg">{data.path}</span>
+      <span className="flex min-w-0 items-start gap-2">
+        <FileCog aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-fg-faint" />
+        <span className="min-w-0">
+          Saved to <span className="mono text-12 break-all text-fg">{data.path}</span>
+        </span>
       </span>
       {data.writable ? null : (
         <span className="flex items-center gap-1.5 text-fail">

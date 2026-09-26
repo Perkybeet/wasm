@@ -297,3 +297,19 @@
     opacity: 1;
   }
 }
+
+/*
+ * A tab strip wider than its screen scrolls sideways; an end that hides tabs fades out, so
+ * the row reads as continuing rather than ending at the last visible tab (see useTabStrip).
+ */
+@layer components {
+  .tab-strip[data-overflow="end"] {
+    mask-image: linear-gradient(to right, #000 calc(100% - 2rem), transparent);
+  }
+  .tab-strip[data-overflow="start"] {
+    mask-image: linear-gradient(to left, #000 calc(100% - 2rem), transparent);
+  }
+  .tab-strip[data-overflow="both"] {
+    mask-image: linear-gradient(to right, transparent, #000 2rem, #000 calc(100% - 2rem), transparent);
+  }
+}

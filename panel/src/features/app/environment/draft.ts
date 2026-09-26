@@ -8,7 +8,6 @@
  * unmasked map, read fresh when the operator reviews, to build exactly what is saved.
  */
 
-import { readBack } from "./dotenv";
 
 export type DraftOp =
   | { kind: "set"; name: string; value: string }
@@ -84,8 +83,6 @@ export interface EnvChange {
   kind: "added" | "changed" | "removed";
   before: string | null;
   after: string | null;
-  /** What WASM will read back when it differs from `after` (the writer does not quote). */
-  readsBackAs: string | null;
 }
 
 export interface EnvDiff {
@@ -99,18 +96,14 @@ export interface EnvDiff {
 export function diffEnv(before: EnvMap, next: Map<string, string>): EnvDiff {
   const changes: EnvChange[] = [];
   let unchanged = 0;
-  const withReadBack = (value: string): string | null => {
-    const back = readBack(value);
-    return back === value ? null : back;
-  };
   for (const [name, value] of next) {
     const old = before.get(name);
-    if (old === undefined) changes.push({ name, kind: "added", before: null, after: value, readsBackAs: withReadBack(value) });
-    else if (old !== value) changes.push({ name, kind: "changed", before: old, after: value, readsBackAs: withReadBack(value) });
+    if (old === undefined) changes.push({ name, kind: "added", before: null, after: value });
+    else if (old !== value) changes.push({ name, kind: "changed", before: old, after: value });
     else unchanged += 1;
   }
   for (const [name, value] of before) {
-    if (!next.has(name)) changes.push({ name, kind: "removed", before: value, after: null, readsBackAs: null });
+    if (!next.has(name)) changes.push({ name, kind: "removed", before: value, after: null });
   }
   return { changes, unchanged, next };
 }

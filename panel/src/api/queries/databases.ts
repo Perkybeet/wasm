@@ -18,6 +18,7 @@ export type UserList = ResponseOf<"/api/databases/users/{engine}", "get">;
 export type DatabaseUser = UserList["users"][number];
 export type DatabaseBackupList = ResponseOf<"/api/databases/backups", "get">;
 export type DatabaseBackup = DatabaseBackupList["backups"][number];
+export type PrivilegesResponse = ResponseOf<"/api/databases/engines/{engine}/privileges", "get">;
 
 export const databaseKeys = {
   all: ["databases"] as const,
@@ -26,6 +27,7 @@ export const databaseKeys = {
   detail: (engine: string, name: string) => ["database", engine, name] as const,
   users: (engine: string) => ["databases", "users", engine] as const,
   backups: (engine: string | null, database: string | null) => ["databases", "backups", { engine, database }] as const,
+  privileges: (engine: string) => ["databases", "privileges", engine] as const,
 };
 
 export const enginesQuery = () =>
@@ -52,6 +54,14 @@ export const databaseUsersQuery = (engine: string) =>
   queryOptions({
     queryKey: databaseKeys.users(engine),
     queryFn: ({ signal }) => request("get", "/api/databases/users/{engine}", { params: { engine }, signal }),
+  });
+
+/** The privileges an engine's own manager will grant - its one whitelist, not a copy of it. */
+export const enginePrivilegesQuery = (engine: string) =>
+  queryOptions({
+    queryKey: databaseKeys.privileges(engine),
+    queryFn: ({ signal }) =>
+      request("get", "/api/databases/engines/{engine}/privileges", { params: { engine }, signal }),
   });
 
 /** Dumps `BaseDatabaseManager.list_backups` finds on disk, for one database or a whole engine. */

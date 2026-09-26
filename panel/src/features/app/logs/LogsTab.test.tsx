@@ -81,9 +81,7 @@ describe("the logs tab", { timeout: 20_000 }, () => {
     const { user } = await logsAt();
     await socket();
     const search = await screen.findByRole("searchbox", { name: "Search output" });
-    await waitFor(() => {
-      expect(search).toHaveAttribute("data-page-search");
-    });
+    expect(search).toHaveAttribute("data-page-search");
     await user.keyboard("/");
     expect(search).toHaveFocus();
   });

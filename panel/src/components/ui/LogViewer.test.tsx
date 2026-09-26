@@ -3,10 +3,23 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { expectNoAxeViolations } from "../../test/axe";
+import { downloadText } from "../../lib/clipboard";
 import type { LogLine } from "./LogViewer";
 import { LogViewer } from "./LogViewer";
 
+// The real implementation still runs (so the download tests below exercise the actual blob
+// and anchor dance), wrapped so its calls - and the exact text passed to it - can be asserted.
+vi.mock("../../lib/clipboard", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../lib/clipboard")>();
+  return { ...actual, downloadText: vi.fn(actual.downloadText) };
+});
+
 const ESC = "\u001b";
+
+/** A narrow-viewport `matchMedia`, as the `(max-width: 639px)` query LogViewer reads for it. */
+function mockViewport(matches: boolean) {
+  vi.spyOn(window, "matchMedia").mockReturnValue({ matches } as MediaQueryList);
+}
 
 function lines(count: number, text = (i: number) => `line ${String(i)}`): LogLine[] {
   return Array.from({ length: count }, (_, i) => ({ id: i + 1, text: text(i + 1) }));
@@ -159,6 +172,34 @@ describe("LogViewer", () => {
     expect(screen.getByText("line 1")).toHaveClass("whitespace-pre-wrap");
   });
 
+  describe("the default wrap state", () => {
+    it("starts wrapped on a narrow viewport", () => {
+      mockViewport(true);
+      render(<LogViewer lines={lines(1)} />);
+      expect(screen.getByRole("button", { name: "Wrap lines" })).toHaveAttribute("aria-pressed", "true");
+    });
+
+    it("starts unwrapped on a wide viewport", () => {
+      mockViewport(false);
+      render(<LogViewer lines={lines(1)} />);
+      expect(screen.getByRole("button", { name: "Wrap lines" })).toHaveAttribute("aria-pressed", "false");
+    });
+
+    it("lets an explicit wrap prop override the viewport", () => {
+      mockViewport(true);
+      render(<LogViewer lines={lines(1)} wrap={false} />);
+      expect(screen.getByRole("button", { name: "Wrap lines" })).toHaveAttribute("aria-pressed", "false");
+    });
+
+    it("still toggles by hand after starting wrapped from a narrow viewport", async () => {
+      mockViewport(true);
+      render(<LogViewer lines={lines(1)} />);
+      const toggle = screen.getByRole("button", { name: "Wrap lines" });
+      await userEvent.click(toggle);
+      expect(toggle).toHaveAttribute("aria-pressed", "false");
+    });
+  });
+
   it("copies the output as plain text, without escape codes", async () => {
     const writeText = vi.fn(() => Promise.resolve());
     vi.stubGlobal("isSecureContext", true);
@@ -166,6 +207,29 @@ describe("LogViewer", () => {
     render(<LogViewer lines={[{ id: 1, text: `${ESC}[32mok${ESC}[0m` }, { id: 2, text: "done" }]} />);
     await userEvent.click(screen.getByRole("button", { name: "Copy output" }));
     expect(writeText).toHaveBeenCalledWith("ok\ndone");
+    vi.unstubAllGlobals();
+  });
+
+  it("keeps the time column, not the line-number gutter, in copied and downloaded text", async () => {
+    const writeText = vi.fn(() => Promise.resolve());
+    vi.stubGlobal("isSecureContext", true);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    Object.assign(URL, { createObjectURL: vi.fn(() => "blob:log"), revokeObjectURL: vi.fn() });
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    render(
+      <LogViewer
+        lines={[
+          { id: 1, text: `${ESC}[32mok${ESC}[0m`, ts: "14:31:01" },
+          { id: 2, text: "done" },
+        ]}
+        filename="shop-journal.log"
+      />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Copy output" }));
+    expect(writeText).toHaveBeenCalledWith("14:31:01 ok\ndone");
+
+    await userEvent.click(screen.getByRole("button", { name: "Download output" }));
+    expect(downloadText).toHaveBeenCalledWith("shop-journal.log", "14:31:01 ok\ndone\n");
     vi.unstubAllGlobals();
   });
 
@@ -178,6 +242,7 @@ describe("LogViewer", () => {
     expect(createObjectURL).toHaveBeenCalledOnce();
     const anchor = click.mock.contexts[0] as HTMLAnchorElement;
     expect(anchor.download).toBe("shop-a1b2c3d.log");
+    expect(downloadText).toHaveBeenCalledWith("shop-a1b2c3d.log", "line 1\nline 2\n");
   });
 
   it("asks for older lines when scrolled to the top, once per batch", () => {
@@ -195,6 +260,24 @@ describe("LogViewer", () => {
     render(<LogViewer lines={[]} emptyMessage="Waiting for the build to start." />);
     expect(screen.getByText("Waiting for the build to start.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Download output" })).toBeDisabled();
+  });
+
+  describe("pageSearch", () => {
+    it("leaves the search box out of the page's `/` target by default", () => {
+      render(<LogViewer lines={lines(1)} />);
+      expect(screen.getByRole("searchbox", { name: "Search output" })).not.toHaveAttribute("data-page-search");
+      expect(screen.queryByText("/")).not.toBeInTheDocument();
+    });
+
+    it("registers the search box as the page's `/` target and hints it while empty", async () => {
+      render(<LogViewer lines={lines(1)} pageSearch />);
+      const search = screen.getByRole("searchbox", { name: "Search output" });
+      expect(search).toHaveAttribute("data-page-search");
+      expect(screen.getByText("/")).toBeInTheDocument();
+
+      await userEvent.type(search, "a");
+      expect(screen.queryByText("/")).not.toBeInTheDocument();
+    });
   });
 
   it("has no accessibility violations, with and without a search", async () => {

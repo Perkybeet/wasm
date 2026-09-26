@@ -26,7 +26,9 @@ function deploy(id: number, status = "success", extra: Record<string, unknown> =
 
 /** Thirteen deploys, newest first, served ten at a time with keyset pagination. */
 const history: RouteHandler = (call) => {
-  const all = Array.from({ length: 13 }, (_, i) => deploy(25 - i, i === 5 ? "failed" : "success"));
+  const all = Array.from({ length: 13 }, (_, i) =>
+    deploy(25 - i, i === 5 ? "failed" : "success", i === 0 ? { commit_message: "Redesign checkout summary" } : {}),
+  );
   const before = call.search.get("before_id");
   const limit = Number(call.search.get("limit") ?? "50");
   const rows = before === null ? all : all.filter((row) => row.id < Number(before));
@@ -61,6 +63,8 @@ describe("the deployments tab", { timeout: 20_000 }, () => {
     expect(within(table).getByRole("link", { name: "Deployment 25" })).toHaveAttribute("href", `/apps/${TAB_DOMAIN}/deployments/25`);
     expect(within(table).getByText("Failed")).toBeInTheDocument();
     expect(screen.getByText("Showing 10 of 13")).toBeInTheDocument();
+    // The commit's own subject line, beside its hash, truncated but reachable in full on hover.
+    expect(within(table).getByTitle("Redesign checkout summary")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Load older deploys" }));
     await within(table).findByRole("link", { name: "Deployment 13" });

@@ -93,7 +93,7 @@ describe("the metrics tab", { timeout: 20_000 }, () => {
     expect(within(deploys).queryByRole("link", { name: /^Deploy 9/ })).not.toBeInTheDocument();
   });
 
-  it("keeps the range in the URL and reads the thirty-day tier for a week", async () => {
+  it("keeps the range in the URL and reads the week's own window", async () => {
     const { user, location, backend } = await metricsAt();
     await screen.findByRole("img", { name: /^CPU, last 24 hours/ });
     await user.click(screen.getByRole("radio", { name: "7d" }));
@@ -102,8 +102,8 @@ describe("the metrics tab", { timeout: 20_000 }, () => {
     });
     expect(await screen.findByRole("img", { name: /^CPU, last 7 days/ })).toBeInTheDocument();
     const cpu = backend.callsTo(`GET /api/metrics/app.${TAB_DOMAIN}.cpu.percent`).at(-1);
-    expect(cpu?.search.get("window")).toBe("30d");
-    // The nine-day-old reading is cut from the week.
+    expect(cpu?.search.get("window")).toBe("7d");
+    // A reading older than the week, should the store answer one, is not drawn in it.
     expect(await screen.findByText(/peak 30% at/)).toBeInTheDocument();
   });
 
