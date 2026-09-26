@@ -1,0 +1,1 @@
+import{i as e,o as t}from"./cx-DTdc60p7.js";import{P as n,R as r}from"./errors-DiqCMoSt.js";var i=t(e(),1);function a(e,t){let a=i.useRef(e),o=n(t);r(()=>{a.current!==e&&o(a.current),a.current=e},[e,o])}export{a as t};

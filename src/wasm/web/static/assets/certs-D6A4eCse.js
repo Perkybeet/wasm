@@ -1,1 +1,0 @@
-import{c as e,p as t}from"./auth-DhE7TJDV.js";var n={all:[`certs`],detail:e=>[`cert`,e]},r=()=>t({queryKey:n.all,queryFn:({signal:t})=>e(`get`,`/api/certs`,{signal:t})});export{r as t};

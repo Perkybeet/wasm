@@ -1,0 +1,1 @@
+var e={initialMs:1e3,maxMs:3e4};function t(t){return Math.min(e.maxMs,e.initialMs*2**Math.max(0,t))}export{t};

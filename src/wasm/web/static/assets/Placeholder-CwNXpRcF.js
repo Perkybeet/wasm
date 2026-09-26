@@ -1,1 +1,0 @@
-import{r as e}from"./cx-DTdc60p7.js";import{t}from"./documentTitle-C_TXMSkD.js";import{t as n}from"./EmptyState-lEMX4zQq.js";var r=e();function i({icon:e,title:i,description:a,command:o,action:s,documentTitle:c}){return t(c??null,1),(0,r.jsx)(n,{level:2,icon:e,title:i,description:a,...o===void 0?{}:{command:o},...s===void 0?{}:{action:s},className:`py-16`})}export{i as t};
