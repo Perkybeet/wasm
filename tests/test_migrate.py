@@ -27,7 +27,7 @@ from typing import Any
 
 import pytest
 
-from wasm.core.exceptions import DeploymentError, ValidationError, WASMError
+from wasm.core.exceptions import DeploymentError, ServiceError, ValidationError, WASMError
 from wasm.core.fs import DryRunFileSystem, RealFileSystem, set_fs
 from wasm.core.runner import FakeRunner
 from wasm.core.store import App, Service, Site, WASMStore
@@ -48,6 +48,12 @@ class FakeUnits:
         self.root = root
         self.bodies: dict[str, str] = {}
         self.restarts: list[str] = []
+        self.stops: list[bool] = []
+
+    def stop(self, name: str) -> bool:
+        # Whether the live tree was still in place when the unit stopped.
+        self.stops.append((self.root / "server.js").is_file())
+        return True
 
     def get_service_config(self, name: str) -> str | None:
         return self.bodies.get(name)
@@ -426,12 +432,14 @@ def test_a_step_that_fails_halfway_is_undone_exactly(
             super().move(source, destination)
 
     set_fs(FailingMoves())
-    with pytest.raises(OSError, match="No space left"):
+    with pytest.raises(DeploymentError, match="No space left") as failure:
         migrate(DOMAIN, plan)
     set_fs(None)
 
     assert snapshot(root) == before
     assert machine.units.restarts == ["in place"]
+    assert "Everything was put back" in failure.value.details
+    assert isinstance(failure.value.__cause__, OSError)
 
 
 def test_a_rehearsed_migration_changes_nothing(root: Path, store: WASMStore, machine: Any) -> None:
@@ -551,3 +559,236 @@ def test_a_file_lost_on_the_way_fails_the_migration(
     assert machine.units.restarts == ["in place"]
     app = store.get_app(DOMAIN)
     assert app is not None and app.layout == "inplace"
+
+
+# ---------------------------------------------------------------------------
+# The unit is stopped while its tree moves
+# ---------------------------------------------------------------------------
+
+
+def test_the_unit_is_stopped_before_anything_moves(
+    root: Path, store: WASMStore, machine: Any
+) -> None:
+    """A running Next.js recreates .next under a moving tree; the undo then cannot put it back."""
+    plan = plan_migration(DOMAIN)
+
+    migrate(DOMAIN, plan)
+
+    assert machine.units.stops == [True], "stopped once, with the tree still in place"
+    assert machine.units.restarts == [f"releases/{plan_release(root)}"]
+
+
+def plan_release(root: Path) -> str:
+    """The release current points at."""
+    return Path(os.readlink(root / "current")).name
+
+
+def test_the_plan_states_the_downtime(root: Path, machine: Any) -> None:
+    plan = plan_migration(DOMAIN)
+
+    assert any(
+        "shop-example-com is stopped" in warning and "down" in warning for warning in plan.warnings
+    )
+
+
+def test_a_unit_that_would_not_stop_moves_nothing(
+    root: Path, store: WASMStore, machine: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    before = snapshot(root)
+    plan = plan_migration(DOMAIN)
+
+    def refuse(name: str) -> bool:
+        raise ServiceError(f"Failed to stop {name}", details="Job for it canceled")
+
+    monkeypatch.setattr(machine.units, "stop", refuse)
+    with pytest.raises(ServiceError, match="Failed to stop"):
+        migrate(DOMAIN, plan)
+
+    assert snapshot(root) == before
+    assert machine.units.restarts == ["in place"]
+
+
+def test_a_failure_after_the_build_moved_is_undone_and_says_what_stayed(
+    root: Path, store: WASMStore, machine: Any
+) -> None:
+    """
+    The build output moved, the next rename fails, and one reversal fails too.
+
+    Every other change is still reversed, and the one error raised says what
+    could not be put back and where it is now.
+    """
+    (root / ".next" / "server").mkdir(parents=True)
+    (root / ".next" / "BUILD_ID").write_text("build-1")
+    plan = plan_migration(DOMAIN)
+
+    class Failing(RealFileSystem):
+        def move(self, source: Path, destination: Path) -> None:
+            if source == root / ".wasm":
+                assert (destination.parent / ".next" / "BUILD_ID").is_file(), "after .next"
+                raise OSError("No space left on device")
+            if destination == root / ".git":
+                raise OSError("Permission denied")
+            super().move(source, destination)
+
+    set_fs(Failing())
+    with pytest.raises(DeploymentError, match="No space left") as failure:
+        migrate(DOMAIN, plan)
+    set_fs(None)
+
+    staging = next(root.glob(".wasm-migrating-*"))
+    details = failure.value.details
+    assert "Not put back" in details
+    assert f"{root / '.git'} is still at {staging / '.git'}" in details
+    assert "Permission denied" in details
+    # Everything else was reversed, the build output included.
+    assert (root / ".next" / "BUILD_ID").read_text() == "build-1"
+    assert (root / "node_modules" / "dep" / "index.js").is_file()
+    assert (root / ".env").read_text() == "SECRET=1\n"
+    assert (root / "server.js").is_file()
+    assert (staging / ".git" / "HEAD").is_file()
+    assert machine.units.restarts == ["in place"]
+    app = store.get_app(DOMAIN)
+    assert app is not None and app.layout == "inplace"
+
+
+def test_every_reversal_runs_even_when_one_raises_something_unexpected(
+    root: Path, store: WASMStore, machine: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reversal that fails in a way nobody planned for does not stop the others."""
+    before = snapshot(root)
+    plan = plan_migration(DOMAIN)
+    monkeypatch.setattr(lifecycle, "wait_until_healthy", lambda url, **kw: False)
+
+    def broken_undo(name: str, content: str) -> str:
+        if "current" not in content:
+            raise RuntimeError("systemd went away")
+        return FakeUnits.update_config(machine.units, name, content)
+
+    monkeypatch.setattr(machine.units, "update_config", broken_undo)
+    with pytest.raises(DeploymentError, match="did not pass its health check") as failure:
+        migrate(DOMAIN, plan)
+
+    assert "systemd went away" in failure.value.details
+    assert snapshot(root) == before, "the tree was put back all the same"
+
+
+# ---------------------------------------------------------------------------
+# SQLite databases in the tree
+# ---------------------------------------------------------------------------
+
+SQLITE_HEADER = b"SQLite format 3\x00" + b"\x00" * 84
+
+
+def with_database(root: Path, machine: Any, relative: str = "db.sqlite3") -> None:
+    """Give the application a SQLite database in WAL mode, which git does not track."""
+    database = root / relative
+    database.parent.mkdir(parents=True, exist_ok=True)
+    database.write_bytes(SQLITE_HEADER + b"rows")
+    (root / f"{relative}-wal").write_bytes(b"committed but not checkpointed")
+    (root / f"{relative}-shm").write_bytes(b"index")
+    prefix = ["git", "-c", f"safe.directory={root}", "--no-optional-locks"]
+    machine.runner.script(
+        [*prefix, "status"],
+        stdout="\0".join(
+            [
+                "?? uploads/",
+                "!! node_modules/",
+                "!! .env",
+                "?? .env.local",
+                "?? notes.txt",
+                "?? .wasm/",
+                f"!! {relative}",
+                f"!! {relative}-wal",
+                f"!! {relative}-shm",
+                "",
+            ]
+        ),
+    )
+
+
+def test_a_sqlite_database_is_shared_and_its_wal_moves_with_it(
+    root: Path, store: WASMStore, machine: Any
+) -> None:
+    """Left in the first release, the next deploy would start from an empty database."""
+    with_database(root, machine)
+
+    plan = plan_migration(DOMAIN)
+
+    assert "db.sqlite3" in plan.persistent
+    assert plan.companions == ("db.sqlite3-shm", "db.sqlite3-wal")
+    assert not any("db.sqlite3" in f for f in plan.untracked_files)
+    assert any("SQLite" in warning and "db.sqlite3" in warning for warning in plan.warnings)
+
+    migrate(DOMAIN, plan)
+
+    shared = root / "shared"
+    assert (shared / "db.sqlite3").read_bytes().startswith(b"SQLite format 3")
+    assert (shared / "db.sqlite3-wal").read_bytes() == b"committed but not checkpointed"
+    assert (shared / "db.sqlite3-shm").is_file()
+    release = root / "current"
+    assert os.readlink(release / "db.sqlite3") == "../../shared/db.sqlite3"
+    # SQLite resolves the link and keeps its -wal and -shm beside the real file.
+    assert not os.path.lexists(release / "db.sqlite3-wal")
+    assert "db.sqlite3" in store.get_app(DOMAIN).persistent_paths
+    assert "db.sqlite3-wal" not in store.get_app(DOMAIN).persistent_paths
+
+
+def test_a_database_inside_a_shared_directory_needs_nothing_more(
+    root: Path, store: WASMStore, machine: Any
+) -> None:
+    with_database(root, machine, "uploads/cache.db")
+
+    plan = plan_migration(DOMAIN)
+
+    assert plan.persistent == (".env.local", "uploads")
+    assert plan.companions == ()
+
+
+def test_a_database_outside_the_named_paths_is_refused(root: Path, machine: Any) -> None:
+    """--persist is the operator's list; one that forgets the database is not guessed at."""
+    with_database(root, machine, "var/app.db")
+
+    with pytest.raises(DeploymentError, match=r"var/app\.db") as refused:
+        plan_migration(DOMAIN, ["uploads"])
+
+    assert "--persist var" in refused.value.details
+
+
+def test_a_database_git_tracks_is_warned_about(root: Path, machine: Any) -> None:
+    """The next deploy's copy from the repository would win over the one in shared/."""
+    (root / "seed.db").write_bytes(SQLITE_HEADER)
+
+    plan = plan_migration(DOMAIN)
+
+    assert "seed.db" in plan.persistent
+    assert any("seed.db" in warning and "tracked" in warning for warning in plan.warnings)
+
+
+def test_build_output_and_non_databases_are_not_mistaken_for_databases(
+    root: Path, machine: Any
+) -> None:
+    (root / "node_modules" / "dep" / "fixtures.db").write_bytes(SQLITE_HEADER)
+    (root / "public" / "fonts.db").write_text("not a database")
+
+    plan = plan_migration(DOMAIN)
+
+    assert plan.persistent == (".env.local", "uploads")
+    assert plan.companions == ()
+
+
+def test_a_migration_is_refused_while_another_operation_runs(
+    root: Path, store: WASMStore, machine: Any
+) -> None:
+    """An update building in the tree, or a restore replacing it, must not see it move."""
+    from tests.test_applock import Holder
+    from wasm.core.applock import AppBusyError
+
+    before = snapshot(root)
+    plan = plan_migration(DOMAIN)
+
+    with Holder(DOMAIN, "update"), pytest.raises(AppBusyError, match="update started at"):
+        migrate(DOMAIN, plan)
+
+    assert snapshot(root) == before
+    assert machine.units.stops == []
+    assert store.list_deployments(DOMAIN) == []

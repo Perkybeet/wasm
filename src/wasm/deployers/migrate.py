@@ -26,11 +26,21 @@ The rules, and why:
   uploads directory is almost always in ``.gitignore``). Without git the
   operator names them (``--persist``), or a conservative list of the usual
   upload directories that exist is used.
+- **Nothing moves under a running process.** The unit is stopped before the
+  first rename and started again on the release layout, or on the tree it had
+  after an undo. A Next.js server left running writes into ``.next`` while it
+  moves, and a reversal then finds its source taken and cannot put it back.
 - **A migration that does not come up is undone exactly.** The unit and the
   site are rewritten, the application restarted and put through the same
   health gate as a deploy. If it does not answer, every rename is reversed,
   the unit and site are put back byte for byte and the application restarted
-  on the tree it had.
+  on the tree it had. Every reversal is attempted even when an earlier one
+  fails, and the error names each thing that could not be put back and where
+  it is now.
+- **A SQLite database is data, not code.** One found in the tree moves to
+  ``shared/`` with the ``-wal`` and ``-shm`` files beside it, which hold
+  committed transactions until the next checkpoint. Left in the first
+  release, the next deploy would start from an empty database.
 - **``--dry-run`` changes nothing.** The plan only reads, and a rehearsed
   migration announces its renames through the filesystem seam and stops.
 """
@@ -47,6 +57,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
+from wasm.core.applock import app_lock
 from wasm.core.config import Config
 from wasm.core.exceptions import DeploymentError, ValidationError, WASMError
 from wasm.core.fs import FileSystem, get_fs, is_rehearsal
@@ -113,6 +124,19 @@ COMMON_PERSISTENT: tuple[str, ...] = ("uploads", "public/uploads", "storage", "d
 #: WASM's own inventory of the variables, written next to the ``.env``.
 ENV_INVENTORY = ".wasm"
 
+#: Names a SQLite database is given. Only files named like this are opened to
+#: read their header, so planning does not read a large tree file by file.
+SQLITE_SUFFIXES = (".sqlite", ".sqlite3", ".db", ".db3", ".s3db", ".sl3")
+
+#: The first 16 bytes of every SQLite 3 database.
+_SQLITE_HEADER = b"SQLite format 3\x00"
+
+#: What SQLite keeps beside a database: the write-ahead log holds committed
+#: transactions until they are checkpointed into the database, the rollback
+#: journal an interrupted one. Always next to the file SQLite resolved, so
+#: next to the real database in shared/, never next to a release's link.
+SQLITE_COMPANIONS = ("-journal", "-shm", "-wal")
+
 #: How the persistent paths of a plan were chosen.
 FROM_GIT = "git"
 FROM_OPERATOR = "explicit"
@@ -172,8 +196,13 @@ class MigrationPlan:
         untracked_files: Files git does not track that are not in a
             persistent path. They stay in the first release only: the next
             deploy will not have them. Name one with ``--persist`` to keep it.
-        warnings: Anything the operator should know before going ahead.
+        warnings: Anything the operator should know before going ahead,
+            the downtime included.
         count: What the directory holds now.
+        companions: The ``-wal``, ``-shm`` and ``-journal`` files of the
+            SQLite databases in ``persistent``, which move to ``shared/``
+            with them and are not linked: SQLite finds them beside the real
+            file.
     """
 
     domain: str
@@ -189,6 +218,7 @@ class MigrationPlan:
     untracked_files: tuple[str, ...]
     warnings: tuple[str, ...]
     count: TreeCount
+    companions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -250,6 +280,8 @@ def plan_migration(
         DeploymentError: It is already on releases, its type cannot build
             releases, or its directory is missing.
         ValidationError: A path in ``persist`` is not a path inside it.
+        DeploymentError: The paths named in ``persist`` leave a SQLite
+            database out.
     """
     app = _inplace_app(validate_domain(domain))
     root = app_root(app)
@@ -279,6 +311,10 @@ def plan_migration(
             + "Name every other one with --persist."
         )
 
+    persistent, companions = _with_databases(
+        root, persistent, source, commit, untracked_dirs, untracked_files, warnings
+    )
+
     for path in persistent:
         blocked = first_obstacle(root, PurePosixPath(path))
         if blocked is not None or (root / path).is_symlink():
@@ -302,7 +338,9 @@ def plan_migration(
     left = tuple(
         f
         for f in untracked_files
-        if f not in env_files and not any(PurePosixPath(f).is_relative_to(k) for k in kept)
+        if f not in env_files
+        and f not in companions
+        and not any(PurePosixPath(f).is_relative_to(k) for k in kept)
     )
     if left:
         warnings.append(
@@ -313,6 +351,7 @@ def plan_migration(
     unit = None if app.is_static else _unit_name(app, get_store())
     unit_text = ServiceManager().get_service_config(unit) if unit else None
     site_text = _webserver_for(app).get_site_config(app.domain)
+    warnings.append(_downtime(unit))
 
     return MigrationPlan(
         domain=app.domain,
@@ -328,7 +367,155 @@ def plan_migration(
         untracked_files=left,
         warnings=tuple(warnings),
         count=count_tree(root),
+        companions=companions,
     )
+
+
+def _downtime(unit: str | None) -> str:
+    """
+    Say how long the application is unavailable while it migrates.
+
+    Args:
+        unit: The unit that runs it, or None for a site the web server serves.
+
+    Returns:
+        The sentence for the plan.
+    """
+    if unit is None:
+        return (
+            "The site answers with errors while its files move and the site is reloaded to "
+            "serve current: usually under a second."
+        )
+    return (
+        f"{unit} is stopped before anything moves and started again on the release layout, "
+        "where it must pass its health check: the application is down from the stop until it "
+        "answers, usually a few seconds and at most about half a minute. If it does not answer, "
+        "the tree is put back and it is started again as it was."
+    )
+
+
+def _with_databases(
+    root: Path,
+    persistent: Sequence[str],
+    source: str,
+    commit: str | None,
+    untracked_dirs: Sequence[str],
+    untracked_files: Sequence[str],
+    warnings: list[str],
+) -> tuple[list[str], tuple[str, ...]]:
+    """
+    Keep every SQLite database of the tree in ``shared/``, with its WAL.
+
+    A database left in the first release is not in the next one: the next
+    deploy would start from an empty database, and the data would go with
+    the first release when it is pruned.
+
+    Args:
+        root: The application directory.
+        persistent: The paths chosen so far.
+        source: How they were chosen.
+        commit: The commit the tree is at, when it is a git checkout.
+        untracked_dirs: What git does not track, directories.
+        untracked_files: What git does not track, files.
+        warnings: Where what the operator should know is added.
+
+    Returns:
+        The persistent paths, databases added, and the companions of the
+        databases that are persistent paths of their own.
+
+    Raises:
+        DeploymentError: The operator named the persistent paths and left a
+            database out; it is not guessed at.
+    """
+    databases = _sqlite_databases(root)
+    chosen = [PurePosixPath(p) for p in persistent]
+    uncovered = [
+        db for db in databases if not any(PurePosixPath(db).is_relative_to(k) for k in chosen)
+    ]
+    if uncovered and source == FROM_OPERATOR:
+        raise DeploymentError(
+            f"SQLite database(s) outside the paths named with --persist: {', '.join(uncovered)}",
+            details="A database left in the first release is not in the next one: the next "
+            "deploy would start from an empty database. Name each one, or the directory that "
+            "holds it, too: " + " ".join(_persist_hint(db) for db in uncovered),
+        )
+    if uncovered:
+        warnings.append(
+            f"SQLite database(s) move to shared/ with their -wal and -shm files, and every release "
+            f"links them: {', '.join(uncovered)}."
+        )
+    result = [*persistent, *(db for db in uncovered if db not in persistent)]
+
+    if commit:
+        tracked = [
+            db
+            for db in databases
+            if db not in untracked_files
+            and not any(PurePosixPath(db).is_relative_to(d) for d in untracked_dirs)
+        ]
+        for db in tracked:
+            warnings.append(
+                f"{db} is a SQLite database tracked by git: it moves to shared/, but a deploy "
+                "uses the repository's copy instead of the shared one for as long as the "
+                f"repository tracks it. Untrack it (git rm --cached {db}) before the next deploy."
+            )
+
+    companions = tuple(
+        sorted(
+            f"{db}{suffix}"
+            for db in databases
+            if db in result
+            for suffix in SQLITE_COMPANIONS
+            if os.path.lexists(root / f"{db}{suffix}") and not (root / f"{db}{suffix}").is_symlink()
+        )
+    )
+    return result, companions
+
+
+def _persist_hint(database: str) -> str:
+    """
+    Suggest the ``--persist`` that keeps a database.
+
+    Args:
+        database: Its path, relative to the application.
+
+    Returns:
+        Its directory, or the file itself at the top of the tree.
+    """
+    parent = PurePosixPath(database).parent
+    return f"--persist {database}" if parent == PurePosixPath(".") else f"--persist {parent}"
+
+
+def _sqlite_databases(root: Path) -> list[str]:
+    """
+    Find the SQLite databases in an application tree.
+
+    Build output and installed dependencies are not looked into: a database
+    there is a fixture or a cache the next build makes again.
+
+    Args:
+        root: The application directory.
+
+    Returns:
+        Their paths, relative to the root.
+    """
+    found: list[str] = []
+    for directory, subdirectories, names in os.walk(root, followlinks=False):
+        subdirectories[:] = sorted(d for d in subdirectories if d not in BUILD_OUTPUTS)
+        for name in names:
+            if not name.lower().endswith(SQLITE_SUFFIXES):
+                continue
+            path = Path(directory) / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                with path.open("rb") as handle:
+                    header = handle.read(len(_SQLITE_HEADER))
+            except OSError:
+                continue
+            if header == _SQLITE_HEADER:
+                found.append(path.relative_to(root).as_posix())
+    return sorted(found)
 
 
 def _inplace_app(domain: str) -> App:
@@ -706,10 +893,12 @@ class _Journal:
 
         def undo() -> None:
             if os.path.lexists(source):
-                raise OSError(f"{source} exists again, so {destination} was left where it is")
+                raise OSError(f"something was created at {source} in the meantime")
             self._fs.move(destination, source)
 
-        self.record(f"moved {source} to {destination}", undo)
+        # Worded as where it is if it cannot be put back: that is what the
+        # operator needs from the error.
+        self.record(f"{source} is still at {destination}", undo)
 
     def made_dir(self, path: Path) -> None:
         """
@@ -728,7 +917,7 @@ class _Journal:
         Args:
             path: The directory.
         """
-        self.record(f"created {path}", lambda: self.remove_empty(path))
+        self.record(f"{path} was created by the migration", lambda: self.remove_empty(path))
 
     def created_link(self, path: Path) -> None:
         """
@@ -742,17 +931,38 @@ class _Journal:
             if path.is_symlink():
                 self._fs.remove(path)
 
-        self.record(f"linked {path}", undo)
+        self.record(f"{path} is a link the migration made", undo)
 
     def undo(self) -> None:
-        """Reverse every change, newest first."""
+        """
+        Reverse every change, newest first, whatever each reversal raises.
+
+        One reversal that fails must not leave the ones after it undone: a
+        renamed build directory is no less worth putting back because the
+        unit before it could not be rewritten. Each failure is logged and
+        kept in :attr:`failures`, for the error the migration raises.
+        """
         while self._entries:
             description, undo = self._entries.pop()
             try:
                 undo()
-            except (OSError, WASMError, sqlite3.Error) as exc:
+            # The undo is an error boundary: it runs after something already
+            # failed, and every reversal after this one must still be tried.
+            # What went wrong is logged and reported in the migration's error.
+            except Exception as exc:
                 self.failures.append(f"{description}: {exc}")
                 self._logger.error(f"Could not undo ({description}): {exc}")
+
+    def report(self) -> str:
+        """
+        Say what the undo could not put back, or that it put everything back.
+
+        Returns:
+            A paragraph for an error's details.
+        """
+        if not self.failures:
+            return "Everything was put back as it was."
+        return "\n".join(["Not put back:", *(f"  - {failure}" for failure in self.failures)])
 
     def remove_empty(self, path: Path) -> None:
         """
@@ -798,10 +1008,35 @@ def migrate(
         DeploymentError: The plan is not for this application as it is now,
             a step failed, or the application did not pass the health gate
             on the new layout. In each case everything was put back, and the
-            details say what, if anything, could not be.
+            details say what, if anything, could not be, and where it is.
+        ServiceError: The unit could not be stopped; nothing was moved.
+        AppBusyError: Another operation is running on the application.
     """
     log = logger if logger is not None else CapturingLogger()
-    app = _inplace_app(validate_domain(domain))
+    domain = validate_domain(domain)
+    # Nothing else may run on the application while its tree moves: an
+    # update building in it, a restore replacing it, a second migration.
+    with app_lock(domain, "migration"):
+        return _migrate(domain, plan, trigger=trigger, log=log)
+
+
+def _migrate(domain: str, plan: MigrationPlan, *, trigger: str, log: Logger) -> MigrationResult:
+    """
+    Migrate an application whose lock the caller holds.
+
+    Args:
+        domain: A validated domain.
+        plan: What :func:`plan_migration` said would be done.
+        trigger: Who asked, recorded in the deployment history.
+        log: Where progress is reported.
+
+    Returns:
+        What was done.
+
+    Raises:
+        DeploymentError: See :func:`migrate`.
+    """
+    app = _inplace_app(domain)
     root = app_root(app)
     if plan.domain != app.domain or Path(plan.app_path) != root:
         raise DeploymentError(
@@ -831,10 +1066,13 @@ def migrate(
         log.warning(f"Migration failed, restoring the in-place layout: {error}")
         journal.undo()
         if plan.unit:
+            # Started again whatever the undo managed: it was stopped for the
+            # migration, and the tree it runs from is as close to what it had
+            # as could be made.
             try:
                 services.restart(plan.unit)
             except WASMError as exc:
-                journal.failures.append(f"{plan.unit} did not restart in place: {exc}")
+                journal.failures.append(f"{plan.unit} did not start again in place: {exc}")
         restored = count_tree(root)
         if restored != before:
             journal.failures.append(
@@ -843,44 +1081,56 @@ def migrate(
         if journal.failures and isinstance(error, WASMError):
             # The operator must learn from the error itself, not from a log
             # line above it, that the tree is not exactly as it was.
-            error.details = "\n\n".join(
-                [error.details or "", "Not put back:", *journal.failures]
-            ).strip()
+            error.details = "\n\n".join([error.details or "", journal.report()]).strip()
 
-    with recording(recorder, git_branch=app.branch, on_failure=put_back):
-        staging, release = _move_into_release(root, plan, releases, journal, log)
-        created_dirs = _share(root, release, plan, releases, journal, log)
+    try:
+        with recording(recorder, git_branch=app.branch, on_failure=put_back):
+            if plan.unit:
+                # Before the first rename: a process running from the tree
+                # writes into it while it moves (Next.js recreates .next), and
+                # the undo of a rename whose source was recreated cannot run.
+                log.substep(f"Stopping {plan.unit} while its tree moves")
+                services.stop(plan.unit)
+            staging, release = _move_into_release(root, plan, releases, journal, log)
+            created_dirs = _share(root, release, plan, releases, journal, log)
 
-        # Counted before anything runs on the new layout, so an upload that
-        # arrives once it is serving is not mistaken for a file gained.
-        after = count_tree(root)
-        added_links = (ENV_FILE in plan.env_files) + len(plan.persistent) + 1
-        if (after.files, after.bytes) != (before.files, before.bytes) or (
-            after.links != before.links + added_links
-        ):
-            raise DeploymentError(
-                f"{root} held {before} before the migration and {after} after it",
-                details="Every file must still be there, in the release or in shared/. The "
-                "migration was undone.",
-            )
+            # Counted before anything runs on the new layout, so an upload that
+            # arrives once it is serving is not mistaken for a file gained.
+            after = count_tree(root)
+            added_links = (ENV_FILE in plan.env_files) + len(plan.persistent) + 1
+            if (after.files, after.bytes) != (before.files, before.bytes) or (
+                after.links != before.links + added_links
+            ):
+                raise DeploymentError(
+                    f"{root} held {before} before the migration and {after} after it",
+                    details="Every file must still be there, in the release or in shared/. The "
+                    "migration was undone.",
+                )
 
-        _hand_over([release, *created_dirs], log)
-        unit_rewritten = _rewrite_unit(app, root, plan, services, store, journal, log)
-        site_rewritten = _rewrite_site(app, root, webserver, store, journal, log)
+            _hand_over([release, *created_dirs], log)
+            unit_rewritten = _rewrite_unit(app, root, plan, services, store, journal, log)
+            site_rewritten = _rewrite_site(app, root, webserver, store, journal, log)
 
-        log.substep("Restarting on the release layout")
-        healthy, evidence = health_gate_for(app, store, log).restart_and_probe()
-        if not healthy:
-            raise DeploymentError(
-                f"{app.domain} did not pass its health check on the release layout; "
-                "the in-place layout was put back",
-                details=evidence,
-            )
+            log.substep("Restarting on the release layout")
+            healthy, evidence = health_gate_for(app, store, log).restart_and_probe()
+            if not healthy:
+                raise DeploymentError(
+                    f"{app.domain} did not pass its health check on the release layout; "
+                    "the in-place layout was put back",
+                    details=evidence,
+                )
 
-        # The staging directory is empty once everything is in the release.
-        journal.remove_empty(staging)
-        _record(store, app, release, plan)
-        _keep_the_directory_root_owned(root, log)
+            # The staging directory is empty once everything is in the release.
+            journal.remove_empty(staging)
+            _record(store, app, release, plan)
+            _keep_the_directory_root_owned(root, log)
+    except (OSError, sqlite3.Error) as error:
+        # Not a WASM error, so it carries no details to put the undo's report
+        # in: one error that says what failed and what the undo managed.
+        raise DeploymentError(
+            f"The migration of {app.domain} failed and was undone: {error}",
+            details=journal.report(),
+        ) from error
 
     log.substep(f"{app.domain} runs from release {release.name}")
     return MigrationResult(
@@ -923,6 +1173,8 @@ def _rehearse(
     for path in plan.persistent:
         fs.move(release / path, root / SHARED_DIR / path)
         fs.symlink(root / SHARED_DIR / path, release / path)
+    for name in plan.companions:
+        fs.move(release / name, root / SHARED_DIR / name)
     fs.symlink(Path(RELEASES_DIR) / plan.release_id, root / CURRENT_LINK)
     if plan.unit_rewrite and plan.unit:
         log.info(f"Would rewrite the unit {plan.unit} to run from {root / CURRENT_LINK}")
@@ -1037,6 +1289,13 @@ def _share(
         else:
             journal.made_dir(shared / path)
             created.append(shared / path)
+
+    # Beside their database, never linked: SQLite resolves the release's link
+    # and keeps these next to the real file in shared/.
+    for name in plan.companions:
+        source = release / name
+        if os.path.lexists(source) and not source.is_symlink():
+            journal.moved(source, shared / name)
 
     links = releases.link_shared(release, plan.persistent)
     for linked in links.linked:

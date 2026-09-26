@@ -25,7 +25,7 @@ import queue
 import sqlite3
 import threading
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -39,8 +39,8 @@ from wasm.core.exceptions import (
     WASMError,
 )
 from wasm.core.fs import SECRET_DIR_MODE, SECRET_MODE, get_fs
+from wasm.core.redact import Scrubber, app_secret_values, scrubber_for, secret_env_values
 from wasm.core.store import JobRecord, get_store
-from wasm.core.utils import domain_to_app_name
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +97,7 @@ class JobType(str, Enum):
     SERVICE_ACTION = "service_action"
     SITE_ACTION = "site_action"
     DELETE = "delete"
+    MIGRATE = "migrate"
     CUSTOM = "custom"
 
 
@@ -156,6 +157,10 @@ class Job:
         actor: Who queued the job - a session id prefix, an API token name,
             or ``master`` - never a secret. None for a job the system queued
             on its own, such as a webhook-triggered deploy.
+        scrubber: Removes the secrets of what the job works on from every
+            log line and from the error, before either is kept anywhere.
+            Log lines and errors carry raw tool output, and a job's log file,
+            row and live updates are readable with the ``read`` scope.
     """
 
     id: str
@@ -174,6 +179,7 @@ class Job:
     logs: list[JobLogEntry] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     actor: str | None = None
+    scrubber: Scrubber = field(default_factory=Scrubber, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         """
@@ -203,7 +209,10 @@ class Job:
 
     def add_log(self, message: str, level: str = "info", step: int | None = None) -> None:
         """
-        Append a log entry to the job.
+        Append a log entry to the job, scrubbed of its secrets.
+
+        The one way a line enters a job's log, so the scrubbing here covers
+        the in-memory tail, the log file and every live update alike.
 
         Args:
             message: The message to record.
@@ -214,7 +223,7 @@ class Job:
             JobLogEntry(
                 timestamp=datetime.now(),
                 level=level,
-                message=message,
+                message=self.scrubber.scrub(message),
                 step=step if step is not None else self.progress,
             )
         )
@@ -260,7 +269,7 @@ class JobContext:
             step_name: Name of the step.
             progress: Progress value, clamped to the job's total.
         """
-        self._job.current_step = step_name
+        self._job.current_step = self._job.scrubber.scrub(step_name)
         self._job.progress = min(progress, self._job.total_steps)
         self._job.add_log(step_name, "info", progress)
         self._notify(self._job)
@@ -280,11 +289,16 @@ class JobContext:
         """
         Attach context to the job.
 
+        Naming the job's ``domain`` also makes that application's secrets
+        known to the job's scrubber, from this line on.
+
         Args:
             key: Metadata key.
             value: JSON-serialisable value.
         """
         self._job.metadata[key] = value
+        if key == "domain" and isinstance(value, str) and value:
+            self._job.scrubber.add(app_secret_values(value))
 
 
 class JobManager:
@@ -416,6 +430,9 @@ class JobManager:
         if not job:
             return
 
+        domain = job.metadata.get("domain")
+        job.scrubber = scrubber_for(domain if isinstance(domain, str) else None)
+        job.scrubber.add(_argument_secrets(kwargs))
         job.status = JobStatus.RUNNING
         job.started_at = datetime.now()
         job.add_log("Job started", "info")
@@ -433,8 +450,13 @@ class JobManager:
         # the only worker thread.
         except Exception as exc:
             logger.exception("Job %s failed", job_id)
+            domain = job.metadata.get("domain")
+            if isinstance(domain, str) and domain:
+                # A deploy writes the application's .env as it runs; a value
+                # generated there is only on disk by now.
+                job.scrubber.add(app_secret_values(domain))
             job.status = JobStatus.FAILED
-            job.error = str(exc)
+            job.error = job.scrubber.scrub(str(exc))
             job.add_log(f"Job failed: {exc}", "error")
         finally:
             job.completed_at = datetime.now()
@@ -806,6 +828,28 @@ class JobManager:
         return len(to_remove)
 
 
+def _argument_secrets(kwargs: Mapping[str, Any]) -> list[str]:
+    """
+    Pick the secret values a job was handed as arguments.
+
+    A fresh deploy's variables arrive as ``env_vars`` before any ``.env``
+    exists, and the build runs with them; other jobs take a ``password``
+    directly. Both are classified by name, the same way an ``.env`` is.
+
+    Args:
+        kwargs: The job function's keyword arguments.
+
+    Returns:
+        The secret values among the top-level string arguments and inside
+        every mapping argument.
+    """
+    values = secret_env_values(kwargs)
+    for argument in kwargs.values():
+        if isinstance(argument, Mapping):
+            values.extend(secret_env_values(argument))
+    return values
+
+
 def get_job_manager() -> JobManager:
     """
     Get the process-wide job manager.
@@ -1045,15 +1089,24 @@ def delete_app_job(
     domain: str,
     remove_files: bool = True,
     remove_ssl: bool = True,
+    remove_volumes: bool = False,
     job_context: JobContext | None = None,
 ) -> dict[str, Any]:
     """
     Remove an application, its service, its site and optionally its files.
 
+    The same removal ``wasm delete`` runs,
+    :func:`wasm.deployers.lifecycle.delete_app`. This job used to have its
+    own: it never took a Docker Compose stack down, so the containers kept
+    running from the directory it then deleted, and a unit that would not
+    stop kept its unit file.
+
     Args:
         domain: Domain of the application.
         remove_files: Also delete the application directory.
         remove_ssl: Also delete the certificate.
+        remove_volumes: Also remove a Docker Compose stack's named volumes,
+            which hold its databases. Never unless asked for.
         job_context: Injected by the job manager.
 
     Returns:
@@ -1061,74 +1114,96 @@ def delete_app_job(
 
     Raises:
         DeploymentError: When the application is unknown.
+        AppBusyError: Another operation is running on the application.
     """
-    from wasm.managers.apache_manager import ApacheManager
-    from wasm.managers.cert_manager import CertManager
-    from wasm.managers.nginx_manager import NginxManager
-    from wasm.managers.service_manager import ServiceManager
-    from wasm.managers.webserver import delete_site_completely
+    from wasm.deployers.lifecycle import delete_app
 
     context = _require_context(job_context)
     context.set_metadata("domain", domain)
 
-    store = get_store()
-    app = store.get_app(domain)
-    if app is None:
+    if get_store().get_app(domain) is None:
         raise DeploymentError(
             f"Application not found: {domain}",
             details="Nothing to delete; check 'wasm list' for the exact domain.",
         )
 
-    app_name = domain_to_app_name(domain)
-
-    context.update("Stopping service", 20)
-    service_manager = ServiceManager(verbose=False)
-    try:
-        service_manager.stop(app_name)
-        service_manager.disable(app_name)
-        service_manager.delete_service(app_name)
-    except WASMError as exc:
-        context.log(f"Service removal reported: {exc}", "warning")
-
-    # Walks nginx and apache and, unless remove_ssl says otherwise, the
-    # certificate. This used to touch nginx only, so an app whose site had
-    # been recreated on apache - or migrated between the two - left a vhost
-    # behind that no delete request from the panel ever reached.
-    context.update("Removing site configuration and certificate", 55)
-    deletion = delete_site_completely(
+    outcome = delete_app(
         domain,
-        nginx=NginxManager(verbose=False),
-        apache=ApacheManager(verbose=False),
-        cert_manager=CertManager(verbose=False),
-        delete_certificate=remove_ssl,
+        remove_files=remove_files,
+        remove_certificate=remove_ssl,
+        remove_volumes=remove_volumes,
+        on_phase=lambda index, total, message: context.update(message, 100 * (index - 1) // total),
     )
-    context.log(
-        f"Site removal: nginx={deletion.nginx_removed} apache={deletion.apache_removed} "
-        f"certificate={deletion.certificate_removed}",
-        "info",
-    )
+    for warning in outcome.warnings:
+        context.log(warning, "warning")
 
-    if remove_files and app.app_path:
-        context.update("Removing files", 85)
-        app_path = Path(app.app_path)
-        if app_path.is_dir():
-            # Through the filesystem seam, not shutil.rmtree directly: that is
-            # the one execution path --dry-run cannot make honest, and the
-            # seam is also what lets a test assert on the removal without
-            # touching a real directory.
-            try:
-                get_fs().remove_tree(app_path)
-            except OSError as exc:
-                context.log(f"Could not remove {app_path}: {exc}", "warning")
-
-    store.delete_app(domain)
     context.update("Deletion complete", 100)
-
     return {
         "domain": domain,
         "status": "deleted",
         "files_removed": remove_files,
         "ssl_removed": remove_ssl,
+        "containers_stopped": outcome.containers_stopped,
+        "volumes_removed": outcome.volumes_removed,
+    }
+
+
+def migrate_app_job(
+    domain: str,
+    persist: list[str] | None = None,
+    job_context: JobContext | None = None,
+) -> dict[str, Any]:
+    """
+    Move an in-place application onto the release layout.
+
+    Queued by ``POST /api/apps/{domain}/migrate``, like an update: the tree
+    moves, the unit is stopped and started and the health check waits for it,
+    which is longer than a request should hold a connection, and a job keeps
+    its log when the browser goes away. The plan is worked out again when the
+    job runs, so what is migrated is what is on disk then.
+
+    Args:
+        domain: Domain of the application.
+        persist: Paths to keep in ``shared/``; None detects them.
+        job_context: Injected by the job manager.
+
+    Returns:
+        What was done: the first release, what moved to ``shared/`` and the
+        file counts before and after, plus the deployment history row.
+
+    Raises:
+        DeploymentError: A step failed or the application did not answer on
+            the release layout; everything was put back, and the details say
+            what, if anything, could not be.
+        AppBusyError: Another operation is running on the application.
+    """
+    from wasm.deployers import migrate as migration
+
+    context = _require_context(job_context)
+    context.set_metadata("domain", domain)
+
+    context.update("Planning the migration", 10)
+    plan = migration.plan_migration(domain, persist)
+    for warning in plan.warnings:
+        context.log(warning, "warning")
+
+    context.update("Moving the tree onto releases", 30)
+    result = migration.migrate(domain, plan, trigger="panel")
+
+    context.update("Migration complete", 100)
+    return {
+        "domain": result.domain,
+        "status": "migrated",
+        "release_id": result.release_id,
+        "persistent": list(result.persistent),
+        "env_files": list(result.env_files),
+        "files_before": result.before.files,
+        "files_after": result.after.files,
+        "bytes_before": result.before.bytes,
+        "bytes_after": result.after.bytes,
+        "unit_rewritten": result.unit_rewritten,
+        "site_rewritten": result.site_rewritten,
+        "deployment_id": result.deployment_id,
     }
 
 

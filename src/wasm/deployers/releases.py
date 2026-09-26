@@ -583,7 +583,10 @@ class ReleaseManager:
         Delete old releases.
 
         The newest ``keep`` survive, and so does the active one wherever it is
-        in the history: after a rollback it can be older than all of them.
+        in the history: after a rollback it can be older than all of them. So
+        does the release just before the active one, which is where a
+        rollback goes: pruning it would leave the release serving with
+        nothing to go back to, even when ``keep`` is 1.
 
         Args:
             keep: How many of the newest releases to keep. At least 1.
@@ -602,7 +605,14 @@ class ReleaseManager:
             )
 
         releases = self.list()
-        survivors = {r.id for r in releases[:keep]} | {r.id for r in releases if r.active}
+        survivors = {r.id for r in releases[:keep]}
+        for index, release in enumerate(releases):
+            if release.active:
+                survivors.add(release.id)
+                # The rollback target, as rollback() picks it: the next older
+                # release on disk.
+                if index + 1 < len(releases):
+                    survivors.add(releases[index + 1].id)
         removed: builtins.list[Release] = []
         # Oldest first, so an interruption leaves the newest history in place.
         for release in reversed(releases):

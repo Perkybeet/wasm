@@ -64,10 +64,11 @@ import tarfile
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, ClassVar, Protocol, runtime_checkable
 
+from wasm.core.applock import app_lock
 from wasm.core.config import Config
 from wasm.core.exceptions import (
     BackupError,
@@ -87,7 +88,7 @@ from wasm.core.fs import (
 )
 from wasm.core.logger import Logger
 from wasm.core.runner import DEFAULT_TIMEOUT, CommandResult, CommandRunner, get_runner
-from wasm.core.store import DeploymentTrigger, get_store
+from wasm.core.store import AppType, DeploymentTrigger, get_store
 from wasm.core.utils import domain_to_app_name
 from wasm.deployers.helpers.layout import RELEASES, env_file_in, layout_on_disk
 from wasm.deployers.helpers.permissions import hand_over_tree
@@ -1218,6 +1219,8 @@ class BackupManager:
                 contains a member that is unsafe to extract, does not say which
                 application it belongs to, or carries data that cannot be put
                 back.
+            AppBusyError: Another deploy, update, rollback, migration or
+                restore is already running on the target application.
         """
         archive = Path(archive)
         if not archive.is_file():
@@ -1235,13 +1238,93 @@ class BackupManager:
                     "created. Restoring it would restore corrupted data.",
                 )
 
-        if self._rehearsing:
-            return self._rehearse_restore(archive, target_domain, fallback)
+        # Resolved before the lock, which is keyed on it, and before anything
+        # on disk changes. A caller that already knows the domain (restore(),
+        # by id) never opens the archive twice; one that only has a file reads
+        # its manifest without extracting anything, exactly as a rehearsal
+        # does.
+        domain = target_domain or self._manifest_domain(
+            self._read_manifest_in_place(archive), fallback
+        )
 
-        with tempfile.TemporaryDirectory(prefix="wasm-restore-") as tmp_dir:
-            tmp_path = Path(tmp_dir)
-            extracted = tmp_path / "extracted"
+        with app_lock(domain, "restore"):
+            if self._rehearsing:
+                return self._rehearse_restore(archive, target_domain, fallback)
 
+            return self._restore_locked(
+                archive,
+                domain=domain,
+                restore_env=restore_env,
+                stop_service=stop_service,
+                fallback=fallback,
+                pre_restore_hook=pre_restore_hook,
+                post_restore_hook=post_restore_hook,
+            )
+
+    def _restore_locked(
+        self,
+        archive: Path,
+        *,
+        domain: str,
+        restore_env: bool,
+        stop_service: bool,
+        fallback: BackupMetadata | None,
+        pre_restore_hook: str | None,
+        post_restore_hook: str | None,
+    ) -> bool:
+        """
+        Run a real restore, with the target application's lock already held.
+
+        The previous tree is copied aside next to the application directory,
+        not under :func:`tempfile.gettempdir`: that is often tmpfs or a
+        different filesystem, where a multi-gigabyte copy can fill RAM, the
+        swap back on failure is a copy rather than an atomic rename, and the
+        safety copy vanishes on reboot. The extracted archive is staged there
+        too, so putting it into place is a rename on one filesystem rather
+        than a cross-filesystem copy.
+
+        Args:
+            archive: Archive to restore.
+            domain: Domain to restore into, already resolved.
+            restore_env: Restore the ``.env`` files from the archive.
+            stop_service: Stop the service before restoring.
+            fallback: Metadata of an older archive that carries no manifest.
+            pre_restore_hook: Command to run before the restore.
+            post_restore_hook: Command to run after the restore.
+
+        Returns:
+            True once the restore has fully succeeded.
+
+        Raises:
+            BackupError: If the target domain is unusable, the archive cannot
+                be extracted, or a step fails. Once the files have been
+                replaced, the previous tree is put back automatically when
+                that succeeds; when it does not, it is left beside the
+                application directory and named in the error.
+        """
+        try:
+            app_name = validate_app_name(domain_to_app_name(domain))
+        except ValidationError as exc:
+            raise BackupError(
+                f"Cannot restore into {domain!r}",
+                details=f"{exc}. The target domain does not yield a usable directory name.",
+            ) from exc
+        app_path = self.config.apps_directory / app_name
+
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        workspace = app_path.parent / f".wasm-restore-{app_path.name}-{stamp}"
+        try:
+            self.fs.make_dir(workspace, mode=SECRET_DIR_MODE)
+        except OSError as exc:
+            raise BackupError(
+                f"Could not create a restore workspace beside {app_path}",
+                details=f"{exc}. Free space or fix permissions under {app_path.parent}.",
+            ) from exc
+
+        swapped = False
+        service_was_running = False
+        try:
+            extracted = workspace / "extracted"
             try:
                 extract_archive(
                     archive,
@@ -1257,15 +1340,6 @@ class BackupManager:
                 ) from exc
 
             manifest = self._read_manifest(extracted)
-            domain = target_domain or self._manifest_domain(manifest, fallback)
-            try:
-                app_name = validate_app_name(domain_to_app_name(domain))
-            except ValidationError as exc:
-                raise BackupError(
-                    f"Cannot restore into {domain!r}",
-                    details=f"{exc}. The target domain does not yield a usable directory name.",
-                ) from exc
-            app_path = self.config.apps_directory / app_name
             app_root = self._locate_app_root(extracted, manifest, fallback)
 
             service_was_running = self._stop_service_for_restore(app_name, stop_service)
@@ -1286,7 +1360,8 @@ class BackupManager:
                 except OSError as exc:
                     self.logger.warning(f"Could not read the current .env: {exc}")
 
-            self._swap_in_tree(app_root, app_path, tmp_path)
+            self._swap_in_tree(app_root, app_path, workspace)
+            swapped = True
 
             # Where the .env goes depends on the tree that came back, which
             # need not be on the layout of the one it replaced.
@@ -1304,16 +1379,33 @@ class BackupManager:
             # restored app unwritable by its own service whenever the
             # operator's service_group differed from service_user, silently -
             # the chown's exit code was never checked.
-            for tree in self._service_trees(app_path, layout):
-                hand_over_tree(
-                    tree,
-                    user=self.config.service_user,
-                    group=self.config.service_group,
-                    runner=self.runner,
-                    fs=self.fs,
-                    logger=self.logger,
-                    env_files=(env_file,),
+            #
+            # A Docker Compose application is the exception: its bind mounts
+            # and named volumes carry the uids their containers chose
+            # (postgres's data directory is 999, for instance), and a
+            # recursive chown to the service account would break every one of
+            # them. extract_archive() never chowns to the archived owner
+            # either - it writes as the extracting process, which is root -
+            # so the tree already comes back exactly as a fresh `docker
+            # compose up` would first see it, and the containers are left to
+            # take ownership of their own data the way they always do.
+            if self._is_docker_compose_app(domain):
+                self.logger.info(
+                    f"{domain} is a Docker Compose app: ownership was kept as extracted, "
+                    "not handed to the service account, so its volumes and bind mounts "
+                    "keep the uids their containers expect"
                 )
+            else:
+                for tree in self._service_trees(app_path, layout):
+                    hand_over_tree(
+                        tree,
+                        user=self.config.service_user,
+                        group=self.config.service_group,
+                        runner=self.runner,
+                        fs=self.fs,
+                        logger=self.logger,
+                        env_files=(env_file,),
+                    )
             self._warn_about_a_layout_mismatch(domain, layout)
 
             # Putting only the files back was silent data loss for every
@@ -1322,6 +1414,21 @@ class BackupManager:
             self._restore_docker_volumes(manifest, extracted, fallback)
 
             self._warn_about_missing_environment(self._code_path(app_path))
+        except (BackupError, OSError) as exc:
+            if swapped:
+                raise self._recover_after_failed_restore(app_path, workspace, exc) from exc
+            raise
+        else:
+            # Only reached once every step above has succeeded. The restore
+            # did succeed: a safety copy that will not go away is reported,
+            # never turned into a failure.
+            try:
+                self.fs.remove_tree(workspace)
+            except OSError as exc:
+                self.logger.warning(
+                    f"The restore succeeded, but its safety copy could not be removed: {exc}. "
+                    f"Remove {workspace} by hand once the application is checked."
+                )
 
         if post_restore_hook:
             self.logger.debug(f"Running post-restore hook: {post_restore_hook}")
@@ -1336,6 +1443,60 @@ class BackupManager:
             self.service_manager.start(app_name)
 
         return True
+
+    def _recover_after_failed_restore(
+        self, app_path: Path, workspace: Path, exc: BaseException
+    ) -> BackupError:
+        """
+        Put the previous tree back after a step following the swap fails.
+
+        By the time a database or a volume fails to come back, the files have
+        already been replaced, so there is something to protect: the previous
+        tree, copied aside in :meth:`_swap_in_tree` before the swap ran. It is
+        put back when that succeeds; when it does not, both trees would
+        otherwise be at risk of being lost, so the previous one is left
+        exactly where it is and named in the error instead.
+
+        Args:
+            app_path: Application directory the swap replaced.
+            workspace: Sibling workspace holding the previous tree, when
+                there was one.
+            exc: What failed after the swap.
+
+        Returns:
+            The error to raise in place of ``exc``, naming where the
+            operator's previous tree ended up.
+        """
+        reason = getattr(exc, "details", "") or str(exc)
+        safety_copy = workspace / "previous"
+        if not safety_copy.is_dir():
+            # Nothing had to be copied aside: the application did not exist
+            # before this restore, so there is no previous tree to protect.
+            return BackupError(
+                f"Restore failed after the files were replaced: {exc}", details=reason
+            )
+
+        try:
+            if app_path.exists():
+                self.fs.remove_tree(app_path)
+            self.fs.move(safety_copy, app_path)
+        except OSError as rollback_error:
+            self.logger.error(f"Could not put the previous tree back: {rollback_error}")
+            self.logger.error(f"The previous tree is kept at {safety_copy}")
+            return BackupError(
+                f"Restore failed after the files were replaced: {exc}",
+                details=f"{reason} The previous tree could not be put back automatically "
+                f"({rollback_error}) and is kept at {safety_copy}.",
+            )
+
+        self.logger.warning(
+            f"Restore of {app_path} failed after the files were replaced; "
+            "the previous state was put back"
+        )
+        return BackupError(
+            f"Restore failed after the files were replaced: {exc}",
+            details=f"{reason} The previous state of {app_path} was put back from {workspace}.",
+        )
 
     def _rehearse_restore(
         self,
@@ -1453,6 +1614,25 @@ class BackupManager:
                 f"Restore a backup taken on the {recorded} layout, or redeploy {domain}."
             )
 
+    def _is_docker_compose_app(self, domain: str) -> bool:
+        """
+        Tell whether the store records this application as Docker Compose.
+
+        Args:
+            domain: The application's domain.
+
+        Returns:
+            True when the store has a row for this domain with app_type
+            ``docker-compose``. False when there is no row yet (a restore into
+            a domain nothing has deployed) or the store cannot be read.
+        """
+        try:
+            app = get_store().get_app(domain)
+        except (WASMError, sqlite3.Error) as exc:
+            self.logger.debug(f"Could not read the application's type: {exc}")
+            return False
+        return app is not None and getattr(app, "app_type", None) == AppType.DOCKER_COMPOSE.value
+
     def _read_manifest_in_place(self, archive: Path) -> dict[str, Any] | None:
         """
         Read an archive's manifest without extracting the archive.
@@ -1546,7 +1726,8 @@ class BackupManager:
         Args:
             app_root: Extracted application tree.
             app_path: Directory the application is deployed in.
-            workspace: Temporary directory used to hold the previous tree.
+            workspace: Directory beside ``app_path``, on the same filesystem,
+                used to hold the previous tree until the restore succeeds.
 
         Raises:
             BackupError: If the safety copy cannot be made, or if the swap
@@ -2652,116 +2833,119 @@ class RollbackManager:
         Raises:
             BackupError: If there is no backup to roll back to, or the restore
                 fails.
+            AppBusyError: Another deploy, update, rollback, migration or
+                restore is already running on the application.
         """
-        if backup_id:
-            metadata = self.backup_manager.get_backup(backup_id)
-            if not metadata:
-                raise BackupError(f"Backup not found: {backup_id}")
-        else:
-            all_backups = self.backup_manager.list_backups(domain=domain)
-            metadata = None
-            for backup in all_backups:
-                # Skip auto-generated safety backups.
-                if "auto" not in backup.tags and "pre-deploy" not in backup.tags:
-                    metadata = backup
-                    break
+        with app_lock(domain, "rollback"):
+            if backup_id:
+                metadata = self.backup_manager.get_backup(backup_id)
+                if not metadata:
+                    raise BackupError(f"Backup not found: {backup_id}")
+            else:
+                all_backups = self.backup_manager.list_backups(domain=domain)
+                metadata = None
+                for backup in all_backups:
+                    # Skip auto-generated safety backups.
+                    if "auto" not in backup.tags and "pre-deploy" not in backup.tags:
+                        metadata = backup
+                        break
 
-            if not metadata:
-                if all_backups:
-                    # All of them are automatic: the oldest is the most stable.
-                    metadata = all_backups[-1]
-                else:
-                    raise BackupError(f"No backups found for: {domain}")
-
-        recorder = DeploymentRecorder(get_store(), domain, trigger, logger=self.logger)
-        recorder.start()
-        recorder.annotate(git_commit=metadata.git_commit, git_branch=metadata.git_branch)
-
-        try:
-            # A safety backup of the current state, taken here so that both
-            # the CLI and the panel get one: this used to be the CLI's own
-            # extra step before calling rollback(), which meant a rollback
-            # triggered from the panel had no way back if the restore itself
-            # went wrong. A missing safety net is worth a warning, not an
-            # abort - the operator already has a reason to go back.
-            self.logger.info("Creating a safety backup of the current state")
-            try:
-                self.create_pre_deploy_backup(domain, description="Pre-rollback safety backup")
-            except WASMError as exc:
-                self.logger.warning(f"Could not create safety backup: {exc}")
-
-            self.logger.info(f"Rolling back to: {metadata.id}")
-            self.logger.info(f"  Created: {metadata.age}")
-            if metadata.git_commit:
-                self.logger.info(f"  Commit: {metadata.git_commit}")
-
-            self.backup_manager.restore(
-                backup_id=metadata.id,
-                restore_env=True,
-                stop_service=True,
-            )
-
-            app_name = domain_to_app_name(domain)
-
-            app_path = self.config.apps_directory / app_name
-            if rebuild and layout_on_disk(app_path) == RELEASES:
-                # A rebuild in place would install and build in the
-                # application directory, which on releases is not where the
-                # code is. A release is built by an update, behind the health
-                # gate, and going back to one is `wasm releases rollback`.
-                self.logger.warning(
-                    "The restored application is on the release layout and was not rebuilt. "
-                    f"Run 'wasm update {domain}' to build a release from it."
-                )
-            elif rebuild:
-                self.logger.info("Rebuilding application...")
-
-                from wasm.deployers import detect_app_type, get_deployer
-
-                app_type = detect_app_type(app_path, verbose=self.verbose)
-                if app_type:
-                    deployer = get_deployer(app_type, verbose=self.verbose)
-                    # The rebuild happens through the deployer's own logger;
-                    # capturing it puts the build output in this rollback's
-                    # log. The interface does not promise a logger, so one
-                    # that is missing or not capturable is simply not mirrored.
-                    delegate_logger = getattr(deployer, "logger", None)
-                    if isinstance(delegate_logger, Logger):
-                        recorder.also_capture(delegate_logger)
-                    # The source is already on disk: this is a rebuild in place,
-                    # not a deployment, so the restored directory is its own
-                    # source.
-                    deployer.configure(domain, source=str(app_path), app_path=app_path)
-
-                    if isinstance(deployer, _InPlaceRebuilder):
-                        try:
-                            deployer.install_dependencies()
-                            deployer.build()
-                        except WASMError as exc:
-                            self.logger.warning(f"Rebuild failed: {exc}")
-                            self.logger.info("Application restored but may need manual rebuild")
+                if not metadata:
+                    if all_backups:
+                        # All of them are automatic: the oldest is the most stable.
+                        metadata = all_backups[-1]
                     else:
-                        self.logger.warning(
-                            f"The {app_type} deployer cannot rebuild in place; "
-                            "the files are restored but not rebuilt"
-                        )
+                        raise BackupError(f"No backups found for: {domain}")
+
+            recorder = DeploymentRecorder(get_store(), domain, trigger, logger=self.logger)
+            recorder.start()
+            recorder.annotate(git_commit=metadata.git_commit, git_branch=metadata.git_branch)
 
             try:
-                status = self.service_manager.get_status(app_name)
-                if status.get("exists"):
-                    self.service_manager.start(app_name)
-            except ServiceError as exc:
-                self.logger.debug(f"Could not start service: {exc}")
-        except Exception as exc:
-            # Not handling: the failure is recorded and re-raised unchanged.
-            recorder.finish_failure(exc)
-            raise
+                # A safety backup of the current state, taken here so that both
+                # the CLI and the panel get one: this used to be the CLI's own
+                # extra step before calling rollback(), which meant a rollback
+                # triggered from the panel had no way back if the restore itself
+                # went wrong. A missing safety net is worth a warning, not an
+                # abort - the operator already has a reason to go back.
+                self.logger.info("Creating a safety backup of the current state")
+                try:
+                    self.create_pre_deploy_backup(domain, description="Pre-rollback safety backup")
+                except WASMError as exc:
+                    self.logger.warning(f"Could not create safety backup: {exc}")
 
-        # The restore succeeded, so the newest successful deployment is the
-        # build that just stopped serving.
-        recorder.mark_previous_success_rolled_back()
-        recorder.finish_success()
-        return True
+                self.logger.info(f"Rolling back to: {metadata.id}")
+                self.logger.info(f"  Created: {metadata.age}")
+                if metadata.git_commit:
+                    self.logger.info(f"  Commit: {metadata.git_commit}")
+
+                self.backup_manager.restore(
+                    backup_id=metadata.id,
+                    restore_env=True,
+                    stop_service=True,
+                )
+
+                app_name = domain_to_app_name(domain)
+
+                app_path = self.config.apps_directory / app_name
+                if rebuild and layout_on_disk(app_path) == RELEASES:
+                    # A rebuild in place would install and build in the
+                    # application directory, which on releases is not where the
+                    # code is. A release is built by an update, behind the health
+                    # gate, and going back to one is `wasm releases rollback`.
+                    self.logger.warning(
+                        "The restored application is on the release layout and was not "
+                        f"rebuilt. Run 'wasm update {domain}' to build a release from it."
+                    )
+                elif rebuild:
+                    self.logger.info("Rebuilding application...")
+
+                    from wasm.deployers import detect_app_type, get_deployer
+
+                    app_type = detect_app_type(app_path, verbose=self.verbose)
+                    if app_type:
+                        deployer = get_deployer(app_type, verbose=self.verbose)
+                        # The rebuild happens through the deployer's own logger;
+                        # capturing it puts the build output in this rollback's
+                        # log. The interface does not promise a logger, so one
+                        # that is missing or not capturable is simply not mirrored.
+                        delegate_logger = getattr(deployer, "logger", None)
+                        if isinstance(delegate_logger, Logger):
+                            recorder.also_capture(delegate_logger)
+                        # The source is already on disk: this is a rebuild in
+                        # place, not a deployment, so the restored directory is
+                        # its own source.
+                        deployer.configure(domain, source=str(app_path), app_path=app_path)
+
+                        if isinstance(deployer, _InPlaceRebuilder):
+                            try:
+                                deployer.install_dependencies()
+                                deployer.build()
+                            except WASMError as exc:
+                                self.logger.warning(f"Rebuild failed: {exc}")
+                                self.logger.info("Application restored but may need manual rebuild")
+                        else:
+                            self.logger.warning(
+                                f"The {app_type} deployer cannot rebuild in place; "
+                                "the files are restored but not rebuilt"
+                            )
+
+                try:
+                    status = self.service_manager.get_status(app_name)
+                    if status.get("exists"):
+                        self.service_manager.start(app_name)
+                except ServiceError as exc:
+                    self.logger.debug(f"Could not start service: {exc}")
+            except Exception as exc:
+                # Not handling: the failure is recorded and re-raised unchanged.
+                recorder.finish_failure(exc)
+                raise
+
+            # The restore succeeded, so the newest successful deployment is the
+            # build that just stopped serving.
+            recorder.mark_previous_success_rolled_back()
+            recorder.finish_success()
+            return True
 
     def list_rollback_points(self, domain: str) -> list[BackupMetadata]:
         """

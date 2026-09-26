@@ -14,6 +14,7 @@ probe - through the same seams the deployers use in production.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import stat
@@ -86,6 +87,8 @@ class TreeRunner(FakeRunner):
         self.where.append((tuple(argv), cwd))
         if list(argv[:3]) == ["cp", "-a", "--reflink=auto"] and result.success:
             shutil.copytree(argv[3], argv[4], symlinks=True)
+        elif list(argv[:3]) == ["python3", "-m", "venv"] and result.success:
+            Path(argv[3]).mkdir(parents=True, exist_ok=True)
         return result
 
     def stream(self, argv: Any, *, on_line: Any, cwd: Path | None = None, **kwargs: Any) -> Any:
@@ -311,6 +314,11 @@ def node_tree(directory: Path, *, server: str = GOOD_SERVER, lockfile: str = LOC
     )
 
 
+def python_tree(directory: Path, *, requirements: str = "flask\n") -> Path:
+    """A Python project with a requirements.txt lockfile."""
+    return write_tree(directory, {"requirements.txt": requirements, "app.py": "app = None\n"})
+
+
 def wire(deployer: Any, machine: SimpleNamespace) -> Any:
     """
     Point a deployer at the fakes.
@@ -359,7 +367,13 @@ def deploy_new(
     return deployer
 
 
-def update(machine: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, **kwargs: Any) -> Any:
+def update(
+    machine: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    deployer_class: type = NodeJSDeployer,
+    **kwargs: Any,
+) -> Any:
     """
     Run the shared update sequence, with deployers wired to the fakes.
 
@@ -370,7 +384,7 @@ def update(machine: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, **kwargs: 
         lifecycle,
         "get_deployer",
         lambda app_type, verbose=False: wire(
-            NodeJSDeployer(verbose=False, runner=machine.runner), machine
+            deployer_class(verbose=False, runner=machine.runner), machine
         ),
     )
     return lifecycle.update_app(DOMAIN, **kwargs)
@@ -635,6 +649,148 @@ def test_a_changed_lockfile_installs_again(
 
     assert len(machine.runner.cwd_of("npm", "ci")) == 2
     assert not machine.runner.ran("cp")
+
+
+# ---------------------------------------------------------------------------
+# Dependency reuse must key on the runtime, not only the lockfile
+# ---------------------------------------------------------------------------
+
+
+def test_a_stamp_is_written_after_a_real_install(
+    tmp_path: Path, root: Path, store: WASMStore, machine: SimpleNamespace
+) -> None:
+    """A fresh install records the runtime it was built with, so the next deploy can trust it."""
+    machine.runner.script(["node", "--version"], stdout="v20.11.0\n")
+    machine.runner.script(["npm", "--version"], stdout="10.2.4\n")
+    machine.git.publish(node_tree(tmp_path / "v1"))
+    deploy_new(root, machine)
+
+    stamp = json.loads(
+        (root / "releases" / active_id(root) / "node_modules" / ".wasm-runtime.json").read_text()
+    )
+    assert stamp == {"node": "v20.11.0", "npm": "10.2.4"}
+
+
+def test_matching_runtime_reuses_dependencies(
+    tmp_path: Path,
+    root: Path,
+    store: WASMStore,
+    machine: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The runtime is queried and found unchanged, so the copy still happens."""
+    machine.runner.script(["node", "--version"], stdout="v20.11.0\n")
+    machine.runner.script(["npm", "--version"], stdout="10.2.4\n")
+    machine.git.publish(node_tree(tmp_path / "v1"))
+    deploy_new(root, machine)
+    first = active_id(root)
+
+    machine.git.publish(node_tree(tmp_path / "v2", server=GOOD_SERVER + "// v2\n"))
+    update(machine, monkeypatch)
+    second = active_id(root)
+
+    assert machine.runner.cwd_of("npm", "ci") == [root / "releases" / first]
+    assert (
+        "cp",
+        "-a",
+        "--reflink=auto",
+        str(root / "releases" / first / "node_modules"),
+        str(root / "releases" / second / "node_modules"),
+    ) in machine.runner.calls
+    log = Path(store.list_deployments(DOMAIN)[0].log_path).read_text()
+    assert f"Dependencies reused from {first}" in log
+
+
+def test_a_node_version_change_reinstalls_dependencies(
+    tmp_path: Path,
+    root: Path,
+    store: WASMStore,
+    machine: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """apt upgrading Node must not hand a new release native modules built for the old ABI."""
+    machine.runner.script(["node", "--version"], stdout="v20.11.0\n")
+    machine.git.publish(node_tree(tmp_path / "v1"))
+    deploy_new(root, machine)
+
+    machine.runner.script(["node", "--version"], stdout="v22.3.0\n")
+    machine.git.publish(node_tree(tmp_path / "v2", server=GOOD_SERVER + "// v2\n"))
+    update(machine, monkeypatch)
+
+    assert len(machine.runner.cwd_of("npm", "ci")) == 2
+    assert not machine.runner.ran("cp")
+    log = Path(store.list_deployments(DOMAIN)[0].log_path).read_text()
+    assert "Dependencies reinstalled: the runtime changed (node v20.11.0 -> v22.3.0)" in log
+
+
+def test_a_package_manager_version_change_reinstalls_dependencies(
+    tmp_path: Path,
+    root: Path,
+    store: WASMStore,
+    machine: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A different npm on the same Node still produces a different install."""
+    machine.runner.script(["npm", "--version"], stdout="10.2.4\n")
+    machine.git.publish(node_tree(tmp_path / "v1"))
+    deploy_new(root, machine)
+
+    machine.runner.script(["npm", "--version"], stdout="10.8.1\n")
+    machine.git.publish(node_tree(tmp_path / "v2", server=GOOD_SERVER + "// v2\n"))
+    update(machine, monkeypatch)
+
+    assert len(machine.runner.cwd_of("npm", "ci")) == 2
+    assert not machine.runner.ran("cp")
+    log = Path(store.list_deployments(DOMAIN)[0].log_path).read_text()
+    assert "Dependencies reinstalled: the runtime changed (npm 10.2.4 -> 10.8.1)" in log
+
+
+def test_a_release_without_a_runtime_stamp_reinstalls(
+    tmp_path: Path,
+    root: Path,
+    store: WASMStore,
+    machine: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A release built before this change carries no stamp and must not be reused blindly."""
+    machine.git.publish(node_tree(tmp_path / "v1"))
+    deploy_new(root, machine)
+    first = active_id(root)
+    (root / "releases" / first / "node_modules" / ".wasm-runtime.json").unlink()
+
+    machine.git.publish(node_tree(tmp_path / "v2", server=GOOD_SERVER + "// v2\n"))
+    update(machine, monkeypatch)
+
+    assert len(machine.runner.cwd_of("npm", "ci")) == 2
+    assert not machine.runner.ran("cp")
+    log = Path(store.list_deployments(DOMAIN)[0].log_path).read_text()
+    assert "Dependencies reinstalled: no runtime stamp" in log
+
+
+def test_a_python_interpreter_change_reinstalls_the_venv(
+    tmp_path: Path,
+    root: Path,
+    store: WASMStore,
+    machine: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Python upgrade must not hand a new release a venv built for the old interpreter."""
+    machine.runner.script(["python3", "--version"], stdout="Python 3.11.6\n")
+    machine.git.publish(python_tree(tmp_path / "v1"))
+    deploy_new(root, machine, deployer_class=PythonDeployer)
+
+    machine.runner.script(["python3", "--version"], stdout="Python 3.12.1\n")
+    machine.git.publish(python_tree(tmp_path / "v2"))
+    update(machine, monkeypatch, deployer_class=PythonDeployer)
+
+    installs = [call for call in machine.runner.calls if "requirements.txt" in call]
+    assert len(installs) == 2
+    assert not machine.runner.ran("cp")
+    log = Path(store.list_deployments(DOMAIN)[0].log_path).read_text()
+    assert (
+        "Dependencies reinstalled: the runtime changed (python3 Python 3.11.6 -> Python 3.12.1)"
+        in log
+    )
 
 
 def test_old_releases_are_pruned_to_the_retention(

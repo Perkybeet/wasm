@@ -11,19 +11,23 @@ environment variable management, and systemd integration.
 """
 
 import json
+import re
 import sqlite3
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, ClassVar
 
 import yaml
 
+from wasm.core.applock import app_lock
 from wasm.core.config import Config
 from wasm.core.exceptions import (
     DeploymentError,
     DockerError,
+    SecurityError,
+    ValidationError,
     WASMError,
 )
 from wasm.core.fs import FileSystem
@@ -31,6 +35,7 @@ from wasm.core.runner import CommandResult, CommandRunner, get_runner
 from wasm.core.store import AppStatus, AppType, DeploymentTrigger, get_store
 from wasm.core.utils import domain_to_app_name
 from wasm.deployers.helpers.registration import StoreRegistrar
+from wasm.deployers.helpers.target import claim_deploy_target
 from wasm.deployers.interface import AppDeployer, StepReporter, UpdateResult
 from wasm.deployers.recorder import (
     CapturingLogger,
@@ -40,10 +45,12 @@ from wasm.deployers.recorder import (
     recording,
 )
 from wasm.deployers.registry import DeployerRegistry
+from wasm.deployers.releases import persistent_path
 from wasm.managers.cert_manager import CertManager
 from wasm.managers.nginx_manager import NginxManager
 from wasm.managers.service_manager import ServiceManager
 from wasm.managers.source_manager import SourceManager
+from wasm.validators.names import resolve_within
 
 #: Building images pulls layers and compiles; give it room but not forever.
 BUILD_TIMEOUT = 1800
@@ -60,6 +67,157 @@ COMPOSE_FILE_PRIORITY = [
     "compose.yml",
     "compose.yaml",
 ]
+
+#: What Compose itself strips from a directory name before using it as a
+#: project name: everything outside [a-z0-9_-], then any leading run of
+#: characters that are not a letter or digit.
+_PROJECT_NAME_INVALID_CHARS = re.compile(r"[^a-z0-9_-]+")
+_PROJECT_NAME_LEADING_JUNK = re.compile(r"^[^a-z0-9]+")
+
+#: ``COMPOSE_PROJECT_NAME`` set in the project's ``.env``, which Compose reads.
+_ENV_PROJECT_NAME = re.compile(r"^\s*(?:export\s+)?COMPOSE_PROJECT_NAME\s*=", re.MULTILINE)
+
+
+def _names_its_own_project(compose_path: Path) -> bool:
+    """
+    Tell whether a stack chooses its project name itself.
+
+    Args:
+        compose_path: The compose file in use.
+
+    Returns:
+        True when the file has a top-level ``name:`` or the project's ``.env``
+        sets ``COMPOSE_PROJECT_NAME``; also when the file exists but cannot
+        be read, so that nothing is pinned over a name that could not be
+        checked. A file that is not there names nothing.
+    """
+    try:
+        document = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return True
+    if isinstance(document, dict) and document.get("name"):
+        return True
+    env_file = compose_path.parent / ".env"
+    try:
+        env_text = env_file.read_text(encoding="utf-8") if env_file.is_file() else ""
+    except (OSError, UnicodeDecodeError):
+        return True
+    return _ENV_PROJECT_NAME.search(env_text) is not None
+
+
+def compose_project_name(app_path: Path, compose_path: Path | None) -> str | None:
+    """
+    Reproduce the Compose project name this stack has always had.
+
+    Every ``docker compose`` invocation in this module runs with ``app_path``
+    as its working directory and an absolute ``-f`` built from it; the
+    systemd unit does the same with ``COMPOSE_FILE`` and ``WorkingDirectory``.
+    With no ``-p``, no ``COMPOSE_PROJECT_NAME`` and no top-level ``name:`` in
+    the compose file, Compose names the project - and therefore every
+    container, network and named volume (``<project>_<volume>``) - after the
+    directory of that first file: lower-cased, restricted to
+    ``[a-z0-9_-]``, and trimmed to start on a letter or digit. That directory
+    is ``app_path`` itself unless ``compose_file`` names a subdirectory, in
+    which case it is that subdirectory.
+
+    Passing this value back as ``-p`` does not change what Compose would
+    already have inferred for either layout; it stops that inference from
+    depending on the working directory, the exact ``-f`` path built, or
+    Compose's own algorithm never changing - any of which silently renames
+    the project, and the day one does, ``docker compose up`` creates new,
+    empty volumes instead of reusing the ones with the data. It deliberately
+    keeps naming a subdirectory-based project after that subdirectory rather
+    than after ``app_path``: repointing it would be exactly the rename this
+    exists to prevent, for every application already deployed that way.
+
+    A stack that names its project itself - a top-level ``name:`` in the
+    compose file, or ``COMPOSE_PROJECT_NAME`` in the project's ``.env`` - is
+    not pinned at all: ``-p`` overrides both, and the name 1.x and the unit
+    (which never passes ``-p``) have always used is the stack's own.
+
+    Args:
+        app_path: The application directory the source was fetched to.
+        compose_path: The compose file in use, or ``None`` before discovery,
+            in which case ``app_path`` itself is normalised.
+
+    Returns:
+        The Compose project name for this stack, or None when the stack
+        names its own project and no ``-p`` must be passed.
+    """
+    if compose_path is not None and _names_its_own_project(compose_path):
+        return None
+    source_dir = compose_path.parent if compose_path is not None else app_path
+    name = _PROJECT_NAME_INVALID_CHARS.sub("", source_dir.name.lower())
+    name = _PROJECT_NAME_LEADING_JUNK.sub("", name)
+    return name or "default"
+
+
+def compose_file_option(raw: str) -> PurePosixPath:
+    """
+    Validate the ``compose_file`` a deployment names, before anything is fetched.
+
+    The same rule as a persistent path, applied by the same function: the file
+    is handed to ``docker compose -f``, which runs as root, so a name that is
+    absolute or climbs with ``..`` would read a file from anywhere on the host.
+    Whether it exists, and whether a symlink on the way leads out, can only be
+    known once the source is on disk; :func:`compose_file_in` checks that.
+
+    Args:
+        raw: The path as the operator gave it, relative to the project root.
+
+    Returns:
+        The normalized relative path.
+
+    Raises:
+        DeploymentError: When the path is empty, absolute, contains ``..`` or
+            a NUL byte.
+    """
+    try:
+        return persistent_path(raw)
+    except DeploymentError as exc:
+        raise DeploymentError(
+            f"Compose file {raw!r} is not a path inside the application",
+            details="Name the compose file relative to the project root, such as "
+            "'docker-compose.prod.yml' or 'docker/compose.yml'. Absolute paths and "
+            "'..' are refused because the file is read as root.",
+        ) from exc
+
+
+def compose_file_in(app_path: Path, relative: PurePosixPath | str) -> Path:
+    """
+    Locate a compose file in a fetched project, refusing any way out of it.
+
+    Args:
+        app_path: The application directory the source was fetched to.
+        relative: The compose file, relative to ``app_path``.
+
+    Returns:
+        ``app_path / relative``, unresolved, so it can still be expressed
+        relative to ``app_path`` for the systemd unit.
+
+    Raises:
+        DeploymentError: When a symlink in the project resolves the path
+            outside ``app_path``, or when it is not an existing file.
+    """
+    path = app_path / relative
+    try:
+        resolve_within(app_path, str(relative))
+    except (SecurityError, ValidationError) as exc:
+        raise DeploymentError(
+            f"Compose file {str(relative)!r} resolves outside the application",
+            details=f"A symlink in the repository leads out of {app_path}. Commit the "
+            "compose file itself instead of a link to it; the file is read as root, so "
+            "only files inside the project are accepted.",
+        ) from exc
+    if not path.is_file():
+        raise DeploymentError(
+            f"Specified compose file not found: {relative}",
+            details=f"Looked for {path}. Check the path is relative to the project root "
+            "and that the file is committed on the branch being deployed.",
+        )
+    return path
 
 
 @dataclass
@@ -126,6 +284,7 @@ class DockerComposeDeployer(AppDeployer):
         self.store = get_store()
         self.trigger: str = DeploymentTrigger.CLI.value
         self._is_new_deployment = True
+        self.replace_existing = False
 
         # Deployment state
         self.domain = ""
@@ -299,22 +458,38 @@ class DockerComposeDeployer(AppDeployer):
         self.branch = branch
         self.env_vars = env_vars or {}
         compose_file = options.get("compose_file")
-        self.compose_file = str(compose_file) if compose_file else None
+        # Checked here, before anything is fetched, because configure() is the
+        # one call the CLI, the API's deploy job and the auto deployer share.
+        self.compose_file = str(compose_file_option(str(compose_file))) if compose_file else None
         self.compose_profiles = options.get("compose_profiles") or []
         self.port = port
+        # A directory that already holds files - bind-mounted data among
+        # them - is only deployed into when asked for (wasm create --force).
+        self.replace_existing = bool(options.get("replace_existing", False))
+        self.deploy_target = None
 
     def _compose(self, *args: str) -> list[str]:
         """
         Build a ``docker compose`` argument vector for this stack.
 
+        ``-p`` is pinned to the project name Compose would already derive
+        from ``app_path`` and the compose file (see
+        :func:`compose_project_name`), so the containers, networks and named
+        volumes this stack owns keep their name regardless of the working
+        directory a future change might run this from.
+
         Args:
             args: Subcommand and its arguments.
 
         Returns:
-            The full argument vector, including the file and profile flags.
+            The full argument vector, including the project, file and
+            profile flags.
         """
         cmd = ["docker", "compose"]
         if self.compose_path:
+            project = compose_project_name(self.app_path, self.compose_path)
+            if project is not None:
+                cmd.extend(["-p", project])
             cmd.extend(["-f", str(self.compose_path)])
         for profile in self.compose_profiles:
             cmd.extend(["--profile", profile])
@@ -384,13 +559,27 @@ class DockerComposeDeployer(AppDeployer):
         delete a stack that was serving.
 
         Raises:
-            DeploymentError: If any deployment step fails.
+            DeploymentError: If any deployment step fails, or the application
+                directory already holds files and replacing them was not
+                asked for.
+            AppBusyError: Another operation is running on the application.
         """
-        self._is_new_deployment = self.store.get_app(self.domain) is None
-        with recording(self._recorder(), git_branch=self.branch) as recorder:
-            result = self._deploy_steps()
-        self.last_deployment_id = recorder.deployment_id
-        return result
+        # Held for the whole deploy, and the directory claimed before the
+        # fetch, which empties it: a stack's bind-mounted data lives there.
+        with app_lock(self.domain, "deploy"):
+            existing = self.store.get_app(self.domain)
+            self._is_new_deployment = existing is None
+            if self.deploy_target is None:
+                self.deploy_target = claim_deploy_target(
+                    self.app_path,
+                    domain=self.domain,
+                    existing=existing,
+                    replace=self.replace_existing,
+                )
+            with recording(self._recorder(), git_branch=self.branch) as recorder:
+                result = self._deploy_steps()
+            self.last_deployment_id = recorder.deployment_id
+            return result
 
     def _deploy_steps(self) -> bool:
         """
@@ -495,19 +684,23 @@ class DockerComposeDeployer(AppDeployer):
         self.logger.substep(f"Source fetched to {self.app_path}")
 
     def _discover_compose_file(self) -> None:
-        """Find the best compose file to use."""
+        """
+        Find the compose file to use, inside the application directory.
+
+        Raises:
+            DeploymentError: When the named file is missing, when no default
+                name is present, or when the file found resolves outside the
+                application through a symlink.
+        """
         if self.compose_file:
-            path = self.app_path / self.compose_file
-            if not path.exists():
-                raise DeploymentError(f"Specified compose file not found: {self.compose_file}")
-            self.compose_path = path
+            self.compose_path = compose_file_in(self.app_path, self.compose_file)
             self.logger.substep(f"Using specified: {self.compose_file}")
             return
 
         for filename in COMPOSE_FILE_PRIORITY:
-            path = self.app_path / filename
-            if path.exists():
-                self.compose_path = path
+            if (self.app_path / filename).exists():
+                # A default name is as much repository content as a named one.
+                self.compose_path = compose_file_in(self.app_path, filename)
                 self.logger.substep(f"Found: {filename}")
                 return
 
@@ -899,8 +1092,10 @@ class DockerComposeDeployer(AppDeployer):
             except (WASMError, OSError) as e:
                 self.logger.debug(f"Site cleanup failed: {e}")
 
-        # Remove app directory
-        if self.app_path.exists():
+        # Remove app directory: only what this deploy put there.
+        if self.deploy_target is not None:
+            self.deploy_target.undo_fetch(self.fs, self.logger)
+        elif self.app_path.exists():
             try:
                 self.fs.remove_tree(self.app_path)
             except OSError as e:
@@ -1047,6 +1242,37 @@ class DockerComposeDeployer(AppDeployer):
             start_command=" ".join(self._compose("up", "-d")),
         )
 
+    def down(self, remove_volumes: bool = False) -> bool:
+        """
+        Stop and remove the stack's containers, with the file and project it runs as.
+
+        What :func:`wasm.deployers.lifecycle.delete_app` takes a stack down
+        with: the same compose file discovery and the same project name as
+        every other command here, so ``docker-compose.prod.yml`` and a
+        pinned project are honoured.
+
+        Args:
+            remove_volumes: Also remove the named volumes. They hold the
+                stack's databases, so only when asked for explicitly.
+
+        Returns:
+            Whether docker reported success.
+
+        Raises:
+            DeploymentError: No compose file is left to take the stack down with.
+        """
+        if self.compose_path is None:
+            self._discover_compose_file()
+        down = (
+            ["down", "--volumes", "--remove-orphans"]
+            if remove_volumes
+            else ["down", "--remove-orphans"]
+        )
+        result = self._run(self._compose(*down))
+        if not result.success:
+            self.logger.warning(f"docker compose down failed: {result.stderr.strip()}")
+        return result.success
+
     def delete(self, remove_volumes: bool = False) -> None:
         """
         Delete the Docker Compose application.
@@ -1055,12 +1281,7 @@ class DockerComposeDeployer(AppDeployer):
             remove_volumes: Also remove Docker volumes.
         """
         # Stop and remove containers
-        down = (
-            ["down", "--volumes", "--remove-orphans"]
-            if remove_volumes
-            else ["down", "--remove-orphans"]
-        )
-        self._run(self._compose(*down))
+        self.down(remove_volumes=remove_volumes)
 
         # Remove systemd service
         try:

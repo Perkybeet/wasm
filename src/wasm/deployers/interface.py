@@ -20,9 +20,12 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, TypeAlias
+from typing import TYPE_CHECKING, Any, ClassVar, TypeAlias
 
 from wasm.core.fs import FileSystem, get_fs
+
+if TYPE_CHECKING:
+    from wasm.deployers.helpers.target import DeployTarget
 
 #: Called with a short description as each update step begins.
 StepReporter: TypeAlias = Callable[[str], None]
@@ -69,6 +72,14 @@ class AppDeployer(ABC):
     DETECTION_PRIORITY: int = DEFAULT_DETECTION_PRIORITY
 
     source_already_fetched: bool = False
+
+    #: How the application directory was found when this deploy claimed it
+    #: (see :func:`~wasm.deployers.helpers.target.claim_deploy_target`).
+    #: Set by :meth:`deploy`, or handed over by
+    #: :class:`~wasm.deployers.auto.AutoDeployer`, which claims the
+    #: directory before it fetches into it. What a failed deploy may remove
+    #: is decided from this, never from what the directory holds by then.
+    deploy_target: DeployTarget | None = None
 
     #: The background job that started this deployment, when one did. A
     #: class-level default, not just one set in ``__init__``, because

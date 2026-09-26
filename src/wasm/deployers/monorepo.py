@@ -20,6 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, ClassVar
 
+from wasm.core.applock import app_lock
 from wasm.core.config import Config
 from wasm.core.exceptions import (
     BuildError,
@@ -53,6 +54,7 @@ from wasm.deployers.helpers import (
 )
 from wasm.deployers.helpers.permissions import hand_over_tree
 from wasm.deployers.helpers.registration import StoreRegistrar
+from wasm.deployers.helpers.target import claim_deploy_target
 from wasm.deployers.interface import AppDeployer, StepReporter, UpdateResult
 from wasm.deployers.recorder import (
     CapturingLogger,
@@ -177,6 +179,7 @@ class MonorepoDeployer(AppDeployer):
         # Database configuration
         self.databases: dict[str, DatabaseConfig] = {}
         self.skip_database: bool = False
+        self.replace_existing: bool = False
 
         # Package manager
         self.package_manager: str = "pnpm"
@@ -275,8 +278,10 @@ class MonorepoDeployer(AppDeployer):
             trigger: What initiated this deployment, recorded in the history.
             **options: ``subdomain_overrides`` maps workspace names to
                 subdomains, ``workspace_filter`` limits which workspaces deploy,
-                ``skip_database`` disables provisioning, and ``job_id`` is the
-                background job driving this deployment, when there is one.
+                ``skip_database`` disables provisioning, ``job_id`` is the
+                background job driving this deployment, when there is one, and
+                ``replace_existing`` deploys into a directory that already
+                holds files (``wasm create --force``).
 
         Raises:
             DeploymentError: When ``webserver`` is ``apache``, which this
@@ -303,6 +308,8 @@ class MonorepoDeployer(AppDeployer):
         self.subdomain_overrides = options.get("subdomain_overrides") or {}
         self.workspace_filter = options.get("workspace_filter")
         self.skip_database = bool(options.get("skip_database", False))
+        self.replace_existing = bool(options.get("replace_existing", False))
+        self.deploy_target = None
 
         # Set app name and path
         self.app_name = domain_to_app_name(domain)
@@ -410,11 +417,36 @@ class MonorepoDeployer(AppDeployer):
 
         Returns:
             True if deployment was successful.
+
+        Raises:
+            DeploymentError: A step failed, or the application directory
+                already holds files and replacing them was not asked for.
+            AppBusyError: Another operation is running on the application.
+        """
+        with app_lock(self.domain, "deploy"):
+            return self._deploy()
+
+    def _deploy(self) -> bool:
+        """
+        Deploy the monorepo, holding the application's lock.
+
+        Returns:
+            True if deployment was successful.
         """
         total_steps = 11
 
         # Track if this is a new deployment (for rollback)
-        self._is_new_deployment = not self.store.get_app(self.domain)
+        existing = self.store.get_app(self.domain)
+        self._is_new_deployment = not existing
+        if self.deploy_target is None:
+            # Before the fetch, which empties a directory it is not updating,
+            # and the rollback, which deletes the one it deployed into.
+            self.deploy_target = claim_deploy_target(
+                self.app_path,
+                domain=self.domain,
+                existing=existing,
+                replace=self.replace_existing,
+            )
 
         # Pre-flight checks
         self.logger.debug("Running pre-flight validation...")
@@ -1545,8 +1577,11 @@ class MonorepoDeployer(AppDeployer):
         except (WASMError, OSError) as e:
             errors.append(f"Site cleanup error: {e}")
 
-        # Remove files
-        if self.app_path and self.app_path.exists():
+        # Remove files: only what this deploy put there. A directory that held
+        # files before it is not this deploy's to delete.
+        if self.deploy_target is not None:
+            self.deploy_target.undo_fetch(self.fs, self.logger)
+        elif self.app_path and self.app_path.exists():
             try:
                 self.fs.remove_tree(self.app_path)
             except OSError as e:

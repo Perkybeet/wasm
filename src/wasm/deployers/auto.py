@@ -21,6 +21,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from wasm.core.applock import app_lock
 from wasm.core.config import Config
 from wasm.core.exceptions import DeploymentError
 from wasm.core.fs import FileSystem
@@ -29,6 +30,7 @@ from wasm.core.store import App, get_store
 from wasm.core.utils import domain_to_app_name
 from wasm.deployers.helpers.layout import INPLACE, RELEASES, choose_layout
 from wasm.deployers.helpers.release_build import discard_release, stage_release
+from wasm.deployers.helpers.target import DeployTarget, claim_deploy_target
 from wasm.deployers.interface import AppDeployer
 from wasm.deployers.registry import DeployerRegistry
 from wasm.deployers.releases import ReleaseManager
@@ -186,21 +188,34 @@ class AutoDeployer(AppDeployer):
             app_type=self.APP_TYPE,
             supports_releases=True,
         )
+        # Claimed here, not by the deployer chosen below: detection fetches,
+        # and an in-place fetch empties a directory that holds an application.
+        target = claim_deploy_target(
+            self.app_path,
+            domain=self.domain,
+            existing=existing,
+            replace=bool(self._options.get("replace_existing", False)),
+        )
         if layout == RELEASES:
-            return self._resolve_into_release(existing)
+            return self._resolve_into_release(existing, target)
 
         self.source_manager.fetch(self.source, self.app_path, branch=self.branch)
-        deployer_class = self._detect(self.app_path)
+        try:
+            deployer_class = self._detect(self.app_path)
+        except DeploymentError:
+            target.undo_fetch(self.fs, self.logger)
+            raise
 
         delegate = deployer_class(verbose=self.verbose, fs=self._fs)
         delegate.configure(self.domain, self.source, **self._options)
         # The code is already on disk; re-fetching would clean the directory and
         # clone it a second time.
         delegate.source_already_fetched = True
+        delegate.deploy_target = target
         self.delegate = delegate
         return delegate
 
-    def _resolve_into_release(self, existing: App | None) -> AppDeployer:
+    def _resolve_into_release(self, existing: App | None, target: DeployTarget) -> AppDeployer:
         """
         Fetch the source into a new release, detect it there, and hand it over.
 
@@ -212,6 +227,7 @@ class AutoDeployer(AppDeployer):
 
         Args:
             existing: The application's store row, when it is already deployed.
+            target: How the application directory was found.
 
         Returns:
             A configured deployer that builds the staged release.
@@ -232,9 +248,9 @@ class AutoDeployer(AppDeployer):
             deployer_class = self._detect(staged.path)
         except DeploymentError:
             # Nothing was deployed: a new application leaves no directory
-            # behind, an existing one loses only the release just staged.
-            if existing is None and self.app_path.is_dir():
-                self.fs.remove_tree(self.app_path)
+            # behind, anything else loses only the release just staged.
+            if existing is None and not target.had_files:
+                target.undo_fetch(self.fs, self.logger)
             else:
                 discard_release(staged.path, releases=releases, logger=self.logger)
             raise
@@ -251,13 +267,18 @@ class AutoDeployer(AppDeployer):
             # A new application: what was staged is all this deploy created,
             # and the in-place fetch starts from a clean directory anyway.
             self.logger.substep(f"{deployer_class.APP_TYPE} applications deploy in place")
-            if self.app_path.is_dir():
-                self.fs.remove_tree(self.app_path)
+            if target.had_files:
+                # Deployed over with --force: the in-place fetch below
+                # replaces what is there, as asked; the release goes first.
+                discard_release(staged.path, releases=releases, logger=self.logger)
+            else:
+                target.undo_fetch(self.fs, self.logger)
             self._options["layout"] = INPLACE
             self.source_manager.fetch(self.source, self.app_path, branch=self.branch)
             delegate = deployer_class(verbose=self.verbose, fs=self._fs)
             delegate.configure(self.domain, self.source, **self._options)
             delegate.source_already_fetched = True
+            delegate.deploy_target = target
             self.delegate = delegate
             return delegate
 
@@ -267,6 +288,7 @@ class AutoDeployer(AppDeployer):
         if adopt is None:  # pragma: no cover - SUPPORTS_RELEASES implies BaseDeployer
             raise DeploymentError(f"{deployer_class.APP_TYPE} cannot build a staged release")
         adopt(staged)
+        delegate.deploy_target = target
         self.delegate = delegate
         return delegate
 
@@ -313,8 +335,17 @@ class AutoDeployer(AppDeployer):
 
         Raises:
             WASMError: Whatever the chosen deployer raised.
+            AppBusyError: Another operation is running on the application.
         """
-        return self.resolve().deploy()
+        if not self.domain:
+            raise DeploymentError(
+                "Deployer was not configured",
+                details="Call configure(domain=..., source=...) before deploy().",
+            )
+        # Taken before detection fetches anything; the deployer chosen takes
+        # it again, which within this thread is the same lock.
+        with app_lock(self.domain, "deploy"):
+            return self.resolve().deploy()
 
 
 DeployerRegistry.register(AutoDeployer)

@@ -38,8 +38,12 @@ the rollback returns to.
 The other operations on a deployed application that every surface shares
 live here for the same reason: going back to a release that is on disk
 (:func:`activate_release`, behind the same health gate), listing them
-(:func:`list_releases`), and setting the resource limits of its units
-(:func:`set_resource_limits`).
+(:func:`list_releases`), setting the resource limits of its units
+(:func:`set_resource_limits`) and removing it (:func:`delete_app`).
+
+Every one of them holds the application's lock
+(:func:`wasm.core.applock.app_lock`) while it runs, so two of them never
+interleave on one application.
 """
 
 from __future__ import annotations
@@ -51,9 +55,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from wasm.core.applock import app_lock
 from wasm.core.config import Config
 from wasm.core.exceptions import DeploymentError, ServiceError, WASMError
-from wasm.core.fs import SECRET_MODE, get_fs
+from wasm.core.fs import SECRET_MODE, get_fs, is_rehearsal
 from wasm.core.logger import Logger
 from wasm.core.store import (
     App,
@@ -79,9 +84,13 @@ from wasm.deployers.releases import (
     ReleaseManager,
     release_order_key,
 )
+from wasm.managers.apache_manager import ApacheManager
 from wasm.managers.backup_manager import RollbackManager
+from wasm.managers.cert_manager import CertManager
+from wasm.managers.nginx_manager import NginxManager
 from wasm.managers.service_manager import ResourceLimits, ServiceManager
 from wasm.managers.source_manager import SourceManager
+from wasm.managers.webserver import delete_site_completely
 from wasm.validators.domain import validate_domain
 from wasm.validators.source import validate_source
 
@@ -166,11 +175,64 @@ def update_app(
     Raises:
         WASMError: When the application is unknown or a step fails. A failed
             build leaves the previous build running.
+        AppBusyError: Another operation is running on the application.
+    """
+    domain = validate_domain(domain)
+    # Held for the whole update, backup to restart: a rollback, a migration
+    # or a second update (a webhook firing while an operator updates by hand)
+    # must not interleave with it. Refused at once, naming this update.
+    with app_lock(domain, "update"):
+        return _update_app(
+            domain,
+            source=source,
+            branch=branch,
+            package_manager=package_manager,
+            trigger=trigger,
+            job_id=job_id,
+            on_phase=on_phase,
+            on_step=on_step,
+            logger=logger,
+            verbose=verbose,
+        )
+
+
+def _update_app(
+    domain: str,
+    *,
+    source: str | None,
+    branch: str | None,
+    package_manager: str,
+    trigger: str,
+    job_id: str | None,
+    on_phase: PhaseReporter | None,
+    on_step: Callable[[str], None] | None,
+    logger: Logger | None,
+    verbose: bool,
+) -> AppUpdate:
+    """
+    Update an application whose lock the caller holds.
+
+    Args:
+        domain: A validated domain.
+        source: Fetch from this source instead of pulling the current one.
+        branch: Git branch to update from.
+        package_manager: Node package manager, or ``auto``.
+        trigger: Who asked for the update.
+        job_id: The background job driving this update, when there is one.
+        on_phase: Called as each phase begins.
+        on_step: Called as each step of the rebuild begins.
+        logger: Logger for the details of each phase.
+        verbose: Verbosity of the managers and the deployer.
+
+    Returns:
+        What was done.
+
+    Raises:
+        WASMError: When the application is unknown or a step fails.
     """
     log = logger or Logger(verbose=verbose)
     phase = on_phase or (lambda _index, _total, _message: None)
 
-    domain = validate_domain(domain)
     store = get_store()
 
     # The store holds the real path, which is what keeps legacy apps deployed
@@ -716,9 +778,35 @@ def activate_release(
             not exist or there is nothing earlier to go back to, or the
             release did not pass the health gate (the previous one is active
             again by then).
+        AppBusyError: Another operation is running on the application.
     """
     log = logger if logger is not None else CapturingLogger(verbose=verbose)
     app = _release_app(validate_domain(domain))
+    # An update pruning releases, or a second activation, must not run while
+    # this one re-points current and restarts.
+    with app_lock(app.domain, "release activation"):
+        return _activate_release(app, release_id, trigger=trigger, log=log)
+
+
+def _activate_release(
+    app: App, release_id: str | None, *, trigger: str, log: Logger
+) -> ReleaseActivation:
+    """
+    Activate a release of an application whose lock the caller holds.
+
+    Args:
+        app: The application, on the release layout.
+        release_id: The release to activate, or None for the one before the
+            active one.
+        trigger: Who asked, recorded in the history.
+        log: Logger for the progress.
+
+    Returns:
+        What was done.
+
+    Raises:
+        DeploymentError: See :func:`activate_release`.
+    """
     root = app_root(app)
     releases = ReleaseManager(root, logger=log)
     previous = releases.current()
@@ -1064,6 +1152,7 @@ def set_resource_limits(
             did not answer under the new limits, and the old ones are back.
         ServiceError: A unit could not be rewritten; the ones already
             rewritten are put back.
+        AppBusyError: Another operation is running on the application.
     """
     log = logger if logger is not None else Logger()
     domain = validate_domain(domain)
@@ -1074,6 +1163,33 @@ def set_resource_limits(
             f"Application not found: {domain}", details="Run 'wasm list' to see what is deployed."
         )
     limits.validated()
+    # Rewriting the units while a migration or an update rewrites or restarts
+    # them would leave whichever finished last.
+    with app_lock(app.domain, "resource limits change"):
+        return _set_resource_limits(app, limits, restart=restart, store=store, log=log)
+
+
+def _set_resource_limits(
+    app: App, limits: ResourceLimits, *, restart: bool, store: WASMStore, log: Logger
+) -> LimitsChange:
+    """
+    Apply resource limits to an application whose lock the caller holds.
+
+    Args:
+        app: The application.
+        limits: The validated limits.
+        restart: Restart the units so the processes run under them now.
+        store: The store.
+        log: Where the restart and the probes are reported.
+
+    Returns:
+        What was done.
+
+    Raises:
+        DeploymentError: See :func:`set_resource_limits`.
+        ServiceError: A unit could not be rewritten.
+    """
+    domain = app.domain
     if app.app_type == "docker-compose":
         raise DeploymentError(
             f"{domain} runs in Docker containers, which its unit's limits do not reach",
@@ -1124,3 +1240,198 @@ def set_resource_limits(
     app.tasks_max = limits.tasks_max
     store.update_app(app)
     return LimitsChange(domain=domain, limits=limits, units=tuple(units), restarted=restart)
+
+
+# ---------------------------------------------------------------------------
+# Deletion
+# ---------------------------------------------------------------------------
+
+#: How many phases :func:`delete_app` reports.
+DELETE_PHASES = 5
+
+
+@dataclass(frozen=True)
+class AppDeletion:
+    """
+    What :func:`delete_app` did.
+
+    Attributes:
+        domain: The application's domain.
+        units: The units removed.
+        containers_stopped: Whether a Docker Compose stack was taken down.
+        volumes_removed: Whether its named volumes went with it.
+        certificate_removed: Whether a certificate was removed.
+        files_removed: Whether the application directory was removed.
+        warnings: What could not be removed, and why; the rest was.
+    """
+
+    domain: str
+    units: tuple[str, ...]
+    containers_stopped: bool
+    volumes_removed: bool
+    certificate_removed: bool
+    files_removed: bool
+    warnings: tuple[str, ...]
+
+
+def delete_app(
+    domain: str,
+    *,
+    remove_files: bool = True,
+    remove_certificate: bool = True,
+    remove_volumes: bool = False,
+    on_phase: PhaseReporter | None = None,
+    logger: Logger | None = None,
+) -> AppDeletion:
+    """
+    Remove a deployed application: its containers, units, site, certificate, files and rows.
+
+    The one deletion, for ``wasm delete`` and the console's delete job alike.
+    They used to differ: the console's job never took a Docker Compose stack
+    down, so its containers went on running from a directory it then deleted,
+    and a unit that would not stop left its unit file behind.
+
+    Each step is attempted whatever the one before it did, and what failed is
+    returned as a warning: a deletion that stopped at the first failure left
+    the rest of the application half there.
+
+    Args:
+        domain: The application's domain.
+        remove_files: Also remove the application directory.
+        remove_certificate: Also remove the domain's certificate.
+        remove_volumes: Also remove a Docker Compose stack's named volumes.
+            Off unless asked for explicitly: they hold its databases.
+        on_phase: Called as each phase begins, with its position and
+            :data:`DELETE_PHASES`.
+        logger: Where the details are reported.
+
+    Returns:
+        What was done.
+
+    Raises:
+        WASMError: Nothing is deployed at that domain.
+        AppBusyError: Another operation is running on the application.
+    """
+    log = logger if logger is not None else Logger()
+    domain = validate_domain(domain)
+    # A deploy writing the tree, or an update restarting the unit, must not
+    # run while it is taken apart.
+    with app_lock(domain, "deletion"):
+        return _delete_app(
+            domain,
+            remove_files=remove_files,
+            remove_certificate=remove_certificate,
+            remove_volumes=remove_volumes,
+            phase=on_phase or (lambda _index, _total, _message: None),
+            log=log,
+        )
+
+
+def _delete_app(
+    domain: str,
+    *,
+    remove_files: bool,
+    remove_certificate: bool,
+    remove_volumes: bool,
+    phase: PhaseReporter,
+    log: Logger,
+) -> AppDeletion:
+    """
+    Remove an application whose lock the caller holds.
+
+    Args:
+        domain: A validated domain.
+        remove_files: Also remove the application directory.
+        remove_certificate: Also remove the domain's certificate.
+        remove_volumes: Also remove a Docker Compose stack's named volumes.
+        phase: Reporter for the :data:`DELETE_PHASES` phases.
+        log: Where the details are reported.
+
+    Returns:
+        What was done.
+
+    Raises:
+        WASMError: Nothing is deployed at that domain.
+    """
+    store = get_store()
+    app = store.get_app(domain)
+    # The store holds the real path, which is what finds a legacy app
+    # deployed under a wasm- prefix.
+    app_path = (
+        Path(app.app_path)
+        if app is not None and app.app_path
+        else Config().apps_directory / domain_to_app_name(domain)
+    )
+    if app is None and not app_path.exists():
+        raise WASMError(
+            f"Application not found: {domain}",
+            details="Nothing to delete; check 'wasm list' for the exact domain.",
+        )
+    warnings: list[str] = []
+
+    def failed(what: str, error: BaseException) -> None:
+        warnings.append(f"{what}: {error}")
+        log.warning(f"{what}: {error}")
+
+    containers_stopped = False
+    if app is not None and app.app_type == "docker-compose":
+        phase(1, DELETE_PHASES, "Stopping Docker Compose containers")
+        deployer = DockerComposeDeployer(verbose=log.verbose)
+        deployer.app_path = app_path
+        deployer.app_name = app_path.name
+        deployer.domain = domain
+        try:
+            containers_stopped = deployer.down(remove_volumes=remove_volumes)
+        except WASMError as exc:
+            failed("The containers were not taken down", exc)
+    else:
+        phase(1, DELETE_PHASES, "Stopping the application")
+
+    phase(2, DELETE_PHASES, "Removing its units")
+    units = [s.name for s in store.list_services() if app is not None and s.app_id == app.id]
+    if not units:
+        units = [app_path.name]
+    services = ServiceManager(verbose=log.verbose)
+    for unit in units:
+        try:
+            # Stops, disables and removes it, and tolerates one that is gone.
+            services.delete_service(unit)
+        except WASMError as exc:
+            failed(f"The unit {unit} was not removed", exc)
+
+    phase(3, DELETE_PHASES, "Removing its site and certificate")
+    deletion = delete_site_completely(
+        domain,
+        nginx=NginxManager(verbose=log.verbose),
+        apache=ApacheManager(verbose=log.verbose),
+        cert_manager=CertManager(verbose=log.verbose),
+        delete_certificate=remove_certificate,
+    )
+
+    files_removed = False
+    if remove_files and app_path.exists():
+        phase(4, DELETE_PHASES, "Removing application files")
+        try:
+            get_fs().remove_tree(app_path)
+            files_removed = not is_rehearsal()
+        except OSError as exc:
+            failed(f"{app_path} was not removed", exc)
+    else:
+        phase(4, DELETE_PHASES, "Keeping application files")
+
+    phase(5, DELETE_PHASES, "Removing its records")
+    if app is not None and not is_rehearsal():
+        store.delete_site(domain)
+        for unit in units:
+            store.delete_service(unit)
+        store.delete_app(domain)
+
+    return AppDeletion(
+        domain=domain,
+        units=tuple(units),
+        containers_stopped=containers_stopped,
+        volumes_removed=containers_stopped and remove_volumes,
+        certificate_removed=deletion.certificate_removed,
+        files_removed=files_removed,
+        warnings=tuple(warnings),
+    )

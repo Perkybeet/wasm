@@ -196,6 +196,8 @@ def test_a_failed_compose_redeploy_leaves_the_stack_that_was_serving(
     root = tmp_path / "stack"
     existing_app(store, "docker-compose", root)
     deployer = compose(root, runner)
+    # Redeploying over the live stack is only done when asked (--force).
+    deployer.replace_existing = True
     monkeypatch.setattr(deployer, "_fetch_source", lambda: None)
     runner.script(["docker", "compose"], stderr="build failed", exit_code=1)
 

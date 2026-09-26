@@ -655,11 +655,13 @@ class TestRollback:
     def test_a_pruned_release_cannot_be_rolled_back_to(self, manager: ReleaseManager, clock: Clock):
         first = build(manager, clock, SHA_A)
         second = build(manager, clock, SHA_B)
-        manager.activate(second)
+        third = build(manager, clock, SHA_C)
+        manager.activate(third)
         manager.prune(keep=1)
 
         with pytest.raises(DeploymentError, match="does not exist"):
             manager.rollback(to=first.name)
+        assert manager.rollback().id == second.name
         with pytest.raises(DeploymentError, match="nothing earlier"):
             manager.rollback()
 
@@ -693,6 +695,38 @@ class TestPrune:
         current = manager.current()
         assert current is not None and current.id == paths[0].name
 
+    def test_never_removes_what_a_rollback_would_go_back_to(
+        self, manager: ReleaseManager, clock: Clock
+    ):
+        """Keeping one release must not leave the active one with nowhere to roll back to."""
+        paths = [build(manager, clock) for _ in range(3)]
+        manager.activate(paths[2])
+
+        removed = manager.prune(keep=1)
+
+        assert [r.id for r in removed] == [paths[0].name]
+        assert manager.rollback().id == paths[1].name
+
+    def test_after_a_rollback_keeps_the_active_one_and_the_one_before_it(
+        self, manager: ReleaseManager, clock: Clock
+    ):
+        """current points at an older release: it and its own rollback target survive."""
+        paths = [build(manager, clock) for _ in range(6)]
+        manager.activate(paths[2])
+
+        removed = manager.prune(keep=2)
+
+        assert [r.id for r in removed] == [paths[0].name, paths[3].name]
+        assert [r.id for r in manager.list()] == [
+            paths[5].name,
+            paths[4].name,
+            paths[2].name,
+            paths[1].name,
+        ]
+        current = manager.current()
+        assert current is not None and current.id == paths[2].name
+        assert manager.rollback().id == paths[1].name
+
     def test_nothing_to_remove(self, manager: ReleaseManager, clock: Clock):
         build(manager, clock)
 
@@ -714,6 +748,7 @@ class TestPrune:
         (app / "shared" / "uploads" / "photo.jpg").write_text("jpeg")
         old = build(manager, clock)
         manager.link_shared(old, ["uploads"])
+        build(manager, clock)
         new = build(manager, clock)
         manager.activate(new)
 
@@ -774,7 +809,8 @@ class TestDryRun:
         assert linked.linked == (".env", "uploads", "storage/logs")
         assert previous is not None and previous.id.endswith("-c3d4e5f")
         assert rolled_back.id.endswith("-b2c3d4e")
-        assert [r.id for r in pruned] == [r.id for r in manager.list()[1:][::-1]]
+        # The active release and the one a rollback goes back to are kept.
+        assert [r.id for r in pruned] == [r.id for r in manager.list()[2:][::-1]]
         assert any(f"would link {deployed / 'current'}" in line for line in dry.skipped)
         assert any("would delete directory" in line for line in dry.skipped)
 

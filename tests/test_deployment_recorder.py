@@ -30,6 +30,7 @@ from wasm.core.exceptions import BackupError, BuildError
 from wasm.core.fs import DryRunFileSystem, set_fs
 from wasm.core.runner import FakeRunner
 from wasm.core.store import DeploymentStatus, StoreError, WASMStore
+from wasm.deployers.helpers.target import DeployTarget
 from wasm.deployers.nodejs import NodeJSDeployer
 from wasm.deployers.recorder import CapturingLogger, DeploymentRecorder
 from wasm.managers.backup_manager import BackupMetadata, RollbackManager
@@ -85,6 +86,8 @@ def happy_deployer(tmp_path: Path) -> Any:
     deployer = build_deployer(NodeJSDeployer, tmp_path)
     (tmp_path / "app").mkdir(parents=True, exist_ok=True)
     deployer.fetch_source = lambda: True
+    # The tree stands in for what the stubbed fetch would have created.
+    deployer.deploy_target = DeployTarget(path=tmp_path / "app", existed=False, had_files=False)
     deployer.install_dependencies = lambda: True
     deployer.build = lambda: True
     deployer.health_check = lambda retries=5, delay=2.0: True
@@ -144,6 +147,8 @@ def test_streamed_build_output_is_captured_without_verbose(
     # this test is about.
     (deployer.app_path / "package-lock.json").write_text("{}")
     deployer.fetch_source = lambda: True
+    # The tree stands in for what the stubbed fetch would have created.
+    deployer.deploy_target = DeployTarget(path=deployer.app_path, existed=False, had_files=False)
     deployer.pre_install = lambda: True
     deployer.post_install = lambda: True
     deployer.package_manager = "npm"

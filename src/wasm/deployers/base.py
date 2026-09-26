@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
+from wasm.core.applock import app_lock
 from wasm.core.config import Config
 from wasm.core.exceptions import (
     BuildError,
@@ -80,8 +81,10 @@ from wasm.deployers.helpers.release_build import (
     discard_release,
     reuse_dependencies,
     stage_release,
+    stamp_installed_dependencies,
 )
 from wasm.deployers.helpers.summary import print_deployment_summary
+from wasm.deployers.helpers.target import claim_deploy_target
 from wasm.deployers.interface import AppDeployer, StepReporter, UpdateResult
 from wasm.deployers.pipeline import DeployStep, run_pipeline
 from wasm.deployers.recorder import (
@@ -152,6 +155,7 @@ class BaseDeployer(AppDeployer):
     _layout: str | None = None
     _staged: StagedRelease | None = None
     _app_record: App | None = None
+    _replace_existing: bool = False
 
     def __init__(
         self,
@@ -378,8 +382,12 @@ class BaseDeployer(AppDeployer):
                 existing application's limits exactly as they were - set once
                 through ``PATCH .../limits`` or at creation, a redeploy or an
                 update must not silently clear them.
-            **options: Accepted and ignored, so a caller can pass the union of
-                every deployer's settings without knowing which one it got.
+            **options: ``replace_existing`` deploys into a directory that
+                already holds files (``wasm create --force``): in place they
+                are replaced, on releases a release is added beside them.
+                Anything else is accepted and ignored, so a caller can pass
+                the union of every deployer's settings without knowing which
+                one it got.
         """
         from wasm.validators.domain import should_include_www
 
@@ -403,6 +411,10 @@ class BaseDeployer(AppDeployer):
         self._layout = None
         self._releases = None
         self._staged = None
+        # Deploying over a directory that already holds files is refused
+        # unless asked for (wasm create --force); see claim_deploy_target.
+        self._replace_existing = bool(options.get("replace_existing", False))
+        self.deploy_target = None
 
         # Set app name and path
         self.app_name = domain_to_app_name(domain)
@@ -1035,7 +1047,17 @@ class BaseDeployer(AppDeployer):
     # halfway through its own work.
 
     def remove_source(self) -> None:
-        """Delete the fetched application directory."""
+        """
+        Take back the application directory a failed deploy fetched into.
+
+        During a deploy, what was there before decides: a directory this
+        deploy created is deleted, one it found empty is emptied, one that
+        held files is never touched. Outside a deploy nothing records that,
+        and the directory is deleted, as this always did.
+        """
+        if self.deploy_target is not None:
+            self.deploy_target.undo_fetch(self.fs, self.logger)
+            return
         if self.app_path and self.app_path.exists():
             self.logger.debug(f"Removing app files: {self.app_path}")
             try:
@@ -1692,7 +1714,7 @@ class BaseDeployer(AppDeployer):
                 title="Fetching source into a new release",
                 icon=Icons.DOWNLOAD,
                 run=self._step_fetch_release,
-                undo=self.remove_source if new_app else self._abandon_release,
+                undo=self._undo_release_fetch,
             ),
         ]
         steps += (
@@ -1794,6 +1816,11 @@ class BaseDeployer(AppDeployer):
         )
         if self.dependencies_reused_from is None:
             self.install_dependencies()
+            # So the next deploy can tell whether reusing this install would
+            # still match the runtime it was built with.
+            stamp_installed_dependencies(
+                staged.path, runner=self.runner, fs=self.fs, logger=self.logger
+            )
             return
 
         self.pre_install()
@@ -1899,6 +1926,28 @@ class BaseDeployer(AppDeployer):
             restart=self.restart,
             files_check=None if serves else self.health_check,
         )
+
+    def _undo_release_fetch(self) -> None:
+        """
+        Undo the fetch of a release deploy that failed.
+
+        A new application whose directory this deploy created (or found
+        empty) leaves nothing behind. Anything else loses only the release
+        this deploy staged: the releases, ``shared/`` and whatever else the
+        directory held before are not this deploy's.
+        """
+        target = self.deploy_target
+        if self._is_new_deployment and (target is None or not target.had_files):
+            self.remove_source()
+            return
+        staged = self._staged
+        if self._is_new_deployment and staged is not None:
+            active = staged.manager.current()
+            if active is not None and active.id == staged.id:
+                # A first release that failed its gate had nothing to go back
+                # to, so current was made by this deploy and points at it.
+                self.fs.remove(staged.manager.current_link)
+        self._abandon_release()
 
     def _abandon_release(self) -> None:
         """
@@ -2381,6 +2430,7 @@ class BaseDeployer(AppDeployer):
 
         Raises:
             WASMError: Whatever the failing step raised, after the rollback.
+            AppBusyError: Another operation is running on the application.
         """
         if not self.domain:
             raise DeploymentError(
@@ -2388,10 +2438,23 @@ class BaseDeployer(AppDeployer):
                 details="Call configure(domain=..., source=...) before deploy().",
             )
 
-        self._ssl_obtained = False
+        # Held from the first look at the directory to the last step: an
+        # update, a migration or a second deploy of the same application
+        # must not interleave with this one.
+        with app_lock(self.domain, "deploy"):
+            return self._deploy()
 
-        self.logger.debug("Running pre-flight validation...")
-        self.pre_flight_check()
+    def _deploy(self) -> bool:
+        """
+        Run the deployment, holding the application's lock.
+
+        Returns:
+            True if the application ended up deployed.
+
+        Raises:
+            WASMError: Whatever the failing step raised, after the rollback.
+        """
+        self._ssl_obtained = False
 
         # A redeployment must not lose its app row just because this attempt
         # failed, so only a genuinely new app registers an undo for it.
@@ -2399,6 +2462,20 @@ class BaseDeployer(AppDeployer):
         is_new_deployment = existing is None
         self._is_new_deployment = is_new_deployment
         self.resolve_layout(existing)
+        if self.deploy_target is None:
+            # Before anything is fetched: a directory that holds an
+            # application must not be emptied by the fetch, nor deleted by
+            # the undo of a deploy that fails.
+            self.deploy_target = claim_deploy_target(
+                self.app_path,
+                domain=self.domain,
+                existing=existing,
+                replace=self._replace_existing,
+            )
+
+        self.logger.debug("Running pre-flight validation...")
+        self.pre_flight_check()
+
         self._app_record = self._register_app_in_store(AppStatus.DEPLOYING.value)
 
         steps = self.build_pipeline()

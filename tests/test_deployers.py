@@ -26,7 +26,7 @@ from wasm.core.logger import Logger
 from wasm.core.runner import FakeRunner
 from wasm.core.store import App, AppStatus, MonorepoWorkspace, WASMStore
 from wasm.deployers.auto import AutoDeployer
-from wasm.deployers.docker_compose import DockerComposeDeployer
+from wasm.deployers.docker_compose import DockerComposeDeployer, compose_project_name
 from wasm.deployers.helpers.permissions import hand_over_tree
 from wasm.deployers.interface import AppDeployer, UpdateResult
 from wasm.deployers.monorepo import MonorepoDeployer
@@ -588,6 +588,8 @@ def test_docker_compose_builds_argv_with_file_and_profiles(tmp_path: Path) -> No
     assert deployer._compose("build") == [
         "docker",
         "compose",
+        "-p",
+        compose_project_name(tmp_path, deployer.compose_path),
         "-f",
         str(tmp_path / "docker-compose.prod.yml"),
         "--profile",
@@ -608,7 +610,15 @@ def test_docker_compose_build_streams_and_has_a_deadline(
 
     deployer._build_images()
 
-    assert runner.ran("docker", "compose", "-f", str(tmp_path / "docker-compose.yml"), "build")
+    assert runner.ran(
+        "docker",
+        "compose",
+        "-p",
+        compose_project_name(tmp_path, deployer.compose_path),
+        "-f",
+        str(tmp_path / "docker-compose.yml"),
+        "build",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1244,6 +1254,9 @@ def test_a_rehearsed_failed_deployment_deletes_nothing(
     """The rollback of a redeployment must not take the running tree with it."""
     deployer = build_deployer(NodeJSDeployer, tmp_path)
     deployer._fs = dry
+    # Asked to deploy over the tree (wasm create --force): without it the
+    # deploy is refused before anything runs, which deletes nothing either.
+    deployer._replace_existing = True
     app_dir = tmp_path / "app"
     app_dir.mkdir()
     (app_dir / "package.json").write_text(PACKAGE_JSON)
@@ -1449,6 +1462,8 @@ def test_docker_compose_update_rebuilds_and_recreates(
     assert runner.ran(
         "docker",
         "compose",
+        "-p",
+        compose_project_name(app_path, deployer.compose_path),
         "-f",
         str(app_path / "docker-compose.yml"),
         "up",

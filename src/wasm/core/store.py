@@ -682,6 +682,35 @@ _APPS_V5_COLUMNS_SQL = "".join(
     f"    {name} {definition},\n" for name, definition in APPS_V5_COLUMNS
 )
 
+
+def _run_script(cursor: sqlite3.Cursor, script: str) -> None:
+    """
+    Run a static, multi-statement SQL script one statement at a time.
+
+    ``Cursor.executescript`` cannot be used for a schema change that must be
+    atomic: it issues an implicit ``COMMIT`` of whatever transaction is
+    already pending - even one opened explicitly with ``BEGIN`` - before it
+    runs a single statement of the script, and its own statements are never
+    covered by a later ``rollback()``. Splitting on SQLite's own statement
+    boundary keeps every statement inside the caller's transaction instead,
+    so the whole script commits or rolls back with it.
+
+    Args:
+        cursor: Cursor already inside the transaction the script's
+            statements must join.
+        script: A schema script of one or more ``;``-terminated statements,
+            exactly what used to be handed to ``executescript``.
+    """
+    buffer = ""
+    for line in script.splitlines(keepends=True):
+        buffer += line
+        if sqlite3.complete_statement(buffer):
+            statement = buffer.strip()
+            if statement:
+                cursor.execute(statement)
+            buffer = ""
+
+
 SCHEMA_SQL = (
     """
 -- Schema version tracking
@@ -1012,6 +1041,50 @@ class WASMStore:
             conn.rollback()
             raise
 
+    @contextmanager
+    def _ddl_transaction(self) -> Iterator[sqlite3.Cursor]:
+        """
+        Run one schema change - the fresh install or a single migration step
+        - as one atomic, explicit transaction.
+
+        :meth:`_transaction` is not enough here: SQLite's default (legacy)
+        transaction handling only auto-begins before a DML statement
+        (INSERT/UPDATE/DELETE) and implicitly commits whatever was pending
+        before a DDL statement (CREATE/ALTER/DROP) rather than folding it
+        into the same transaction, so a bare ``cursor.execute("ALTER TABLE
+        ...")`` is never covered by ``conn.rollback()``. Issuing ``BEGIN
+        IMMEDIATE`` ourselves is what stops SQLite from doing that: it grabs
+        the write lock up front and keeps every statement executed
+        afterwards, DDL included, pending until this commits or rolls it
+        back as a whole. Scripts must go through :func:`_run_script`, never
+        ``executescript``, for the same reason - see its docstring.
+
+        Yields:
+            A cursor whose statements are all-or-nothing. Under ``--dry-run``
+            the work is done and then rolled back, matching
+            :meth:`_transaction`.
+
+        Raises:
+            sqlite3.Error: Propagated after rolling back whatever this step
+                had already executed, so a failing schema change leaves the
+                database exactly as it was before this call - never with a
+                version number bumped ahead of the schema it actually has.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        committed = False
+        try:
+            yield cursor
+            if not is_rehearsal():
+                conn.commit()
+                committed = True
+        finally:
+            # Whatever interrupted the step, and under --dry-run, nothing of
+            # it stays: no handler, so nothing is caught on the way out.
+            if not committed:
+                conn.rollback()
+
     def _secure_directory(self, path: Path) -> None:
         """
         Create the directory the database lives in, owner-only.
@@ -1090,32 +1163,67 @@ class WASMStore:
             logger.debug("Filesystem declined to create %s; skipping schema", self._db_path)
             return
 
-        with self._transaction() as cursor:
-            # Check if schema_version table exists
-            cursor.execute("""
-                SELECT name FROM sqlite_master
-                WHERE type='table' AND name='schema_version'
-            """)
+        # A plain read: it decides which path to take next, and neither path
+        # needs it inside its own transaction.
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name='schema_version'
+        """)
+        schema_exists = cursor.fetchone() is not None
 
-            if not cursor.fetchone():
-                # Fresh install - create all tables
-                cursor.executescript(SCHEMA_SQL)
-                cursor.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
-            else:
-                # Check for migrations
-                cursor.execute("SELECT MAX(version) FROM schema_version")
-                current_version = cursor.fetchone()[0] or 0
+        if not schema_exists:
+            self._create_fresh_schema()
+            return
 
-                if current_version < SCHEMA_VERSION:
-                    self._run_migrations(cursor, current_version)
+        cursor.execute("SELECT MAX(version) FROM schema_version")
+        current_version = cursor.fetchone()[0] or 0
 
-    def _run_migrations(self, cursor: sqlite3.Cursor, from_version: int) -> None:
+        if current_version < SCHEMA_VERSION:
+            self._run_migrations(current_version)
+
+    def _create_fresh_schema(self) -> None:
         """
-        Run database migrations.
+        Create every table at the current version, for a database that has none.
+
+        Runs as one explicit transaction so a crash or a failing statement
+        partway through ``SCHEMA_SQL`` leaves no ``schema_version`` table at
+        all, the same "nothing happened" state as before this was called,
+        rather than some tables present and no version row to say so.
+        """
+        with self._ddl_transaction() as cursor:
+            _run_script(cursor, SCHEMA_SQL)
+            cursor.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
+
+    def _run_migrations(self, from_version: int) -> None:
+        """
+        Run database migrations, one version at a time.
+
+        Each version's schema change and its ``schema_version`` row are
+        committed together, in their own transaction, immediately after that
+        version's migration function returns - not in one transaction over
+        the whole climb from ``from_version`` to :data:`SCHEMA_VERSION`. A
+        real upgrade can walk several versions in one opening (a 1.6.x
+        database goes straight from 3 to 8), and a crash or a failing
+        statement partway through that climb must not undo versions that
+        already finished: a database left at version 6 because 7 failed has
+        every row and column version 6 promised, and can be retried from
+        there; unwinding 4, 5 and 6 as well over a step that had nothing to
+        do with them would just make the retry redo work that already
+        succeeded. Each step is still all-or-nothing in itself, because it
+        runs inside :meth:`_ddl_transaction`: a statement failing partway
+        through one version's migration rolls back everything that version
+        had done so far, including a ``schema_version`` row it might have
+        already written, so the version number on disk never gets ahead of
+        the schema that is actually there.
 
         Args:
-            cursor: Database cursor.
             from_version: Current schema version.
+
+        Raises:
+            sqlite3.Error: Propagated from whichever version's migration
+                failed, after that version's own changes are rolled back.
         """
         # Keyed by the version each migration produces, matching the loop.
         migrations = {
@@ -1129,9 +1237,10 @@ class WASMStore:
         }
 
         for version in range(from_version + 1, SCHEMA_VERSION + 1):
-            if version in migrations:
-                migrations[version](cursor)
-            cursor.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+            with self._ddl_transaction() as cursor:
+                if version in migrations:
+                    migrations[version](cursor)
+                cursor.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
 
     def _migrate_v1_to_v2(self, cursor: sqlite3.Cursor) -> None:
         """
@@ -1140,7 +1249,7 @@ class WASMStore:
         Args:
             cursor: Cursor the migration runs on.
         """
-        cursor.executescript(DEPLOYMENTS_SCHEMA_SQL)
+        _run_script(cursor, DEPLOYMENTS_SCHEMA_SQL)
 
     def _migrate_v2_to_v3(self, cursor: sqlite3.Cursor) -> None:
         """
@@ -1161,7 +1270,7 @@ class WASMStore:
         Args:
             cursor: Cursor the migration runs on.
         """
-        cursor.executescript(JOBS_SCHEMA_SQL)
+        _run_script(cursor, JOBS_SCHEMA_SQL)
 
     def _migrate_v4_to_v5(self, cursor: sqlite3.Cursor) -> None:
         """
@@ -1176,7 +1285,7 @@ class WASMStore:
         """
         for name, definition in APPS_V5_COLUMNS:
             cursor.execute(f"ALTER TABLE apps ADD COLUMN {name} {definition}")
-        cursor.executescript(RELEASES_SCHEMA_SQL)
+        _run_script(cursor, RELEASES_SCHEMA_SQL)
 
     def _migrate_v5_to_v6(self, cursor: sqlite3.Cursor) -> None:
         """
@@ -1196,7 +1305,7 @@ class WASMStore:
         Args:
             cursor: Cursor the migration runs on.
         """
-        cursor.executescript(DOMAINS_SCHEMA_SQL)
+        _run_script(cursor, DOMAINS_SCHEMA_SQL)
         cursor.execute(
             "INSERT INTO domains (app_id, domain, kind, created_at) "
             "SELECT id, domain, ?, created_at FROM apps",
