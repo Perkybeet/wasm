@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import importlib
+import time
 from pathlib import Path
 from typing import Any
 
@@ -45,18 +46,22 @@ def fast_recheck(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(events_module, "CREDENTIAL_RECHECK_SECONDS", 0.02)
 
 
-def close_code_after(ws: Any, limit: int = 500) -> int | None:
+def close_code_after(ws: Any, seconds: float = 5.0) -> int | None:
     """
     Read from a socket until the server closes it.
 
+    Bounded by time, not by frames: a fast machine answers hundreds of pings before a
+    deadline of a tenth of a second has passed, which made a frame budget flaky.
+
     Args:
         ws: An open test WebSocket.
-        limit: Frames to read at most before giving up.
+        seconds: How long to wait for the server to close at most.
 
     Returns:
-        The close code, or None when the server never closed within the limit.
+        The close code, or None when the server never closed in time.
     """
-    for _ in range(limit):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
         try:
             ws.send_json({"type": "ping"})
             ws.receive_json()
