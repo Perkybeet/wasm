@@ -25,17 +25,7 @@ from datetime import datetime
 import click
 
 from wasm.cli.app import Context, WasmGroup, json_option, pass_context
-from wasm.web.auth import SecurityConfig, TokenManager
-
-
-def _manager() -> TokenManager:
-    """
-    Build the token manager over the same on-disk state the panel uses.
-
-    Returns:
-        The manager.
-    """
-    return TokenManager(SecurityConfig())
+from wasm.cli.web_state import token_manager
 
 
 def _fmt(timestamp: float | None) -> str:
@@ -63,7 +53,7 @@ def cli() -> None:
 @pass_context
 def list_command(ctx: Context) -> None:
     """List every active panel session."""
-    manager = _manager()
+    manager = token_manager()
     records = manager.list_sessions()
 
     if ctx.json_output:
@@ -100,7 +90,7 @@ def revoke_command(ctx: Context, prefix: str) -> None:
     Revoke one session, named by a unique PREFIX of its id, as listed by
     'wasm sessions list'.
     """
-    revoked = _manager().revoke_session_by_prefix(prefix)
+    revoked = token_manager().revoke_session_by_prefix(prefix)
     if revoked is None:
         ctx.logger.error("No active session matches that prefix. It may have expired.")
         raise SystemExit(1)
@@ -127,5 +117,5 @@ def revoke_others_command(ctx: Context, force: bool) -> None:
         ctx.logger.info("Cancelled")
         return
 
-    _manager().revoke_all_sessions()
+    token_manager().revoke_all_sessions()
     ctx.logger.success("All sessions revoked")

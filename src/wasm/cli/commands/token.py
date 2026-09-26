@@ -28,22 +28,10 @@ from typing import Any
 import click
 
 from wasm.cli.app import Context, WasmGroup, json_option, pass_context
-from wasm.web.auth import SecurityConfig, TokenManager
+from wasm.cli.web_state import token_manager
 
 #: Scopes ``POST /api/auth/tokens`` accepts, in the order shown by --help.
 SCOPES: tuple[str, ...] = ("read", "deploy", "admin")
-
-
-def _manager() -> TokenManager:
-    """
-    Build the token manager over the same on-disk state the panel uses.
-
-    Returns:
-        The manager, reading and writing the state directory
-        :class:`~wasm.web.auth.SecurityConfig` resolves by default -
-        ``WASM_WEB_STATE_DIR``, or ``/etc/wasm``.
-    """
-    return TokenManager(SecurityConfig())
 
 
 def _fmt(timestamp: float | None) -> str:
@@ -76,7 +64,7 @@ def list_command(ctx: Context) -> None:
     No output from this command ever shows a token: only its salted hash is
     stored, so it cannot be shown again after 'wasm token create'.
     """
-    records = _manager().list_api_tokens()
+    records = token_manager().list_api_tokens()
 
     if ctx.json_output:
         click.echo(json.dumps({"tokens": records}))
@@ -129,7 +117,7 @@ def create_command(ctx: Context, name: str, scope: str, expires_hours: int | Non
     keeps a salted hash of it, the same as the master token, so it cannot be
     shown again.
     """
-    issued: dict[str, Any] = _manager().create_api_token(name, scope, expires_hours)
+    issued: dict[str, Any] = token_manager().create_api_token(name, scope, expires_hours)
 
     logger = ctx.logger
     logger.success(f"API token issued: {issued['name']} (scope: {issued['scope']})")
@@ -164,7 +152,7 @@ def revoke_command(ctx: Context, token_id: int, force: bool) -> None:
         ctx.logger.info("Cancelled")
         return
 
-    name = _manager().revoke_api_token(token_id)
+    name = token_manager().revoke_api_token(token_id)
     if name is None:
         ctx.logger.error(f"No API token with id {token_id}")
         raise SystemExit(1)

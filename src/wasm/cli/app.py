@@ -523,7 +523,7 @@ def main(argv: list[str] | None = None) -> int:
         return 130
     except WASMError as exc:
         logger = Logger(verbose="-v" in (argv or sys.argv) or "--verbose" in (argv or sys.argv))
-        logger.error(str(exc))
+        logger.error(exc.message)
         if exc.details:
             logger.info(exc.details)
         # A system error is never paraphrased: nginx's, systemd's or psql's

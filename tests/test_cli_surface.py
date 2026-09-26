@@ -259,6 +259,8 @@ class TestErrorBoundary:
         assert "the command failed" in captured.out
         assert "try again with --force" in captured.out
         assert 'nginx: [emerg] unexpected "}" in /etc/nginx/nginx.conf:12' in captured.out
+        # The fix is said once: str(exc) folds details in, and the boundary printed both.
+        assert captured.out.count("try again with --force") == 1
 
     def test_no_output_field_prints_no_extra_block(self, capsys: pytest.CaptureFixture[str]):
         """A WASMError with nothing to show verbatim adds nothing extra."""

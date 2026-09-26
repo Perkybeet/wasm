@@ -24,17 +24,7 @@ import json
 import click
 
 from wasm.cli.app import Context, WasmGroup, json_option, pass_context
-from wasm.web.auth import SecurityConfig, TokenManager
-
-
-def _manager() -> TokenManager:
-    """
-    Build the token manager over the same on-disk state the panel uses.
-
-    Returns:
-        The manager.
-    """
-    return TokenManager(SecurityConfig())
+from wasm.cli.web_state import token_manager
 
 
 @click.group("2fa", cls=WasmGroup)
@@ -47,7 +37,7 @@ def cli() -> None:
 @pass_context
 def status_command(ctx: Context) -> None:
     """Report the two-factor state, without exposing any secret."""
-    status = _manager().totp_status()
+    status = token_manager().totp_status()
 
     if ctx.json_output:
         click.echo(json.dumps(status))
@@ -68,7 +58,7 @@ def enroll_command(ctx: Context) -> None:
     """
     from wasm.web.api.auth import enrollment_uri
 
-    secret = _manager().begin_totp_enrollment()
+    secret = token_manager().begin_totp_enrollment()
 
     logger = ctx.logger
     logger.success("Two-factor enrolment started")
@@ -92,7 +82,7 @@ def confirm_command(ctx: Context, code: str) -> None:
     Prints the backup codes exactly once: only their salted hashes are
     stored, so they cannot be shown again.
     """
-    codes = _manager().confirm_totp_enrollment(code)
+    codes = token_manager().confirm_totp_enrollment(code)
     if codes is None:
         ctx.logger.error("That code was not accepted. Scan the QR again and enter a fresh code.")
         raise SystemExit(1)
@@ -110,7 +100,7 @@ def confirm_command(ctx: Context, code: str) -> None:
 @pass_context
 def disable_command(ctx: Context, code: str) -> None:
     """Turn the second factor off, on presentation of a current CODE or an unused backup code."""
-    if not _manager().disable_totp(code):
+    if not token_manager().disable_totp(code):
         ctx.logger.error("That code was not accepted. Two-factor authentication stays on.")
         raise SystemExit(1)
 
@@ -135,7 +125,7 @@ def backup_codes_command(ctx: Context, force: bool) -> None:
         ctx.logger.info("Cancelled")
         return
 
-    codes = _manager().regenerate_backup_codes()
+    codes = token_manager().regenerate_backup_codes()
 
     logger = ctx.logger
     logger.success("New backup codes issued")
