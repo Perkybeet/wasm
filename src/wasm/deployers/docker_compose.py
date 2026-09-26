@@ -185,6 +185,37 @@ def compose_file_option(raw: str) -> PurePosixPath:
         ) from exc
 
 
+_UNIT_COMPOSE_FILE = re.compile(
+    r'^Environment="COMPOSE_FILE=((?:[^"\\]|\\.)*)"[ \t]*$', re.MULTILINE
+)
+
+
+def compose_file_from_unit(unit_text: str | None) -> str | None:
+    """
+    Read back the compose file a Compose application's unit names.
+
+    A deploy records a compose file other than the default names only in the
+    unit, as ``Environment="COMPOSE_FILE=..."``. An update reads it from there,
+    because rediscovering would find only the root-level default names and
+    rebuild a different stack, or none.
+
+    Args:
+        unit_text: The unit file's content, or None when there is no unit.
+
+    Returns:
+        The compose file relative to the application, as the deploy chose it,
+        or None when the unit names none.
+    """
+    if not unit_text:
+        return None
+    match = _UNIT_COMPOSE_FILE.search(unit_text)
+    if match is None:
+        return None
+    # Undo the template's env_value escaping: specifiers doubled, backslashes and quotes escaped.
+    value = re.sub(r"\\(.)", r"\1", match.group(1).replace("%%", "%"))
+    return value or None
+
+
 def compose_file_in(app_path: Path, relative: PurePosixPath | str) -> Path:
     """
     Locate a compose file in a fetched project, refusing any way out of it.

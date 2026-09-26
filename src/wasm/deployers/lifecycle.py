@@ -69,7 +69,11 @@ from wasm.core.store import (
     get_store,
 )
 from wasm.core.utils import domain_to_app_name
-from wasm.deployers.docker_compose import DockerComposeDeployer
+from wasm.deployers.docker_compose import (
+    DockerComposeDeployer,
+    compose_file_from_unit,
+    compose_file_option,
+)
 from wasm.deployers.helpers.health import wait_until_healthy
 from wasm.deployers.helpers.health_gate import HealthGate
 from wasm.deployers.helpers.layout import INPLACE, RELEASES, app_root, env_file_in
@@ -555,6 +559,11 @@ def _rebuild_compose(
     deployer.app_path = app_path
     deployer.app_name = app_name
     deployer.domain = domain
+    unit_compose_file = compose_file_from_unit(
+        ServiceManager(verbose=verbose).get_service_config(app_name)
+    )
+    if unit_compose_file:
+        deployer.compose_file = str(compose_file_option(unit_compose_file))
     deployer.trigger = trigger
     deployer.job_id = job_id
     result = deployer.update(on_step=on_step)

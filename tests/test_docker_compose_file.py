@@ -167,3 +167,70 @@ def test_a_link_that_stays_inside_the_application_is_accepted(
     deployer._discover_compose_file()
 
     assert deployer.compose_path == tmp_path / "compose.yml"
+
+
+# ---------------------------------------------------------------------------
+# An update uses the compose file the deploy chose
+# ---------------------------------------------------------------------------
+
+
+def rendered_unit(compose_file: str | None) -> str:
+    """The docker-compose unit exactly as ServiceManager renders it."""
+    from wasm.managers.service_manager import ServiceManager
+
+    env = ServiceManager().jinja_env
+    assert env is not None
+    return env.get_template("docker-compose.service.j2").render(
+        name="stack-example-com",
+        description="Docker Compose app: stack.example.com",
+        working_directory="/var/www/apps/stack-example-com",
+        environment={},
+        compose_file=compose_file,
+    )
+
+
+@pytest.mark.parametrize(
+    "compose_file",
+    ["docker/compose.prod.yml", 'odd "name" 100%.yml', "back\\slash.yml"],
+)
+def test_the_compose_file_is_read_back_from_the_unit_the_deploy_wrote(compose_file: str) -> None:
+    """Whatever the template escaped, reading it back gives the same relative path."""
+    from wasm.deployers.docker_compose import compose_file_from_unit
+
+    assert compose_file_from_unit(rendered_unit(compose_file)) == compose_file
+
+
+def test_a_unit_without_a_compose_file_names_none() -> None:
+    from wasm.deployers.docker_compose import compose_file_from_unit
+
+    assert compose_file_from_unit(rendered_unit(None)) is None
+    assert compose_file_from_unit(None) is None
+    assert compose_file_from_unit("") is None
+
+
+def test_an_update_rebuilds_with_the_compose_file_the_deploy_chose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without this an update rediscovered only the root-level default names."""
+    from wasm.deployers import lifecycle
+    from wasm.deployers.interface import UpdateResult
+    from wasm.managers.service_manager import ServiceManager
+
+    seen: list[str | None] = []
+
+    def update(self: DockerComposeDeployer, on_step: object = None) -> UpdateResult:
+        seen.append(self.compose_file)
+        return UpdateResult(
+            package_manager="", prisma_updated=False, is_static=False, start_command=""
+        )
+
+    monkeypatch.setattr(
+        ServiceManager,
+        "get_service_config",
+        lambda self, name: rendered_unit("docker/compose.prod.yml"),
+    )
+    monkeypatch.setattr(DockerComposeDeployer, "update", update)
+
+    lifecycle._rebuild_compose(DOMAIN, tmp_path, "stack-example-com", None, False, "manual")
+
+    assert seen == ["docker/compose.prod.yml"]
