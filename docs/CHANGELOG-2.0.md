@@ -35,12 +35,21 @@ Changes since 1.6.4. Upgrade notes, including what may need a setting after upgr
 - **Instant rollback** to any release on disk: `wasm releases rollback`, the console, or
   `POST /api/apps/{domain}/releases/{id}/activate`, behind the same health gate.
 - **Dependency reuse.** `node_modules`, `.venv` or `venv` is copied from the active release
-  (with reflinks where the filesystem supports them) when every lockfile is unchanged.
-- **Retention**: the newest five releases and the active one are kept.
+  (with reflinks where the filesystem supports them) when every lockfile and the runtime
+  version (Node and its package manager, or Python) are unchanged.
+- **Retention**: the newest five releases, the active one and the one a rollback would go
+  back to are kept.
 - **Migration** of in-place applications with `wasm app migrate`, never implicit: the live
   tree becomes the first release, the `.env` and the directories the application writes into
-  move to `shared/`, nothing is deleted or copied, file counts are verified, and a migration
-  that does not come up is undone exactly.
+  move to `shared/` (SQLite databases with their WAL files), the unit is stopped while the
+  tree moves, nothing is deleted or copied, file counts are verified, and a migration that
+  does not come up is undone step by step, naming anything that could not be put back.
+- **One operation per application at a time.** Update, deploy, rollback, migration, limits,
+  restore and deletion take a per-application lock; a second one is refused with the name of
+  the operation that holds it (`409 app_busy` over the API).
+- **`wasm create` never wipes an existing tree.** A non-empty directory WASM did not create
+  is refused without `--force`, and a failed deploy never deletes a directory it did not
+  create. It had overwritten such directories, and could delete them, since 1.x.
 - New applications use the release layout by default (`deploy.layout`); existing
   applications keep theirs. `wasm create --layout` and `--persist` choose per application.
 - **Resource limits** per application: `MemoryMax`, `CPUQuota` and `TasksMax`, from
@@ -54,6 +63,11 @@ Changes since 1.6.4. Upgrade notes, including what may need a setting after upgr
   with `export` are understood.
 - `wasm create` without `--type` detects the application type. It had deployed every such
   application as Node.js since the first release.
+- Deleting an application is one implementation for the CLI and the console, which also
+  brings a Docker Compose stack down and removes every unit the application has.
+- A Docker Compose update rebuilds with the compose file the deploy chose, and keeps the
+  project name a stack declares for itself, so its volumes are never orphaned.
+- Store migrations run each schema step in one transaction.
 
 ## Domains and certificates
 
@@ -112,16 +126,35 @@ Changes since 1.6.4. Upgrade notes, including what may need a setting after upgr
 - **Sudo mode.** Deleting applications, databases, users, services, sites, certificates,
   backups and domains; restoring backups; revealing or writing an `.env`; editing units and
   sites; SQL in write mode; writing configuration; migrating to releases; changing limits;
-  issuing API tokens; disabling 2FA and regenerating backup codes need a confirmation from
-  the last 10 minutes in a browser session.
-- **Least-privilege read-only SQL.** PostgreSQL statements run under a dedicated role without
-  superuser rights inside a read-only transaction; MySQL and MariaDB under a dedicated
-  account with `SELECT` only. `pg_read_file`, `LOAD_FILE()` and `INTO OUTFILE` are out of
-  reach of the read-only runner.
+  issuing API tokens; creating services, cron jobs and backup schedules; enrolling,
+  disabling and regenerating 2FA need a confirmation from the last 10 minutes in a browser
+  session, whichever channel the session token arrives on.
+- **Least-privilege read-only SQL.** PostgreSQL read mode signs in as a dedicated
+  `wasm_ro_<database>` role, never a superuser session that switched role; MySQL and MariaDB
+  use a dedicated account with `SELECT` only. `pg_read_file`, `COPY ... TO PROGRAM`,
+  `LOAD_FILE()` and `INTO OUTFILE` are out of reach of the read-only runner.
+- **No client commands from the SQL console or a restore.** psql receives the statement as
+  a `-c` string and mysql reads in `--binary-mode`, so `\!`, `system` and `source` never run.
+  A PostgreSQL dump with psql meta-commands is refused; a MySQL dump is read as data. In 1.x a
+  restored MySQL dump could run shell commands as root.
+- **Scopes.** A `deploy` token updates, rolls back and activates releases of existing
+  applications; creating or inspecting one is admin-only, and a local-path source needs the
+  master token or an elevated session. Credentials in stored clone URLs are masked.
+- **Streams re-check their credential.** Log and job WebSockets and the `/events` stream
+  close when the credential is revoked or expires, have a per-credential cap and a maximum
+  lifetime, and `/ws/logs` streams only units WASM manages.
+- **Secrets scrubbed from logs.** Deployment and job logs and errors have the application's
+  secret values replaced with `***` before they are stored or streamed.
+- TOTP codes are single use; a locked-out address is refused on every channel; a session
+  renews into exactly one successor; request bodies are capped before authentication;
+  process command lines are admin-only.
 - **SSRF guard** on notifications: loopback, private, carrier-grade NAT, link-local and
-  metadata destinations are refused, on every redirect hop, unless listed in
-  `notifications.allow_private_hosts`. The test button no longer echoes the remote response.
-- **Webhook signature failures** count toward the login lockout.
+  metadata destinations are refused, also when wrapped in an IPv6 address (IPv4-mapped,
+  NAT64, 6to4), on every redirect hop, unless listed in `notifications.allow_private_hosts`.
+  The test button no longer echoes the remote response.
+- **Webhook signature failures** lock out that application's hook, not the forge's address.
+- Static sites refuse hidden files (`.env`, `.git/`) on nginx and Apache, while
+  `/.well-known/` stays reachable for certificate validation.
 - The loopback-or-TLS rule for the console is also enforced where the socket is bound.
 - Strict Content Security Policy with Trusted Types and no `unsafe-inline`; hashed assets
   cached immutable, everything else `no-store`.
@@ -138,7 +171,9 @@ Changes since 1.6.4. Upgrade notes, including what may need a setting after upgr
   validation as the console), `wasm token create|list|revoke`, `wasm sessions
   list|revoke|revoke-others`, `wasm 2fa enroll|confirm|disable|status|backup-codes`,
   `wasm notify test`.
-- `--json` on `wasm list`, `wasm status` and `wasm logs`, from one shared option.
+- `--json` on every command that reports something, from one shared option; commands where
+  JSON means nothing refuse the flag instead of ignoring it.
+- A tool's own output (psql, nginx, systemd) is printed verbatim under a CLI error.
 - `--open` links point at the console's pages.
 - `wasm create --layout`, `--persist`; `wasm create --www` records a redirect.
 
@@ -172,6 +207,7 @@ Changes since 1.6.4. Upgrade notes, including what may need a setting after upgr
   Base UI, Tailwind CSS); CI fails when the committed build or the generated API types
   differ from the source.
 - End-to-end tests with Playwright against the real backend, with axe and CSP checks.
+- Removing the package stops the monitor and the console daemon; upgrading never does.
 - A real-machine integration harness deploys applications in a systemd container.
 - Store schema 8: application layout, persistent paths and limits; releases, domains and jobs
   tables; job actors; deployment job and release links.
