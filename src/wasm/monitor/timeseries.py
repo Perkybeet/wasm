@@ -112,6 +112,31 @@ _ROLL_MINUTES_TO_HOURS_SQL = _ROLL_UP_SQL.format(
 )
 
 
+def resolution_label(window_s: int) -> str:
+    """
+    Name the coarsest tier a query over this window draws from.
+
+    Uses the exact thresholds :meth:`MetricsStore.query` uses to decide which
+    tiers to union, so a caller reporting "what resolution is this" can never
+    name a tier the query itself did not read from - a second, hand-kept
+    mapping from window to tier is how the two would eventually disagree.
+
+    Args:
+        window_s: Width of the window, in seconds, as passed to
+            :meth:`MetricsStore.query`.
+
+    Returns:
+        ``"raw"`` for a window the raw tier alone covers, ``"minute"`` once it
+        reaches into the minute tier, ``"hour"`` once it reaches into the hour
+        tier.
+    """
+    if window_s > MINUTE_RETENTION_SECONDS:
+        return "hour"
+    if window_s > RAW_RETENTION_SECONDS:
+        return "minute"
+    return "raw"
+
+
 def default_metrics_db_path() -> Path:
     """
     Choose the database location for the current process.

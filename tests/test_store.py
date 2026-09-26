@@ -933,6 +933,89 @@ class TestSchemaV7Migration:
         assert upgraded_columns == fresh_columns
 
 
+class TestSchemaV8Migration:
+    """Schema v8 links a deployment to the job that started it and the release it built."""
+
+    def _create_v7_database(self, db_path: Path) -> None:
+        """
+        Create a real v7 database with one deployment, as 2.0 pre-releases left it.
+
+        Args:
+            db_path: Where the database file is created.
+        """
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.executescript(V1_SCHEMA_SQL)
+            conn.executescript(V2_DEPLOYMENTS_SQL)
+            conn.execute("ALTER TABLE apps ADD COLUMN webhook_secret TEXT")
+            conn.executescript(V4_JOBS_SQL)
+            conn.execute("ALTER TABLE jobs ADD COLUMN actor TEXT")
+            for name, definition in store_module.APPS_V5_COLUMNS:
+                conn.execute(f"ALTER TABLE apps ADD COLUMN {name} {definition}")
+            conn.executescript(store_module.RELEASES_SCHEMA_SQL)
+            conn.executescript(store_module.DOMAINS_SCHEMA_SQL)
+            for version in (1, 2, 3, 4, 5, 6, 7):
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+            conn.execute(
+                "INSERT INTO deployments (domain, status, triggered_by, started_at)"
+                " VALUES (?, ?, ?, ?)",
+                ("old.example.com", "success", "cli", "2026-01-02T03:04:05"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_existing_deployments_keep_no_job_or_release(self, fresh, tmp_path):
+        """A deployment recorded before these columns existed has nothing to backfill them with."""
+        db_path = tmp_path / "wasm.db"
+        self._create_v7_database(db_path)
+
+        store = WASMStore(db_path, fs=RecordingFileSystem())
+
+        with store._transaction() as cursor:
+            cursor.execute("SELECT MAX(version) FROM schema_version")
+            assert cursor.fetchone()[0] == SCHEMA_VERSION
+
+        record = store.list_deployments("old.example.com")[0]
+        assert record.job_id is None
+        assert record.release_id is None
+        assert record.commit_message is None
+
+    def test_a_migrated_database_can_record_the_new_facts(self, fresh, tmp_path):
+        """The columns are usable immediately after migrating, not just present."""
+        db_path = tmp_path / "wasm.db"
+        self._create_v7_database(db_path)
+        store = WASMStore(db_path, fs=RecordingFileSystem())
+
+        deployment_id = store.record_deployment_start("new.example.com", "panel", job_id="ab12cd34")
+        store.annotate_deployment(
+            deployment_id, release_id="20260101-000000", commit_message="Fix bug"
+        )
+
+        record = store.get_deployment(deployment_id)
+        assert record.job_id == "ab12cd34"
+        assert record.release_id == "20260101-000000"
+        assert record.commit_message == "Fix bug"
+
+    def test_the_fresh_schema_and_the_migration_agree(self, fresh, tmp_path):
+        """Both paths to v8 give the deployments table the same columns."""
+        db_path = tmp_path / "migrated.db"
+        self._create_v7_database(db_path)
+        migrated = WASMStore(db_path, fs=RecordingFileSystem())
+        with migrated._transaction() as cursor:
+            cursor.execute("PRAGMA table_info(deployments)")
+            upgraded_columns = {row["name"] for row in cursor.fetchall()}
+        WASMStore.reset_instance()
+
+        fresh_store = WASMStore(tmp_path / "fresh.db", fs=RecordingFileSystem())
+        with fresh_store._transaction() as cursor:
+            cursor.execute("PRAGMA table_info(deployments)")
+            fresh_columns = {row["name"] for row in cursor.fetchall()}
+
+        assert {"job_id", "release_id", "commit_message"} <= upgraded_columns
+        assert upgraded_columns == fresh_columns
+
+
 class TestDomains:
     """The store is the chokepoint for which application answers on which name."""
 
@@ -1715,6 +1798,33 @@ class TestDeploymentHistory:
         with pytest.raises(StoreError):
             temp_db.finish_deployment(999, "success")
 
+    def test_job_id_is_recorded_when_a_job_started_the_deploy(self, temp_db):
+        """A deployment started by the panel's job queue remembers which job."""
+        deployment_id = temp_db.record_deployment_start("example.com", "panel", job_id="ab12cd34")
+
+        assert temp_db.get_deployment(deployment_id).job_id == "ab12cd34"
+
+    def test_job_id_is_none_when_nothing_queued_the_deploy(self, temp_db):
+        """The CLI deploys directly; there is no job to point at."""
+        deployment_id = temp_db.record_deployment_start("example.com", "cli")
+
+        assert temp_db.get_deployment(deployment_id).job_id is None
+
+    def test_annotate_can_record_release_id_and_commit_message(self, temp_db):
+        """A release build and its commit subject are learned once the fetch step has run."""
+        deployment_id = temp_db.record_deployment_start("example.com", "panel")
+
+        assert (
+            temp_db.annotate_deployment(
+                deployment_id, release_id="20260101-000000", commit_message="Fix the thing"
+            )
+            is True
+        )
+
+        record = temp_db.get_deployment(deployment_id)
+        assert record.release_id == "20260101-000000"
+        assert record.commit_message == "Fix the thing"
+
     def test_history_survives_the_app_being_deleted(self, populated_store):
         """
         Why there is no foreign key to apps: deleting a broken app is exactly
@@ -1772,6 +1882,19 @@ class TestLatestDeployments:
         latest = temp_db.get_latest_deployments(["a.example.com"])
 
         assert set(latest) == {"a.example.com"}
+
+    def test_the_new_linking_columns_come_through_too(self, temp_db):
+        """This query's explicit column list must not silently drop a new column."""
+        deployment_id = temp_db.record_deployment_start("a.example.com", "panel", job_id="ab12cd34")
+        temp_db.annotate_deployment(
+            deployment_id, release_id="20260101-000000", commit_message="Fix it"
+        )
+
+        latest = temp_db.get_latest_deployments(["a.example.com"])
+
+        assert latest["a.example.com"].job_id == "ab12cd34"
+        assert latest["a.example.com"].release_id == "20260101-000000"
+        assert latest["a.example.com"].commit_message == "Fix it"
 
 
 class TestRelations:

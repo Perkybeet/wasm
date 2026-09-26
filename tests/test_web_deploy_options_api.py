@@ -198,6 +198,8 @@ def test_the_job_hands_the_options_to_the_deployer(monkeypatch: pytest.MonkeyPat
     class FakeDeployer:
         """Records how it was configured and deploys nothing."""
 
+        last_deployment_id = None
+
         def configure(self, **kwargs: Any) -> None:
             captured.update(kwargs)
 
@@ -227,3 +229,81 @@ def test_the_job_hands_the_options_to_the_deployer(monkeypatch: pytest.MonkeyPat
     assert captured["compose_profiles"] == ["web"]
     assert captured["env_vars"] == {"FOO": "bar"}
     assert captured["trigger"] == "panel"
+
+
+def test_a_request_with_www_paths_and_limits_carries_them_to_the_job(
+    client: TestClient, queued: list[dict[str, Any]]
+) -> None:
+    """include_www, persistent_paths and the three unit limits reach the queued job."""
+    response = client.post(
+        "/api/apps",
+        json={
+            **FORM,
+            "include_www": True,
+            "persistent_paths": ["storage", "uploads"],
+            "memory_max_mb": 512,
+            "cpu_quota_percent": 150,
+            "tasks_max": 200,
+        },
+    )
+
+    assert response.status_code == 202, response.text
+    kwargs = queued[0]["kwargs"]
+    assert kwargs["include_www"] is True
+    assert kwargs["persistent_paths"] == ["storage", "uploads"]
+    assert kwargs["memory_max_mb"] == 512
+    assert kwargs["cpu_quota_percent"] == 150
+    assert kwargs["tasks_max"] == 200
+
+
+def test_a_limit_below_the_minimum_is_refused_before_queueing(
+    client: TestClient, queued: list[dict[str, Any]]
+) -> None:
+    """The same range PATCH .../limits enforces applies at creation too."""
+    response = client.post("/api/apps", json={**FORM, "memory_max_mb": 1})
+
+    assert response.status_code == 400, response.text
+    assert response.json()["error"] == "validationerror"
+    assert not queued
+
+
+def test_the_job_hands_www_paths_and_limits_to_the_deployer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """deploy_app_job forwards include_www, persistent_paths and the limits to configure()."""
+    from wasm.web.jobs import Job, JobContext, JobType, deploy_app_job
+
+    captured: dict[str, Any] = {}
+
+    class FakeDeployer:
+        """Records how it was configured and deploys nothing."""
+
+        last_deployment_id = None
+
+        def configure(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        def deploy(self) -> bool:
+            return True
+
+    monkeypatch.setattr("wasm.deployers.get_deployer", lambda *a, **k: FakeDeployer())
+
+    job = Job(id="job-test", type=JobType.DEPLOY, name="deploy", description="")
+    deploy_app_job(
+        "limited.example.com",
+        "https://github.com/you/app",
+        "nodejs",
+        include_www=True,
+        persistent_paths=["storage"],
+        memory_max_mb=256,
+        cpu_quota_percent=50,
+        tasks_max=64,
+        job_context=JobContext(job, lambda _job: None),
+    )
+
+    assert captured["include_www"] is True
+    assert captured["persistent_paths"] == ["storage"]
+    assert captured["memory_max_mb"] == 256
+    assert captured["cpu_quota_percent"] == 50
+    assert captured["tasks_max"] == 64
+    assert captured["resource_limits_given"] is True

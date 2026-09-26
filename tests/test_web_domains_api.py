@@ -264,3 +264,66 @@ def test_the_dns_check_is_served_as_the_operation_answers_it(
         "resolved_addresses": ["198.51.100.7"],
         "points_here": False,
     }
+
+
+def build_bare(session: dict[str, Any]) -> TestClient:
+    """
+    A client for the app-less DNS check alone, with a fixed session.
+
+    Args:
+        session: What ``require_auth`` resolves every request to.
+
+    Returns:
+        The client.
+    """
+    app = FastAPI()
+    install_error_handlers(app)
+    app.include_router(domains_api.dns_router, prefix="/api/domains")
+    app.dependency_overrides[require_auth] = lambda: session
+    return TestClient(app)
+
+
+def test_the_bare_dns_check_needs_no_application(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wizard can check a domain before anything is deployed at it."""
+    recorder = Calls()
+    check = DnsCheck(
+        domain="new-app.example.com",
+        expected_addresses=("203.0.113.5",),
+        resolved_addresses=("203.0.113.5",),
+        points_here=True,
+    )
+    monkeypatch.setattr(domains_api, "check_dns", recorder.stub("dns", check))
+    client = build_bare({"sid": "token", "scope": "admin", "source": "bearer"})
+
+    response = client.get("/api/domains/dns", params={"name": "new-app.example.com"})
+
+    assert response.status_code == 200, response.text
+    assert recorder.calls == [("dns", ("new-app.example.com",), {})]
+    assert response.json() == {
+        "domain": "new-app.example.com",
+        "expected_addresses": ["203.0.113.5"],
+        "resolved_addresses": ["203.0.113.5"],
+        "points_here": True,
+    }
+
+
+def test_the_bare_dns_check_uses_the_same_operation_as_the_app_scoped_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One implementation of "resolve a domain", asked with or without an app."""
+    calls: list[str] = []
+
+    def fake_check_dns(name: str) -> DnsCheck:
+        calls.append(name)
+        return DnsCheck(
+            domain=name, expected_addresses=(), resolved_addresses=(), points_here=False
+        )
+
+    monkeypatch.setattr(domains_api, "check_dns", fake_check_dns)
+    client = build_bare({"sid": "token", "scope": "admin", "source": "bearer"})
+
+    client.get("/api/domains/dns", params={"name": "a.example.com"})
+
+    assert calls == ["a.example.com"]

@@ -861,6 +861,76 @@ def test_apache_validation_warning_that_says_syntax_ok_passes(
 
 
 @pytest.mark.parametrize("backend", ["nginx", "apache"])
+def test_test_config_text_reports_a_pass_without_raising(
+    managers: dict[str, WebServerManager],
+    runner: FakeRunner,
+    validation_tmp: Path,
+    backend: str,
+) -> None:
+    """The "try before you save" caller gets an answer, not an exception."""
+    manager = managers[backend]
+    stdout = "nginx: the configuration file /tmp/x.conf syntax is ok\n"
+    runner.script(list(manager.backend.validation_argv), stdout=stdout)
+
+    ok, output = manager.test_config_text("# fine\n", domain="example.com")
+
+    assert ok is True
+    assert output == stdout
+    # Nothing staged outlives the call, on the passing path exactly as on the
+    # failing one.
+    assert list(validation_tmp.iterdir()) == []
+
+
+@pytest.mark.parametrize("backend", ["nginx", "apache"])
+def test_test_config_text_reports_a_failure_with_the_servers_output(
+    managers: dict[str, WebServerManager],
+    runner: FakeRunner,
+    validation_tmp: Path,
+    backend: str,
+) -> None:
+    """A rejected snippet is reported, not raised, with the output verbatim."""
+    manager = managers[backend]
+    stderr = 'nginx: [emerg] unexpected end of file, expecting "}"\n'
+    runner.script(list(manager.backend.validation_argv), stderr=stderr, exit_code=1)
+
+    ok, output = manager.test_config_text("server {", domain="example.com")
+
+    assert ok is False
+    assert output == stderr
+
+
+@pytest.mark.parametrize("backend", ["nginx", "apache"])
+def test_test_config_text_never_writes_the_real_site(
+    managers: dict[str, WebServerManager],
+    runner: FakeRunner,
+    validation_tmp: Path,
+    backend: str,
+) -> None:
+    """Testing a candidate config must not touch the site it might replace."""
+    manager = managers[backend]
+    manager.create_site("example.com", context={"port": 3000})
+    before = manager.get_site_config("example.com")
+
+    manager.test_config_text("server { listen 9999; }", domain="example.com")
+
+    assert manager.get_site_config("example.com") == before
+
+
+def test_validate_config_text_carries_the_output_on_the_exception(
+    nginx: NginxManager, runner: FakeRunner, validation_tmp: Path
+) -> None:
+    """The output travels on a field of its own, not only inside details."""
+    stderr = 'nginx: [emerg] unexpected end of file, expecting "}"\n'
+    runner.script(list(nginx.backend.validation_argv), stderr=stderr, exit_code=1)
+
+    with pytest.raises(ValidationError) as raised:
+        nginx.validate_config_text("server {", domain="example.com")
+
+    assert raised.value.output == stderr
+    assert raised.value.details == stderr
+
+
+@pytest.mark.parametrize("backend", ["nginx", "apache"])
 def test_replace_refuses_an_invalid_config_and_keeps_the_file(
     managers: dict[str, WebServerManager],
     runner: FakeRunner,

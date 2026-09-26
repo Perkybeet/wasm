@@ -18,6 +18,7 @@ here for that to be true.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -26,14 +27,24 @@ from pydantic import BaseModel, Field
 from wasm.core import app_state
 from wasm.core.app_state import AppState, resolve_state_with_status, resolve_states_with_status
 from wasm.core.config import REDACTED, redact_secrets
-from wasm.core.store import App, DeploymentRecord, DeploymentTrigger, Service, get_store
+from wasm.core.exceptions import DeploymentError, ValidationError, WASMError
+from wasm.core.store import (
+    DEFAULT_KEEP_RELEASES,
+    App,
+    DeploymentRecord,
+    DeploymentTrigger,
+    Service,
+    get_store,
+)
 from wasm.core.utils import domain_to_app_name
+from wasm.deployers.base import BaseDeployer
 from wasm.deployers.helpers.app_env import read_app_env, write_app_env
 from wasm.deployers.helpers.env_manager import EnvManager, redact_url_credentials
 from wasm.deployers.helpers.layout import RELEASES
 from wasm.deployers.inspect import inspect_source
 from wasm.deployers.lifecycle import activate_release, list_releases, set_resource_limits
 from wasm.deployers.migrate import MigrationPlan, migrate, plan_migration
+from wasm.deployers.registry import DeployerRegistry, available_types
 from wasm.deployers.releases import is_release_id
 from wasm.managers.backup_manager import RollbackManager
 from wasm.managers.service_manager import ResourceLimits, ServiceManager
@@ -114,7 +125,18 @@ class AppInfo(BaseModel):
         port: Upstream port.
         app_type: Deployer that owns it.
         path: Application directory.
+        source: Git URL or local path it was deployed from.
+        branch: Git branch it tracks, or None for a source that has none.
         layout: ``inplace`` or ``releases``.
+        keep_releases: Release directories kept before older ones are pruned.
+            Meaningful only on ``releases``; the in-place default otherwise.
+        build_command: Argv the deployer runs to build the project, read off
+            the same ``get_build_command()`` the deploy used. Empty in a
+            list response - computing it means instantiating the deployer
+            once per application, which this endpoint does not do for a
+            list - and filled in when this application is fetched on its own.
+        start_command: What its unit runs, exactly as the deploy recorded it
+            on the service row. None for a static site, which has no unit.
         memory_max_mb: Memory limit of its unit, in MB, or None.
         cpu_quota_percent: CPU quota of its unit, in percent of one CPU, or None.
         tasks_max: Task limit of its unit, or None.
@@ -138,7 +160,12 @@ class AppInfo(BaseModel):
     port: int | None = None
     app_type: str | None = None
     path: str | None = None
+    source: str | None = None
+    branch: str | None = None
     layout: str = "inplace"
+    keep_releases: int = DEFAULT_KEEP_RELEASES
+    build_command: list[str] = Field(default_factory=list)
+    start_command: str | None = None
     memory_max_mb: int | None = None
     cpu_quota_percent: int | None = None
     tasks_max: int | None = None
@@ -193,6 +220,26 @@ class CreateAppRequest(BaseModel):
         default=None,
         description="Build every deploy as a release behind a health gate, or in place. "
         "Omitted: the server's deploy.layout",
+    )
+    include_www: bool = Field(
+        default=False, description="Also answer on www.<domain>, as a redirect to it"
+    )
+    persistent_paths: list[str] | None = Field(
+        default=None,
+        description="Releases only: paths, relative to the application, linked into shared/ "
+        "and kept across every release (uploads, storage)",
+    )
+    memory_max_mb: int | None = Field(
+        default=None, description="MemoryMax for the unit, in MB; at least 64. Null: no limit"
+    )
+    cpu_quota_percent: int | None = Field(
+        default=None,
+        description="CPUQuota for the unit, in percent of one CPU (200 is two CPUs); "
+        "1 to 100 per CPU. Null: no limit",
+    )
+    tasks_max: int | None = Field(
+        default=None,
+        description="TasksMax for the unit, processes and threads; at least 16. Null: no limit",
     )
 
 
@@ -312,7 +359,11 @@ def _to_app_info(
         port=app.port,
         app_type=app.app_type,
         path=app.app_path,
+        source=app.source or None,
+        branch=app.branch,
         layout=app.layout,
+        keep_releases=app.keep_releases,
+        start_command=service.command if service is not None and service.command else None,
         memory_max_mb=app.memory_max_mb,
         cpu_quota_percent=app.cpu_quota_percent,
         tasks_max=app.tasks_max,
@@ -321,6 +372,43 @@ def _to_app_info(
         run_as=service.user if service is not None else None,
         last_deployment=_last_deployment_out(last_deployment),
     )
+
+
+def _deployer_build_command(app: App) -> list[str]:
+    """
+    Read the build command a fresh deploy of this application would run.
+
+    Instantiates the deployer and reads its ``get_build_command()`` the same
+    way :func:`wasm.deployers.inspect.inspect_source` does for a checkout
+    that has not been deployed yet - ``configure()`` and nothing past it, no
+    install, no build, no network. Cheap enough for one application, which is
+    why only the detail endpoint calls this: the list endpoint would pay this
+    once per application shown, and :func:`_to_app_info` already gives every
+    caller a ``build_command`` (empty) without it.
+
+    Args:
+        app: The stored application.
+
+    Returns:
+        Argv the deployer would run to build the project. Empty when the
+        type is not registered, has nothing to build, or the computation
+        itself failed - this is a convenience for the detail view, not a
+        fact worth failing the request over.
+    """
+    deployer_class = DeployerRegistry.get(app.app_type)
+    if deployer_class is None or not issubclass(deployer_class, BaseDeployer):
+        return []
+    try:
+        instance = deployer_class(verbose=False)
+        instance.configure(
+            domain=app.domain,
+            source=app.source,
+            branch=app.branch,
+            app_path=Path(app.app_path) if app.app_path else None,
+        )
+        return instance.get_build_command()
+    except (WASMError, OSError):
+        return []
 
 
 def _looks_secret(name: str) -> bool:
@@ -452,6 +540,9 @@ def create_app(
             port is free.
         PortError: When the requested port is not usable.
         DomainError: When the domain is not acceptable.
+        ValidationError: A resource limit is out of range (400, with the
+            range) - the same check ``PATCH .../limits`` runs, so a limit
+            given at creation cannot be more permissive than one set later.
     """
     domain = strict_domain(body.domain)
 
@@ -464,6 +555,12 @@ def create_app(
         port = find_available_port(preferred=DEFAULT_PORT)
         if port is None:
             raise HTTPException(status_code=503, detail="No available port found")
+
+    ResourceLimits(
+        memory_max_mb=body.memory_max_mb,
+        cpu_quota_percent=body.cpu_quota_percent,
+        tasks_max=body.tasks_max,
+    ).validated()
 
     job = get_job_manager().create_job(
         job_type=JobType.DEPLOY,
@@ -485,6 +582,11 @@ def create_app(
             "compose_file": body.compose_file,
             "compose_profiles": body.compose_profiles,
             "layout": body.layout,
+            "include_www": body.include_www,
+            "persistent_paths": body.persistent_paths,
+            "memory_max_mb": body.memory_max_mb,
+            "cpu_quota_percent": body.cpu_quota_percent,
+            "tasks_max": body.tasks_max,
         },
         metadata={"domain": domain, "app_type": body.app_type, "port": port},
         actor=actor_label(session),
@@ -576,10 +678,21 @@ def inspect_app_source(
         The inspection result.
 
     Raises:
-        SourceError: The source is invalid, or fetching it failed.
-        DeploymentError: The checkout matches no registered application type.
+        SourceError: The source is invalid, or fetching it failed. Answered
+            as 400: the operator gave a source WASM cannot reach, not a
+            server fault.
+        ValidationError: The checkout matches no registered application
+            type. ``inspect_source`` raises ``DeploymentError`` for this -
+            right for the CLI, where it means the whole operation failed -
+            but here it is the wizard's input that could not be classified,
+            so it is translated to the API's validation-error contract
+            (400 with details) instead of the 500 an unqualified
+            ``DeploymentError`` would answer.
     """
-    result = inspect_source(body.source, branch=body.branch)
+    try:
+        result = inspect_source(body.source, branch=body.branch)
+    except DeploymentError as exc:
+        raise ValidationError(exc.message, details=exc.details) from exc
     return SourceInspectionResponse(
         app_type=result.app_type,
         detected_types=result.detected_types,
@@ -599,6 +712,48 @@ def inspect_app_source(
         ],
         branch=result.branch,
         commit=result.commit,
+    )
+
+
+class AppTypeInfo(BaseModel):
+    """One application type the new-app wizard may offer."""
+
+    type: str
+    name: str
+    default_port: int
+
+
+class AppTypesResponse(BaseModel):
+    """Every application type WASM can deploy."""
+
+    types: list[AppTypeInfo]
+
+
+# NOTE: declared before GET /{domain} for the same reason /inspect is: a
+# request for /api/apps/types must not be read as a request for the
+# application whose domain is literally "types".
+@router.get("/types", response_model=AppTypesResponse)
+def list_app_types(session: Annotated[dict, Depends(get_current_session)]) -> AppTypesResponse:
+    """
+    List the application types WASM can deploy.
+
+    :func:`~wasm.deployers.registry.available_types` is the one source of
+    truth - the CLI's ``--type`` choices come from it too - so a deployer
+    registered with :meth:`~wasm.deployers.registry.DeployerRegistry.register`
+    reaches the wizard the moment it exists, instead of needing a second,
+    hand-kept copy of the list in the console.
+
+    Args:
+        session: The authenticated session.
+
+    Returns:
+        Every registered type, most specific first, ``auto`` last.
+    """
+    return AppTypesResponse(
+        types=[
+            AppTypeInfo(type=entry["type"], name=entry["name"], default_port=entry["default_port"])
+            for entry in available_types()
+        ]
     )
 
 
@@ -630,7 +785,7 @@ def get_app(domain: str, session: Annotated[dict, Depends(get_current_session)])
 
     recent = store.list_deployments(domain=app.domain, limit=1)
 
-    return _to_app_info(
+    info = _to_app_info(
         app,
         state,
         status,
@@ -638,6 +793,10 @@ def get_app(domain: str, session: Annotated[dict, Depends(get_current_session)])
         webhook_enabled=store.get_webhook_secret(app.domain) is not None,
         last_deployment=recent[0] if recent else None,
     )
+    # Only the detail view pays for this: one deployer instantiation, not one
+    # per application in the list.
+    info.build_command = _deployer_build_command(app)
+    return info
 
 
 def _service_action(domain: str, action: str, past_tense: str) -> AppActionResponse:

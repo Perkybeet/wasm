@@ -253,12 +253,15 @@ class DockerComposeDeployer(AppDeployer):
             package_manager: Ignored; images are built by docker.
             include_www: Ignored; compose stacks are proxied on one hostname.
             trigger: What initiated this deployment, recorded in the history.
-            **options: ``compose_file`` selects a specific compose file and
-                ``compose_profiles`` activates Docker Compose profiles.
+            **options: ``compose_file`` selects a specific compose file,
+                ``compose_profiles`` activates Docker Compose profiles, and
+                ``job_id`` is the background job driving this deployment,
+                when there is one.
         """
         self.domain = domain
         self.source = source
         self.trigger = trigger
+        self.job_id = options.get("job_id")
         self.app_name = domain_to_app_name(domain)
         self.app_path = app_path or (self.config.apps_directory / self.app_name)
         self.webserver = webserver
@@ -354,8 +357,10 @@ class DockerComposeDeployer(AppDeployer):
             DeploymentError: If any deployment step fails.
         """
         self._is_new_deployment = self.store.get_app(self.domain) is None
-        with recording(self._recorder(), git_branch=self.branch):
-            return self._deploy_steps()
+        with recording(self._recorder(), git_branch=self.branch) as recorder:
+            result = self._deploy_steps()
+        self.last_deployment_id = recorder.deployment_id
+        return result
 
     def _deploy_steps(self) -> bool:
         """
@@ -970,8 +975,10 @@ class DockerComposeDeployer(AppDeployer):
             DeploymentError: When no compose file can be found.
             DockerError: When the build or the recreate fails.
         """
-        with recording(self._recorder(), git_branch=self.branch):
-            return self._update_steps(on_step or (lambda _message: None))
+        with recording(self._recorder(), git_branch=self.branch) as recorder:
+            result = self._update_steps(on_step or (lambda _message: None))
+        self.last_deployment_id = recorder.deployment_id
+        return result
 
     def _update_steps(self, report: StepReporter) -> UpdateResult:
         """

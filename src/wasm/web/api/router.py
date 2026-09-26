@@ -25,6 +25,7 @@ from wasm.web.api.databases import router as databases_router
 from wasm.web.api.deployments import router as deployments_router
 from wasm.web.api.deps import install_error_handlers
 from wasm.web.api.diagnose import router as diagnose_router
+from wasm.web.api.domains import dns_router
 from wasm.web.api.domains import router as domains_router
 from wasm.web.api.jobs import router as jobs_router
 from wasm.web.api.metrics import router as metrics_router
@@ -64,6 +65,9 @@ router.include_router(deployments_router, prefix="/deployments", tags=["Deployme
 router.include_router(diagnose_router, prefix="/apps", tags=["Applications"])
 # Same composition: domains.py owns only paths under "/{domain}/domains".
 router.include_router(domains_router, prefix="/apps", tags=["Domains"])
+# domains.py's second router: a DNS check with no application yet, for the
+# new-app wizard. GET /api/domains/dns.
+router.include_router(dns_router, prefix="/domains", tags=["Domains"])
 # No prefix: the route is declared as "/openapi.json" and this router mounts
 # directly under "/api", giving GET /api/openapi.json.
 router.include_router(openapi_router, tags=["OpenAPI"])

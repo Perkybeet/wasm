@@ -182,9 +182,12 @@ class TestErrorHandling:
     """
 
     #: Current count. Lower it when you fix some; never raise it.
-    #: validators/ssh.py's generate_ssh_key() no longer swallows a chmod
-    #: failure with ``except Exception: pass``.
-    MAX_BLIND_EXCEPTS = 65
+    #: wasm/web/websockets/router.py's WebSocket handlers no longer swallow
+    #: everything with ``except Exception: pass/break``: each loop now catches
+    #: the specific exception it guards against (WebSocketDisconnect,
+    #: RuntimeError, json.JSONDecodeError), and the four remaining broad
+    #: catches are the genuine per-connection error boundaries, and they log.
+    MAX_BLIND_EXCEPTS = 38
 
     def test_blind_excepts_do_not_grow(self):
         found: list[str] = []

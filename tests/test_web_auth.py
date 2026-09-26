@@ -1109,6 +1109,56 @@ def test_a_backup_code_can_disable_when_the_authenticator_is_lost(sandbox: Path)
     assert client.get("/api/auth/2fa").json()["enabled"] is False
 
 
+def test_regenerating_backup_codes_requires_elevation(sandbox: Path) -> None:
+    """A fresh, unelevated cookie session cannot mint a new recovery set."""
+    client = build_client(sandbox)
+    token = get_token_manager().generate_master_token()
+    csrf = login(client, token)["csrf_token"]
+    enable_totp(client, csrf)
+
+    response = client.post("/api/auth/2fa/backup-codes", headers={CSRF_HEADER_NAME: csrf})
+
+    assert response.status_code == 403, response.text
+    assert response.json()["error"] == "elevation_required"
+
+
+def test_regenerating_backup_codes_invalidates_the_old_ones(sandbox: Path) -> None:
+    """A set an operator no longer trusts must not keep working alongside the new one."""
+    client = build_client(sandbox)
+    token = get_token_manager().generate_master_token()
+    csrf = login(client, token)["csrf_token"]
+    secret, old_codes = enable_totp(client, csrf)
+    elevated = client.post(
+        "/api/auth/elevate",
+        json={"code": totp.totp_now(secret)},
+        headers={CSRF_HEADER_NAME: csrf},
+    )
+    assert elevated.status_code == 200, elevated.text
+
+    response = client.post("/api/auth/2fa/backup-codes", headers={CSRF_HEADER_NAME: csrf})
+
+    assert response.status_code == 200, response.text
+    new_codes = response.json()["backup_codes"]
+    assert len(new_codes) == auth_module.BACKUP_CODE_COUNT
+    assert set(new_codes).isdisjoint(old_codes)
+
+    old_login = client.post("/api/auth/login", json={"token": token, "totp_code": old_codes[0]})
+    assert old_login.status_code == 401
+
+    new_login = client.post("/api/auth/login", json={"token": token, "totp_code": new_codes[0]})
+    assert new_login.status_code == 200
+
+
+def test_regenerating_backup_codes_needs_two_factor_enabled(sandbox: Path) -> None:
+    """There is nothing to regenerate for a login that has no second factor."""
+    manager = TokenManager(make_config(sandbox))
+
+    with pytest.raises(SecurityError):
+        manager.regenerate_backup_codes()
+
+    manager.sessions.close()
+
+
 def test_the_secret_never_appears_again_after_confirmation(sandbox: Path, runner: object) -> None:
     """
     One screen sees the secret once; no response or audit line repeats it.

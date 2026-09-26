@@ -30,7 +30,7 @@ from pydantic import BaseModel, Field
 from wasm.core.exceptions import ValidationError
 from wasm.managers.cert_manager import CertificateInfo, CertManager
 from wasm.web.api.auth import get_current_session
-from wasm.web.api.deps import JobAcceptedResponse, WASMErrorRoute, strict_domain
+from wasm.web.api.deps import JobAcceptedResponse, WASMErrorRoute, require_elevated, strict_domain
 from wasm.web.auth import actor_label
 from wasm.web.jobs import JobType, cert_create_job, cert_renew_job, get_job_manager
 
@@ -50,6 +50,8 @@ class CertInfo(BaseModel):
         auto_renew: Whether certbot's renewal timer covers this certificate.
         path: Directory holding the certificate files.
         key_path: Path of the private key. The key itself is never read.
+        issuer: The certificate authority that signed it, read from the
+            certificate itself. None when it could not be read.
     """
 
     domain: str
@@ -60,6 +62,7 @@ class CertInfo(BaseModel):
     auto_renew: bool = True
     path: str | None = None
     key_path: str | None = None
+    issuer: str | None = None
 
 
 class CertListResponse(BaseModel):
@@ -154,6 +157,7 @@ def _to_cert_info(entry: CertificateInfo) -> CertInfo:
         days_remaining=_days_remaining(expiry),
         path=cert_path,
         key_path=entry.get("key_path"),
+        issuer=entry.get("issuer"),
     )
 
 
@@ -338,10 +342,15 @@ def renew_certificate(
 
 @router.post("/{domain}/revoke", response_model=CertActionResponse)
 def revoke_certificate(
-    domain: str, session: Annotated[dict, Depends(get_current_session)]
+    domain: str, session: Annotated[dict, Depends(require_elevated)]
 ) -> CertActionResponse:
     """
     Revoke a certificate and delete its files.
+
+    Revoking takes the certificate down at the CA and cannot be undone, so a
+    cookie session must have confirmed it's them recently (D5); a Bearer
+    credential is exempt, as issuing it already required that confirmation
+    once. See :func:`~wasm.web.api.deps.require_elevated`.
 
     Args:
         domain: Certificate name.
@@ -352,6 +361,8 @@ def revoke_certificate(
 
     Raises:
         CertificateError: When certbot refuses the revocation.
+        HTTPException: 403 with ``error: "elevation_required"`` per
+            :func:`~wasm.web.api.deps.require_elevated`.
     """
     validated = strict_domain(domain)
 
@@ -364,10 +375,15 @@ def revoke_certificate(
 
 @router.delete("/{domain}", response_model=CertActionResponse)
 def delete_certificate(
-    domain: str, session: Annotated[dict, Depends(get_current_session)]
+    domain: str, session: Annotated[dict, Depends(require_elevated)]
 ) -> CertActionResponse:
     """
     Delete a certificate without revoking it.
+
+    Deleting removes the certificate files for good, so a cookie session must
+    have confirmed it's them recently (D5), the same rule
+    ``POST /{domain}/revoke`` applies. See
+    :func:`~wasm.web.api.deps.require_elevated`.
 
     Args:
         domain: Certificate name.
@@ -378,6 +394,8 @@ def delete_certificate(
 
     Raises:
         CertificateError: When certbot refuses the deletion.
+        HTTPException: 403 with ``error: "elevation_required"`` per
+            :func:`~wasm.web.api.deps.require_elevated`.
     """
     validated = strict_domain(domain)
 

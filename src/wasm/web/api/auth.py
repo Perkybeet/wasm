@@ -961,6 +961,45 @@ def two_factor_disable(
     return SuccessResponse(success=True, message="Two-factor authentication disabled")
 
 
+@router.post("/2fa/backup-codes", response_model=TwoFactorConfirmed)
+def regenerate_backup_codes(
+    request: Request, session: dict[str, Any] = Depends(require_elevated)
+) -> TwoFactorConfirmed:
+    """
+    Replace the backup codes with a fresh set, shown exactly once.
+
+    Every code issued before this call stops working: a set an operator can
+    no longer account for - lost, or shown on a screen they no longer trust -
+    is worthless as a recovery path if the old ones stay live alongside it.
+
+    Args:
+        request: The incoming request.
+        session: The authenticated session, elevated (D5): a cookie session
+            must have called ``POST /api/auth/elevate`` recently.
+
+    Returns:
+        The new backup codes, in clear.
+
+    Raises:
+        HTTPException: 403 with ``error: "elevation_required"`` per
+            :func:`wasm.web.api.deps.require_elevated`.
+        SecurityError: 400 when two-factor authentication is not enabled.
+    """
+    codes = get_token_manager().regenerate_backup_codes()
+
+    audit = get_audit_logger()
+    if audit:
+        audit.record(
+            action="auth.2fa.backup_codes",
+            result="success",
+            client_ip=get_client_ip(request),
+            actor=str(session.get("sid")),
+            resource="/api/auth/2fa/backup-codes",
+        )
+
+    return TwoFactorConfirmed(success=True, backup_codes=codes)
+
+
 class ApiTokenRequest(BaseModel):
     """
     Request to issue an API token.

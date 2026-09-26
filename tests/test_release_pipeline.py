@@ -421,6 +421,7 @@ def test_a_new_app_deploys_as_a_release(
     deployment = store.list_deployments(DOMAIN)[0]
     assert deployment.status == "success"
     assert deployment.git_commit == commit[:7]
+    assert deployment.release_id == release.name
 
 
 def test_the_unit_and_the_site_are_written_against_current(

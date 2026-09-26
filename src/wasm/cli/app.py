@@ -50,6 +50,7 @@ log = logging.getLogger(__name__)
 #: Command group to the module that defines it. The value is the module path;
 #: the attribute is always ``cli``.
 COMMAND_MODULES: dict[str, str] = {
+    "2fa": "wasm.cli.commands.twofa",
     "app": "wasm.cli.commands.app",
     "backup": "wasm.cli.commands.backup",
     "cert": "wasm.cli.commands.cert",
@@ -61,12 +62,15 @@ COMMAND_MODULES: dict[str, str] = {
     "env": "wasm.cli.commands.env",
     "health": "wasm.cli.commands.health",
     "monitor": "wasm.cli.commands.monitor",
+    "notify": "wasm.cli.commands.notify",
     "releases": "wasm.cli.commands.releases",
     "rollback": "wasm.cli.commands.backup",
     "service": "wasm.cli.commands.service",
+    "sessions": "wasm.cli.commands.sessions",
     "setup": "wasm.cli.commands.setup",
     "site": "wasm.cli.commands.site",
     "store": "wasm.cli.commands.store",
+    "token": "wasm.cli.commands.token",
     "web": "wasm.cli.commands.web",
 }
 

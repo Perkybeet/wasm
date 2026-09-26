@@ -543,7 +543,15 @@ class EnvManager:
         """
         Write a single .env file, readable by its owner only.
 
-        Values are not quoted for systemd compatibility.
+        A value is left bare unless that would change what
+        :meth:`read_env_file` gives back for it: values written unquoted come
+        back with surrounding whitespace stripped, and a value that itself
+        starts and ends with the same quote character would have that pair
+        read as delimiters and stripped too. Both are wrapped in double
+        quotes, with the value copied through unescaped, because
+        ``read_env_file`` unquotes by dropping exactly the first and last
+        character rather than by scanning for an unescaped delimiter -
+        wrapping never needs anything smarter than that to round-trip.
 
         A symlink at the destination is refused rather than written through.
         The seam would not follow it anyway, because it renames a temporary file
@@ -571,10 +579,26 @@ class EnvManager:
 
         lines = []
         for key, value in sorted(values.items()):
-            # Don't quote values for systemd compatibility
-            lines.append(f"{key}={value}")
+            lines.append(f"{key}={self._quote_if_needed(value)}")
         self.fs.write_text(path, "\n".join(lines) + "\n", mode=SECRET_MODE)
         self.logger.debug(f"Wrote env file: {path}")
+
+    @staticmethod
+    def _quote_if_needed(value: str) -> str:
+        """
+        Quote a value only when writing it bare would change how it reads back.
+
+        Args:
+            value: The raw value to write.
+
+        Returns:
+            ``value`` unchanged, or wrapped in double quotes.
+        """
+        has_surrounding_whitespace = value != value.strip()
+        looks_pre_quoted = len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'")
+        if has_surrounding_whitespace or looks_pre_quoted:
+            return f'"{value}"'
+        return value
 
     def save_config(self, app_path: Path, config: EnvConfig) -> None:
         """
@@ -680,11 +704,21 @@ class EnvManager:
         """
         self._write_single_env_file(path, values)
 
+    #: A leading ``export`` keyword, the way a shell (and dotenv) accepts it: the
+    #: literal, lowercase word followed by at least one space or tab, consumed
+    #: whole so ``export  FOO`` and ``export\tFOO`` both leave a clean key.
+    #: Case-sensitive and requiring the whitespace is what keeps ``exported=yes``
+    #: and ``EXPORT_DIR=...`` intact - they don't have a bare ``export`` word
+    #: to strip.
+    _EXPORT_PREFIX = re.compile(r"^export[ \t]+(.*)$")
+
     def read_env_file(self, env_file: Path) -> dict[str, str]:
         """
         Read the values of one environment file.
 
-        Strips quotes from values for consistency.
+        Strips quotes from values for consistency, and a leading ``export``
+        keyword from names, the way a shell sourcing the file (or Node's
+        dotenv) would: ``export FOO=bar`` is read as ``FOO``.
 
         Args:
             env_file: The file to read.
@@ -705,6 +739,9 @@ class EnvManager:
                     continue
                 key, _, val = line.partition("=")
                 key = key.strip()
+                exported = self._EXPORT_PREFIX.match(key)
+                if exported:
+                    key = exported.group(1)
                 val = val.strip()
                 if len(val) >= 2:
                     if (val[0] == '"' and val[-1] == '"') or (val[0] == "'" and val[-1] == "'"):

@@ -55,7 +55,17 @@ MAX_PAGE_LIMIT = 200
 
 
 class DeploymentOut(BaseModel):
-    """One deployment attempt, as the console lists and inspects it."""
+    """
+    One deployment attempt, as the console lists and inspects it.
+
+    Attributes:
+        job_id: The background job that started this deployment, when the
+            panel queued it. None for a CLI or webhook deploy.
+        release_id: The release this deployment built, on the releases
+            layout. None for an in-place deployment.
+        commit_message: Subject line of the deployed commit, for a git
+            source. None for a source that is not git.
+    """
 
     id: int
     domain: str
@@ -68,6 +78,9 @@ class DeploymentOut(BaseModel):
     duration_s: float | None = None
     error: str | None = None
     has_log: bool
+    job_id: str | None = None
+    release_id: str | None = None
+    commit_message: str | None = None
 
     _iso_timestamps = iso_offset_validator("started_at", "finished_at")
 
@@ -125,6 +138,9 @@ def _to_out(record: DeploymentRecord) -> DeploymentOut:
         duration_s=record.duration_s,
         error=record.error,
         has_log=record.log_path is not None,
+        job_id=record.job_id,
+        release_id=record.release_id,
+        commit_message=record.commit_message,
     )
 
 

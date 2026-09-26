@@ -560,6 +560,63 @@ def test_set_rejects_a_boolean_that_does_not_parse(wasm: Wasm, real_config_path:
     assert "Expected a boolean" in result.output
 
 
+def test_set_list_flag_splits_on_commas_for_a_key_with_no_default(
+    wasm: Wasm, real_config_path: Path
+) -> None:
+    """
+    notifications.allow_private_hosts has no default, so it starts out
+    _MISSING; --list is the documented way to give it a list value anyway.
+    """
+    result = wasm(
+        "config",
+        "set",
+        "notifications.allow_private_hosts",
+        "internal.example,partner.example",
+        "--list",
+    )
+
+    assert result.exit_code == 0, result.output
+    stored = yaml.safe_load(real_config_path.read_text())
+    assert stored["notifications"]["allow_private_hosts"] == [
+        "internal.example",
+        "partner.example",
+    ]
+
+
+def test_set_list_flag_trims_whitespace_and_drops_empty_items(
+    wasm: Wasm, real_config_path: Path
+) -> None:
+    """A trailing comma or stray spaces must not produce a value nobody typed."""
+    result = wasm(
+        "config", "set", "notifications.allow_private_hosts", " a.example, , b.example,", "--list"
+    )
+
+    assert result.exit_code == 0, result.output
+    stored = yaml.safe_load(real_config_path.read_text())
+    assert stored["notifications"]["allow_private_hosts"] == ["a.example", "b.example"]
+
+
+def test_set_a_list_default_key_also_accepts_a_json_array_without_the_flag(
+    wasm: Wasm, real_config_path: Path
+) -> None:
+    """monitor.email_recipients already defaults to a list, so JSON is recognised on its own."""
+    result = wasm("config", "set", "monitor.email_recipients", '["ops@example.com", "a@b.com"]')
+
+    assert result.exit_code == 0, result.output
+    stored = yaml.safe_load(real_config_path.read_text())
+    assert stored["monitor"]["email_recipients"] == ["ops@example.com", "a@b.com"]
+
+
+def test_set_get_round_trips_a_list_value(wasm: Wasm, real_config_path: Path) -> None:
+    """'config get' shows a list value as YAML, the same as any other structured value."""
+    wasm("config", "set", "notifications.allow_private_hosts", "internal.example", "--list")
+
+    result = wasm("config", "get", "notifications.allow_private_hosts")
+
+    assert result.exit_code == 0, result.output
+    assert yaml.safe_load(result.output) == ["internal.example"]
+
+
 def test_the_panel_documented_apps_directory_command_works(
     wasm: Wasm, real_config_path: Path
 ) -> None:

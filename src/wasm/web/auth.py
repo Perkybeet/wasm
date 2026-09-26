@@ -1736,6 +1736,40 @@ class TokenManager:
                 return True
             return False
 
+    def regenerate_backup_codes(self) -> list[str]:
+        """
+        Replace the backup codes with a fresh set, invalidating the old ones.
+
+        Unlike :meth:`disable_totp`, this does not ask for a current code: the
+        caller is a cookie session that has just called ``POST
+        /api/auth/elevate`` (D5), the same standing proof of identity that
+        guards issuing an API token, and asking for a second, TOTP-specific
+        proof on top of it would only make losing the authenticator - the
+        situation this command exists for - harder to recover from.
+
+        Returns:
+            The new codes, in clear, to be shown exactly once - only their
+            salted hashes are stored, so they cannot be shown again.
+
+        Raises:
+            SecurityError: When two-factor authentication is not enabled.
+                There is nothing to regenerate for a login that needs no
+                second factor.
+        """
+        with self._totp_lock:
+            state = self._read_totp_state()
+            if not state["enabled"]:
+                raise SecurityError(
+                    "Two-factor authentication is not enabled",
+                    details="There is nothing to regenerate. Enrol first from Settings.",
+                )
+            codes = [
+                f"{secrets.token_hex(2)}-{secrets.token_hex(2)}" for _ in range(BACKUP_CODE_COUNT)
+            ]
+            state["backup_codes"] = [self._hash_backup_code(c) for c in codes]
+            self._write_totp_state(state)
+        return codes
+
     def disable_totp(self, code: str) -> bool:
         """
         Turn the second factor off, on presentation of a current code.

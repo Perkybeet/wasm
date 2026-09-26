@@ -1631,3 +1631,29 @@ class TestPackageManagerAvailability:
         deployer.configure("example.com", str(app_path), app_path=app_path)
 
         assert deployer.update().package_manager == "pnpm"
+
+
+class TestJobIdDefaultsToNone:
+    """
+    Every deployer answers ``job_id`` and ``last_deployment_id`` even unconfigured.
+
+    ``wasm.deployers.lifecycle._rebuild_monorepo`` and ``_rebuild_compose``
+    build a deployer and set its attributes by hand instead of calling
+    ``configure()``, and :func:`~wasm.deployers.recorder.recorder_for` reads
+    ``deployer.job_id`` unconditionally. Without a class-level default on
+    :class:`~wasm.deployers.interface.AppDeployer`, that rebuild path would
+    raise ``AttributeError`` the first time it recorded history.
+    """
+
+    @pytest.mark.parametrize("deployer_class", [MonorepoDeployer, DockerComposeDeployer])
+    def test_unconfigured_deployers_have_no_job_and_no_recorded_deployment(
+        self, deployer_class: type
+    ) -> None:
+        """
+        Args:
+            deployer_class: A deployer built the way the update rebuild helpers do.
+        """
+        deployer = deployer_class()
+
+        assert deployer.job_id is None
+        assert deployer.last_deployment_id is None

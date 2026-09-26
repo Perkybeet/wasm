@@ -251,8 +251,8 @@ async def websocket_logs(
                         )
             except asyncio.TimeoutError:
                 pass  # No stderr available yet, this is normal
-            except Exception:
-                pass  # WebSocket may be closed, ignore
+            except (RuntimeError, WebSocketDisconnect):
+                pass  # The socket closed before the warning could be sent.
 
         await check_stderr()
 
@@ -270,7 +270,7 @@ async def websocket_logs(
                     log_line = line.decode("utf-8", errors="replace").strip()
                     if log_line:
                         await websocket.send_json({"type": "log", "data": log_line})
-                except Exception:
+                except (RuntimeError, WebSocketDisconnect):
                     break  # Connection closed or process terminated
 
         # Handle incoming messages (for ping/pong or commands)
@@ -284,7 +284,7 @@ async def websocket_logs(
                         await websocket.send_json({"type": "pong"})
                 except WebSocketDisconnect:
                     break
-                except Exception:
+                except (RuntimeError, json.JSONDecodeError):
                     break
 
         # Run both tasks
@@ -303,10 +303,16 @@ async def websocket_logs(
 
     except WebSocketDisconnect:
         pass
-    except Exception as e:
+    except Exception as exc:
+        # The genuine error boundary for this handler: spawning journalctl,
+        # orchestrating its two reader tasks, or anything neither of them
+        # already turned into a clean break. Logged per rule 2 - a bare
+        # "notify the client and move on" is how this failure used to leave
+        # no trace of what actually broke.
+        logger.warning("Log stream for %s failed: %s", domain, exc)
         try:
-            await websocket.send_json({"type": "error", "message": str(e)})
-        except Exception:
+            await websocket.send_json({"type": "error", "message": str(exc)})
+        except (RuntimeError, WebSocketDisconnect):
             pass
     finally:
         await _terminate(process)
@@ -317,7 +323,7 @@ async def websocket_logs(
 
         try:
             await websocket.close()
-        except Exception:
+        except (RuntimeError, WebSocketDisconnect):
             pass  # WebSocket already closed
 
 
@@ -388,7 +394,7 @@ async def websocket_events(websocket: WebSocket, ticket: str | None = Query(defa
                         )
                     except json.JSONDecodeError:
                         pass
-                except Exception:
+                except (RuntimeError, WebSocketDisconnect):
                     break
 
         async def handle_messages():
@@ -401,7 +407,7 @@ async def websocket_events(websocket: WebSocket, ticket: str | None = Query(defa
                         await websocket.send_json({"type": "pong"})
                 except WebSocketDisconnect:
                     break
-                except Exception:
+                except (RuntimeError, json.JSONDecodeError):
                     break
 
         event_task = asyncio.create_task(read_events())
@@ -416,17 +422,22 @@ async def websocket_events(websocket: WebSocket, ticket: str | None = Query(defa
 
     except WebSocketDisconnect:
         pass
-    except Exception as e:
+    except Exception as exc:
+        # journalctl is spawned here with no shutil.which() guard, unlike the
+        # logs stream, so a missing binary raises FileNotFoundError (an
+        # OSError) straight out of create_subprocess_exec and used to vanish
+        # with nothing but a client-side error frame to show for it.
+        logger.warning("Event stream failed: %s", exc)
         try:
-            await websocket.send_json({"type": "error", "message": str(e)})
-        except Exception:
+            await websocket.send_json({"type": "error", "message": str(exc)})
+        except (RuntimeError, WebSocketDisconnect):
             pass
     finally:
         await _terminate(process)
 
         try:
             await websocket.close()
-        except Exception:
+        except (RuntimeError, WebSocketDisconnect):
             pass
 
 
@@ -482,8 +493,11 @@ async def websocket_job(
         if updated_job.id == job_id:
             try:
                 loop.call_soon_threadsafe(update_queue.put_nowait, updated_job.to_dict())
-            except Exception:
-                pass
+            except RuntimeError as exc:
+                # The event loop closed - the connection is already gone -
+                # between the check above and this call; there is nobody
+                # left to deliver the update to.
+                logger.debug("Could not queue a job update for %s: %s", job_id, exc)
 
     # Subscribe to job updates
     manager.subscribe(job_id, on_job_update)
@@ -505,7 +519,7 @@ async def websocket_job(
                 except asyncio.TimeoutError:
                     # Send heartbeat
                     await websocket.send_json({"type": "heartbeat"})
-                except Exception:
+                except (RuntimeError, WebSocketDisconnect):
                     break
 
         async def handle_messages():
@@ -527,7 +541,7 @@ async def websocket_job(
                             await websocket.send_json({"type": "cancelled", "job_id": job_id})
                 except WebSocketDisconnect:
                     break
-                except Exception:
+                except (RuntimeError, json.JSONDecodeError):
                     break
 
         update_task = asyncio.create_task(send_updates())
@@ -542,10 +556,11 @@ async def websocket_job(
 
     except WebSocketDisconnect:
         pass
-    except Exception as e:
+    except Exception as exc:
+        logger.warning("Job stream for %s failed: %s", job_id, exc)
         try:
-            await websocket.send_json({"type": "error", "message": str(e)})
-        except Exception:
+            await websocket.send_json({"type": "error", "message": str(exc)})
+        except (RuntimeError, WebSocketDisconnect):
             pass
     finally:
         # Unsubscribe and cleanup
@@ -554,7 +569,7 @@ async def websocket_job(
             _job_connections[job_id].discard(websocket)
         try:
             await websocket.close()
-        except Exception:
+        except (RuntimeError, WebSocketDisconnect):
             pass
 
 
@@ -592,8 +607,10 @@ async def websocket_all_jobs(
         """Callback when any job is updated (called from worker thread)."""
         try:
             loop.call_soon_threadsafe(update_queue.put_nowait, job.to_dict())
-        except Exception:
-            pass
+        except RuntimeError as exc:
+            # The event loop closed between the check and this call; nobody
+            # is left to deliver the update to.
+            logger.debug("Could not queue a job update for /ws/jobs: %s", exc)
 
     # Subscribe to all job updates
     manager.subscribe_all(on_any_job_update)
@@ -619,7 +636,7 @@ async def websocket_all_jobs(
                     await websocket.send_json(
                         {"type": "heartbeat", "active": len(manager.get_active_jobs())}
                     )
-                except Exception:
+                except (RuntimeError, WebSocketDisconnect):
                     break
 
         async def handle_messages():
@@ -637,7 +654,7 @@ async def websocket_all_jobs(
                         )
                 except WebSocketDisconnect:
                     break
-                except Exception:
+                except (RuntimeError, json.JSONDecodeError):
                     break
 
         update_task = asyncio.create_task(send_updates())
@@ -652,10 +669,11 @@ async def websocket_all_jobs(
 
     except WebSocketDisconnect:
         pass
-    except Exception as e:
+    except Exception as exc:
+        logger.warning("All-jobs stream failed: %s", exc)
         try:
-            await websocket.send_json({"type": "error", "message": str(e)})
-        except Exception:
+            await websocket.send_json({"type": "error", "message": str(exc)})
+        except (RuntimeError, WebSocketDisconnect):
             pass
     finally:
         # Remove global subscriber
@@ -666,5 +684,5 @@ async def websocket_all_jobs(
         _all_jobs_connections.discard(websocket)
         try:
             await websocket.close()
-        except Exception:
+        except (RuntimeError, WebSocketDisconnect):
             pass

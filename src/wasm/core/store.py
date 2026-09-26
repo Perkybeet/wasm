@@ -385,6 +385,9 @@ class DeploymentRecord:
     duration_s: float | None = None
     log_path: str | None = None
     error: str | None = None
+    job_id: str | None = None
+    release_id: str | None = None
+    commit_message: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -530,7 +533,7 @@ class MonorepoWorkspace:
 
 
 # Schema version for migrations
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 _DEPLOYMENT_STATUSES_SQL = ", ".join(f"'{status.value}'" for status in DeploymentStatus)
 _DEPLOYMENT_TRIGGERS_SQL = ", ".join(f"'{trigger.value}'" for trigger in DeploymentTrigger)
@@ -560,7 +563,15 @@ CREATE TABLE IF NOT EXISTS deployments (
     finished_at TEXT,
     duration_s REAL,
     log_path TEXT,
-    error TEXT
+    error TEXT,
+    -- Schema v8: what started this deployment and what it built, so the
+    -- console can link a job to its deployment and a deployment to its
+    -- release without guessing from timing. No foreign keys, for the same
+    -- reason there is none to apps: a job or a release row does not outlive
+    -- this history, and the history must not either.
+    job_id TEXT,
+    release_id TEXT,
+    commit_message TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_deployments_domain_started
@@ -1114,6 +1125,7 @@ class WASMStore:
             5: self._migrate_v4_to_v5,
             6: self._migrate_v5_to_v6,
             7: self._migrate_v6_to_v7,
+            8: self._migrate_v7_to_v8,
         }
 
         for version in range(from_version + 1, SCHEMA_VERSION + 1):
@@ -1212,6 +1224,26 @@ class WASMStore:
         columns = {row[1] for row in cursor.execute("PRAGMA table_info(jobs)").fetchall()}
         if "actor" not in columns:
             cursor.execute("ALTER TABLE jobs ADD COLUMN actor TEXT")
+
+    def _migrate_v7_to_v8(self, cursor: sqlite3.Cursor) -> None:
+        """
+        Link a deployment to the job that started it and the release it built (schema v8).
+
+        NULL, which every existing row gets, is the honest answer for all
+        three: a deployment recorded before this column existed has no job to
+        point at, no release id worth guessing and no commit subject captured.
+
+        Args:
+            cursor: Cursor the migration runs on.
+        """
+        # A database that never ran an older release created the deployments
+        # table at step 2 from today's DEPLOYMENTS_SCHEMA_SQL, which already
+        # has these columns - the same idempotency the v6-to-v7 migration
+        # needs for the jobs table's actor column.
+        columns = {row[1] for row in cursor.execute("PRAGMA table_info(deployments)").fetchall()}
+        for column in ("job_id", "release_id", "commit_message"):
+            if column not in columns:
+                cursor.execute(f"ALTER TABLE deployments ADD COLUMN {column} TEXT")
 
     # =========================================================================
     # Application CRUD
@@ -2143,6 +2175,7 @@ class WASMStore:
         git_commit: str | None = None,
         git_branch: str | None = None,
         log_path: str | None = None,
+        job_id: str | None = None,
     ) -> int:
         """
         Record the start of a deployment attempt.
@@ -2156,6 +2189,9 @@ class WASMStore:
             git_commit: Commit being deployed, when known.
             git_branch: Branch being deployed, when known.
             log_path: Where the captured build log is written, when there is one.
+            job_id: The background job that started this deployment, when one
+                did. None for a CLI or webhook deploy, which run with nothing
+                queuing them.
 
         Returns:
             The id of the history row, to pass to :meth:`finish_deployment`.
@@ -2175,8 +2211,9 @@ class WASMStore:
         with self._transaction() as cursor:
             cursor.execute(
                 """INSERT INTO deployments
-                   (domain, status, triggered_by, git_commit, git_branch, started_at, log_path)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   (domain, status, triggered_by, git_commit, git_branch, started_at, log_path,
+                    job_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     domain,
                     DeploymentStatus.RUNNING.value,
@@ -2185,6 +2222,7 @@ class WASMStore:
                     git_branch,
                     datetime.now().isoformat(),
                     log_path,
+                    job_id,
                 ),
             )
             deployment_id = cursor.lastrowid
@@ -2203,20 +2241,27 @@ class WASMStore:
         log_path: str | None = None,
         git_commit: str | None = None,
         git_branch: str | None = None,
+        release_id: str | None = None,
+        commit_message: str | None = None,
     ) -> bool:
         """
         Record facts about a deployment that are only learned after it starts.
 
         The captured log is named after the row id, so the row has to exist
-        before its path does; the commit being deployed is only known once the
-        fetch step has run. Both arrive here instead of widening
-        :meth:`record_deployment_start` with values nobody has yet.
+        before its path does; the commit being deployed, its subject and the
+        release it built are only known once the fetch step has run. All of
+        them arrive here instead of widening :meth:`record_deployment_start`
+        with values nobody has yet.
 
         Args:
             deployment_id: Id returned by :meth:`record_deployment_start`.
             log_path: Where the captured build log is written.
             git_commit: Commit being deployed (short hash).
             git_branch: Branch being deployed.
+            release_id: The release this deployment built, on the releases
+                layout. None for an in-place deployment.
+            commit_message: Subject line of the deployed commit, for a git
+                source. None for a source that is not a git repository.
 
         Returns:
             True if the row exists and something was updated. None arguments
@@ -2228,6 +2273,8 @@ class WASMStore:
             ("log_path", log_path),
             ("git_commit", git_commit),
             ("git_branch", git_branch),
+            ("release_id", release_id),
+            ("commit_message", commit_message),
         ):
             if value is not None:
                 updates.append(f"{column} = ?")
@@ -2382,7 +2429,8 @@ class WASMStore:
         placeholders = ",".join("?" * len(unique))
         query = f"""
             SELECT id, domain, status, triggered_by, git_commit, git_branch,
-                   started_at, finished_at, duration_s, log_path, error
+                   started_at, finished_at, duration_s, log_path, error,
+                   job_id, release_id, commit_message
             FROM (
                 SELECT *, ROW_NUMBER() OVER (
                     PARTITION BY domain ORDER BY started_at DESC, id DESC

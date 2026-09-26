@@ -197,6 +197,108 @@ def test_deploy_records_git_commit_and_branch(
     assert record.git_branch == "main"
 
 
+def test_job_id_is_recorded_when_a_job_started_the_deploy(tmp_path: Path, store: WASMStore) -> None:
+    """A deploy queued from the panel remembers which job started it."""
+    recorder = DeploymentRecorder(
+        store,
+        DOMAIN,
+        "panel",
+        logger=CapturingLogger(),
+        log_root=tmp_path / "deploy-logs",
+        job_id="ab12cd34",
+    )
+
+    recorder.start()
+    recorder.finish_success()
+
+    record = store.get_deployment(recorder.deployment_id)
+    assert record is not None
+    assert record.job_id == "ab12cd34"
+
+
+def test_release_id_and_commit_message_are_collected_at_finish(
+    tmp_path: Path, store: WASMStore
+) -> None:
+    """
+    Both are asked once recording finishes, like the commit and branch: the
+    release is only staged, and the checkout only exists, once the fetch step
+    has run.
+    """
+    recorder = DeploymentRecorder(
+        store,
+        DOMAIN,
+        "cli",
+        logger=CapturingLogger(),
+        log_root=tmp_path / "deploy-logs",
+        release_id=lambda: "20260101-000000",
+        commit_message=lambda: "Fix the thing",
+    )
+
+    recorder.start()
+    recorder.finish_success()
+
+    record = store.get_deployment(recorder.deployment_id)
+    assert record is not None
+    assert record.release_id == "20260101-000000"
+    assert record.commit_message == "Fix the thing"
+
+
+def test_a_failing_release_id_reader_does_not_abort_recording(
+    tmp_path: Path, store: WASMStore
+) -> None:
+    """A reader that cannot answer leaves the release id unknown, not the deploy broken."""
+
+    def explode() -> str | None:
+        raise OSError("staged release vanished")
+
+    recorder = DeploymentRecorder(
+        store,
+        DOMAIN,
+        "cli",
+        logger=CapturingLogger(),
+        log_root=tmp_path / "deploy-logs",
+        release_id=explode,
+    )
+
+    recorder.start()
+    recorder.finish_success()
+
+    record = store.get_deployment(recorder.deployment_id)
+    assert record is not None
+    assert record.release_id is None
+
+
+def test_deploy_records_the_commit_subject_for_a_git_source(
+    tmp_path: Path, store: WASMStore, runner: FakeRunner
+) -> None:
+    """A deployed git checkout records what its HEAD commit says it did."""
+    runner.script([*GIT, "rev-parse", "--abbrev-ref", "HEAD"], stdout="main\n")
+    runner.script([*GIT, "rev-parse", "--short", "HEAD"], stdout="abc1234\n")
+
+    deployer = happy_deployer(tmp_path)
+    # The commit subject is read through the deployer's own runner (the same
+    # seam _run() uses), not the process-wide one SourceManager falls back to
+    # for the commit and branch above - build_deployer injects a FakeRunner
+    # of its own for exactly this reason.
+    deployer._runner.script(["git", "log", "-1", "--format=%s"], stdout="Fix the login bug\n")
+    (tmp_path / "app" / ".git").mkdir(parents=True)
+
+    assert deployer.deploy() is True
+
+    record = store.list_deployments(DOMAIN)[0]
+    assert record.commit_message == "Fix the login bug"
+
+
+def test_a_non_git_source_records_no_commit_message(tmp_path: Path, store: WASMStore) -> None:
+    """A local directory or archive has no commit to describe."""
+    deployer = happy_deployer(tmp_path)
+
+    assert deployer.deploy() is True
+
+    record = store.list_deployments(DOMAIN)[0]
+    assert record.commit_message is None
+
+
 def test_trigger_is_recorded_per_caller(tmp_path: Path, store: WASMStore) -> None:
     """The trigger flows from configure() into the history row."""
     deployer = happy_deployer(tmp_path)

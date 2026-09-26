@@ -70,6 +70,20 @@ class AppDeployer(ABC):
 
     source_already_fetched: bool = False
 
+    #: The background job that started this deployment, when one did. A
+    #: class-level default, not just one set in ``__init__``, because
+    #: ``wasm.deployers.lifecycle``'s update-rebuild helpers build a
+    #: monorepo or compose deployer and set its attributes by hand rather
+    #: than calling ``configure()``; :func:`~wasm.deployers.recorder.recorder_for`
+    #: reads this unconditionally, so an instance that never went through
+    #: ``configure()`` must still answer it instead of raising.
+    job_id: str | None = None
+
+    #: The id of the history row the most recent :meth:`deploy` or
+    #: :meth:`update` wrote, once it returns. None before that, and None
+    #: again if recording itself failed or the run was a dry one.
+    last_deployment_id: int | None = None
+
     #: Class-level default so :attr:`fs` answers even for a subclass that builds
     #: its own state without calling ``__init__`` here.
     _fs: FileSystem | None = None

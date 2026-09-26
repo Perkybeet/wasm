@@ -45,6 +45,9 @@ export interface paths {
          *             port is free.
          *         PortError: When the requested port is not usable.
          *         DomainError: When the domain is not acceptable.
+         *         ValidationError: A resource limit is out of range (400, with the
+         *             range) - the same check ``PATCH .../limits`` runs, so a limit
+         *             given at creation cannot be more permissive than one set later.
          */
         post: operations["create_app_api_apps_post"];
         delete?: never;
@@ -81,10 +84,50 @@ export interface paths {
          *         The inspection result.
          *
          *     Raises:
-         *         SourceError: The source is invalid, or fetching it failed.
-         *         DeploymentError: The checkout matches no registered application type.
+         *         SourceError: The source is invalid, or fetching it failed. Answered
+         *             as 400: the operator gave a source WASM cannot reach, not a
+         *             server fault.
+         *         ValidationError: The checkout matches no registered application
+         *             type. ``inspect_source`` raises ``DeploymentError`` for this -
+         *             right for the CLI, where it means the whole operation failed -
+         *             but here it is the wizard's input that could not be classified,
+         *             so it is translated to the API's validation-error contract
+         *             (400 with details) instead of the 500 an unqualified
+         *             ``DeploymentError`` would answer.
          */
         post: operations["inspect_app_source_api_apps_inspect_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/apps/types": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List App Types
+         * @description List the application types WASM can deploy.
+         *
+         *     :func:`~wasm.deployers.registry.available_types` is the one source of
+         *     truth - the CLI's ``--type`` choices come from it too - so a deployer
+         *     registered with :meth:`~wasm.deployers.registry.DeployerRegistry.register`
+         *     reaches the wizard the moment it exists, instead of needing a second,
+         *     hand-kept copy of the list in the console.
+         *
+         *     Args:
+         *         session: The authenticated session.
+         *
+         *     Returns:
+         *         Every registered type, most specific first, ``auto`` last.
+         */
+        get: operations["list_app_types_api_apps_types_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -813,6 +856,43 @@ export interface paths {
         get: operations["two_factor_status_api_auth_2fa_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/auth/2fa/backup-codes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Regenerate Backup Codes
+         * @description Replace the backup codes with a fresh set, shown exactly once.
+         *
+         *     Every code issued before this call stops working: a set an operator can
+         *     no longer account for - lost, or shown on a screen they no longer trust -
+         *     is worthless as a recovery path if the old ones stay live alongside it.
+         *
+         *     Args:
+         *         request: The incoming request.
+         *         session: The authenticated session, elevated (D5): a cookie session
+         *             must have called ``POST /api/auth/elevate`` recently.
+         *
+         *     Returns:
+         *         The new backup codes, in clear.
+         *
+         *     Raises:
+         *         HTTPException: 403 with ``error: "elevation_required"`` per
+         *             :func:`wasm.web.api.deps.require_elevated`.
+         *         SecurityError: 400 when two-factor authentication is not enabled.
+         */
+        post: operations["regenerate_backup_codes_api_auth_2fa_backup_codes_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1678,6 +1758,11 @@ export interface paths {
          * Delete Certificate
          * @description Delete a certificate without revoking it.
          *
+         *     Deleting removes the certificate files for good, so a cookie session must
+         *     have confirmed it's them recently (D5), the same rule
+         *     ``POST /{domain}/revoke`` applies. See
+         *     :func:`~wasm.web.api.deps.require_elevated`.
+         *
          *     Args:
          *         domain: Certificate name.
          *         session: The authenticated session.
@@ -1687,6 +1772,8 @@ export interface paths {
          *
          *     Raises:
          *         CertificateError: When certbot refuses the deletion.
+         *         HTTPException: 403 with ``error: "elevation_required"`` per
+         *             :func:`~wasm.web.api.deps.require_elevated`.
          */
         delete: operations["delete_certificate_api_certs__domain__delete"];
         options?: never;
@@ -1738,6 +1825,11 @@ export interface paths {
          * Revoke Certificate
          * @description Revoke a certificate and delete its files.
          *
+         *     Revoking takes the certificate down at the CA and cannot be undone, so a
+         *     cookie session must have confirmed it's them recently (D5); a Bearer
+         *     credential is exempt, as issuing it already required that confirmation
+         *     once. See :func:`~wasm.web.api.deps.require_elevated`.
+         *
          *     Args:
          *         domain: Certificate name.
          *         session: The authenticated session.
@@ -1747,6 +1839,8 @@ export interface paths {
          *
          *     Raises:
          *         CertificateError: When certbot refuses the revocation.
+         *         HTTPException: 403 with ``error: "elevation_required"`` per
+         *             :func:`~wasm.web.api.deps.require_elevated`.
          */
         post: operations["revoke_certificate_api_certs__domain__revoke_post"];
         delete?: never;
@@ -3078,6 +3172,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/domains/dns": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Bare Dns
+         * @description Check whether a domain resolves to this server, before it is any application's.
+         *
+         *     The same check :func:`get_domain_dns` runs for a domain already added to
+         *     an application, through the same :func:`wasm.deployers.domains.check_dns`
+         *     - the new-app wizard needs an answer before anything is created, and there
+         *     is no application yet to hang the path off.
+         *
+         *     Args:
+         *         session: Authenticated session, injected.
+         *         name: The domain to resolve.
+         *
+         *     Returns:
+         *         What it resolves to, compared with this server's addresses.
+         */
+        get: operations["get_bare_dns_api_domains_dns_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/jobs": {
         parameters: {
             query?: never;
@@ -3230,9 +3356,16 @@ export interface paths {
          * Create Delete Job
          * @description Queue a deletion.
          *
+         *     Runs the same :func:`~wasm.web.jobs.delete_app_job` that
+         *     ``DELETE /api/apps/{domain}`` queues, so it is guarded the same way: a
+         *     cookie session must have confirmed recently (see
+         *     :func:`~wasm.web.api.deps.require_elevated`), the same as any other
+         *     irreversible action. A stale client still calling this route instead of
+         *     the app-level one gets no less protection for it.
+         *
          *     Args:
          *         request: The deletion request.
-         *         session: The authenticated session.
+         *         session: The authenticated, elevated session.
          *
          *     Returns:
          *         The queued job.
@@ -3440,9 +3573,10 @@ export interface paths {
          *             is refused by validation before this runs.
          *
          *     Returns:
-         *         The metric, the window, and ``[ts, value]`` pairs. A metric nothing
-         *         has recorded returns an empty list rather than a 404: "no data yet"
-         *         is a normal chart state, not a missing resource.
+         *         The metric, the window, the resolution the points are spaced at, and
+         *         ``[ts, value]`` pairs. A metric nothing has recorded returns an empty
+         *         list rather than a 404: "no data yet" is a normal chart state, not a
+         *         missing resource.
          */
         get: operations["metric_history_api_metrics__metric__get"];
         put?: never;
@@ -4129,7 +4263,8 @@ export interface paths {
          *
          *     Returns:
          *         The sites known to the store, falling back to what the manager finds on
-         *         disk when the store has no record of them.
+         *         disk when the store has no record of them. Every entry carries the
+         *         server names its own configuration answers on.
          */
         get: operations["list_sites_api_sites_get"];
         put?: never;
@@ -4184,10 +4319,44 @@ export interface paths {
          *         The reload outcome.
          *
          *     Raises:
-         *         HTTPException: 400 when the configuration does not pass its own test,
-         *             500 when the reload itself fails.
+         *         ValidationError: When the configuration does not pass its own test;
+         *             ``details`` and ``output`` both carry the web server's own output
+         *             verbatim, and the running configuration is kept.
+         *         HTTPException: 500 when the reload itself fails.
          */
         post: operations["reload_webserver_api_sites_reload_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/sites/templates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Site Templates
+         * @description List the site templates available for the detected web server.
+         *
+         *     Registered before ``/{domain}`` so the literal path wins, the same reason
+         *     ``/reload`` is declared here rather than after it: the templates
+         *     directory :meth:`~wasm.managers.webserver.WebServerManager.list_templates`
+         *     reads is the one source of truth this shares with ``POST /api/sites``,
+         *     which refuses a template not on this list.
+         *
+         *     Args:
+         *         session: The authenticated session.
+         *
+         *     Returns:
+         *         The template names and the web server they belong to.
+         */
+        get: operations["list_site_templates_api_sites_templates_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -4285,14 +4454,56 @@ export interface paths {
          *
          *     Raises:
          *         HTTPException: 404 when no such site exists.
-         *         ValidationError: When the web server rejects the configuration; the
-         *             error carries the server's own output verbatim and the file on
-         *             disk is left as it was.
+         *         ValidationError: When the web server rejects the configuration; its
+         *             output travels verbatim in both ``hint`` and the dedicated
+         *             ``output`` field of the error body, and the file on disk is left
+         *             as it was. ``POST /{domain}/config/test`` answers the same
+         *             question beforehand, without this side effect.
          *         SiteError: When the file cannot be staged or written.
          *         DomainError: When the domain is not acceptable.
          */
         put: operations["update_site_config_api_sites__domain__config_put"];
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/sites/{domain}/config/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Test Site Config
+         * @description Try a candidate configuration against the web server, without saving it.
+         *
+         *     Reuses :meth:`~wasm.managers.webserver.WebServerManager.test_config_text`,
+         *     the exact staging and syntax check ``PUT /{domain}/config`` validates
+         *     through before it writes anything - one implementation, so the answer
+         *     this gives is the answer saving would get. The site named in the path
+         *     need not exist yet: this only asks the web server about the text, it
+         *     never reads or touches the file on disk.
+         *
+         *     Args:
+         *         domain: Domain the configuration is meant for.
+         *         data: The candidate configuration.
+         *         session: The authenticated session.
+         *
+         *     Returns:
+         *         Whether the web server would accept it, and its own output verbatim.
+         *
+         *     Raises:
+         *         DomainError: When the domain is not acceptable.
+         *         NginxError: When the nginx snippet cannot be staged.
+         *         ApacheError: When the apache snippet cannot be staged.
+         */
+        post: operations["test_site_config_api_sites__domain__config_test_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4919,7 +5130,18 @@ export interface components {
          *         port: Upstream port.
          *         app_type: Deployer that owns it.
          *         path: Application directory.
+         *         source: Git URL or local path it was deployed from.
+         *         branch: Git branch it tracks, or None for a source that has none.
          *         layout: ``inplace`` or ``releases``.
+         *         keep_releases: Release directories kept before older ones are pruned.
+         *             Meaningful only on ``releases``; the in-place default otherwise.
+         *         build_command: Argv the deployer runs to build the project, read off
+         *             the same ``get_build_command()`` the deploy used. Empty in a
+         *             list response - computing it means instantiating the deployer
+         *             once per application, which this endpoint does not do for a
+         *             list - and filled in when this application is fetched on its own.
+         *         start_command: What its unit runs, exactly as the deploy recorded it
+         *             on the service row. None for a static site, which has no unit.
          *         memory_max_mb: Memory limit of its unit, in MB, or None.
          *         cpu_quota_percent: CPU quota of its unit, in percent of one CPU, or None.
          *         tasks_max: Task limit of its unit, or None.
@@ -4937,12 +5159,21 @@ export interface components {
             active: boolean;
             /** App Type */
             app_type?: string | null;
+            /** Branch */
+            branch?: string | null;
+            /** Build Command */
+            build_command?: string[];
             /** Cpu Quota Percent */
             cpu_quota_percent?: number | null;
             /** Domain */
             domain: string;
             /** Enabled */
             enabled: boolean;
+            /**
+             * Keep Releases
+             * @default 5
+             */
+            keep_releases: number;
             last_deployment?: components["schemas"]["LastDeploymentOut"] | null;
             /**
              * Layout
@@ -4961,6 +5192,10 @@ export interface components {
             port?: number | null;
             /** Run As */
             run_as?: string | null;
+            /** Source */
+            source?: string | null;
+            /** Start Command */
+            start_command?: string | null;
             /** Status */
             status: string;
             /** Tasks Max */
@@ -4996,6 +5231,26 @@ export interface components {
             lines: number;
             /** Logs */
             logs: string;
+        };
+        /**
+         * AppTypeInfo
+         * @description One application type the new-app wizard may offer.
+         */
+        AppTypeInfo: {
+            /** Default Port */
+            default_port: number;
+            /** Name */
+            name: string;
+            /** Type */
+            type: string;
+        };
+        /**
+         * AppTypesResponse
+         * @description Every application type WASM can deploy.
+         */
+        AppTypesResponse: {
+            /** Types */
+            types: components["schemas"]["AppTypeInfo"][];
         };
         /**
          * AppsDirConfig
@@ -5291,6 +5546,8 @@ export interface components {
          *         auto_renew: Whether certbot's renewal timer covers this certificate.
          *         path: Directory holding the certificate files.
          *         key_path: Path of the private key. The key itself is never read.
+         *         issuer: The certificate authority that signed it, read from the
+         *             certificate itself. None when it could not be read.
          */
         CertInfo: {
             /**
@@ -5309,6 +5566,8 @@ export interface components {
             domains: string[];
             /** Expires On */
             expires_on?: string | null;
+            /** Issuer */
+            issuer?: string | null;
             /** Key Path */
             key_path?: string | null;
             /** Path */
@@ -5523,6 +5782,11 @@ export interface components {
              */
             compose_profiles?: string[] | null;
             /**
+             * Cpu Quota Percent
+             * @description CPUQuota for the unit, in percent of one CPU (200 is two CPUs); 1 to 100 per CPU. Null: no limit
+             */
+            cpu_quota_percent?: number | null;
+            /**
              * Domain
              * @description Target domain name
              */
@@ -5535,10 +5799,26 @@ export interface components {
                 [key: string]: string;
             };
             /**
+             * Include Www
+             * @description Also answer on www.<domain>, as a redirect to it
+             * @default false
+             */
+            include_www: boolean;
+            /**
              * Layout
              * @description Build every deploy as a release behind a health gate, or in place. Omitted: the server's deploy.layout
              */
             layout?: ("inplace" | "releases") | null;
+            /**
+             * Memory Max Mb
+             * @description MemoryMax for the unit, in MB; at least 64. Null: no limit
+             */
+            memory_max_mb?: number | null;
+            /**
+             * Persistent Paths
+             * @description Releases only: paths, relative to the application, linked into shared/ and kept across every release (uploads, storage)
+             */
+            persistent_paths?: string[] | null;
             /**
              * Port
              * @description Application port
@@ -5568,6 +5848,11 @@ export interface components {
             subdomain_overrides?: {
                 [key: string]: string;
             };
+            /**
+             * Tasks Max
+             * @description TasksMax for the unit, processes and threads; at least 16. Null: no limit
+             */
+            tasks_max?: number | null;
             /**
              * Webserver
              * @description Web server to use
@@ -6054,8 +6339,18 @@ export interface components {
         /**
          * DeploymentOut
          * @description One deployment attempt, as the console lists and inspects it.
+         *
+         *     Attributes:
+         *         job_id: The background job that started this deployment, when the
+         *             panel queued it. None for a CLI or webhook deploy.
+         *         release_id: The release this deployment built, on the releases
+         *             layout. None for an in-place deployment.
+         *         commit_message: Subject line of the deployed commit, for a git
+         *             source. None for a source that is not git.
          */
         DeploymentOut: {
+            /** Commit Message */
+            commit_message?: string | null;
             /** Domain */
             domain: string;
             /** Duration S */
@@ -6072,6 +6367,10 @@ export interface components {
             has_log: boolean;
             /** Id */
             id: number;
+            /** Job Id */
+            job_id?: string | null;
+            /** Release Id */
+            release_id?: string | null;
             /** Started At */
             started_at?: string | null;
             /** Status */
@@ -6495,6 +6794,12 @@ export interface components {
         /**
          * JobResponse
          * @description One job, as the queue records it.
+         *
+         *     Attributes:
+         *         deployment_id: The deployment history row a deploy or update job
+         *             wrote, lifted out of ``result`` so a client can link to it
+         *             without knowing which job types carry one. None for a job that
+         *             never deployed anything, or one whose recording failed.
          */
         JobResponse: {
             /** Actor */
@@ -6505,6 +6810,8 @@ export interface components {
             created_at: string;
             /** Current Step */
             current_step: string;
+            /** Deployment Id */
+            deployment_id?: number | null;
             /** Description */
             description: string;
             /** Error */
@@ -6750,6 +7057,8 @@ export interface components {
                 number,
                 number
             ][];
+            /** Resolution */
+            resolution: string;
             /** Window */
             window: string;
         };
@@ -7670,6 +7979,22 @@ export interface components {
             webserver: string;
         };
         /**
+         * SiteConfigTestResponse
+         * @description Outcome of testing a candidate configuration.
+         *
+         *     Attributes:
+         *         ok: Whether the web server would accept the configuration.
+         *         output: The web server's own output, verbatim - present whichever way
+         *             it answers, since nginx and apache2ctl both print a confirmation
+         *             line even when there is nothing wrong.
+         */
+        SiteConfigTestResponse: {
+            /** Ok */
+            ok: boolean;
+            /** Output */
+            output: string;
+        };
+        /**
          * SiteInfo
          * @description A configured virtual host.
          *
@@ -7679,6 +8004,9 @@ export interface components {
          *         enabled: Whether the site is enabled.
          *         config_path: Absolute path of the configuration file.
          *         has_ssl: Whether the configuration carries TLS directives.
+         *         server_names: Every name the configuration answers on - the primary
+         *             domain and its aliases - read from the file's own directives.
+         *             Empty when the configuration cannot be read.
          */
         SiteInfo: {
             /** Config Path */
@@ -7692,6 +8020,11 @@ export interface components {
             has_ssl: boolean;
             /** Name */
             name: string;
+            /**
+             * Server Names
+             * @default []
+             */
+            server_names: string[];
             /** Webserver */
             webserver: string;
         };
@@ -7704,6 +8037,20 @@ export interface components {
             sites: components["schemas"]["SiteInfo"][];
             /** Total */
             total: number;
+            /** Webserver */
+            webserver: string;
+        };
+        /**
+         * SiteTemplatesResponse
+         * @description Templates a site can be created or rendered from.
+         *
+         *     Attributes:
+         *         templates: Template names, without their file suffix, sorted.
+         *         webserver: Backend the templates belong to.
+         */
+        SiteTemplatesResponse: {
+            /** Templates */
+            templates: string[];
             /** Webserver */
             webserver: string;
         };
@@ -7798,6 +8145,14 @@ export interface components {
             os: string;
             /** Uptime */
             uptime: string;
+        };
+        /**
+         * TestSiteConfigRequest
+         * @description Request to try a candidate configuration without saving it.
+         */
+        TestSiteConfigRequest: {
+            /** Content */
+            content: string;
         };
         /**
          * TokenInfo
@@ -8458,6 +8813,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_app_types_api_apps_types_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AppTypesResponse"];
                 };
             };
         };
@@ -9227,6 +9602,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["TwoFactorStatus"];
+                };
+            };
+        };
+    };
+    regenerate_backup_codes_api_auth_2fa_backup_codes_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TwoFactorConfirmed"];
                 };
             };
         };
@@ -11658,6 +12053,38 @@ export interface operations {
             };
         };
     };
+    get_bare_dns_api_domains_dns_get: {
+        parameters: {
+            query: {
+                /** @description The domain to resolve */
+                name: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DnsCheckResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_jobs_api_jobs_get: {
         parameters: {
             query?: {
@@ -12028,7 +12455,7 @@ export interface operations {
     metric_history_api_metrics__metric__get: {
         parameters: {
             query?: {
-                window?: "1h" | "24h" | "30d";
+                window?: "1h" | "24h" | "7d" | "30d";
             };
             header?: never;
             path: {
@@ -12883,6 +13310,26 @@ export interface operations {
             };
         };
     };
+    list_site_templates_api_sites_templates_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SiteTemplatesResponse"];
+                };
+            };
+        };
+    };
     get_site_api_sites__domain__get: {
         parameters: {
             query?: never;
@@ -12998,6 +13445,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SiteActionResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    test_site_config_api_sites__domain__config_test_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TestSiteConfigRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SiteConfigTestResponse"];
                 };
             };
             /** @description Validation Error */

@@ -54,6 +54,7 @@ from wasm.core.exceptions import (
     DomainConflictError,
     DomainError,
     SecurityError,
+    SourceError,
     ValidationError,
     WASMError,
 )
@@ -105,6 +106,7 @@ _STATUS_BY_ERROR: tuple[tuple[type[WASMError], int], ...] = (
     (ValidationError, 400),
     (DomainError, 400),
     (ConfigError, 400),
+    (SourceError, 400),
     (WASMPermissionError, 403),
 )
 
@@ -124,12 +126,16 @@ class ErrorResponse(BaseModel):
             an error that never became a WASM exception.
         fields: Field name to message, for a validation failure that names
             more than one field. ``None`` for every other kind of error.
+        output: The failing tool's own output, verbatim, when the error
+            carries one - a rejected web server configuration, for example.
+            ``None`` for every error that has no external tool output to show.
     """
 
     detail: str
     hint: str | None = None
     error: str
     fields: dict[str, str] | None = None
+    output: str | None = None
 
 
 class JobAcceptedResponse(BaseModel):
@@ -190,6 +196,7 @@ def error_response(exc: WASMError) -> JSONResponse:
                 # regardless of whether the code came from a WASM exception
                 # or from the fixed vocabulary in _ERROR_BY_STATUS.
                 error=type(exc).__name__.lower(),
+                output=getattr(exc, "output", None),
             )
         ),
     )
@@ -295,6 +302,7 @@ async def handle_http_exception(request: Request, exc: StarletteHTTPException) -
             "detail": detail.get("detail", ""),
             "hint": detail.get("hint"),
             "fields": detail.get("fields"),
+            "output": detail.get("output"),
         }
         return JSONResponse(status_code=exc.status_code, content=body, headers=headers)
 

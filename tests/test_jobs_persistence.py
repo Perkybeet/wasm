@@ -29,6 +29,7 @@ What is defended here:
 
 from __future__ import annotations
 
+import json
 import stat
 import time
 import uuid
@@ -325,6 +326,72 @@ def test_a_single_job_from_before_the_restart_can_be_fetched(
     assert body["id"] == "cafebeef"
     assert body["status"] == "failed"
     assert body["error"] == "nginx: [emerg] duplicate listen options"
+
+
+def test_a_persisted_deploy_jobs_result_exposes_its_deployment_id(
+    client: TestClient, store: Any
+) -> None:
+    """
+    A completed deploy job's result carries ``deployment_id``; the API lifts it
+    onto the job itself, so the console can link straight to the deployment's
+    log without parsing the free-form result.
+    """
+    store.create_job(
+        JobRecord(
+            id="deadbeef",
+            type="deploy",
+            name="Deploy old.example.com",
+            status="completed",
+            domain="old.example.com",
+            result_json=json.dumps(
+                {"domain": "old.example.com", "status": "deployed", "deployment_id": 17}
+            ),
+        )
+    )
+
+    response = client.get("/api/jobs/deadbeef")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["deployment_id"] == 17
+    assert body["result"]["deployment_id"] == 17
+
+
+def test_a_job_with_no_deployment_id_in_its_result_answers_none(
+    client: TestClient, store: Any
+) -> None:
+    """A job that never deployed anything (a backup, say) has nothing to link."""
+    store.create_job(
+        JobRecord(
+            id="cafebabe",
+            type="backup",
+            name="Back up old.example.com",
+            status="completed",
+            domain="old.example.com",
+            result_json=json.dumps({"domain": "old.example.com"}),
+        )
+    )
+
+    response = client.get("/api/jobs/cafebabe")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["deployment_id"] is None
+
+
+def test_a_live_deploy_jobs_result_also_exposes_its_deployment_id() -> None:
+    """The same lift happens for a job still in the in-memory queue, not just a persisted one."""
+    from wasm.web.api.jobs import _to_response
+    from wasm.web.jobs import Job, JobType
+
+    job = Job(
+        id="live1",
+        type=JobType.DEPLOY,
+        name="Deploy new.example.com",
+        description="",
+        result={"domain": "new.example.com", "status": "deployed", "deployment_id": 99},
+    )
+
+    assert _to_response(job).deployment_id == 99
 
 
 def test_an_unknown_job_id_is_404(client: TestClient) -> None:

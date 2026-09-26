@@ -39,6 +39,13 @@ from wasm.managers.webserver import WebServerManager, create_secured_site, delet
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import WASMErrorRoute, require_elevated, strict_domain
 
+#: Cache of managers already built by :func:`_manager_for`, keyed by resolved
+#: name. A site listing may hold rows for both backends, and building one
+#: manager per row would mean re-detecting the same installation and
+#: re-loading the same Jinja environment for every site of a mixed
+#: deployment.
+_ManagerCache = dict[str, WebServerManager]
+
 router = APIRouter(route_class=WASMErrorRoute)
 
 #: Web server used when none is installed and none was requested.
@@ -64,6 +71,9 @@ class SiteInfo(BaseModel):
         enabled: Whether the site is enabled.
         config_path: Absolute path of the configuration file.
         has_ssl: Whether the configuration carries TLS directives.
+        server_names: Every name the configuration answers on - the primary
+            domain and its aliases - read from the file's own directives.
+            Empty when the configuration cannot be read.
     """
 
     name: str
@@ -71,6 +81,7 @@ class SiteInfo(BaseModel):
     enabled: bool
     config_path: str
     has_ssl: bool = False
+    server_names: list[str] = []
 
 
 class SiteListResponse(BaseModel):
@@ -133,6 +144,40 @@ class UpdateSiteConfigRequest(BaseModel):
     config: str
 
 
+class TestSiteConfigRequest(BaseModel):
+    """Request to try a candidate configuration without saving it."""
+
+    content: str
+
+
+class SiteConfigTestResponse(BaseModel):
+    """
+    Outcome of testing a candidate configuration.
+
+    Attributes:
+        ok: Whether the web server would accept the configuration.
+        output: The web server's own output, verbatim - present whichever way
+            it answers, since nginx and apache2ctl both print a confirmation
+            line even when there is nothing wrong.
+    """
+
+    ok: bool
+    output: str
+
+
+class SiteTemplatesResponse(BaseModel):
+    """
+    Templates a site can be created or rendered from.
+
+    Attributes:
+        templates: Template names, without their file suffix, sorted.
+        webserver: Backend the templates belong to.
+    """
+
+    templates: list[str]
+    webserver: str
+
+
 def detect_webserver() -> str:
     """
     Work out which web server this host uses.
@@ -188,6 +233,21 @@ def _has_ssl(config: str) -> bool:
     return "ssl_certificate" in config or "SSLCertificateFile" in config
 
 
+def _manager_cached(cache: _ManagerCache, webserver: str | None) -> WebServerManager:
+    """
+    Resolve a web server name to its manager, reusing one already built.
+
+    Args:
+        cache: Managers already resolved in this request, keyed by name.
+        webserver: Requested web server, or None to detect one.
+
+    Returns:
+        The manager, built once per distinct name.
+    """
+    name, manager = _manager_for(webserver)
+    return cache.setdefault(name, manager)
+
+
 @router.get("", response_model=SiteListResponse)
 def list_sites(session: Annotated[dict, Depends(get_current_session)]) -> SiteListResponse:
     """
@@ -198,9 +258,11 @@ def list_sites(session: Annotated[dict, Depends(get_current_session)]) -> SiteLi
 
     Returns:
         The sites known to the store, falling back to what the manager finds on
-        disk when the store has no record of them.
+        disk when the store has no record of them. Every entry carries the
+        server names its own configuration answers on.
     """
     webserver, manager = _manager_for(None)
+    cache: _ManagerCache = {webserver: manager}
 
     sites = [
         SiteInfo(
@@ -209,6 +271,7 @@ def list_sites(session: Annotated[dict, Depends(get_current_session)]) -> SiteLi
             enabled=site.enabled,
             config_path=site.config_path or "",
             has_ssl=site.ssl_enabled,
+            server_names=_manager_cached(cache, site.webserver).served_names(site.domain),
         )
         for site in get_store().list_sites()
     ]
@@ -221,11 +284,35 @@ def list_sites(session: Annotated[dict, Depends(get_current_session)]) -> SiteLi
                 enabled=entry.enabled,
                 config_path=entry.config_path,
                 has_ssl=_has_ssl(manager.get_site_config(entry.domain) or ""),
+                server_names=manager.served_names(entry.domain),
             )
             for entry in manager.list_sites()
         ]
 
     return SiteListResponse(sites=sites, total=len(sites), webserver=webserver)
+
+
+@router.get("/templates", response_model=SiteTemplatesResponse)
+def list_site_templates(
+    session: Annotated[dict, Depends(get_current_session)],
+) -> SiteTemplatesResponse:
+    """
+    List the site templates available for the detected web server.
+
+    Registered before ``/{domain}`` so the literal path wins, the same reason
+    ``/reload`` is declared here rather than after it: the templates
+    directory :meth:`~wasm.managers.webserver.WebServerManager.list_templates`
+    reads is the one source of truth this shares with ``POST /api/sites``,
+    which refuses a template not on this list.
+
+    Args:
+        session: The authenticated session.
+
+    Returns:
+        The template names and the web server they belong to.
+    """
+    webserver, manager = _manager_for(None)
+    return SiteTemplatesResponse(templates=manager.list_templates(), webserver=webserver)
 
 
 @router.post("", response_model=SiteActionResponse)
@@ -308,15 +395,19 @@ def reload_webserver(session: Annotated[dict, Depends(get_current_session)]) -> 
         The reload outcome.
 
     Raises:
-        HTTPException: 400 when the configuration does not pass its own test,
-            500 when the reload itself fails.
+        ValidationError: When the configuration does not pass its own test;
+            ``details`` and ``output`` both carry the web server's own output
+            verbatim, and the running configuration is kept.
+        HTTPException: 500 when the reload itself fails.
     """
     webserver, manager = _manager_for(None)
 
-    if not manager.test_config():
-        raise HTTPException(
-            status_code=400,
-            detail=f"{webserver} configuration test failed; the running config was kept",
+    errors = manager.config_errors()
+    if errors is not None:
+        raise ValidationError(
+            f"{webserver} configuration test failed; the running config was kept",
+            details=errors,
+            output=errors,
         )
 
     if not manager.reload():
@@ -345,12 +436,14 @@ def get_site(domain: str, session: Annotated[dict, Depends(get_current_session)]
 
     site = get_store().get_site(validated)
     if site:
+        _, site_manager = _manager_for(site.webserver)
         return SiteInfo(
             name=site.domain,
             webserver=site.webserver,
             enabled=site.enabled,
             config_path=site.config_path or "",
             has_ssl=site.ssl_enabled,
+            server_names=site_manager.served_names(site.domain),
         )
 
     webserver, manager = _manager_for(None)
@@ -363,6 +456,7 @@ def get_site(domain: str, session: Annotated[dict, Depends(get_current_session)]
         enabled=manager.site_enabled(validated),
         config_path=str(manager.config_path(validated)),
         has_ssl=_has_ssl(manager.get_site_config(validated) or ""),
+        server_names=manager.served_names(validated),
     )
 
 
@@ -399,6 +493,43 @@ def get_site_config(
     )
 
 
+@router.post("/{domain}/config/test", response_model=SiteConfigTestResponse)
+def test_site_config(
+    domain: str,
+    data: TestSiteConfigRequest,
+    session: Annotated[dict, Depends(get_current_session)],
+) -> SiteConfigTestResponse:
+    """
+    Try a candidate configuration against the web server, without saving it.
+
+    Reuses :meth:`~wasm.managers.webserver.WebServerManager.test_config_text`,
+    the exact staging and syntax check ``PUT /{domain}/config`` validates
+    through before it writes anything - one implementation, so the answer
+    this gives is the answer saving would get. The site named in the path
+    need not exist yet: this only asks the web server about the text, it
+    never reads or touches the file on disk.
+
+    Args:
+        domain: Domain the configuration is meant for.
+        data: The candidate configuration.
+        session: The authenticated session.
+
+    Returns:
+        Whether the web server would accept it, and its own output verbatim.
+
+    Raises:
+        DomainError: When the domain is not acceptable.
+        NginxError: When the nginx snippet cannot be staged.
+        ApacheError: When the apache snippet cannot be staged.
+    """
+    validated = strict_domain(domain)
+    _, manager = _manager_for(None)
+
+    ok, output = manager.test_config_text(data.content, domain=validated)
+
+    return SiteConfigTestResponse(ok=ok, output=output)
+
+
 @router.put("/{domain}/config", response_model=SiteActionResponse)
 def update_site_config(
     domain: str,
@@ -424,9 +555,11 @@ def update_site_config(
 
     Raises:
         HTTPException: 404 when no such site exists.
-        ValidationError: When the web server rejects the configuration; the
-            error carries the server's own output verbatim and the file on
-            disk is left as it was.
+        ValidationError: When the web server rejects the configuration; its
+            output travels verbatim in both ``hint`` and the dedicated
+            ``output`` field of the error body, and the file on disk is left
+            as it was. ``POST /{domain}/config/test`` answers the same
+            question beforehand, without this side effect.
         SiteError: When the file cannot be staged or written.
         DomainError: When the domain is not acceptable.
     """

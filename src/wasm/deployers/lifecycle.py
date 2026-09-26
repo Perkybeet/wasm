@@ -114,6 +114,9 @@ class AppUpdate:
             docker-compose stacks whose containers the deployer recreated).
         restarted: Units restarted to pick up the new build.
         active: Whether every restarted unit was running afterwards.
+        deployment_id: Id of the deployment history row this update wrote,
+            when recording succeeded. None if it failed (see
+            :class:`~wasm.deployers.recorder.DeploymentRecorder`).
     """
 
     domain: str
@@ -123,6 +126,7 @@ class AppUpdate:
     is_static: bool
     restarted: tuple[str, ...]
     active: bool
+    deployment_id: int | None = None
 
 
 def update_app(
@@ -132,6 +136,7 @@ def update_app(
     branch: str | None = None,
     package_manager: str = "auto",
     trigger: str = DeploymentTrigger.CLI.value,
+    job_id: str | None = None,
     on_phase: PhaseReporter | None = None,
     on_step: Callable[[str], None] | None = None,
     logger: Logger | None = None,
@@ -147,6 +152,8 @@ def update_app(
         branch: Git branch to update from.
         package_manager: Node package manager, or ``auto``.
         trigger: Who asked for the update, recorded in the deployment history.
+        job_id: The background job driving this update, when the panel
+            queued it. Recorded on the deployment history row.
         on_phase: Called as each phase begins, with its position and the
             total: :data:`PHASES` in place, :data:`RELEASE_PHASES` on releases.
         on_step: Called as each step of the rebuild begins.
@@ -191,6 +198,7 @@ def update_app(
             branch=branch,
             package_manager=package_manager,
             trigger=trigger,
+            job_id=job_id,
             phase=phase,
             on_step=on_step,
             log=log,
@@ -231,9 +239,13 @@ def update_app(
 
     phase(4, PHASES, "Rebuilding")
     if app_type == "monorepo":
-        result = _rebuild_monorepo(domain, app_path, app_name, on_step, verbose, trigger)
+        result, deployment_id = _rebuild_monorepo(
+            domain, app_path, app_name, on_step, verbose, trigger, job_id
+        )
     elif app_type == "docker-compose":
-        result = _rebuild_compose(domain, app_path, app_name, on_step, verbose, trigger)
+        result, deployment_id = _rebuild_compose(
+            domain, app_path, app_name, on_step, verbose, trigger, job_id
+        )
     else:
         deployer = get_deployer(app_type, verbose=verbose)
         deployer.configure(
@@ -242,8 +254,13 @@ def update_app(
             app_path=app_path,
             package_manager=package_manager,
             trigger=trigger,
+            job_id=job_id,
         )
         result = deployer.update(on_step=on_step)
+        # getattr: a duck-typed test double implements configure/update/deploy
+        # only, per the AppDeployer contract, and must not have to grow this
+        # attribute just to be updatable.
+        deployment_id = getattr(deployer, "last_deployment_id", None)
 
     phase(5, PHASES, "Restarting")
     if result.is_static:
@@ -262,6 +279,7 @@ def update_app(
         is_static=result.is_static,
         restarted=restarted,
         active=active,
+        deployment_id=deployment_id,
     )
 
 
@@ -273,6 +291,7 @@ def _update_release(
     branch: str | None,
     package_manager: str,
     trigger: str,
+    job_id: str | None,
     phase: PhaseReporter,
     on_step: Callable[[str], None] | None,
     log: Logger,
@@ -288,6 +307,7 @@ def _update_release(
         branch: Git branch; the recorded one when None.
         package_manager: Node package manager, or ``auto``.
         trigger: Who asked for the update.
+        job_id: The background job driving this update, when there is one.
         phase: Reporter for the :data:`RELEASE_PHASES` phases.
         on_step: Called as each step of the release build begins.
         log: Logger for the details of each phase.
@@ -337,6 +357,7 @@ def _update_release(
         branch=branch or app.branch,
         package_manager=package_manager,
         trigger=trigger,
+        job_id=job_id,
     )
     result = deployer.update(on_step=on_step)
 
@@ -351,6 +372,7 @@ def _update_release(
         is_static=result.is_static,
         restarted=restarted,
         active=True,
+        deployment_id=getattr(deployer, "last_deployment_id", None),
     )
 
 
@@ -415,7 +437,8 @@ def _rebuild_monorepo(
     on_step: Callable[[str], None] | None,
     verbose: bool,
     trigger: str,
-) -> UpdateResult:
+    job_id: str | None = None,
+) -> tuple[UpdateResult, int | None]:
     """
     Rebuild every workspace of a monorepo.
 
@@ -426,17 +449,20 @@ def _rebuild_monorepo(
         on_step: Called as each step begins.
         verbose: Verbosity of the deployer.
         trigger: Who asked, recorded in the deployment history.
+        job_id: The background job driving this update, when there is one.
 
     Returns:
-        What the deployer did.
+        What the deployer did, and the deployment history row it wrote.
     """
     deployer = MonorepoDeployer(verbose=verbose)
     deployer.app_path = app_path
     deployer.app_name = app_name
     deployer.domain = domain
     deployer.trigger = trigger
+    deployer.job_id = job_id
     deployer.package_manager = "pnpm"
-    return deployer.update(on_step=on_step)
+    result = deployer.update(on_step=on_step)
+    return result, getattr(deployer, "last_deployment_id", None)
 
 
 def _rebuild_compose(
@@ -446,7 +472,8 @@ def _rebuild_compose(
     on_step: Callable[[str], None] | None,
     verbose: bool,
     trigger: str,
-) -> UpdateResult:
+    job_id: str | None = None,
+) -> tuple[UpdateResult, int | None]:
     """
     Rebuild the images of a Docker Compose project and recreate its containers.
 
@@ -457,16 +484,19 @@ def _rebuild_compose(
         on_step: Called as each step begins.
         verbose: Verbosity of the deployer.
         trigger: Who asked, recorded in the deployment history.
+        job_id: The background job driving this update, when there is one.
 
     Returns:
-        What the deployer did.
+        What the deployer did, and the deployment history row it wrote.
     """
     deployer = DockerComposeDeployer(verbose=verbose)
     deployer.app_path = app_path
     deployer.app_name = app_name
     deployer.domain = domain
     deployer.trigger = trigger
-    return deployer.update(on_step=on_step)
+    deployer.job_id = job_id
+    result = deployer.update(on_step=on_step)
+    return result, getattr(deployer, "last_deployment_id", None)
 
 
 def _restart(app_name: str, log: Logger, verbose: bool) -> tuple[tuple[str, ...], bool]:

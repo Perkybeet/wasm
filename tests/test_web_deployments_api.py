@@ -321,6 +321,36 @@ class TestGetDeployment:
         response = client.get("/api/deployments/424242")
         assert response.status_code == 404
 
+    def test_carries_the_job_and_release_that_produced_it(
+        self, client: TestClient, store: WASMStore
+    ) -> None:
+        """A deploy queued from the panel links back to its job and its release."""
+        deployment_id = store.record_deployment_start(DOMAIN, "panel", job_id="ab12cd34")
+        store.annotate_deployment(
+            deployment_id, release_id="20260101-000000", commit_message="Fix the thing"
+        )
+        store.finish_deployment(deployment_id, DeploymentStatus.SUCCESS.value)
+
+        response = client.get(f"/api/deployments/{deployment_id}")
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["job_id"] == "ab12cd34"
+        assert body["release_id"] == "20260101-000000"
+        assert body["commit_message"] == "Fix the thing"
+
+    def test_a_cli_deploy_carries_none_of_them(self, client: TestClient, store: WASMStore) -> None:
+        """A CLI deploy has no job and, in place, no release either."""
+        deployment_id = seed_deployment(store, DOMAIN)
+
+        response = client.get(f"/api/deployments/{deployment_id}")
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["job_id"] is None
+        assert body["release_id"] is None
+        assert body["commit_message"] is None
+
 
 # --------------------------------------------------------------- log reading
 

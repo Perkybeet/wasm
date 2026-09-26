@@ -140,12 +140,23 @@ def queued(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
                 Returns:
                     The job as the API's response model expects it.
                 """
-                return {"id": self.id}
+                return {
+                    "id": self.id,
+                    "type": "delete",
+                    "name": "Delete example.com",
+                    "description": "",
+                    "status": "pending",
+                    "progress": 0,
+                    "total_steps": 100,
+                    "current_step": "",
+                    "created_at": "2026-01-01T00:00:00",
+                }
 
         return Queued()
 
     manager = type("FakeJobs", (), {"create_job": staticmethod(create_job)})()
     monkeypatch.setattr("wasm.web.api.apps.get_job_manager", lambda: manager)
+    monkeypatch.setattr("wasm.web.api.jobs.get_job_manager", lambda: manager)
     return captured
 
 
@@ -348,3 +359,154 @@ def test_the_master_token_bearer_is_exempt(
     )
     assert response.status_code == 202, response.text
     assert queued
+
+
+# --------------------------------------------------------------------------
+# POST /api/jobs/delete: the same deletion, queued through a second route
+# --------------------------------------------------------------------------
+
+
+def test_jobs_delete_requires_elevation_the_same_as_the_app_route(
+    client: TestClient, seeded_app: None, queued: list[dict[str, Any]]
+) -> None:
+    """
+    ``POST /api/jobs/delete`` runs the identical ``delete_app_job``
+    ``DELETE /api/apps/{domain}`` queues, so a fresh, unelevated cookie
+    session must be refused here too - not only on the route the console
+    actually calls today.
+    """
+    response = client.post("/api/jobs/delete", json={"domain": "example.com"})
+
+    assert response.status_code == 403, response.text
+    assert response.json()["error"] == "elevation_required"
+    assert not queued
+
+
+def test_jobs_delete_succeeds_once_elevated(
+    client: TestClient,
+    seeded_app: None,
+    queued: list[dict[str, Any]],
+    master_token: str,
+) -> None:
+    """Elevating opens the same window for ``POST /api/jobs/delete`` as for the app route."""
+    elevate(client, token=master_token)
+
+    response = client.post("/api/jobs/delete", json={"domain": "example.com"})
+
+    assert response.status_code == 202, response.text
+    assert queued
+
+
+# --------------------------------------------------------------------------
+# Certificates: revoking and deleting are as destructive as deleting an app
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fake_cert_manager(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+    """
+    Stand in for ``CertManager`` so revoke/delete never reach certbot.
+
+    Args:
+        monkeypatch: Patching helper, scoped to the test.
+
+    Returns:
+        The calls the endpoint made - empty when a request never got past the
+        elevation gate.
+    """
+    calls: list[tuple[str, str]] = []
+
+    class FakeCertManager:
+        """Records what it was asked, does nothing to the machine."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            """
+            Args:
+                *args: Ignored, kept for signature compatibility.
+                **kwargs: Ignored, kept for signature compatibility.
+            """
+
+        def revoke(self, domain: str) -> bool:
+            """
+            Args:
+                domain: Certificate name.
+
+            Returns:
+                Always True.
+            """
+            calls.append(("revoke", domain))
+            return True
+
+        def delete(self, domain: str) -> bool:
+            """
+            Args:
+                domain: Certificate name.
+
+            Returns:
+                Always True.
+            """
+            calls.append(("delete", domain))
+            return True
+
+    monkeypatch.setattr("wasm.web.api.certs.CertManager", FakeCertManager)
+    return calls
+
+
+def test_revoking_a_certificate_requires_elevation(
+    client: TestClient, fake_cert_manager: list[tuple[str, str]]
+) -> None:
+    """A fresh cookie session is refused before certbot is ever asked."""
+    response = client.post("/api/certs/example.com/revoke")
+
+    assert response.status_code == 403, response.text
+    assert response.json()["error"] == "elevation_required"
+    assert fake_cert_manager == []
+
+
+def test_revoking_a_certificate_succeeds_once_elevated(
+    client: TestClient, fake_cert_manager: list[tuple[str, str]], master_token: str
+) -> None:
+    """Elevating opens the same window revoking a certificate needs."""
+    elevate(client, token=master_token)
+
+    response = client.post("/api/certs/example.com/revoke")
+
+    assert response.status_code == 200, response.text
+    assert fake_cert_manager == [("revoke", "example.com")]
+
+
+def test_deleting_a_certificate_requires_elevation(
+    client: TestClient, fake_cert_manager: list[tuple[str, str]]
+) -> None:
+    """Deleting the certificate files is refused the same way revoking is."""
+    response = client.delete("/api/certs/example.com")
+
+    assert response.status_code == 403, response.text
+    assert response.json()["error"] == "elevation_required"
+    assert fake_cert_manager == []
+
+
+def test_deleting_a_certificate_succeeds_once_elevated(
+    client: TestClient, fake_cert_manager: list[tuple[str, str]], master_token: str
+) -> None:
+    """Elevating opens the same window deleting a certificate needs."""
+    elevate(client, token=master_token)
+
+    response = client.delete("/api/certs/example.com")
+
+    assert response.status_code == 200, response.text
+    assert fake_cert_manager == [("delete", "example.com")]
+
+
+def test_the_master_token_bearer_is_exempt_for_certificate_revocation(
+    client: TestClient, fake_cert_manager: list[tuple[str, str]], master_token: str
+) -> None:
+    """Automation presenting the master token needs no elevation either."""
+    anon = TestClient(client.app, client=("testclient", 50000))
+
+    response = anon.post(
+        "/api/certs/example.com/revoke", headers={"Authorization": f"Bearer {master_token}"}
+    )
+
+    assert response.status_code == 200, response.text
+    assert fake_cert_manager == [("revoke", "example.com")]

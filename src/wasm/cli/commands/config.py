@@ -22,6 +22,7 @@ does for the panel.
 
 from __future__ import annotations
 
+import json
 from argparse import Namespace
 from collections.abc import Callable
 from typing import Any, NoReturn
@@ -245,14 +246,40 @@ def _run_get(key: str, logger: Logger) -> int:
     return 0
 
 
+def _parse_list_value(raw: str) -> list[str]:
+    """
+    Split a comma-separated command line value into a list.
+
+    This is what ``--list`` asks for: argv has no native list type, and
+    typing ``wasm config set notifications.allow_private_hosts
+    internal.example,partner.example --list`` is the documented way to give a
+    list value to a key such as ``notifications.allow_private_hosts``, which
+    has no default for :func:`_coerce_cli_value` to recognise as one.
+
+    Empty items are dropped, so a trailing comma or repeated commas do not
+    store a value nobody typed.
+
+    Args:
+        raw: The value exactly as typed after ``--list``.
+
+    Returns:
+        The items, whitespace trimmed, in the order given.
+    """
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 def _coerce_cli_value(existing: Any, raw: str) -> Any:
     """
     Parse a command line value using the type the key already holds.
 
     ``wasm config set`` only ever has a string to work with - argv has no other
-    type - so a boolean or numeric setting has to be recovered from the shape
-    it already has, the default included, or ``wasm config set ssl.enabled
-    false`` would store the literal string ``"false"``, which is truthy.
+    type - so a boolean, numeric or list setting has to be recovered from the
+    shape it already has, the default included, or ``wasm config set
+    ssl.enabled false`` would store the literal string ``"false"``, which is
+    truthy. A key whose current or default value is a list also accepts a
+    JSON array (``wasm config set monitor.email_recipients
+    '["a@example.com"]'``) without needing ``--list``, since argv already
+    hands over one string a command line has no other way to shape.
 
     Args:
         existing: Current or default value for the key, or :data:`_MISSING`
@@ -261,14 +288,21 @@ def _coerce_cli_value(existing: Any, raw: str) -> Any:
 
     Returns:
         The value cast to match ``existing``, or ``raw`` unchanged when there
-        is nothing to match against, or the key holds a string, a mapping or a
-        sequence.
+        is nothing to match against, the key holds a string or a mapping, or
+        it holds a list and ``raw`` does not parse as a JSON array.
 
     Raises:
         ConfigError: When ``existing`` is a boolean or a number and ``raw``
             cannot be parsed as one.
     """
-    if existing is _MISSING or isinstance(existing, (str, dict, list)):
+    if isinstance(existing, list):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return raw
+        return parsed if isinstance(parsed, list) else raw
+
+    if existing is _MISSING or isinstance(existing, (str, dict)):
         return raw
 
     if isinstance(existing, bool):
@@ -297,7 +331,7 @@ def _coerce_cli_value(existing: Any, raw: str) -> Any:
     return raw
 
 
-def _run_set(key: str, raw_value: str, logger: Logger) -> int:
+def _run_set(key: str, raw_value: str, logger: Logger, *, as_list: bool = False) -> int:
     """
     Set one configuration value, addressed by its dotted key, and save it.
 
@@ -309,6 +343,9 @@ def _run_set(key: str, raw_value: str, logger: Logger) -> int:
         key: Dotted key, such as ``apps.directory`` or ``web.port``.
         raw_value: The new value, exactly as typed on the command line.
         logger: Logger for progress and errors.
+        as_list: Treat ``raw_value`` as a comma-separated list, for a key such
+            as ``notifications.allow_private_hosts`` that has no default value
+            :func:`_coerce_cli_value` could otherwise recognise as one.
 
     Returns:
         Exit code.
@@ -317,7 +354,7 @@ def _run_set(key: str, raw_value: str, logger: Logger) -> int:
     existing = config.get(key, _MISSING)
 
     try:
-        value = _coerce_cli_value(existing, raw_value)
+        value = _parse_list_value(raw_value) if as_list else _coerce_cli_value(existing, raw_value)
         config.set(key, value)
     except ConfigError as exc:
         logger.error(str(exc))
@@ -436,9 +473,18 @@ def get(ctx: Context, key: str) -> None:
 @cli.command("set")
 @click.argument("key")
 @click.argument("value")
+@click.option(
+    "--list",
+    "as_list",
+    is_flag=True,
+    help=(
+        "Treat VALUE as a comma-separated list, for a key such as "
+        "notifications.allow_private_hosts."
+    ),
+)
 @global_flags
 @pass_context
-def set_(ctx: Context, key: str, value: str) -> None:
+def set_(ctx: Context, key: str, value: str, as_list: bool) -> None:
     """
     Set one configuration value, addressed by its dotted key, and save it.
 
@@ -446,5 +492,11 @@ def set_(ctx: Context, key: str, value: str) -> None:
     checked against the same rule the panel applies to that key, when it has
     one, so an unsupported webserver or a port out of range is refused here
     too rather than written and discovered later.
+
+    A key needing a list value takes it two ways: 'wasm config set
+    notifications.allow_private_hosts internal.example,partner.example
+    --list' splits VALUE on commas, and a key that already holds a list (for
+    example monitor.email_recipients) also accepts a JSON array such as
+    '["a@example.com"]' without --list.
     """
-    _exit(_run_set(key, value, ctx.logger))
+    _exit(_run_set(key, value, ctx.logger, as_list=as_list))

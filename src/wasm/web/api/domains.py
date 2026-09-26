@@ -16,14 +16,16 @@ them too. Two things are decided here because they are about HTTP:
 - **Removing a domain needs sudo mode**, like every other destructive action.
 
 Mounted under ``/apps`` beside :mod:`wasm.web.api.apps`, which owns no path
-under ``/{domain}/domains``.
+under ``/{domain}/domains``. :data:`dns_router` is the exception: a DNS check
+against a domain that is not (yet) any application's, for the new-app wizard
+to run before it creates one, so it is mounted separately under ``/domains``.
 """
 
 from __future__ import annotations
 
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from wasm.core.store import DomainKind, DomainRecord, get_store
@@ -42,6 +44,14 @@ from wasm.web.jobs import JobContext, JobType, get_job_manager
 from wasm.web.pydantic_compat import iso_offset_validator
 
 router = APIRouter(route_class=WASMErrorRoute)
+
+#: DNS checks that do not need an application: mounted at ``/domains`` rather
+#: than ``/apps/{domain}/domains``, so a bare domain can be checked before it
+#: belongs to anything. Kept in this module, not a new one, because it shares
+#: :class:`DnsCheckResponse` and :func:`wasm.deployers.domains.check_dns` with
+#: the app-scoped check below - one implementation of "resolve a domain and
+#: compare it with this server", asked two ways.
+dns_router = APIRouter(route_class=WASMErrorRoute)
 
 
 class AppDomain(BaseModel):
@@ -305,6 +315,35 @@ def get_domain_dns(
         What it resolves to, compared with this server's addresses.
     """
     _require_app(domain)
+    check = check_dns(strict_domain(name))
+    return DnsCheckResponse(
+        domain=check.domain,
+        expected_addresses=list(check.expected_addresses),
+        resolved_addresses=list(check.resolved_addresses),
+        points_here=check.points_here,
+    )
+
+
+@dns_router.get("/dns", response_model=DnsCheckResponse)
+def get_bare_dns(
+    session: Annotated[dict[str, Any], Depends(get_current_session)],
+    name: Annotated[str, Query(description="The domain to resolve")],
+) -> DnsCheckResponse:
+    """
+    Check whether a domain resolves to this server, before it is any application's.
+
+    The same check :func:`get_domain_dns` runs for a domain already added to
+    an application, through the same :func:`wasm.deployers.domains.check_dns`
+    - the new-app wizard needs an answer before anything is created, and there
+    is no application yet to hang the path off.
+
+    Args:
+        session: Authenticated session, injected.
+        name: The domain to resolve.
+
+    Returns:
+        What it resolves to, compared with this server's addresses.
+    """
     check = check_dns(strict_domain(name))
     return DnsCheckResponse(
         domain=check.domain,

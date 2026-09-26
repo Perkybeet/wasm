@@ -432,3 +432,156 @@ def test_a_missing_app_is_404(client: TestClient) -> None:
     response = client.get("/api/apps/nothing.example.com")
 
     assert response.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# source, branch, keep_releases, build_command and start_command
+# ---------------------------------------------------------------------------
+
+
+def test_the_list_carries_source_branch_and_keep_releases_for_free(
+    client: TestClient, store: WASMStore, monkeypatch
+) -> None:
+    """These come straight off the stored row: no extra query, no N+1."""
+    seed_app(store)
+    _install_fake_manager(monkeypatch, {})
+
+    body = client.get("/api/apps").json()
+
+    entry = body["apps"][0]
+    assert entry["source"] == "https://github.com/you/app"
+    assert entry["branch"] == "main"
+    assert entry["keep_releases"] == 5
+
+
+def test_the_list_reports_the_deployed_start_command_from_the_service_row(
+    client: TestClient, store: WASMStore, monkeypatch
+) -> None:
+    """start_command is what the deploy recorded on the unit, not recomputed."""
+    app = seed_app(store)
+    seed_service(store, app)
+    _install_fake_manager(monkeypatch, {domain_to_app_name(DOMAIN): _active()})
+
+    body = client.get("/api/apps").json()
+
+    assert body["apps"][0]["start_command"] == "node server.js"
+
+
+def test_a_static_app_has_no_start_command(
+    client: TestClient, store: WASMStore, monkeypatch
+) -> None:
+    seed_app(store, is_static=True, port=None)
+    _install_fake_manager(monkeypatch, {})
+
+    body = client.get("/api/apps").json()
+
+    assert body["apps"][0]["start_command"] is None
+
+
+def test_the_list_never_computes_a_build_command_per_app(
+    client: TestClient, store: WASMStore, monkeypatch
+) -> None:
+    """Listing is cheap: build_command is always empty here, never instantiates a deployer."""
+    seed_app(store, DOMAIN)
+    seed_app(store, OTHER_DOMAIN)
+    _install_fake_manager(monkeypatch, {})
+
+    def _must_not_be_called(app: App) -> list[str]:
+        raise AssertionError("the list endpoint must not compute a build command")
+
+    monkeypatch.setattr(apps_api, "_deployer_build_command", _must_not_be_called)
+
+    response = client.get("/api/apps")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert all(item["build_command"] == [] for item in body["apps"])
+
+
+def test_the_detail_endpoint_computes_the_build_command(
+    client: TestClient, store: WASMStore, monkeypatch
+) -> None:
+    """Fetching one application may afford what the list must not."""
+    seed_app(store)
+    _install_fake_manager(monkeypatch, {})
+    monkeypatch.setattr(apps_api, "_deployer_build_command", lambda app: ["npm", "run", "build"])
+
+    body = client.get(f"/api/apps/{DOMAIN}").json()
+
+    assert body["build_command"] == ["npm", "run", "build"]
+
+
+# ---------------------------------------------------------------------------
+# GET /api/apps/types
+# ---------------------------------------------------------------------------
+
+
+def test_app_types_lists_the_registry_not_a_hardcoded_copy(client: TestClient) -> None:
+    """The wizard's type list comes from DeployerRegistry, the CLI's own source."""
+    response = client.get("/api/apps/types")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    types = {entry["type"]: entry for entry in body["types"]}
+    assert "nodejs" in types
+    assert types["nodejs"]["name"] == "Node.js"
+    assert types["nodejs"]["default_port"] == 3000
+    assert "static" in types
+    assert "auto" in types
+
+
+# ---------------------------------------------------------------------------
+# POST /api/apps/inspect: a bad source is the operator's mistake, not a crash
+# ---------------------------------------------------------------------------
+
+
+def test_an_unreachable_source_answers_400_not_500(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A repository WASM cannot fetch is a validation problem, not a server fault."""
+    from wasm.core.exceptions import SourceError
+
+    def broken(source: str, *, branch: str | None = None) -> Any:
+        raise SourceError(
+            "Could not reach the repository", details="Check the URL and your network"
+        )
+
+    monkeypatch.setattr(apps_api, "inspect_source", broken)
+
+    response = client.post("/api/apps/inspect", json={"source": "https://example.com/nope.git"})
+
+    assert response.status_code == 400, response.text
+    body = response.json()
+    assert body["error"] == "sourceerror"
+    assert "reach the repository" in body["detail"]
+    assert body["hint"] == "Check the URL and your network"
+
+
+def test_a_source_matching_no_app_type_answers_400_not_500(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Nothing recognising the checkout is a validation problem too.
+
+    ``inspect_source`` raises ``DeploymentError`` for this - right when a real
+    deploy fails partway through, wrong for a wizard preview that never wrote
+    anything - so the endpoint must translate it into the same 400 contract
+    as any other bad input, with the manager's own details kept as the hint.
+    """
+    from wasm.core.exceptions import DeploymentError
+
+    def unmatched(source: str, *, branch: str | None = None) -> Any:
+        raise DeploymentError(
+            f"Could not identify the application type at {source}",
+            details="Choose a type explicitly instead of relying on auto-detection.",
+        )
+
+    monkeypatch.setattr(apps_api, "inspect_source", unmatched)
+
+    response = client.post("/api/apps/inspect", json={"source": "https://example.com/mystery.git"})
+
+    assert response.status_code == 400, response.text
+    body = response.json()
+    assert body["error"] == "validationerror"
+    assert "Could not identify" in body["detail"]
+    assert "Choose a type explicitly" in body["hint"]

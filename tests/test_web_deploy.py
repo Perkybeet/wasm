@@ -284,6 +284,8 @@ def test_deploy_job_hands_the_panel_trigger_to_the_deployer(
     class FakeDeployer:
         """Records how it was configured and deploys nothing."""
 
+        last_deployment_id = None
+
         def configure(self, **kwargs: Any) -> None:
             captured.update(kwargs)
 
@@ -300,6 +302,46 @@ def test_deploy_job_hands_the_panel_trigger_to_the_deployer(
     )
 
     assert captured["trigger"] == "panel"
+
+
+def test_deploy_job_hands_its_own_id_to_the_deployer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    The deployment history links back to the job that started it.
+
+    :class:`~wasm.deployers.recorder.DeploymentRecorder` records ``job_id`` at
+    the start of the deploy, read off the deployer :func:`recorder_for` is
+    built from - so the job has to hand its id to the deployer before
+    ``deploy()`` runs, not after.
+
+    Args:
+        monkeypatch: Patching helper, scoped to the test.
+    """
+    from wasm.web.jobs import deploy_app_job
+
+    captured: dict[str, Any] = {}
+
+    class FakeDeployer:
+        """Records how it was configured and deploys nothing."""
+
+        def configure(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        def deploy(self) -> bool:
+            return True
+
+        last_deployment_id = 42
+
+    monkeypatch.setattr("wasm.deployers.get_deployer", lambda *a, **k: FakeDeployer())
+
+    result = deploy_app_job(
+        "app.example.com",
+        "https://github.com/you/app",
+        "nodejs",
+        job_context=_job_context(),
+    )
+
+    assert captured["job_id"] == "job-test"
+    assert result["deployment_id"] == 42
 
 
 def test_rollback_job_hands_the_panel_trigger_to_the_rollback(

@@ -273,11 +273,13 @@ class MonorepoDeployer(AppDeployer):
             trigger: What initiated this deployment, recorded in the history.
             **options: ``subdomain_overrides`` maps workspace names to
                 subdomains, ``workspace_filter`` limits which workspaces deploy,
-                and ``skip_database`` disables provisioning.
+                ``skip_database`` disables provisioning, and ``job_id`` is the
+                background job driving this deployment, when there is one.
         """
         self.domain = domain
         self.source = source
         self.trigger = trigger
+        self.job_id = options.get("job_id")
         self.base_port = port or self.DEFAULT_BASE_PORT
         self.webserver = webserver
         self.ssl = ssl
@@ -406,8 +408,10 @@ class MonorepoDeployer(AppDeployer):
         # Register app in store
         app = self._register_app_in_store(AppStatus.DEPLOYING.value)
 
-        with recording(self._recorder(), git_branch=self.branch):
-            return self._deploy_steps(app, total_steps)
+        with recording(self._recorder(), git_branch=self.branch) as recorder:
+            result = self._deploy_steps(app, total_steps)
+        self.last_deployment_id = recorder.deployment_id
+        return result
 
     def _deploy_steps(self, app: App, total_steps: int) -> bool:
         """
@@ -548,8 +552,10 @@ class MonorepoDeployer(AppDeployer):
                 details="Call configure(domain=..., source=...) before update().",
             )
 
-        with recording(self._recorder(), git_branch=self.branch):
-            return self._update_steps(on_step or (lambda _message: None))
+        with recording(self._recorder(), git_branch=self.branch) as recorder:
+            result = self._update_steps(on_step or (lambda _message: None))
+        self.last_deployment_id = recorder.deployment_id
+        return result
 
     def _update_steps(self, report: StepReporter) -> UpdateResult:
         """

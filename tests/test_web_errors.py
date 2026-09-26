@@ -2,9 +2,9 @@
 Tests for the API's one error contract.
 
 Every endpoint under ``/api`` answers a failure as
-``{"error": str, "detail": str, "hint": str | None, "fields": dict[str, str] | None}``,
-never Starlette's bare ``{"detail": ...}`` and never an unhandled 500. Three
-defect classes are pinned here:
+``{"error": str, "detail": str, "hint": str | None, "fields": dict[str, str] | None,
+"output": str | None}``, never Starlette's bare ``{"detail": ...}`` and never an
+unhandled 500. Three defect classes are pinned here:
 
 - **Three routers had no error boundary.** ``services``, ``config`` and
   ``monitor`` were built as plain ``APIRouter()``, so a manager error crashed
@@ -140,6 +140,7 @@ class TestManagerErrors:
             "detail": "bad key",
             "hint": "use apps.directory",
             "fields": None,
+            "output": None,
         }
 
     def test_a_service_not_found_uses_the_contract(self, client: TestClient) -> None:

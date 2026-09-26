@@ -111,6 +111,10 @@ BUILD_TIMEOUT = 2700
 #: Everything else in a deployer is a quick local command.
 COMMAND_TIMEOUT = 300
 
+#: A local, read-only ``git log`` never touches the network; this is generous
+#: only against a checkout on a badly loaded disk.
+GIT_LOG_TIMEOUT = 10
+
 #: Failures while writing release bookkeeping. The release on disk is the
 #: truth; a row that could not be written is reported, never fatal.
 _RECORDING_ERRORS = (WASMError, sqlite3.Error)
@@ -203,6 +207,19 @@ class BaseDeployer(AppDeployer):
         self.branch: str | None = None
         self.env_vars: dict[str, str] = {}
         self.trigger: str = DeploymentTrigger.CLI.value
+        #: The background job that started this deployment, when one did.
+        #: None for the CLI and for a webhook, which run with nothing queuing
+        #: them.
+        self.job_id: str | None = None
+        #: The id of the history row :meth:`deploy` or :meth:`update` just
+        #: wrote, once it returns. None until then, and None again if
+        #: recording itself failed (see :class:`DeploymentRecorder`) or the
+        #: run was a dry one.
+        self.last_deployment_id: int | None = None
+        self.memory_max_mb: int | None = None
+        self.cpu_quota_percent: int | None = None
+        self.tasks_max: int | None = None
+        self._resource_limits_given: bool = False
 
         # Package manager (auto = auto-detect)
         self._package_manager: PackageManager = "auto"
@@ -313,6 +330,11 @@ class BaseDeployer(AppDeployer):
         trigger: str = DeploymentTrigger.CLI.value,
         layout: str | None = None,
         persistent_paths: Sequence[str] | None = None,
+        job_id: str | None = None,
+        memory_max_mb: int | None = None,
+        cpu_quota_percent: int | None = None,
+        tasks_max: int | None = None,
+        resource_limits_given: bool = False,
         **options: Any,
     ) -> None:
         """
@@ -340,6 +362,22 @@ class BaseDeployer(AppDeployer):
             persistent_paths: Paths, relative to the application, that live
                 in ``shared/`` and are linked into every release (uploads,
                 storage). None keeps what the application already has.
+            job_id: The background job driving this deployment, when the
+                panel queued it. Recorded on the deployment history row so
+                the two can be linked; None for the CLI and for a webhook.
+            memory_max_mb: ``MemoryMax`` the unit is created with, in MB.
+                Only takes effect when ``resource_limits_given`` is true; see
+                :meth:`~wasm.deployers.helpers.registration.StoreRegistrar.register_app`.
+            cpu_quota_percent: ``CPUQuota`` the unit is created with, in
+                percent of one CPU. Same rule as ``memory_max_mb``.
+            tasks_max: ``TasksMax`` the unit is created with. Same rule as
+                ``memory_max_mb``.
+            resource_limits_given: Whether the three limits above were part of
+                this call at all. False (the default, and every caller except
+                a fresh ``POST /api/apps`` with limits in the body) leaves an
+                existing application's limits exactly as they were - set once
+                through ``PATCH .../limits`` or at creation, a redeploy or an
+                update must not silently clear them.
             **options: Accepted and ignored, so a caller can pass the union of
                 every deployer's settings without knowing which one it got.
         """
@@ -354,6 +392,11 @@ class BaseDeployer(AppDeployer):
         self.branch = branch
         self.env_vars = env_vars or {}
         self.trigger = trigger
+        self.job_id = job_id
+        self.memory_max_mb = memory_max_mb
+        self.cpu_quota_percent = cpu_quota_percent
+        self.tasks_max = tasks_max
+        self._resource_limits_given = resource_limits_given
         self._package_manager = package_manager  # type: ignore[assignment]
         self._requested_layout = layout
         self._persistent_request = list(persistent_paths) if persistent_paths is not None else None
@@ -2027,7 +2070,44 @@ class BaseDeployer(AppDeployer):
             store, logger and filesystem. One shared construction site, so the
             deploy and update paths cannot record differently.
         """
-        return recorder_for(self, git_info=self._git_info)
+        return recorder_for(
+            self,
+            git_info=self._git_info,
+            commit_message=self._commit_message_for_recording,
+            release_id=self._release_id_for_recording,
+        )
+
+    def _commit_message_for_recording(self) -> str | None:
+        """
+        Read the subject line of the deployed commit, for a git source only.
+
+        In place, that is :attr:`app_path` itself. On releases the exported
+        release has no ``.git`` - it is exported without one - so this reads
+        the repository cache instead, which persists across deploys.
+
+        Returns:
+            The subject (``git log -1 --format=%s``), or None when the
+            checkout is not a git repository or the command fails. A missing
+            subject must not cost the deployment its history row.
+        """
+        checkout = (self.app_path / REPO_CACHE_DIR) if self._staged is not None else self.app_path
+        if not (checkout / ".git").is_dir():
+            return None
+        result = self.runner.run(
+            ["git", "log", "-1", "--format=%s"], cwd=checkout, timeout=GIT_LOG_TIMEOUT
+        )
+        subject = result.stdout.strip()
+        return subject if result.success and subject else None
+
+    def _release_id_for_recording(self) -> str | None:
+        """
+        Read the release this deployment built, once the fetch step has staged it.
+
+        Returns:
+            The release id, or None for an in-place deployment or one where
+            the fetch step has not run yet (a failure before it).
+        """
+        return self._staged.id if self._staged is not None else None
 
     def _git_info(self) -> tuple[str | None, str | None]:
         """
@@ -2085,10 +2165,10 @@ class BaseDeployer(AppDeployer):
             self._recorder(),
             git_branch=self.branch,
             on_failure=(lambda _exc: self._abandon_release()) if releases else None,
-        ):
-            if releases:
-                return self._update_release(report)
-            return self._update_in_place(report)
+        ) as recorder:
+            result = self._update_release(report) if releases else self._update_in_place(report)
+        self.last_deployment_id = recorder.deployment_id
+        return result
 
     def _update_in_place(self, report: StepReporter) -> UpdateResult:
         """
@@ -2240,8 +2320,11 @@ class BaseDeployer(AppDeployer):
                 ),
             )
 
-        with recording(self._recorder(), git_branch=self.branch, on_failure=self._deploy_failed):
+        with recording(
+            self._recorder(), git_branch=self.branch, on_failure=self._deploy_failed
+        ) as recorder:
             run_pipeline(steps, self.logger)
+        self.last_deployment_id = recorder.deployment_id
 
         self._report_result()
         return True
@@ -2306,6 +2389,10 @@ class BaseDeployer(AppDeployer):
             env_vars=self.env_vars,
             layout=self._layout,
             persistent_paths=self._persistent_request,
+            memory_max_mb=self.memory_max_mb,
+            cpu_quota_percent=self.cpu_quota_percent,
+            tasks_max=self.tasks_max,
+            limits_given=self._resource_limits_given,
         )
 
 

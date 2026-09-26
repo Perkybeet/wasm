@@ -32,7 +32,7 @@ from wasm.core.exceptions import ValidationError
 from wasm.core.store import JobRecord, get_store
 from wasm.validators.names import validate_filename
 from wasm.web.api.auth import get_current_session
-from wasm.web.api.deps import WASMErrorRoute, strict_domain
+from wasm.web.api.deps import WASMErrorRoute, require_elevated, strict_domain
 from wasm.web.auth import actor_label
 from wasm.web.jobs import (
     Job,
@@ -94,7 +94,15 @@ class CertRequest(BaseModel):
 
 
 class JobResponse(BaseModel):
-    """One job, as the queue records it."""
+    """
+    One job, as the queue records it.
+
+    Attributes:
+        deployment_id: The deployment history row a deploy or update job
+            wrote, lifted out of ``result`` so a client can link to it
+            without knowing which job types carry one. None for a job that
+            never deployed anything, or one whose recording failed.
+    """
 
     id: str
     type: str
@@ -112,6 +120,7 @@ class JobResponse(BaseModel):
     logs: list[dict[str, Any]] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
     actor: str | None = None
+    deployment_id: int | None = None
 
     _iso_timestamps = iso_offset_validator("created_at", "started_at", "completed_at")
 
@@ -152,6 +161,26 @@ class JobLogResponse(BaseModel):
     truncated: bool
 
 
+def _deployment_id_of(result: dict[str, Any] | None) -> int | None:
+    """
+    Lift ``deployment_id`` out of a job's free-form result, when it has one.
+
+    Only deploy and update jobs put it there
+    (:func:`~wasm.web.jobs.deploy_app_job`, :func:`~wasm.web.jobs.run_update`);
+    every other job type's result simply has no such key.
+
+    Args:
+        result: The job's result, or None for one that has not finished.
+
+    Returns:
+        The deployment id, or None.
+    """
+    if not isinstance(result, dict):
+        return None
+    deployment_id = result.get("deployment_id")
+    return deployment_id if isinstance(deployment_id, int) else None
+
+
 def _to_response(job: Job) -> JobResponse:
     """
     Convert a job into its API representation.
@@ -162,7 +191,8 @@ def _to_response(job: Job) -> JobResponse:
     Returns:
         The API model.
     """
-    return JobResponse(**job.to_dict())
+    data = job.to_dict()
+    return JobResponse(deployment_id=_deployment_id_of(data.get("result")), **data)
 
 
 def _from_record(record: JobRecord) -> JobResponse:
@@ -203,6 +233,7 @@ def _from_record(record: JobRecord) -> JobResponse:
         started_at=record.started_at,
         completed_at=record.finished_at,
         result=result,
+        deployment_id=_deployment_id_of(result),
         error=record.error,
         logs=[],
         metadata={"domain": record.domain} if record.domain else {},
@@ -331,14 +362,21 @@ def create_update_job(
 
 @router.post("/delete", response_model=JobCreatedResponse, status_code=202)
 def create_delete_job(
-    request: DeleteRequest, session: Annotated[dict, Depends(get_current_session)]
+    request: DeleteRequest, session: Annotated[dict, Depends(require_elevated)]
 ) -> JobCreatedResponse:
     """
     Queue a deletion.
 
+    Runs the same :func:`~wasm.web.jobs.delete_app_job` that
+    ``DELETE /api/apps/{domain}`` queues, so it is guarded the same way: a
+    cookie session must have confirmed recently (see
+    :func:`~wasm.web.api.deps.require_elevated`), the same as any other
+    irreversible action. A stale client still calling this route instead of
+    the app-level one gets no less protection for it.
+
     Args:
         request: The deletion request.
-        session: The authenticated session.
+        session: The authenticated, elevated session.
 
     Returns:
         The queued job.

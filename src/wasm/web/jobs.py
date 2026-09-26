@@ -857,6 +857,11 @@ def deploy_app_job(
     compose_file: str | None = None,
     compose_profiles: list[str] | None = None,
     layout: str | None = None,
+    include_www: bool = False,
+    persistent_paths: list[str] | None = None,
+    memory_max_mb: int | None = None,
+    cpu_quota_percent: int | None = None,
+    tasks_max: int | None = None,
     job_context: JobContext | None = None,
 ) -> dict[str, Any]:
     """
@@ -883,10 +888,22 @@ def deploy_app_job(
         compose_profiles: Docker Compose: profiles to activate.
         layout: ``inplace`` or ``releases``; None for the server's
             configured layout.
+        include_www: Also answer on ``www.<domain>``, as a redirect.
+        persistent_paths: Paths, relative to the application, linked into
+            ``shared/`` and kept across every release.
+        memory_max_mb: ``MemoryMax`` the unit is created with, in MB. Every
+            caller of this job function is a fresh deployment (``POST
+            /api/apps`` refuses a domain that already exists before queuing
+            it), so these three are always "given": None means no limit, not
+            "leave it alone".
+        cpu_quota_percent: ``CPUQuota`` the unit is created with, in percent
+            of one CPU.
+        tasks_max: ``TasksMax`` the unit is created with.
         job_context: Injected by the job manager.
 
     Returns:
-        Summary of the deployment.
+        Summary of the deployment, including ``deployment_id``: the history
+        row this run wrote, or None if recording it failed.
 
     Raises:
         DeploymentError: When the deployer reports failure.
@@ -915,6 +932,13 @@ def deploy_app_job(
         compose_profiles=compose_profiles,
         trigger="panel",
         layout=layout or CONFIGURED_LAYOUT,
+        job_id=context.job_id,
+        include_www=include_www,
+        persistent_paths=persistent_paths,
+        memory_max_mb=memory_max_mb,
+        cpu_quota_percent=cpu_quota_percent,
+        tasks_max=tasks_max,
+        resource_limits_given=True,
     )
 
     context.update("Deploying", 10)
@@ -925,7 +949,16 @@ def deploy_app_job(
         )
 
     context.update("Deployment complete", 100)
-    return {"domain": domain, "app_type": app_type, "port": port, "status": "deployed"}
+    return {
+        "domain": domain,
+        "app_type": app_type,
+        "port": port,
+        "status": "deployed",
+        # getattr: a duck-typed test double implements configure/deploy only,
+        # per the AppDeployer contract, and must not have to grow this
+        # attribute just to be deployable.
+        "deployment_id": getattr(deployer, "last_deployment_id", None),
+    }
 
 
 def update_app_job(
@@ -985,6 +1018,7 @@ def run_update(domain: str, *, trigger: str, job_context: JobContext | None) -> 
         trigger=trigger,
         on_phase=lambda index, total, message: context.update(message, 100 * (index - 1) // total),
         on_step=context.log,
+        job_id=context.job_id,
     )
 
     if outcome.restarted and not outcome.active:
@@ -997,6 +1031,7 @@ def run_update(domain: str, *, trigger: str, job_context: JobContext | None) -> 
         "trigger": trigger,
         "restarted": list(outcome.restarted),
         "active": outcome.active,
+        "deployment_id": outcome.deployment_id,
     }
 
 

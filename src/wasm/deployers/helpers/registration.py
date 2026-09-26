@@ -44,6 +44,10 @@ class StoreRegistrar:
         env_vars: dict[str, str],
         layout: str | None = None,
         persistent_paths: list[str] | None = None,
+        memory_max_mb: int | None = None,
+        cpu_quota_percent: int | None = None,
+        tasks_max: int | None = None,
+        limits_given: bool = False,
     ) -> App:
         """
         Create or update the application row.
@@ -69,6 +73,20 @@ class StoreRegistrar:
                 row's, or the in-place default for a new one.
             persistent_paths: Paths kept in ``shared/`` across releases. None
                 keeps the existing row's, or none for a new one.
+            memory_max_mb: ``MemoryMax`` for the unit this deployment creates,
+                in MB. Ignored unless ``limits_given`` is true - three fields
+                that default to None cannot otherwise tell "no limit" from
+                "say nothing", and a redeploy that says nothing must not
+                erase a limit set through ``PATCH .../limits``.
+            cpu_quota_percent: ``CPUQuota``, in percent of one CPU. Same rule
+                as ``memory_max_mb``.
+            tasks_max: ``TasksMax``. Same rule as ``memory_max_mb``.
+            limits_given: Whether the three limits above were part of this
+                request at all, as opposed to simply unset. True only for a
+                fresh deployment that named them explicitly (see
+                ``CreateAppRequest``); a redeploy or an update never passes
+                this, so the limits an operator set through the panel survive
+                every later deploy of the same application.
 
         Returns:
             The stored application row.
@@ -99,6 +117,10 @@ class StoreRegistrar:
             app.layout = layout
         if persistent_paths is not None:
             app.persistent_paths = list(persistent_paths)
+        if limits_given:
+            app.memory_max_mb = memory_max_mb
+            app.cpu_quota_percent = cpu_quota_percent
+            app.tasks_max = tasks_max
         if existing:
             # created_at belongs to the first deployment, not to this one.
             app.created_at = existing.created_at

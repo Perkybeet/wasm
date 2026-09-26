@@ -1174,15 +1174,17 @@ class WebServerManager(BaseManager):
 
     # -- Validating a configuration without installing it --------------------
 
-    def validate_config_text(self, config_text: str, *, domain: str) -> None:
+    def test_config_text(self, config_text: str, *, domain: str) -> tuple[bool, str]:
         """
         Ask the web server whether it would accept a configuration snippet.
 
-        The snippet is staged into a throwaway directory together with a
-        minimal main configuration that includes it, and the backend's own
-        syntax checker runs against that wrapper. The live configuration is
-        never touched: a broken snippet used to be written first and checked
-        never, which took the site down at the next reload.
+        The snippet is staged into a throwaway directory through the
+        filesystem seam, together with a minimal main configuration that
+        includes it, and the backend's own syntax checker runs against that
+        wrapper. The live configuration is never touched and nothing staged
+        outlives this call, whichever way it answers - a "try before you
+        save" caller and :meth:`validate_config_text` share this one
+        implementation of that instead of each staging its own copy.
 
         Args:
             config_text: The virtual host configuration to check.
@@ -1190,11 +1192,12 @@ class WebServerManager(BaseManager):
                 way as everywhere else before it names a staged file.
 
         Returns:
-            None. Returning at all means the server accepted the snippet.
+            Whether the server accepted the snippet, and its own output
+            verbatim. The output is not empty on a pass either: nginx and
+            apache2ctl both print a confirmation ("syntax is ok" / "Syntax
+            OK") even when there is nothing wrong.
 
         Raises:
-            ValidationError: When the server rejects the snippet. ``details``
-                carries the server's own output verbatim.
             NginxError: When the nginx snippet cannot be staged.
             ApacheError: When the apache snippet cannot be staged.
             DomainError: When the domain is not a valid domain name.
@@ -1227,15 +1230,43 @@ class WebServerManager(BaseManager):
             if staging.exists():
                 self.fs.remove_tree(staging)
 
+        output = "\n".join(stream for stream in (result.stderr, result.stdout) if stream.strip())
         # The same tolerance test_config() needs: apache2ctl exits non-zero on
         # warnings it then describes as "Syntax OK".
-        if result.success or "Syntax OK" in f"{result.stdout}\n{result.stderr}":
+        ok = result.success or "Syntax OK" in f"{result.stdout}\n{result.stderr}"
+        return ok, output
+
+    def validate_config_text(self, config_text: str, *, domain: str) -> None:
+        """
+        Ask the web server whether it would accept a configuration snippet.
+
+        Raises rather than answering, for the caller about to install the
+        text and needing to stop if it is refused. Built on
+        :meth:`test_config_text`, which a caller that only wants to preview
+        the answer - never installing anything - calls directly.
+
+        Args:
+            config_text: The virtual host configuration to check.
+            domain: Domain the configuration is meant for.
+
+        Returns:
+            None. Returning at all means the server accepted the snippet.
+
+        Raises:
+            ValidationError: When the server rejects the snippet. ``details``
+                and ``output`` both carry the server's own output verbatim.
+            NginxError: When the nginx snippet cannot be staged.
+            ApacheError: When the apache snippet cannot be staged.
+            DomainError: When the domain is not a valid domain name.
+        """
+        ok, output = self.test_config_text(config_text, domain=domain)
+        if ok:
             return
 
-        output = "\n".join(stream for stream in (result.stderr, result.stdout) if stream.strip())
         raise ValidationError(
             f"{self.backend.name} rejected the configuration for {domain}",
             details=output,
+            output=output,
         )
 
     def replace_site_config(self, domain: str, config_text: str, *, validate: bool = True) -> Path:

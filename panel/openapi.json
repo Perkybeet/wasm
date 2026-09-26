@@ -366,7 +366,7 @@
         "type": "object"
       },
       "AppInfo": {
-        "description": "A deployed application and the live state of its service.\n\nAttributes:\n    name: Application name, which is its domain.\n    domain: Domain the application is served on.\n    status: What is true about it right now, resolved by\n        :func:`wasm.core.app_state.resolve_state` - the one place the CLI\n        and the panel agree on this: ``running``, ``restarting`` (systemd\n        is crash-looping the unit), ``no_answer`` (the unit is up but\n        nothing accepts connections on its port), ``stopped``, ``failed``\n        (systemd gave up on it), ``static`` (served directly by the web\n        server, there is no unit) or ``unknown`` (systemd could not be\n        asked).\n    active: Whether the unit is active.\n    enabled: Whether the unit starts on boot.\n    pid: Main PID when running.\n    uptime: How long the unit has been up.\n    port: Upstream port.\n    app_type: Deployer that owns it.\n    path: Application directory.\n    layout: ``inplace`` or ``releases``.\n    memory_max_mb: Memory limit of its unit, in MB, or None.\n    cpu_quota_percent: CPU quota of its unit, in percent of one CPU, or None.\n    tasks_max: Task limit of its unit, or None.\n    webhook_enabled: Whether a webhook secret is set for it. The secret\n        itself is never part of this or any other response; it is set\n        through ``POST /api/apps/{domain}/webhook-secret`` and cleared\n        through the ``DELETE`` of the same path.\n    unit: The systemd unit that runs it, or None for a static site.\n    run_as: The account its unit runs as, or None for a static site.\n    last_deployment: Its most recent deployment attempt, or None when\n        nothing has ever been recorded for it.",
+        "description": "A deployed application and the live state of its service.\n\nAttributes:\n    name: Application name, which is its domain.\n    domain: Domain the application is served on.\n    status: What is true about it right now, resolved by\n        :func:`wasm.core.app_state.resolve_state` - the one place the CLI\n        and the panel agree on this: ``running``, ``restarting`` (systemd\n        is crash-looping the unit), ``no_answer`` (the unit is up but\n        nothing accepts connections on its port), ``stopped``, ``failed``\n        (systemd gave up on it), ``static`` (served directly by the web\n        server, there is no unit) or ``unknown`` (systemd could not be\n        asked).\n    active: Whether the unit is active.\n    enabled: Whether the unit starts on boot.\n    pid: Main PID when running.\n    uptime: How long the unit has been up.\n    port: Upstream port.\n    app_type: Deployer that owns it.\n    path: Application directory.\n    source: Git URL or local path it was deployed from.\n    branch: Git branch it tracks, or None for a source that has none.\n    layout: ``inplace`` or ``releases``.\n    keep_releases: Release directories kept before older ones are pruned.\n        Meaningful only on ``releases``; the in-place default otherwise.\n    build_command: Argv the deployer runs to build the project, read off\n        the same ``get_build_command()`` the deploy used. Empty in a\n        list response - computing it means instantiating the deployer\n        once per application, which this endpoint does not do for a\n        list - and filled in when this application is fetched on its own.\n    start_command: What its unit runs, exactly as the deploy recorded it\n        on the service row. None for a static site, which has no unit.\n    memory_max_mb: Memory limit of its unit, in MB, or None.\n    cpu_quota_percent: CPU quota of its unit, in percent of one CPU, or None.\n    tasks_max: Task limit of its unit, or None.\n    webhook_enabled: Whether a webhook secret is set for it. The secret\n        itself is never part of this or any other response; it is set\n        through ``POST /api/apps/{domain}/webhook-secret`` and cleared\n        through the ``DELETE`` of the same path.\n    unit: The systemd unit that runs it, or None for a static site.\n    run_as: The account its unit runs as, or None for a static site.\n    last_deployment: Its most recent deployment attempt, or None when\n        nothing has ever been recorded for it.",
         "properties": {
           "active": {
             "title": "Active",
@@ -382,6 +382,24 @@
               }
             ],
             "title": "App Type"
+          },
+          "branch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Branch"
+          },
+          "build_command": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Build Command",
+            "type": "array"
           },
           "cpu_quota_percent": {
             "anyOf": [
@@ -401,6 +419,11 @@
           "enabled": {
             "title": "Enabled",
             "type": "boolean"
+          },
+          "keep_releases": {
+            "default": 5,
+            "title": "Keep Releases",
+            "type": "integer"
           },
           "last_deployment": {
             "anyOf": [
@@ -475,6 +498,28 @@
               }
             ],
             "title": "Run As"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source"
+          },
+          "start_command": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Command"
           },
           "status": {
             "title": "Status",
@@ -573,6 +618,47 @@
           "lines"
         ],
         "title": "AppLogsResponse",
+        "type": "object"
+      },
+      "AppTypeInfo": {
+        "description": "One application type the new-app wizard may offer.",
+        "properties": {
+          "default_port": {
+            "title": "Default Port",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "name",
+          "default_port"
+        ],
+        "title": "AppTypeInfo",
+        "type": "object"
+      },
+      "AppTypesResponse": {
+        "description": "Every application type WASM can deploy.",
+        "properties": {
+          "types": {
+            "items": {
+              "$ref": "#/components/schemas/AppTypeInfo"
+            },
+            "title": "Types",
+            "type": "array"
+          }
+        },
+        "required": [
+          "types"
+        ],
+        "title": "AppTypesResponse",
         "type": "object"
       },
       "AppsDirConfig": {
@@ -1110,7 +1196,7 @@
         "type": "object"
       },
       "CertInfo": {
-        "description": "One certificate as certbot reports it.\n\nAttributes:\n    domain: Certificate (lineage) name.\n    domains: Every domain the certificate covers.\n    valid_until: Raw expiry line from certbot, including its validity note.\n    expires_on: Expiry date as ``YYYY-MM-DD`` when it could be parsed.\n    days_remaining: Whole days until expiry, negative once expired.\n    auto_renew: Whether certbot's renewal timer covers this certificate.\n    path: Directory holding the certificate files.\n    key_path: Path of the private key. The key itself is never read.",
+        "description": "One certificate as certbot reports it.\n\nAttributes:\n    domain: Certificate (lineage) name.\n    domains: Every domain the certificate covers.\n    valid_until: Raw expiry line from certbot, including its validity note.\n    expires_on: Expiry date as ``YYYY-MM-DD`` when it could be parsed.\n    days_remaining: Whole days until expiry, negative once expired.\n    auto_renew: Whether certbot's renewal timer covers this certificate.\n    path: Directory holding the certificate files.\n    key_path: Path of the private key. The key itself is never read.\n    issuer: The certificate authority that signed it, read from the\n        certificate itself. None when it could not be read.",
         "properties": {
           "auto_renew": {
             "default": true,
@@ -1150,6 +1236,17 @@
               }
             ],
             "title": "Expires On"
+          },
+          "issuer": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Issuer"
           },
           "key_path": {
             "anyOf": [
@@ -1529,6 +1626,18 @@
             "description": "Docker Compose: profiles to activate",
             "title": "Compose Profiles"
           },
+          "cpu_quota_percent": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "CPUQuota for the unit, in percent of one CPU (200 is two CPUs); 1 to 100 per CPU. Null: no limit",
+            "title": "Cpu Quota Percent"
+          },
           "domain": {
             "description": "Target domain name",
             "title": "Domain",
@@ -1541,6 +1650,12 @@
             "description": "Environment variables",
             "title": "Env Vars",
             "type": "object"
+          },
+          "include_www": {
+            "default": false,
+            "description": "Also answer on www.<domain>, as a redirect to it",
+            "title": "Include Www",
+            "type": "boolean"
           },
           "layout": {
             "anyOf": [
@@ -1557,6 +1672,33 @@
             ],
             "description": "Build every deploy as a release behind a health gate, or in place. Omitted: the server's deploy.layout",
             "title": "Layout"
+          },
+          "memory_max_mb": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "MemoryMax for the unit, in MB; at least 64. Null: no limit",
+            "title": "Memory Max Mb"
+          },
+          "persistent_paths": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Releases only: paths, relative to the application, linked into shared/ and kept across every release (uploads, storage)",
+            "title": "Persistent Paths"
           },
           "port": {
             "anyOf": [
@@ -1594,6 +1736,18 @@
             "description": "Monorepo: workspace name to subdomain overrides",
             "title": "Subdomain Overrides",
             "type": "object"
+          },
+          "tasks_max": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "TasksMax for the unit, processes and threads; at least 16. Null: no limit",
+            "title": "Tasks Max"
           },
           "webserver": {
             "default": "nginx",
@@ -2428,8 +2582,19 @@
         "type": "object"
       },
       "DeploymentOut": {
-        "description": "One deployment attempt, as the console lists and inspects it.",
+        "description": "One deployment attempt, as the console lists and inspects it.\n\nAttributes:\n    job_id: The background job that started this deployment, when the\n        panel queued it. None for a CLI or webhook deploy.\n    release_id: The release this deployment built, on the releases\n        layout. None for an in-place deployment.\n    commit_message: Subject line of the deployed commit, for a git\n        source. None for a source that is not git.",
         "properties": {
+          "commit_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Commit Message"
+          },
           "domain": {
             "title": "Domain",
             "type": "string"
@@ -2496,6 +2661,28 @@
           "id": {
             "title": "Id",
             "type": "integer"
+          },
+          "job_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Id"
+          },
+          "release_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Release Id"
           },
           "started_at": {
             "anyOf": [
@@ -3266,7 +3453,7 @@
         "type": "object"
       },
       "JobResponse": {
-        "description": "One job, as the queue records it.",
+        "description": "One job, as the queue records it.\n\nAttributes:\n    deployment_id: The deployment history row a deploy or update job\n        wrote, lifted out of ``result`` so a client can link to it\n        without knowing which job types carry one. None for a job that\n        never deployed anything, or one whose recording failed.",
         "properties": {
           "actor": {
             "anyOf": [
@@ -3297,6 +3484,17 @@
           "current_step": {
             "title": "Current Step",
             "type": "string"
+          },
+          "deployment_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deployment Id"
           },
           "description": {
             "title": "Description",
@@ -3813,6 +4011,10 @@
             "title": "Points",
             "type": "array"
           },
+          "resolution": {
+            "title": "Resolution",
+            "type": "string"
+          },
           "window": {
             "title": "Window",
             "type": "string"
@@ -3821,6 +4023,7 @@
         "required": [
           "metric",
           "window",
+          "resolution",
           "points"
         ],
         "title": "MetricHistoryResponse",
@@ -5472,8 +5675,27 @@
         "title": "SiteConfigResponse",
         "type": "object"
       },
+      "SiteConfigTestResponse": {
+        "description": "Outcome of testing a candidate configuration.\n\nAttributes:\n    ok: Whether the web server would accept the configuration.\n    output: The web server's own output, verbatim - present whichever way\n        it answers, since nginx and apache2ctl both print a confirmation\n        line even when there is nothing wrong.",
+        "properties": {
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "output": {
+            "title": "Output",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ok",
+          "output"
+        ],
+        "title": "SiteConfigTestResponse",
+        "type": "object"
+      },
       "SiteInfo": {
-        "description": "A configured virtual host.\n\nAttributes:\n    name: The domain, which is also the configuration file name.\n    webserver: Web server serving it.\n    enabled: Whether the site is enabled.\n    config_path: Absolute path of the configuration file.\n    has_ssl: Whether the configuration carries TLS directives.",
+        "description": "A configured virtual host.\n\nAttributes:\n    name: The domain, which is also the configuration file name.\n    webserver: Web server serving it.\n    enabled: Whether the site is enabled.\n    config_path: Absolute path of the configuration file.\n    has_ssl: Whether the configuration carries TLS directives.\n    server_names: Every name the configuration answers on - the primary\n        domain and its aliases - read from the file's own directives.\n        Empty when the configuration cannot be read.",
         "properties": {
           "config_path": {
             "title": "Config Path",
@@ -5491,6 +5713,14 @@
           "name": {
             "title": "Name",
             "type": "string"
+          },
+          "server_names": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Server Names",
+            "type": "array"
           },
           "webserver": {
             "title": "Webserver",
@@ -5531,6 +5761,28 @@
           "webserver"
         ],
         "title": "SiteListResponse",
+        "type": "object"
+      },
+      "SiteTemplatesResponse": {
+        "description": "Templates a site can be created or rendered from.\n\nAttributes:\n    templates: Template names, without their file suffix, sorted.\n    webserver: Backend the templates belong to.",
+        "properties": {
+          "templates": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Templates",
+            "type": "array"
+          },
+          "webserver": {
+            "title": "Webserver",
+            "type": "string"
+          }
+        },
+        "required": [
+          "templates",
+          "webserver"
+        ],
+        "title": "SiteTemplatesResponse",
         "type": "object"
       },
       "SourceInspectionResponse": {
@@ -5711,6 +5963,20 @@
           "disks"
         ],
         "title": "SystemInfo",
+        "type": "object"
+      },
+      "TestSiteConfigRequest": {
+        "description": "Request to try a candidate configuration without saving it.",
+        "properties": {
+          "content": {
+            "title": "Content",
+            "type": "string"
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "title": "TestSiteConfigRequest",
         "type": "object"
       },
       "TokenInfo": {
@@ -6683,7 +6949,7 @@
         ]
       },
       "post": {
-        "description": "Queue the deployment of a new application.\n\nArgs:\n    body: The deployment request.\n    session: The authenticated session.\n\nReturns:\n    The queued job.\n\nRaises:\n    HTTPException: 409 when the domain is already deployed, 503 when no\n        port is free.\n    PortError: When the requested port is not usable.\n    DomainError: When the domain is not acceptable.",
+        "description": "Queue the deployment of a new application.\n\nArgs:\n    body: The deployment request.\n    session: The authenticated session.\n\nReturns:\n    The queued job.\n\nRaises:\n    HTTPException: 409 when the domain is already deployed, 503 when no\n        port is free.\n    PortError: When the requested port is not usable.\n    DomainError: When the domain is not acceptable.\n    ValidationError: A resource limit is out of range (400, with the\n        range) - the same check ``PATCH .../limits`` runs, so a limit\n        given at creation cannot be more permissive than one set later.",
         "operationId": "create_app_api_apps_post",
         "requestBody": {
           "content": {
@@ -6725,7 +6991,7 @@
     },
     "/api/apps/inspect": {
       "post": {
-        "description": "Preview what a repository is before deploying it.\n\nFetches the source into a throwaway checkout, detects the application\ntype, and reports the commands, port and environment variables a\ndeployment would use, so the new-app wizard has something real to show\ninstead of a guess. Nothing is written outside the checkout, which is\nremoved before this returns, and no application, domain or unit is\ncreated.\n\nArgs:\n    body: The source to inspect and the branch to check out.\n    session: The authenticated session.\n\nReturns:\n    The inspection result.\n\nRaises:\n    SourceError: The source is invalid, or fetching it failed.\n    DeploymentError: The checkout matches no registered application type.",
+        "description": "Preview what a repository is before deploying it.\n\nFetches the source into a throwaway checkout, detects the application\ntype, and reports the commands, port and environment variables a\ndeployment would use, so the new-app wizard has something real to show\ninstead of a guess. Nothing is written outside the checkout, which is\nremoved before this returns, and no application, domain or unit is\ncreated.\n\nArgs:\n    body: The source to inspect and the branch to check out.\n    session: The authenticated session.\n\nReturns:\n    The inspection result.\n\nRaises:\n    SourceError: The source is invalid, or fetching it failed. Answered\n        as 400: the operator gave a source WASM cannot reach, not a\n        server fault.\n    ValidationError: The checkout matches no registered application\n        type. ``inspect_source`` raises ``DeploymentError`` for this -\n        right for the CLI, where it means the whole operation failed -\n        but here it is the wizard's input that could not be classified,\n        so it is translated to the API's validation-error contract\n        (400 with details) instead of the 500 an unqualified\n        ``DeploymentError`` would answer.",
         "operationId": "inspect_app_source_api_apps_inspect_post",
         "requestBody": {
           "content": {
@@ -6760,6 +7026,28 @@
           }
         },
         "summary": "Inspect App Source",
+        "tags": [
+          "Applications"
+        ]
+      }
+    },
+    "/api/apps/types": {
+      "get": {
+        "description": "List the application types WASM can deploy.\n\n:func:`~wasm.deployers.registry.available_types` is the one source of\ntruth - the CLI's ``--type`` choices come from it too - so a deployer\nregistered with :meth:`~wasm.deployers.registry.DeployerRegistry.register`\nreaches the wizard the moment it exists, instead of needing a second,\nhand-kept copy of the list in the console.\n\nArgs:\n    session: The authenticated session.\n\nReturns:\n    Every registered type, most specific first, ``auto`` last.",
+        "operationId": "list_app_types_api_apps_types_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppTypesResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List App Types",
         "tags": [
           "Applications"
         ]
@@ -7971,6 +8259,28 @@
         ]
       }
     },
+    "/api/auth/2fa/backup-codes": {
+      "post": {
+        "description": "Replace the backup codes with a fresh set, shown exactly once.\n\nEvery code issued before this call stops working: a set an operator can\nno longer account for - lost, or shown on a screen they no longer trust -\nis worthless as a recovery path if the old ones stay live alongside it.\n\nArgs:\n    request: The incoming request.\n    session: The authenticated session, elevated (D5): a cookie session\n        must have called ``POST /api/auth/elevate`` recently.\n\nReturns:\n    The new backup codes, in clear.\n\nRaises:\n    HTTPException: 403 with ``error: \"elevation_required\"`` per\n        :func:`wasm.web.api.deps.require_elevated`.\n    SecurityError: 400 when two-factor authentication is not enabled.",
+        "operationId": "regenerate_backup_codes_api_auth_2fa_backup_codes_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TwoFactorConfirmed"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Regenerate Backup Codes",
+        "tags": [
+          "Authentication"
+        ]
+      }
+    },
     "/api/auth/2fa/confirm": {
       "post": {
         "description": "Verify a code from the authenticator and activate the second factor.\n\nArgs:\n    request: The incoming request.\n    body: The code the app shows for the pending secret.\n    session: The authenticated session.\n\nReturns:\n    The backup codes, in clear, exactly once.\n\nRaises:\n    HTTPException: 400 when the code does not verify. Not counted by the\n        lockout: the pending secret is on the operator's own screen, so a\n        wrong code here proves a typo, not a guess at a credential.",
@@ -8954,7 +9264,7 @@
     },
     "/api/certs/{domain}": {
       "delete": {
-        "description": "Delete a certificate without revoking it.\n\nArgs:\n    domain: Certificate name.\n    session: The authenticated session.\n\nReturns:\n    The action outcome.\n\nRaises:\n    CertificateError: When certbot refuses the deletion.",
+        "description": "Delete a certificate without revoking it.\n\nDeleting removes the certificate files for good, so a cookie session must\nhave confirmed it's them recently (D5), the same rule\n``POST /{domain}/revoke`` applies. See\n:func:`~wasm.web.api.deps.require_elevated`.\n\nArgs:\n    domain: Certificate name.\n    session: The authenticated session.\n\nReturns:\n    The action outcome.\n\nRaises:\n    CertificateError: When certbot refuses the deletion.\n    HTTPException: 403 with ``error: \"elevation_required\"`` per\n        :func:`~wasm.web.api.deps.require_elevated`.",
         "operationId": "delete_certificate_api_certs__domain__delete",
         "parameters": [
           {
@@ -9156,7 +9466,7 @@
     },
     "/api/certs/{domain}/revoke": {
       "post": {
-        "description": "Revoke a certificate and delete its files.\n\nArgs:\n    domain: Certificate name.\n    session: The authenticated session.\n\nReturns:\n    The action outcome.\n\nRaises:\n    CertificateError: When certbot refuses the revocation.",
+        "description": "Revoke a certificate and delete its files.\n\nRevoking takes the certificate down at the CA and cannot be undone, so a\ncookie session must have confirmed it's them recently (D5); a Bearer\ncredential is exempt, as issuing it already required that confirmation\nonce. See :func:`~wasm.web.api.deps.require_elevated`.\n\nArgs:\n    domain: Certificate name.\n    session: The authenticated session.\n\nReturns:\n    The action outcome.\n\nRaises:\n    CertificateError: When certbot refuses the revocation.\n    HTTPException: 403 with ``error: \"elevation_required\"`` per\n        :func:`~wasm.web.api.deps.require_elevated`.",
         "operationId": "revoke_certificate_api_certs__domain__revoke_post",
         "parameters": [
           {
@@ -11315,6 +11625,51 @@
         ]
       }
     },
+    "/api/domains/dns": {
+      "get": {
+        "description": "Check whether a domain resolves to this server, before it is any application's.\n\nThe same check :func:`get_domain_dns` runs for a domain already added to\nan application, through the same :func:`wasm.deployers.domains.check_dns`\n- the new-app wizard needs an answer before anything is created, and there\nis no application yet to hang the path off.\n\nArgs:\n    session: Authenticated session, injected.\n    name: The domain to resolve.\n\nReturns:\n    What it resolves to, compared with this server's addresses.",
+        "operationId": "get_bare_dns_api_domains_dns_get",
+        "parameters": [
+          {
+            "description": "The domain to resolve",
+            "in": "query",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "description": "The domain to resolve",
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DnsCheckResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Bare Dns",
+        "tags": [
+          "Domains"
+        ]
+      }
+    },
     "/api/jobs": {
       "get": {
         "description": "List recent jobs, from the store, so a panel restart does not erase history.\n\nArgs:\n    limit: Maximum number of jobs to return.\n    status: Status to filter by.\n    domain: Domain to filter by.\n    session: The authenticated session.\n\nReturns:\n    The jobs, newest first.\n\nRaises:\n    ValidationError: When the status filter is not a known status.",
@@ -11556,7 +11911,7 @@
     },
     "/api/jobs/delete": {
       "post": {
-        "description": "Queue a deletion.\n\nArgs:\n    request: The deletion request.\n    session: The authenticated session.\n\nReturns:\n    The queued job.",
+        "description": "Queue a deletion.\n\nRuns the same :func:`~wasm.web.jobs.delete_app_job` that\n``DELETE /api/apps/{domain}`` queues, so it is guarded the same way: a\ncookie session must have confirmed recently (see\n:func:`~wasm.web.api.deps.require_elevated`), the same as any other\nirreversible action. A stale client still calling this route instead of\nthe app-level one gets no less protection for it.\n\nArgs:\n    request: The deletion request.\n    session: The authenticated, elevated session.\n\nReturns:\n    The queued job.",
         "operationId": "create_delete_job_api_jobs_delete_post",
         "requestBody": {
           "content": {
@@ -11853,7 +12208,7 @@
     },
     "/api/metrics/{metric}": {
       "get": {
-        "description": "Read one metric over a named window, oldest point first.\n\nArgs:\n    metric: Metric name, e.g. ``cpu.percent`` or\n        ``app.example.com.mem.bytes``.\n    session: Authenticated session, injected.\n    window: Which window to read. Anything outside the fixed vocabulary\n        is refused by validation before this runs.\n\nReturns:\n    The metric, the window, and ``[ts, value]`` pairs. A metric nothing\n    has recorded returns an empty list rather than a 404: \"no data yet\"\n    is a normal chart state, not a missing resource.",
+        "description": "Read one metric over a named window, oldest point first.\n\nArgs:\n    metric: Metric name, e.g. ``cpu.percent`` or\n        ``app.example.com.mem.bytes``.\n    session: Authenticated session, injected.\n    window: Which window to read. Anything outside the fixed vocabulary\n        is refused by validation before this runs.\n\nReturns:\n    The metric, the window, the resolution the points are spaced at, and\n    ``[ts, value]`` pairs. A metric nothing has recorded returns an empty\n    list rather than a 404: \"no data yet\" is a normal chart state, not a\n    missing resource.",
         "operationId": "metric_history_api_metrics__metric__get",
         "parameters": [
           {
@@ -11874,6 +12229,7 @@
               "enum": [
                 "1h",
                 "24h",
+                "7d",
                 "30d"
               ],
               "title": "Window",
@@ -12926,7 +13282,7 @@
     },
     "/api/sites": {
       "get": {
-        "description": "List every configured site.\n\nArgs:\n    session: The authenticated session.\n\nReturns:\n    The sites known to the store, falling back to what the manager finds on\n    disk when the store has no record of them.",
+        "description": "List every configured site.\n\nArgs:\n    session: The authenticated session.\n\nReturns:\n    The sites known to the store, falling back to what the manager finds on\n    disk when the store has no record of them. Every entry carries the\n    server names its own configuration answers on.",
         "operationId": "list_sites_api_sites_get",
         "responses": {
           "200": {
@@ -12988,7 +13344,7 @@
     },
     "/api/sites/reload": {
       "post": {
-        "description": "Test and reload the web server configuration.\n\nRegistered before ``/{domain}`` so the literal path wins: FastAPI matches\nroutes in registration order, and a parametrised route declared first would\nswallow this one.\n\nArgs:\n    session: The authenticated session.\n\nReturns:\n    The reload outcome.\n\nRaises:\n    HTTPException: 400 when the configuration does not pass its own test,\n        500 when the reload itself fails.",
+        "description": "Test and reload the web server configuration.\n\nRegistered before ``/{domain}`` so the literal path wins: FastAPI matches\nroutes in registration order, and a parametrised route declared first would\nswallow this one.\n\nArgs:\n    session: The authenticated session.\n\nReturns:\n    The reload outcome.\n\nRaises:\n    ValidationError: When the configuration does not pass its own test;\n        ``details`` and ``output`` both carry the web server's own output\n        verbatim, and the running configuration is kept.\n    HTTPException: 500 when the reload itself fails.",
         "operationId": "reload_webserver_api_sites_reload_post",
         "responses": {
           "200": {
@@ -13003,6 +13359,28 @@
           }
         },
         "summary": "Reload Webserver",
+        "tags": [
+          "Sites"
+        ]
+      }
+    },
+    "/api/sites/templates": {
+      "get": {
+        "description": "List the site templates available for the detected web server.\n\nRegistered before ``/{domain}`` so the literal path wins, the same reason\n``/reload`` is declared here rather than after it: the templates\ndirectory :meth:`~wasm.managers.webserver.WebServerManager.list_templates`\nreads is the one source of truth this shares with ``POST /api/sites``,\nwhich refuses a template not on this list.\n\nArgs:\n    session: The authenticated session.\n\nReturns:\n    The template names and the web server they belong to.",
+        "operationId": "list_site_templates_api_sites_templates_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SiteTemplatesResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Site Templates",
         "tags": [
           "Sites"
         ]
@@ -13135,7 +13513,7 @@
         ]
       },
       "put": {
-        "description": "Replace the raw configuration of a site.\n\nThe path comes from the manager, so a hand-edited configuration can only\never overwrite the file that domain already owns. The manager validates\nthe text against the web server itself before persisting it: a broken\nconfiguration used to be written unchecked and took the site down at the\nnext reload.\n\nArgs:\n    domain: Domain of the site.\n    data: The new configuration.\n    session: The authenticated session.\n\nReturns:\n    The action outcome.\n\nRaises:\n    HTTPException: 404 when no such site exists.\n    ValidationError: When the web server rejects the configuration; the\n        error carries the server's own output verbatim and the file on\n        disk is left as it was.\n    SiteError: When the file cannot be staged or written.\n    DomainError: When the domain is not acceptable.",
+        "description": "Replace the raw configuration of a site.\n\nThe path comes from the manager, so a hand-edited configuration can only\never overwrite the file that domain already owns. The manager validates\nthe text against the web server itself before persisting it: a broken\nconfiguration used to be written unchecked and took the site down at the\nnext reload.\n\nArgs:\n    domain: Domain of the site.\n    data: The new configuration.\n    session: The authenticated session.\n\nReturns:\n    The action outcome.\n\nRaises:\n    HTTPException: 404 when no such site exists.\n    ValidationError: When the web server rejects the configuration; its\n        output travels verbatim in both ``hint`` and the dedicated\n        ``output`` field of the error body, and the file on disk is left\n        as it was. ``POST /{domain}/config/test`` answers the same\n        question beforehand, without this side effect.\n    SiteError: When the file cannot be staged or written.\n    DomainError: When the domain is not acceptable.",
         "operationId": "update_site_config_api_sites__domain__config_put",
         "parameters": [
           {
@@ -13181,6 +13559,59 @@
           }
         },
         "summary": "Update Site Config",
+        "tags": [
+          "Sites"
+        ]
+      }
+    },
+    "/api/sites/{domain}/config/test": {
+      "post": {
+        "description": "Try a candidate configuration against the web server, without saving it.\n\nReuses :meth:`~wasm.managers.webserver.WebServerManager.test_config_text`,\nthe exact staging and syntax check ``PUT /{domain}/config`` validates\nthrough before it writes anything - one implementation, so the answer\nthis gives is the answer saving would get. The site named in the path\nneed not exist yet: this only asks the web server about the text, it\nnever reads or touches the file on disk.\n\nArgs:\n    domain: Domain the configuration is meant for.\n    data: The candidate configuration.\n    session: The authenticated session.\n\nReturns:\n    Whether the web server would accept it, and its own output verbatim.\n\nRaises:\n    DomainError: When the domain is not acceptable.\n    NginxError: When the nginx snippet cannot be staged.\n    ApacheError: When the apache snippet cannot be staged.",
+        "operationId": "test_site_config_api_sites__domain__config_test_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "domain",
+            "required": true,
+            "schema": {
+              "title": "Domain",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TestSiteConfigRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SiteConfigTestResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Test Site Config",
         "tags": [
           "Sites"
         ]

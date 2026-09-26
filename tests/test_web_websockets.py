@@ -11,7 +11,10 @@ way a cross-site WebSocket hijack would.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from pathlib import Path
+from typing import Any
 
 import pytest
 from starlette.websockets import WebSocketDisconnect
@@ -271,6 +274,52 @@ def test_master_token_subprotocol_is_accepted(sandbox: Path, path: str) -> None:
 
     with client.websocket_connect(path, subprotocols=token_subprotocols(token)) as ws:
         assert ws.receive_json()["type"] == "connected"
+
+
+def test_malformed_json_over_the_jobs_socket_closes_cleanly(sandbox: Path) -> None:
+    """
+    A bad frame ends the connection instead of raising out of the handler.
+
+    ``handle_messages`` used to catch every ``Exception`` here, which hid a
+    real bug in the same net that catches a JSON decode error. Narrowed to
+    ``(RuntimeError, json.JSONDecodeError)``, the observable behaviour - the
+    connection ends - must stay exactly what it was.
+    """
+    client = build_client(sandbox)
+    token = get_token_manager().generate_master_token()
+
+    with client.websocket_connect("/ws/jobs", subprotocols=token_subprotocols(token)) as ws:
+        assert ws.receive_json()["type"] == "connected"
+        ws.send_text("not json")
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_json()
+
+
+def test_a_missing_journalctl_on_the_events_stream_is_reported_and_logged(
+    sandbox: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    ``/ws/events`` spawns journalctl with no ``shutil.which`` guard, unlike
+    ``/ws/logs``. A missing binary must still reach the client as an error
+    frame and the server's own log, not vanish into a bare ``except Exception:
+    pass`` the way it used to.
+    """
+
+    async def _missing(*_args: Any, **_kwargs: Any) -> None:
+        raise FileNotFoundError("journalctl")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _missing)
+    client = build_client(sandbox)
+    token = get_token_manager().generate_master_token()
+
+    with caplog.at_level(logging.WARNING):
+        with client.websocket_connect("/ws/events", subprotocols=token_subprotocols(token)) as ws:
+            assert ws.receive_json()["type"] == "connected"
+            error = ws.receive_json()
+
+    assert error["type"] == "error"
+    assert "journalctl" in error["message"].lower()
+    assert any("Event stream failed" in record.message for record in caplog.records)
 
 
 def test_a_read_token_cannot_cancel_a_job_over_the_socket(sandbox: Path) -> None:

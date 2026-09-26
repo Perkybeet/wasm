@@ -13,9 +13,19 @@ class WASMError(Exception):
     All custom exceptions should inherit from this class.
     """
 
-    def __init__(self, message: str, details: str = ""):
+    def __init__(self, message: str, details: str = "", *, output: str | None = None):
+        """
+        Args:
+            message: The bare, human-readable sentence describing the failure.
+            details: How to fix it, or further context - shown as a hint.
+            output: The failing tool's own output, verbatim, when the caller
+                wants it carried as a field of its own rather than folded into
+                ``details``. None for an error that has no external tool
+                output to show, which is most of them.
+        """
         self.message = message
         self.details = details
+        self.output = output
         super().__init__(self.message)
 
     def __str__(self) -> str:

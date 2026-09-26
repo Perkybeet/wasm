@@ -189,6 +189,9 @@ class DeploymentRecorder:
         logger: Logger,
         fs: FileSystem | None = None,
         git_info: GitInfo | None = None,
+        commit_message: Callable[[], str | None] | None = None,
+        release_id: Callable[[], str | None] | None = None,
+        job_id: str | None = None,
         log_root: Path | None = None,
         keep: int = DEFAULT_KEEP,
     ) -> None:
@@ -207,6 +210,15 @@ class DeploymentRecorder:
             git_info: Optional callable answering the commit and branch of the
                 deployed tree, asked once when the recording finishes, because
                 the checkout only exists after the fetch step has run.
+            commit_message: Optional callable answering the subject line of
+                the deployed commit, asked at the same time as ``git_info``
+                and for the same reason. None for a source that is not git.
+            release_id: Optional callable answering the release this
+                deployment built, asked once when the recording finishes,
+                because the release is only staged once the fetch step has
+                run. None for an in-place deployment.
+            job_id: The background job that started this deployment, when one
+                did. Known upfront, unlike the release and the commit.
             log_root: Where the logs live. Defaults to ``deploy-logs`` next to
                 the store's database file, so the logs land in ``/var/lib/wasm``
                 on a system install and inside ``tmp_path`` in a test, without
@@ -219,6 +231,9 @@ class DeploymentRecorder:
         self._logger = logger
         self._fs = fs if fs is not None else get_fs()
         self._git_info = git_info
+        self._commit_message_reader = commit_message
+        self._release_id_reader = release_id
+        self._job_id = job_id
         self._log_root = log_root if log_root is not None else store.db_path.parent / "deploy-logs"
         self._keep = keep
         self._deployment_id: int | None = None
@@ -246,7 +261,7 @@ class DeploymentRecorder:
 
         try:
             deployment_id = self._store.record_deployment_start(
-                self._domain, self._trigger, git_branch=git_branch
+                self._domain, self._trigger, git_branch=git_branch, job_id=self._job_id
             )
             self._deployment_id = deployment_id
             self._open_log(deployment_id)
@@ -383,9 +398,15 @@ class DeploymentRecorder:
         self._finished = True
         try:
             git_commit, git_branch = self._collect_git_info()
-            if git_commit or git_branch:
+            commit_message = self._collect_commit_message()
+            release_id = self._collect_release_id()
+            if git_commit or git_branch or commit_message or release_id:
                 self._store.annotate_deployment(
-                    self._deployment_id, git_commit=git_commit, git_branch=git_branch
+                    self._deployment_id,
+                    git_commit=git_commit,
+                    git_branch=git_branch,
+                    commit_message=commit_message,
+                    release_id=release_id,
                 )
             self._store.finish_deployment(self._deployment_id, status, error=error)
             self._rotate()
@@ -408,6 +429,41 @@ class DeploymentRecorder:
         except (WASMError, OSError) as exc:
             self._logger.debug(f"Could not read git information: {exc}")
             return None, None
+
+    def _collect_commit_message(self) -> str | None:
+        """
+        Ask the caller-provided reader for the subject of the deployed commit.
+
+        Returns:
+            The subject line, or None when there is no reader, the source is
+            not git, or the reader fails - which is reported at debug level
+            and treated as unknown, the same as a git_info failure.
+        """
+        if self._commit_message_reader is None:
+            return None
+        try:
+            return self._commit_message_reader()
+        except (WASMError, OSError) as exc:
+            self._logger.debug(f"Could not read the commit subject: {exc}")
+            return None
+
+    def _collect_release_id(self) -> str | None:
+        """
+        Ask the caller-provided reader for the release this deployment built.
+
+        Returns:
+            The release id, or None when there is no reader, the application
+            is not on the releases layout, or the reader fails - reported at
+            debug level and treated as unknown, never as a reason to fail the
+            deployment that already ran.
+        """
+        if self._release_id_reader is None:
+            return None
+        try:
+            return self._release_id_reader()
+        except (WASMError, OSError) as exc:
+            self._logger.debug(f"Could not read the release id: {exc}")
+            return None
 
     def _rotate(self) -> None:
         """Prune rows beyond ``keep`` and delete the log files they leave behind."""
@@ -490,6 +546,10 @@ class Recordable(Protocol):
     def fs(self) -> FileSystem:
         """The filesystem the deployment changes the machine through."""
 
+    @property
+    def job_id(self) -> str | None:
+        """The background job that started this deployment, or None."""
+
 
 def checkout_git_info(source_manager: object, path: Path) -> GitInfo:
     """
@@ -517,7 +577,13 @@ def checkout_git_info(source_manager: object, path: Path) -> GitInfo:
     return read
 
 
-def recorder_for(deployer: Recordable, *, git_info: GitInfo | None = None) -> DeploymentRecorder:
+def recorder_for(
+    deployer: Recordable,
+    *,
+    git_info: GitInfo | None = None,
+    commit_message: Callable[[], str | None] | None = None,
+    release_id: Callable[[], str | None] | None = None,
+) -> DeploymentRecorder:
     """
     Build the recorder for one deploy or update of a deployer.
 
@@ -528,9 +594,13 @@ def recorder_for(deployer: Recordable, *, git_info: GitInfo | None = None) -> De
     Args:
         deployer: The deployer being recorded.
         git_info: Answers the commit and branch that were deployed.
+        commit_message: Answers the subject of the deployed commit.
+        release_id: Answers the release this deployment built, on the
+            releases layout.
 
     Returns:
-        A recorder wired to the deployer's store, logger and filesystem.
+        A recorder wired to the deployer's store, logger, filesystem and the
+        job that started it, if any.
     """
     return DeploymentRecorder(
         deployer.store,
@@ -539,6 +609,9 @@ def recorder_for(deployer: Recordable, *, git_info: GitInfo | None = None) -> De
         logger=deployer.logger,
         fs=deployer.fs,
         git_info=git_info,
+        commit_message=commit_message,
+        release_id=release_id,
+        job_id=deployer.job_id,
     )
 
 

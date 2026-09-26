@@ -63,7 +63,7 @@ _CRON_MODE = 0o644
 
 #: Fields of :class:`CertificateInfo` that hold text, used to type the mapping
 #: accessor the CLI and the health check still read certificates through.
-_TextField = Literal["name", "expiry", "expiry_full", "cert_path", "key_path"]
+_TextField = Literal["name", "expiry", "expiry_full", "cert_path", "key_path", "issuer"]
 
 #: Validity of a certificate WASM mints for itself. Long on purpose: it is
 #: self-signed, so an early expiry adds no security and only breaks a restart
@@ -118,6 +118,9 @@ class CertificateInfo(MappingRecord):
         expiry_full: The raw expiry line, including certbot's validity note.
         cert_path: Path to the certificate file.
         key_path: Path to the private key.
+        issuer: The certificate authority that signed it, read from the
+            certificate file itself - certbot's own listing never prints
+            this. None when it could not be read.
     """
 
     name: str = ""
@@ -126,6 +129,7 @@ class CertificateInfo(MappingRecord):
     expiry_full: str = ""
     cert_path: str = ""
     key_path: str = ""
+    issuer: str | None = None
 
     # The overloads exist so that a reader still using the mapping form keeps a
     # real static type instead of Any. Reading ``cert.expiry`` is the intended
@@ -344,7 +348,45 @@ class CertManager(BaseManager):
                 f"{(result.stderr or result.stdout).strip()}"
             )
             return None
-        return self._parse_certificates(result.stdout)
+        certificates = self._parse_certificates(result.stdout)
+        for certificate in certificates:
+            certificate.issuer = self._read_issuer(certificate.cert_path)
+        return certificates
+
+    def _read_issuer(self, cert_path: str) -> str | None:
+        """
+        Read a certificate's issuer straight from the file, through openssl.
+
+        certbot's own listing never prints the issuer, and asking the ACME
+        account for it would be a network round trip for something already
+        sitting on disk in the certificate itself - openssl reading the file
+        it is pointed at is the cheapest correct way to answer this.
+
+        Args:
+            cert_path: Path of the certificate (fullchain) file.
+
+        Returns:
+            The issuer's distinguished name, or None when there is no path to
+            read, the file is missing, or openssl cannot parse it. A
+            certificate record with no issuer is still useful, so a read
+            failure here is logged and does not fail the caller.
+        """
+        if not cert_path:
+            return None
+        result = self._exec(["openssl", "x509", "-noout", "-issuer", "-in", cert_path])
+        if not result.success:
+            self.logger.debug(
+                f"Could not read the issuer of {cert_path}: "
+                f"{(result.stderr or result.stdout).strip()}"
+            )
+            return None
+        # openssl prints "issuer=C = US, O = Let's Encrypt, CN = R11", give or
+        # take the exact fields; everything after the first '=' is what an
+        # operator wants to see.
+        output = result.stdout.strip()
+        if output.lower().startswith("issuer="):
+            return output.split("=", 1)[1].strip() or None
+        return output or None
 
     @staticmethod
     def _parse_certificates(output: str) -> list[CertificateInfo]:

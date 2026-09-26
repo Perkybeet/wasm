@@ -171,6 +171,45 @@ def test_a_failed_query_is_hidden_from_the_read_only_callers(
     assert certs._query_certificates() is None
 
 
+def test_list_certificates_reads_the_issuer_from_the_file(
+    certs: CertManager, runner: FakeRunner
+) -> None:
+    """The issuer comes from the certificate itself, through openssl."""
+    runner.script(["certbot", "certificates"], stdout=CERTBOT_OUTPUT)
+    runner.script(
+        ["openssl", "x509", "-noout", "-issuer", "-in"],
+        stdout="issuer=C = US, O = Let's Encrypt, CN = R11\n",
+    )
+
+    (certificate,) = certs.list_certificates()
+
+    assert certificate.issuer == "C = US, O = Let's Encrypt, CN = R11"
+    assert (
+        "openssl",
+        "x509",
+        "-noout",
+        "-issuer",
+        "-in",
+        "/etc/letsencrypt/live/shop.tld/fullchain.pem",
+    ) in runner.calls
+
+
+def test_list_certificates_tolerates_openssl_failing_to_read_the_issuer(
+    certs: CertManager, runner: FakeRunner
+) -> None:
+    """A record is still useful without an issuer; the read failure is not fatal."""
+    runner.script(["certbot", "certificates"], stdout=CERTBOT_OUTPUT)
+    runner.script(
+        ["openssl", "x509", "-noout", "-issuer", "-in"],
+        stderr="unable to load certificate",
+        exit_code=1,
+    )
+
+    (certificate,) = certs.list_certificates()
+
+    assert certificate.issuer is None
+
+
 def test_a_certificate_that_covers_the_request_is_left_alone(
     certs: CertManager, runner: FakeRunner
 ) -> None:

@@ -367,6 +367,7 @@ class TestRouteOrdering:
         [
             (backups_api, "/storage", "/{backup_id}"),
             (sites_api, "/reload", "/{domain}"),
+            (sites_api, "/templates", "/{domain}"),
             (jobs_api, "/jobs/active", "/jobs/{job_id}"),
             (jobs_api, "/jobs/cleanup", "/jobs/{job_id}"),
             (databases_api, "/users/grant", "/users/{engine}"),
@@ -484,6 +485,154 @@ class TestSiteConfigValidation:
         assert response.status_code == 200, response.text
         assert sandbox_nginx().get_site_config(domain) == new_config
         assert any(call[:3] == ("nginx", "-t", "-c") for call in runner.calls), runner.calls
+
+    def test_the_failure_also_carries_the_output_in_its_own_field(
+        self, sites_client: TestClient, runner: Any
+    ) -> None:
+        """The output is not only folded into the hint any more."""
+        domain = self._created(sites_client)
+        stderr = 'nginx: [emerg] unexpected end of file, expecting "}"\n'
+        runner.script(["nginx", "-t", "-c"], stderr=stderr, exit_code=1)
+
+        response = sites_client.put(f"/api/sites/{domain}/config", json={"config": "server {"})
+
+        assert response.status_code == 400, response.text
+        assert response.json()["output"] == stderr
+
+
+class TestSiteConfigTest:
+    """POST /{domain}/config/test tries a config without saving it."""
+
+    @pytest.fixture(autouse=True)
+    def staging_tmp(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """Keep the test endpoint's staging files inside the test's own directory."""
+        staging = tmp_path / "validation-tmp"
+        staging.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(staging))
+        return staging
+
+    def test_a_valid_candidate_is_reported_ok_with_the_servers_output(
+        self, sites_client: TestClient, runner: Any
+    ) -> None:
+        stdout = "nginx: the configuration file /tmp/x.conf syntax is ok\n"
+        runner.script(["nginx", "-t", "-c"], stdout=stdout)
+
+        response = sites_client.post(
+            "/api/sites/panel.example.com/config/test", json={"content": "server {}\n"}
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body == {"ok": True, "output": stdout}
+
+    def test_an_invalid_candidate_is_reported_not_ok_without_raising(
+        self, sites_client: TestClient, runner: Any
+    ) -> None:
+        stderr = 'nginx: [emerg] unexpected end of file, expecting "}"\n'
+        runner.script(["nginx", "-t", "-c"], stderr=stderr, exit_code=1)
+
+        response = sites_client.post(
+            "/api/sites/panel.example.com/config/test", json={"content": "server {"}
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"ok": False, "output": stderr}
+
+    def test_testing_does_not_require_the_site_to_exist(
+        self, sites_client: TestClient, site_dirs: tuple[Path, Path]
+    ) -> None:
+        """Nothing is written and no 404 is raised for a domain with no site yet."""
+        available, _ = site_dirs
+
+        response = sites_client.post(
+            "/api/sites/never-created.example.com/config/test", json={"content": "server {}\n"}
+        )
+
+        assert response.status_code == 200, response.text
+        assert list(available.iterdir()) == []
+
+    def test_testing_never_overwrites_the_real_site(
+        self, sites_client: TestClient, sandbox_nginx: Any
+    ) -> None:
+        response = sites_client.post("/api/sites", json={"domain": "panel.example.com"})
+        assert response.status_code == 200, response.text
+        before = sandbox_nginx().get_site_config("panel.example.com")
+
+        test_response = sites_client.post(
+            "/api/sites/panel.example.com/config/test",
+            json={"content": "server { listen 9999; }\n"},
+        )
+
+        assert test_response.status_code == 200, test_response.text
+        assert sandbox_nginx().get_site_config("panel.example.com") == before
+
+
+class TestSiteTemplates:
+    """GET /api/sites/templates names the one source of truth for templates."""
+
+    def test_lists_the_backends_own_templates(self, sites_client: TestClient) -> None:
+        from wasm.managers.nginx_manager import NginxManager
+        from wasm.managers.webserver import NGINX_BACKEND
+
+        expected = NginxManager(backend=NGINX_BACKEND).list_templates()
+
+        response = sites_client.get("/api/sites/templates")
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["webserver"] == "nginx"
+        assert body["templates"] == expected
+        assert body["templates"], "the backend ships at least one template"
+
+
+class TestSiteListServerNames:
+    """Every site the API reports names what it actually serves."""
+
+    def test_list_entries_carry_the_server_names(
+        self, sites_client: TestClient, sandbox_nginx: Any
+    ) -> None:
+        response = sites_client.post(
+            "/api/sites",
+            json={"domain": "panel.example.com", "enable": False},
+        )
+        assert response.status_code == 200, response.text
+
+        listing = sites_client.get("/api/sites")
+
+        assert listing.status_code == 200, listing.text
+        (entry,) = [s for s in listing.json()["sites"] if s["name"] == "panel.example.com"]
+        assert entry["server_names"] == ["panel.example.com"]
+
+    def test_get_one_site_also_carries_the_server_names(
+        self, sites_client: TestClient, sandbox_nginx: Any
+    ) -> None:
+        response = sites_client.post(
+            "/api/sites",
+            json={"domain": "panel.example.com", "enable": False},
+        )
+        assert response.status_code == 200, response.text
+
+        detail = sites_client.get("/api/sites/panel.example.com")
+
+        assert detail.status_code == 200, detail.text
+        assert detail.json()["server_names"] == ["panel.example.com"]
+
+
+class TestReloadFailureIsVerbatim:
+    """A failed reload must show the web server's own words, not a paraphrase."""
+
+    def test_reload_failure_carries_the_servers_output(
+        self, sites_client: TestClient, runner: Any
+    ) -> None:
+        stderr = "nginx: configuration file /etc/nginx/nginx.conf test failed\n"
+        runner.script(["nginx", "-t"], stderr=stderr, exit_code=1)
+
+        response = sites_client.post("/api/sites/reload")
+
+        assert response.status_code == 400, response.text
+        body = response.json()
+        assert body["output"] == stderr
+        assert stderr.strip() in (body["hint"] or "")
 
 
 class TestTraversal:

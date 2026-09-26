@@ -76,6 +76,7 @@ class DeployerRegistry:
                 "name": d.DISPLAY_NAME,
                 "detection_files": d.DETECTION_FILES,
                 "priority": d.DETECTION_PRIORITY,
+                "default_port": d.DEFAULT_PORT,
             }
             for d in cls.in_detection_order()
         ]
@@ -159,7 +160,7 @@ def detect_app_type(path: Path, verbose: bool = False) -> str | None:
     return DeployerRegistry.detect(path, verbose=verbose)
 
 
-def available_types() -> list[dict[str, str]]:
+def available_types() -> list[dict[str, Any]]:
     """
     List the application types anything in the product may offer.
 
@@ -169,18 +170,23 @@ def available_types() -> list[dict[str, str]]:
     is how a deployer could be added and reach neither front door.
 
     Returns:
-        One mapping per type, with ``type`` and ``name``, ordered with the
-        detectors first and ``auto`` last: picking a specific type is the
-        deliberate choice, and offering "let WASM decide" at the top invites
-        the operator to skip a decision they usually know the answer to.
+        One mapping per type, with ``type``, ``name`` and ``default_port``,
+        ordered with the detectors first and ``auto`` last: picking a
+        specific type is the deliberate choice, and offering "let WASM
+        decide" at the top invites the operator to skip a decision they
+        usually know the answer to.
     """
     _import_deployers()
 
     types = [
-        {"type": str(entry["type"]), "name": str(entry["name"])}
+        {
+            "type": str(entry["type"]),
+            "name": str(entry["name"]),
+            "default_port": int(entry["default_port"]),
+        }
         for entry in DeployerRegistry.list_deployers()
     ]
-    return sorted(types, key=lambda entry: (entry["type"] == "auto", entry["name"].lower()))
+    return sorted(types, key=lambda entry: (entry["type"] == "auto", str(entry["name"]).lower()))
 
 
 def _import_deployers() -> None:

@@ -95,8 +95,29 @@ def test_a_metric_window_comes_back_as_timestamped_points(
     assert response.json() == {
         "metric": "cpu.percent",
         "window": "1h",
+        "resolution": "raw",
         "points": [[NOW - 20, 10.0], [NOW - 10, 30.0]],
     }
+
+
+def test_a_week_is_read_from_the_same_hourly_tier_as_a_month(
+    client: TestClient, store: MetricsStore
+) -> None:
+    """
+    window=7d is not a fourth tier: it is the 30d hour tier, cut off sooner.
+
+    There is no separate storage or aggregation for it - :meth:`MetricsStore.query`
+    already answers any window width from the three tiers it keeps, so asking
+    for 7 days just narrows the cutoff on the same hour means 30d reads.
+    """
+    store.record("cpu.percent", 42.0, ts=NOW - 5 * 86_400)
+
+    response = client.get("/api/metrics/cpu.percent?window=7d")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["window"] == "7d"
+    assert body["resolution"] == "hour"
 
 
 def test_the_window_defaults_to_an_hour(client: TestClient, store: MetricsStore) -> None:
@@ -109,7 +130,7 @@ def test_the_window_defaults_to_an_hour(client: TestClient, store: MetricsStore)
     assert response.json()["window"] == "1h"
 
 
-@pytest.mark.parametrize("window", ["7d", "2h", "60", "", "1h; DROP TABLE samples"])
+@pytest.mark.parametrize("window", ["2h", "60", "", "1h; DROP TABLE samples"])
 def test_a_window_outside_the_vocabulary_is_refused(client: TestClient, window: str) -> None:
     """
     The retention tiers are fixed, so the windows are too.
@@ -127,7 +148,23 @@ def test_a_metric_with_no_data_is_an_empty_chart_not_a_404(client: TestClient) -
     response = client.get("/api/metrics/app.example.com.cpu.percent?window=24h")
 
     assert response.status_code == 200, response.text
-    assert response.json()["points"] == []
+    body = response.json()
+    assert body["points"] == []
+    assert body["resolution"] == "minute"
+
+
+@pytest.mark.parametrize(
+    ("window", "resolution"),
+    [("1h", "raw"), ("24h", "minute"), ("7d", "hour"), ("30d", "hour")],
+)
+def test_the_response_states_its_resolution(
+    client: TestClient, window: str, resolution: str
+) -> None:
+    """Every window says which tier answered it, so a chart can label its axis honestly."""
+    response = client.get(f"/api/metrics/cpu.percent?window={window}")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["resolution"] == resolution
 
 
 def test_every_window_maps_onto_a_retention_tier() -> None:
@@ -141,6 +178,8 @@ def test_every_window_maps_onto_a_retention_tier() -> None:
     assert WINDOWS["1h"] == RAW_RETENTION_SECONDS
     assert WINDOWS["24h"] == MINUTE_RETENTION_SECONDS
     assert WINDOWS["30d"] == HOUR_RETENTION_SECONDS
+    # 7d is not its own tier: it is a narrower cut of the same hour means 30d reads.
+    assert MINUTE_RETENTION_SECONDS < WINDOWS["7d"] < HOUR_RETENTION_SECONDS
 
 
 def test_the_endpoints_demand_a_session(tmp_path: Path) -> None:
