@@ -622,6 +622,19 @@ class BaseDatabaseManager(BaseManager):
         """
         return bool(self.CLIENT_BINARY) and self.runner.exists(self.CLIENT_BINARY)
 
+    def server_port(self) -> int:
+        """
+        Return the TCP port this engine's server listens on.
+
+        Engines that can ask their server override this; the rest answer the
+        port they install with. Every place that shows or records a port asks
+        here, so none of them assumes the default on its own.
+
+        Returns:
+            The port.
+        """
+        return self.DEFAULT_PORT
+
     def get_version(self) -> str | None:
         """
         Read the engine version from its own ``--version`` output.

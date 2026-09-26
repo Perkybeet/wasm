@@ -18,6 +18,12 @@ from pathlib import Path
 
 from wasm.core.exceptions import WASMError
 from wasm.core.runner import CommandRunner
+from wasm.managers.source_manager import (
+    GIT_AUTH_FAILURE_MESSAGE,
+    git_auth_fix,
+    git_environment,
+    is_git_auth_failure,
+)
 
 #: A repository probe answers in seconds or is not going to answer.
 GIT_PROBE_TIMEOUT = 30
@@ -67,6 +73,7 @@ def repository_unreachable(runner: CommandRunner, source: str) -> list[str]:
     probe = runner.run(
         ["git", "ls-remote", "--exit-code", source],
         cwd=safe_cwd,
+        env=git_environment(),
         timeout=GIT_PROBE_TIMEOUT,
     )
     if probe.success:
@@ -80,6 +87,8 @@ def repository_unreachable(runner: CommandRunner, source: str) -> list[str]:
         if detail
         else f"Repository not accessible: {source}"
     ]
+    if is_git_auth_failure(probe.stderr or ""):
+        issues.append(f"{GIT_AUTH_FAILURE_MESSAGE}. {git_auth_fix(source)}")
     if "Permission denied" in str(probe.stderr):
         issues.append("Check SSH key configuration: wasm setup ssh --test")
     return issues

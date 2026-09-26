@@ -57,6 +57,31 @@ describe("Toast", () => {
     expect(screen.getAllByText("Deploy failed")).toHaveLength(1);
   });
 
+  it("shows a failing tool's own output verbatim, apart from detail", async () => {
+    render(<ToastProvider>{null}</ToastProvider>);
+    act(() => {
+      toast.error("The statement failed", {
+        detail: 'ERROR: syntax error at or near "SELCT"',
+        output: 'psql:query.sql:1: ERROR:  syntax error at or near "SELCT"\nLINE 1: SELCT * FROM apps;',
+      });
+    });
+    await waitFor(() => {
+      expect(visibleToast()).toHaveTextContent('LINE 1: SELCT * FROM apps;');
+    });
+    expect(screen.getByText('ERROR: syntax error at or near "SELCT"')).toBeInTheDocument();
+  });
+
+  it("does not repeat the output when it reads the same as detail", async () => {
+    render(<ToastProvider>{null}</ToastProvider>);
+    act(() => {
+      toast.error("Could not fetch the source", { detail: "Permission denied", output: "Permission denied" });
+    });
+    await waitFor(() => {
+      expect(visibleToast()).toHaveTextContent("Permission denied");
+    });
+    expect(screen.getAllByText("Permission denied")).toHaveLength(1);
+  });
+
   it("announces a success once, politely", async () => {
     render(<ToastProvider>{null}</ToastProvider>);
     act(() => {

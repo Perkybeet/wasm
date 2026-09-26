@@ -20,13 +20,12 @@ import asyncio
 import json
 import logging
 from collections.abc import Coroutine
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from starlette.concurrency import run_in_threadpool
 
 from wasm.core.exceptions import ValidationError
-from wasm.core.utils import domain_to_app_name
 from wasm.web.auth import (
     WS_CLOSE_FORBIDDEN,
     WS_CLOSE_UNAUTHORIZED,
@@ -39,6 +38,9 @@ from wasm.web.auth import (
     get_client_ip,
     scope_satisfies,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - imported for types only
+    from wasm.managers.service_manager import UnitOwnership
 
 logger = logging.getLogger(__name__)
 
@@ -249,6 +251,85 @@ async def _accept(websocket: WebSocket, session: dict[str, Any], path: str) -> N
         )
 
 
+def _resolve_log_units(target: str) -> tuple[list[UnitOwnership], str | None]:
+    """
+    Work out which units ``/ws/logs/{target}`` streams, and whether it may.
+
+    Args:
+        target: An application's domain, or a unit name.
+
+    Returns:
+        The units, primary first, and None; or no units and the message that
+        refuses the stream.
+
+    Raises:
+        ValidationError: When the target cannot name a unit.
+    """
+    from wasm.core.store import get_store
+    from wasm.core.utils import domain_to_app_name
+    from wasm.managers.service_manager import ServiceManager
+
+    manager = ServiceManager(verbose=False)
+    app = get_store().get_app(target)
+    if app is not None:
+        names = manager.app_units(app)
+        if not names:
+            return [], (
+                f"{target} is a static site: the web server serves its files directly, "
+                "so there is no process and no journal to follow"
+            )
+    else:
+        # A unit name as the Services page passes it, or the domain of an
+        # application the store does not know, whose unit is named after it.
+        name = target.removesuffix(".service")
+        names = [name] if manager.inspect_unit(name).exists else [domain_to_app_name(target)]
+
+    units = [manager.inspect_unit(name) for name in names]
+    for unit in units:
+        if not unit.exists or not unit.managed:
+            reason = unit.reason or f"there is no unit named {unit.unit}"
+            return [], f"Refusing to stream a unit WASM does not manage: {unit.unit} ({reason})"
+    return units, None
+
+
+async def _report_journal_exit(
+    websocket: WebSocket,
+    process: asyncio.subprocess.Process,
+    stderr: asyncio.StreamReader,
+    already_read: str = "",
+) -> None:
+    """
+    Tell the client that journalctl ended, in journalctl's own words.
+
+    A follow only ends on its own when journalctl failed (a journal it cannot
+    read, an option this systemd does not know), and the console used to show
+    a bare "The journal stream failed" with the reason thrown away.
+
+    Args:
+        websocket: The client connection.
+        process: The journalctl that stopped producing output.
+        stderr: Its error stream.
+        already_read: What was read from that stream before, so the message
+            carries all of it.
+    """
+    try:
+        code = await asyncio.wait_for(process.wait(), timeout=TERMINATE_GRACE_SECONDS)
+    except asyncio.TimeoutError:
+        return  # Still running: the output ended for another reason.
+    rest = (await stderr.read()).decode("utf-8", errors="replace")
+    output = "\n".join(part for part in (already_read.strip(), rest.strip()) if part)
+    if code == 0 and not output:
+        return
+    message = f"journalctl exited with status {code}"
+    if output:
+        message = f"{message}: {output}"
+    logger.warning("Log stream ended: %s", message)
+    try:
+        await websocket.send_json({"type": "error", "message": message})
+    except (RuntimeError, WebSocketDisconnect):
+        pass  # The client left in the same instant; there is nobody to tell.
+
+
 @router.websocket("/logs/{domain}")
 async def websocket_logs(
     websocket: WebSocket,
@@ -262,12 +343,23 @@ async def websocket_logs(
     Connect with the session cookie, with ``Sec-WebSocket-Protocol:
     wasm.auth, wasm.token.<token>``, or with ``?ticket=<single-use ticket>``.
 
-    Only a unit WASM manages is streamed. The name is resolved and judged by
+    Only a unit WASM manages is streamed. What the path names is resolved by
+    :func:`_resolve_log_units`: an application's domain streams the unit(s)
+    that application runs as, from the one mapping in
+    :meth:`~wasm.managers.service_manager.ServiceManager.app_units` (so a
+    legacy ``wasm-`` unit, a Compose unit and a monorepo's workspaces are all
+    found); anything else is taken as a unit name. Every unit is then judged by
     :meth:`~wasm.managers.service_manager.ServiceManager.inspect_unit`, the
     ownership rule ``GET /api/services/{name}/logs`` and every other service
     operation already go through: this route used to follow whatever unit
     the path named - ``/ws/logs/ssh`` was sshd's journal, as root, for any
     valid credential.
+
+    A monorepo streams all of its workspaces' units together, in one
+    ``journalctl`` with a ``-u`` per unit: the journal interleaves them by
+    time and each line names its process, which is what an operator reading
+    "the application's logs" expects. ``service`` in the ``connected`` frame
+    is the first of them; ``services`` lists them all.
 
     Args:
         websocket: The client connection.
@@ -283,30 +375,21 @@ async def websocket_logs(
 
     await _accept(websocket, session, f"/ws/logs/{domain}")
 
-    from wasm.managers.service_manager import ServiceManager
-
     try:
         # The domain is client supplied and ends up as a journalctl unit
         # selector, where '*' and '/' are not inert. inspect_unit validates
-        # the name before anything is spawned.
-        app_name = domain_to_app_name(domain)
-        unit = await run_in_threadpool(ServiceManager(verbose=False).inspect_unit, app_name)
+        # every name before anything is spawned.
+        units, refusal = await run_in_threadpool(_resolve_log_units, domain)
     except ValidationError as exc:
         await websocket.send_json({"type": "error", "message": f"Invalid domain: {exc}"})
         await _close(websocket)
         return
 
-    if not unit.exists or not unit.managed:
-        reason = unit.reason or f"there is no unit named {unit.unit}"
-        await websocket.send_json(
-            {
-                "type": "error",
-                "message": f"Refusing to stream a unit WASM does not manage: {unit.unit} ({reason})",
-            }
-        )
+    if refusal is not None:
+        await websocket.send_json({"type": "error", "message": refusal})
         await _close(websocket, WS_CLOSE_FORBIDDEN)
         return
-    service_name = unit.unit
+    service_name = units[0].unit
 
     # Add to connections
     if domain not in _log_connections:
@@ -330,10 +413,10 @@ async def websocket_logs(
             return
 
         # Start journalctl follow process
+        selectors = [arg for unit in units for arg in ("-u", unit.unit_file)]
         process = await asyncio.create_subprocess_exec(
             "journalctl",
-            "-u",
-            unit.unit_file,
+            *selectors,
             "-f",
             "-n",
             str(lines),
@@ -345,7 +428,14 @@ async def websocket_logs(
         )
 
         # Send initial message
-        await websocket.send_json({"type": "connected", "domain": domain, "service": service_name})
+        await websocket.send_json(
+            {
+                "type": "connected",
+                "domain": domain,
+                "service": service_name,
+                "services": [unit.unit for unit in units],
+            }
+        )
 
         if process.stdout is None or process.stderr is None:
             await websocket.send_json({"type": "error", "message": "journalctl produced no output"})
@@ -355,12 +445,17 @@ async def websocket_logs(
         stderr = process.stderr
         follow = process
 
+        # What journalctl said before its first line, kept so that the error
+        # sent if it then exits carries all of it.
+        early_stderr: list[str] = []
+
         # Check for immediate stderr (e.g., service not found)
         async def check_stderr() -> None:
             try:
                 stderr_data = await asyncio.wait_for(stderr.read(1024), timeout=0.5)
                 if stderr_data:
                     error_msg = stderr_data.decode("utf-8", errors="replace").strip()
+                    early_stderr.append(error_msg)
                     if error_msg:
                         await websocket.send_json(
                             {"type": "warning", "data": f"journalctl: {error_msg}"}
@@ -391,7 +486,8 @@ async def websocket_logs(
                     if log_line:
                         await websocket.send_json({"type": "log", "data": log_line})
                 except (RuntimeError, WebSocketDisconnect):
-                    break  # Connection closed or process terminated
+                    return  # Connection closed or process terminated
+            await _report_journal_exit(websocket, follow, stderr, "\n".join(early_stderr))
 
         # Handle incoming messages (for ping/pong or commands)
         async def handle_messages() -> None:

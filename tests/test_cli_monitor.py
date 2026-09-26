@@ -456,6 +456,43 @@ def test_status_json_carries_the_same_fields_the_api_uses(monitor_env: Any) -> N
     assert any("signals, terminates or restarts a process" in item for item in payload["scope"])
 
 
+def test_status_warns_about_a_scan_interval_that_hides_failures(
+    monitor_env: Any, cli_output: io.StringIO, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An operator's 3600 s is respected, and the status says what it costs."""
+    from wasm.monitor.process_monitor import MonitorConfig
+
+    monkeypatch.setattr(
+        cli_monitor.ProcessMonitor,
+        "_load_config",
+        lambda self: MonitorConfig(scan_interval=3600),
+    )
+
+    assert invoke("status", standalone_mode=False).return_value == 0
+    output = cli_output.getvalue()
+    assert "3600s" in output
+    assert "may go unnoticed for up to 60 minutes" in output
+
+    payload = json.loads(invoke("status", "--json").output)
+    assert payload["settings"]["scan_interval"] == 3600
+    assert any("unnoticed" in warning for warning in payload["warnings"])
+
+
+def test_status_does_not_warn_about_the_default_interval(
+    monitor_env: Any, cli_output: io.StringIO, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A minute is prompt; the report says every WASM unit is watched."""
+    from wasm.monitor.process_monitor import MonitorConfig
+
+    monkeypatch.setattr(cli_monitor.ProcessMonitor, "_load_config", lambda self: MonitorConfig())
+
+    assert invoke("status", standalone_mode=False).return_value == 0
+    output = cli_output.getvalue()
+    assert "unnoticed" not in output
+    assert "every unit WASM manages" in output
+    assert json.loads(invoke("status", "--json").output)["warnings"] == []
+
+
 def test_status_without_json_still_prints_a_report(
     monitor_env: Any, cli_output: io.StringIO
 ) -> None:

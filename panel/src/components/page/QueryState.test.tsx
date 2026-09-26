@@ -117,4 +117,34 @@ describe("ErrorBlock", () => {
     rerender(<ErrorBlock error={FAILURE} title="Restart failed" live />);
     expect(screen.getByRole("alert")).toHaveTextContent("Restart failed");
   });
+
+  it("shows a failing tool's own output verbatim, apart from the one-line detail", async () => {
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(192);
+    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(900);
+    const withOutput = new ApiError(
+      400,
+      "query_failed",
+      'ERROR: syntax error at or near "SELCT"',
+      null,
+      null,
+      null,
+      'psql:query.sql:1: ERROR:  syntax error at or near "SELCT"\nLINE 1: SELCT * FROM apps;\n        ^',
+    );
+    render(<ErrorBlock error={withOutput} title="The statement failed" />);
+    expect(screen.getByText('ERROR: syntax error at or near "SELCT"')).toBeInTheDocument();
+    const output = await screen.findByRole("region", { name: "The statement failed: the command's own output" });
+    expect(output.tagName).toBe("PRE");
+    expect(output).toHaveTextContent(/LINE 1: SELCT \* FROM apps;/);
+  });
+
+  it("does not repeat the output block when it says exactly the same thing as detail", () => {
+    const same = new ApiError(400, "rejected", "Permission denied", null, null, null, "Permission denied");
+    render(<ErrorBlock error={same} title="Could not fetch the source" />);
+    expect(screen.getAllByText("Permission denied")).toHaveLength(1);
+  });
+
+  it("shows nothing extra when the error carries no output", () => {
+    render(<ErrorBlock error={FAILURE} title="Restart failed" />);
+    expect(screen.queryByText(": the command's own output", { exact: false })).not.toBeInTheDocument();
+  });
 });

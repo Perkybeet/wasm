@@ -123,8 +123,11 @@ def _list(all_services: bool, *, verbose: bool, json_output: bool = False) -> in
     """
     Print the services WASM manages.
 
+    The list is :meth:`~wasm.managers.service_manager.ServiceManager.managed_units`,
+    the same one the console's Services page and top bar read.
+
     Args:
-        all_services: Include units WASM does not manage.
+        all_services: Include units WASM does not manage, flagged as such.
         verbose: Show the detail of each step.
         json_output: Print the list as JSON instead of a table.
 
@@ -146,6 +149,8 @@ def _list(all_services: bool, *, verbose: bool, json_output: bool = False) -> in
                         if manager.state_is_running(svc["active"])
                         else "stopped",
                         "state": svc["sub"],
+                        "managed": bool(svc["managed"]),
+                        "app": svc.get("app"),
                     }
                     for svc in services
                 ]
@@ -164,10 +169,17 @@ def _list(all_services: bool, *, verbose: bool, json_output: bool = False) -> in
             svc["name"],
             "running" if manager.state_is_running(svc["active"]) else "stopped",
             svc["sub"],
+            svc.get("app") or "",
         ]
         for svc in services
     ]
-    logger.table(["Name", "Status", "State"], rows)
+    headers = ["Name", "Status", "State", "App"]
+    if all_services:
+        # Every unit on the machine: say which ones WASM would act on.
+        headers.append("WASM")
+        for row, svc in zip(rows, services, strict=True):
+            row.append("yes" if svc["managed"] else "")
+    logger.table(headers, rows)
 
     return 0
 

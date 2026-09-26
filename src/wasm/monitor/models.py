@@ -154,11 +154,22 @@ class ServiceHealth:
     State of one systemd unit.
 
     Attributes:
-        unit: Unit name, without the .service suffix.
-        active: True when systemd reports the unit as active.
+        unit: Unit name as it was asked about, usually without the
+            ``.service`` suffix.
+        active: True when systemd reports the unit as active or activating.
         enabled: True when the unit starts at boot.
-        active_state: Raw output of ``systemctl is-active``.
-        enabled_state: Raw output of ``systemctl is-enabled``.
+        active_state: systemd's ``ActiveState`` (``active``, ``failed``...).
+        enabled_state: systemd's ``UnitFileState`` (``enabled``...).
+        sub_state: systemd's ``SubState``; ``auto-restart`` is a unit
+            waiting to be restarted after it exited.
+        load_state: systemd's ``LoadState``; ``not-found`` for a name no
+            unit file answers to.
+        result: systemd's ``Result`` for the last run: ``success`` after a
+            clean stop, ``exit-code``, ``signal``, ``start-limit-hit``...
+        exec_main_status: Exit status (or signal number) of the main
+            process's last run, None when systemd did not report one.
+        restarts: ``NRestarts``: automatic restarts since the unit was last
+            started deliberately. None when systemd did not report it.
     """
 
     unit: str
@@ -166,3 +177,8 @@ class ServiceHealth:
     enabled: bool
     active_state: str = ""
     enabled_state: str = ""
+    sub_state: str = ""
+    load_state: str = ""
+    result: str = ""
+    exec_main_status: int | None = None
+    restarts: int | None = None

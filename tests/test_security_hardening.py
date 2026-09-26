@@ -60,7 +60,7 @@ from wasm.web.server import create_app as build_app
 
 PSQL_PREFIX = ("runuser", "-u", "postgres", "--", "psql")
 
-#: The address under test, never actually bound: uvicorn.run is mocked below.
+#: The address under test, never actually bound: the server is mocked below.
 ALL_INTERFACES = "0.0.0.0"  # noqa: S104
 
 # --------------------------------------------------------------------------
@@ -240,7 +240,7 @@ class TestRunServerRefusesUnprotectedExposure:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         calls: list[dict[str, Any]] = []
-        monkeypatch.setattr("uvicorn.run", lambda **kwargs: calls.append(kwargs))
+        monkeypatch.setattr("wasm.web.server._serve", calls.append)
 
         with pytest.raises(SecurityError, match="--insecure-http"):
             run_server(host=ALL_INTERFACES, port=8080)
@@ -251,7 +251,7 @@ class TestRunServerRefusesUnprotectedExposure:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         calls: list[dict[str, Any]] = []
-        monkeypatch.setattr("uvicorn.run", lambda **kwargs: calls.append(kwargs))
+        monkeypatch.setattr("wasm.web.server._serve", calls.append)
 
         run_server(
             host=ALL_INTERFACES,
@@ -267,7 +267,7 @@ class TestRunServerRefusesUnprotectedExposure:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         calls: list[dict[str, Any]] = []
-        monkeypatch.setattr("uvicorn.run", lambda **kwargs: calls.append(kwargs))
+        monkeypatch.setattr("wasm.web.server._serve", calls.append)
 
         run_server(
             host="127.0.0.1",
@@ -469,7 +469,8 @@ class TestPostgresReadOnlyRole:
         # none of the broader grants (ALL PRIVILEGES, pg_read_server_files
         # membership) that would defeat the point.
         assert "ALL PRIVILEGES" not in provisioning
-        assert len(runner.calls) == 3
+        # database_exists, SHOW port (the port the login uses), provisioning, the login.
+        assert len(runner.calls) == 4
 
     def test_a_write_never_touches_the_read_only_role(
         self, postgres: Any, runner: FakeRunner

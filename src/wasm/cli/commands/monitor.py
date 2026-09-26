@@ -49,6 +49,7 @@ from wasm.monitor import (
     ProcessMonitor,
     ProcessObservation,
     default_db_path,
+    scan_interval_warning,
 )
 
 #: Options the parser still accepts from the antivirus era. Accepting and
@@ -170,6 +171,9 @@ def _status_as_dict(monitor: ProcessMonitor) -> dict[str, Any]:
             "notify": config.notify,
             "watch_units": list(config.watch_units),
         },
+        "warnings": [
+            warning for warning in (scan_interval_warning(config.scan_interval),) if warning
+        ],
     }
 
     try:
@@ -219,9 +223,12 @@ def _show_status(verbose: bool = False, *, json_output: bool = False) -> int:
     config = monitor.config
     logger.section("Observing")
     logger.key_value("Scan interval", f"{config.scan_interval}s")
+    interval_warning = scan_interval_warning(config.scan_interval)
+    if interval_warning:
+        logger.warning(interval_warning)
     logger.key_value("CPU threshold", f"{config.cpu_threshold:.0f}%")
     logger.key_value("Memory threshold", f"{config.memory_threshold:.0f}%")
-    logger.key_value("Watched units", ", ".join(config.watch_units) or "none")
+    logger.key_value("Watched units", _watched_units_label(config.watch_units))
     logger.key_value("Email reports", "On" if config.notify else "Off")
 
     logger.section("Observation store")
@@ -232,6 +239,20 @@ def _show_status(verbose: bool = False, *, json_output: bool = False) -> int:
 
     _print_scope(logger)
     return 0
+
+
+def _watched_units_label(extras: Any) -> str:
+    """
+    Describe which units a scan checks.
+
+    Args:
+        extras: ``monitor.watch_units``, checked on top of WASM's own.
+
+    Returns:
+        A line for the report.
+    """
+    listed = ", ".join(str(unit) for unit in extras or ())
+    return f"every unit WASM manages, plus {listed}" if listed else "every unit WASM manages"
 
 
 def _print_store_counts(logger: Logger) -> None:
@@ -486,7 +507,7 @@ def _show_config(verbose: bool = False) -> int:
         "Memory threshold", f"{config.get('monitor.memory_threshold', DEFAULT_MEMORY_THRESHOLD)}%"
     )
     watch_units = config.get("monitor.watch_units", []) or []
-    logger.key_value("Watched units", ", ".join(watch_units) or "none")
+    logger.key_value("Watched units", _watched_units_label(watch_units))
 
     logger.section("Observation store")
     logger.key_value("Database", str(default_db_path()))

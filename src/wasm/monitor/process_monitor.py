@@ -30,6 +30,7 @@ from wasm.core.notifier import NotificationEvent, Notifier
 from wasm.core.runner import CommandRunner, get_runner
 from wasm.core.utils import remove_file, write_file
 from wasm.managers.cert_manager import CertManager
+from wasm.managers.service_manager import ServiceManager
 from wasm.monitor.email_notifier import EmailNotifier
 from wasm.monitor.metrics import (
     SYSTEMCTL_TIMEOUT,
@@ -49,6 +50,17 @@ from wasm.monitor.signals import observe_processes
 #: Seconds between scans. A minute is enough for capacity planning and cheap
 #: enough to leave running on a small box.
 DEFAULT_SCAN_INTERVAL = 60
+
+#: Past this, a unit that fails can stay down for minutes before anybody is
+#: told. It is respected - an operator may want a quiet monitor - but
+#: ``wasm monitor status`` says what it costs. One production server ran with
+#: 3600: an hour between a crash and its alert, at best.
+SCAN_INTERVAL_WARNING_SECONDS = 300
+
+#: Automatic restarts within one scan interval that make a crash loop even
+#: when the scan happens to catch the unit up. Fewer than this, a unit that is
+#: active again is a unit that recovered; as many, it is one that keeps dying.
+CRASH_LOOP_RESTARTS = 3
 
 #: Floor for the scan interval. Walking /proc for every process is the most
 #: expensive thing this daemon does; doing it several times a second costs more
@@ -93,6 +105,148 @@ MONITOR_SCOPE: tuple[str, ...] = (
 )
 
 
+def scan_interval_warning(interval: int) -> str | None:
+    """
+    Say what a long scan interval costs, when it is long enough to matter.
+
+    Args:
+        interval: The configured seconds between scans.
+
+    Returns:
+        A sentence for the operator, or None when the interval is short
+        enough that a failure is noticed promptly.
+    """
+    if interval <= SCAN_INTERVAL_WARNING_SECONDS:
+        return None
+    minutes = interval / 60
+    span = f"{minutes:.0f} minutes" if minutes >= 2 else f"{interval} seconds"
+    return (
+        f"The monitor scans every {interval}s: a unit that fails may go unnoticed for up "
+        f"to {span}. Set monitor.scan_interval to {DEFAULT_SCAN_INTERVAL} "
+        "(the default) to hear about it within a minute."
+    )
+
+
+@dataclass(frozen=True)
+class UnitFailure:
+    """
+    Why a unit deserves an alert.
+
+    Attributes:
+        kind: ``failed``, ``crash_loop`` or ``stopped_on_failure``.
+        title: One line naming the unit and what happened to it.
+        detail: What systemd reported, in its own vocabulary.
+    """
+
+    kind: str
+    title: str
+    detail: str
+
+
+def _exit_phrase(health: ServiceHealth) -> str:
+    """
+    Describe how a unit's last run ended, in systemd's own terms.
+
+    Args:
+        health: The unit's state.
+
+    Returns:
+        ``result exit-code, main process exit status 1``, or as much of it
+        as systemd reported.
+    """
+    parts = [f"result {health.result or 'unknown'}"]
+    if health.exec_main_status:
+        parts.append(f"main process exit status {health.exec_main_status}")
+    if health.result == "start-limit-hit":
+        parts.append("systemd stopped restarting it after repeated failures")
+    return ", ".join(parts)
+
+
+def unit_failure(health: ServiceHealth, previous_restarts: int | None) -> UnitFailure | None:
+    """
+    Decide whether a unit failed, as opposed to being stopped on purpose.
+
+    Any state but ``active`` used to count as down, so a unit an operator
+    stopped alerted exactly like one that crashed. What counts now:
+
+    - ``failed``: systemd gave up on it, or it has no restart policy.
+    - A crash loop: ``NRestarts`` (automatic restarts only; a deliberate
+      restart does not count) grew since the previous scan while the unit is
+      waiting to be restarted, or grew by :data:`CRASH_LOOP_RESTARTS` or more
+      whatever state the scan caught it in.
+    - ``inactive`` after a run that did not end in ``success``.
+
+    An ``inactive`` unit whose last run ended in ``success`` was stopped
+    cleanly and is not a failure.
+
+    Args:
+        health: The unit's state this scan.
+        previous_restarts: Its ``NRestarts`` at the previous scan, or None on
+            the first scan that saw it.
+
+    Returns:
+        What to alert about, or None when there is nothing to.
+    """
+    unit = health.unit
+    if health.active_state == "failed":
+        return UnitFailure(
+            "failed",
+            f"Unit {unit} failed",
+            f"systemd reports {unit} failed: {_exit_phrase(health)}.",
+        )
+
+    grew = 0
+    if previous_restarts is not None and health.restarts is not None:
+        grew = health.restarts - previous_restarts
+    waiting = health.active_state == "activating" or health.sub_state == "auto-restart"
+    if grew > 0 and (waiting or grew >= CRASH_LOOP_RESTARTS):
+        return UnitFailure(
+            "crash_loop",
+            f"Unit {unit} is crash-looping",
+            (
+                f"systemd restarted {unit} {grew} time(s) since the previous check "
+                f"({health.restarts} automatic restarts in total); it is "
+                f"{health.active_state or 'unknown'}/{health.sub_state or 'unknown'}, "
+                f"last run: {_exit_phrase(health)}."
+            ),
+        )
+
+    if health.active_state == "inactive" and health.result not in ("", "success"):
+        return UnitFailure(
+            "stopped_on_failure",
+            f"Unit {unit} stopped on a failure",
+            f"systemd reports {unit} inactive after a run that failed: {_exit_phrase(health)}.",
+        )
+    return None
+
+
+def _settled(health: ServiceHealth, previous_restarts: int | None) -> bool:
+    """
+    Decide whether a unit that was alerted about is fine again.
+
+    Stricter than "not failing this scan": a crash-looping unit is caught up
+    between two crashes now and then, and re-arming on that would send the
+    same alert every other scan.
+
+    Args:
+        health: The unit's state this scan.
+        previous_restarts: Its ``NRestarts`` at the previous scan.
+
+    Returns:
+        True when it is running and was not restarted since the previous
+        scan, or was stopped cleanly.
+    """
+    if health.active_state == "inactive":
+        return health.result in ("", "success")
+    if health.active_state != "active":
+        return False
+    return (
+        previous_restarts is None
+        or health.restarts is None
+        or (health.restarts <= previous_restarts)
+    )
+
+
 def _days_until_expiry(expiry: str | None, today: date) -> int | None:
     """
     Compute how many days remain until a certificate's recorded expiry.
@@ -132,7 +286,8 @@ class MonitorConfig:
         cpu_threshold: CPU percentage above which a process is noted.
         memory_threshold: Memory percentage above which a process is noted.
         notify: Send observations by email.
-        watch_units: systemd units whose health is checked each scan.
+        watch_units: Units checked each scan on top of every unit WASM
+            manages, which are always watched.
         retention_days: How long observations are kept.
         max_observations: Hard ceiling on rows kept in the observation store.
         log_file: Where the daemon writes its log.
@@ -173,6 +328,7 @@ class ProcessMonitor:
         event_notifier: Any | None = None,
         cert_manager: Any | None = None,
         cert_state_path: Path | None = None,
+        service_manager: Any | None = None,
     ) -> None:
         """
         Args:
@@ -188,6 +344,8 @@ class ProcessMonitor:
             cert_state_path: Where the per-certificate last-notified date is
                 recorded. Defaults to a sidecar next to the observation
                 store; tests point it at a sandbox.
+            service_manager: Where the units WASM manages are listed from.
+                Created on first use if None.
         """
         self.verbose = verbose
         self.logger = Logger(verbose=verbose)
@@ -200,6 +358,7 @@ class ProcessMonitor:
         self._event_notifier = event_notifier
         self._cert_manager = cert_manager
         self._cert_state_path = cert_state_path
+        self._service_manager = service_manager
         self._running = False
         # Far enough in the past that the first loop iteration purges once.
         self._last_purge = float("-inf")
@@ -208,6 +367,9 @@ class ProcessMonitor:
         # sixty second interval becomes a message a minute to every channel.
         self._alerted_disks: set[str] = set()
         self._failed_units: set[str] = set()
+        # NRestarts per unit at the previous scan: a crash loop is the count
+        # growing, which one reading cannot show.
+        self._restart_counts: dict[str, int] = {}
 
     def _load_config(self) -> MonitorConfig:
         """
@@ -260,6 +422,43 @@ class ProcessMonitor:
             self._cert_manager = CertManager(verbose=self.verbose, runner=self.runner)
         return self._cert_manager
 
+    @property
+    def service_manager(self) -> Any:
+        """The service manager, built on first use."""
+        if self._service_manager is None:
+            self._service_manager = ServiceManager(verbose=self.verbose, runner=self.runner)
+        return self._service_manager
+
+    def _managed_units(self) -> list[str]:
+        """
+        List the units WASM manages, from the service manager's one definition.
+
+        Returns:
+            Their names. Empty, and logged, when they cannot be listed: the
+            extras in ``watch_units`` are still checked.
+        """
+        try:
+            units = self.service_manager.managed_units()
+        except (WASMError, OSError) as exc:
+            self.logger.warning(f"Could not list the units WASM manages: {exc}")
+            return []
+        return [unit.name for unit in units]
+
+    def watched_units(self) -> list[str]:
+        """
+        Name every unit a scan checks.
+
+        Every unit WASM manages, read again each scan so an application
+        deployed since is watched without a restart, then the extras in
+        ``monitor.watch_units``. With only the extras, which default to none,
+        the monitor watched nothing and ``unit_failed`` never fired.
+
+        Returns:
+            Unit names, each once.
+        """
+        units = [*self._managed_units(), *self.config.watch_units]
+        return list(dict.fromkeys(unit.removesuffix(".service") for unit in units if unit))
+
     def _publish_event(self, kind: str, title: str, body: str) -> None:
         """
         Hand one observation to the multi-channel notifier.
@@ -297,15 +496,17 @@ class ProcessMonitor:
         Ask systemd about the units being watched.
 
         Args:
-            units: Units to check. Defaults to the configured ones.
+            units: Units to check. Defaults to :meth:`watched_units`.
 
         Returns:
             One health record per unit.
         """
-        watched = list(units if units is not None else self.config.watch_units)
+        watched = list(units if units is not None else self.watched_units())
         if not watched:
             return []
-        return collect_service_health(watched, runner=self.runner)
+        return collect_service_health(
+            watched, runner=self.runner, service_manager=self.service_manager
+        )
 
     def scan_once(self, cpu_sample_interval: float = 0.0) -> list[ProcessObservation]:
         """
@@ -517,29 +718,45 @@ class ProcessMonitor:
 
     def _report_services(self) -> None:
         """
-        Log any watched unit that is not active, and announce the transition.
+        Log every watched unit that failed, and announce the failure once.
 
-        The ``unit_failed`` event goes out once per outage, when a unit goes
-        from active to anything else; a unit that stays down is not repeated
-        every scan, and one that recovers re-arms.
+        A failure is what :func:`unit_failure` says it is: ``failed``, a
+        crash loop, or a stop that did not end in success. A unit stopped on
+        purpose is not one. The ``unit_failed`` event goes out once per
+        outage; a unit that stays down is not repeated every scan, and one
+        that settles (:func:`_settled`) re-arms.
         """
         down: set[str] = set()
+        restarts: dict[str, int] = {}
         for health in self.check_services():
-            if health.active:
+            previous = self._restart_counts.get(health.unit)
+            if health.restarts is not None:
+                restarts[health.unit] = health.restarts
+
+            if health.load_state == "not-found":
+                self.logger.warning(f"Watched unit {health.unit} does not exist")
                 continue
-            state = health.active_state or "unknown"
+
+            failure = unit_failure(health, previous)
+            if failure is None:
+                if health.unit in self._failed_units and not _settled(health, previous):
+                    down.add(health.unit)
+                continue
+
             down.add(health.unit)
-            self.logger.warning(f"Service {health.unit} is {state}")
+            self.logger.warning(f"{failure.title}: {failure.detail}")
             if health.unit not in self._failed_units:
                 self._publish_event(
                     "unit_failed",
-                    f"Unit {health.unit} is {state}",
+                    failure.title,
                     (
-                        f"The watched systemd unit {health.unit} reports {state}. "
-                        f"Inspect it with: systemctl status {health.unit}"
+                        f"{failure.detail}\n"
+                        f"Inspect it with: systemctl status {health.unit} "
+                        f"and journalctl -u {health.unit} -n 50"
                     ),
                 )
         self._failed_units = down
+        self._restart_counts = restarts
 
     def run(self) -> None:
         """

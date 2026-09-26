@@ -676,6 +676,77 @@ class TestRelativeAppsDirectoryIsRefused:
         assert client.get("/api/config/apps-directory").json()["apps_directory"] == "/srv/apps"
 
 
+class TestBackupDirectoryIsNeverRelative:
+    """
+    ``backup.directory: ''`` meant the working directory: backups went to /root.
+
+    Empty now means the default, and a relative path is refused - by the typed
+    endpoint, by PATCH and by a full replace alike, because all three reach
+    :meth:`Config.set`/:meth:`Config.replace`, where the rule lives.
+    """
+
+    def test_the_typed_endpoint_refuses_a_relative_path(
+        self, client: TestClient, config_path: Path
+    ) -> None:
+        response = client.put("/api/config/backup", json={"directory": "backups", "max_per_app": 5})
+
+        assert response.status_code == 400
+        assert "backup.directory must be an absolute path" in response.text
+        assert not config_path.exists()
+
+    def test_patch_refuses_a_relative_path(self, client: TestClient, config_path: Path) -> None:
+        response = client.patch("/api/config", json={"path": "backup.directory", "value": "b"})
+
+        assert response.status_code == 400
+        assert "absolute path" in response.text
+
+    def test_full_replace_refuses_a_relative_path(
+        self, client: TestClient, config_path: Path
+    ) -> None:
+        response = client.put("/api/config", json={"config": {"backup": {"directory": "b"}}})
+
+        assert response.status_code == 400
+        assert not config_path.exists()
+
+    def test_empty_means_the_default(self, client: TestClient, config_path: Path) -> None:
+        response = client.put("/api/config/backup", json={"directory": "  ", "max_per_app": 5})
+
+        assert response.status_code == 200, response.text
+        assert stored_value(config_path, "backup.directory") == "/var/backups/wasm"
+        assert client.get("/api/config/backup").json()["directory"] == "/var/backups/wasm"
+
+    def test_an_empty_value_on_disk_reads_as_the_default(
+        self, client: TestClient, config_path: Path
+    ) -> None:
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(yaml.safe_dump({"backup": {"directory": "", "max_per_app": 3}}))
+        Config.reset_instance()
+
+        body = client.get("/api/config/backup").json()
+
+        assert body == {"directory": "/var/backups/wasm", "max_per_app": 3}
+
+    def test_an_absolute_path_is_accepted(self, client: TestClient, config_path: Path) -> None:
+        response = client.put(
+            "/api/config/backup", json={"directory": "/srv/backups", "max_per_app": 5}
+        )
+
+        assert response.status_code == 200, response.text
+        assert client.get("/api/config/backup").json()["directory"] == "/srv/backups"
+
+    def test_patching_the_whole_section_meets_the_same_rule(
+        self, client: TestClient, config_path: Path
+    ) -> None:
+        """Writing "backup" as a dict used to skip the per-key rule its keys have."""
+        response = client.patch(
+            "/api/config",
+            json={"path": "backup", "value": {"directory": "backups", "max_per_app": 5}},
+        )
+
+        assert response.status_code == 400
+        assert "absolute" in response.text
+
+
 class TestTypedSectionsNeedElevation:
     """
     The five typed section saves need sudo mode exactly like ``PUT``/``PATCH

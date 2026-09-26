@@ -27,7 +27,7 @@ from pydantic import BaseModel
 from wasm.core.config import SYSTEMD_DIR, Config
 from wasm.core.exceptions import ServiceError, ValidationError, WASMError
 from wasm.core.store import get_store
-from wasm.managers.service_manager import ServiceManager
+from wasm.managers.service_manager import ServiceManager, readable_unit_name
 from wasm.validators.names import resolve_within, validate_service_name
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import WASMErrorRoute, require_elevated
@@ -73,9 +73,10 @@ class ServiceInfo(BaseModel):
     Service information.
 
     Attributes:
-        managed: Whether this unit was created by WASM. Always true for a
-            service reached through the store; may be false when listing
-            with ``wasm_only=false``, which walks every unit on the host.
+        managed: Whether WASM manages this unit. False only when listing with
+            ``wasm_only=false``, which walks every unit on the host; such a
+            row carries systemd's state fields and nothing else (``enabled``
+            false, no PID, memory or uptime), read from the one listing.
         active_state: Systemd's own ``ActiveState`` (``active``, ``failed``,
             ``activating``, ...). Distinguishes a unit systemd is repeatedly
             restarting from one that is cleanly stopped, which ``active``
@@ -395,30 +396,18 @@ def list_services(
     """
     List services.
 
-    ``wasm_only`` (the default) scopes the listing to what the store
-    tracks - the units WASM itself created. Set it to false for a full
-    inventory of every unit on the host, each flagged ``managed``, which is
-    how a diagnostics view tells a foreign unit's own crash loop from one of
-    WASM's own.
+    ``wasm_only`` (the default) lists the units WASM manages - the one
+    definition in :meth:`~wasm.managers.service_manager.ServiceManager.managed_units`
+    the console's top bar counts too, so the two always agree. Set it to false
+    for a full inventory of every unit on the host, each flagged ``managed``,
+    which is how a diagnostics view tells a foreign unit's own crash loop from
+    one of WASM's own. A foreign unit carries only its state: it is listed
+    from systemd's own listing, never probed or acted on.
     """
-    service_manager = ServiceManager(verbose=False)
-
-    if not wasm_only:
-        entries = service_manager.list_services(all_services=True)
-        result = [
-            _service_info(
-                entry["name"],
-                None,
-                service_manager.get_status(entry["name"], require_managed=False),
-            )
-            for entry in entries
-        ]
-        return ServiceListResponse(services=result, total=len(result))
-
-    stored_services = get_store().list_services()
+    statuses = ServiceManager(verbose=False).list_statuses(all_services=not wasm_only)
+    commands = {service.name: service.command for service in get_store().list_services()}
     result = [
-        _service_info(svc.name, svc.command, service_manager.get_status(svc.name))
-        for svc in stored_services
+        _service_info(status["name"], commands.get(status["name"]), status) for status in statuses
     ]
     return ServiceListResponse(services=result, total=len(result))
 
@@ -442,24 +431,30 @@ def verify_unit(
 def get_service(name: str, request: Request, session: dict = Depends(get_current_session)):
     """
     Get details for a specific service.
+
+    Answers for a unit WASM manages, whether or not the store's services
+    table has a row for it (since 0.14.1 an application's unit is named after
+    the application and may have none). Any other unit is a 404, which is how
+    the console knows to describe it from the all-units listing instead;
+    systemd's own escaped names (``systemd-fsck@dev-disk-by\\x2dlabel-BOOT``)
+    arrive URL-encoded and get that 404, not a 400.
     """
-    service_name = validate_service_name(name)
+    service_name = readable_unit_name(name)
+    try:
+        validate_service_name(service_name)
+    except ValidationError as exc:
+        # WASM never creates a name its own validator refuses, so this is a
+        # unit systemd or a package named: not one of ours.
+        raise HTTPException(status_code=404, detail=f"Service not found: {service_name}") from exc
 
-    store = get_store()
     service_manager = ServiceManager(verbose=False)
-
-    # Handle both prefixed and non-prefixed names for backwards compatibility
-    svc = store.get_service(service_name)
-    if not svc:
-        svc = store.get_service(f"{LEGACY_PREFIX}{service_name}")
-
-    if not svc:
+    info = service_manager.inspect_unit(service_name)
+    if not info.exists or not info.managed:
         raise HTTPException(status_code=404, detail=f"Service not found: {service_name}")
 
-    # Get live status from systemd (ServiceManager resolves name automatically)
-    live_status = service_manager.get_status(svc.name)
-
-    return _service_info(svc.name, svc.command, live_status)
+    stored = get_store().get_service(info.unit)
+    live_status = service_manager.get_status(info.unit)
+    return _service_info(info.unit, stored.command if stored else None, live_status)
 
 
 def _run_service_action(name: str, action: str, past_tense: str) -> ServiceActionResponse:

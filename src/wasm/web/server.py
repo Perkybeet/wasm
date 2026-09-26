@@ -25,10 +25,13 @@ stream and the two WebSockets, the same surface a script uses.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 import threading
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs
@@ -68,12 +71,18 @@ from wasm.web.auth import (
     ip_matches,
     is_allowed_origin,
     is_secure_request,
+    rate_limit_identity,
     set_audit_logger,
     set_brute_force_protection,
     set_security_config,
     set_token_manager,
 )
-from wasm.web.events import AppStatePublisher, announce_app_mutation
+from wasm.web.events import (
+    AppStatePublisher,
+    announce_app_mutation,
+    begin_shutdown,
+    shutting_down,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -188,28 +197,71 @@ def is_machine_path(path: str) -> bool:
 
 def _spends_no_rate_budget(scope: Scope, path: str) -> bool:
     """
-    Report whether a request is exempt from the per-client rate limit.
+    Report whether a request is exempt from the rate limit.
 
     Loading the console fetches every hashed chunk its router may need - some
     forty files - before the first API call, and a hard reload fetches them
-    all again. Counted against the default 120 requests a minute, two reloads
-    would lock the operator out of a blank page. The chunks are public,
-    content-addressed, immutable and cheap to serve, so a flood of them costs
-    nothing the limiter protects; everything that reaches a manager, a
-    credential or the event stream still counts.
+    all again, plus the console's ``index.html`` itself. Counted against the
+    anonymous budget, a couple of reloads locked the operator out, and the
+    browser showed the raw 429 JSON in place of the console. The chunks are
+    public, content-addressed and immutable; the shell is a two kilobyte file
+    that names them and carries no data. A flood of either costs nothing the
+    limiter protects; everything that reaches a manager, a credential or the
+    event stream still counts.
 
     Args:
         scope: The ASGI connection scope.
         path: The request path.
 
     Returns:
-        True for a GET or HEAD of a build asset under ``/assets/``.
+        True for a GET or HEAD of a build asset under ``/assets/`` or of a
+        console address (any path outside :data:`MACHINE_PATH_PREFIXES`,
+        which the SPA fallback answers with the shell).
     """
     return (
         scope["type"] == "http"
         and str(scope.get("method", "")).upper() in ("GET", "HEAD")
-        and path.startswith("/assets/")
+        and (path.startswith("/assets/") or not is_machine_path(path))
     )
+
+
+@dataclass(frozen=True)
+class RateBucket:
+    """
+    The budget one request is counted against.
+
+    Attributes:
+        limiter: The anonymous limiter (per client IP) or the authenticated
+            one (per credential).
+        key: The client IP or the credential's name.
+    """
+
+    limiter: RateLimiter
+    key: str
+
+
+def rate_bucket(connection: HTTPConnection, client_ip: str) -> RateBucket:
+    """
+    Pick the budget a request spends.
+
+    A request with a valid credential is counted per credential, against
+    ``rate_limit_authenticated_requests``; anything else per client IP,
+    against the strict ``rate_limit_requests``. An address the lockout has
+    refused is not given the benefit of a credential check: it is counted as
+    anonymous, and the lockout refuses it right after.
+
+    Args:
+        connection: The incoming request or handshake.
+        client_ip: The resolved client address.
+
+    Returns:
+        The bucket to count the request in.
+    """
+    if not get_brute_force().is_locked(client_ip):
+        identity = rate_limit_identity(connection, client_ip)
+        if identity is not None:
+            return RateBucket(get_authenticated_rate_limiter(), identity)
+    return RateBucket(get_rate_limiter(), client_ip)
 
 
 #: Endpoints that check a credential carried in the request itself - the
@@ -230,6 +282,7 @@ AUTH_PATHS = frozenset({"/api/auth/login", "/api/auth/elevate", "/api/auth/2fa/d
 
 _token_manager: TokenManager | None = None
 _rate_limiter: RateLimiter | None = None
+_authenticated_rate_limiter: RateLimiter | None = None
 _brute_force: BruteForceProtection | None = None
 _audit_logger: AuditLogger | None = None
 _connection_limiter: ConnectionLimiter | None = None
@@ -267,6 +320,23 @@ def get_rate_limiter() -> RateLimiter:
             max_requests=config.rate_limit_requests, window=config.rate_limit_window
         )
     return _rate_limiter
+
+
+def get_authenticated_rate_limiter() -> RateLimiter:
+    """
+    Return the per-credential rate limiter, creating it on first use.
+
+    Returns:
+        The process-wide limiter for requests carrying a valid credential.
+    """
+    global _authenticated_rate_limiter
+    if _authenticated_rate_limiter is None:
+        config = get_security_config()
+        _authenticated_rate_limiter = RateLimiter(
+            max_requests=config.rate_limit_authenticated_requests,
+            window=config.rate_limit_window,
+        )
+    return _authenticated_rate_limiter
 
 
 def get_brute_force() -> BruteForceProtection:
@@ -500,11 +570,20 @@ async def lifespan(app: FastAPI):
     app_states = AppStatePublisher()
     jobs.subscribe_all(app_states)
     start_metrics_collector()
-    yield
-    stop_metrics_collector()
-    jobs.unsubscribe_all(app_states)
-    jobs.unsubscribe_all(notify_jobs)
-    manager.purge_expired_sessions()
+    try:
+        yield
+    except asyncio.CancelledError:
+        # A second Ctrl+C makes uvicorn skip the lifespan shutdown, and
+        # asyncio then cancels this task while it waits for it. That is the
+        # stop the operator asked for, not a failure worth a traceback; any
+        # other cancellation is not ours to swallow.
+        if not shutting_down():
+            raise
+    finally:
+        stop_metrics_collector()
+        jobs.unsubscribe_all(app_states)
+        jobs.unsubscribe_all(notify_jobs)
+        manager.purge_expired_sessions()
 
 
 def create_app(config: SecurityConfig | None = None) -> FastAPI:
@@ -522,7 +601,7 @@ def create_app(config: SecurityConfig | None = None) -> FastAPI:
             persisted, or when TLS is required but not configured.
     """
     global _token_manager, _rate_limiter, _brute_force, _audit_logger, _connection_limiter
-    global _webhook_failures
+    global _webhook_failures, _authenticated_rate_limiter
 
     security_config = config or SecurityConfig()
     set_security_config(security_config)
@@ -543,6 +622,10 @@ def create_app(config: SecurityConfig | None = None) -> FastAPI:
 
     _rate_limiter = RateLimiter(
         max_requests=security_config.rate_limit_requests,
+        window=security_config.rate_limit_window,
+    )
+    _authenticated_rate_limiter = RateLimiter(
+        max_requests=security_config.rate_limit_authenticated_requests,
         window=security_config.rate_limit_window,
     )
     _brute_force = BruteForceProtection(
@@ -718,6 +801,28 @@ def verify_tls_material(config: SecurityConfig) -> tuple[str, str]:
     return certfile, keyfile
 
 
+async def _quiet_at_shutdown(call: Any) -> None:
+    """
+    Run a request, letting a cancellation at shutdown end it without a traceback.
+
+    uvicorn cancels a connection that is still open when it gives up waiting
+    (the graceful shutdown timeout, or a second Ctrl+C), and logs whatever the
+    task ends with as "Exception in ASGI application". The streams end on
+    their own when the server stops, so this only matters for one that did
+    not in time; the stop was asked for and is not an error. A cancellation
+    at any other time is re-raised: swallowing it would break whoever
+    cancelled.
+
+    Args:
+        call: The awaitable running the request.
+    """
+    try:
+        await call
+    except asyncio.CancelledError:
+        if not shutting_down():
+            raise
+
+
 class SecurityMiddleware:
     """
     Connection-level security for every scope the panel serves.
@@ -793,11 +898,10 @@ class SecurityMiddleware:
             )
             return
 
-        if (
-            config.rate_limit_enabled
-            and not _spends_no_rate_budget(scope, path)
-            and not get_rate_limiter().is_allowed(client_ip)
-        ):
+        rate: RateBucket | None = None
+        if config.rate_limit_enabled and not _spends_no_rate_budget(scope, path):
+            rate = rate_bucket(connection, client_ip)
+        if rate is not None and not rate.limiter.is_allowed(rate.key):
             await self._deny(
                 scope,
                 receive,
@@ -807,8 +911,14 @@ class SecurityMiddleware:
                 ws_code=WS_CLOSE_RATE_LIMITED,
                 detail="Too many requests. Please try again later.",
                 error="rate_limited",
+                hint=(
+                    "Wait for the time in Retry-After. The limits are "
+                    "web.rate_limit_requests (without a credential, per address) and "
+                    "web.rate_limit_authenticated_requests (per credential) in config.yaml."
+                ),
                 headers={
-                    "Retry-After": str(config.rate_limit_window),
+                    "Retry-After": str(rate.limiter.retry_after(rate.key)),
+                    "X-RateLimit-Limit": str(rate.limiter.max_requests),
                     "X-RateLimit-Remaining": "0",
                 },
             )
@@ -921,12 +1031,14 @@ class SecurityMiddleware:
                 return
             scope.setdefault("state", {})["session"] = session
             try:
-                await self.app(scope, receive, send)
+                await _quiet_at_shutdown(self.app(scope, receive, send))
             finally:
                 limiter.release(key)
             return
 
-        await self.app(scope, receive, self._wrap_send(scope, connection, client_ip, send))
+        await _quiet_at_shutdown(
+            self.app(scope, receive, self._wrap_send(scope, connection, client_ip, rate, send))
+        )
 
     def _body_limit(self, path: str) -> int:
         """
@@ -1036,7 +1148,12 @@ class SecurityMiddleware:
         return bearer_token(connection) is not None
 
     def _wrap_send(
-        self, scope: Scope, connection: HTTPConnection, client_ip: str, send: Send
+        self,
+        scope: Scope,
+        connection: HTTPConnection,
+        client_ip: str,
+        rate: RateBucket | None,
+        send: Send,
     ) -> Send:
         """
         Decorate the response as it leaves: cookies, audit and hardening.
@@ -1045,6 +1162,8 @@ class SecurityMiddleware:
             scope: The ASGI connection scope.
             connection: A view over the scope.
             client_ip: The resolved client address.
+            rate: The budget the request was counted in, reported in the
+                ``X-RateLimit-*`` headers; None for a request that spends none.
             send: The original ASGI send channel.
 
         Returns:
@@ -1056,11 +1175,9 @@ class SecurityMiddleware:
                 headers = MutableHeaders(scope=message)
                 self._harden_headers(headers, connection, int(message["status"]))
                 self._apply_renewed_session(scope, headers, connection)
-                if self.config.rate_limit_enabled:
-                    headers["X-RateLimit-Remaining"] = str(
-                        get_rate_limiter().get_remaining(client_ip)
-                    )
-                    headers["X-RateLimit-Limit"] = str(self.config.rate_limit_requests)
+                if rate is not None:
+                    headers["X-RateLimit-Remaining"] = str(rate.limiter.get_remaining(rate.key))
+                    headers["X-RateLimit-Limit"] = str(rate.limiter.max_requests)
                 self._audit_mutation(scope, client_ip, int(message["status"]))
                 # Beside the audit trail because it is the same question - did
                 # a mutation succeed - asked at the one place every API call
@@ -1378,10 +1495,10 @@ def _uvicorn_kwargs(
     ssl_keyfile: str | None,
 ) -> dict[str, Any]:
     """
-    Build the keyword arguments ``run_server`` hands to ``uvicorn.run``.
+    Build the keyword arguments ``run_server`` hands to ``uvicorn.Config``.
 
     Pulled out as its own pure function so the composition is testable
-    without binding a real socket: ``uvicorn.run`` blocks for the life of the
+    without binding a real socket: serving blocks for the life of the
     process and tests/conftest.py makes real network access fail, so nothing
     that actually starts the server can run in the suite.
 
@@ -1394,7 +1511,7 @@ def _uvicorn_kwargs(
             HTTP.
 
     Returns:
-        Keyword arguments for ``uvicorn.run``.
+        Keyword arguments for ``uvicorn.Config``.
     """
     return {
         "app": app,
@@ -1411,7 +1528,65 @@ def _uvicorn_kwargs(
         # exploit, and the panel's own hardening headers do not touch it: it
         # is uvicorn, not the application, that writes it.
         "server_header": False,
+        # An open stream must never hold shutdown: past this, uvicorn cancels
+        # what is still running. The streams end by themselves as soon as the
+        # server is asked to stop, so this is only the backstop.
+        **_graceful_shutdown_kwargs(),
     }
+
+
+#: Seconds uvicorn waits for open connections to finish when stopping.
+GRACEFUL_SHUTDOWN_SECONDS = 5
+
+
+def _graceful_shutdown_kwargs() -> dict[str, Any]:
+    """
+    Bound uvicorn's graceful shutdown, where the installed uvicorn can.
+
+    ``timeout_graceful_shutdown`` arrived in uvicorn 0.20; Debian 12 packages
+    0.17, which refuses an argument it does not know.
+
+    Returns:
+        ``{"timeout_graceful_shutdown": GRACEFUL_SHUTDOWN_SECONDS}``, or
+        nothing on an older uvicorn.
+    """
+    import uvicorn
+
+    if "timeout_graceful_shutdown" in inspect.signature(uvicorn.Config.__init__).parameters:
+        return {"timeout_graceful_shutdown": GRACEFUL_SHUTDOWN_SECONDS}
+    return {}
+
+
+def _serve(kwargs: dict[str, Any]) -> None:
+    """
+    Run uvicorn until it is told to stop, ending the open streams when it is.
+
+    uvicorn takes SIGINT and SIGTERM for itself, so the one place to learn
+    that the server is stopping is its own signal handler. The handler only
+    schedules :func:`~wasm.web.events.begin_shutdown` on the loop: a signal
+    handler interrupts whatever the main thread was doing, and that may be
+    holding a lock ``begin_shutdown`` takes.
+
+    Args:
+        kwargs: What :func:`_uvicorn_kwargs` built.
+    """
+    import uvicorn
+
+    class ConsoleServer(uvicorn.Server):
+        """uvicorn's server, telling the event streams when it is asked to stop."""
+
+        loop: asyncio.AbstractEventLoop | None = None
+
+        async def serve(self, sockets: Any = None) -> None:
+            self.loop = asyncio.get_running_loop()
+            await super().serve(sockets=sockets)
+
+        def handle_exit(self, sig: int, frame: Any) -> None:
+            if self.loop is not None:
+                self.loop.call_soon_threadsafe(begin_shutdown)
+            super().handle_exit(sig, frame)
+
+    ConsoleServer(uvicorn.Config(**kwargs)).run()
 
 
 def run_server(
@@ -1450,7 +1625,9 @@ def run_server(
             bind address is reachable from another machine without TLS and
             without ``insecure_http``.
     """
-    import uvicorn
+    # Imported before the token is issued and printed, so a missing uvicorn
+    # fails here rather than after the operator was handed a token.
+    import uvicorn  # noqa: F401
 
     if config is None:
         config = SecurityConfig(host=host, port=port)
@@ -1485,4 +1662,4 @@ def run_server(
         print("\n".join(startup_banner(master_token, banner_address(host), port, scheme)))
         print(flush=True)
 
-    uvicorn.run(**_uvicorn_kwargs(app, host, port, ssl_certfile, ssl_keyfile))
+    _serve(_uvicorn_kwargs(app, host, port, ssl_certfile, ssl_keyfile))

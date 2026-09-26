@@ -2835,6 +2835,52 @@ class WASMStore:
             cursor.execute(f"UPDATE jobs SET {', '.join(updates)} WHERE id = ?", params)
             return cursor.rowcount > 0
 
+    def save_job(self, job: JobRecord) -> JobRecord:
+        """
+        Write a job's current state, creating the row if it does not exist yet.
+
+        One statement, so it is atomic: the job manager records a job from the
+        request thread that queues it and from the worker that starts it, and
+        an update-then-insert pair lets both see "no row" and the second
+        insert fail on the primary key, losing that write. The identity
+        columns (type, name, description, total steps, actor, creation time)
+        are only ever set by the insert. ``domain`` and ``log_path`` keep
+        their stored value when the snapshot has none, so a late notification
+        after the log was closed does not erase where it lives.
+
+        ``ON CONFLICT ... DO UPDATE`` needs SQLite 3.24 (2018); every
+        supported distribution's Python ships a newer one.
+
+        Args:
+            job: The job's full current state.
+
+        Returns:
+            The job, with ``created_at`` filled in when the caller left it
+            blank.
+        """
+        if not job.created_at:
+            job.created_at = datetime.now().isoformat()
+
+        data = job.to_dict()
+        columns = ", ".join(data.keys())
+        placeholders = ", ".join(["?" for _ in data])
+        with self._transaction() as cursor:
+            cursor.execute(
+                f"INSERT INTO jobs ({columns}) VALUES ({placeholders}) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "status = excluded.status, "
+                "progress = excluded.progress, "
+                "error = excluded.error, "
+                "result_json = excluded.result_json, "
+                "started_at = excluded.started_at, "
+                "finished_at = excluded.finished_at, "
+                "domain = COALESCE(excluded.domain, jobs.domain), "
+                "log_path = COALESCE(excluded.log_path, jobs.log_path)",
+                list(data.values()),
+            )
+
+        return job
+
     def get_job(self, job_id: str) -> JobRecord | None:
         """
         Get a job by id.

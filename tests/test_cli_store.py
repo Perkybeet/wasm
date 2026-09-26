@@ -30,6 +30,7 @@ from wasm.cli import app as app_module
 from wasm.cli.commands import store as store_module
 from wasm.core.exceptions import ConfigError
 from wasm.core.logger import Logger
+from wasm.core.utils import domain_to_app_name
 
 #: Flags the root group owns. A subcommand that declares one of them again is
 #: the shadowing defect the Click migration exists to remove.
@@ -388,6 +389,16 @@ def test_sync_writes_back_only_what_changed(
                 verbose: Ignored; present to match the real signature.
             """
             self.verbose = verbose
+
+        def app_units(self, app: Any) -> list[str]:
+            """
+            Args:
+                app: The application.
+
+            Returns:
+                The unit it is named after, as ServiceManager.app_units names it.
+            """
+            return [] if app.is_static else [domain_to_app_name(app.domain)]
 
         def get_status(self, name: str) -> dict[str, bool]:
             """

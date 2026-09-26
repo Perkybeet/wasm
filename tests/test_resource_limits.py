@@ -52,6 +52,11 @@ SNAPSHOT = """\
 Description=WASM: shop.example.com (nodejs)
 Documentation=https://github.com/Perkybeet/wasm
 After=network.target
+# A transient failure is retried; a hopeless one (a missing script, a missing
+# binary) ends in `failed` after five starts in five minutes instead of looping
+# every RestartSec forever. Deliberate starts clear the counter first.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple

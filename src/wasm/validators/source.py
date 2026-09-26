@@ -114,7 +114,7 @@ def parse_git_url(url: str) -> dict:
     match = GIT_SSH_PATTERN.match(url)
     if match:
         result["host"] = match.group("host")
-        path_parts = match.group("path").rstrip(".git").split("/")
+        path_parts = match.group("path").removesuffix(".git").split("/")
         if len(path_parts) >= 2:
             result["owner"] = path_parts[0]
             result["repo"] = path_parts[1]
@@ -128,7 +128,7 @@ def parse_git_url(url: str) -> dict:
     match = GIT_HTTPS_PATTERN.match(url) or GIT_PROTOCOL_PATTERN.match(url)
     if match:
         result["host"] = match.group("host")
-        path_parts = match.group("path").rstrip(".git").split("/")
+        path_parts = match.group("path").removesuffix(".git").split("/")
         if len(path_parts) >= 2:
             result["owner"] = path_parts[0]
             result["repo"] = path_parts[1]

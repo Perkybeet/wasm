@@ -62,6 +62,10 @@ SECRET_FILE_MODE = SECRET_MODE
 DEFAULT_CONFIG_PATH = Path("/etc/wasm/config.yaml")
 DEFAULT_APPS_DIR = Path("/var/www/apps")
 DEFAULT_LOG_DIR = Path("/var/log/wasm")
+#: Where backups go when ``backup.directory`` is unset or empty. It lives here,
+#: not in the backup manager, so the config chokepoint and every reader resolve
+#: an empty value to the same place.
+DEFAULT_BACKUP_DIR = Path("/var/backups/wasm")
 
 # Nginx paths
 NGINX_SITES_AVAILABLE = Path("/etc/nginx/sites-available")
@@ -118,7 +122,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "monitor": {
         "enabled": False,
-        "scan_interval": 30,  # Local pattern scan every 30 seconds
+        # Seconds between scans, and so the longest a failed unit can go
+        # unannounced. Matches process_monitor.DEFAULT_SCAN_INTERVAL.
+        "scan_interval": 60,
         "cpu_threshold": 80.0,
         "memory_threshold": 80.0,
         "log_file": str(DEFAULT_LOG_DIR / "monitor.log"),
@@ -173,6 +179,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # unnoticed exactly as long as this section was ignored.
         "rate_limit_enabled": True,
         "rate_limit_requests": 120,
+        "rate_limit_authenticated_requests": 1200,
         "rate_limit_window": 60,
         "max_failed_attempts": 5,
         "lockout_duration": 900,
@@ -278,6 +285,85 @@ def _validate_absolute_path(label: str) -> Callable[[Any], str]:
     return validator
 
 
+def resolve_backup_directory(value: Any, default: Path = DEFAULT_BACKUP_DIR) -> Path:
+    """
+    Turn a stored ``backup.directory`` into the directory backups really go to.
+
+    This is the only interpretation of the setting. ``Path('')`` is the current
+    working directory, and ``backup.directory: ''`` - written by the 1.x
+    panel's settings form, whose field rendered empty because the section had
+    no default - sent every backup to ``/root/<app>/`` when an operator ran
+    wasm from ``/root`` and to ``/<app>/`` when a timer did. So empty means
+    the default, and a relative path is refused, never resolved against
+    whatever directory the caller happens to be in.
+
+    Args:
+        value: The stored value; None, empty or whitespace mean "not set".
+        default: Directory used when the value is not set. The backup manager
+            passes its own class attribute so a sandbox can redirect it.
+
+    Returns:
+        An absolute directory.
+
+    Raises:
+        ConfigError: When the value is set to a relative path.
+    """
+    text = "" if value is None else str(value).strip()
+    if not text:
+        return default
+    path = Path(text)
+    if not path.is_absolute():
+        raise ConfigError(
+            "backup.directory must be an absolute path",
+            details=(
+                f"Got {text!r}, which would depend on the directory wasm is started from. "
+                f"Run 'wasm config set backup.directory {DEFAULT_BACKUP_DIR}' (or any path "
+                "starting with '/'), or set it to '' to use the default."
+            ),
+        )
+    return path
+
+
+def _validate_backup_directory(value: Any) -> str:
+    """
+    Refuse a relative backup directory and store an empty one as the default.
+
+    Args:
+        value: The candidate value, from either front end.
+
+    Returns:
+        The absolute directory, as a string.
+
+    Raises:
+        ConfigError: When the value is a relative path.
+    """
+    return str(resolve_backup_directory(value))
+
+
+def _forget_blank_backup_directory(tree: dict[str, Any]) -> None:
+    """
+    Treat a stored ``backup.directory: ''`` as not set, in memory only.
+
+    The file is deliberately not rewritten here. The configuration is loaded
+    by every command, read-only ones and ``--dry-run`` included, and by the
+    console while the CLI may be writing the same file: a write on load would
+    change ``/etc/wasm/config.yaml`` without anyone asking, would behave
+    differently under a rehearsal, and could race the real writer. Dropping
+    the key gives exactly the behaviour a rewrite would, and the next write
+    through :meth:`Config.set` or :meth:`Config.replace` persists it.
+
+    Args:
+        tree: The configuration just merged from the file, changed in place.
+    """
+    section = tree.get("backup")
+    if not isinstance(section, dict) or "directory" not in section:
+        return
+    stored = section["directory"]
+    if stored is None or (isinstance(stored, str) and not stored.strip()):
+        del section["directory"]
+        logger.debug("Treating an empty backup.directory as the default %s", DEFAULT_BACKUP_DIR)
+
+
 def _int_range_validator(label: str, low: int, high: int) -> Callable[[Any], int]:
     """
     Build a validator that requires a whole number in a closed range.
@@ -323,6 +409,9 @@ _KEY_VALIDATORS: dict[str, Callable[[Any], Any]] = {
     # dotted alias, resolved to this key by _canonical_key() before a
     # validator is even looked up - see KEY_ALIASES.
     "apps_directory": _validate_absolute_path("apps_directory"),
+    # Empty is stored as the default; relative is refused. See
+    # resolve_backup_directory for the server this came from.
+    "backup.directory": _validate_backup_directory,
 }
 
 
@@ -1015,6 +1104,7 @@ class Config:
             else:
                 if isinstance(file_config, dict):
                     self._config = self._deep_merge(self._config, _strip_removed_keys(file_config))
+                    _forget_blank_backup_directory(self._config)
 
         # Override with environment variables
         self._load_env_overrides()
@@ -1134,6 +1224,14 @@ class Config:
             return
 
         value = _validate_known_value(key, value)
+        if isinstance(value, dict):
+            # A whole section written at once ("backup" with a dict) must meet
+            # the same per-key rules as writing its keys one by one.
+            value = copy.deepcopy(value)
+            wrapper: dict[str, Any] = value
+            for part in reversed(key.split(".")):
+                wrapper = {part: wrapper}
+            _validate_known_values_in(wrapper)
 
         keys = key.split(".")
         config = self._config
@@ -1193,6 +1291,20 @@ class Config:
     def apps_directory(self) -> Path:
         """Get the applications directory path."""
         return Path(str(self.get("apps_directory", str(DEFAULT_APPS_DIR))))
+
+    @property
+    def backup_directory(self) -> Path:
+        """
+        The directory backups are written to.
+
+        Returns:
+            An absolute directory; the default when the setting is unset or
+            empty.
+
+        Raises:
+            ConfigError: When the stored value is a relative path.
+        """
+        return resolve_backup_directory(self.get("backup.directory"))
 
     @property
     def webserver(self) -> str:

@@ -259,6 +259,63 @@ What does not come back:
 - Deployment history, jobs and audit entries recorded under 2.0 (kept in
   `/var/lib/wasm.2.0` and `/etc/wasm.2.0`).
 
+## 2.0.1
+
+**Backups: check where yours went**
+
+A configuration with a blank `backup.directory` (which the 1.x settings form saved) made
+every backup land in the directory `wasm` ran from: `/root/<app>/` when run from root's home,
+`/<app>/` for scheduled backups. 2.0.1 reads blank as `/var/backups/wasm` and refuses a
+relative path. After upgrading:
+
+```bash
+wasm backup storage                    # names the directories where it found backups
+wasm --dry-run backup import /root     # what would move
+wasm backup import /root               # and again with / if it was listed
+```
+
+`import` moves only complete WASM backups (archive and metadata), never overwrites, and
+leaves everything else where it is.
+
+**Other changes you may notice**
+
+- Git never asks for credentials: a private repository over HTTPS fails at once with how to
+  fix it, instead of waiting ten minutes. Use its SSH URL with the key `wasm setup ssh
+  --show` prints, or a git credential helper.
+- The PostgreSQL read-only console asks the server which port it listens on. Set
+  `databases.credentials.postgresql.port` only to override that.
+- Signed-in requests count against `web.rate_limit_authenticated_requests` (1200 a minute)
+  per credential; `web.rate_limit_requests` (120 a minute per address) now applies to
+  requests without a valid credential.
+
+**Units**
+
+- Units written from 2.0.1 on carry `StartLimitIntervalSec=300` and `StartLimitBurst=5` in
+  their `[Unit]` section. A unit that fails five starts within five minutes now ends in
+  `failed` instead of restarting every ten seconds forever. WASM clears that counter before
+  it starts or restarts a unit itself (deploy, update, rollback, `wasm restart`).
+- **Units already on disk are not rewritten by the upgrade.** They keep their content,
+  without a start limit, until the application is deployed again. `wasm update` does not
+  rewrite the unit.
+- An application redeployed or updated as a type that runs no process (a static site, or a
+  Vite build served as files) loses the unit a previous type left, as the last step of that
+  deploy or update. The unit is stopped, disabled and deleted through the same ownership check
+  as `wasm service delete`. A server that already has such a unit crash-looping (for example,
+  an application first deployed as Next.js and later as Vite) is cleaned up by the next
+  `wasm update DOMAIN`, or at once with `wasm service delete APP_NAME`.
+
+**Monitor**
+
+- The monitor now watches every unit WASM manages. `monitor.watch_units` adds units to that
+  set; before, it was the whole set, and it was empty by default, so `unit_failed` never
+  fired.
+- `unit_failed` means a failure: a unit in `failed`, a crash loop (automatic restarts growing
+  between two scans), or a unit that stopped after a failed run. A unit stopped on purpose
+  does not alert.
+- The default `monitor.scan_interval` is 60 seconds (it was 30 in the configuration defaults).
+  A value you set is kept. When it is above 300, `wasm monitor status` warns that a failure
+  may go unnoticed that long.
+
 ## Known limitations in 2.0
 
 **Deploy engine**

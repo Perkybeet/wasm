@@ -989,6 +989,7 @@ def test_config_yaml_security_keys_apply_without_flags(
         lockout_duration=120,
         rate_limit_enabled=False,
         rate_limit_requests=42,
+        rate_limit_authenticated_requests=4200,
         rate_limit_window=30,
         token_expiration_hours=2,
         ip_whitelist=["10.0.0.8"],
@@ -1002,6 +1003,7 @@ def test_config_yaml_security_keys_apply_without_flags(
     assert config.lockout_duration == 120
     assert config.rate_limit_enabled is False
     assert config.rate_limit_requests == 42
+    assert config.rate_limit_authenticated_requests == 4200
     assert config.rate_limit_window == 30
     assert config.token_expiration_hours == 2
     assert config.ip_whitelist == ["10.0.0.8"]
@@ -1042,6 +1044,7 @@ def test_shipped_defaults_apply_when_nothing_is_declared(
         "lockout_duration",
         "rate_limit_enabled",
         "rate_limit_requests",
+        "rate_limit_authenticated_requests",
         "rate_limit_window",
         "token_expiration_hours",
     ):
@@ -1064,6 +1067,9 @@ def test_the_config_defaults_agree_with_the_enforcement_defaults() -> None:
 
     assert shipped["rate_limit_enabled"] == defaults.rate_limit_enabled
     assert shipped["rate_limit_requests"] == defaults.rate_limit_requests
+    assert (
+        shipped["rate_limit_authenticated_requests"] == defaults.rate_limit_authenticated_requests
+    )
     assert shipped["rate_limit_window"] == defaults.rate_limit_window
     assert shipped["max_failed_attempts"] == defaults.max_failed_attempts
     assert shipped["lockout_duration"] == defaults.lockout_duration
@@ -1539,7 +1545,7 @@ def test_the_daemon_child_serves_the_token_its_parent_printed(
     from wasm.web.server import run_server
 
     issued = TokenManager(SecurityConfig()).generate_master_token()
-    monkeypatch.setattr("uvicorn.run", lambda **kwargs: None)
+    monkeypatch.setattr("wasm.web.server._serve", lambda kwargs: None)
 
     run_server(host="127.0.0.1", port=8081, config=SecurityConfig(), show_token=False)
 

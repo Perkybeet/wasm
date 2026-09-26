@@ -2031,7 +2031,11 @@ export interface paths {
          *         session: Authenticated session, injected by the dependency.
          *
          *     Returns:
-         *         The backup directory and the retention limit.
+         *         The backup directory, as every backup reader resolves it, and the
+         *         retention limit.
+         *
+         *     Raises:
+         *         ConfigError: When the stored directory is a relative path.
          */
         get: operations["get_backup_config_api_config_backup_get"];
         /**
@@ -2047,6 +2051,9 @@ export interface paths {
          *         Confirmation message.
          *
          *     Raises:
+         *         ConfigError: When the directory is a relative path; an empty one is
+         *             stored as the default. The rule is Config.set's, the same one
+         *             'wasm config set backup.directory' meets.
          *         HTTPException: If the configuration cannot be written.
          */
         put: operations["update_backup_config_api_config_backup_put"];
@@ -4125,11 +4132,13 @@ export interface paths {
          * List Services
          * @description List services.
          *
-         *     ``wasm_only`` (the default) scopes the listing to what the store
-         *     tracks - the units WASM itself created. Set it to false for a full
-         *     inventory of every unit on the host, each flagged ``managed``, which is
-         *     how a diagnostics view tells a foreign unit's own crash loop from one of
-         *     WASM's own.
+         *     ``wasm_only`` (the default) lists the units WASM manages - the one
+         *     definition in :meth:`~wasm.managers.service_manager.ServiceManager.managed_units`
+         *     the console's top bar counts too, so the two always agree. Set it to false
+         *     for a full inventory of every unit on the host, each flagged ``managed``,
+         *     which is how a diagnostics view tells a foreign unit's own crash loop from
+         *     one of WASM's own. A foreign unit carries only its state: it is listed
+         *     from systemd's own listing, never probed or acted on.
          */
         get: operations["list_services_api_services_get"];
         put?: never;
@@ -4183,6 +4192,13 @@ export interface paths {
         /**
          * Get Service
          * @description Get details for a specific service.
+         *
+         *     Answers for a unit WASM manages, whether or not the store's services
+         *     table has a row for it (since 0.14.1 an application's unit is named after
+         *     the application and may have none). Any other unit is a 404, which is how
+         *     the console knows to describe it from the all-units listing instead;
+         *     systemd's own escaped names (``systemd-fsck@dev-disk-by\x2dlabel-BOOT``)
+         *     arrive URL-encoded and get that 404, not a 400.
          */
         get: operations["get_service_api_services__name__get"];
         put?: never;
@@ -5445,7 +5461,7 @@ export interface components {
         BackupConfig: {
             /**
              * Directory
-             * @description Backup storage directory
+             * @description Backup storage directory: an absolute path, or empty for the default
              * @default /var/backups/wasm
              */
             directory: string;
@@ -5609,12 +5625,21 @@ export interface components {
         /**
          * BackupStorageResponse
          * @description Response describing how much disk the backups take.
+         *
+         *     Attributes:
+         *         domains: The applications holding backups in ``path``; directories
+         *             with no WASM backup in them are not listed.
+         *         misplaced: Backups found elsewhere - in the old default directory, or
+         *             where an empty ``backup.directory`` sent them - each with the
+         *             ``wasm backup import`` command that moves them into ``path``.
          */
         BackupStorageResponse: {
             /** Backup Count */
             backup_count: number;
             /** Domains */
             domains: string[];
+            /** Misplaced */
+            misplaced?: components["schemas"]["MisplacedBackupsInfo"][];
             /** Path */
             path: string;
             /** Total Size */
@@ -7289,6 +7314,18 @@ export interface components {
             warnings: string[];
         };
         /**
+         * MisplacedBackupsInfo
+         * @description WASM backups found outside the backup directory, and how to bring them in.
+         */
+        MisplacedBackupsInfo: {
+            /** Command */
+            command: string;
+            /** Count */
+            count: number;
+            /** Directory */
+            directory: string;
+        };
+        /**
          * MonitorActionResponse
          * @description Outcome of a systemd action against the monitor unit, or of acknowledging
          *     an observation - every handler below answers exactly these two fields.
@@ -7861,9 +7898,10 @@ export interface components {
          * @description Service information.
          *
          *     Attributes:
-         *         managed: Whether this unit was created by WASM. Always true for a
-         *             service reached through the store; may be false when listing
-         *             with ``wasm_only=false``, which walks every unit on the host.
+         *         managed: Whether WASM manages this unit. False only when listing with
+         *             ``wasm_only=false``, which walks every unit on the host; such a
+         *             row carries systemd's state fields and nothing else (``enabled``
+         *             false, no PID, memory or uptime), read from the one listing.
          *         active_state: Systemd's own ``ActiveState`` (``active``, ``failed``,
          *             ``activating``, ...). Distinguishes a unit systemd is repeatedly
          *             restarting from one that is cleanly stopped, which ``active``

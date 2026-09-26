@@ -439,7 +439,9 @@ def _engines(*, json_output: bool, logger: Logger) -> int:
                     "display_name": manager.DISPLAY_NAME,
                     "installed": manager.is_installed(),
                     "version": manager.get_version() if manager.is_installed() else None,
-                    "port": manager.DEFAULT_PORT,
+                    "port": manager.server_port()
+                    if manager.is_installed()
+                    else manager.DEFAULT_PORT,
                 }
             )
 
@@ -507,7 +509,7 @@ def _create(
             name=name,
             engine=manager.ENGINE_NAME,
             host="localhost",
-            port=manager.DEFAULT_PORT,
+            port=manager.server_port(),
             username=owner,
             encoding=encoding,
         )

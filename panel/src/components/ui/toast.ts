@@ -5,11 +5,15 @@ export type ToastKind = "success" | "error" | "warning" | "info";
 export interface ToastData {
   /** The system's own output, shown verbatim in mono under the description. */
   detail?: string;
+  /** A failing tool's own output (psql's, git's or nginx's), verbatim, apart from `detail`. */
+  output?: string;
 }
 
 export interface ToastOptions {
   description?: string;
   detail?: string;
+  /** A failing tool's own output, verbatim, when it differs from `detail`. Never paraphrase it. */
+  output?: string;
   action?: { label: string; onClick: () => void };
   /** Milliseconds before dismissal; 0 keeps it until closed. Errors default to 0. */
   timeout?: number;
@@ -29,7 +33,12 @@ export function isUrgent(kind: string | undefined): boolean {
 }
 
 function add(kind: ToastKind, title: string, options: ToastOptions = {}): string {
-  const { description, detail, action, timeout, id } = options;
+  const { description, detail, output, action, timeout, id } = options;
+  const data: ToastData = {
+    ...(detail !== undefined ? { detail } : {}),
+    // Never the same text twice: a tool whose output is its whole error carries nothing extra.
+    ...(output !== undefined && output !== detail ? { output } : {}),
+  };
   return toastManager.add<ToastData>({
     title,
     type: kind,
@@ -38,7 +47,7 @@ function add(kind: ToastKind, title: string, options: ToastOptions = {}): string
     // Urgency is carried by the kind instead, and <ToastProvider> announces it (isUrgent).
     priority: "low",
     timeout: timeout ?? (kind === "error" ? 0 : 5000),
-    data: detail !== undefined ? { detail } : {},
+    data,
     ...(description !== undefined ? { description } : {}),
     ...(id !== undefined ? { id } : {}),
     ...(action ? { actionProps: { children: action.label, onClick: action.onClick } } : {}),

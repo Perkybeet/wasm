@@ -348,8 +348,11 @@ def plan_migration(
             "the next one: " + ", ".join(left[:10]) + (" ..." if len(left) > 10 else "")
         )
 
-    unit = None if app.is_static else _unit_name(app, get_store())
-    unit_text = ServiceManager().get_service_config(unit) if unit else None
+    services = ServiceManager()
+    # app_units is the one mapping from an application to its unit, legacy
+    # prefix included; a static application has none.
+    unit = next(iter(services.app_units(app)), None)
+    unit_text = services.get_service_config(unit) if unit else None
     site_text = _webserver_for(app).get_site_config(app.domain)
     warnings.append(_downtime(unit))
 
@@ -720,21 +723,6 @@ def _is_real_dir(path: Path) -> bool:
         True for a real directory.
     """
     return path.is_dir() and not path.is_symlink()
-
-
-def _unit_name(app: App, store: WASMStore) -> str:
-    """
-    Name the unit an application runs as.
-
-    Args:
-        app: The application.
-        store: Where its service row is.
-
-    Returns:
-        The service row's name, or the directory name units are given.
-    """
-    service = store.get_service_by_app_id(app.id) if app.id is not None else None
-    return service.name if service is not None else app_root(app).name
 
 
 def _webserver_for(app: App) -> NginxManager | ApacheManager:

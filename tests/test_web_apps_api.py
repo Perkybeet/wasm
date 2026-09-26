@@ -50,6 +50,16 @@ class _FakeServiceManager:
         self.statuses = statuses
         self.asked: list[str] = []
 
+    def app_units(self, app: Any) -> list[str]:
+        """
+        Args:
+            app: The application.
+
+        Returns:
+            The unit it is named after, as ServiceManager.app_units names it.
+        """
+        return [] if app.is_static else [domain_to_app_name(app.domain)]
+
     def get_status(self, name: str) -> dict[str, Any]:
         """
         Args:

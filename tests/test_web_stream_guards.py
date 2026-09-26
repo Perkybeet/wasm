@@ -183,6 +183,7 @@ def test_the_log_stream_follows_a_unit_wasm_manages(
         "type": "connected",
         "domain": "app.example.com",
         "service": "app-example-com",
+        "services": ["app-example-com"],
     }
     assert line["type"] == "log"
     assert spawned and spawned[0][:3] == ("journalctl", "-u", "app-example-com.service")

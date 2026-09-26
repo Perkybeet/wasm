@@ -4,8 +4,10 @@ Process and resource observability for WASM.
 **What it measures.** CPU, memory, swap, load average, per-filesystem capacity,
 network counters and uptime for the machine; the process table, of which it
 writes down only processes over a resource threshold or carrying a known
-malware executable name; and the ``systemctl is-active``/``is-enabled`` state
-of the units listed in ``monitor.watch_units``.
+malware executable name; and the state of every unit WASM manages plus the
+units listed in ``monitor.watch_units``, read with one ``systemctl show`` per
+scan. A unit that fails or crash-loops is announced as ``unit_failed``; one
+stopped on purpose is not.
 
 **How often.** Once every ``monitor.scan_interval`` seconds, at least
 :data:`MIN_SCAN_INTERVAL`, 60 by default. Resource metrics are read live and
@@ -55,8 +57,12 @@ from wasm.monitor.process_monitor import (
     DEFAULT_SCAN_INTERVAL,
     MIN_SCAN_INTERVAL,
     MONITOR_SCOPE,
+    SCAN_INTERVAL_WARNING_SECONDS,
     MonitorConfig,
     ProcessMonitor,
+    UnitFailure,
+    scan_interval_warning,
+    unit_failure,
 )
 from wasm.monitor.signals import is_known_safe, observe_process, observe_processes
 
@@ -72,6 +78,7 @@ __all__ = [
     "MAX_COMMAND_LENGTH",
     "MIN_SCAN_INTERVAL",
     "MONITOR_SCOPE",
+    "SCAN_INTERVAL_WARNING_SECONDS",
     "SEVERITY_NOTICE",
     "SEVERITY_WARNING",
     "SIGNAL_NAME_PATTERN",
@@ -86,6 +93,7 @@ __all__ = [
     "ResourceMetrics",
     "SMTPConfig",
     "ServiceHealth",
+    "UnitFailure",
     "collect_resource_metrics",
     "collect_service_health",
     "default_db_path",
@@ -93,4 +101,6 @@ __all__ = [
     "list_processes",
     "observe_process",
     "observe_processes",
+    "scan_interval_warning",
+    "unit_failure",
 ]

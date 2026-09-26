@@ -24,6 +24,24 @@ export interface ChannelField {
   /** Secrets are write-only: masked while typed and never read back. */
   secret: boolean;
   placeholder: string;
+  /** Help shown under the field regardless of what is typed: format, consequence, default. */
+  description?: string;
+  /** A non-blocking warning shown under the field when what is typed looks like a mistake. */
+  warn?: (value: string) => string | null;
+}
+
+/**
+ * Telegram gives a bot's own chat a small positive ID, but a group or supergroup one that is
+ * negative (a supergroup's starts with -100). Typing the group's number without its minus sign
+ * is the one mistake that looks valid (it is still digits) and sends nothing, silently, because
+ * the bot API answers "chat not found" for an ID that belongs to no chat it can reach - so this
+ * warns before saving instead of after the first message never arrives. 13+ digits is a
+ * supergroup's own id range with the sign stripped; a personal chat's id is far shorter.
+ */
+export function telegramChatIdWarning(value: string): string | null {
+  const trimmed = value.trim();
+  if (!/^\d{13,}$/.test(trimmed)) return null;
+  return `This looks like a group's chat ID without its minus sign. Groups and supergroups use a negative ID (a supergroup's starts with -100); try -${trimmed}.`;
 }
 
 export interface ChannelSpec {
@@ -59,7 +77,14 @@ export const CHANNELS: readonly ChannelSpec[] = [
     description: "Your bot sends the message to one chat.",
     fields: [
       { key: "bot_token", label: "Bot token", secret: true, placeholder: "123456789:AAH..." },
-      { key: "chat_id", label: "Chat ID", secret: false, placeholder: "-1001234567890" },
+      {
+        key: "chat_id",
+        label: "Chat ID",
+        secret: false,
+        placeholder: "-1001234567890",
+        description: "A group or supergroup's chat ID is negative, and a supergroup's starts with -100. A personal chat's is a smaller positive number.",
+        warn: telegramChatIdWarning,
+      },
     ],
   },
   {

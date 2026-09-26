@@ -87,14 +87,32 @@ class BackupListResponse(BaseModel):
     total: int
 
 
+class MisplacedBackupsInfo(BaseModel):
+    """WASM backups found outside the backup directory, and how to bring them in."""
+
+    directory: str
+    count: int
+    command: str
+
+
 class BackupStorageResponse(BaseModel):
-    """Response describing how much disk the backups take."""
+    """
+    Response describing how much disk the backups take.
+
+    Attributes:
+        domains: The applications holding backups in ``path``; directories
+            with no WASM backup in them are not listed.
+        misplaced: Backups found elsewhere - in the old default directory, or
+            where an empty ``backup.directory`` sent them - each with the
+            ``wasm backup import`` command that moves them into ``path``.
+    """
 
     path: str
     total_size: int
     total_size_human: str
     backup_count: int
     domains: list[str]
+    misplaced: list[MisplacedBackupsInfo] = Field(default_factory=list)
 
 
 class CreateBackupRequest(BaseModel):
@@ -268,6 +286,12 @@ def get_storage_info(
         total_size_human=_human_size(total_size),
         backup_count=int(usage["total_backups"]),
         domains=sorted(usage["by_app"]),
+        misplaced=[
+            MisplacedBackupsInfo(
+                directory=str(found.directory), count=found.count, command=found.command
+            )
+            for found in manager.find_misplaced_backups()
+        ],
     )
 
 

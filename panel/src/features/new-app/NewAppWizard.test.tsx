@@ -221,6 +221,26 @@ describe("the new-app wizard", () => {
     expect(screen.getByText("Name or service not known")).toBeInTheDocument();
   });
 
+  it("shows git's own output verbatim for a private repository, with the backend's real fix", async () => {
+    const { harness } = wizard({
+      "POST /api/apps/inspect": () =>
+        problem(400, "sourceerror", "Could not access git@github.com:acme/storefront.git", {
+          hint: "This looks like a private repository. Add a deploy key, or embed a token in the URL.",
+          output: "git@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository.",
+        }),
+    });
+    const { user, container } = harness;
+    await screen.findByRole("heading", { level: 1, name: "New application" });
+    await user.type(screen.getByLabelText("Repository or directory"), "git@github.com:acme/storefront.git");
+    await user.click(screen.getByRole("button", { name: "Inspect source" }));
+    // The short sentence is on the field, where the operator is already looking.
+    expect(await screen.findByText("Could not access git@github.com:acme/storefront.git")).toBeInTheDocument();
+    // The block below carries git's own report and the backend's actionable fix, verbatim.
+    expect(screen.getByText("This looks like a private repository. Add a deploy key, or embed a token in the URL.")).toBeInTheDocument();
+    expect(screen.getByText(/Permission denied \(publickey\)/)).toBeInTheDocument();
+    await expectNoAxeViolations(container);
+  });
+
   it("offers www and resource limits, and sends them in the deploy request", async () => {
     const { backend, harness } = wizard();
     const { user } = harness;

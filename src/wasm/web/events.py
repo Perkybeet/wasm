@@ -289,15 +289,63 @@ class EventHub:
             name: Event name.
             payload: JSON body.
         """
-        frame = format_event(name, payload)
+        self._deliver(format_event(name, payload))
+
+    def wake(self) -> None:
+        """Hand every open stream :data:`WAKE_FRAME`, so it looks up from its wait."""
+        self._deliver(WAKE_FRAME)
+
+    def _deliver(self, frame: str) -> None:
+        """
+        Hand one frame to every listener attached right now.
+
+        Args:
+            frame: The frame to deliver.
+        """
         with self._lock:
             listeners = list(self._listeners)
         for listener in listeners:
             listener(frame)
 
 
+#: Not a frame at all: what :meth:`EventHub.wake` queues so a stream waiting
+#: for its next event returns to the top of its loop and sees the server is
+#: stopping. Never written to the wire.
+WAKE_FRAME = ""
+
 #: The process-wide hub every stream attaches to.
 hub = EventHub()
+
+#: Set once the server has been asked to stop.
+_closing = threading.Event()
+
+
+def begin_shutdown() -> None:
+    """
+    End every open stream, because the server is stopping.
+
+    Scheduled on the event loop by the server's signal handler, before
+    uvicorn waits for open connections to finish. A stream never finishes by
+    itself, so without this a Ctrl+C with a console tab open either waited
+    for the tab forever or, on a second Ctrl+C, cancelled the stream
+    mid-await and printed its ``CancelledError`` traceback. Ending the
+    response instead lets uvicorn close the connection like any finished
+    request.
+
+    Not to be called from the signal handler itself: it takes locks the
+    interrupted code may be holding.
+    """
+    _closing.set()
+    hub.wake()
+
+
+def shutting_down() -> bool:
+    """
+    Returns:
+        Whether :func:`begin_shutdown` has been called in this process.
+    """
+    return _closing.is_set()
+
 
 #: Job types whose progress and outcome change what an application looks like.
 #: ``restore`` is the rollback job; certificate jobs carry a domain too but
@@ -638,7 +686,7 @@ async def _stream(request: Request, session: dict[str, Any] | None = None) -> As
         recheck_at = now + CREDENTIAL_RECHECK_SECONDS
 
         while True:
-            if await request.is_disconnected():
+            if shutting_down() or await request.is_disconnected():
                 return
 
             now = loop.time()
@@ -664,12 +712,15 @@ async def _stream(request: Request, session: dict[str, Any] | None = None) -> As
 
             timeout = min(metrics_at, machine_at, heartbeat_at, recheck_at) - loop.time()
             try:
-                yield await asyncio.wait_for(queue.get(), timeout=max(0.0, timeout))
-                heartbeat_at = loop.time() + HEARTBEAT_SECONDS
+                frame = await asyncio.wait_for(queue.get(), timeout=max(0.0, timeout))
             except asyncio.TimeoutError:
                 if loop.time() >= heartbeat_at:
                     yield ": keepalive\n\n"
                     heartbeat_at = loop.time() + HEARTBEAT_SECONDS
+                continue
+            if frame != WAKE_FRAME:
+                yield frame
+                heartbeat_at = loop.time() + HEARTBEAT_SECONDS
     finally:
         manager.unsubscribe_all(publish)
         hub.detach(relay)

@@ -211,6 +211,34 @@ class FakeBackupManager:
             "by_app": {"example-com": {"size_bytes": 2048, "count": 1}},
         }
 
+    #: Where the fake pretends its backups live.
+    backup_dir = Path("/var/backups/wasm")
+
+    def find_misplaced_backups(self) -> list[Any]:
+        """
+        Report backups found outside the backup directory.
+
+        Returns:
+            None found; the real search is tested in test_backup_placement.
+        """
+        self._record("find_misplaced_backups", {})
+        return []
+
+    def import_backups(self, source: Path) -> Any:
+        """
+        Pretend to import backups.
+
+        Args:
+            source: Directory asked for.
+
+        Returns:
+            A report with nothing moved.
+        """
+        from wasm.managers.backup_manager import BackupImportReport
+
+        self._record("import_backups", {"source": source})
+        return BackupImportReport(source=source, destination=self.backup_dir)
+
 
 class FakeRollbackManager:
     """A RollbackManager that records calls instead of restoring anything."""
@@ -1268,6 +1296,22 @@ def test_argparse_handler_resolves_action_aliases(manager: type[FakeBackupManage
 
     assert exit_code == 0
     assert _call(manager.calls, "delete") == {"backup_id": "example-com-20260101-000000"}
+
+
+def test_import_passes_the_directory_to_the_manager(
+    manager: type[FakeBackupManager], tmp_path: Path
+) -> None:
+    """
+    'wasm backup import DIR' hands the manager DIR, resolved, and nothing else.
+
+    Args:
+        manager: Fake backup manager.
+        tmp_path: Per-test temporary directory, standing in for /root.
+    """
+    exit_code = handle_backup(Namespace(action="import", directory=str(tmp_path), verbose=False))
+
+    assert exit_code == 0
+    assert _call(manager.calls, "import_backups") == {"source": tmp_path}
 
 
 def test_argparse_rollback_requires_a_domain() -> None:

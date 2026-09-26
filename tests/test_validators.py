@@ -179,3 +179,19 @@ class TestShouldIncludeWww:
     def test_compound_tld_returns_false(self):
         """Test that compound TLDs (3+ parts) return False."""
         assert should_include_www("example.co.uk") is False
+
+
+@pytest.mark.parametrize(
+    ("url", "repo"),
+    [
+        ("https://github.com/acme/widget.git", "widget"),
+        ("https://github.com/acme/widget", "widget"),
+        ("git@github.com:acme/budget.git", "budget"),
+        ("https://github.com/acme/tig.git", "tig"),
+    ],
+)
+def test_parse_git_url_strips_the_git_suffix_not_trailing_letters(url: str, repo: str) -> None:
+    """rstrip(".git") stripped any trailing g, i, t or dot: "widget" became "widge"."""
+    from wasm.validators.source import parse_git_url
+
+    assert parse_git_url(url)["repo"] == repo

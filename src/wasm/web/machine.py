@@ -32,7 +32,9 @@ import socket
 import sqlite3
 import time
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import Any
 
 from wasm.core.exceptions import WASMError
 
@@ -129,7 +131,7 @@ class MachineState:
     apps: AppTally = field(default_factory=lambda: AppTally(0, 0, 0, 0))
 
 
-def classify_unit(service: dict[str, str]) -> str:
+def classify_unit(service: Mapping[str, Any]) -> str:
     """
     Sort one systemd unit into a state bucket.
 
@@ -157,11 +159,15 @@ def classify_unit(service: dict[str, str]) -> str:
     return "stopped"
 
 
-def fetch_service_states() -> list[dict[str, str]]:
+def fetch_service_states() -> list[dict[str, Any]]:
     """
     Ask systemd for the units WASM owns.
 
-    One ``systemctl list-units`` call, scoped to units WASM created, used to
+    :meth:`~wasm.managers.service_manager.ServiceManager.list_services`, which
+    is :meth:`~wasm.managers.service_manager.ServiceManager.managed_units`:
+    the same definition the Services page and ``wasm service list`` read, so
+    the top bar counts exactly the rows the Services page shows. One
+    ``systemctl list-units`` call and a scan of the unit directory, used to
     build both the unit tally and the application tally below: probing each
     application's unit and port individually, the way
     :func:`~wasm.core.app_state.resolve_states` does for ``wasm list``, is
@@ -170,9 +176,10 @@ def fetch_service_states() -> list[dict[str, str]]:
 
     Returns:
         One dictionary per unit, with the fields ``systemctl list-units``
-        prints (``name``, ``load``, ``active``, ``sub``). Empty when systemd
-        cannot be reached, which only degrades every tally built from it to
-        zero rather than raising through a page render or the event stream.
+        prints (``name``, ``load``, ``active``, ``sub``) and ``app``, the
+        domain of the application the unit runs. Empty when systemd cannot be
+        reached, which only degrades every tally built from it to zero rather
+        than raising through a page render or the event stream.
     """
     from wasm.managers.service_manager import ServiceManager
 
@@ -183,7 +190,7 @@ def fetch_service_states() -> list[dict[str, str]]:
         return []
 
 
-def _count_units(services: list[dict[str, str]]) -> UnitTally:
+def _count_units(services: list[dict[str, Any]]) -> UnitTally:
     """
     Tally the JSON snapshot's three unit buckets.
 
@@ -206,21 +213,18 @@ def _count_units(services: list[dict[str, str]]) -> UnitTally:
     return UnitTally(running=running, failed=failed, stopped=stopped)
 
 
-def _count_apps(services: list[dict[str, str]]) -> AppTally:
+def _count_apps(services: list[dict[str, Any]]) -> AppTally:
     """
     Tally applications by state, from the unit list the unit tally also reads.
 
     Each application either has no unit at all - it is static, served
     directly by the web server, and asking systemd about it would always say
-    "not running" - or is backed by one, named either the current way
-    (:func:`~wasm.core.utils.domain_to_app_name`) or, for an application
-    deployed before the prefix was dropped, the legacy way
-    (:func:`~wasm.core.utils.legacy_app_name`). Matching against the live
-    list already fetched for the unit tally is both cheaper and more honest
-    than asking the filesystem which unit file exists, the way
-    :meth:`~wasm.managers.service_manager.ServiceManager._resolve_service_name`
-    does for an operator-issued command: it is what systemd is actually
-    running right now, with no extra process spawned.
+    "not running" - or runs as the units the listing attributes to it (its
+    ``app`` field, from
+    :meth:`~wasm.managers.service_manager.ServiceManager.app_units`: the
+    legacy prefix, a monorepo's workspaces and Compose are resolved there,
+    once). An application with several units is as healthy as its worst one:
+    failed when any failed, running only when all run.
 
     Args:
         services: What :func:`fetch_service_states` returned.
@@ -229,7 +233,6 @@ def _count_apps(services: list[dict[str, str]]) -> AppTally:
         How many applications are running, failed, stopped or static.
     """
     from wasm.core.store import get_store
-    from wasm.core.utils import domain_to_app_name, legacy_app_name
 
     try:
         apps = get_store().list_apps()
@@ -237,7 +240,11 @@ def _count_apps(services: list[dict[str, str]]) -> AppTally:
         log.warning("Could not read applications for the machine snapshot: %s", exc)
         return AppTally(running=0, failed=0, stopped=0, static=0)
 
-    by_name = {service.get("name", ""): service for service in services}
+    by_app: dict[str, list[str]] = {}
+    for service in services:
+        domain = service.get("app")
+        if domain:
+            by_app.setdefault(str(domain), []).append(classify_unit(service))
 
     running = failed = stopped = static = 0
     for app in apps:
@@ -245,18 +252,11 @@ def _count_apps(services: list[dict[str, str]]) -> AppTally:
             static += 1
             continue
 
-        service = by_name.get(domain_to_app_name(app.domain)) or by_name.get(
-            legacy_app_name(app.domain)
-        )
-        if service is None:
-            stopped += 1
-            continue
-
-        bucket = classify_unit(service)
-        if bucket == "active":
-            running += 1
-        elif bucket == "failed":
+        buckets = by_app.get(app.domain, [])
+        if "failed" in buckets:
             failed += 1
+        elif buckets and all(bucket == "active" for bucket in buckets):
+            running += 1
         else:
             stopped += 1
 

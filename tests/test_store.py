@@ -1299,6 +1299,83 @@ class TestJobRecordCRUD:
         assert job.error == "Interrupted by a panel restart"
         assert job.finished_at is not None
 
+    def test_save_job_creates_the_row_when_there_is_none(self, temp_db):
+        """The first notification of a job is what creates it."""
+        temp_db.save_job(self._job())
+
+        job = temp_db.get_job("job-abc123")
+        assert job is not None
+        assert job.status == "pending"
+        assert job.created_at
+
+    def test_save_job_overwrites_the_state_and_keeps_the_identity(self, temp_db):
+        """A later snapshot updates what changes; what the job is stays as queued."""
+        temp_db.save_job(
+            self._job(created_at="2026-01-01T00:00:00", log_path="/logs/job-abc123.log")
+        )
+
+        temp_db.save_job(
+            self._job(
+                name="renamed",
+                status="failed",
+                progress=40,
+                error="DNS does not point here",
+                created_at="2030-01-01T00:00:00",
+                finished_at="2026-01-01T00:01:00",
+                log_path=None,
+            )
+        )
+
+        job = temp_db.get_job("job-abc123")
+        assert job.status == "failed"
+        assert job.progress == 40
+        assert job.error == "DNS does not point here"
+        assert job.finished_at == "2026-01-01T00:01:00"
+        assert job.name == "Deploy example.com"
+        assert job.created_at == "2026-01-01T00:00:00"
+        # A snapshot taken after the log was closed does not erase where it is.
+        assert job.log_path == "/logs/job-abc123.log"
+
+    def test_save_job_still_refuses_an_invalid_status(self, temp_db):
+        """The upsert goes through the same CHECK constraint as the insert."""
+        temp_db.save_job(self._job())
+
+        with pytest.raises(sqlite3.IntegrityError):
+            temp_db.save_job(self._job(status="sideways"))
+
+    def test_two_threads_saving_the_same_job_never_collide(self, temp_db):
+        """
+        The production failure: "UNIQUE constraint failed: jobs.id".
+
+        The request thread that queues a job and the worker that starts it
+        write it at the same moment. With an update-then-insert both could see
+        no row and both insert; one statement cannot.
+        """
+        import threading
+
+        iterations = 200
+        errors: list[BaseException] = []
+        barrier = threading.Barrier(2)
+
+        def write(status: str) -> None:
+            for index in range(iterations):
+                barrier.wait()
+                try:
+                    temp_db.save_job(self._job(id=f"job-{index}", status=status))
+                except sqlite3.Error as exc:
+                    errors.append(exc)
+
+        threads = [
+            threading.Thread(target=write, args=(status,)) for status in ("pending", "running")
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+
+        assert errors == []
+        assert len(temp_db.list_jobs(limit=iterations * 2)) == iterations
+
 
 class TestWebhookSecret:
     """The webhook secret is written and read only through its own methods."""

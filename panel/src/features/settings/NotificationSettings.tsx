@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Eye, EyeOff, Send } from "lucide-react";
+import { Eye, EyeOff, Send, TriangleAlert } from "lucide-react";
 import { useId, useState } from "react";
 import type { ReactNode, SyntheticEvent } from "react";
 
@@ -297,33 +297,43 @@ function HttpChannel({ spec, stored }: { spec: ChannelSpec; stored: Readonly<Rec
       <form noValidate onSubmit={submit} className="flex min-w-0 flex-col gap-3">
         {errors.form !== null ? <ErrorBlock live compact error={errors.form} title={`Could not save ${spec.label}`} /> : null}
         <div className={cx("grid min-w-0 gap-3", spec.fields.length > 1 && "sm:grid-cols-2")}>
-          {spec.fields.map((field) => (
-            <Field key={field.key} label={field.label} error={errors.fields[field.key]}>
-              {field.secret ? (
-                <SecretInput
-                  field={field}
-                  value={draft[field.key] ?? ""}
-                  configured={stored[field.key] === REDACTED}
-                  disabled={save.isPending}
-                  onChange={(value) => {
-                    setDraft((current) => ({ ...current, [field.key]: value }));
-                  }}
-                />
-              ) : (
-                <Input
-                  mono
-                  autoComplete="off"
-                  spellCheck={false}
-                  placeholder={field.placeholder}
-                  value={draft[field.key] ?? stored[field.key] ?? ""}
-                  disabled={save.isPending}
-                  onValueChange={(value: string) => {
-                    setDraft((current) => ({ ...current, [field.key]: value }));
-                  }}
-                />
-              )}
-            </Field>
-          ))}
+          {spec.fields.map((field) => {
+            const value = draft[field.key] ?? stored[field.key] ?? "";
+            const warning = field.secret ? null : (field.warn?.(value) ?? null);
+            return (
+              <Field key={field.key} label={field.label} description={field.description} error={errors.fields[field.key]}>
+                {field.secret ? (
+                  <SecretInput
+                    field={field}
+                    value={draft[field.key] ?? ""}
+                    configured={stored[field.key] === REDACTED}
+                    disabled={save.isPending}
+                    onChange={(next) => {
+                      setDraft((current) => ({ ...current, [field.key]: next }));
+                    }}
+                  />
+                ) : (
+                  <Input
+                    mono
+                    autoComplete="off"
+                    spellCheck={false}
+                    placeholder={field.placeholder}
+                    value={value}
+                    disabled={save.isPending}
+                    onValueChange={(next: string) => {
+                      setDraft((current) => ({ ...current, [field.key]: next }));
+                    }}
+                  />
+                )}
+                {warning !== null ? (
+                  <p role="alert" className="flex items-start gap-1.5 text-13 text-warn">
+                    <TriangleAlert aria-hidden="true" className="mt-0.5 size-3.5 shrink-0" />
+                    <span>{warning}</span>
+                  </p>
+                ) : null}
+              </Field>
+            );
+          })}
         </div>
         <DirtyActions
           dirty={dirty}

@@ -87,8 +87,19 @@ The console acts as root, so how it is reached matters more than anything else o
   `X-Forwarded-Proto` are believed, and only from that peer. By default WASM trusts nobody's
   forwarding headers. Declaring the proxy is what makes the session cookie `Secure` and the
   client address in the audit log the real one.
-- Requests are rate limited per client address (120 a minute by default). The console's
-  hashed build assets are exempt, so reloading the page cannot lock the operator out.
+- Requests are rate limited. A request without a valid credential (the sign-in, the forge
+  webhooks, anything anonymous) is counted per client address, 120 a minute by default
+  (`web.rate_limit_requests`). A request with a valid credential is counted per credential
+  instead (one sign-in, one API token, the master token), 1200 a minute by default
+  (`web.rate_limit_authenticated_requests`): over an SSH tunnel every request comes from
+  `127.0.0.1`, and a per-address budget made every tab and script share one. A wrong
+  credential buys nothing: it is counted as anonymous, and guessing is stopped by the
+  lockout below, which is separate. The console's shell (`index.html` on any console
+  address) and its hashed build assets spend no budget, so reloading the page cannot lock
+  the operator out. A refusal is `429` with `"error": "rate_limited"` and a `Retry-After`
+  of the seconds until the budget frees; every counted response carries
+  `X-RateLimit-Limit` and `X-RateLimit-Remaining` for the budget it was counted in. Both
+  budgets share `web.rate_limit_window` (60 seconds) and `web.rate_limit_enabled`.
 - Request bodies are capped before authentication and before routing: 1 MiB for everything
   but the forge webhooks, which get 5 MiB. A larger body is refused with `413` and
   `"error": "payload_too_large"`, from its `Content-Length` or, for a chunked body, as it is

@@ -152,6 +152,42 @@ describe("Settings > Notifications", () => {
     await expectNoAxeViolations(container);
   });
 
+  it("hints that a group's chat ID is negative, and warns before saving one typed without its sign", async () => {
+    notificationsBackend();
+    const { user, container } = renderConsole("/settings/notifications");
+    await screen.findByRole("switch", { name: /Send notifications/ });
+    const telegram = channel("Telegram");
+    const chatId = within(telegram).getByLabelText("Chat ID");
+
+    expect(
+      within(telegram).getByText(
+        "A group or supergroup's chat ID is negative, and a supergroup's starts with -100. A personal chat's is a smaller positive number.",
+      ),
+    ).toBeInTheDocument();
+    expect(within(telegram).queryByRole("alert")).toBeNull();
+
+    // A personal chat's ID is a short positive number: no warning.
+    await user.type(chatId, "123456789");
+    expect(within(telegram).queryByRole("alert")).toBeNull();
+
+    // 13+ digits, positive: the shape of a supergroup ID typed without its leading minus sign.
+    await user.clear(chatId);
+    await user.type(chatId, "1001234567890");
+    expect(
+      await within(telegram).findByText(
+        "This looks like a group's chat ID without its minus sign. Groups and supergroups use a negative ID (a supergroup's starts with -100); try -1001234567890.",
+      ),
+    ).toBeInTheDocument();
+    await expectNoAxeViolations(container);
+
+    // The warning does not block saving: it is a hint, not a validation failure.
+    await user.click(within(telegram).getByRole("button", { name: "Save" }));
+    await confirmItsYou(user);
+    await waitFor(() => {
+      expect(within(telegram).queryByRole("button", { name: "Save" })).toBeNull();
+    });
+  });
+
   it("turns delivery on and saves the events as one map", { timeout: 20_000 }, async () => {
     const backend = notificationsBackend();
     const { user } = renderConsole("/settings/notifications");

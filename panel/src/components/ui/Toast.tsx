@@ -52,6 +52,15 @@ function ToastList({ urgent }: { urgent: boolean }) {
                   {item.data.detail}
                 </SystemOutput>
               ) : null}
+              {item.data?.output !== undefined ? (
+                <SystemOutput
+                  label="The command's own output"
+                  maxHeight="max-h-28"
+                  className="mt-1.5 rounded-control bg-bg-sunken px-2 py-1.5"
+                >
+                  {item.data.output}
+                </SystemOutput>
+              ) : null}
               {item.actionProps ? <Toast.Action className={buttonClassName("secondary", "sm", "mt-2 self-start")} /> : null}
             </div>
             <Toast.Close

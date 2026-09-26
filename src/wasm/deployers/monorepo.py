@@ -53,6 +53,7 @@ from wasm.deployers.helpers import (
     WorkspaceHelper,
 )
 from wasm.deployers.helpers.permissions import hand_over_tree
+from wasm.deployers.helpers.preflight import repository_unreachable
 from wasm.deployers.helpers.registration import StoreRegistrar
 from wasm.deployers.helpers.target import claim_deploy_target
 from wasm.deployers.interface import AppDeployer, StepReporter, UpdateResult
@@ -659,11 +660,7 @@ class MonorepoDeployer(AppDeployer):
             if not self.runner.exists("git"):
                 issues.append("git is not installed")
             else:
-                result = self.runner.run(
-                    ["git", "ls-remote", "--exit-code", self.source], timeout=30
-                )
-                if not result.success:
-                    issues.append(f"Repository not accessible: {self.source}")
+                issues.extend(repository_unreachable(self.runner, self.source))
 
         # Check disk space
         apps_dir = self.config.apps_directory

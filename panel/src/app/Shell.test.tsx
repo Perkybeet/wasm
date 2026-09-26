@@ -42,7 +42,7 @@ describe("the shell", () => {
     });
     expect(await within(strip).findByText("web-02")).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Services 3 failed" })).toBeInTheDocument();
-    expect(within(strip).getByRole("link", { name: "Units 9 running 3 failed 2 stopped" })).toBeInTheDocument();
+    expect(within(strip).getByRole("link", { name: "WASM units: 9 running, 3 failed, 2 stopped" })).toBeInTheDocument();
   });
 
   it("sends an anonymous visitor to sign in, remembering where they were going", async () => {

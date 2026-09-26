@@ -30,6 +30,12 @@ export interface ErrorBlockProps {
 export function ErrorBlock({ error, title, hint, onRetry, retrying = false, live = false, compact = false, className }: ErrorBlockProps) {
   const described = describeError(error);
   const fix = described.hint ?? hint;
+  // A failing tool (psql, git, nginx) prints its own report on top of the one-line detail;
+  // show both unless they are the same words twice.
+  const output =
+    described.output !== null && described.output.trim() !== "" && described.output.trim() !== described.detail.trim()
+      ? described.output
+      : null;
   return (
     <div
       {...(live ? { role: "alert" } : {})}
@@ -49,6 +55,15 @@ export function ErrorBlock({ error, title, hint, onRetry, retrying = false, live
       <SystemOutput label={`${title}: what the system said`} className="rounded-control border border-border bg-surface px-3 py-2">
         {described.detail}
       </SystemOutput>
+      {output !== null ? (
+        <SystemOutput
+          label={`${title}: the command's own output`}
+          maxHeight="max-h-48"
+          className="rounded-control border border-border bg-surface px-3 py-2"
+        >
+          {output}
+        </SystemOutput>
+      ) : null}
       {onRetry !== undefined ? (
         <div>
           <Button size="sm" icon={<RotateCw aria-hidden="true" />} loading={retrying} onClick={onRetry}>

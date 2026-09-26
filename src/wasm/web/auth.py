@@ -41,6 +41,7 @@ import hmac
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -74,11 +75,20 @@ SECRET_KEY_LENGTH = 64
 MAX_FAILED_ATTEMPTS = 5
 LOCKOUT_DURATION = 900
 
-#: A logged-in dashboard polling every widget stays well under 120 requests per
-#: minute (2/s sustained per IP). Anything above that is a script, and scripts
-#: that need more should use their own token and their own trusted-proxy entry.
+#: The budget of a request that carries no valid credential, per client IP:
+#: the sign-in page, the forge webhooks, a scanner. Nothing anonymous needs 2/s
+#: sustained, and it is what an attacker without a credential gets.
 RATE_LIMIT_WINDOW = 60
 RATE_LIMIT_MAX_REQUESTS = 120
+
+#: The budget of a request that carries a valid credential, per credential
+#: (one sign-in, one API token, the master token) rather than per address. The
+#: console alone exceeds 120 a minute following a deploy and navigating, and
+#: over an SSH tunnel every request comes from 127.0.0.1, so a per-address
+#: budget made every tab and script share one. Holding a valid credential is
+#: what guessing one would win, so this protects the machine from a runaway
+#: client, not from an attacker; credential guessing is the lockout's job.
+RATE_LIMIT_AUTHENTICATED_MAX_REQUESTS = 1200
 
 #: Upper bound on tracked client IPs, so a spoofed-source flood cannot turn the
 #: rate limiter into unbounded memory growth.
@@ -254,8 +264,11 @@ class SecurityConfig:
         allowed_hosts: Host header values accepted by the deployment.
         enable_cors: Whether cross-origin requests are allowed at all.
         cors_origins: Explicit origins allowed when CORS is enabled.
-        rate_limit_enabled: Whether per-IP rate limiting is applied.
-        rate_limit_requests: Requests allowed per window and per client IP.
+        rate_limit_enabled: Whether rate limiting is applied.
+        rate_limit_requests: Requests without a valid credential allowed per
+            window and per client IP.
+        rate_limit_authenticated_requests: Requests with a valid credential
+            allowed per window and per credential.
         rate_limit_window: Length of the rate limit window in seconds.
         max_failed_attempts: Failed logins before an IP is locked out.
         lockout_duration: Lockout length in seconds.
@@ -287,6 +300,7 @@ class SecurityConfig:
     cors_origins: list[str] = field(default_factory=list)
     rate_limit_enabled: bool = True
     rate_limit_requests: int = RATE_LIMIT_MAX_REQUESTS
+    rate_limit_authenticated_requests: int = RATE_LIMIT_AUTHENTICATED_MAX_REQUESTS
     rate_limit_window: int = RATE_LIMIT_WINDOW
     max_failed_attempts: int = MAX_FAILED_ATTEMPTS
     lockout_duration: int = LOCKOUT_DURATION
@@ -560,7 +574,13 @@ class FailedAttempt:
 
 
 class RateLimiter:
-    """Sliding window request limiter, keyed by the real client IP."""
+    """
+    Sliding window request limiter.
+
+    Keyed by whatever the caller counts by: the server keeps one keyed by
+    client IP for anonymous requests and one keyed by credential for
+    authenticated ones (see :func:`rate_limit_identity`).
+    """
 
     def __init__(
         self,
@@ -618,6 +638,29 @@ class RateLimiter:
         with self._lock:
             timestamps = [ts for ts in self._requests.get(client_ip, []) if now - ts < self.window]
             return max(0, self.max_requests - len(timestamps))
+
+    def retry_after(self, client_ip: str) -> int:
+        """
+        Report how long until the client may make its next request.
+
+        Args:
+            client_ip: The client's key.
+
+        Returns:
+            Whole seconds until the oldest request in the window expires,
+            at least 1; 0 when the client is within its budget.
+        """
+        now = time.time()
+        with self._lock:
+            timestamps = [ts for ts in self._requests.get(client_ip, []) if now - ts < self.window]
+        if len(timestamps) < self.max_requests:
+            return 0
+        if not timestamps:
+            # A budget of zero: nothing ever frees a slot.
+            return self.window
+        # The request whose expiry brings the count back under the budget.
+        freeing = timestamps[len(timestamps) - self.max_requests]
+        return max(1, math.ceil(freeing + self.window - now))
 
     def reset(self, client_ip: str) -> None:
         """
@@ -3406,6 +3449,38 @@ def credential_key(payload: Mapping[str, Any]) -> str:
     if payload.get("type") == "session":
         return f"session:{payload.get('family') or payload.get('sid')}"
     return str(payload.get("sid") or "unknown")
+
+
+def rate_limit_identity(connection: HTTPConnection, client_ip: str) -> str | None:
+    """
+    Name the valid credential a request carries, for the rate limiter.
+
+    Checks the channels a request can carry a credential on - the session
+    cookie, the ``wasm.token.`` subprotocol of a WebSocket handshake, the
+    ``Authorization`` header - with :func:`check_credential`, which records
+    nothing: a wrong credential is counted against the lockout by the
+    endpoint that refuses it, once, not here as well. A single-use WebSocket
+    ticket is not looked at, because checking it would spend it.
+
+    Args:
+        connection: The incoming request or handshake.
+        client_ip: The resolved client address, which a session is bound to.
+
+    Returns:
+        :func:`credential_key` of the first valid credential, or None when the
+        request carries none, in which case it is counted by address.
+    """
+    candidates = [connection.cookies.get(SESSION_COOKIE_NAME)]
+    if connection.scope["type"] == "websocket":
+        candidates.append(subprotocol_token(connection))
+    candidates.append(bearer_token(connection))
+    for credential in candidates:
+        if not credential:
+            continue
+        payload = check_credential(credential, client_ip)
+        if payload is not None:
+            return credential_key(payload)
+    return None
 
 
 def check_credential(credential: str, client_ip: str) -> dict[str, Any] | None:

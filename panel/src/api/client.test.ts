@@ -1,5 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { toast } from "../components/ui/toast";
 import { fakeBackend, json, problem } from "../test/fakes";
 import { ApiError, ElevationCancelledError, api, buildPath, configureApi, request } from "./client";
 
@@ -195,6 +196,75 @@ describe("api", () => {
       confirm();
       await expect(both).resolves.toEqual([{ ok: true }, { ok: true }]);
       expect(elevate).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("a rate-limited request (item 17: a higher budget per credential)", () => {
+    afterEach(() => {
+      vi.useRealTimers();
+      toast.dismiss();
+    });
+
+    it("retries a GET once after waiting the server's Retry-After, and shows one toast", async () => {
+      vi.useFakeTimers();
+      const warning = vi.spyOn(toast, "warning");
+      let attempts = 0;
+      const backend = fakeBackend({
+        "GET /api/apps": () => {
+          attempts += 1;
+          return attempts === 1
+            ? problem(429, "rate_limited", "Too many requests.", { headers: { "Retry-After": "30" } })
+            : json(200, { apps: [], total: 0 });
+        },
+      });
+      const call = api("GET", "/api/apps");
+      await vi.waitFor(() => {
+        expect(warning).toHaveBeenCalledTimes(1);
+      });
+      expect(backend.calls).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(30_000);
+      await expect(call).resolves.toEqual({ apps: [], total: 0 });
+      expect(backend.calls).toHaveLength(2);
+      expect(warning).toHaveBeenCalledTimes(1);
+      expect(warning).toHaveBeenCalledWith(
+        "Too many requests",
+        expect.objectContaining({ id: "rate-limited", detail: "Too many requests.", description: "Retrying automatically in 30s." }),
+      );
+    });
+
+    it("does not retry a second time when the retried GET is rate-limited again", async () => {
+      vi.useFakeTimers();
+      const warning = vi.spyOn(toast, "warning");
+      const backend = fakeBackend({
+        "GET /api/apps": () => problem(429, "rate_limited", "Still too many.", { headers: { "Retry-After": "5" } }),
+      });
+      const call = api("GET", "/api/apps").catch((caught: unknown) => caught);
+      await vi.waitFor(() => {
+        expect(warning).toHaveBeenCalledTimes(1);
+      });
+      await vi.advanceTimersByTimeAsync(5_000);
+      const error = await call;
+      expect(error).toMatchObject({ status: 429, error: "rate_limited" });
+      expect(backend.calls).toHaveLength(2);
+      expect(warning).toHaveBeenCalledTimes(2);
+    });
+
+    it("never retries a mutation: it surfaces the refusal instead of repeating a write", async () => {
+      const warning = vi.spyOn(toast, "warning");
+      const backend = fakeBackend({
+        "POST /api/apps": () => problem(429, "rate_limited", "Slow down.", { headers: { "Retry-After": "10" } }),
+      });
+      const error = await api("POST", "/api/apps", { domain: "shop.example.com" }).catch((caught: unknown) => caught);
+      expect(error).toMatchObject({ status: 429, error: "rate_limited", retryAfter: 10 });
+      expect(backend.calls).toHaveLength(1);
+      expect(warning).toHaveBeenCalledTimes(1);
+      expect(warning).toHaveBeenCalledWith("Too many requests", expect.objectContaining({ description: "Try again in 10s." }));
+    });
+
+    it("does not retry a GET missing Retry-After: there is nothing to wait out", async () => {
+      const backend = fakeBackend({ "GET /api/apps": () => problem(429, "rate_limited", "Too many requests.") });
+      await expect(api("GET", "/api/apps")).rejects.toMatchObject({ status: 429, retryAfter: null });
+      expect(backend.calls).toHaveLength(1);
     });
   });
 });

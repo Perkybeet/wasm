@@ -18,6 +18,13 @@ superuser. It signs in over TCP as ``wasm_ro_<database>``, a role that holds
 nothing but ``SELECT``: a superuser session that merely switched roles can
 switch back from inside a single SELECT (``set_config('role', ...)``), so the
 limit has to be the login itself. See :meth:`PostgresManager._ensure_read_only_role`.
+
+That TCP login, and every connection string WASM shows, uses the port of the
+cluster WASM administers, found by :meth:`PostgresManager.server_port`: the
+superuser session reaches that cluster through Debian's pg_wrapper, which
+picks the cluster's port by itself, but a TCP client has to be told, and a
+fixed 5432 on a server whose cluster listens on 5433 signs in to whatever else
+answers on 5432 (a container publishing it, a second cluster).
 """
 
 from __future__ import annotations
@@ -31,6 +38,7 @@ import secrets
 import stat
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 from wasm.core.config import secure_write
 from wasm.core.exceptions import (
@@ -41,7 +49,8 @@ from wasm.core.exceptions import (
     DatabaseQueryError,
     DatabaseUserError,
 )
-from wasm.core.runner import CommandResult, runuser_prefix
+from wasm.core.fs import FileSystem
+from wasm.core.runner import CommandResult, CommandRunner, runuser_prefix
 from wasm.managers.database.base import (
     QUERY_TIMEOUT,
     TRANSFER_TIMEOUT,
@@ -119,6 +128,12 @@ _SIGN_IN_FAILURE = re.compile(
     r"connection to server at .* failed|could not connect to server|^psql: FATAL:", re.M
 )
 
+#: libpq relaying a server that has no role of that name.
+_ROLE_MISSING = re.compile(r'role ".*" does not exist')
+
+#: Where the configured port lives, named in the errors that suggest it.
+_PORT_SETTING = "databases.credentials.postgresql.port"
+
 #: SCRAM-SHA-256 iteration count, PostgreSQL's own default (scram_iterations).
 _SCRAM_ITERATIONS = 4096
 
@@ -183,6 +198,23 @@ def _scram_sha256_verifier(password: str) -> str:
     )
 
 
+def _parse_port(value: object) -> int | None:
+    """
+    Read a TCP port from a configuration value or a server's answer.
+
+    Args:
+        value: What was configured, or what ``SHOW port`` printed.
+
+    Returns:
+        The port, or None when the value is not one.
+    """
+    try:
+        port = int(str(value).strip())
+    except ValueError:
+        return None
+    return port if 0 < port < 65536 else None
+
+
 def _sign_in_failed(result: CommandResult) -> bool:
     """
     Tell a psql that never got a session apart from a statement that failed.
@@ -222,6 +254,24 @@ class PostgresManager(BaseDatabaseManager):
 
     #: Databases that belong to the cluster, not to a user.
     SYSTEM_DATABASES = frozenset({"postgres", "template0", "template1"})
+
+    def __init__(
+        self,
+        verbose: bool = False,
+        runner: CommandRunner | None = None,
+        fs: FileSystem | None = None,
+    ) -> None:
+        """
+        Initialize the manager.
+
+        Args:
+            verbose: Enable verbose logging.
+            runner: Command runner to execute with.
+            fs: Filesystem to write through.
+        """
+        super().__init__(verbose=verbose, runner=runner, fs=fs)
+        # The port and where it came from, once known; see server_port().
+        self._port: tuple[int, str] | None = None
 
     # ==================== SQL text ====================
 
@@ -311,6 +361,106 @@ class PostgresManager(BaseDatabaseManager):
             user=self.SUPERUSER,
         )
         return result.success, result.stdout if result.success else result.stderr
+
+    def _show(self, setting: str) -> str | None:
+        """
+        Ask the cluster WASM administers for one of its settings.
+
+        Args:
+            setting: A setting name WASM chose, never input.
+
+        Returns:
+            The value as the server prints it, or None when the superuser
+            session could not be opened.
+        """
+        success, output = self._execute_sql(f"SHOW {setting};")
+        return output.strip() if success else None
+
+    # ==================== Port ====================
+
+    def server_port(self) -> int:
+        """
+        Return the TCP port of the PostgreSQL WASM administers.
+
+        What every TCP path uses: the read-only console's login and the
+        connection strings shown to operators. Precedence:
+
+        1. ``databases.credentials.postgresql.port``, when configured: the
+           operator's word, for a server the superuser session cannot
+           describe (pg_hba.conf answers, but TCP is forwarded elsewhere).
+        2. ``SHOW port`` over the superuser session, which reaches the cluster
+           WASM administers however it was found (Debian's pg_wrapper picks
+           the cluster's port for ``psql``; a TCP client has to be told).
+        3. :data:`DEFAULT_PORT`, when neither answers. Not remembered, so a
+           server started later is asked on the next call.
+
+        Only ``port`` is asked. ``listen_addresses`` only matters when the
+        login is refused, and is asked then (:meth:`_sign_in_refused`).
+        ``unix_socket_directories`` is not needed because the login stays on
+        TCP: the default Debian pg_hba.conf authenticates every ``local``
+        connection by ``peer``, which refuses a role with no OS account of the
+        same name before any password is asked, while its ``host all all
+        127.0.0.1/32 scram-sha-256`` line already admits this login.
+
+        Returns:
+            The port, remembered for the manager's lifetime once found.
+
+        Raises:
+            DatabaseQueryError: When the configured port is not a TCP port.
+        """
+        return self._server_port()[0]
+
+    def _server_port(self) -> tuple[int, str]:
+        """
+        Resolve :meth:`server_port`, with where the answer came from.
+
+        Returns:
+            The port and a phrase naming its source, for the errors that
+            have to say which port was used and why.
+
+        Raises:
+            DatabaseQueryError: When the configured port is not a TCP port.
+        """
+        if self._port is not None:
+            return self._port
+
+        settings = self.config.get("databases", {}).get("credentials", {}).get("postgresql", {})
+        configured = settings.get("port") if isinstance(settings, dict) else None
+        if configured is not None and configured != "":
+            port = _parse_port(configured)
+            if port is None:
+                raise DatabaseQueryError(
+                    f"Invalid PostgreSQL port in the configuration: {configured!r}",
+                    details=(
+                        f"Set {_PORT_SETTING} in /etc/wasm/config.yaml to the port "
+                        "PostgreSQL listens on, or remove it to ask the server."
+                    ),
+                )
+            self._port = (port, f"configured in {_PORT_SETTING}")
+            return self._port
+
+        answer = self._show("port")
+        port = _parse_port(answer) if answer is not None else None
+        if port is None:
+            self.logger.debug(
+                f"PostgreSQL did not report its port ({answer!r}); using {self.DEFAULT_PORT}"
+            )
+            return self.DEFAULT_PORT, "PostgreSQL's default, because the server did not report one"
+        self._port = (port, "the one the server reports (SHOW port)")
+        return self._port
+
+    def get_status(self) -> dict[str, Any]:
+        """
+        Summarise the engine's state, with the port it actually listens on.
+
+        Returns:
+            The base summary; ``port`` is :meth:`server_port` while the
+            service is running.
+        """
+        status = super().get_status()
+        if status["running"]:
+            status["port"] = self.server_port()
+        return status
 
     # ==================== Database Management ====================
 
@@ -1141,12 +1291,14 @@ class PostgresManager(BaseDatabaseManager):
         have done the same. Signing in as the role leaves the server nothing
         to switch back to.
 
-        A password the server rejects is rotated once and the sign-in
-        retried: that heals a stored password that no longer matches, such as
-        after two first reads raced to set it. Any other refusal - pg_hba.conf
-        allowing no password login on the loopback, the server not listening
-        on TCP - is reported with the exact fix, and never answered by falling
-        back to the superuser session.
+        The port is :meth:`server_port`'s. A password the server rejects is
+        rotated once and the sign-in retried: that heals a stored password
+        that no longer matches, such as after two first reads raced to set it.
+        Any other refusal - pg_hba.conf allowing no password login on the
+        loopback, the server not listening on TCP, another PostgreSQL
+        answering on the port - is reported with psql's own output and the
+        fix it points at, and never answered by falling back to the superuser
+        session.
 
         Args:
             database: Database to connect to.
@@ -1170,6 +1322,9 @@ class PostgresManager(BaseDatabaseManager):
         tail = [
             arg for command in ("BEGIN READ ONLY", statement, "COMMIT") for arg in ("-c", command)
         ]
+        # Resolved before the role is provisioned, so a server that cannot
+        # report its port is not asked between provisioning and the login.
+        port, source = self._server_port()
         for rotate in (False, True):
             role, password = self._ensure_read_only_role(database, rotate=rotate)
             argv = self._console_argv(
@@ -1178,7 +1333,7 @@ class PostgresManager(BaseDatabaseManager):
                     "-h",
                     READ_ONLY_HOST,
                     "-p",
-                    str(self._port()),
+                    str(port),
                     "-U",
                     role,
                     # Never prompt: a password psql asks the terminal for would
@@ -1205,7 +1360,7 @@ class PostgresManager(BaseDatabaseManager):
                 )
                 continue
             break
-        raise self._sign_in_refused(database, role, result)
+        raise self._sign_in_refused(database, role, result, port=port, source=source)
 
     def _console_argv(self, database: str, tail: Sequence[str], *, csv: bool) -> list[str]:
         """
@@ -1223,70 +1378,72 @@ class PostgresManager(BaseDatabaseManager):
             return self._psql_csv_argv(database, *tail)
         return self._psql_argv(database, *tail)
 
-    def _port(self) -> int:
-        """
-        Return the TCP port the read-only console signs in on.
-
-        Returns:
-            ``databases.credentials.postgresql.port`` from the configuration,
-            or :data:`DEFAULT_PORT`.
-
-        Raises:
-            DatabaseQueryError: When the configured port is not a TCP port.
-        """
-        settings = self.config.get("databases", {}).get("credentials", {}).get("postgresql", {})
-        configured = settings.get("port") if isinstance(settings, dict) else None
-        if configured is None or configured == "":
-            return self.DEFAULT_PORT
-        try:
-            port = int(configured)
-        except (TypeError, ValueError):
-            port = 0
-        if not 0 < port < 65536:
-            raise DatabaseQueryError(
-                f"Invalid PostgreSQL port in the configuration: {configured!r}",
-                details=(
-                    "Set databases.credentials.postgresql.port in /etc/wasm/config.yaml "
-                    "to the port PostgreSQL listens on, or remove it to use 5432."
-                ),
-            )
-        return port
-
     def _sign_in_refused(
-        self, database: str, role: str, result: CommandResult
+        self, database: str, role: str, result: CommandResult, *, port: int, source: str
     ) -> DatabaseQueryError:
         """
         Build the error for a read-only console that could not sign in.
+
+        The fix is chosen from what psql said, and only that: pg_hba.conf is
+        suggested when the server says it has no line for the login, not for
+        every refusal.
 
         Args:
             database: Database the console was reading.
             role: The read-only role.
             result: psql's failed result.
+            port: The port the login used.
+            source: Where that port came from, as :meth:`_server_port` names it.
 
         Returns:
-            An error that says what happened, carries psql's own output
-            verbatim and gives the pg_hba.conf line that fixes it.
+            An error that says where the login went, carries psql's own output
+            verbatim and gives the fix psql's words point at.
         """
-        hba_line = f"host {database} {role} {READ_ONLY_HOST}/32 scram-sha-256"
-        port = self._port()
-        if "Connection refused" in result.stderr:
-            steps = (
-                f"PostgreSQL is not accepting TCP connections on {READ_ONLY_HOST}:{port}. "
-                "Set listen_addresses = 'localhost' in postgresql.conf and restart "
-                "PostgreSQL (systemctl restart postgresql). Then make sure pg_hba.conf "
-                f"allows this role a password login:\n  {hba_line}"
-            )
-        else:
+        stderr = result.stderr
+        where = f"{READ_ONLY_HOST}:{port}"
+        origin = f"Port {port} is {source}."
+        elsewhere = (
+            f"If the PostgreSQL WASM administers listens on another port, set {_PORT_SETTING} "
+            "in /etc/wasm/config.yaml to it."
+        )
+        if "no pg_hba.conf entry" in stderr:
+            hba_line = f"host {database} {role} {READ_ONLY_HOST}/32 scram-sha-256"
             steps = (
                 "Read mode signs in as its own least-privilege role with a password "
                 f"over {READ_ONLY_HOST}, and never falls back to the superuser. Add this "
                 "line to pg_hba.conf, above any broader 'host' line, then reload "
                 f"PostgreSQL (systemctl reload postgresql):\n  {hba_line}"
             )
+        elif "password authentication failed" in stderr or _ROLE_MISSING.search(stderr):
+            steps = (
+                f"The server answering on {where} does not know {role}, or rejects the "
+                "password WASM set for it on the cluster it administers, so another "
+                f"PostgreSQL (a container publishing port {port}, a second cluster) is "
+                f"probably answering on port {port}. {origin} Set {_PORT_SETTING} in "
+                "/etc/wasm/config.yaml to the port of the cluster WASM administers: "
+                "'SHOW port' in 'wasm db connect' prints it."
+            )
+        elif "Connection refused" in stderr:
+            reported = self._show("listen_addresses")
+            current = (
+                f" PostgreSQL reports listen_addresses = '{reported}'."
+                if reported is not None
+                else ""
+            )
+            steps = (
+                f"Nothing accepts TCP connections on {where}. {origin}{current} Set "
+                "listen_addresses = 'localhost' in postgresql.conf and restart PostgreSQL "
+                f"(systemctl restart postgresql). {elsewhere}"
+            )
+        else:
+            steps = (
+                f"psql could not open a session on {where} as {role}; its own output "
+                f"follows. {origin} {elsewhere}"
+            )
         return DatabaseQueryError(
-            f"The read-only console could not sign in to PostgreSQL as {role}",
+            f"The read-only console could not sign in to PostgreSQL as {role} on {where}",
             details=steps,
-            output=result.stderr.strip(),
+            output=(stderr or result.stdout).strip(),
         )
 
     def _psql_csv_argv(self, database: str, *tail: str) -> list[str]:
@@ -1522,7 +1679,7 @@ class PostgresManager(BaseDatabaseManager):
         host: str = "localhost",
     ) -> str:
         """
-        Build a libpq URI.
+        Build a libpq URI, on the port the server listens on (:meth:`server_port`).
 
         Args:
             database: Database name.
@@ -1533,7 +1690,7 @@ class PostgresManager(BaseDatabaseManager):
         Returns:
             The connection string.
         """
-        return f"postgresql://{username}:{password}@{host}:{self.DEFAULT_PORT}/{database}"
+        return f"postgresql://{username}:{password}@{host}:{self.server_port()}/{database}"
 
     def get_interactive_command(
         self,

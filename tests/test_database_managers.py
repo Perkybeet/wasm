@@ -1572,3 +1572,8 @@ class TestOwnerAndGrantsInListings:
         users = mysql.list_users()
 
         assert users[0].databases == []
+
+
+def test_every_engine_answers_its_port_through_one_method(mysql: MySQLManager) -> None:
+    """Callers ask server_port(); an engine that cannot ask its server answers its default."""
+    assert mysql.server_port() == mysql.DEFAULT_PORT

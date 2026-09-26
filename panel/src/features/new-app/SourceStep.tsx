@@ -61,8 +61,14 @@ const FETCH_HINT = "Check the address and that this server can reach it. A priva
 function InspectFailure({ failure, source, onManual }: { failure: unknown; source: string; onManual: () => void }) {
   let block: ReactNode;
   if (isApiError(failure) && failure.error === "sourceerror") {
-    if (failure.hint === null) return null;
-    block = <ErrorBlock live error={{ detail: failure.hint }} title={`What fetching ${source} reported`} hint={FETCH_HINT} />;
+    // The short sentence (failure.detail) is already on the field, next to what it complains
+    // about; this block is for what the tool itself printed - git's own words, verbatim, when
+    // the backend carried them as `output` (a private repository's auth failure, for example).
+    // An older or simpler SourceError has no output of its own; `hint` is what it printed then.
+    const printed = failure.output ?? failure.hint;
+    if (printed === null) return null;
+    const fix = failure.output !== null ? (failure.hint ?? FETCH_HINT) : FETCH_HINT;
+    block = <ErrorBlock live error={{ detail: printed }} title={`What fetching ${source} reported`} hint={fix} />;
   } else if (isApiError(failure) && failure.error === "deploymenterror") {
     block = (
       <>

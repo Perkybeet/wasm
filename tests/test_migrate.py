@@ -31,6 +31,7 @@ from wasm.core.exceptions import DeploymentError, ServiceError, ValidationError,
 from wasm.core.fs import DryRunFileSystem, RealFileSystem, set_fs
 from wasm.core.runner import FakeRunner
 from wasm.core.store import App, Service, Site, WASMStore
+from wasm.core.utils import domain_to_app_name
 from wasm.deployers import lifecycle
 from wasm.deployers import migrate as migrate_module
 from wasm.deployers.migrate import count_tree, migrate, plan_migration, relocate
@@ -54,6 +55,9 @@ class FakeUnits:
         # Whether the live tree was still in place when the unit stopped.
         self.stops.append((self.root / "server.js").is_file())
         return True
+
+    def app_units(self, app: App) -> list[str]:
+        return [] if app.is_static else [domain_to_app_name(app.domain)]
 
     def get_service_config(self, name: str) -> str | None:
         return self.bodies.get(name)

@@ -33,7 +33,7 @@ import pytest
 from wasm.core.exceptions import SecurityError, ServiceError, ValidationError
 from wasm.core.fs import DryRunFileSystem, set_fs
 from wasm.core.runner import FakeRunner
-from wasm.core.store import Service
+from wasm.core.store import App, Service
 from wasm.managers.service_manager import WASM_UNIT_MARKER, ServiceManager
 
 #: A unit file body that carries no WASM marker, like every distribution unit.
@@ -52,11 +52,16 @@ class FakeStore:
 
     def __init__(self) -> None:
         self.services: dict[str, Service] = {}
+        self.apps: list[App] = []
         self.deleted: list[str] = []
 
     def list_services(self, **_kwargs: object) -> list[Service]:
         """Return every recorded service."""
         return list(self.services.values())
+
+    def list_apps(self, **_kwargs: object) -> list[App]:
+        """Return every recorded application."""
+        return list(self.apps)
 
     def get_service(self, name: str) -> Service | None:
         """Return a service by name, or None."""

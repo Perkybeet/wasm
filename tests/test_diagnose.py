@@ -71,6 +71,9 @@ class FakeStore:
     def list_services(self, **_kwargs: Any) -> list[Service]:
         return self._services
 
+    def list_apps(self, **_kwargs: Any) -> list[App]:
+        return []
+
 
 def _app(**overrides: Any) -> App:
     fields: dict[str, Any] = {

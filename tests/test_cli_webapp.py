@@ -34,6 +34,7 @@ from wasm.cli.app import cli as root_cli
 from wasm.cli.commands import webapp
 from wasm.core.logger import Logger
 from wasm.core.runner import DryRunRunner, FakeRunner, get_runner
+from wasm.core.utils import domain_to_app_name
 from wasm.deployers import lifecycle
 from wasm.managers.webserver import SiteDeletion
 
@@ -145,6 +146,16 @@ class ServiceSpy:
             name: Service name.
         """
         self.calls.append(("delete_service", name))
+
+    def app_units(self, app: Any) -> list[str]:
+        """
+        Args:
+            app: The application.
+
+        Returns:
+            The unit it is named after, as ServiceManager.app_units names it.
+        """
+        return [] if app.is_static else [domain_to_app_name(app.domain)]
 
     def get_status(self, name: str) -> dict[str, Any]:
         """

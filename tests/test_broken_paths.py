@@ -480,7 +480,7 @@ def test_health_counts_a_running_application(
     """A deployed app whose unit is active must be reported as running."""
     runner.script(["systemctl", "is-active"], stdout="active\n")
     health_environment.apps["example.com"] = SimpleNamespace(
-        domain="example.com", is_static=False, port=3000
+        domain="example.com", is_static=False, port=3000, id=None, app_type="nextjs"
     )
 
     from wasm.cli.commands.health import handle_health

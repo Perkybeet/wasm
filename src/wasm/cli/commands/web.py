@@ -267,6 +267,7 @@ def _web_config_overrides() -> dict[str, Any]:
     for key, cast in (
         ("rate_limit_enabled", bool),
         ("rate_limit_requests", int),
+        ("rate_limit_authenticated_requests", int),
         ("rate_limit_window", int),
         ("max_failed_attempts", int),
         ("lockout_duration", int),

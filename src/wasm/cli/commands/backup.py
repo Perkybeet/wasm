@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 from argparse import Namespace
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 import click
@@ -531,15 +532,21 @@ def _show_storage(*, logger: Logger, json_output: bool = False) -> int:
     try:
         manager = BackupManager(verbose=logger.verbose)
         usage = manager.get_storage_usage()
+        misplaced = manager.find_misplaced_backups()
     except WASMError as exc:
         logger.error(f"Error: {exc}")
         return 1
 
     if json_output:
+        usage["directory"] = str(manager.backup_dir)
+        usage["misplaced"] = [
+            {"directory": str(found.directory), "count": found.count} for found in misplaced
+        ]
         click.echo(json.dumps(usage, indent=2))
         return 0
 
     logger.info("Backup Storage Usage")
+    logger.info(f"  Directory: {manager.backup_dir}")
     logger.info(
         f"  Total: {_human_bytes(usage['total_size_bytes'])} ({usage['total_backups']} backups)"
     )
@@ -550,7 +557,49 @@ def _show_storage(*, logger: Logger, json_output: bool = False) -> int:
             f"  {app_name}: {_human_bytes(app_usage['size_bytes'])} ({app_usage['count']} backups)"
         )
 
+    for found in misplaced:
+        logger.warning(
+            f"{found.count} backup(s) found outside the backup directory, in {found.directory}"
+        )
+        logger.info(f"  Move them into {manager.backup_dir} with: {found.command}")
+
     return 0
+
+
+def _import_backups(*, logger: Logger, source: str) -> int:
+    """
+    Move misplaced WASM backups into the configured backup directory.
+
+    Args:
+        logger: Logger to report through.
+        source: Directory holding the misplaced ``<app>/`` backup directories.
+
+    Returns:
+        0 when everything that looked like a backup was moved (or would be,
+        under ``--dry-run``), 1 when something was left behind or the import
+        could not start.
+    """
+    try:
+        manager = BackupManager(verbose=logger.verbose)
+        report = manager.import_backups(Path(source))
+    except WASMError as exc:
+        logger.error(f"Import failed: {exc}")
+        return 1
+
+    verb = "Would move" if report.rehearsal else "Moved"
+    for moved_from, moved_to in report.moved:
+        logger.info(f"  {moved_from} -> {moved_to}")
+    for left, reason in report.left:
+        logger.warning(f"Left {left}: {reason}")
+
+    if report.moved:
+        logger.success(
+            f"{verb} {len(report.moved)} backup(s) from {report.source} into {report.destination}"
+        )
+    else:
+        logger.info(f"No backups to move from {report.source}")
+
+    return 1 if report.left else 0
 
 
 def _create_schedule(
@@ -942,6 +991,22 @@ def backup_storage(state: Context) -> None:
     _finish(_show_storage(logger=state.logger, json_output=state.json_output))
 
 
+@backup.command("import")
+@click.argument("directory", type=click.Path(file_okay=False, resolve_path=True))
+@pass_context
+def backup_import(state: Context, directory: str) -> None:
+    """
+    Move WASM backups found in DIRECTORY into the backup directory.
+
+    For backups written to the wrong place, such as /root/<app>/ or /<app>/
+    while backup.directory was empty. Only complete backups move (the
+    .tar.gz and its .json); nothing else in DIRECTORY is touched and nothing
+    in the backup directory is overwritten. Use --dry-run to see what would
+    move.
+    """
+    _finish(_import_backups(logger=state.logger, source=directory))
+
+
 @backup.group("schedule", cls=AliasedGroup, aliases=SCHEDULE_ALIASES)
 def backup_schedule() -> None:
     """
@@ -1105,6 +1170,8 @@ def handle_backup(args: Namespace) -> int:
         )
     if action == "storage":
         return _show_storage(logger=logger, json_output=getattr(args, "json", False))
+    if action == "import":
+        return _import_backups(logger=logger, source=getattr(args, "directory", ""))
     if action == "schedule":
         return _handle_backup_schedule(args, logger)
 

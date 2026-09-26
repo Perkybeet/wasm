@@ -36,6 +36,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import IO
 
 from wasm.core.exceptions import WASMError
 
@@ -219,6 +220,8 @@ class CommandRunner(ABC):
             stdin_path: A file given to the process as its stdin, byte for byte.
                 How a dump reaches a client without being named in a command
                 the client would parse as a script. Exclusive with ``input``.
+                With neither, the process reads ``/dev/null``: no command
+                WASM runs may wait on the caller's terminal.
             user: Run as this account instead of the current one.
             check: Raise CommandError instead of returning a failed result.
             secrets: Literal values to redact from the recorded command line.
@@ -372,7 +375,14 @@ class SubprocessRunner(CommandRunner):
         started = time.monotonic()
         try:
             with contextlib.ExitStack() as stack:
-                stdin = stack.enter_context(open(stdin_path, "rb")) if stdin_path else None
+                # Never the caller's stdin: a child that inherits a terminal
+                # can sit reading it until the deadline (git asking for a
+                # username did exactly that). /dev/null makes it fail instead.
+                stdin: IO[bytes] | int | None
+                if stdin_path is not None:
+                    stdin = stack.enter_context(open(stdin_path, "rb"))
+                else:
+                    stdin = None if input is not None else subprocess.DEVNULL
                 completed = subprocess.run(
                     args,
                     cwd=str(cwd) if cwd else None,
@@ -435,6 +445,7 @@ class SubprocessRunner(CommandRunner):
                 args,
                 cwd=str(cwd) if cwd else None,
                 env=run_env,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -524,6 +535,7 @@ class SubprocessRunner(CommandRunner):
                     args,
                     cwd=str(cwd) if cwd else None,
                     env=run_env,
+                    stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE if compress else sink,
                     stderr=subprocess.PIPE,
                 )
@@ -785,6 +797,8 @@ class FakeRunner(CommandRunner):
                 response.
         """
         self.calls: list[tuple[str, ...]] = []
+        #: The ``env`` each call was given, index for index with ``calls``.
+        self.envs: list[Mapping[str, str] | None] = []
         self.inputs: list[str | None] = []
         self.stdin_paths: list[Path] = []
         self.written: dict[Path, tuple[str, ...]] = {}
@@ -845,7 +859,12 @@ class FakeRunner(CommandRunner):
             return True
         return program in self._known_programs
 
-    def _lookup(self, argv: Sequence[str], user: str | None = None) -> CommandResult:
+    def _lookup(
+        self,
+        argv: Sequence[str],
+        user: str | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> CommandResult:
         """
         Find the scripted response for a call, recording the call first.
 
@@ -856,6 +875,8 @@ class FakeRunner(CommandRunner):
                 :meth:`SubprocessRunner._prepare` folds it in, so a test's
                 ``.script(...)`` and ``.calls`` assertions see exactly what
                 would execute for real.
+            env: Extra environment the call was given, recorded in
+                :attr:`envs` next to the argv.
 
         Returns:
             The scripted result, or a default success.
@@ -865,6 +886,7 @@ class FakeRunner(CommandRunner):
             args = [*runuser_prefix(user), *args]
         recorded = tuple(args)
         self.calls.append(recorded)
+        self.envs.append(dict(env) if env is not None else None)
         for scripted in reversed(self._scripted):
             if recorded[: len(scripted.match)] == scripted.match:
                 return replace(scripted.result, argv=recorded)
@@ -886,7 +908,7 @@ class FakeRunner(CommandRunner):
         self.inputs.append(input)
         if stdin_path is not None:
             self.stdin_paths.append(stdin_path)
-        result = self._lookup(argv, user)
+        result = self._lookup(argv, user, env)
         return result.check() if check else result
 
     def stream(
@@ -900,7 +922,7 @@ class FakeRunner(CommandRunner):
         user: str | None = None,
         secrets: Sequence[str] = (),
     ) -> CommandResult:
-        result = self._lookup(argv, user)
+        result = self._lookup(argv, user, env)
         for line in result.stdout.splitlines():
             on_line(line)
         return result
@@ -917,7 +939,7 @@ class FakeRunner(CommandRunner):
         user: str | None = None,
         secrets: Sequence[str] = (),
     ) -> CommandResult:
-        result = self._lookup(argv, user)
+        result = self._lookup(argv, user, env)
         self.written[destination] = result.argv
         if result.success:
             destination.parent.mkdir(parents=True, exist_ok=True)

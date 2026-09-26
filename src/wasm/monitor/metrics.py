@@ -17,6 +17,7 @@ from typing import Any
 
 from wasm.core.exceptions import MonitorError
 from wasm.core.runner import CommandRunner, get_runner
+from wasm.managers.service_manager import ServiceManager
 from wasm.monitor.models import DiskUsage, ProcessInfo, ResourceMetrics, ServiceHealth
 
 try:
@@ -306,34 +307,61 @@ def collect_resource_metrics() -> ResourceMetrics:
     )
 
 
+def _optional_int(value: str | None) -> int | None:
+    """
+    Read a numeric systemd property.
+
+    Args:
+        value: The raw value, or None when the property was absent.
+
+    Returns:
+        The number, or None when it was absent or not a number: "systemd did
+        not say" must not read as zero restarts.
+    """
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
 def collect_service_health(
     units: Sequence[str],
     runner: CommandRunner | None = None,
+    *,
+    service_manager: ServiceManager | None = None,
 ) -> list[ServiceHealth]:
     """
-    Ask systemd about a set of units.
+    Ask systemd about a set of units, in one call for all of them.
+
+    The call is :meth:`ServiceManager.describe_units`, the same one the
+    Services page reads: two calls per unit per scan was forty processes a
+    minute on a server with twenty applications, to learn less.
 
     Args:
         units: Unit names, with or without the .service suffix.
-        runner: Command runner to use. Defaults to the process-wide one.
+        runner: Command runner to use when no service manager is given.
+            Defaults to the process-wide one.
+        service_manager: Where the properties are read from. Built on
+            ``runner`` when None.
 
     Returns:
-        One ServiceHealth per requested unit, in the order given.
+        One ServiceHealth per requested unit, in the order given. A unit
+        systemd said nothing about (the call failed outright) has an empty
+        ``active_state``: unknown, which is neither up nor failed.
     """
-    command_runner = runner or get_runner()
+    if not units:
+        return []
+    names = [unit.removesuffix(".service") for unit in units]
+    manager = service_manager or ServiceManager(runner=runner or get_runner())
+    described = manager.describe_units(names)
 
     health: list[ServiceHealth] = []
-    for unit in units:
-        active = command_runner.run(
-            ["systemctl", "is-active", unit],
-            timeout=SYSTEMCTL_TIMEOUT,
-        )
-        enabled = command_runner.run(
-            ["systemctl", "is-enabled", unit],
-            timeout=SYSTEMCTL_TIMEOUT,
-        )
-        active_state = active.output
-        enabled_state = enabled.output
+    for unit, name in zip(units, names, strict=True):
+        fields = described.get(name, {})
+        active_state = fields.get("ActiveState", "").strip()
+        enabled_state = fields.get("UnitFileState", "").strip()
         health.append(
             ServiceHealth(
                 unit=unit,
@@ -341,6 +369,11 @@ def collect_service_health(
                 enabled=enabled_state in ("enabled", "enabled-runtime", "static"),
                 active_state=active_state,
                 enabled_state=enabled_state,
+                sub_state=fields.get("SubState", "").strip(),
+                load_state=fields.get("LoadState", "").strip(),
+                result=fields.get("Result", "").strip(),
+                exec_main_status=_optional_int(fields.get("ExecMainStatus", "").strip()),
+                restarts=_optional_int(fields.get("NRestarts", "").strip()),
             )
         )
 

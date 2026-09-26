@@ -162,12 +162,21 @@ def resolve_state_with_status(
             {},
         )
 
-    try:
-        status = service_manager.get_status(domain_to_app_name(app.domain))
-    except (WASMError, ValidationError) as error:
-        return AppState(UNKNOWN, healthy=False, detail=str(error)), {}
-
-    return _state_from_status(app, status, probe=probe), status
+    # The unit(s) come from the one mapping of an application to its units:
+    # the legacy prefix, a monorepo's workspaces and Compose are resolved
+    # there. An application with several units is as healthy as its worst.
+    units = service_manager.app_units(app) or [domain_to_app_name(app.domain)]
+    resolved: list[tuple[AppState, dict[str, Any]]] = []
+    for unit in units:
+        try:
+            status = service_manager.get_status(unit)
+        except (WASMError, ValidationError) as error:
+            return AppState(UNKNOWN, healthy=False, detail=str(error)), {}
+        state = _state_from_status(app, status, probe=probe)
+        if not state.healthy:
+            return state, status
+        resolved.append((state, status))
+    return resolved[0]
 
 
 def _state_from_status(app: App, status: dict[str, Any], *, probe: bool) -> AppState:

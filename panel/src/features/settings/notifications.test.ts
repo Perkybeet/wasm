@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 
-import { CHANNELS, REDACTED, channelValue, isChannelConfigured, parseHostList, readNotificationSettings } from "./notifications";
+import {
+  CHANNELS,
+  REDACTED,
+  channelValue,
+  isChannelConfigured,
+  parseHostList,
+  readNotificationSettings,
+  telegramChatIdWarning,
+} from "./notifications";
 import type { ChannelSpec } from "./notifications";
 
 /** GET /api/config's notifications block as the sandboxed server answers it. */
@@ -80,5 +88,30 @@ describe("the notification settings", () => {
   it("reads a list of hosts typed one per line or with commas", () => {
     expect(parseHostList("10.0.0.12\n  Hooks.Internal , 10.0.0.12\n\n")).toEqual(["10.0.0.12", "hooks.internal"]);
     expect(parseHostList("   ")).toEqual([]);
+  });
+});
+
+describe("telegramChatIdWarning", () => {
+  it("says nothing about a negative ID, the correct shape for a group or supergroup", () => {
+    expect(telegramChatIdWarning("-1001234567890")).toBeNull();
+  });
+
+  it("says nothing about a short positive ID, the shape of a personal chat", () => {
+    expect(telegramChatIdWarning("123456789")).toBeNull();
+  });
+
+  it("says nothing about an empty or non-numeric value: a different problem, not this one", () => {
+    expect(telegramChatIdWarning("")).toBeNull();
+    expect(telegramChatIdWarning("not-a-number")).toBeNull();
+  });
+
+  it("warns about a 13+ digit positive number: a group ID typed without its minus sign", () => {
+    expect(telegramChatIdWarning("1001234567890")).toBe(
+      "This looks like a group's chat ID without its minus sign. Groups and supergroups use a negative ID (a supergroup's starts with -100); try -1001234567890.",
+    );
+  });
+
+  it("ignores surrounding whitespace", () => {
+    expect(telegramChatIdWarning("  1001234567890  ")).not.toBeNull();
   });
 });

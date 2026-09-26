@@ -667,3 +667,122 @@ def test_post_jobs_deploy_is_gone(client: TestClient) -> None:
 
     assert response.status_code in (404, 405)
     assert response.status_code != 202
+
+
+# ---------------------------------------------------------------------------
+# Two threads recording one job
+# ---------------------------------------------------------------------------
+
+
+def test_queueing_and_starting_a_job_at_once_loses_no_write(
+    store: Any, runner: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    The production failure: "Could not persist job faf6fc7b: UNIQUE constraint failed".
+
+    The request thread records the job it queued while the worker records it
+    starting. Every write must land, and the row must end at the newest state
+    whichever thread got there first.
+    """
+    import threading
+    from datetime import datetime
+
+    manager = get_job_manager()
+    barrier = threading.Barrier(2)
+
+    for _ in range(100):
+        job_id = str(uuid.uuid4())[:8]
+        job = Job(id=job_id, type=JobType.CUSTOM, name="Race", description="")
+        manager._jobs[job_id] = job
+
+        def queue_it(job: Job = job) -> None:
+            barrier.wait()
+            manager._notify_subscribers(job)
+
+        def start_it(job: Job = job) -> None:
+            barrier.wait()
+            job.status = JobStatus.RUNNING
+            job.started_at = datetime.now()
+            manager._notify_subscribers(job)
+
+        threads = [threading.Thread(target=queue_it), threading.Thread(target=start_it)]
+        with caplog.at_level("WARNING", logger="wasm.web.jobs"):
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=30)
+
+        record = store.get_job(job_id)
+        assert record is not None
+        assert record.status == "running"
+        assert record.started_at is not None
+
+    assert [r.getMessage() for r in caplog.records if "Could not persist" in r.getMessage()] == []
+
+
+# ---------------------------------------------------------------------------
+# A failed job is logged at the weight its failure deserves
+# ---------------------------------------------------------------------------
+
+
+def _dns_refused_renewal(job_context: JobContext | None = None) -> None:
+    """
+    A job that fails the way a renewal does when DNS points elsewhere.
+
+    Args:
+        job_context: Injected by the job manager.
+
+    Raises:
+        CertificateError: Always, with certbot's output attached.
+    """
+    from wasm.core.exceptions import CertificateError
+
+    raise CertificateError(
+        "Could not renew the certificate for shop.example.com",
+        details="shop.example.com does not resolve to this server.\nPoint its A record here.",
+        output="certbot: Challenge failed for domain shop.example.com",
+    )
+
+
+def test_an_expected_failure_is_logged_as_one_line_without_a_traceback(
+    store: Any, runner: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    A WASMError already says what happened and how to fix it; a traceback
+    through the job worker only buries that.
+    """
+    manager = get_job_manager()
+
+    with caplog.at_level("DEBUG", logger="wasm.web.jobs"):
+        job = _run_job_synchronously(manager, JobType.CERT_RENEW, "Renew", "", _dns_refused_renewal)
+
+    assert job.status == JobStatus.FAILED
+    failures = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(failures) == 1
+    record = failures[0]
+    assert record.exc_info is None
+    message = record.getMessage()
+    assert "\n" not in message
+    assert f"Job {job.id} failed" in message
+    assert "Could not renew the certificate for shop.example.com" in message
+    assert "Point its A record here." in message
+    # The tool's own output is kept, at debug, not in the one line.
+    assert "Challenge failed" not in message
+    debug = [r.getMessage() for r in caplog.records if r.levelname == "DEBUG"]
+    assert any("Challenge failed for domain shop.example.com" in line for line in debug)
+
+
+def test_an_unexpected_failure_keeps_its_traceback(
+    store: Any, runner: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Anything that is not a WASMError is a defect, and finding it needs the trace."""
+    manager = get_job_manager()
+
+    with caplog.at_level("ERROR", logger="wasm.web.jobs"):
+        job = _run_job_synchronously(manager, JobType.CUSTOM, "Boom", "", _failing_job)
+
+    assert job.status == JobStatus.FAILED
+    failures = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(failures) == 1
+    assert failures[0].exc_info is not None
+    assert failures[0].exc_info[0] is RuntimeError

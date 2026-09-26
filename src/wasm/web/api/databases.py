@@ -535,7 +535,7 @@ def list_engines(session: Annotated[dict, Depends(get_current_session)]) -> Engi
                 installed=installed,
                 version=manager.get_version() if installed else None,
                 running=manager.is_running() if installed else False,
-                port=manager.DEFAULT_PORT,
+                port=manager.server_port() if installed else manager.DEFAULT_PORT,
             )
         )
     return EngineListResponse(engines=engines)

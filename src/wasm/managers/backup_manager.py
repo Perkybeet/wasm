@@ -58,6 +58,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import re
 import shutil
 import sqlite3
 import tarfile
@@ -69,7 +70,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any, ClassVar, Protocol, runtime_checkable
 
 from wasm.core.applock import app_lock
-from wasm.core.config import Config
+from wasm.core.config import DEFAULT_BACKUP_DIR as _DEFAULT_BACKUP_DIR
+from wasm.core.config import Config, resolve_backup_directory
 from wasm.core.exceptions import (
     BackupError,
     DatabaseError,
@@ -112,8 +114,10 @@ __all__ = [
     "PAYLOAD_DIR",
     "VOLUMES_DIR",
     "BackupError",
+    "BackupImportReport",
     "BackupManager",
     "BackupMetadata",
+    "MisplacedBackups",
     "RollbackManager",
 ]
 
@@ -145,6 +149,31 @@ MAX_BACKUP_ENTRIES = 2_000_000
 
 #: Bytes allowed out of a backup archive during a restore.
 MAX_BACKUP_BYTES = 256 * 1024**3
+
+#: The archive suffix every backup carries.
+ARCHIVE_SUFFIX = ".tar.gz"
+
+#: What :meth:`BackupManager._generate_backup_id` writes: the domain with dots
+#: as dashes, then the local date and time. Matching it is how a WASM backup is
+#: told apart from whatever else shares a directory with it - a misplaced backup
+#: directory was ``/root``, next to ``.ssh`` and ``.docker``.
+BACKUP_ID_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?_\d{8}_\d{6}$")
+
+
+def backup_id_of_archive(path: Path) -> str | None:
+    """
+    Read the backup identifier out of an archive's file name.
+
+    Args:
+        path: A file that may be a backup archive.
+
+    Returns:
+        The identifier, or None when the name is not a WASM backup's.
+    """
+    if not path.name.endswith(ARCHIVE_SUFFIX):
+        return None
+    stem = path.name[: -len(ARCHIVE_SUFFIX)]
+    return stem if BACKUP_ID_PATTERN.match(stem) else None
 
 
 @dataclass
@@ -285,6 +314,63 @@ class BackupMetadata:
             return "unknown"
 
 
+@dataclass
+class MisplacedBackups:
+    """
+    WASM backups found outside the configured backup directory.
+
+    Attributes:
+        directory: The directory holding them, in the ``<app>/<id>.tar.gz``
+            layout :meth:`BackupManager.import_backups` takes.
+        count: How many complete backups (archive and metadata) it holds.
+    """
+
+    directory: Path
+    count: int
+
+    @property
+    def command(self) -> str:
+        """
+        The command that moves them into the backup directory.
+
+        Returns:
+            A ``wasm backup import`` command line.
+        """
+        return f"wasm backup import {self.directory}"
+
+
+@dataclass
+class _BackupPair:
+    """One backup found on disk: its archive, its metadata, and whose it is."""
+
+    archive: Path
+    metadata: Path
+    app_name: str
+
+
+@dataclass
+class BackupImportReport:
+    """
+    What :meth:`BackupManager.import_backups` did, or would do in a rehearsal.
+
+    Attributes:
+        source: The directory the backups were taken from.
+        destination: The configured backup directory.
+        moved: Archive moved, as (where it was, where it is now). Its metadata
+            moved with it.
+        left: Things that look like backups and were left where they were,
+            with the reason: a collision, missing metadata, a symlink, a move
+            that failed.
+        rehearsal: True when nothing was actually moved.
+    """
+
+    source: Path
+    destination: Path
+    moved: list[tuple[Path, Path]] = field(default_factory=list)
+    left: list[tuple[Path, str]] = field(default_factory=list)
+    rehearsal: bool = False
+
+
 class BackupManager:
     """
     Manager for application backups.
@@ -293,8 +379,15 @@ class BackupManager:
     enforces retention.
     """
 
-    # Default backup directory
-    DEFAULT_BACKUP_DIR = Path("/var/backups/wasm")
+    # Default backup directory. The value is owned by wasm.core.config; the
+    # class attribute is what a sandbox redirects.
+    DEFAULT_BACKUP_DIR = _DEFAULT_BACKUP_DIR
+
+    #: Where backups ended up while ``backup.directory: ''`` meant the working
+    #: directory: root's home, where an operator runs wasm, and ``/``, the
+    #: working directory of every systemd unit - the backup timers and the
+    #: console among them. :meth:`find_misplaced_backups` looks there.
+    MISPLACED_BACKUP_ROOTS: ClassVar[tuple[Path, ...]] = (Path("/root"), Path("/"))
 
     # Files/directories to always exclude from backups.
     #
@@ -360,7 +453,11 @@ class BackupManager:
         self._fs = fs
         self.service_manager = ServiceManager(verbose=verbose, runner=runner)
 
-        self.backup_dir = Path(self.config.get("backup.directory", str(self.DEFAULT_BACKUP_DIR)))
+        # The one interpretation of the setting: empty is the default, relative
+        # is refused. Never Path(value), which is the working directory for ''.
+        self.backup_dir = resolve_backup_directory(
+            self.config.get("backup.directory"), default=self.DEFAULT_BACKUP_DIR
+        )
         self.max_backups = self.config.get("backup.max_per_app", self.DEFAULT_MAX_BACKUPS)
         self.max_entries = int(self.config.get("backup.max_entries", MAX_BACKUP_ENTRIES))
         self.max_bytes = int(self.config.get("backup.max_bytes", MAX_BACKUP_BYTES))
@@ -2683,6 +2780,13 @@ class BackupManager:
         """
         Report how much disk the backups take.
 
+        Only archives named like a WASM backup count, and only directories
+        holding one are listed. Every subdirectory used to be an
+        "application": with the backup directory resolved to ``/root``, the
+        console listed ``.ssh``, ``.docker`` and ``.claude``. An archive with
+        no metadata still counts, because it still takes the space and
+        :meth:`restore_archive` can still restore it.
+
         Returns:
             Totals overall and per application.
         """
@@ -2693,14 +2797,19 @@ class BackupManager:
             "by_app": by_app,
         }
 
-        if not self.backup_dir.exists():
-            return usage
-
-        for app_dir in self.backup_dir.iterdir():
-            if not app_dir.is_dir():
+        for app_dir in self._subdirectories(self.backup_dir):
+            try:
+                app_backups = [
+                    path
+                    for path in app_dir.glob(f"*{ARCHIVE_SUFFIX}")
+                    if backup_id_of_archive(path) and path.is_file() and not path.is_symlink()
+                ]
+            except OSError as exc:
+                self.logger.debug(f"Could not list {app_dir}: {exc}")
+                continue
+            if not app_backups:
                 continue
 
-            app_backups = list(app_dir.glob("*.tar.gz"))
             app_size = 0
             for backup_file in app_backups:
                 try:
@@ -2713,6 +2822,247 @@ class BackupManager:
             usage["total_backups"] += len(app_backups)
 
         return usage
+
+    # -- misplaced backups ------------------------------------------------
+
+    def _subdirectories(self, root: Path) -> list[Path]:
+        """
+        List the real directories directly under a directory.
+
+        Args:
+            root: Directory to list.
+
+        Returns:
+            Its subdirectories, sorted, symlinks excluded. Empty when ``root``
+            is missing or unreadable.
+        """
+        try:
+            return sorted(
+                entry for entry in root.iterdir() if entry.is_dir() and not entry.is_symlink()
+            )
+        except OSError as exc:
+            self.logger.debug(f"Could not list {root}: {exc}")
+            return []
+
+    def _find_backup_pairs(
+        self, root: Path, names: set[str] | None = None
+    ) -> tuple[list[_BackupPair], list[tuple[Path, str]]]:
+        """
+        Find complete WASM backups laid out as ``<root>/<app>/<id>.tar.gz``.
+
+        A pair counts only when every part agrees: the archive is named like a
+        backup, its ``.json`` sits next to it and describes that same
+        identifier, and the directory is named after the application the
+        metadata says it belongs to. That is what keeps an unrelated tarball,
+        or a whole home directory, from ever being taken for a backup.
+
+        Args:
+            root: Directory holding one subdirectory per application.
+            names: Only look in these subdirectories. None looks in all of
+                them.
+
+        Returns:
+            The complete pairs, and the files that are named like a backup
+            archive but are not one, with the reason.
+        """
+        if names is None:
+            candidates = self._subdirectories(root)
+        else:
+            candidates = []
+            for name in sorted(names):
+                candidate = root / name
+                try:
+                    if candidate.is_dir() and not candidate.is_symlink():
+                        candidates.append(candidate)
+                except OSError as exc:
+                    # An unreadable place is somewhere no backup of ours can be
+                    # found, not a reason to fail the storage report.
+                    self.logger.debug(f"Could not look at {candidate}: {exc}")
+
+        pairs: list[_BackupPair] = []
+        rejected: list[tuple[Path, str]] = []
+        for app_dir in candidates:
+            try:
+                archives = sorted(app_dir.glob(f"*{ARCHIVE_SUFFIX}"))
+            except OSError as exc:
+                self.logger.debug(f"Could not list {app_dir}: {exc}")
+                continue
+            for archive in archives:
+                backup_id = backup_id_of_archive(archive)
+                if backup_id is None:
+                    continue
+                if archive.is_symlink() or not archive.is_file():
+                    rejected.append((archive, "is a symbolic link or not a regular file"))
+                    continue
+                metadata_file = app_dir / f"{backup_id}.json"
+                if metadata_file.is_symlink() or not metadata_file.is_file():
+                    rejected.append((archive, "has no metadata file next to it"))
+                    continue
+                metadata = self._read_metadata_file(metadata_file)
+                if metadata is None or metadata.id != backup_id:
+                    rejected.append((archive, "its metadata does not describe this archive"))
+                    continue
+                app_name = domain_to_app_name(metadata.domain)
+                if app_name != app_dir.name:
+                    rejected.append(
+                        (archive, f"belongs to {metadata.domain}, not to {app_dir.name}")
+                    )
+                    continue
+                pairs.append(_BackupPair(archive, metadata_file, app_name))
+        return pairs, rejected
+
+    def import_backups(self, source: Path) -> BackupImportReport:
+        """
+        Move WASM backups from another directory into the backup directory.
+
+        This is the way back for backups written somewhere else, above all
+        the ones ``backup.directory: ''`` sent to the working directory
+        (``/root/<app>/`` or ``/<app>/``). Only complete backups move - the
+        archive and its metadata, together - and nothing is ever overwritten:
+        a backup whose name is already taken in the destination stays where it
+        is and is reported. Running it again moves nothing new. Every move
+        goes through the filesystem seam, so ``--dry-run`` reports what would
+        move and moves nothing.
+
+        Args:
+            source: Directory laid out like the backup directory, one
+                subdirectory per application.
+
+        Returns:
+            What moved and what was left behind.
+
+        Raises:
+            BackupError: When ``source`` is not a directory or is the backup
+                directory itself.
+        """
+        source = Path(source).absolute()
+        if not source.is_dir():
+            raise BackupError(
+                f"Not a directory: {source}",
+                details="Pass the directory holding the misplaced <app>/ backup directories.",
+            )
+        if source.resolve() == self.backup_dir.resolve():
+            raise BackupError(
+                f"{source} is already the backup directory",
+                details="Pass the directory the backups were written to by mistake.",
+            )
+
+        report = BackupImportReport(
+            source=source, destination=self.backup_dir, rehearsal=self._rehearsing
+        )
+        pairs, rejected = self._find_backup_pairs(source)
+        report.left.extend(rejected)
+        if pairs:
+            self._ensure_backup_dir()
+
+        for pair in pairs:
+            destination = self._get_app_backup_dir(pair.app_name)
+            archive_to = destination / pair.archive.name
+            metadata_to = destination / pair.metadata.name
+
+            if destination.is_symlink():
+                # A backup directory is a secrets directory; a link there
+                # would send the archive wherever it points.
+                report.left.append((pair.archive, f"{destination} is a symbolic link"))
+                continue
+            taken = [p for p in (archive_to, metadata_to) if p.exists() or p.is_symlink()]
+            if taken:
+                report.left.append(
+                    (pair.archive, f"{taken[0]} already exists; nothing was overwritten")
+                )
+                continue
+
+            try:
+                self.fs.make_dir(destination, mode=SECRET_DIR_MODE)
+                self.fs.chmod(destination, SECRET_DIR_MODE)
+                self.fs.move(pair.archive, archive_to)
+            except OSError as exc:
+                report.left.append((pair.archive, f"could not be moved: {exc}"))
+                continue
+            try:
+                self.fs.move(pair.metadata, metadata_to)
+            except OSError as exc:
+                # An archive without its metadata is invisible to the listing,
+                # so the pair is never left split: the archive goes back.
+                try:
+                    self.fs.move(archive_to, pair.archive)
+                except OSError as back_exc:
+                    report.left.append(
+                        (
+                            pair.archive,
+                            f"metadata could not be moved ({exc}) and the archive could "
+                            f"not be put back ({back_exc}); it is at {archive_to}",
+                        )
+                    )
+                    continue
+                report.left.append((pair.archive, f"metadata could not be moved: {exc}"))
+                continue
+            report.moved.append((pair.archive, archive_to))
+
+        return report
+
+    def _has_backups(self, root: Path) -> bool:
+        """
+        Report whether a backup root holds at least one archive.
+
+        Args:
+            root: Directory laid out like the backup directory.
+
+        Returns:
+            True when any application directory under it holds a backup.
+        """
+        for app_dir in self._subdirectories(root):
+            try:
+                if any(backup_id_of_archive(p) for p in app_dir.glob(f"*{ARCHIVE_SUFFIX}")):
+                    return True
+            except OSError as exc:
+                self.logger.debug(f"Could not list {app_dir}: {exc}")
+        return False
+
+    def _known_app_names(self) -> set[str]:
+        """
+        Name the applications whose backups may have been misplaced.
+
+        Returns:
+            The applications deployed now plus every application the backup
+            directory already holds backups of.
+        """
+        names = {entry.name for entry in self._subdirectories(self.config.apps_directory)}
+        names.update(entry.name for entry in self._subdirectories(self.backup_dir))
+        return names
+
+    def find_misplaced_backups(self) -> list[MisplacedBackups]:
+        """
+        Look for WASM backups outside the configured backup directory.
+
+        Two places are checked. The default directory, when the configured
+        one is elsewhere and holds nothing: backups taken before the setting
+        changed are there. And :attr:`MISPLACED_BACKUP_ROOTS`, where an empty
+        setting sent them; those are only searched for the applications this
+        server knows, so ``/`` is never walked wholesale.
+
+        Returns:
+            Each directory holding backups, with how many; empty when there
+            are none anywhere else.
+        """
+        found: list[MisplacedBackups] = []
+        configured = self.backup_dir
+
+        if self.DEFAULT_BACKUP_DIR != configured and not self._has_backups(configured):
+            pairs, _ = self._find_backup_pairs(self.DEFAULT_BACKUP_DIR)
+            if pairs:
+                found.append(MisplacedBackups(self.DEFAULT_BACKUP_DIR, len(pairs)))
+
+        names = self._known_app_names()
+        if names:
+            for root in self.MISPLACED_BACKUP_ROOTS:
+                if root in (configured, self.DEFAULT_BACKUP_DIR):
+                    continue
+                pairs, _ = self._find_backup_pairs(root, names=names)
+                if pairs:
+                    found.append(MisplacedBackups(root, len(pairs)))
+
+        return found
 
 
 @runtime_checkable

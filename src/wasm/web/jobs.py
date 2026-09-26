@@ -337,6 +337,11 @@ class JobManager:
         self._max_concurrent = MAX_CONCURRENT_JOBS
         self._running_count = 0
         self._lock = threading.Lock()
+        # Serialises recording a job: the request thread that queues it and
+        # the worker that starts it notify at once, and the snapshot each one
+        # writes must be taken and stored as one step, or the older snapshot
+        # can land last and put a running job back to pending.
+        self._persist_lock = threading.Lock()
         self._subscribers: dict[str, list[Callable[[Job], None]]] = {}
         self._global_subscribers: list[Callable[[Job], None]] = []
         self._worker_thread: threading.Thread | None = None
@@ -449,18 +454,44 @@ class JobManager:
         # product code and a crash here must mark the job failed, never kill
         # the only worker thread.
         except Exception as exc:
-            logger.exception("Job %s failed", job_id)
             domain = job.metadata.get("domain")
             if isinstance(domain, str) and domain:
                 # A deploy writes the application's .env as it runs; a value
                 # generated there is only on disk by now.
                 job.scrubber.add(app_secret_values(domain))
+            self._log_failure(job, exc)
             job.status = JobStatus.FAILED
             job.error = job.scrubber.scrub(str(exc))
             job.add_log(f"Job failed: {exc}", "error")
         finally:
             job.completed_at = datetime.now()
             self._notify_subscribers(job)
+
+    @staticmethod
+    def _log_failure(job: Job, exc: Exception) -> None:
+        """
+        Record a failed job in the server log, at the weight the failure deserves.
+
+        A :class:`WASMError` is an outcome the product anticipated - a renewal
+        refused because DNS does not point here, a build that failed - and it
+        already carries the explanation and the fix, so it is one line: a
+        traceback would only bury it. The failing tool's own output goes at
+        debug. Anything else is a defect in WASM, and its traceback is what
+        finding it needs.
+
+        Args:
+            job: The job that failed; its scrubber has every secret known so far.
+            exc: What the job function raised.
+        """
+        if isinstance(exc, WASMError):
+            summary = exc.message
+            if exc.details:
+                summary = f"{summary} ({exc.details})"
+            logger.error("Job %s failed: %s", job.id, " ".join(job.scrubber.scrub(summary).split()))
+            if exc.output:
+                logger.debug("Job %s output:\n%s", job.id, job.scrubber.scrub(exc.output))
+            return
+        logger.exception("Job %s failed unexpectedly", job.id)
 
     def create_job(
         self,
@@ -651,39 +682,24 @@ class JobManager:
         """
         Write a job's current state to the store and its newest line to disk.
 
-        Tries an update first and falls back to an insert when the row does
-        not exist yet, so the very first notification - queueing the job,
-        before it has run a single step - is what creates the row. A store
-        that cannot be reached must not fail the job it is only recording.
+        The store write is one atomic upsert, so the very first notification -
+        queueing the job, before it has run a single step - creates the row and
+        every later one updates it, whichever thread gets there first. The
+        snapshot is taken under :attr:`_persist_lock`, so the last write is
+        always the newest state. A store that cannot be reached must not fail
+        the job it is only recording.
 
         Args:
             job: The job that changed.
         """
-        if job.logs:
-            latest = job.logs[-1]
-            self._write_log_line(job.id, latest.message, latest.level)
+        with self._persist_lock:
+            if job.logs:
+                latest = job.logs[-1]
+                self._write_log_line(job.id, latest.message, latest.level)
 
-        domain = job.metadata.get("domain")
-        started_at = job.started_at.isoformat() if job.started_at else None
-        finished_at = job.completed_at.isoformat() if job.completed_at else None
-        result_json = self._safe_json(job.result) if job.result is not None else None
-        log_path = self._log_paths.get(job.id)
-
-        try:
-            store = get_store()
-            updated = store.update_job(
-                job.id,
-                status=job.status.value,
-                progress=job.progress,
-                domain=domain,
-                error=job.error,
-                result_json=result_json,
-                started_at=started_at,
-                finished_at=finished_at,
-                log_path=log_path,
-            )
-            if not updated:
-                store.create_job(
+            domain = job.metadata.get("domain")
+            try:
+                get_store().save_job(
                     JobRecord(
                         id=job.id,
                         type=job.type.value,
@@ -692,21 +708,24 @@ class JobManager:
                         status=job.status.value,
                         progress=job.progress,
                         total_steps=job.total_steps,
-                        domain=domain,
+                        domain=domain if isinstance(domain, str) else None,
                         error=job.error,
-                        result_json=result_json,
-                        started_at=started_at,
-                        finished_at=finished_at,
-                        log_path=log_path,
+                        result_json=(
+                            self._safe_json(job.result) if job.result is not None else None
+                        ),
+                        created_at=job.created_at.isoformat(),
+                        started_at=job.started_at.isoformat() if job.started_at else None,
+                        finished_at=job.completed_at.isoformat() if job.completed_at else None,
+                        log_path=self._log_paths.get(job.id),
                         actor=job.actor,
                     )
                 )
-        except _RECORDING_ERRORS as exc:
-            logger.warning("Could not persist job %s: %s", job.id, exc)
+            except _RECORDING_ERRORS as exc:
+                logger.warning("Could not persist job %s: %s", job.id, exc)
 
-        if job.status in FINISHED_STATUSES:
-            self._close_log(job.id)
-            self._log_paths.pop(job.id, None)
+            if job.status in FINISHED_STATUSES:
+                self._close_log(job.id)
+                self._log_paths.pop(job.id, None)
 
     @staticmethod
     def _safe_json(value: Any) -> str:

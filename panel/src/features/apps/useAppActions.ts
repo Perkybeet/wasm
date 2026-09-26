@@ -26,8 +26,8 @@ export function reportActionError(title: string, error: unknown): void {
     toast.info(error.detail);
     return;
   }
-  const { hint, detail } = describeError(error);
-  toast.error(title, { detail, ...(hint !== null ? { description: hint } : {}) });
+  const { hint, detail, output } = describeError(error);
+  toast.error(title, { detail, ...(hint !== null ? { description: hint } : {}), ...(output !== null ? { output } : {}) });
 }
 
 type UnitVerb = "restart" | "start" | "stop";

@@ -42,13 +42,13 @@ and is sandboxed (`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome=read-o
 
 ## What it watches
 
-Every scan interval (30 seconds by default, never less than 10):
+Every scan interval (60 seconds by default, never less than 10):
 
 | Watch | Recorded when | Severity |
 |---|---|---|
 | Process names | The executable's name starts with a known miner or malware name: `xmrig`, `minerd`, `cpuminer`, `cgminer`, `bfgminer`, `ethminer`, `ccminer`, `kdevtmpfsi`, `kinsing`, `kerberods`, `watchdogs`. Common daemons are never flagged. | `warning` |
 | Process resource use | A process uses more CPU or memory than `monitor.cpu_threshold` or `monitor.memory_threshold` percent (80 by default). | `notice` |
-| Units | A unit listed in `monitor.watch_units` stops being active. | notification `unit_failed` |
+| Units | A unit WASM manages, or one listed in `monitor.watch_units`, fails: it is `failed`, it crash-loops (its automatic restarts grow between two scans), or it stopped after a failed run. A unit stopped on purpose does not count. All units are read with one `systemctl show` per scan; one message per outage. | notification `unit_failed` |
 | Certificates | A certificate has less than 14 days left; at most one message per certificate per day. | notification `cert_expiring` |
 | Disks | A filesystem crosses 90% used; one message per crossing. | notification `disk_threshold` |
 
@@ -84,10 +84,10 @@ scan. Credentials are only sent over TLS: `use_ssl` (implicit TLS, the default) 
 | Key | Default | Meaning |
 |---|---|---|
 | `monitor.enabled` | `false` | Whether it is meant to run at boot |
-| `monitor.scan_interval` | `30` | Seconds between scans, at least 10 |
+| `monitor.scan_interval` | `60` | Seconds between scans, at least 10. Above 300, `wasm monitor status` warns that a failure may go unnoticed that long |
 | `monitor.cpu_threshold` | `80.0` | CPU percent above which a process is recorded |
 | `monitor.memory_threshold` | `80.0` | Memory percent above which a process is recorded |
-| `monitor.watch_units` | `[]` | Units whose state is reported |
+| `monitor.watch_units` | `[]` | Units watched in addition to every unit WASM manages |
 | `monitor.notify` | `false` | Mail new observations |
 | `monitor.retention_days` | `30` | Days observations are kept |
 | `monitor.max_observations` | `5000` | Observations kept at most |

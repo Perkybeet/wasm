@@ -117,6 +117,150 @@ _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:")
 #: recursive clone; these two settings close that path.
 _GIT_SAFE_CONFIG = ("-c", "protocol.ext.allow=never", "-c", "protocol.file.allow=never")
 
+#: The ssh git runs. BatchMode makes ssh fail instead of asking for a
+#: passphrase, a password or a host key confirmation on the terminal.
+#: accept-new is the host key policy WASM already applies when it tests a
+#: connection (validators/ssh.py): a first contact is recorded, a changed key
+#: is still refused.
+GIT_SSH_COMMAND = "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30"
+
+#: The message of every "git was refused credentials" error, whatever git said.
+GIT_AUTH_FAILURE_MESSAGE = "The repository is private or the credentials were refused"
+
+#: What git and the forges say when a repository wants credentials it did not
+#: get. Matched lowercased against git's output. "Repository not found" is
+#: how GitHub answers an unauthenticated request for a private repository.
+_GIT_AUTH_FAILURE_MARKERS = (
+    "could not read username",
+    "could not read password",
+    "terminal prompts disabled",
+    "authentication failed",
+    "invalid username or password",
+    "http basic: access denied",
+    "permission denied (publickey",
+    "repository not found",
+)
+
+_HTTPS_REPOSITORY_RE = re.compile(r"^https?://(?P<host>[\w.-]+)/(?P<path>[\w./-]+?)(?:\.git)?/?$")
+
+
+def git_environment() -> dict[str, str]:
+    """
+    Build the environment every git WASM runs is given.
+
+    Nobody is at the keyboard when WASM runs git: the console, a webhook and a
+    deploy job all run it on the operator's behalf, and a credential prompt
+    blocks until the clone timeout instead of failing. Each variable here
+    closes one way git or ssh can ask a person for something:
+
+    - ``GIT_TERMINAL_PROMPT=0``: git-remote-https does not read the terminal.
+    - ``GIT_ASKPASS``: a program that answers nothing and fails, so git gives
+      up instead of falling back to the terminal. Credential helpers still run
+      first, so a token stored with ``credential.helper`` keeps working.
+    - ``SSH_ASKPASS_REQUIRE=never``: ssh never starts a graphical prompt.
+    - ``GIT_SSH_COMMAND``: ssh in batch mode (see :data:`GIT_SSH_COMMAND`),
+      unless the operator exported one of their own, which is their choice.
+    - ``LC_ALL=C.UTF-8``: git's messages in English, so a refused credential
+      can be recognised whatever the server's locale is.
+
+    Returns:
+        Variables to merge over the current environment.
+    """
+    refuse = shutil.which("false") or "/bin/false"
+    env = {
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": refuse,
+        "SSH_ASKPASS": refuse,
+        "SSH_ASKPASS_REQUIRE": "never",
+        "GCM_INTERACTIVE": "never",
+        "LC_ALL": "C.UTF-8",
+        # gettext reads LANGUAGE before LC_ALL; empty means "not set".
+        "LANGUAGE": "",
+    }
+    if not os.environ.get("GIT_SSH_COMMAND"):
+        env["GIT_SSH_COMMAND"] = GIT_SSH_COMMAND
+    return env
+
+
+def is_git_auth_failure(output: str) -> bool:
+    """
+    Tell whether git failed because the repository wanted credentials.
+
+    Args:
+        output: git's stderr, or stderr and stdout together.
+
+    Returns:
+        True when git's output names a missing or refused credential.
+    """
+    lowered = output.lower()
+    return any(marker in lowered for marker in _GIT_AUTH_FAILURE_MARKERS)
+
+
+def _ssh_equivalent(url: str | None) -> str | None:
+    """
+    Spell an https repository URL the way ssh reaches it.
+
+    Args:
+        url: Repository URL, or None when it is not known.
+
+    Returns:
+        ``git@host:owner/repo.git``, or None when the URL is not https.
+    """
+    if not url:
+        return None
+    match = _HTTPS_REPOSITORY_RE.match(url.split("#")[0].strip())
+    if not match:
+        return None
+    return f"git@{match.group('host')}:{match.group('path')}.git"
+
+
+def git_auth_fix(url: str | None) -> str:
+    """
+    Say how to give this server access to a repository that refused it.
+
+    Args:
+        url: The repository URL, or None when it is not known.
+
+    Returns:
+        The fix, in one paragraph.
+    """
+    if url and is_ssh_url(url):
+        return (
+            "Add this server's public key as a deploy key of the repository: "
+            "`wasm setup ssh --show` prints it (`wasm setup ssh --generate` creates it "
+            "if there is none), then retry. If the repository does not exist, check the URL."
+        )
+    ssh_url = _ssh_equivalent(url) or "git@<host>:<owner>/<repo>.git"
+    return (
+        f"Deploy from the SSH URL instead ({ssh_url}) after adding this server's key "
+        "as a deploy key of the repository: `wasm setup ssh --show` prints it "
+        "(`wasm setup ssh --generate` creates it if there is none). Or keep the https URL "
+        "and store an access token for the host with a git credential helper "
+        "(`git config --global credential.helper store`, then a line "
+        "https://<user>:<token>@<host> in /root/.git-credentials, mode 0600). "
+        "If the repository is public, check the URL: a missing repository is refused "
+        "the same way."
+    )
+
+
+def git_auth_error(url: str | None, result: CommandResult) -> SourceError:
+    """
+    Build the error for a git command that was refused credentials.
+
+    Args:
+        url: The repository URL, or None when it is not known.
+        result: The failed git command.
+
+    Returns:
+        The error to raise, carrying git's own output verbatim.
+    """
+    return SourceError(
+        GIT_AUTH_FAILURE_MESSAGE,
+        details=git_auth_fix(url),
+        output=result.stderr or result.stdout,
+    )
+
+
 #: CPython's own hardened tar filter (PEP 706), present from 3.12. Used as an
 #: extra gate where available; the checks below do not depend on it, because
 #: the project supports 3.10 and 3.11 where it does not exist.
@@ -1089,9 +1233,40 @@ class SourceManager(BaseManager):
         """
         argv = ["git", *_GIT_SAFE_CONFIG, *args]
         self.logger.debug(f"Running: {' '.join(argv)}")
-        result = self.runner.run(argv, cwd=cwd, timeout=timeout)
+        result = self.runner.run(argv, cwd=cwd, env=git_environment(), timeout=timeout)
         self.logger.command_output(result.stdout, result.stderr)
         return result
+
+    def _git_failed(
+        self,
+        result: CommandResult,
+        message: str,
+        *,
+        url: str | None = None,
+        repository: Path | None = None,
+    ) -> SourceError:
+        """
+        Build the error for a git network command that failed.
+
+        A refused credential gets its own error, which says how to give this
+        server access; anything else keeps the message the caller chose.
+
+        Args:
+            result: The failed command.
+            message: What failed, for a failure that is not about credentials.
+            url: The repository URL, when the caller has it.
+            repository: A clone whose ``origin`` names the repository, asked
+                only when ``url`` is not given and credentials were refused.
+
+        Returns:
+            The error to raise.
+        """
+        if not is_git_auth_failure(f"{result.stderr}\n{result.stdout}"):
+            return SourceError(message, details=result.stderr)
+        if url is None and repository is not None:
+            origin = self._git(["remote", "get-url", "origin"], cwd=repository)
+            url = origin.stdout.strip() if origin.success else None
+        return git_auth_error(url, result)
 
     def is_installed(self) -> bool:
         """Check if Git is installed."""
@@ -1207,7 +1382,7 @@ class SourceManager(BaseManager):
         # Fetch all branches
         result = self._git(["fetch", "--all"], cwd=destination, timeout=GIT_NETWORK_TIMEOUT)
         if not result.success:
-            raise SourceError("Git fetch failed", details=result.stderr)
+            raise self._git_failed(result, "Git fetch failed", url=safe_url)
 
         # Determine target branch
         if safe_branch:
@@ -1323,7 +1498,7 @@ class SourceManager(BaseManager):
             timeout=GIT_NETWORK_TIMEOUT,
         )
         if not result.success:
-            raise SourceError(f"Git fetch of {safe_branch} failed", details=result.stderr)
+            raise self._git_failed(result, f"Git fetch of {safe_branch} failed", url=safe_url)
 
         if safe_branch != current:
             result = self._git(
@@ -1444,10 +1619,7 @@ class SourceManager(BaseManager):
         result = self._git(cmd, timeout=GIT_CLONE_TIMEOUT)
 
         if not result.success:
-            raise SourceError(
-                f"Git clone failed: {safe_url}",
-                details=result.stderr,
-            )
+            raise self._git_failed(result, f"Git clone failed: {safe_url}", url=safe_url)
 
         return True
 
@@ -1519,9 +1691,11 @@ class SourceManager(BaseManager):
                 result = self._git(["checkout", safe_branch], cwd=path)
                 if not result.success:
                     # Branch might not exist locally, try fetching first
-                    self._git(
+                    fetched = self._git(
                         ["fetch", "origin", safe_branch], cwd=path, timeout=GIT_NETWORK_TIMEOUT
                     )
+                    if not fetched.success and is_git_auth_failure(fetched.stderr):
+                        raise self._git_failed(fetched, "Git fetch failed", repository=path)
                     result = self._git(["checkout", safe_branch], cwd=path)
                     if not result.success:
                         raise SourceError(f"Failed to checkout branch: {safe_branch}")
@@ -1530,6 +1704,11 @@ class SourceManager(BaseManager):
             result = self._git(["pull", "--rebase"], cwd=path, timeout=GIT_NETWORK_TIMEOUT)
 
             if not result.success:
+                # A refused credential is not a diverged branch: resetting
+                # would fetch, be refused again, and hide the first answer.
+                if is_git_auth_failure(result.stderr):
+                    raise self._git_failed(result, "Git pull failed", repository=path)
+
                 # Analyze the error and try to recover
                 error_msg = result.stderr.lower()
 
@@ -1623,7 +1802,7 @@ class SourceManager(BaseManager):
         # Fetch all from remote
         result = self._git(["fetch", "--all"], cwd=path, timeout=GIT_NETWORK_TIMEOUT)
         if not result.success:
-            raise SourceError("Git fetch failed", details=result.stderr)
+            raise self._git_failed(result, "Git fetch failed", repository=path)
 
         # Determine target reference
         if branch:

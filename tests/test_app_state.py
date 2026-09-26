@@ -30,6 +30,7 @@ from wasm.core.app_state import (
 )
 from wasm.core.exceptions import ServiceError
 from wasm.core.store import App
+from wasm.core.utils import domain_to_app_name
 
 
 class _Services:
@@ -44,6 +45,16 @@ class _Services:
         self.statuses = statuses
         self.failing = failing
         self.asked: list[str] = []
+
+    def app_units(self, app: App) -> list[str]:
+        """
+        Args:
+            app: The application.
+
+        Returns:
+            The unit it is named after, as ServiceManager.app_units names it.
+        """
+        return [] if app.is_static else [domain_to_app_name(app.domain)]
 
     def get_status(self, name: str) -> dict[str, Any]:
         """

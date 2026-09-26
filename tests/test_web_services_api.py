@@ -70,8 +70,8 @@ class FakeServiceManager:
     #: Scripted answers for get_status(), keyed by unit name. Reset per test
     #: by the fake_manager fixture.
     statuses: ClassVar[dict[str, dict]] = {}
-    #: Scripted answer for list_services(all_services=True): every unit on
-    #: the host, as ServiceManager.list_services would report it.
+    #: Scripted listing: every unit on the host, as
+    #: ServiceManager.list_services reports it; ``managed`` defaults to true.
     all_units: ClassVar[list[dict]] = []
     #: Scripted (success, output) answer for verify_unit().
     verify_result: ClassVar[tuple[bool, str]] = (True, "")
@@ -116,18 +116,22 @@ class FakeServiceManager:
             },
         )
 
-    def list_services(self, all_services: bool = False) -> list[dict]:
+    def list_statuses(self, all_services: bool = False) -> list[dict]:
         """
-        Return the scripted unit listing, recording the call.
+        Return the scripted listing, each unit described like get_status.
 
         Args:
             all_services: Recorded for assertions.
 
         Returns:
-            The scripted list.
+            The scripted status of every unit in ``all_units``.
         """
-        self.calls.append(("list_services", all_services))
-        return FakeServiceManager.all_units
+        self.calls.append(("list_statuses", all_services))
+        return [
+            FakeServiceManager.statuses.get(unit["name"], {"name": unit["name"]})
+            for unit in FakeServiceManager.all_units
+            if all_services or unit.get("managed", True)
+        ]
 
     def daemon_reload(self) -> bool:
         """Record a daemon-reload request."""
@@ -274,6 +278,9 @@ class TestListServices:
     ) -> None:
         """A WASM-tracked unit's crash-loop state reaches the API."""
         store.create_service(Service(name="wasm-shop", command="node server.js"))
+        FakeServiceManager.all_units = [
+            {"name": "wasm-shop", "load": "loaded", "active": "activating", "sub": "auto-restart"}
+        ]
         FakeServiceManager.statuses["wasm-shop"] = {
             "name": "wasm-shop",
             "exists": True,
@@ -300,6 +307,7 @@ class TestListServices:
         assert svc["active_state"] == "activating"
         assert svc["sub_state"] == "auto-restart"
         assert svc["result"] == "exit-code"
+        assert svc["description"] == "node server.js"
 
     def test_wasm_only_false_lists_every_unit_including_foreign_ones(
         self, client: TestClient, fake_manager, store
@@ -307,7 +315,13 @@ class TestListServices:
         """``wasm_only=false`` reaches every unit systemd knows about, flagged."""
         FakeServiceManager.all_units = [
             {"name": "wasm-shop", "load": "loaded", "active": "active", "sub": "running"},
-            {"name": "sshd", "load": "loaded", "active": "active", "sub": "running"},
+            {
+                "name": "sshd",
+                "load": "loaded",
+                "active": "active",
+                "sub": "running",
+                "managed": False,
+            },
         ]
         FakeServiceManager.statuses = {
             "wasm-shop": {
@@ -349,8 +363,9 @@ class TestListServices:
         assert services["wasm-shop"]["managed"] is True
 
         manager = FakeServiceManager.instances[-1]
-        assert ("list_services", True) in manager.calls
-        assert ("get_status", "sshd", False) in manager.calls
+        assert ("list_statuses", True) in manager.calls
+        # Described from the one listing, never probed unit by unit.
+        assert not any(call[0] == "get_status" for call in manager.calls)
 
     def test_wasm_only_true_is_the_default_and_never_asks_for_all_units(
         self, client: TestClient, fake_manager, store
@@ -360,7 +375,8 @@ class TestListServices:
 
         assert response.status_code == 200, response.text
         manager = FakeServiceManager.instances[-1]
-        assert ("list_services", True) not in manager.calls
+        assert ("list_statuses", False) in manager.calls
+        assert ("list_statuses", True) not in manager.calls
 
 
 class TestVerifyUnit:

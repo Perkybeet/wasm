@@ -2,9 +2,11 @@
  * The one way the console talks to the API.
  *
  * `api()` is the transport: same-origin cookies, JSON in and out, the CSRF header mirrored
- * from its cookie, and the three answers that are not the caller's business handled here
- * once: a lost session sends the operator to sign in, a destructive action asks them to
- * confirm it's them and is retried once, and every other failure becomes an ApiError.
+ * from its cookie, and the answers that are not the caller's business handled here once: a
+ * lost session sends the operator to sign in, a destructive action asks them to confirm it's
+ * them and is retried once, a rate limit on a read waits out the server's own Retry-After and
+ * is retried once (a write surfaces it instead, since repeating it is not free), and every
+ * other failure becomes an ApiError.
  *
  * `request()` is the same call typed by the OpenAPI contract (schema.gen.ts): a path that
  * does not exist, a missing path parameter or a wrong body is a compile error, and the
@@ -12,6 +14,7 @@
  * backend declares their response model, the generated types sharpen with no change here.
  */
 
+import { toast } from "../components/ui/toast";
 import type { paths } from "./schema.gen";
 import { ElevationCancelledError, errorFromResponse, unreachable } from "./errors";
 
@@ -99,7 +102,29 @@ async function readBody(response: Response): Promise<unknown> {
   return type.includes("json") ? (JSON.parse(text) as unknown) : text;
 }
 
-async function send(method: Method, path: string, body: unknown, init: ApiInit, mayElevate: boolean): Promise<unknown> {
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+/** Reusing this id updates one toast in place instead of stacking a new one per request. */
+const RATE_LIMIT_TOAST_ID = "rate-limited";
+
+function waitDescription(retryAfter: number | null): string {
+  if (retryAfter === null) return "shortly";
+  if (retryAfter < 60) return `${String(retryAfter)}s`;
+  return `${String(Math.ceil(retryAfter / 60))}m`;
+}
+
+async function send(
+  method: Method,
+  path: string,
+  body: unknown,
+  init: ApiInit,
+  mayElevate: boolean,
+  mayRetryRateLimit = true,
+): Promise<unknown> {
   const headers: Record<string, string> = { Accept: "application/json" };
   if (body !== undefined) headers["Content-Type"] = "application/json";
   const token = readCookie(csrf.cookie);
@@ -129,6 +154,22 @@ async function send(method: Method, path: string, body: unknown, init: ApiInit, 
     await elevateOnce();
     // Exactly one retry: a second refusal is reported, never a second dialog.
     return send(method, path, body, init, false);
+  } else if (error.status === 429 && error.error === "rate_limited") {
+    // Reading again is safe to repeat; a mutation is not, so it surfaces the refusal for the
+    // caller to report instead of silently repeating a write. TanStack Query is told never to
+    // retry a 4xx (see createQueryClient), so this is the one retry that happens, not a storm.
+    const retrying = method === "GET" && mayRetryRateLimit && error.retryAfter !== null;
+    toast.warning("Too many requests", {
+      id: RATE_LIMIT_TOAST_ID,
+      detail: error.detail,
+      description: retrying
+        ? `Retrying automatically in ${waitDescription(error.retryAfter)}.`
+        : (error.hint ?? `Try again in ${waitDescription(error.retryAfter)}.`),
+    });
+    if (retrying) {
+      await delay(error.retryAfter * 1000);
+      return send(method, path, body, init, mayElevate, false);
+    }
   }
   throw error;
 }

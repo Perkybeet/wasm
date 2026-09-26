@@ -834,7 +834,7 @@
         "properties": {
           "directory": {
             "default": "/var/backups/wasm",
-            "description": "Backup storage directory",
+            "description": "Backup storage directory: an absolute path, or empty for the default",
             "title": "Directory",
             "type": "string"
           },
@@ -1135,7 +1135,7 @@
         "type": "object"
       },
       "BackupStorageResponse": {
-        "description": "Response describing how much disk the backups take.",
+        "description": "Response describing how much disk the backups take.\n\nAttributes:\n    domains: The applications holding backups in ``path``; directories\n        with no WASM backup in them are not listed.\n    misplaced: Backups found elsewhere - in the old default directory, or\n        where an empty ``backup.directory`` sent them - each with the\n        ``wasm backup import`` command that moves them into ``path``.",
         "properties": {
           "backup_count": {
             "title": "Backup Count",
@@ -1146,6 +1146,13 @@
               "type": "string"
             },
             "title": "Domains",
+            "type": "array"
+          },
+          "misplaced": {
+            "items": {
+              "$ref": "#/components/schemas/MisplacedBackupsInfo"
+            },
+            "title": "Misplaced",
             "type": "array"
           },
           "path": {
@@ -4271,6 +4278,30 @@
         "title": "MigrationPlanOut",
         "type": "object"
       },
+      "MisplacedBackupsInfo": {
+        "description": "WASM backups found outside the backup directory, and how to bring them in.",
+        "properties": {
+          "command": {
+            "title": "Command",
+            "type": "string"
+          },
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "directory": {
+            "title": "Directory",
+            "type": "string"
+          }
+        },
+        "required": [
+          "directory",
+          "count",
+          "command"
+        ],
+        "title": "MisplacedBackupsInfo",
+        "type": "object"
+      },
       "MonitorActionResponse": {
         "description": "Outcome of a systemd action against the monitor unit, or of acknowledging\nan observation - every handler below answers exactly these two fields.",
         "properties": {
@@ -5257,7 +5288,7 @@
         "type": "object"
       },
       "ServiceInfo": {
-        "description": "Service information.\n\nAttributes:\n    managed: Whether this unit was created by WASM. Always true for a\n        service reached through the store; may be false when listing\n        with ``wasm_only=false``, which walks every unit on the host.\n    active_state: Systemd's own ``ActiveState`` (``active``, ``failed``,\n        ``activating``, ...). Distinguishes a unit systemd is repeatedly\n        restarting from one that is cleanly stopped, which ``active``\n        alone cannot: both report ``active=false`` between attempts.\n    sub_state: Systemd's own ``SubState`` (``running``, ``dead``,\n        ``auto-restart``, ...), the finer-grained half of the same story.\n    result: Systemd's own ``Result`` for the last run (``success``,\n        ``exit-code``, ``signal``, ...).",
+        "description": "Service information.\n\nAttributes:\n    managed: Whether WASM manages this unit. False only when listing with\n        ``wasm_only=false``, which walks every unit on the host; such a\n        row carries systemd's state fields and nothing else (``enabled``\n        false, no PID, memory or uptime), read from the one listing.\n    active_state: Systemd's own ``ActiveState`` (``active``, ``failed``,\n        ``activating``, ...). Distinguishes a unit systemd is repeatedly\n        restarting from one that is cleanly stopped, which ``active``\n        alone cannot: both report ``active=false`` between attempts.\n    sub_state: Systemd's own ``SubState`` (``running``, ``dead``,\n        ``auto-restart``, ...), the finer-grained half of the same story.\n    result: Systemd's own ``Result`` for the last run (``success``,\n        ``exit-code``, ``signal``, ...).",
         "properties": {
           "active": {
             "title": "Active",
@@ -9614,7 +9645,7 @@
     },
     "/api/config/backup": {
       "get": {
-        "description": "Get backup configuration.\n\nArgs:\n    session: Authenticated session, injected by the dependency.\n\nReturns:\n    The backup directory and the retention limit.",
+        "description": "Get backup configuration.\n\nArgs:\n    session: Authenticated session, injected by the dependency.\n\nReturns:\n    The backup directory, as every backup reader resolves it, and the\n    retention limit.\n\nRaises:\n    ConfigError: When the stored directory is a relative path.",
         "operationId": "get_backup_config_api_config_backup_get",
         "responses": {
           "200": {
@@ -9634,7 +9665,7 @@
         ]
       },
       "put": {
-        "description": "Update backup configuration.\n\nArgs:\n    body: Body carrying the backup directory and retention limit.\n    request: The incoming request, for the audit record.\n    session: Authenticated session, injected by the dependency.\n\nReturns:\n    Confirmation message.\n\nRaises:\n    HTTPException: If the configuration cannot be written.",
+        "description": "Update backup configuration.\n\nArgs:\n    body: Body carrying the backup directory and retention limit.\n    request: The incoming request, for the audit record.\n    session: Authenticated session, injected by the dependency.\n\nReturns:\n    Confirmation message.\n\nRaises:\n    ConfigError: When the directory is a relative path; an empty one is\n        stored as the default. The rule is Config.set's, the same one\n        'wasm config set backup.directory' meets.\n    HTTPException: If the configuration cannot be written.",
         "operationId": "update_backup_config_api_config_backup_put",
         "requestBody": {
           "content": {
@@ -12647,7 +12678,7 @@
     },
     "/api/services": {
       "get": {
-        "description": "List services.\n\n``wasm_only`` (the default) scopes the listing to what the store\ntracks - the units WASM itself created. Set it to false for a full\ninventory of every unit on the host, each flagged ``managed``, which is\nhow a diagnostics view tells a foreign unit's own crash loop from one of\nWASM's own.",
+        "description": "List services.\n\n``wasm_only`` (the default) lists the units WASM manages - the one\ndefinition in :meth:`~wasm.managers.service_manager.ServiceManager.managed_units`\nthe console's top bar counts too, so the two always agree. Set it to false\nfor a full inventory of every unit on the host, each flagged ``managed``,\nwhich is how a diagnostics view tells a foreign unit's own crash loop from\none of WASM's own. A foreign unit carries only its state: it is listed\nfrom systemd's own listing, never probed or acted on.",
         "operationId": "list_services_api_services_get",
         "parameters": [
           {
@@ -12816,7 +12847,7 @@
         ]
       },
       "get": {
-        "description": "Get details for a specific service.",
+        "description": "Get details for a specific service.\n\nAnswers for a unit WASM manages, whether or not the store's services\ntable has a row for it (since 0.14.1 an application's unit is named after\nthe application and may have none). Any other unit is a 404, which is how\nthe console knows to describe it from the all-units listing instead;\nsystemd's own escaped names (``systemd-fsck@dev-disk-by\\x2dlabel-BOOT``)\narrive URL-encoded and get that 404, not a 400.",
         "operationId": "get_service_api_services__name__get",
         "parameters": [
           {

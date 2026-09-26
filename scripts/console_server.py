@@ -54,7 +54,7 @@ import tempfile
 import threading
 import time
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatch
@@ -325,6 +325,9 @@ def redirect_system_paths(sandbox: Sandbox) -> None:
     # script - exactly what the module docstring promises never happens.
     process_monitor_module.SYSTEMD_DIR = sandbox.systemd_dir
     BackupManager.DEFAULT_BACKUP_DIR = sandbox.backup_dir
+    # The misplaced-backup hint looks in /root and /: on a developer's machine those are the
+    # developer's own, so the sandbox has none.
+    BackupManager.MISPLACED_BACKUP_ROOTS = ()
     BaseDatabaseManager.BACKUP_DIR = sandbox.backup_dir / "databases"
     CertManager.LETSENCRYPT_DIR = etc / "letsencrypt"
     CertManager.LIVE_DIR = etc / "letsencrypt" / "live"
@@ -772,10 +775,16 @@ def make_runner(
             self._stdin.value = kwargs.get("input") or ""
             return super().run(argv, **kwargs)
 
-        def _lookup(self, argv: Sequence[str], user: str | None = None) -> CommandResult:
+        def _lookup(
+            self,
+            argv: Sequence[str],
+            user: str | None = None,
+            env: Mapping[str, str] | None = None,
+        ) -> CommandResult:
             args = tuple(str(a) for a in argv)
             recorded = (*runuser_prefix(user), *args) if user is not None else args
             self.calls.append(recorded)
+            self.envs.append(dict(env) if env is not None else None)
             # Answered as the command it runs: switching the account (runuser -u
             # postgres -- psql) asks the same question of the machine.
             program = args[0] if args else ""
@@ -961,6 +970,13 @@ def make_runner(
             # _PG_USERS for its (now 5-column) shape.
             if program == "psql" and "has_database_privilege" in statement:
                 return _PG_USERS
+            # PostgresManager.server_port() asks the superuser session which
+            # port the cluster listens on, for connection strings and the
+            # read-only console's TCP login.
+            if program == "psql" and statement.strip() == "SHOW port;":
+                return "5432\n"
+            if program == "psql" and statement.strip() == "SHOW listen_addresses;":
+                return "localhost\n"
             if program == "psql" and "FROM demo_orders" in statement:
                 return _PG_DEMO_ROWS_CSV if headers else _PG_DEMO_ROWS
             if program == "psql" and "pg_database" in statement:

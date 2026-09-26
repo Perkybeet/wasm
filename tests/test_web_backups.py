@@ -406,3 +406,47 @@ def test_an_archive_with_only_warnings_is_still_reported_as_invalid(
     body = response.json()
     assert body["valid"] is False
     assert body["warnings"] == ["missing manifest entry"]
+
+
+# ---------------------------------------------------------------------------
+# Where they are
+# ---------------------------------------------------------------------------
+
+
+def test_storage_lists_only_backup_directories_and_points_at_misplaced_ones(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The console listed /root's .ssh, .docker and .claude as applications.
+
+    ``backup.directory: ''`` sent every backup to the working directory, so the
+    storage page walked /root. It now counts only directories holding WASM
+    backups, and names where misplaced ones are so they can be imported.
+    """
+    from tests.test_backup_placement import plant_backup, plant_home_clutter
+    from wasm.core.config import Config
+    from wasm.managers.backup_manager import BackupManager
+
+    configured = tmp_path / "backups"
+    plant_backup(configured, "example.com")
+    plant_home_clutter(configured)
+    home = tmp_path / "root"
+    plant_backup(home, "example.com", stamp="20260803_000000")
+    config_file = tmp_path / "etc" / "config.yaml"
+    config_file.parent.mkdir()
+    config_file.write_text(f"backup:\n  directory: {configured}\n")
+    monkeypatch.setattr("wasm.core.config.DEFAULT_CONFIG_PATH", config_file)
+    monkeypatch.setattr(BackupManager, "MISPLACED_BACKUP_ROOTS", (home,))
+    Config.reset_instance()
+    try:
+        response = client.get("/api/backups/storage")
+    finally:
+        Config.reset_instance()
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["path"] == str(configured)
+    assert body["domains"] == ["example-com", "orphan-example-com"]
+    assert body["misplaced"] == [
+        {"directory": str(home), "count": 1, "command": f"wasm backup import {home}"}
+    ]

@@ -44,6 +44,7 @@ from wasm.core.exceptions import (
     CertificateError,
     DeploymentError,
     OutOfMemoryError,
+    ServiceError,
     ValidationError,
     WASMError,
 )
@@ -1091,6 +1092,50 @@ class BaseDeployer(AppDeployer):
         except WASMError as e:
             self.logger.debug(f"Service was not running: {e}")
         self.service_manager.delete_service(self.app_name)
+
+    def _leftover_unit(self) -> bool:
+        """
+        Report whether a unit is on disk for an application that runs no process.
+
+        Asked again when the unit is retired rather than trusted from the
+        pipeline's construction: a Vite build decides whether it serves files
+        or runs a server only once it has looked at the source.
+
+        Returns:
+            True when this type serves files (no start command) and a unit
+            file for the application is in the managed directory.
+        """
+        if not self.app_name or self.get_start_command():
+            return False
+        return self.service_manager.service_exists(self.app_name)
+
+    def retire_leftover_unit(self) -> None:
+        """
+        Stop, disable and delete the unit a process type left behind.
+
+        An application first deployed as a type that runs a process and later
+        redeployed as one that serves files keeps its old unit otherwise, and
+        with ``Restart=always`` that unit restarts a command the new tree does
+        not have every ten seconds, forever: one production server was found
+        at 7750 consecutive "Missing script: start" failures. The deletion is
+        :meth:`ServiceManager.delete_service`, which refuses a unit WASM does
+        not own; that refusal, like any other failure here, is reported and
+        does not fail a deployment whose site already serves the new files.
+        """
+        if not self._leftover_unit():
+            return
+        name = self.app_name or ""
+        try:
+            self.service_manager.delete_service(name)
+        except ServiceError as exc:
+            self.logger.warning(f"The unit of {name} was left in place: {exc.message}")
+            if exc.details:
+                self.logger.substep(exc.details)
+            return
+        self.logger.substep(
+            f"Removed the unit of {name}: as {self.APP_TYPE} it is served by the web server "
+            "and runs no process"
+        )
 
     def forget_records(self) -> None:
         """Delete the app, site and service rows this deployment created."""
@@ -2309,6 +2354,9 @@ class BaseDeployer(AppDeployer):
             on_failure=(lambda _exc: self._abandon_release()) if releases else None,
         ) as recorder:
             result = self._update_release(report) if releases else self._update_in_place(report)
+            if self._leftover_unit():
+                report("Removing the unit a previous deployment left")
+                self.retire_leftover_unit()
         self.last_deployment_id = recorder.deployment_id
         return result
 
@@ -2479,6 +2527,16 @@ class BaseDeployer(AppDeployer):
         self._app_record = self._register_app_in_store(AppStatus.DEPLOYING.value)
 
         steps = self.build_pipeline()
+        if self._leftover_unit():
+            # Last, once the site serves the new files: until then the old
+            # unit may still be what answers for the domain.
+            steps.append(
+                DeployStep(
+                    title="Removing the unit a previous deployment left",
+                    icon=Icons.GEAR,
+                    run=self.retire_leftover_unit,
+                )
+            )
         if is_new_deployment:
             steps.insert(
                 0,

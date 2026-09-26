@@ -27,7 +27,7 @@ from wasm.cli.app import main as app_main
 from wasm.cli.commands import service as service_module
 from wasm.core.logger import Logger
 from wasm.core.runner import FakeRunner
-from wasm.core.store import Service
+from wasm.core.store import App, Service
 from wasm.managers.service_manager import WASM_UNIT_MARKER, ServiceManager
 
 #: Flags the root group owns. A subcommand that declares one of them shadows
@@ -60,6 +60,10 @@ class FakeStore:
     def list_services(self, **_kwargs: object) -> list[Service]:
         """Return every recorded service."""
         return list(self.services.values())
+
+    def list_apps(self, **_kwargs: object) -> list[App]:
+        """No applications: these tests are about units."""
+        return []
 
     def get_service(self, name: str) -> Service | None:
         """Return a service by name, or None."""
@@ -464,7 +468,9 @@ def test_list_json_before_the_command_name(runner: FakeRunner, unit_dir: Path) -
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload == [{"name": "wasm-up", "status": "running", "state": "running"}]
+    assert payload == [
+        {"name": "wasm-up", "status": "running", "state": "running", "managed": True, "app": None}
+    ]
 
 
 def test_logs_asks_the_journal_for_the_requested_lines(runner: FakeRunner, owned: str) -> None:

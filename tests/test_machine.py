@@ -284,7 +284,14 @@ def test_fetch_service_states_is_the_one_call_both_tallies_share(
     services = fetch_service_states()
 
     assert services == [
-        {"name": "wasm-one", "load": "loaded", "active": "active", "sub": "running"}
+        {
+            "name": "wasm-one",
+            "load": "loaded",
+            "active": "active",
+            "sub": "running",
+            "managed": True,
+            "app": None,
+        }
     ]
 
 

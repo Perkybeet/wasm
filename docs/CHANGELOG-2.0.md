@@ -1,9 +1,49 @@
 # WASM 2.0 changelog
 
-Changes since 1.6.4. Upgrade notes, including what may need a setting after upgrading, are in
+Upgrade notes, including what may need a setting after upgrading, are in
 [UPGRADING-2.0.md](UPGRADING-2.0.md).
 
-## Console
+## 2.0.1
+
+Fixes found running 2.0.0 on a production server with about twenty applications.
+
+- **Backups could land in the working directory.** A blank `backup.directory` (which the 1.x
+  settings form saved) was read as the current directory, so backups went wherever `wasm` ran
+  from, and scheduled ones to `/`. Blank now means `/var/backups/wasm`, a relative path is
+  refused by the CLI, the API and a whole-section write alike, and `wasm backup import DIR`
+  moves misplaced backups into place (`wasm backup storage` says where it found them).
+- **Unit failures now alert.** The monitor watches every unit WASM manages without any
+  configuration, alerts on a failure or a crash loop and not on a unit someone stopped, and
+  scans every 60 seconds by default. Failed cron and backup runs alert too.
+- **One definition of WASM's units.** The top bar, the Services page, `wasm service list`,
+  the monitor and the live log stream agree; application units without the old `wasm-`
+  prefix were missed, and "show all units" failed on systemd's escaped names.
+- **Live logs** stream monorepo and legacy-named units, and show journalctl's own error.
+- **A unit left by an earlier application type is removed** when the application becomes
+  static, and new units stop retrying after five failed starts in five minutes instead of
+  restarting forever.
+- **Git never prompts.** A private repository fails in about a second with how to fix it
+  (the SSH URL with this server's key, or a credential helper) instead of hanging until a
+  ten-minute timeout; no process WASM runs reads from the terminal.
+- **PostgreSQL's read-only console** signs in on the port the server reports (`SHOW port`), so
+  a cluster on a port other than 5432 works; psql's own message is always shown, and pg_hba is
+  suggested only when psql names it. Connection strings and engine lists use the real port.
+- **Rate limits:** signed-in requests count per credential with a budget of 1200 a minute
+  (`web.rate_limit_authenticated_requests`); the console's page no longer counts; the console
+  waits out a 429 and retries once instead of showing raw JSON.
+- **Console errors show the tool's own output** (git, psql, nginx, certbot) under the message.
+- The unit tally in the top bar says what its numbers mean; the Telegram form explains that a
+  group's chat ID is negative.
+- Ctrl+C on `wasm web start` with a browser connected shuts down at once and quietly.
+- Saving a job is atomic (no more "UNIQUE constraint failed: jobs.id"), and an expected
+  failure is logged in one line instead of a traceback.
+- A repository name ending in "g", "i" or "t" is no longer truncated when read from its URL.
+
+## 2.0.0
+
+Changes since 1.6.4.
+
+### Console
 
 - The server-rendered panel (Jinja, htmx, hand-written JavaScript and CSS) is replaced by the
   WASM Console, a React single-page application. Its build is committed to the package, so
@@ -23,7 +63,7 @@ Changes since 1.6.4. Upgrade notes, including what may need a setting after upgr
 - The console has parity with the CLI: updating applications, monitor controls, full backup
   and certificate options, certificate issuance when creating a site.
 
-## Deploy engine
+### Deploy engine
 
 - **Releases.** Every deploy of a new application builds in its own directory under
   `releases/`, and `current` points at the one that serves. The environment and persistent
@@ -69,7 +109,7 @@ Changes since 1.6.4. Upgrade notes, including what may need a setting after upgr
   project name a stack declares for itself, so its volumes are never orphaned.
 - Store migrations run each schema step in one transaction.
 
-## Domains and certificates
+### Domains and certificates
 
 - Several domains per application: one primary, any number of aliases (served like the
   primary) and redirects (a `301` to the primary). `wasm domain add|list|remove`, the
@@ -87,7 +127,7 @@ Changes since 1.6.4. Upgrade notes, including what may need a setting after upgr
   the certificate before the site refers to it, and deleting one removes it from nginx and
   Apache and removes its certificate.
 
-## Diagnosis and health
+### Diagnosis and health
 
 - `wasm diagnose DOMAIN`, the Diagnose tab and `GET /api/apps/{domain}/diagnose` explain why
   an application is down: unit state and exit status, port listening or mismatched, HTTP
@@ -97,7 +137,7 @@ Changes since 1.6.4. Upgrade notes, including what may need a setting after upgr
 - Application states are resolved from systemd everywhere, so the console, `wasm list` and
   the API agree.
 
-## API
+### API
 
 - One error contract for every router: `{error, detail, hint, fields, output}`, with
   per-field messages on validation errors and the system tool's own output verbatim.
@@ -121,7 +161,7 @@ Changes since 1.6.4. Upgrade notes, including what may need a setting after upgr
 - Removed: `POST /api/jobs/deploy` (use `POST /api/apps`), the `/ws/system` WebSocket (use
   `/events` or `GET /api/system/machine`), and every server-rendered page and fragment.
 
-## Security
+### Security
 
 - **Sudo mode.** Deleting applications, databases, users, services, sites, certificates,
   backups and domains; restoring backups; revealing or writing an `.env`; editing units and
@@ -163,7 +203,7 @@ Changes since 1.6.4. Upgrade notes, including what may need a setting after upgr
 - The audit log is readable at `GET /api/audit` and on the Activity page, with an admin
   credential.
 
-## CLI
+### CLI
 
 - New commands: `wasm releases list|rollback`, `wasm app migrate|limits`,
   `wasm domain add|list|remove`, `wasm diagnose`, `wasm cron
@@ -177,12 +217,12 @@ Changes since 1.6.4. Upgrade notes, including what may need a setting after upgr
 - `--open` links point at the console's pages.
 - `wasm create --layout`, `--persist`; `wasm create --www` records a redirect.
 
-## Monitor and notifications
+### Monitor and notifications
 
 - The monitor warns about certificates expiring within 14 days, at most once a day per
   certificate, through the notification channels.
 
-## Backups
+### Backups
 
 - Backups of applications on releases carry the active release and `shared/`, not the
   repository cache or older releases, and restore the `.env` link.
@@ -190,7 +230,7 @@ Changes since 1.6.4. Upgrade notes, including what may need a setting after upgr
   `node_modules`, build output, databases, Docker volumes, PostgreSQL schemas, the Redis
   capture method and tags.
 
-## Reliability
+### Reliability
 
 - The store uses SQLite's WAL mode with a busy timeout, so the console and the CLI can write
   at the same time without `database is locked`.
@@ -201,7 +241,7 @@ Changes since 1.6.4. Upgrade notes, including what may need a setting after upgr
 - Deleting a service and rolling back from the console go through the same guards as the
   CLI.
 
-## Development and packaging
+### Development and packaging
 
 - The console's source is in `panel/` (React 19, TypeScript, Vite, TanStack Router and Query,
   Base UI, Tailwind CSS); CI fails when the committed build or the generated API types

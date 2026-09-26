@@ -503,8 +503,13 @@ def test_service_health_uses_the_command_runner(runner: Any) -> None:
     """Service checks go through the audited seam, never bare subprocess."""
     from wasm.monitor.metrics import collect_service_health
 
-    runner.script(["systemctl", "is-active"], stdout="active\n")
-    runner.script(["systemctl", "is-enabled"], stdout="enabled\n")
+    runner.script(
+        ["systemctl", "show"],
+        stdout=(
+            "Id=wasm-example-com.service\nNames=wasm-example-com.service\n"
+            "ActiveState=active\nSubState=running\nUnitFileState=enabled\n"
+        ),
+    )
 
     health = collect_service_health(["wasm-example-com"], runner=runner)
 
@@ -512,7 +517,8 @@ def test_service_health_uses_the_command_runner(runner: Any) -> None:
     assert health[0].unit == "wasm-example-com"
     assert health[0].active is True
     assert health[0].enabled is True
-    assert ("systemctl", "is-active", "wasm-example-com") in runner.calls
+    assert runner.calls[0][:2] == ("systemctl", "show")
+    assert runner.calls[0][-1] == "wasm-example-com.service"
 
 
 class _FakeSMTP:

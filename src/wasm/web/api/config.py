@@ -31,7 +31,14 @@ import yaml
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from wasm.core.config import DEFAULT_CONFIG, NO_DEFAULT, Config, coerce_config_value, redact_secrets
+from wasm.core.config import (
+    DEFAULT_BACKUP_DIR,
+    DEFAULT_CONFIG,
+    NO_DEFAULT,
+    Config,
+    coerce_config_value,
+    redact_secrets,
+)
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import WASMErrorRoute, require_elevated
 from wasm.web.auth import actor_label, get_audit_logger, get_client_ip
@@ -195,7 +202,10 @@ class WebserverConfig(BaseModel):
 class BackupConfig(BaseModel):
     """Backup configuration."""
 
-    directory: str = Field("/var/backups/wasm", description="Backup storage directory")
+    directory: str = Field(
+        str(DEFAULT_BACKUP_DIR),
+        description="Backup storage directory: an absolute path, or empty for the default",
+    )
     max_per_app: int = Field(10, ge=1, le=100, description="Maximum backups per application")
 
 
@@ -515,11 +525,15 @@ def get_backup_config(session: dict = Depends(get_current_session)) -> BackupSet
         session: Authenticated session, injected by the dependency.
 
     Returns:
-        The backup directory and the retention limit.
+        The backup directory, as every backup reader resolves it, and the
+        retention limit.
+
+    Raises:
+        ConfigError: When the stored directory is a relative path.
     """
     config = load_config()
     return BackupSettingsResponse(
-        directory=config.get("backup.directory", "/var/backups/wasm"),
+        directory=str(config.backup_directory),
         max_per_app=config.get("backup.max_per_app", 10),
     )
 
@@ -542,6 +556,9 @@ def update_backup_config(
         Confirmation message.
 
     Raises:
+        ConfigError: When the directory is a relative path; an empty one is
+            stored as the default. The rule is Config.set's, the same one
+            'wasm config set backup.directory' meets.
         HTTPException: If the configuration cannot be written.
     """
     config = load_config()

@@ -30,6 +30,7 @@ from wasm.cli.commands import health as cli_health
 from wasm.core.exceptions import ServiceError
 from wasm.core.logger import Logger
 from wasm.core.store import App
+from wasm.core.utils import domain_to_app_name
 from wasm.managers import health as health_module
 
 #: Flags that belong to the root command and to no other.
@@ -72,6 +73,16 @@ class _FakeServices:
         self.active = active
         self.failing = failing
         self.asked: list[str] = []
+
+    def app_units(self, app: Any) -> list[str]:
+        """
+        Args:
+            app: The application.
+
+        Returns:
+            The unit it is named after, as ServiceManager.app_units names it.
+        """
+        return [] if app.is_static else [domain_to_app_name(app.domain)]
 
     def get_status(self, name: str) -> dict[str, Any]:
         """

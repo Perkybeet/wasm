@@ -377,23 +377,26 @@ PASSWORD_REJECTED = (
 
 class ConsoleRunner(FakeRunner):
     """
-    A FakeRunner that also records environments and answers direct psql calls in turn.
+    A FakeRunner that records secrets and answers direct psql calls in turn.
 
-    The read-only console's password travels in ``env``, which FakeRunner does
-    not record, and a rejected sign-in followed by a retry needs two different
-    answers to the same argv prefix.
+    A rejected sign-in followed by a retry needs two different answers to the
+    same argv prefix, and the superuser session's ``SHOW`` statements arrive
+    on stdin, which FakeRunner does not match on. The environment each call
+    was given is FakeRunner's own ``envs``.
     """
 
     def __init__(self) -> None:
         """Start with no queued answers."""
         super().__init__()
-        self.envs: list[Mapping[str, str] | None] = []
         self.redacted: list[tuple[str, ...]] = []
         self.sign_ins: list[CommandResult] = []
+        # What the cluster WASM administers answers to SHOW, as psql -t -A
+        # prints it; None is a superuser session that could not be opened.
+        self.settings: dict[str, str | None] = {"port": "5432", "listen_addresses": "localhost"}
 
     def run(self, argv, **kwargs) -> CommandResult:
         """
-        Record the call's environment and secrets, then answer it.
+        Record the call's secrets, then answer it.
 
         Args:
             argv: The argument vector.
@@ -402,12 +405,29 @@ class ConsoleRunner(FakeRunner):
         Returns:
             The next queued answer for a direct psql call, else the scripted one.
         """
-        self.envs.append(kwargs.get("env"))
         self.redacted.append(tuple(kwargs.get("secrets") or ()))
         result = super().run(argv, **kwargs)
         if argv[0] == "psql" and kwargs.get("user") is None and self.sign_ins:
             return self.sign_ins.pop(0)
+        shown = re.fullmatch(r"SHOW (\w+);", (kwargs.get("input") or "").strip())
+        if argv[0] == "psql" and kwargs.get("user") == "postgres" and shown:
+            value = self.settings.get(shown.group(1))
+            if value is None:
+                return _failure("psql: error: could not connect to server\n")
+            return CommandResult(argv=result.argv, exit_code=0, stdout=f"{value}\n")
         return result
+
+    def shows(self, setting: str) -> int:
+        """
+        Count how often the superuser session was asked for a setting.
+
+        Args:
+            setting: The setting's name.
+
+        Returns:
+            The number of ``SHOW <setting>;`` statements sent.
+        """
+        return sum(1 for sent in self.inputs if (sent or "").strip() == f"SHOW {setting};")
 
 
 @pytest.fixture
@@ -685,7 +705,8 @@ class TestPostgresReadModeSignsInAsTheRole:
             read_only_postgres.execute_query(database="app", query="SELECT 1", read_only=True)
 
         assert "listen_addresses" in caught.value.details
-        assert "host app wasm_ro_app 127.0.0.1/32 scram-sha-256" in caught.value.details
+        # pg_hba.conf is only blamed when psql says it refused the login.
+        assert "pg_hba" not in caught.value.details
 
     def test_a_rejected_password_is_rotated_once_and_retried(
         self, read_only_postgres, console_runner
@@ -750,3 +771,189 @@ class TestPostgresReadModeSignsInAsTheRole:
         assert call[: len(PSQL)] == PSQL
         assert "-U" not in call
         assert not _password_file(read_only_postgres).exists()
+
+
+#: libpq on a server that has no such role (the role lives in another cluster).
+ROLE_MISSING = (
+    'psql: error: connection to server at "127.0.0.1", port 5433 failed: FATAL:  '
+    'role "wasm_ro_app" does not exist\n'
+)
+
+#: libpq when nothing listens on the port.
+CONNECTION_REFUSED = (
+    'psql: error: connection to server at "127.0.0.1", port 5433 failed: '
+    "Connection refused\n\tIs the server running on that host and accepting "
+    "TCP/IP connections?\n"
+)
+
+
+class TestPostgresReadModeFindsTheServerItAdministers:
+    """
+    Read mode signs in on the port the cluster WASM administers listens on.
+
+    The superuser session goes through Debian's pg_wrapper, which picks the
+    cluster's port by itself; the read-only login is TCP and has to be told.
+    On a server whose cluster listens on 5433 while a container publishes
+    127.0.0.1:5432, a fixed 5432 signed in to the container.
+    """
+
+    def test_the_port_the_server_reports_is_used(self, read_only_postgres, console_runner):
+        console_runner.settings["port"] = "5433"
+
+        read_only_postgres.execute_query(database="app", query="SELECT 1", read_only=True)
+
+        (call,) = _psql_console_calls(console_runner)
+        assert call[call.index("-p") + 1] == "5433"
+        # Asked of the superuser session, which reaches the cluster WASM administers.
+        index = console_runner.inputs.index("SHOW port;")
+        assert console_runner.calls[index][: len(PSQL)] == PSQL
+
+    def test_the_configured_port_wins_and_the_server_is_not_asked(
+        self, read_only_postgres, console_runner
+    ):
+        console_runner.settings["port"] = "5433"
+        read_only_postgres.config = StubConfig(
+            {"databases": {"credentials": {"postgresql": {"port": 6543}}}}
+        )
+
+        read_only_postgres.execute_query(database="app", query="SELECT 1", read_only=True)
+
+        (call,) = _psql_console_calls(console_runner)
+        assert call[call.index("-p") + 1] == "6543"
+        assert console_runner.shows("port") == 0
+
+    def test_the_server_is_asked_once_per_manager(self, read_only_postgres, console_runner):
+        console_runner.settings["port"] = "5433"
+
+        read_only_postgres.execute_query(database="app", query="SELECT 1", read_only=True)
+        read_only_postgres.execute_query(database="app", query="SELECT 2", read_only=True)
+
+        assert console_runner.shows("port") == 1
+        assert all(
+            call[call.index("-p") + 1] == "5433" for call in _psql_console_calls(console_runner)
+        )
+
+    @pytest.mark.parametrize("answer", [None, "", "not-a-port", "0", "70000"])
+    def test_no_usable_answer_falls_back_to_the_default(
+        self, read_only_postgres, console_runner, answer
+    ):
+        console_runner.settings["port"] = answer
+
+        assert read_only_postgres.server_port() == 5432
+        # Not cached: a server that could not answer is asked again next time.
+        console_runner.settings["port"] = "5433"
+        assert read_only_postgres.server_port() == 5433
+
+    def test_the_connection_string_uses_the_server_port(self, read_only_postgres, console_runner):
+        console_runner.settings["port"] = "5433"
+
+        uri = read_only_postgres.get_connection_string("app", "app", "secret", host="localhost")
+
+        assert uri == "postgresql://app:secret@localhost:5433/app"
+
+    def test_the_connection_string_uses_the_configured_port(
+        self, read_only_postgres, console_runner
+    ):
+        console_runner.settings["port"] = "5433"
+        read_only_postgres.config = StubConfig(
+            {"databases": {"credentials": {"postgresql": {"port": "6543"}}}}
+        )
+
+        uri = read_only_postgres.get_connection_string("app", "app", "secret")
+
+        assert uri == "postgresql://app:secret@localhost:6543/app"
+
+    def test_the_status_reports_the_server_port(self, read_only_postgres, console_runner):
+        console_runner.settings["port"] = "5433"
+        console_runner.script(["systemctl", "is-active"], stdout="active\n")
+
+        assert read_only_postgres.get_status()["port"] == 5433
+
+    def test_a_role_the_server_does_not_know_points_at_another_postgresql(
+        self, read_only_postgres, console_runner
+    ):
+        console_runner.settings["port"] = "5433"
+        console_runner.sign_ins = [_failure(ROLE_MISSING)]
+
+        with pytest.raises(DatabaseQueryError) as caught:
+            read_only_postgres.execute_query(database="app", query="SELECT 1", read_only=True)
+
+        error = caught.value
+        assert "127.0.0.1:5433" in error.message
+        assert "another PostgreSQL" in error.details
+        assert "5433" in error.details
+        assert "databases.credentials.postgresql.port" in error.details
+        assert "pg_hba" not in error.details
+        assert error.output == ROLE_MISSING.strip()
+        # A missing role is not healed by a new password.
+        assert len(_psql_console_calls(console_runner)) == 1
+
+    def test_a_password_rejected_after_rotation_points_at_another_postgresql(
+        self, read_only_postgres, console_runner
+    ):
+        console_runner.sign_ins = [_failure(PASSWORD_REJECTED), _failure(PASSWORD_REJECTED)]
+
+        with pytest.raises(DatabaseQueryError) as caught:
+            read_only_postgres.execute_query(database="app", query="SELECT 1", read_only=True)
+
+        error = caught.value
+        assert "another PostgreSQL" in error.details
+        assert "port 5432" in error.details
+        assert "SHOW port" in error.details
+        assert "databases.credentials.postgresql.port" in error.details
+        assert "pg_hba" not in error.details
+        assert error.output == PASSWORD_REJECTED.strip()
+
+    def test_the_configured_port_is_named_as_the_source(self, read_only_postgres, console_runner):
+        read_only_postgres.config = StubConfig(
+            {"databases": {"credentials": {"postgresql": {"port": 5433}}}}
+        )
+        console_runner.sign_ins = [_failure(ROLE_MISSING)]
+
+        with pytest.raises(DatabaseQueryError) as caught:
+            read_only_postgres.execute_query(database="app", query="SELECT 1", read_only=True)
+
+        assert "configured in databases.credentials.postgresql.port" in caught.value.details
+
+    def test_no_pg_hba_entry_gives_the_line(self, read_only_postgres, console_runner):
+        console_runner.sign_ins = [_failure(HBA_REFUSAL)]
+
+        with pytest.raises(DatabaseQueryError) as caught:
+            read_only_postgres.execute_query(database="app", query="SELECT 1", read_only=True)
+
+        assert "host app wasm_ro_app 127.0.0.1/32 scram-sha-256" in caught.value.details
+        assert "another PostgreSQL" not in caught.value.details
+        assert caught.value.output == HBA_REFUSAL.strip()
+
+    def test_a_refused_connection_gives_listen_addresses_as_the_server_reports_it(
+        self, read_only_postgres, console_runner
+    ):
+        console_runner.settings["port"] = "5433"
+        console_runner.settings["listen_addresses"] = ""
+        console_runner.sign_ins = [_failure(CONNECTION_REFUSED)]
+
+        with pytest.raises(DatabaseQueryError) as caught:
+            read_only_postgres.execute_query(database="app", query="SELECT 1", read_only=True)
+
+        error = caught.value
+        assert "listen_addresses = 'localhost'" in error.details
+        assert "PostgreSQL reports listen_addresses = ''" in error.details
+        assert "127.0.0.1:5433" in error.details
+        assert "pg_hba" not in error.details
+        assert error.output == CONNECTION_REFUSED.strip()
+
+    def test_any_other_sign_in_failure_carries_psql_verbatim_without_guessing(
+        self, read_only_postgres, console_runner
+    ):
+        stderr = (
+            'psql: error: connection to server at "127.0.0.1", port 5432 failed: '
+            "FATAL:  sorry, too many clients already\n"
+        )
+        console_runner.sign_ins = [_failure(stderr)]
+
+        with pytest.raises(DatabaseQueryError) as caught:
+            read_only_postgres.execute_query(database="app", query="SELECT 1", read_only=True)
+
+        assert caught.value.output == stderr.strip()
+        assert "pg_hba" not in caught.value.details
+        assert "127.0.0.1:5432" in caught.value.details

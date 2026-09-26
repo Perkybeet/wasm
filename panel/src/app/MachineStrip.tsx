@@ -1,6 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
-import { Fragment } from "react";
 
 import { sessionQuery } from "../api/queries/auth";
 import { machineQuery } from "../api/queries/system";
@@ -8,9 +7,15 @@ import type { Machine } from "../api/queries/system";
 import { Meter } from "../components/ui/Progress";
 import { Skeleton } from "../components/ui/Skeleton";
 import { StatusGlyph, StatusPill } from "../components/ui/StatusPill";
+import { Tooltip } from "../components/ui/Tooltip";
 import { cx } from "../lib/cx";
 import { formatDuration } from "../lib/format";
 import { useStreamStatus } from "../realtime/events";
+
+/** The one sentence that says what the unit tally means, for the tooltip and the link's accessible name alike. */
+export function unitTallySummary(units: Machine["units"]): string {
+  return `WASM units: ${String(units.running)} running, ${String(units.failed)} failed, ${String(units.stopped)} stopped`;
+}
 
 /** The recent one-minute load as a line, scaled to its own peak (at least 1). */
 export function sparklinePath(samples: readonly number[], width: number, height: number): string {
@@ -46,32 +51,33 @@ function Load({ machine }: { machine: Machine }) {
 
 function UnitTally({ units }: { units: Machine["units"] }) {
   const parts = [
-    { state: "running" as const, count: units.running, word: "running", tone: units.running > 0 ? "text-ok" : "text-fg-faint" },
-    { state: "failed" as const, count: units.failed, word: "failed", tone: units.failed > 0 ? "text-fail" : "text-fg-faint" },
-    { state: "stopped" as const, count: units.stopped, word: "stopped", tone: "text-idle" },
+    { state: "running" as const, count: units.running, tone: units.running > 0 ? "text-ok" : "text-fg-faint" },
+    { state: "failed" as const, count: units.failed, tone: units.failed > 0 ? "text-fail" : "text-fg-faint" },
+    { state: "stopped" as const, count: units.stopped, tone: "text-idle" },
   ];
+  // One sentence, not two: the tooltip (hover and keyboard focus) and the accessible name say
+  // the same thing, so the symbols next to it are never the only place the meaning lives.
+  const summary = unitTallySummary(units);
   return (
-    <Link
-      to="/services"
-      title={`WASM units: ${String(units.running)} running, ${String(units.failed)} failed, ${String(units.stopped)} stopped`}
-      className="flex items-center gap-2.5 rounded-control px-1.5 py-1 hover:bg-surface-hover focus-visible:outline-2 focus-visible:outline-focus"
-    >
-      <span className="text-12 text-fg-muted">Units</span>
-      {parts.map((part) => (
-        // Text-node spaces between the parts keep the accessible name "Units 9 running 1
-        // failed 2 stopped"; between flex items they take no room on screen.
-        <Fragment key={part.state}>
-          {" "}
-          <span className={cx("inline-flex items-center gap-1", part.tone)}>
+    <Tooltip content={summary}>
+      <Link
+        to="/services"
+        aria-label={summary}
+        className="flex items-center gap-2.5 rounded-control px-1.5 py-1 hover:bg-surface-hover focus-visible:outline-2 focus-visible:outline-focus"
+      >
+        <span aria-hidden="true" className="text-12 text-fg-muted">
+          Units
+        </span>
+        {parts.map((part) => (
+          <span key={part.state} aria-hidden="true" className={cx("inline-flex items-center gap-1", part.tone)}>
             <StatusGlyph state={part.state} size={10} />
             <span className={cx("mono text-13", part.count > 0 && part.state === "failed" ? "font-medium" : "text-fg")}>
               {part.count}
-            </span>{" "}
-            <span className="sr-only">{part.word}</span>
+            </span>
           </span>
-        </Fragment>
-      ))}
-    </Link>
+        ))}
+      </Link>
+    </Tooltip>
   );
 }
 
