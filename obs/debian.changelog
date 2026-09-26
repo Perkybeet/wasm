@@ -1,3 +1,9 @@
+wasm (2.0.1-1) unstable; urgency=medium
+
+  * Backups never land in the working directory (wasm backup import recovers them), unit failures alert by default, one definition of WASM's units, git never prompts for credentials, PostgreSQL read-only console on any port, per-credential rate limits
+
+ -- Yago Lopez Prado <yago.lopez.adeje@gmail.com>  Sat, 26 Sep 2026 13:49:48 +0000
+
 wasm (2.0.0-1) unstable; urgency=medium
 
   * WASM 2.0: releases with health-gated activation and instant rollback, a new browser console, domains, diagnosis, resource limits, API tokens and sudo mode; see docs/CHANGELOG-2.0.md and docs/UPGRADING-2.0.md

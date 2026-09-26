@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        2.0.0
+Version:        2.0.1
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -276,6 +276,8 @@ if [ $1 -eq 0 ]; then
 fi
 
 %changelog
+* Sat Sep 26 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 2.0.1-1
+- Backups never land in the working directory (wasm backup import recovers them), unit failures alert by default, one definition of WASM's units, git never prompts for credentials, PostgreSQL read-only console on any port, per-credential rate limits
 * Sat Sep 26 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 2.0.0-1
 - WASM 2.0: releases with health-gated activation and instant rollback, a new browser console, domains, diagnosis, resource limits, API tokens and sudo mode; see docs/CHANGELOG-2.0.md and docs/UPGRADING-2.0.md
 * Sat Sep 26 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.6.5-1
