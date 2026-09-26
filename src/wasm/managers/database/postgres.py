@@ -1236,7 +1236,7 @@ class PostgresManager(BaseDatabaseManager):
         """
         settings = self.config.get("databases", {}).get("credentials", {}).get("postgresql", {})
         configured = settings.get("port") if isinstance(settings, dict) else None
-        if configured in (None, ""):
+        if configured is None or configured == "":
             return self.DEFAULT_PORT
         try:
             port = int(configured)

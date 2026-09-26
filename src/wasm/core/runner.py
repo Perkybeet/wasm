@@ -113,7 +113,7 @@ class CommandResult:
             return self
         raise CommandError(
             f"Command failed with exit code {self.exit_code}: {self.command}",
-            details=(self.stderr or self.stdout).strip() or None,
+            details=(self.stderr or self.stdout).strip(),
         )
 
 

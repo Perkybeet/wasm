@@ -1449,7 +1449,7 @@ class WASMStore:
             List of applications.
         """
         query = "SELECT * FROM apps WHERE 1=1"
-        params = []
+        params: list[object] = []
 
         if status:
             query += " AND status = ?"
@@ -1919,7 +1919,7 @@ class WASMStore:
     ) -> list[Site]:
         """List all sites."""
         query = "SELECT * FROM sites WHERE 1=1"
-        params = []
+        params: list[object] = []
 
         if webserver:
             query += " AND webserver = ?"
@@ -2026,7 +2026,7 @@ class WASMStore:
     ) -> list[Service]:
         """List all services."""
         query = "SELECT * FROM services WHERE 1=1"
-        params = []
+        params: list[object] = []
 
         if status is not None:
             query += " AND status = ?"
@@ -2084,7 +2084,7 @@ class WASMStore:
             status = "active" if active else "inactive"
 
         updates = []
-        params = []
+        params: list[object] = []
 
         if status is not None:
             updates.append("status = ?")
@@ -2155,7 +2155,7 @@ class WASMStore:
     ) -> list[Database]:
         """List all databases."""
         query = "SELECT * FROM databases WHERE 1=1"
-        params = []
+        params: list[object] = []
 
         if engine:
             query += " AND engine = ?"
@@ -2249,7 +2249,7 @@ class WASMStore:
     ) -> list[DatabaseUser]:
         """List database users."""
         query = "SELECT * FROM database_users WHERE 1=1"
-        params = []
+        params: list[object] = []
 
         if engine:
             query += " AND engine = ?"

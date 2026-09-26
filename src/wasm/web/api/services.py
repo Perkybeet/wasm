@@ -368,7 +368,7 @@ def _service_info(name: str, description: str | None, live_status: dict) -> Serv
     # systemctl show reports MainPID as a string, "0" for a stopped unit and
     # "" from a status a scripted test double left blank; neither is a pid.
     raw_pid = live_status.get("pid")
-    pid = int(raw_pid) if raw_pid not in (None, "", "0") else None
+    pid = int(raw_pid) if raw_pid is not None and raw_pid not in ("", "0") else None
 
     return ServiceInfo(
         name=live_status.get("name") or name,

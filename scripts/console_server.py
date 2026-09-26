@@ -3644,22 +3644,24 @@ def use_console_build(static_dir: Path) -> None:
 
 def use_fixed_hostname(hostname: str) -> None:
     """
-    Make the machine snapshot report a fixed hostname instead of this machine's own.
+    Make the console report a fixed hostname instead of this machine's own.
 
     Development and screenshots only: a recording or a review screenshot should not carry
-    the developer's real machine name. ``wasm.web.machine.read_machine`` is the one place that
-    reads it, with a bare ``socket.gethostname()`` - not a module-level constant this could
-    rebind the way ``use_console_build`` rebinds ``server.STATIC_DIR`` - so this replaces the
-    name ``machine`` itself resolves ``socket`` to, inside that module's own namespace only.
-    Every other reader of ``socket.gethostname()`` (the session's own hostname, the TOTP
-    account name in ``wasm.web.api.auth``) keeps the real module and is unaffected.
+    the developer's real machine name. The name is read with a bare ``socket.gethostname()``
+    in two modules - the machine snapshot (``wasm.web.machine``) and the session answer and
+    TOTP account name (``wasm.web.api.auth``) - neither of which uses ``socket`` for anything
+    else, so each gets a stand-in bound to its own name, and the real module is untouched for
+    everything else in the process.
 
     Args:
         hostname: The name to report.
     """
+    import wasm.web.api.auth as auth_api
     import wasm.web.machine as machine_module
 
-    machine_module.socket = SimpleNamespace(gethostname=lambda: hostname)  # type: ignore[assignment]
+    fixed = SimpleNamespace(gethostname=lambda: hostname)
+    machine_module.socket = fixed  # type: ignore[assignment]
+    auth_api.socket = fixed  # type: ignore[assignment]
 
 
 def serve(args: argparse.Namespace, sandbox: Sandbox) -> None:

@@ -263,10 +263,11 @@ def validate_ssh_setup_for_url(url: str) -> dict:
     Returns:
         Dictionary with validation results and guidance.
     """
+    host = get_host_from_git_url(url)
     result = {
         "valid": False,
         "is_ssh": is_ssh_url(url),
-        "host": get_host_from_git_url(url),
+        "host": host,
         "has_ssh_key": False,
         "key_path": None,
         "public_key": None,
@@ -305,9 +306,9 @@ def validate_ssh_setup_for_url(url: str) -> dict:
     result["public_key"] = get_public_key(key_path)
 
     # Test connection
-    if result["host"]:
+    if host:
         result["connection_tested"] = True
-        conn_success, conn_msg = test_ssh_connection(result["host"])
+        conn_success, conn_msg = test_ssh_connection(host)
         result["connection_success"] = conn_success
 
         if conn_success:
@@ -325,7 +326,7 @@ def validate_ssh_setup_for_url(url: str) -> dict:
                 result["public_key"] or "(could not read public key)",
                 "─" * 60,
                 "",
-                _get_provider_instructions(result["host"]),
+                _get_provider_instructions(host),
                 "",
                 "After adding the key, run your command again.",
             ]

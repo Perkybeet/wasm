@@ -59,7 +59,9 @@ export async function startConsoleServer(args: readonly string[] = []): Promise<
   // WASM_E2E_STATIC points the backend at a private build (see console_server.py
   // --static-dir), so parallel work on the console never serves another's chunks.
   const staticDir = process.env.WASM_E2E_STATIC;
-  const extra = staticDir ? ["--static-dir", staticDir] : [];
+  // WASM_E2E_HOSTNAME: screenshots for the docs show a neutral machine name.
+  const hostname = process.env.WASM_E2E_HOSTNAME;
+  const extra = [...(staticDir ? ["--static-dir", staticDir] : []), ...(hostname ? ["--hostname", hostname] : [])];
   const child = spawn(python(), [SERVER_SCRIPT, ...extra, ...args], {
     cwd: REPO,
     stdio: ["ignore", "pipe", "pipe"],
