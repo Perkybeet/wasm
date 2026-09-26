@@ -281,8 +281,9 @@ What does not come back:
   `--persist`; untracked files outside a persistent path stay in the first release only.
 - `wasm cron create --app` defaults the working directory to the application directory, not
   `current/`: for an application on releases, pass `--working-directory`.
-- `--pm` accepts `npm`, `pnpm` and `bun`; Yarn is used when detected from `yarn.lock` but
-  cannot be forced. `POST /api/apps` has no package manager field.
+- `--pm` accepts `npm`, `pnpm`, `yarn` and `bun` (`POST /api/apps` takes the same as
+  `package_manager`); left out, it is detected from the lock file. Monorepo and Docker Compose
+  applications ignore it.
 - Variables given with `wasm create --env-file` (or `env_vars` on `POST /api/apps`) are
   written into the application's `.env` file, and the unit loads it with `EnvironmentFile=`.
   Only `PORT` and `NODE_ENV` stay inline in the unit, which local users can read; `wasm env
@@ -290,8 +291,8 @@ What does not come back:
   file, since that would silently override what the unit and nginx expect. A unit from
   before this change, with every variable inline, keeps working as it is: the next `wasm
   update` or redeploy moves them into the `.env` file, once, automatically.
-- Python applications need the `venv` module (`python3-venv` on Debian and Ubuntu), which the
-  package does not pull in.
+- Python applications need the `venv` module. The Debian and Ubuntu package depends on
+  `python3-venv`; a pip installation on those systems has to install it by hand.
 
 **Domains**
 
@@ -310,5 +311,5 @@ What does not come back:
   otherwise). Before, the endpoint accepted the request but no handshake could ever redeem
   the ticket it issued.
 - Webhook secrets are created from the console or the API only; there is no CLI command.
-- Every CLI run checks GitHub for a newer release at most every five minutes, and there is
-  no setting to turn that off.
+- Every CLI run checks GitHub for a newer release at most every five minutes;
+  `wasm config set updates.check false` turns that off.
