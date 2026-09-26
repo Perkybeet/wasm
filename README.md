@@ -550,35 +550,16 @@ committed to `src/wasm/web/static/`, so packaging never runs Node. See
 
 ## License
 
-This project is licensed under the **WASM Non-Commercial Source-Available License (WASM-NCSAL) Version 1.0**.
+From 2.1.0, WASM is free software under the **GNU Affero General Public License, version 3
+or later** ([LICENSE](LICENSE)). You may use it for anything, commercially included, study
+it, change it and share it. If you change WASM and let others use your changed version over a
+network (a hosted service, say), you must offer them its source under the same licence.
 
-### Free usage
+Releases up to 2.0.x were published under the WASM Non-Commercial Source-Available License
+1.0, and stay under it.
 
-You may use WASM free of charge for:
-- Personal projects
-- Educational purposes
-- Research and development
-- Non-commercial use
-
-### Commercial usage
-
-Commercial use requires a license. This includes:
-- Use within commercial organizations
-- Providing paid services using WASM
-- Reducing operational costs in business environments
-- Any revenue-generating use case
-
-### Obtain a commercial license
-
-For commercial licensing inquiries:
-
-- **Email**: yago.lopez.adeje@gmail.com, hello@bitbeet.dev
-- **Phone**: +34 637 881 066
-- **Web**: [bitbeet.dev](https://bitbeet.dev)
-
-**[Read full license terms](LICENSE)**
-
----
+Copyright (c) 2024-2026 Yago López Prado. For a licence on other terms (for example to
+embed WASM in a closed product), write to yago.lopez.adeje@gmail.com.
 
 ## Acknowledgments
 

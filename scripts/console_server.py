@@ -127,6 +127,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--misplaced-backups",
+        action="store_true",
+        help=(
+            "also seed backups outside the backup directory, where an empty backup.directory "
+            "once sent them, so the Backups page names them and the command that imports them"
+        ),
+    )
+    parser.add_argument(
+        "--expired-certificate",
+        action="store_true",
+        help=(
+            "seed the first certificate as expired three days ago, so the health report "
+            "turns critical with a reason naming it"
+        ),
+    )
+    parser.add_argument(
         "--hostname",
         default=None,
         help=(
@@ -1185,12 +1201,15 @@ def make_runner(
 
 def seed_machine(
     sandbox: Sandbox,
+    *,
+    expired_certificate: bool = False,
 ) -> tuple[dict[str, Unit], dict[str, int], dict[str, str], list[str]]:
     """
     Seed the store, then the files and units that live beside it.
 
     Args:
         sandbox: The sandbox.
+        expired_certificate: Seed the first certificate as expired (``--expired-certificate``).
 
     Returns:
         The unit model, each unit's port, each unit's domain, and the domains
@@ -1255,7 +1274,9 @@ def seed_machine(
     seed_job_history(sandbox, store, state.domains[0])
     seed_activity_audit_log(sandbox, state.domains[0])
     seed_app_tabs(sandbox, store, units, ports, domains, tabs_history)
-    seed_domains_and_sources(sandbox, store, units, list(state.cert_domains))
+    seed_domains_and_sources(
+        sandbox, store, units, list(state.cert_domains), expired_certificate=expired_certificate
+    )
     return units, ports, domains, list(state.cert_domains)
 
 
@@ -1304,7 +1325,7 @@ def seed_overview_failed_worker(sandbox: Sandbox, store: Any, units: dict[str, U
     )
 
 
-def seed_backups(sandbox: Sandbox, domains: list[str]) -> None:
+def seed_backups(sandbox: Sandbox, domains: list[str], *, root: Path | None = None) -> None:
     """
     Write backups the way :class:`~wasm.managers.backup_manager.BackupManager` lists them.
 
@@ -1314,6 +1335,7 @@ def seed_backups(sandbox: Sandbox, domains: list[str]) -> None:
     Args:
         sandbox: The sandbox.
         domains: Domains to give backups to, two each.
+        root: Where the ``<app>/`` directories go; the backup directory by default.
     """
     from wasm.core.utils import domain_to_app_name
     from wasm.managers.backup_manager import BackupMetadata
@@ -1321,7 +1343,7 @@ def seed_backups(sandbox: Sandbox, domains: list[str]) -> None:
     now = datetime.now()
     for index, domain in enumerate(domains):
         app_name = domain_to_app_name(domain)
-        directory = sandbox.backup_dir / app_name
+        directory = (root or sandbox.backup_dir) / app_name
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         for age_days, tags in ((index + 1, ["scheduled"]), (index + 8, ["pre-deploy"])):
             created = now - timedelta(days=age_days, hours=index)
@@ -1350,6 +1372,27 @@ def seed_backups(sandbox: Sandbox, domains: list[str]) -> None:
             (directory / f"{backup_id}.json").write_text(
                 json.dumps(metadata.to_dict(), indent=2), encoding="utf-8"
             )
+
+
+def seed_misplaced_backups(sandbox: Sandbox) -> None:
+    """
+    Leave backups where an empty ``backup.directory`` once sent them (``--misplaced-backups``).
+
+    Production looks for them in ``/root`` and ``/`` (``MISPLACED_BACKUP_ROOTS``), which
+    :func:`redirect_system_paths` empties on a developer's machine; this points it at a
+    stand-in for ``/root`` inside the sandbox instead, holding two backups of an application
+    the backup directory already knows - only known applications are looked for.
+
+    Args:
+        sandbox: The sandbox, its backups already seeded.
+    """
+    from wasm.managers.backup_manager import BackupManager
+
+    known = sorted(sandbox.backup_dir.glob("*/*.json"))[0]
+    domain = str(json.loads(known.read_text(encoding="utf-8"))["domain"])
+    home = sandbox.root / "root"
+    seed_backups(sandbox, [domain], root=home)
+    BackupManager.MISPLACED_BACKUP_ROOTS = (home,)
 
 
 def seed_cron(domain: str) -> None:
@@ -2133,7 +2176,7 @@ def seed_app_tabs_history(store: Any) -> dict[str, _TabsApp]:
         lines, error = _tabs_release_log(
             kind, source=source, commit=commit, release_id=rid, previous=previous, port=release.port
         )
-        _tabs_deployment(
+        deployment_id = _tabs_deployment(
             store,
             TABS_RELEASE_APP,
             trigger=trigger,
@@ -2143,6 +2186,9 @@ def seed_app_tabs_history(store: Any) -> dict[str, _TabsApp]:
             status=status,
             error=error,
         )
+        # What the recorder notes once the fetch has named the release: a deployment on
+        # releases can be gone back to while its release is on disk and not serving.
+        store.annotate_deployment(deployment_id, release_id=rid)
         release.deploys.append((started, commit, kind, status, rid))
         if status == "success":
             previous = rid
@@ -2170,6 +2216,7 @@ def seed_app_tabs_history(store: Any) -> dict[str, _TabsApp]:
             )
             seeded.deploys.append((started, commit, "ok", "success", ""))
         apps[domain] = seeded
+    seed_deploy_actions_history(store, apps)
     return apps
 
 
@@ -2691,9 +2738,234 @@ def seed_app_tabs(
     _tabs_metrics(TABS_RELEASE_APP, history[TABS_RELEASE_APP].starts, base_mb=182)
     _tabs_metrics(TABS_LIVE_APP, history[TABS_LIVE_APP].starts, base_mb=96)
     _tabs_slow_live_builds(live_root)
+    seed_deploy_actions(sandbox, store, units, ports, domains, history)
     _tabs_journal_model(units, domains, ports)
     _tabs_diagnose_model(units, ports)
     _tabs_port_model(units, ports)
+
+
+# ---------------------------------------------------------------------------
+# Console: a deploy's actions (rebuild its commit, roll back to it), an update
+# with nothing new, a static site's deploy and a source the wizard cannot
+# deploy as it is. The tabs' release app already has releases on disk to go
+# back to; this adds what else those screens branch on: an in-place
+# deployment whose snapshot backup still exists, an app on releases whose
+# branch head is the commit that is live, a static site's deploy (no health
+# check) and a repository holding a lone Dockerfile.
+# ---------------------------------------------------------------------------
+
+#: On releases, with a git source whose branch head (as the modelled remote
+#: answers `git ls-remote`) is the commit that is live: an update from the
+#: console answers 409 nothing_new.
+NOTHING_NEW_APP = "catalogo.cittek.es"
+
+#: Its repository, and the commit both its live release and the remote's main are at.
+NOTHING_NEW_SOURCE = "https://github.com/cittek/catalogo.git"
+NOTHING_NEW_COMMIT = "6d1e0b27c4a95f3e8d20b61c7a4f9e5d3b2c1a08"
+
+#: A static site with one deploy of ten seconds in its history: its Health phase does not apply.
+STATIC_DEPLOY_APP = "bodas.arennalabs.com"
+
+#: The wizard's source that is a lone Dockerfile: no type matches, and the verdict says to add compose.
+WIZARD_DOCKERFILE_SOURCE = "container-api"
+
+
+def seed_deploy_actions_history(store: Any, apps: dict[str, _TabsApp]) -> None:
+    """
+    Record the deployments the deploy actions need, with the tabs' history.
+
+    Recorded before :func:`seed_console_state`'s deploys of "now", for the
+    same reason the tabs' are: the API orders deployments by id.
+
+    Args:
+        store: The store.
+        apps: The tabs' applications, given the nothing-new app's port and
+            deployment here.
+    """
+    now = datetime.now()
+
+    started = now - timedelta(days=3, hours=2)
+    commit = NOTHING_NEW_COMMIT[:7]
+    rid = _tabs_release_id(started, commit)
+    seeded = _TabsApp(port=_tabs_serve_ok())
+    deployment_id = _tabs_deployment(
+        store,
+        NOTHING_NEW_APP,
+        trigger="webhook",
+        commit=commit,
+        started=started,
+        lines=[
+            (0, "[1/9] Fetching source into a new release..."),
+            (0.4, f"      → Source: {NOTHING_NEW_SOURCE} (main)"),
+            (1.6, f"      → HEAD is now at {commit}"),
+            (1.7, f"      → Release: {rid}"),
+            (1.9, "[2/9] Installing dependencies..."),
+            (2.0, "      → Running: npm ci"),
+            (11.2, "added 402 packages, and audited 403 packages in 9s"),
+            (11.4, "[3/9] Building application..."),
+            (11.5, "      → Running: npm run build"),
+            (29.8, " ✓ Compiled successfully in 17.9s"),
+            (30.1, "[8/9] Activating release..."),
+            (30.2, f"      → Activated release {rid}"),
+            (30.3, f"      → Checking: http://127.0.0.1:{seeded.port}/"),
+            (30.6, f"✓ Release {rid} answered 200 in 61 ms"),
+            (30.7, f"✓ Deployed {NOTHING_NEW_APP}"),
+        ],
+        status="success",
+    )
+    store.annotate_deployment(
+        deployment_id, release_id=rid, commit_message="Show stock per warehouse"
+    )
+    seeded.deploys.append((started, commit, "ok", "success", rid))
+    apps[NOTHING_NEW_APP] = seeded
+
+    # A static deploy: the web server serves the files, so nothing is probed.
+    _tabs_deployment(
+        store,
+        STATIC_DEPLOY_APP,
+        trigger="panel",
+        commit="4c2e9f1",
+        started=now - timedelta(days=2, hours=5),
+        lines=[
+            (0, "[1/6] Fetching source code..."),
+            (0.3, "      → Source: https://github.com/you/landing"),
+            (1.2, "      → HEAD is now at 4c2e9f1"),
+            (1.4, "[2/6] Setting permissions..."),
+            (2.0, "[3/6] Creating site configuration..."),
+            (2.6, "[4/6] Obtaining SSL certificate..."),
+            (2.7, "      → The existing certificate keeps serving what it covers"),
+            (6.0, "[5/6] Activating site..."),
+            (10.0, f"✓ Deployed {STATIC_DEPLOY_APP}"),
+        ],
+        status="success",
+    )
+
+
+def _nothing_new_ls_remote(args: tuple[str, ...]) -> Any:
+    """
+    Answer ``git ls-remote`` for the nothing-new app's repository.
+
+    Args:
+        args: The argv the runner was asked to run.
+
+    Returns:
+        Its ``main`` at the live commit, or None for any other command.
+    """
+    from wasm.core.runner import CommandResult
+
+    if args[:1] != ("git",) or "ls-remote" not in args or NOTHING_NEW_SOURCE not in args:
+        return None
+    return CommandResult(args, 0, f"{NOTHING_NEW_COMMIT}\trefs/heads/main\n", "")
+
+
+def seed_deploy_actions(
+    sandbox: Sandbox,
+    store: Any,
+    units: dict[str, Unit],
+    ports: dict[str, int],
+    domains: dict[str, str],
+    history: dict[str, _TabsApp],
+) -> None:
+    """
+    Seed the states a deploy's actions and an update's "nothing new" branch on.
+
+    - The in-place app's deployment before its live one gets the pre-update
+      backup the update after it took, as its snapshot: it can be gone back to.
+    - The nothing-new app, on releases with its one release serving.
+    - The wizard's lone-Dockerfile source.
+
+    Args:
+        sandbox: The sandbox.
+        store: The seeded store.
+        units: The modelled units, mutated in place.
+        ports: Each unit's port, mutated in place.
+        domains: Each unit's domain, mutated in place.
+        history: What :func:`seed_app_tabs_history` recorded first.
+    """
+    from datetime import timezone
+
+    from wasm.core.runner import get_runner
+    from wasm.core.store import App, ReleaseRecord
+    from wasm.core.utils import domain_to_app_name
+
+    # The snapshot: the older of the two backups seed_backups gave the in-place app.
+    backups = sandbox.backup_dir / domain_to_app_name(TABS_LIVE_APP)
+    pre_deploy = sorted(
+        path.stem
+        for path in backups.glob("*.json")
+        if "pre-deploy" in json.loads(path.read_text(encoding="utf-8")).get("tags", [])
+    )
+    live_history = store.list_deployments(domain=TABS_LIVE_APP, limit=100)
+    if pre_deploy and len(live_history) >= 2 and live_history[1].id is not None:
+        store.set_deployment_snapshot(live_history[1].id, pre_deploy[0])
+
+    seeded = history[NOTHING_NEW_APP]
+    started, commit, _, _, rid = seeded.deploys[0]
+    root = sandbox.apps_dir / domain_to_app_name(NOTHING_NEW_APP)
+    shared = root / "shared"
+    shared.mkdir(parents=True, exist_ok=True)
+    (shared / ".env").write_text(f"NODE_ENV=production\nPORT={seeded.port}\n", encoding="utf-8")
+    (shared / ".env").chmod(0o600)
+    (root / "repo").mkdir(parents=True, exist_ok=True)
+    release_dir = root / "releases" / rid
+    release_dir.mkdir(parents=True, exist_ok=True)
+    (release_dir / "package.json").write_text(
+        json.dumps({"name": "catalogo", "version": "1.8.0"}) + "\n", encoding="utf-8"
+    )
+    (release_dir / ".env").symlink_to("../../shared/.env")
+    app = App(
+        domain=NOTHING_NEW_APP,
+        app_type="nextjs",
+        source=NOTHING_NEW_SOURCE,
+        branch="main",
+        port=seeded.port,
+        app_path=str(root),
+        status="running",
+        ssl_enabled=True,
+        layout="releases",
+        keep_releases=5,
+    )
+    _tabs_register(sandbox, store, units, ports, domains, app, working_directory=root / "current")
+    stored = store.get_app(NOTHING_NEW_APP)
+    if stored is not None and stored.id is not None:
+        store.record_release(
+            ReleaseRecord(
+                id=rid,
+                app_id=stored.id,
+                git_commit=commit,
+                created_at=started.astimezone(timezone.utc).isoformat(),
+                activated_at=(started + timedelta(seconds=31)).astimezone(timezone.utc).isoformat(),
+                status="superseded",
+                path=str(release_dir),
+            )
+        )
+        (root / "current").symlink_to(Path("releases") / rid)
+        store.mark_release_active(stored.id, rid)
+
+    runner = get_runner()
+    original = runner.run
+
+    def run(argv: Sequence[str], **kwargs: Any) -> Any:
+        args = tuple(str(a) for a in argv)
+        answer = _nothing_new_ls_remote(args)
+        if answer is None:
+            return original(argv, **kwargs)
+        runner.calls.append(args)
+        return answer
+
+    runner.run = run  # type: ignore[method-assign]
+
+    # Only a Dockerfile: WASM runs containers through Compose, and says so.
+    container = sandbox.var / "www" / "src" / WIZARD_DOCKERFILE_SOURCE
+    container.mkdir(parents=True, exist_ok=True)
+    (container / "Dockerfile").write_text(
+        "FROM node:22-alpine\nWORKDIR /app\nCOPY . .\nRUN npm ci\nEXPOSE 3000\n"
+        'CMD ["node", "server.js"]\n',
+        encoding="utf-8",
+    )
+    (container / "server.js").write_text(
+        "require('http').createServer((q, s) => s.end('ok')).listen(3000);\n", encoding="utf-8"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2941,18 +3213,19 @@ class _DomainsWebTools:
         root = str(self.sandbox.root)
         return text[len(root) :] if text.startswith(root) else text
 
-    def seed(self, names: Sequence[str]) -> None:
+    def seed(self, names: Sequence[str], *, first_expired: bool = False) -> None:
         """
         Issue the seeded certificates: the name and its www, the expiry
         :func:`make_runner` always gave them (12, 29, 46... days).
 
         Args:
             names: Certificate names, in the order the store seeded them.
+            first_expired: Make the first one expired three days ago instead
+                (``--expired-certificate``), for a health report that is critical.
         """
         for offset, name in enumerate(names):
-            self._issue(
-                name, [name, f"www.{name}"], datetime.now() + timedelta(days=12 + offset * 17)
-            )
+            days = -3 if first_expired and offset == 0 else 12 + offset * 17
+            self._issue(name, [name, f"www.{name}"], datetime.now() + timedelta(days=days))
 
     def _issue(self, name: str, domains: list[str], expires: datetime) -> None:
         """
@@ -3448,7 +3721,12 @@ def _domains_wizard_sources(sandbox: Sandbox) -> None:
 
 
 def seed_domains_and_sources(
-    sandbox: Sandbox, store: Any, units: dict[str, Unit], cert_domains: list[str]
+    sandbox: Sandbox,
+    store: Any,
+    units: dict[str, Unit],
+    cert_domains: list[str],
+    *,
+    expired_certificate: bool = False,
 ) -> None:
     """
     Seed the web server, certificates, DNS and sources the domain pages and the wizard need.
@@ -3464,6 +3742,7 @@ def seed_domains_and_sources(
         store: The seeded store.
         units: The modelled units, given the nginx one.
         cert_domains: The domains the store seeded with a certificate.
+        expired_certificate: Seed the first certificate as expired.
     """
     import functools
     import socket as socket_module
@@ -3480,7 +3759,7 @@ def seed_domains_and_sources(
 
     zones = frozenset(".".join(app.domain.split(".")[-2:]) for app in store.list_apps())
     tools = _DomainsWebTools(sandbox, zones)
-    tools.seed(cert_domains)
+    tools.seed(cert_domains, first_expired=expired_certificate)
 
     runner = get_runner()
     original = runner.run
@@ -3510,11 +3789,16 @@ def seed_domains_and_sources(
             for address in addresses
         ]
 
-    domains_api.check_dns = functools.partial(  # type: ignore[assignment]
+    # Patched where it is defined, not only where the API imported it: the certificate
+    # diagnosis imports it lazily from wasm.deployers.domains and must see the same
+    # modelled DNS, never this machine's real resolver and addresses.
+    modelled = functools.partial(
         domains_core.check_dns,
         resolver=resolver,
         local_addresses=lambda: DOMAINS_MACHINE_ADDRESSES,
     )
+    domains_core.check_dns = modelled  # type: ignore[assignment]
+    domains_api.check_dns = modelled  # type: ignore[assignment]
 
     _domains_site_files(store)
     seed_sites_server_names("qrboda.com", ["www", "shop", "status"])
@@ -3575,6 +3859,86 @@ def pin_settings_update_check() -> str:
 
     UpdateChecker._fetch_latest_version = classmethod(fetch_latest)  # type: ignore[method-assign,assignment]
     return latest
+
+
+#: The modelled Telegram bots: token to the chats each has seen. The first has seen a group and
+#: a private chat; the second none yet, which is what a bot never written to answers.
+TELEGRAM_BOTS: dict[str, list[dict[str, Any]]] = {
+    "7000000001:console-sandbox-bot": [
+        {"id": -1001987654321, "type": "supergroup", "title": "WASM alerts"},
+        {"id": 52345678, "type": "private", "username": "ops_oncall", "first_name": "Ops"},
+    ],
+    "7000000002:console-sandbox-quiet": [],
+}
+
+
+def model_telegram_bot_api() -> None:
+    """
+    Answer the Telegram Bot API from :data:`TELEGRAM_BOTS` instead of api.telegram.org.
+
+    Settings > Notifications finds a bot's chats (``getUpdates``) and sends it a test
+    (``sendMessage``); neither may leave the machine. The notifier the settings endpoints build
+    keeps its real opener - the webhook test posts to a listener the E2E suite runs - but a
+    request for the Bot API is answered here, the way Telegram answers: ``{"ok": true, ...}``,
+    or an HTTP error whose body carries Telegram's own ``description``. Only the Bot API's
+    fixed host is excused from the private-destination guard, since nothing is dialled for it.
+    """
+    import io
+    from email.message import Message
+    from urllib.error import HTTPError
+
+    import wasm.core.notifier as notifier_module
+    import wasm.web.api.config as config_api
+
+    api = notifier_module._TELEGRAM_API + "/bot"
+    guard = notifier_module._require_public_destination
+
+    def require_public_destination(url: str, config: Any) -> None:
+        if not url.startswith(api):
+            guard(url, config)
+
+    def refuse(url: str, code: int, reason: str, description: str) -> HTTPError:
+        body = json.dumps({"ok": False, "error_code": code, "description": description})
+        return HTTPError(url, code, reason, Message(), io.BytesIO(body.encode("utf-8")))
+
+    def answer(request: Any) -> io.BytesIO:
+        url = str(request.full_url)
+        token, _, method = url[len(api) :].partition("/")
+        chats = TELEGRAM_BOTS.get(token)
+        if chats is None:
+            raise refuse(url, 401, "Unauthorized", "Unauthorized")
+        if method == "getUpdates":
+            updates = [
+                {
+                    "update_id": 800 + index,
+                    "message": {"message_id": 1, "chat": chat, "text": "/start"},
+                }
+                for index, chat in enumerate(chats)
+            ]
+            return io.BytesIO(json.dumps({"ok": True, "result": updates}).encode("utf-8"))
+        if method == "sendMessage":
+            sent = json.loads(request.data.decode("utf-8"))
+            if str(sent.get("chat_id")) not in {str(chat["id"]) for chat in chats}:
+                raise refuse(url, 400, "Bad Request", "Bad Request: chat not found")
+            return io.BytesIO(b'{"ok": true, "result": {"message_id": 2}}')
+        raise refuse(url, 404, "Not Found", "Not Found")
+
+    build = config_api._build_notifier
+
+    def build_notifier() -> Any:
+        notifier = build()
+        opener = notifier._opener
+
+        def open_or_answer(request: Any, timeout: float | None = None) -> Any:
+            if str(request.full_url).startswith(api):
+                return answer(request)
+            return opener(request, timeout=timeout)
+
+        notifier._opener = open_or_answer
+        return notifier
+
+    notifier_module._require_public_destination = require_public_destination  # type: ignore[assignment]
+    config_api._build_notifier = build_notifier
 
 
 # ---------------------------------------------------------------------------
@@ -3711,7 +4075,12 @@ def serve(args: argparse.Namespace, sandbox: Sandbox) -> None:
     # Managers report progress on stdout, which belongs to the one JSON line
     # the caller parses.
     with contextlib.redirect_stdout(sys.stderr):
-        seeded_units, seeded_ports, seeded_domains, seeded_certs = seed_machine(sandbox)
+        seeded_units, seeded_ports, seeded_domains, seeded_certs = seed_machine(
+            sandbox, expired_certificate=args.expired_certificate
+        )
+        if args.misplaced_backups:
+            seed_misplaced_backups(sandbox)
+    model_telegram_bot_api()
     units.update(seeded_units)
     ports.update(seeded_ports)
     domains.update(seeded_domains)

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { ApiError } from "../../api/errors";
-import { splitErrors } from "./formErrors";
+import { splitConfigErrors, splitErrors } from "./formErrors";
 
 describe("splitErrors", () => {
   it("puts a 422's messages beside the fields they name, verbatim", () => {
@@ -46,5 +46,34 @@ describe("splitErrors", () => {
 
   it("says nothing when nothing failed", () => {
     expect(splitErrors(null, ["email"])).toEqual({ fields: {}, form: null });
+  });
+});
+
+describe("splitConfigErrors", () => {
+  const KEYS = { "monitor.smtp.host": "host", "monitor.smtp.port": "port", "monitor.email_recipients": "recipients" } as const;
+  const NAMES = ["host", "port", "recipients"] as const;
+
+  it("puts a refusal worded by its configuration key beside that key's field, with its fix", () => {
+    const error = new ApiError(400, "configerror", "monitor.smtp.host is not a valid hostname: bad", "Use a hostname such as smtp.example.com.");
+    expect(splitConfigErrors(error, NAMES, KEYS)).toEqual({
+      fields: { host: "monitor.smtp.host is not a valid hostname: bad Use a hostname such as smtp.example.com." },
+      form: null,
+    });
+  });
+
+  it("still takes a 422's fields as they are named", () => {
+    const error = new ApiError(422, "validation_error", "Validation failed", null, { port: "Input should be a valid integer" });
+    expect(splitConfigErrors(error, NAMES, KEYS)).toEqual({ fields: { port: "Input should be a valid integer" }, form: null });
+  });
+
+  it("leaves a refusal that names no field of this form above it", () => {
+    const other = new ApiError(400, "configerror", "backup.directory must be an absolute path");
+    expect(splitConfigErrors(other, NAMES, KEYS)).toEqual({ fields: {}, form: other });
+    // A key's name inside a longer one is not that key.
+    const longer = new ApiError(400, "configerror", "monitor.smtp.hostname_suffix is odd");
+    expect(splitConfigErrors(longer, NAMES, KEYS).form).toBe(longer);
+    const server = new ApiError(500, "internal", "monitor.smtp.host exploded");
+    expect(splitConfigErrors(server, NAMES, KEYS).form).toBe(server);
+    expect(splitConfigErrors(null, NAMES, KEYS)).toEqual({ fields: {}, form: null });
   });
 });

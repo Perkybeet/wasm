@@ -4,7 +4,7 @@ import type { AppInfo, Deployment } from "./data";
 import { appLimits, appReading, deployMoment, latestDeployByDomain, readsApps } from "./data";
 
 function deploy(id: number, domain: string, status = "success"): Deployment {
-  return { id, domain, status, triggered_by: "cli", has_log: true, started_at: "2026-09-25T10:00:00", finished_at: null };
+  return { id, domain, status, triggered_by: "cli", has_log: true, started_at: "2026-09-25T10:00:00", finished_at: null, rollback_available: false };
 }
 
 describe("latestDeployByDomain", () => {

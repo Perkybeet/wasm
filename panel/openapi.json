@@ -1168,7 +1168,7 @@
         "type": "object"
       },
       "BackupStorageResponse": {
-        "description": "Response describing how much disk the backups take.\n\nAttributes:\n    domains: The applications holding backups in ``path``; directories\n        with no WASM backup in them are not listed.\n    misplaced: Backups found elsewhere - in the old default directory, or\n        where an empty ``backup.directory`` sent them - each with the\n        ``wasm backup import`` command that moves them into ``path``.",
+        "description": "Response describing how much disk the backups take.\n\nAttributes:\n    domains: The applications holding backups in ``path``; directories\n        with no WASM backup in them are not listed.\n    misplaced: Backups found elsewhere - in the old default directory, or\n        where an empty ``backup.directory`` sent them - each with the\n        ``wasm backup import`` command that moves them into ``path``.\n    filesystem_total: Size in bytes of the filesystem ``path`` is on, or\n        None when it could not be read.\n    filesystem_free: Bytes free on that filesystem, or None when it\n        could not be read.",
         "properties": {
           "backup_count": {
             "title": "Backup Count",
@@ -1180,6 +1180,28 @@
             },
             "title": "Domains",
             "type": "array"
+          },
+          "filesystem_free": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filesystem Free"
+          },
+          "filesystem_total": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filesystem Total"
           },
           "misplaced": {
             "items": {
@@ -9622,7 +9644,7 @@
     },
     "/api/backups/storage": {
       "get": {
-        "description": "Report how much disk the backups take.\n\nDeclared before ``/{backup_id}`` so the literal path wins.\n\nArgs:\n    session: The authenticated session.\n\nReturns:\n    Totals and the applications that own them.",
+        "description": "Report how much disk the backups take.\n\nDeclared before ``/{backup_id}`` so the literal path wins.\n\nArgs:\n    session: The authenticated session.\n\nReturns:\n    Totals, the applications that own them, and the filesystem they are on.",
         "operationId": "get_storage_info_api_backups_storage_get",
         "responses": {
           "200": {

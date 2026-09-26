@@ -5,6 +5,7 @@ import { appStatus } from "../../components/page/status";
 import { IconButton } from "../../components/ui/IconButton";
 import { Menu, MenuItem, MenuSeparator } from "../../components/ui/Menu";
 import type { AppInfo } from "./data";
+import { NothingNewDialog } from "./NothingNewDialog";
 import { useAppActions } from "./useAppActions";
 
 /** Whether the app has a unit to restart, start or stop. A static site is served by nginx alone. */
@@ -15,9 +16,10 @@ export function hasUnit(app: Pick<AppInfo, "status" | "app_type">): boolean {
 /** The menu at the end of an application's row: open it, read its logs, restart, update. */
 export function AppRowActions({ app }: { app: AppInfo }) {
   const navigate = useNavigate();
-  const { restart, update } = useAppActions(app.domain);
+  const { restart, update, rebuildAnyway, nothingNew, dismissNothingNew } = useAppActions(app.domain);
   const domain = app.domain;
   return (
+    <>
     <Menu
       align="end"
       trigger={
@@ -38,5 +40,13 @@ export function AppRowActions({ app }: { app: AppInfo }) {
         Update
       </MenuItem>
     </Menu>
+    <NothingNewDialog
+      domain={domain}
+      refusal={nothingNew}
+      pending={rebuildAnyway.isPending}
+      onRebuild={() => rebuildAnyway.mutate()}
+      onClose={dismissNothingNew}
+    />
+    </>
   );
 }

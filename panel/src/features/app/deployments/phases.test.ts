@@ -1,9 +1,14 @@
 import { describe, expect, it } from "vitest";
 
-import { buildLogEvents, jobEvents, levelOf, mergeEvents, parseLine, parseLog } from "./buildLog";
-import { currentPhase, outcomeOf, phaseOf, stepOf, timeline } from "./phases";
+import { buildLogEvents, jobEvents, levelOf, logClock, mergeEvents, parseLine, parseLog } from "./buildLog";
+import { currentPhase, logClockOffset, outcomeOf, phaseOf, stepOf, timeline } from "./phases";
+import type { PhaseClock } from "./phases";
 
-const at = (time: string) => new Date(`2026-09-25T${time}`);
+/** A time on the logs' clock, as parseLine reads one. */
+const at = (time: string) => new Date(`2026-09-25T${time}Z`);
+
+/** A finished deploy's clock: its last line, and a server on UTC. */
+const ended = (last: Date | null): PhaseClock => ({ lastAt: last, now: at("13:00:00"), offset: 0 });
 
 describe("stepOf", () => {
   it("reads the deployer's step headers without the counter, the icon or the ellipsis", () => {
@@ -56,7 +61,7 @@ describe("phaseOf", () => {
 });
 
 describe("timeline", () => {
-  const now = at("12:10:00");
+  const now: PhaseClock = { lastAt: null, now: at("12:10:00"), offset: 0 };
 
   it("marks what came before the furthest phase done, with durations from the times", () => {
     const views = timeline(
@@ -66,7 +71,6 @@ describe("timeline", () => {
         { phase: "build", at: at("12:00:20") },
       ],
       "running",
-      null,
       now,
     );
     expect(views.map((view) => view.state)).toEqual(["done", "done", "running", "pending", "pending"]);
@@ -84,8 +88,7 @@ describe("timeline", () => {
         { phase: "build", at: at("12:00:20") },
       ],
       "failed",
-      at("12:00:45"),
-      now,
+      ended(at("12:00:45")),
     );
     expect(views.map((view) => view.state)).toEqual(["done", "unrecorded", "failed", "unrecorded", "unrecorded"]);
     expect(views[2]?.seconds).toBe(25);
@@ -99,16 +102,60 @@ describe("timeline", () => {
         { phase: "activate", at: at("12:01:01") },
       ],
       "failed",
-      at("12:01:04"),
-      now,
+      ended(at("12:01:04")),
     );
     expect(views[4]?.state).toBe("failed");
     expect(views[3]?.state).toBe("done");
   });
 
   it("says nothing it does not know when a finished deploy recorded no steps", () => {
-    expect(timeline([], "succeeded", null, now).map((view) => view.state)).toEqual(Array(5).fill("unrecorded"));
-    expect(timeline([], "running", null, now).map((view) => view.state)).toEqual(Array(5).fill("pending"));
+    expect(timeline([], "succeeded", ended(null)).map((view) => view.state)).toEqual(Array(5).fill("unrecorded"));
+    expect(timeline([], "running", now).map((view) => view.state)).toEqual(Array(5).fill("pending"));
+  });
+
+  it("ends a finished deploy's last phase at its last line, not at finished_at", () => {
+    const views = timeline(
+      [
+        { phase: "fetch", at: at("12:00:00") },
+        { phase: "activate", at: at("12:00:08") },
+      ],
+      "succeeded",
+      ended(at("12:00:10")),
+      { checksHealth: false },
+    );
+    expect(views[3]?.seconds).toBe(2);
+  });
+
+  it("gives a static site's health phase as not applicable, never as missing from the log", () => {
+    const events = [
+      { phase: "fetch", at: at("12:00:00") },
+      { phase: "activate", at: at("12:00:08") },
+    ] as const;
+    expect(timeline(events, "succeeded", ended(at("12:00:10")), { checksHealth: false })[4]?.state).toBe("not_applicable");
+    expect(timeline(events, "running", now, { checksHealth: false })[4]?.state).toBe("not_applicable");
+    // With a health check, the same log leaves it unrecorded.
+    expect(timeline(events, "succeeded", ended(at("12:00:10")))[4]?.state).toBe("unrecorded");
+  });
+
+  it("places phases in time through the offset, and measures a running one against the present", () => {
+    // The server's clock is an hour ahead of UTC: its 13:00:00 is 12:00:00Z.
+    const views = timeline([{ phase: "build", at: at("13:00:00") }], "running", {
+      lastAt: null,
+      now: new Date("2026-09-25T12:00:30Z"),
+      offset: 3_600_000,
+    });
+    expect(views[2]?.seconds).toBe(30);
+    expect(views[2]?.startedAt?.toISOString()).toBe("2026-09-25T12:00:00.000Z");
+  });
+});
+
+describe("logClockOffset", () => {
+  it("is the server's zone offset, rounded to the quarter hour", () => {
+    const started = new Date("2026-09-25T12:00:00Z");
+    expect(logClockOffset(at("12:00:01"), started)).toBe(0);
+    expect(logClockOffset(at("14:00:02"), started)).toBe(2 * 3_600_000);
+    expect(logClockOffset(at("06:30:00"), started)).toBe(-5.5 * 3_600_000);
+    expect(logClockOffset(null, started)).toBeNull();
   });
 });
 
@@ -126,7 +173,14 @@ describe("the logs", () => {
   it("splits a recorder line into its time and its verbatim text", () => {
     const line = parseLine("[2026-09-25 21:53:39]       → Running: npm ci", 7);
     expect(line).toMatchObject({ id: 7, ts: "21:53:39", text: "      → Running: npm ci" });
-    expect(line.at?.getHours()).toBe(21);
+    // On the logs' clock: the digits the server wrote, whatever zone the browser is in.
+    expect(line.at?.getUTCHours()).toBe(21);
+  });
+
+  it("reads a job entry's ISO time on the same clock, ignoring any zone suffix", () => {
+    expect(logClock("2026-09-25T21:53:39.123456")?.toISOString()).toBe("2026-09-25T21:53:39.123Z");
+    expect(logClock("2026-09-25T21:53:39+02:00")?.toISOString()).toBe("2026-09-25T21:53:39.000Z");
+    expect(logClock("yesterday")).toBeNull();
   });
 
   it("reads a job log line's level and message", () => {

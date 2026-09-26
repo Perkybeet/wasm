@@ -54,6 +54,35 @@ describe("the server page", () => {
     }
   });
 
+  it("shows why the verdict is what it is, and links a certificate it names", async () => {
+    fakeBackend({
+      ...withObservations([]),
+      "GET /api/system/health": () =>
+        json(200, {
+          ...SYSTEM_HEALTH,
+          verdict: "error",
+          issues: ["Certificate for shop.example.com expired 3 days ago"],
+          warnings: ["App 'api.example.com' - the unit is not running"],
+        }),
+    });
+    const { container } = renderConsole("/server");
+    const reasons = await screen.findByRole("group", { name: "Reasons" });
+    const items = within(reasons).getAllByRole("listitem");
+    expect(items.map((item) => item.textContent)).toEqual([
+      "CriticalCertificate for shop.example.com expired 3 days ago",
+      "WarningApp 'api.example.com' - the unit is not running",
+    ]);
+    expect(within(reasons).getByRole("link", { name: "shop.example.com" })).toHaveAttribute("href", "/domains?q=shop.example.com");
+    expect(screen.getAllByText("Critical").length).toBeGreaterThanOrEqual(2);
+    await expectNoAxeViolations(container);
+  });
+
+  it("says nothing needs attention when the report gives no reason", async () => {
+    await serverPage();
+    const reasons = await screen.findByRole("group", { name: "Reasons" });
+    expect(within(reasons).getByText("Nothing needs attention.")).toBeInTheDocument();
+  });
+
   it("shows system info, network and top processes", async () => {
     await serverPage();
     const systemHeading = await screen.findByRole("heading", { name: "System" });

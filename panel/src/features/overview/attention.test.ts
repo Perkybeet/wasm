@@ -21,6 +21,7 @@ function deploy(id: number, domain: string, status: string, error: string | null
     duration_s: 27,
     error,
     has_log: true,
+    rollback_available: false,
   };
 }
 

@@ -70,20 +70,61 @@ export function stepOf(line: string): string | null {
 
 export interface PhaseEvent {
   phase: PhaseKey;
-  /** When the line was written, when the log says. */
+  /** When the line was written, on the logs' clock (see `logClock` in buildLog.ts). */
   at: Date | null;
 }
 
 /** How the deploy ended, in the timeline's terms. */
 export type Outcome = "running" | "succeeded" | "failed";
 
-export type PhaseState = "done" | "running" | "failed" | "pending" | "unrecorded";
+export type PhaseState = "done" | "running" | "failed" | "pending" | "unrecorded" | "not_applicable";
 
 export interface PhaseView extends PhaseSpec {
   state: PhaseState;
+  /** When it started, as an instant; null without times, or when the logs' clock cannot be placed. */
   startedAt: Date | null;
   /** How long it took, or has taken so far; null without times. */
   seconds: number | null;
+}
+
+/**
+ * What the timeline measures against, all read off the logs except `now`.
+ *
+ * The logs stamp the server's wall clock without a zone, while `started_at` and the browser's
+ * clock are instants. Mixing the two is how a ten-second deploy once read "Activate 1h 0m" in
+ * a browser an hour away from the server. So a phase is measured only by differences between
+ * log times, and the end of the last one is the last line written, never `finished_at`. Only a
+ * phase still running needs the present, and that is the one place the offset is applied.
+ */
+export interface PhaseClock {
+  /** The last line either log wrote, on the logs' clock: where a finished deploy's last phase ends. */
+  lastAt: Date | null;
+  /** The present, as an instant. */
+  now: Date;
+  /** Milliseconds the logs' clock is ahead of UTC (`logClockOffset`); null when unknown. */
+  offset: number | null;
+}
+
+/** Every zone in use is a whole number of quarter hours from UTC. */
+const QUARTER_HOUR_MS = 15 * 60_000;
+
+/**
+ * How far the logs' clock is ahead of UTC, in milliseconds: the deploy's first line against its
+ * `started_at`, which the store keeps as an instant. The first line is written within moments
+ * of the start, so the difference, rounded to the quarter hour, is the server's zone offset
+ * and nothing else. Null when either is missing.
+ */
+export function logClockOffset(firstAt: Date | null, startedAt: Date | null): number | null {
+  if (firstAt === null || startedAt === null) return null;
+  return Math.round((firstAt.getTime() - startedAt.getTime()) / QUARTER_HOUR_MS) * QUARTER_HOUR_MS;
+}
+
+export interface TimelineOptions {
+  /**
+   * Whether the deploy has a health phase at all. A static site is served as files by the web
+   * server: there is no process to probe, so its phase is not applicable rather than missing.
+   */
+  checksHealth?: boolean;
 }
 
 /** The deployment status words as the timeline reads them. */
@@ -110,35 +151,41 @@ export function outcomeOf(status: string | null | undefined): Outcome {
  * move the deploy back. A phase before the furthest one that never appeared, or one after it in
  * a deploy that finished, is "unrecorded": it may have run without a line, or been skipped (a
  * static site installs nothing), and the log does not say which.
+ *
+ * Durations come from the logs' own clock only (see PhaseClock).
  */
 export function timeline(
   events: readonly PhaseEvent[],
   outcome: Outcome,
-  finishedAt: Date | null,
-  now: Date,
+  clock: PhaseClock,
+  { checksHealth = true }: TimelineOptions = {},
 ): PhaseView[] {
   const first = new Map<PhaseKey, Date | null>();
   let reached = -1;
   for (const event of events) {
+    if (!checksHealth && event.phase === "health") continue;
     if (!first.has(event.phase)) first.set(event.phase, event.at);
     reached = Math.max(reached, INDEX[event.phase]);
   }
 
+  const nowOnLogClock = clock.offset === null ? null : new Date(clock.now.getTime() + clock.offset);
   const starts = PHASES.map((spec) => first.get(spec.key) ?? null);
   return PHASES.map((spec, index) => {
+    if (!checksHealth && spec.key === "health") return { ...spec, state: "not_applicable", startedAt: null, seconds: null };
     const seen = first.has(spec.key);
     let state: PhaseState;
     if (index < reached) state = seen ? "done" : "unrecorded";
     else if (index === reached) state = outcome === "running" ? "running" : outcome === "failed" ? "failed" : "done";
     else state = outcome === "running" ? "pending" : "unrecorded";
 
-    const startedAt = starts[index] ?? null;
+    const started = starts[index] ?? null;
     let seconds: number | null = null;
-    if (startedAt !== null && (state === "done" || state === "running" || state === "failed")) {
-      const next = starts.slice(index + 1).find((start): start is Date => start !== null && start >= startedAt);
-      const end = next ?? (state === "running" ? now : finishedAt);
-      if (end) seconds = Math.max(0, (end.getTime() - startedAt.getTime()) / 1000);
+    if (started !== null && (state === "done" || state === "running" || state === "failed")) {
+      const next = starts.slice(index + 1).find((start): start is Date => start !== null && start >= started);
+      const end = next ?? (state === "running" ? nowOnLogClock : clock.lastAt);
+      if (end) seconds = Math.max(0, (end.getTime() - started.getTime()) / 1000);
     }
+    const startedAt = started === null || clock.offset === null ? null : new Date(started.getTime() - clock.offset);
     return { ...spec, state, startedAt, seconds };
   });
 }

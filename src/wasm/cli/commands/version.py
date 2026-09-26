@@ -1,6 +1,5 @@
 # Copyright (c) 2024-2025 Yago López Prado
-# Licensed under WASM-NCSAL 1.0 (Commercial use prohibited)
-# https://github.com/Perkybeet/wasm/blob/main/LICENSE
+# SPDX-License-Identifier: AGPL-3.0-or-later
 
 """
 What changed in the release that is installed.

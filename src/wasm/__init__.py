@@ -1,6 +1,5 @@
 # Copyright (c) 2024-2025 Yago López Prado
-# Licensed under WASM-NCSAL 1.0 (Commercial use prohibited)
-# https://github.com/Perkybeet/wasm/blob/main/LICENSE
+# SPDX-License-Identifier: AGPL-3.0-or-later
 
 """
 WASM - Web App System Management
@@ -23,7 +22,7 @@ except PackageNotFoundError:  # pragma: no cover - only hit in uninstalled trees
     __version__ = _FALLBACK_VERSION
 
 __author__ = "Yago López Prado"
-__license__ = "WASM-NCSAL"
+__license__ = "AGPL-3.0-or-later"
 
 from wasm.core.config import Config
 from wasm.core.exceptions import WASMError

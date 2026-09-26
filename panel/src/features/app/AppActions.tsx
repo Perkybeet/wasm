@@ -13,6 +13,7 @@ import { IconButton } from "../../components/ui/IconButton";
 import { Menu, MenuItem, MenuSeparator } from "../../components/ui/Menu";
 import { toast } from "../../components/ui/toast";
 import { hasUnit } from "../apps/AppRowActions";
+import { NothingNewDialog } from "../apps/NothingNewDialog";
 import { reportActionError, useAppActions } from "../apps/useAppActions";
 import { RollbackDialog } from "./RollbackDialog";
 import { useConfirmItsYou, useDeleteApp } from "./useDeleteApp";
@@ -33,7 +34,7 @@ export interface AppActionsProps {
 export function AppActions({ app, busy, onJobQueued }: AppActionsProps) {
   const domain = app.domain;
   const navigate = useNavigate();
-  const { restart, start, stop, update } = useAppActions(domain, { onJobQueued });
+  const { restart, start, stop, update, rebuildAnyway, nothingNew, dismissNothingNew } = useAppActions(domain, { onJobQueued });
   const remove = useDeleteApp(domain);
   const confirmItsYou = useConfirmItsYou();
   const [confirmStop, setConfirmStop] = useState(false);
@@ -145,6 +146,14 @@ export function AppActions({ app, busy, onJobQueued }: AppActionsProps) {
             </Button>
           </>
         }
+      />
+
+      <NothingNewDialog
+        domain={domain}
+        refusal={nothingNew}
+        pending={rebuildAnyway.isPending}
+        onRebuild={() => rebuildAnyway.mutate()}
+        onClose={dismissNothingNew}
       />
 
       <RollbackDialog domain={domain} layout={app.layout} open={rollbackOpen} onOpenChange={setRollbackOpen} onJobQueued={onJobQueued} />

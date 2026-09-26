@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import { expectNoAxeViolations } from "../../test/axe";
 import { renderConsole } from "../../test/console";
-import { fakeBackend, json, signedInRoutes } from "../../test/fakes";
+import { fakeBackend, json, problem, signedInRoutes } from "../../test/fakes";
 import type { RouteHandler } from "../../test/fakes";
 
 const JOB = {
@@ -90,8 +90,28 @@ describe("the applications list", () => {
     await waitFor(() => {
       expect(backend.callsTo("POST /api/jobs/update")).toHaveLength(1);
     });
-    expect(backend.callsTo("POST /api/jobs/update")[0]?.body).toEqual({ domain: "shop.example.com" });
+    expect(backend.callsTo("POST /api/jobs/update")[0]?.body).toEqual({ domain: "shop.example.com", force: false });
     expect(await screen.findByText("Update of shop.example.com queued")).toBeInTheDocument();
+  });
+
+  it("asks a row's update whether to rebuild the same commit when nothing is new", async () => {
+    const { user, backend, table } = await appsAt("/apps", {
+      "POST /api/jobs/update": (call) =>
+        (call.body as { force?: boolean }).force === true
+          ? json(202, {
+              message: "Update job created",
+              job: { id: "0badcafe", type: "update", name: "", description: "", status: "pending", progress: 0, total_steps: 100, current_step: "", created_at: "2026-09-25T19:00:00", logs: [], metadata: { domain: "shop.example.com" } },
+            })
+          : problem(409, "nothing_new", "No new commits on main since 9f2c41a, which is live", { hint: "Update with force to rebuild it anyway." }),
+    });
+    await within(table).findByRole("link", { name: "shop.example.com" });
+    await user.click(screen.getByRole("button", { name: "Actions for shop.example.com" }));
+    await user.click(await screen.findByRole("menuitem", { name: "Update" }));
+    const dialog = await screen.findByRole("dialog", { name: "Nothing new to deploy to shop.example.com" });
+    expect(within(dialog).getByText("No new commits on main since 9f2c41a, which is live")).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "Rebuild anyway" }));
+    expect(await screen.findByText("Update of shop.example.com queued")).toBeInTheDocument();
+    expect(backend.callsTo("POST /api/jobs/update")[1]?.body).toEqual({ domain: "shop.example.com", force: true });
   });
 
   it("restarts from a row's menu, and not a static site that has nothing to restart", async () => {

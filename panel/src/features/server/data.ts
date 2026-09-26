@@ -54,3 +54,40 @@ const CHECK_NAMES: Readonly<Record<string, string>> = {
 export function checkName(name: string): string {
   return CHECK_NAMES[name] ?? name;
 }
+
+/** A reason for the verdict: an issue fails the check, a warning only needs attention. */
+export interface HealthReason {
+  level: "issue" | "warning";
+  message: string;
+  /** The certificate the message is about, when it is about one, to link to it. */
+  certificate: CertificateMention | null;
+}
+
+export interface CertificateMention {
+  /** The message up to the certificate's name: "Certificate for ". */
+  before: string;
+  name: string;
+  /** The rest of the message: " expired 3 days ago". */
+  after: string;
+}
+
+/**
+ * The certificate a health message names. `collect_health_report` words each one as
+ * "Certificate for <name> expired N days ago", "... expires in N days" or "... has an
+ * unreadable expiry date" (wasm.managers.health._check_certificates), with the certbot lineage
+ * name, which carries no spaces.
+ */
+export function certificateMention(message: string): CertificateMention | null {
+  const match = /^(Certificate for )(\S+)( .+)$/.exec(message);
+  if (match === null) return null;
+  const [, before = "", name = "", after = ""] = match;
+  return { before, name, after };
+}
+
+/** The report's issues, then its warnings: why the verdict is what it is, most serious first. */
+export function healthReasons(report: Pick<SystemHealth, "issues" | "warnings">): HealthReason[] {
+  return [
+    ...report.issues.map((message) => ({ level: "issue" as const, message, certificate: certificateMention(message) })),
+    ...report.warnings.map((message) => ({ level: "warning" as const, message, certificate: certificateMention(message) })),
+  ];
+}

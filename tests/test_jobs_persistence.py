@@ -1,6 +1,5 @@
 # Copyright (c) 2024-2026 Yago Lopez Prado
-# Licensed under WASM-NCSAL 1.0 (Commercial use prohibited)
-# https://github.com/Perkybeet/wasm/blob/main/LICENSE
+# SPDX-License-Identifier: AGPL-3.0-or-later
 
 """
 Tests for Task 1.7: jobs survive a panel restart.
@@ -786,3 +785,20 @@ def test_an_unexpected_failure_keeps_its_traceback(
     assert len(failures) == 1
     assert failures[0].exc_info is not None
     assert failures[0].exc_info[0] is RuntimeError
+
+
+def test_a_failed_job_keeps_the_tools_own_output_in_its_error() -> None:
+    """certbot's words used to be dropped from a job's error once the diagnosis took the message."""
+    from wasm.core.exceptions import CertificateError
+    from wasm.web.jobs import _error_text
+
+    exc = CertificateError(
+        "new.example.com has no DNS record pointing at this machine",
+        details="Add an A record for new.example.com",
+        output="DNS problem: NXDOMAIN looking up A for new.example.com",
+    )
+
+    text = _error_text(exc)
+
+    assert text.startswith("new.example.com has no DNS record")
+    assert text.endswith("DNS problem: NXDOMAIN looking up A for new.example.com")

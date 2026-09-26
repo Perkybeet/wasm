@@ -7,7 +7,7 @@ name = "wasm-cli"
 version = "2.0.1"
 description = "Web App System Management - Deploy and manage web applications on Linux servers"
 readme = "README.md"
-license = { text = "WASM-NCSAL" }
+license = { text = "AGPL-3.0-or-later" }
 requires-python = ">=3.10"
 authors = [
     { name = "Yago López Prado", email = "yago.lopez.adeje@gmail.com" }
@@ -28,7 +28,7 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",
-    "License :: Other/Proprietary License",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",

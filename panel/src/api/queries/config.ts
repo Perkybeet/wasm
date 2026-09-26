@@ -20,8 +20,14 @@ export type WebBody = BodyOf<"/api/config/web", "put">;
 
 export type NotificationTestResult = ResponseOf<"/api/config/notifications/{channel}/test", "post">;
 
+/** The monitor's SMTP account, which email notifications go through. The password never comes back. */
+export type SmtpSettings = ResponseOf<"/api/config/smtp", "get">;
+export type SmtpBody = BodyOf<"/api/config/smtp", "put">;
+export type TelegramBody = BodyOf<"/api/config/notifications/telegram", "put">;
+export type TelegramChat = ResponseOf<"/api/config/notifications/telegram/chats", "post">["chats"][number];
+
 /** The typed sections, each one GET and one PUT of its own. */
-export type ConfigSection = "apps-directory" | "webserver" | "backup" | "ssl" | "web";
+export type ConfigSection = "apps-directory" | "webserver" | "backup" | "ssl" | "web" | "smtp";
 
 export const configKeys = {
   all: ["config"] as const,
@@ -73,6 +79,12 @@ export const webSettingsQuery = () =>
     queryFn: ({ signal }) => request("get", "/api/config/web", { signal }),
   });
 
+export const smtpSettingsQuery = () =>
+  queryOptions({
+    queryKey: configKeys.section("smtp"),
+    queryFn: ({ signal }) => request("get", "/api/config/smtp", { signal }),
+  });
+
 export function saveAppsDirectory(body: AppsDirectoryBody) {
   return request("put", "/api/config/apps-directory", { body });
 }
@@ -104,4 +116,26 @@ export function patchConfig(path: string, value: unknown) {
 /** Sends a test message through one notification channel, as the configuration on disk stands. */
 export function testNotificationChannel(channel: string) {
   return request("post", "/api/config/notifications/{channel}/test", { params: { channel } });
+}
+
+/**
+ * Writes the SMTP account and its recipients. An empty password keeps the stored one. Needs a
+ * recent "Confirm it's you"; the client asks for it.
+ */
+export function saveSmtpSettings(body: SmtpBody) {
+  return request("put", "/api/config/smtp", { body });
+}
+
+/**
+ * Writes the Telegram bot token and chat ID. An empty token keeps the stored one; a chat ID
+ * Telegram would refuse is answered as a 422 naming `chat_id`.
+ */
+export function saveTelegramSettings(body: TelegramBody) {
+  return request("put", "/api/config/notifications/telegram", { body });
+}
+
+/** The chats the saved Telegram bot has seen, read from the Bot API's queued updates. */
+export async function findTelegramChats(): Promise<readonly TelegramChat[]> {
+  const result = await request("post", "/api/config/notifications/telegram/chats");
+  return result.chats;
 }

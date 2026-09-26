@@ -93,7 +93,7 @@ describe("an application's page", () => {
     const update = await within(header()).findByRole("button", { name: "Update" });
     await user.click(update);
     await waitFor(() => {
-      expect(backend.callsTo("POST /api/jobs/update")[0]?.body).toEqual({ domain: DOMAIN });
+      expect(backend.callsTo("POST /api/jobs/update")[0]?.body).toEqual({ domain: DOMAIN, force: false });
     });
     expect(await within(header()).findByText("Updating")).toHaveAttribute("data-state", "deploying");
     expect(screen.getByText(`Updating ${DOMAIN}`)).toBeInTheDocument();
@@ -111,6 +111,49 @@ describe("an application's page", () => {
     expect(screen.getByText("Application not found: shop.example.com")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Dismiss" }));
     expect(screen.queryByText(`Update of ${DOMAIN} failed`)).not.toBeInTheDocument();
+  });
+
+  it("asks before rebuilding when the branch has nothing new, in the backend's words, and forces only when told", async () => {
+    const detail = "No new commits on main since 9f2c41a, which is live";
+    const hint = "Rebuilding the same commit still makes sense when the environment or the dependencies changed, or when the last build broke.";
+    const { user, backend } = await appAt({
+      "POST /api/jobs/update": (call) =>
+        (call.body as { force?: boolean }).force === true
+          ? json(202, { message: "Update job created", job: JOB })
+          : problem(409, "nothing_new", detail, { hint }),
+    });
+    await user.click(await within(header()).findByRole("button", { name: "Update" }));
+    const dialog = await screen.findByRole("dialog", { name: `Nothing new to deploy to ${DOMAIN}` });
+    expect(within(dialog).getByText(detail)).toBeInTheDocument();
+    expect(within(dialog).getByText(hint)).toBeInTheDocument();
+    // A question, not a failure: no error toast.
+    expect(screen.queryByText(`Update of ${DOMAIN} could not be queued`)).not.toBeInTheDocument();
+    await expectNoAxeViolations(dialog);
+
+    await user.click(within(dialog).getByRole("button", { name: "Rebuild anyway" }));
+    await waitFor(() => {
+      expect(backend.callsTo("POST /api/jobs/update").map((call) => call.body)).toEqual([
+        { domain: DOMAIN, force: false },
+        { domain: DOMAIN, force: true },
+      ]);
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: `Nothing new to deploy to ${DOMAIN}` })).not.toBeInTheDocument();
+    });
+    expect(await within(header()).findByText("Updating")).toBeInTheDocument();
+  });
+
+  it("leaves the app as it is when the operator does not rebuild the same commit", async () => {
+    const { user, backend } = await appAt({
+      "POST /api/jobs/update": () => problem(409, "nothing_new", "No new commits on main since 9f2c41a, which is live"),
+    });
+    await user.click(await within(header()).findByRole("button", { name: "Update" }));
+    const dialog = await screen.findByRole("dialog", { name: `Nothing new to deploy to ${DOMAIN}` });
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    });
+    expect(backend.callsTo("POST /api/jobs/update")).toHaveLength(1);
   });
 
   it("follows the app event: a deploy elsewhere turns the header to deploying", async () => {

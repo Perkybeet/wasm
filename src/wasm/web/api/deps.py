@@ -186,6 +186,20 @@ def status_for(exc: WASMError) -> int:
     return DEFAULT_ERROR_STATUS
 
 
+def _fields_of(exc: WASMError) -> dict[str, str] | None:
+    """
+    Key an error by the request field it is about, when it names one.
+
+    Args:
+        exc: The raised error.
+
+    Returns:
+        ``{field: message}``, or None when the error is not about one field.
+    """
+    field = getattr(exc, "field", None)
+    return {field: exc.message} if field else None
+
+
 def error_response(exc: WASMError) -> JSONResponse:
     """
     Render a WASM error as the API's error body.
@@ -218,6 +232,7 @@ def error_response(exc: WASMError) -> JSONResponse:
                 hint=hint,
                 error=error,
                 output=getattr(exc, "output", None),
+                fields=_fields_of(exc),
             )
         ),
     )

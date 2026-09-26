@@ -3,15 +3,15 @@ import { useQuery } from "@tanstack/react-query";
 import type { Deployment } from "../../../api/queries/deployments";
 import { jobLogQuery, jobQuery } from "../../../api/queries/jobs";
 import type { Job } from "../../../api/queries/jobs";
-import { parseTimestamp } from "../../../lib/format";
 import { useJobStream } from "../../../realtime/sockets";
 import type { SocketStatus } from "../../../realtime/sockets";
-import { parseLog } from "./buildLog";
+import { logClock, parseLog } from "./buildLog";
 
 const RUNNING_DEPLOY = new Set(["queued", "running"]);
 
 export interface JobEntry {
   text: string;
+  /** When it was reported, on the logs' clock (see logClock). */
   at: Date | null;
 }
 
@@ -29,7 +29,7 @@ function entriesOf(job: Job | null | undefined): JobEntry[] {
     const message = entry["message"];
     if (typeof message !== "string") return [];
     const stamp = entry["timestamp"];
-    return [{ text: message, at: typeof stamp === "string" ? parseTimestamp(stamp) : null }];
+    return [{ text: message, at: typeof stamp === "string" ? logClock(stamp) : null }];
   });
 }
 

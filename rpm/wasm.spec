@@ -1,14 +1,14 @@
 # spec file for package wasm-cli
 #
 # Copyright (c) 2024-2025 Yago López Prado
-# License: WASM-NCSAL (Non-Commercial Source-Available License)
+# License: AGPL-3.0-or-later
 #
 
 Name:           wasm-cli
 Version:        2.0.1
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
-License:        WASM-NCSAL
+License:        AGPL-3.0-or-later
 URL:            https://github.com/Perkybeet/wasm
 Source0:        wasm-%{version}.tar.gz
 Source1:        wasm.default.yaml

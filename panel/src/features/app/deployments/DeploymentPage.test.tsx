@@ -31,6 +31,21 @@ const FAILED_LOG = [
   "",
 ].join("\n");
 
+/** A queued job as the API answers it, for the actions' 202s. */
+const JOB = {
+  id: "0badcafe",
+  type: "update",
+  name: "",
+  description: "",
+  status: "pending",
+  progress: 0,
+  total_steps: 100,
+  current_step: "",
+  created_at: "2026-09-25T19:00:00",
+  logs: [],
+  metadata: { domain: TAB_DOMAIN },
+};
+
 async function pageAt(
   id: number | string,
   extra: Record<string, RouteHandler> = {},
@@ -149,35 +164,42 @@ describe("a deployment's page", { timeout: 20_000 }, () => {
     expect(await screen.findByText("Succeeded")).toBeInTheDocument();
   });
 
-  it("redeploys and opens the new deploy once it is recorded, linked by the job's own id", async () => {
+  it("rebuilds the deploy's commit after saying what that does, and opens the new deploy linked by the job's own id", async () => {
     // Not "the newest deployment": one that arrived after the click but for a different job
     // (someone else's update, or a push) must not be mistaken for this one.
     let queued = false;
-    const { user, location } = await pageAt(20, {
-      "GET /api/deployments": () =>
-        json(200, {
-          items: queued
-            ? [
-                { ...FAILED, id: 22, job_id: "someone-elses-job", status: "success", error: null },
-                { ...FAILED, id: 21, job_id: "0badcafe", status: "running", error: null, finished_at: null },
-                { ...FAILED, id: 20 },
-              ]
-            : [{ ...FAILED, id: 20 }],
-          total: queued ? 3 : 1,
-          next_before_id: null,
-        }),
-      "POST /api/jobs/update": () => {
-        queued = true;
-        return json(202, {
-          message: "Update job created",
-          job: { id: "0badcafe", type: "update", name: "", description: "", status: "pending", progress: 0, total_steps: 100, current_step: "", created_at: "2026-09-25T19:00:00", logs: [], metadata: { domain: TAB_DOMAIN } },
-        });
+    const { user, location, backend } = await pageAt(
+      20,
+      {
+        "GET /api/deployments": () =>
+          json(200, {
+            items: queued
+              ? [
+                  { ...FAILED, id: 22, job_id: "someone-elses-job", status: "success", error: null },
+                  { ...FAILED, id: 21, job_id: "0badcafe", status: "running", error: null, finished_at: null },
+                  { ...FAILED, id: 20 },
+                ]
+              : [{ ...FAILED, id: 20 }],
+            total: queued ? 3 : 1,
+            next_before_id: null,
+          }),
+        [`POST /api/apps/${TAB_DOMAIN}/deployments/20/rebuild`]: () => {
+          queued = true;
+          return json(202, { job_id: "0badcafe", status: "pending", message: "Rebuild queued", job: { ...JOB, id: "0badcafe" } });
+        },
+        "GET /api/jobs/0badcafe": () => json(200, { ...JOB, id: "0badcafe", status: "running" }),
+        "GET /api/deployments/21": () => json(200, { ...FAILED, id: 21, status: "running", error: null, finished_at: null, job_id: "0badcafe" }),
+        "GET /api/deployments/21/log": () => json(200, { content: "", truncated: false, missing_reason: null }),
       },
-      "GET /api/jobs/0badcafe": () => json(200, { id: "0badcafe", type: "update", name: "", description: "", status: "running", progress: 0, total_steps: 100, current_step: "", created_at: "2026-09-25T19:00:00", logs: [], metadata: { domain: TAB_DOMAIN } }),
-      "GET /api/deployments/21": () => json(200, { ...FAILED, id: 21, status: "running", error: null, finished_at: null, job_id: "0badcafe" }),
-      "GET /api/deployments/21/log": () => json(200, { content: "", truncated: false, missing_reason: null }),
-    });
-    await user.click(await screen.findByRole("button", { name: "Redeploy" }));
+      { layout: "releases" },
+    );
+    await user.click(await screen.findByRole("button", { name: "Rebuild this commit" }));
+    const dialog = await screen.findByRole("dialog", { name: "Rebuild commit a94c0e2?" });
+    expect(within(dialog).getByText(/is still on disk and is not the one serving, it is activated in seconds/)).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "Rebuild" }));
+    expect(backend.calls.some((call) => call.method === "POST" && call.path === `/api/apps/${TAB_DOMAIN}/deployments/20/rebuild`)).toBe(true);
+    // Never the plain update the header's Update runs.
+    expect(backend.calls.some((call) => call.path === "/api/jobs/update")).toBe(false);
     await waitFor(
       () => {
         expect(location().pathname).toBe(`/apps/${TAB_DOMAIN}/deployments/21`);
@@ -187,19 +209,44 @@ describe("a deployment's page", { timeout: 20_000 }, () => {
     expect(await screen.findByRole("heading", { level: 2, name: "Deployment 21" })).toBeInTheDocument();
   });
 
-  it("says the redeploy was queued, without a deploy to open, when the job ends without recording one", async () => {
+  it("explains an in-place rebuild: the checkout goes to the commit and the branch is followed again next time", async () => {
+    const { user } = await pageAt(20);
+    await user.click(await screen.findByRole("button", { name: "Rebuild this commit" }));
+    const dialog = await screen.findByRole("dialog", { name: "Rebuild commit a94c0e2?" });
+    expect(within(dialog).getByText(/the checkout is put on a94c0e2.*The next update follows main again\./)).toBeInTheDocument();
+  });
+
+  it("keeps a failed rebuild's error on screen, in the job's own words", async () => {
     const { user } = await pageAt(20, {
-      "POST /api/jobs/update": () =>
-        json(202, {
-          message: "Update job created",
-          job: { id: "cafebabe", type: "update", name: "", description: "", status: "pending", progress: 0, total_steps: 100, current_step: "", created_at: "2026-09-25T19:00:00", logs: [], metadata: { domain: TAB_DOMAIN } },
-        }),
+      [`POST /api/apps/${TAB_DOMAIN}/deployments/20/rebuild`]: () =>
+        json(202, { job_id: "cafebabe", status: "pending", message: "Rebuild queued", job: { ...JOB, id: "cafebabe" } }),
       "GET /api/jobs/cafebabe": () =>
-        json(200, { id: "cafebabe", type: "update", name: "", description: "", status: "completed", progress: 100, total_steps: 100, current_step: "", created_at: "2026-09-25T19:00:00", completed_at: "2026-09-25T19:00:01", logs: [], metadata: { domain: TAB_DOMAIN } }),
+        json(200, { ...JOB, id: "cafebabe", status: "failed", error: "Commit a94c0e2 does not exist in the repository" }),
     });
-    await user.click(await screen.findByRole("button", { name: "Redeploy" }));
+    await user.click(await screen.findByRole("button", { name: "Rebuild this commit" }));
+    await user.click(within(await screen.findByRole("dialog", { name: "Rebuild commit a94c0e2?" })).getByRole("button", { name: "Rebuild" }));
+    const title = await screen.findByText("The rebuild failed", {}, { timeout: 4_000 });
+    const alert = title.closest<HTMLElement>("[role='alert']");
+    if (alert === null) throw new Error("the failure is not announced");
+    expect(within(alert).getByText("Commit a94c0e2 does not exist in the repository")).toBeInTheDocument();
+  });
+
+  it("says a rebuild that recorded no deploy of its own finished", async () => {
+    const { user } = await pageAt(20, {
+      [`POST /api/apps/${TAB_DOMAIN}/deployments/20/rebuild`]: () =>
+        json(202, { job_id: "cafebabe", status: "pending", message: "Rebuild queued", job: { ...JOB, id: "cafebabe" } }),
+      "GET /api/jobs/cafebabe": () => json(200, { ...JOB, id: "cafebabe", status: "completed", completed_at: "2026-09-25T19:00:01" }),
+    });
+    await user.click(await screen.findByRole("button", { name: "Rebuild this commit" }));
+    await user.click(within(await screen.findByRole("dialog", { name: "Rebuild commit a94c0e2?" })).getByRole("button", { name: "Rebuild" }));
     // The job is only found "completed" on jobQuery's own 3s follow poll, not before.
-    expect(await screen.findByText(/The update was queued but no deploy has been recorded yet/, {}, { timeout: 4_000 })).toBeInTheDocument();
+    expect(await screen.findByText("Rebuilt commit a94c0e2: it is live.", {}, { timeout: 4_000 })).toBeInTheDocument();
+  });
+
+  it("offers no rebuild for a deploy whose source is not git", async () => {
+    await pageAt(20, { [`GET /api/deployments/${String(FAILED.id)}`]: () => json(200, { ...FAILED, git_commit: null }) });
+    await screen.findByText("The deploy failed while building");
+    expect(screen.queryByRole("button", { name: "Rebuild this commit" })).not.toBeInTheDocument();
   });
 
   it("shows the commit's message beside its hash and branch", async () => {
@@ -217,61 +264,86 @@ describe("a deployment's page", { timeout: 20_000 }, () => {
     expect(await screen.findByText(/Type error: Property 'total' does not exist on type 'Order'\./)).toBeInTheDocument();
   });
 
-  it("offers to roll back to the deploy's own release, matched by release_id, not by commit or time", async () => {
-    await pageAt(
+  it("rolls back to this deployment when the backend says it can, through its own endpoint", async () => {
+    const SERVED = { ...FAILED, status: "success", error: null, release_id: "20260916-182823-a94c0e2", rollback_available: true, rollback_unavailable_reason: null };
+    const { user, backend } = await pageAt(
       20,
       {
-        [`GET /api/deployments/${String(FAILED.id)}`]: () => json(200, { ...FAILED, release_id: "20260916-182823-a94c0e2" }),
+        [`GET /api/deployments/${String(FAILED.id)}`]: () => json(200, SERVED),
+        [`POST /api/apps/${TAB_DOMAIN}/deployments/20/rollback`]: () =>
+          json(202, { job_id: "5ca1ab1e", status: "pending", message: "Rollback queued", job: { ...JOB, id: "5ca1ab1e", type: "restore" } }),
+        "GET /api/jobs/5ca1ab1e": () => json(200, { ...JOB, id: "5ca1ab1e", type: "restore", status: "completed", completed_at: "2026-09-25T19:00:01" }),
+      },
+      { layout: "releases" },
+    );
+    await user.click(await screen.findByRole("button", { name: "Roll back to this" }));
+    const dialog = await screen.findByRole("dialog", { name: "Roll back to deployment 20?" });
+    expect(within(dialog).getByText(/Release 20260916-182823-a94c0e2 is activated in seconds/)).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "Roll back" }));
+    expect(backend.calls.some((call) => call.method === "POST" && call.path === `/api/apps/${TAB_DOMAIN}/deployments/20/rollback`)).toBe(true);
+    expect(await screen.findByText("Rolled back to deployment 20.", {}, { timeout: 4_000 })).toBeInTheDocument();
+  });
+
+  it("says an in-place rollback restores the deployment's snapshot, after a backup of the current state", async () => {
+    const { user } = await pageAt(20, {
+      [`GET /api/deployments/${String(FAILED.id)}`]: () =>
+        json(200, { ...FAILED, status: "success", error: null, snapshot_backup: "app_20260920_101500", rollback_available: true }),
+    });
+    await user.click(await screen.findByRole("button", { name: "Roll back to this" }));
+    const dialog = await screen.findByRole("dialog", { name: "Roll back to deployment 20?" });
+    expect(within(dialog).getByText(/restored from backup app_20260920_101500.*A backup of the current state is taken first/)).toBeInTheDocument();
+  });
+
+  it("says why a deployment cannot be gone back to, and offers the other versions instead", async () => {
+    const { user } = await pageAt(
+      20,
+      {
+        [`GET /api/deployments/${String(FAILED.id)}`]: () =>
+          json(200, { ...FAILED, rollback_available: false, rollback_unavailable_reason: "Deployment 20 did not finish serving anything to go back to" }),
         [`GET /api/apps/${TAB_DOMAIN}/releases`]: () =>
           json(200, {
             domain: TAB_DOMAIN,
             items: [
-              {
-                id: "20260925-184247-2a8b7c4",
-                // A different release built from the very same commit: matching by commit would
-                // pick this one - the one serving - instead of the deploy's own.
-                commit: "a94c0e2",
-                created_at: "2026-09-25T18:42:47+00:00",
-                activated_at: "2026-09-25T18:43:30+00:00",
-                status: "active",
-                active: true,
-                on_disk: true,
-              },
-              {
-                id: "20260916-182823-a94c0e2",
-                commit: "a94c0e2",
-                created_at: "2026-09-16T18:28:23+00:00",
-                activated_at: null,
-                status: "superseded",
-                active: false,
-                on_disk: true,
-              },
+              { id: "20260925-184247-2a8b7c4", commit: "2a8b7c4", created_at: "2026-09-25T18:42:47+00:00", activated_at: "2026-09-25T18:43:30+00:00", status: "active", active: true, on_disk: true },
+              { id: "20260916-182823-9f2c41a", commit: "9f2c41a", created_at: "2026-09-16T18:28:23+00:00", activated_at: null, status: "superseded", active: false, on_disk: true },
             ],
             total: 2,
           }),
       },
       { layout: "releases" },
     );
-    expect(await screen.findByRole("button", { name: "Roll back to this" })).toBeInTheDocument();
+    expect(await screen.findByText("Can't roll back to this deployment: Deployment 20 did not finish serving anything to go back to.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Roll back to this" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Roll back…" }));
+    const chooser = await screen.findByRole("dialog", { name: `Roll back ${TAB_DOMAIN}` });
+    expect(await within(chooser).findByRole("radio", { name: /20260916-182823-9f2c41a/ })).toBeInTheDocument();
   });
 
-  it("offers a plain rollback when the deploy built no release still on disk", async () => {
+  it("says Health does not apply to a static site, instead of that it is missing from the log", async () => {
     await pageAt(
       20,
       {
-        [`GET /api/apps/${TAB_DOMAIN}/releases`]: () =>
+        [`GET /api/deployments/${String(FAILED.id)}`]: () => json(200, { ...FAILED, status: "success", error: null }),
+        [`GET /api/deployments/${String(FAILED.id)}/log`]: () =>
           json(200, {
-            domain: TAB_DOMAIN,
-            items: [
-              { id: "20260925-184247-2a8b7c4", commit: "2a8b7c4", created_at: "2026-09-25T18:42:47+00:00", activated_at: "2026-09-25T18:43:30+00:00", status: "active", active: true, on_disk: true },
-            ],
-            total: 1,
+            content: "[2026-09-25 18:00:00] [1/6] Fetching source code...\n[2026-09-25 18:00:03] [5/6] Activating release...\n[2026-09-25 18:00:10] Deployed\n",
+            truncated: false,
+            missing_reason: null,
           }),
       },
-      { layout: "releases" },
+      { status: "static", app_type: "static", port: null },
     );
-    expect(await screen.findByRole("button", { name: "Roll back" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Roll back to this" })).not.toBeInTheDocument();
+    await waitFor(() => {
+      expect(phaseStates()).toMatchObject({ activate: "done", health: "not_applicable" });
+    });
+    const phases = screen.getByRole("list", { name: "Deploy phases" });
+    const health = phases.querySelector<HTMLElement>('[data-phase="health"]');
+    if (health === null) throw new Error("no health phase");
+    expect(within(health).getByText("Not applicable")).toBeInTheDocument();
+    expect(within(health).queryByText("Not in the log")).not.toBeInTheDocument();
+    // Measured from the log alone: seven seconds, never an hour of time-zone offset.
+    expect(within(phases).getByText("7.0s")).toBeInTheDocument();
+    expect(screen.getByText(/Health does not apply: a static site is served as files/)).toBeInTheDocument();
   });
 
   it("says plainly when there is no such deployment", async () => {

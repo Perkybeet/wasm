@@ -19,7 +19,8 @@ import type { ConsoleServer, PageProblems } from "./fixtures";
  */
 const INSPECT_NEEDS_SUDO = /status of 403 .* \/api\/apps\/inspect$/;
 
-export type WizardSource = "storefront" | "landing";
+/** `container-api` holds a lone Dockerfile: no type matches it, and the verdict says why. */
+export type WizardSource = "storefront" | "landing" | "container-api";
 
 /** The absolute path of a seeded source on the server `page` is signed in to. */
 export async function wizardSource(page: Page, name: WizardSource): Promise<string> {

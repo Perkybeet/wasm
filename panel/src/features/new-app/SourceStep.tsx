@@ -1,4 +1,4 @@
-import { Archive, FolderGit2, FolderOpen, GitBranch, Search, X } from "lucide-react";
+import { Archive, FolderGit2, FolderOpen, GitBranch, Search, TriangleAlert, X } from "lucide-react";
 import type { ReactNode, Ref, SyntheticEvent } from "react";
 
 import { CommandHint } from "../../components/page/CommandHint";
@@ -10,6 +10,8 @@ import { Field } from "../../components/ui/Field";
 import { Input } from "../../components/ui/Input";
 import { Skeleton } from "../../components/ui/Skeleton";
 import { Spinner } from "../../components/ui/Spinner";
+import { SystemOutput } from "../../components/ui/SystemOutput";
+import { Suggestion } from "./Suggestion";
 import { SOURCE_WORDS, sourceKind } from "./wizard";
 import type { SourceErrors, SourceForm, SourceKind } from "./wizard";
 
@@ -53,6 +55,47 @@ function ReviewSkeleton() {
 
 const FETCH_HINT = "Check the address and that this server can reach it. A private repository needs a deploy key, or a token in the URL.";
 
+/** What the inspection is doing, said once: there is no streamed progress, so no steps are made up. */
+const READING: Readonly<Record<SourceKind, string>> = {
+  git: "Reading the repository",
+  archive: "Downloading and reading the archive",
+  local: "Reading the directory",
+  unknown: "Reading the source",
+};
+
+/** Codes of a source that was fetched and read, but is not something WASM deploys as it is. */
+const VERDICT_ERRORS: ReadonlySet<string> = new Set(["validationerror", "deploymenterror"]);
+
+/**
+ * The inspection's verdict on a source it could read but not classify: what it found (a lone
+ * Dockerfile, a Rust project, projects in subdirectories) as the backend said it, what would
+ * make it deployable - often a file to add, shown as one - and anything a tool printed,
+ * verbatim. The type can still be chosen by hand.
+ */
+function VerdictFailure({ failure, source, onManual }: { failure: { detail: string; hint: string | null; output: string | null }; source: string; onManual: () => void }) {
+  const title = `WASM cannot deploy ${source} as it is`;
+  return (
+    <div role="alert" className="flex min-w-0 flex-col gap-3 rounded-card border border-warn/40 bg-warn-soft/50 p-4">
+      <div className="flex items-start gap-2">
+        <TriangleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warn" />
+        <div className="flex min-w-0 flex-col gap-1">
+          <p className="text-13 font-medium text-fg">{title}</p>
+          <p className="text-13 text-pretty text-fg">{failure.detail}</p>
+        </div>
+      </div>
+      {failure.hint !== null ? <Suggestion text={failure.hint} className="pl-6" /> : null}
+      {failure.output !== null && failure.output.trim() !== "" ? (
+        <SystemOutput label={`${title}: the command's own output`} maxHeight="max-h-48" className="rounded-control border border-border bg-surface px-3 py-2">
+          {failure.output}
+        </SystemOutput>
+      ) : null}
+      <div className="pl-6">
+        <Button onClick={onManual}>Choose the type yourself</Button>
+      </div>
+    </div>
+  );
+}
+
 /**
  * Why the inspection failed. A source that could not be fetched is marked on its field, and
  * what the fetch printed (git's own words) is shown here verbatim. A source that was fetched
@@ -69,7 +112,10 @@ function InspectFailure({ failure, source, onManual }: { failure: unknown; sourc
     if (printed === null) return null;
     const fix = failure.output !== null ? (failure.hint ?? FETCH_HINT) : FETCH_HINT;
     block = <ErrorBlock live error={{ detail: printed }} title={`What fetching ${source} reported`} hint={fix} />;
+  } else if (isApiError(failure) && VERDICT_ERRORS.has(failure.error) && failure.status === 400) {
+    block = <VerdictFailure failure={failure} source={source} onManual={onManual} />;
   } else if (isApiError(failure) && failure.error === "deploymenterror") {
+    // An older backend answered an unclassified source 500 deploymenterror.
     block = (
       <>
         <ErrorBlock live error={failure} title={`WASM could not tell what ${source} is`} />
@@ -203,15 +249,22 @@ export function SourceStep({
 
       {busy ? (
         <div className="flex flex-col gap-3">
-          <p role="status" className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1 text-13 text-fg">
-            <Spinner size={14} className="text-warn" />
-            <span>{local ? "Copying" : kind === "archive" ? "Downloading" : "Cloning"}</span>
-            <code translate="no" className="min-w-0 truncate text-12 text-fg-muted" title={shown}>
-              {shown}
-            </code>
-            {!local && form.branch.trim() !== "" ? <span className="text-fg-muted">{`at ${form.branch.trim()}`}</span> : null}
-            <Elapsed since={inspecting.since} />
-          </p>
+          <div className="flex flex-col gap-1">
+            <p role="status" className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1 text-13 text-fg">
+              <Spinner size={14} className="text-warn" />
+              <span>{`${READING[kind]}…`}</span>
+              <code translate="no" className="min-w-0 truncate text-12 text-fg-muted" title={shown}>
+                {shown}
+              </code>
+              {!local && form.branch.trim() !== "" ? <span className="text-fg-muted">{`at ${form.branch.trim()}`}</span> : null}
+              <Elapsed since={inspecting.since} />
+            </p>
+            <p className="text-12 text-pretty text-fg-muted">
+              {local
+                ? "Only the files that say what the project is are read. Cancel stops it."
+                : "Only the files that say what the project is are fetched, not the whole history. Cancel stops it on the server too."}
+            </p>
+          </div>
           <ReviewSkeleton />
         </div>
       ) : failure !== null && failure !== undefined ? (

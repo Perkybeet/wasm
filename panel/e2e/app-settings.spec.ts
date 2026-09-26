@@ -141,6 +141,75 @@ test("limits are refused as the backend would, then saved with exactly what the 
   await expect(limits.getByRole("button", { name: "Restart now" })).toBeVisible();
 });
 
+test("the health check is refused on its field as the gate would, then saved, then put back to its defaults", async ({ page, consoleServer }) => {
+  await signIn(page, consoleServer, `/apps/${RELEASE_APP}/settings`);
+  const health = region(page, "Health check");
+  await expect(health.getByText("GET /", { exact: true })).toBeVisible();
+  await expect(health.getByText("(default)")).toHaveCount(3);
+
+  const path = health.getByRole("textbox", { name: "Path" });
+  await path.fill("https://example.com/health");
+  await health.getByRole("button", { name: "Save" }).click();
+  await expect(health.getByText(/A scheme or a host is not accepted/)).toBeVisible();
+  await expect(path).toHaveAttribute("aria-invalid", "true");
+  await expectNoA11yViolations(page, "a refused health check");
+
+  await path.fill("/healthz");
+  await health.getByRole("textbox", { name: "Accepted statuses" }).fill("200-399");
+  await health.getByRole("textbox", { name: "Timeout" }).fill("60");
+  const patched = page.waitForRequest((r) => r.url().endsWith(`/api/apps/${RELEASE_APP}/health`) && r.method() === "PATCH");
+  await health.getByRole("button", { name: "Save" }).click();
+  await confirmItsYou(page, consoleServer);
+  expect((await patched).postDataJSON()).toEqual({ path: "/healthz", expect: "200-399", timeout: 60 });
+  await expect(health.getByText(/^Saved\. The next activation requests/)).toBeVisible();
+  await expect(health.getByText("GET /healthz", { exact: true })).toBeVisible();
+  await expect(health.getByText("(default)")).toHaveCount(0);
+  const facts = (await (await page.request.get(`/api/apps/${RELEASE_APP}`)).json()) as { health_path: string | null; health_timeout: number | null };
+  expect(facts).toMatchObject({ health_path: "/healthz", health_timeout: 60 });
+
+  // Back to every default, so the worker's machine is as it was for the next test.
+  await health.getByRole("button", { name: "Use defaults" }).click();
+  const reset = page.waitForRequest((r) => r.url().endsWith(`/api/apps/${RELEASE_APP}/health`) && r.method() === "PATCH");
+  await health.getByRole("button", { name: "Save" }).click();
+  expect((await reset).postDataJSON()).toEqual({ path: null, expect: null, timeout: null });
+  await expect(health.getByText("(default)")).toHaveCount(3);
+});
+
+test("retention is saved at once and says what it removed; an in-place app has none", async ({ page, consoleServer }) => {
+  await signIn(page, consoleServer, `/apps/${RELEASE_APP}/settings`);
+  const retention = region(page, "Retention");
+  const keep = retention.getByRole("textbox", { name: "Keep" });
+  const before = (await factsOf(page, RELEASE_APP)).keep_releases;
+  await expect(keep).toHaveValue(String(before));
+
+  await keep.fill("0");
+  await retention.getByRole("button", { name: "Save" }).click();
+  await expect(retention.getByText("Keep from 1 to 50 releases.")).toBeVisible();
+
+  // More than it has: nothing to remove, and nothing lost for the tests after this one.
+  await keep.fill(String(before + 3));
+  const patched = page.waitForRequest((r) => r.url().endsWith(`/api/apps/${RELEASE_APP}/releases/retention`) && r.method() === "PATCH");
+  await retention.getByRole("button", { name: "Save" }).click();
+  await confirmItsYou(page, consoleServer);
+  expect((await patched).postDataJSON()).toEqual({ keep: before + 3 });
+  await expect(retention.getByText(`Saved. It keeps ${String(before + 3)} releases; nothing was removed.`)).toBeVisible();
+  await expectNoA11yViolations(page, "a saved retention");
+  await keep.fill(String(before));
+  await retention.getByRole("button", { name: "Save" }).click();
+  await expect(retention.getByText(`Saved. It keeps ${String(before)} releases; nothing was removed.`)).toBeVisible();
+
+  await page.goto(`/apps/${IN_PLACE_APP}/settings`);
+  await expect(region(page, "Health check")).toBeVisible();
+  await expect(region(page, "Retention")).toHaveCount(0);
+});
+
+test("a static site's health check is its files: nothing to configure", async ({ page, consoleServer }) => {
+  await signIn(page, consoleServer, "/apps/bodas.arennalabs.com/settings");
+  const releases = region(page, "Releases");
+  await expect(releases.getByText(/A static site is served as files by the web server/)).toBeVisible();
+  await expect(releases.getByRole("textbox", { name: "Path" })).toHaveCount(0);
+});
+
 test("an in-place app moves to releases after its plan is read and confirmed", async ({ page, consoleServer, problems }, testInfo) => {
   const domain = testInfo.project.name === "dark" ? "docs.cittek.es" : "blog.cittek.es";
   // The migration finishing invalidates the app's whole query prefix, migration-plan included

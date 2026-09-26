@@ -1,15 +1,13 @@
 import { useQuery } from "@tanstack/react-query";
-import { Link, useNavigate } from "@tanstack/react-router";
-import { ChevronLeft, CircleArrowUp, FileX, History } from "lucide-react";
-import { useEffect, useState } from "react";
+import { Link } from "@tanstack/react-router";
+import { ChevronLeft, FileX } from "lucide-react";
+import { useState } from "react";
 import type { ReactNode } from "react";
 
 import { isApiError } from "../../../api/client";
-import { appQuery, releasesQuery } from "../../../api/queries/apps";
-import type { Release } from "../../../api/queries/apps";
-import { deploymentLogQuery, deploymentQuery, deploymentsQuery } from "../../../api/queries/deployments";
+import { appQuery } from "../../../api/queries/apps";
+import { deploymentLogQuery, deploymentQuery } from "../../../api/queries/deployments";
 import type { Deployment } from "../../../api/queries/deployments";
-import { isJobFinished, jobQuery } from "../../../api/queries/jobs";
 import { useDocumentTitle } from "../../../app/documentTitle";
 import { DeployStatePill } from "../../../components/page/AppStatePill";
 import { useNow } from "../../../components/page/clock";
@@ -25,11 +23,11 @@ import type { LogLine } from "../../../components/ui/LogViewer";
 import { Skeleton } from "../../../components/ui/Skeleton";
 import { StatusPill } from "../../../components/ui/StatusPill";
 import { formatBytes, formatDuration, parseTimestamp } from "../../../lib/format";
-import { useAppActions } from "../../apps/useAppActions";
-import { RollbackDialog } from "../RollbackDialog";
-import { buildLogEvents, jobEvents, mergeEvents, useLogLines } from "./buildLog";
+import { hasUnit } from "../../apps/AppRowActions";
+import { buildLogEvents, jobEvents, logClockText, logSpan, mergeEvents, useLogLines } from "./buildLog";
+import { DeploymentActions } from "./DeploymentActions";
 import { PhaseTimeline } from "./PhaseTimeline";
-import { currentPhase, outcomeOf, timeline } from "./phases";
+import { currentPhase, logClockOffset, outcomeOf, timeline } from "./phases";
 import type { PhaseKey, PhaseView } from "./phases";
 import { useDeploymentJob } from "./useDeploymentJob";
 import { shortCommit, triggerWords } from "./words";
@@ -133,100 +131,6 @@ function Facts({ deployment }: { deployment: Deployment }) {
         <Elapsed deployment={deployment} />
       </Fact>
     </dl>
-  );
-}
-
-/**
- * Queues an update of the app and, once the deploy it queued has written its own deployment
- * row - found by the job's id, its `job_id`, never by timing - opens it: the operator lands on
- * the new build log, not on a list to find it in.
- */
-function useRedeploy(domain: string) {
-  const navigate = useNavigate();
-  const [waiting, setWaiting] = useState<{ jobId: string } | null>(null);
-  const deployments = useQuery({
-    ...deploymentsQuery({ domain, limit: 10 }),
-    refetchInterval: waiting === null ? false : 1_000,
-  });
-  const job = useQuery({ ...jobQuery(waiting?.jobId ?? ""), enabled: waiting !== null });
-  const { update } = useAppActions(domain, {
-    onJobQueued: (queued) => {
-      setWaiting({ jobId: queued.id });
-    },
-  });
-
-  const arrived = waiting !== null ? deployments.data?.items.find((item) => item.job_id === waiting.jobId) : undefined;
-  const failed = waiting !== null && job.data?.status === "failed" ? job.data : null;
-  // The job ended without ever writing a deployment we can find: recording it must have failed.
-  const stuck = waiting !== null && arrived === undefined && failed === null && job.data !== undefined && isJobFinished(job.data);
-
-  useEffect(() => {
-    if (arrived !== undefined) void navigate({ to: "/apps/$domain/deployments/$id", params: { domain, id: String(arrived.id) } });
-  }, [arrived, domain, navigate]);
-
-  return {
-    start: () => {
-      update.mutate();
-    },
-    busy: update.isPending || (waiting !== null && arrived === undefined && failed === null && !stuck),
-    failed,
-    timedOut: stuck,
-  };
-}
-
-/** Rolling back from a deploy's page: to its own release when it is on disk, otherwise a choice. */
-function RollbackAction({ domain, deployment, layout }: { domain: string; deployment: Deployment; layout: string }) {
-  const [open, setOpen] = useState(false);
-  const releases = useQuery({ ...releasesQuery(domain), enabled: layout === "releases" });
-  const own: Release | undefined = releases.data?.items.find(
-    (release) => !release.active && release.on_disk && deployment.release_id !== null && release.id === deployment.release_id,
-  );
-  const serving = releases.data?.items.find((release) => release.active);
-  const ownIsServing = serving !== undefined && deployment.release_id !== null && serving.id === deployment.release_id;
-  return (
-    <>
-      <Button icon={<History aria-hidden="true" />} onClick={() => setOpen(true)}>
-        {own !== undefined && !ownIsServing ? "Roll back to this" : "Roll back"}
-      </Button>
-      <RollbackDialog
-        domain={domain}
-        layout={layout}
-        open={open}
-        onOpenChange={setOpen}
-        preselect={own?.id ?? null}
-      />
-    </>
-  );
-}
-
-function Actions({ domain, deployment }: { domain: string; deployment: Deployment }) {
-  const app = useQuery(appQuery(domain));
-  const redeploy = useRedeploy(domain);
-  const running = RUNNING.has(deployment.status);
-  return (
-    <div className="flex flex-col items-end gap-2">
-      <div className="flex flex-wrap items-center gap-2">
-        {app.data && !running ? <RollbackAction domain={domain} deployment={deployment} layout={app.data.layout} /> : null}
-        {/* Secondary: the header's Update is the page's one primary action. */}
-        <Button
-          icon={<CircleArrowUp aria-hidden="true" />}
-          loading={redeploy.busy}
-          disabled={running}
-          onClick={redeploy.start}
-        >
-          Redeploy
-        </Button>
-      </div>
-      {redeploy.failed ? (
-        <p role="alert" className="max-w-md text-right text-12 text-fail">
-          {`The redeploy failed before it started: ${redeploy.failed.error ?? "no reason was given"}`}
-        </p>
-      ) : redeploy.timedOut ? (
-        <p role="status" className="max-w-md text-right text-12 text-fg-muted">
-          The update was queued but no deploy has been recorded yet. It will appear under Deployments.
-        </p>
-      ) : null}
-    </div>
   );
 }
 
@@ -358,10 +262,19 @@ function Deploy({ domain, deployment }: { domain: string; deployment: Deployment
   const outcome = outcomeOf(deployment.status);
   const { log, lines, setTail } = useBuildLog(deployment);
   const job = useDeploymentJob(deployment);
+  const app = useQuery(appQuery(domain));
   const now = useNow(() => (running ? 1_000 : 3_600_000));
+  // A static site is served as files: nothing answers a health check, so it has none.
+  const staticSite = app.data !== undefined && !hasUnit(app.data);
 
   const events = mergeEvents(buildLogEvents(lines), jobEvents(job.entries));
-  const phases = timeline(events, outcome, parseTimestamp(deployment.finished_at), new Date(now));
+  const span = logSpan([...lines.map((line) => line.at), ...job.entries.map((entry) => entry.at)]);
+  const phases = timeline(
+    events,
+    outcome,
+    { lastAt: span.last, now: new Date(now), offset: logClockOffset(span.first, parseTimestamp(deployment.started_at)) },
+    { checksHealth: !staticSite },
+  );
   const current = currentPhase(phases);
 
   // Phase changes, and how it ended, are said once each; log lines never.
@@ -374,7 +287,7 @@ function Deploy({ domain, deployment }: { domain: string; deployment: Deployment
   const fallback: LogLine[] = job.entries.map((entry, index) => ({
     id: index,
     text: entry.text,
-    ...(entry.at ? { ts: entry.at.toTimeString().slice(0, 8) } : {}),
+    ...(entry.at ? { ts: logClockText(entry.at) } : {}),
   }));
   const failure = outcome === "failed" ? failureWords(current) : null;
 
@@ -388,7 +301,7 @@ function Deploy({ domain, deployment }: { domain: string; deployment: Deployment
             <DeployStatePill status={deployment.status} />
             {job.socket === "reconnecting" ? <StatusPill state="deploying" label="Reconnecting" appearance="inline" size="sm" /> : null}
           </div>
-          <Actions domain={domain} deployment={deployment} />
+          <DeploymentActions domain={domain} deployment={deployment} />
         </div>
       </div>
 
@@ -396,6 +309,11 @@ function Deploy({ domain, deployment }: { domain: string; deployment: Deployment
 
       <div className="rounded-card border border-border bg-surface px-3 py-5 shadow-raised sm:px-6">
         <PhaseTimeline phases={phases} outcome={outcome} />
+        {staticSite ? (
+          <p className="mt-4 border-t border-border pt-3 text-center text-12 text-pretty text-fg-muted">
+            Health does not apply: a static site is served as files by the web server, with no process of its own to probe.
+          </p>
+        ) : null}
       </div>
 
       {failure !== null ? (

@@ -15,6 +15,7 @@ import { BackupsTable } from "./BackupsTable";
 import { CreateBackupDialog } from "./CreateBackupDialog";
 import { backupDomains, filterBackups, isFiltered } from "./filters";
 import type { BackupsSearch } from "./filters";
+import { MisplacedBackupsNotice } from "./MisplacedBackupsNotice";
 import { SchedulesSection } from "./SchedulesSection";
 import { StorageUsageBar } from "./StorageUsageBar";
 import { useBackupRefresh } from "./useBackupRefresh";
@@ -70,6 +71,7 @@ export function BackupsPage({ search, onSearchChange }: BackupsPageProps) {
       />
       <div className="flex flex-col gap-8">
         <StorageUsageBar />
+        <MisplacedBackupsNotice />
 
         <Section title="Backups">
           {backups.isError && backups.data === undefined ? (

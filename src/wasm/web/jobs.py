@@ -71,6 +71,25 @@ _RECORDING_ERRORS: tuple[type[Exception], ...] = (WASMError, OSError, sqlite3.Er
 INTERRUPTED_REASON = "Interrupted by a panel restart"
 
 
+def _error_text(exc: BaseException) -> str:
+    """
+    Render a failure for a job's ``error``, keeping a tool's own output.
+
+    ``str()`` of a :class:`WASMError` carries its message and fix but not its
+    ``output``: certbot's or nginx's own words, which the job page shows
+    verbatim under the diagnosis and which a job otherwise lost.
+
+    Args:
+        exc: The failure.
+
+    Returns:
+        The message, then the fix, then the tool's output, as present.
+    """
+    if isinstance(exc, WASMError) and exc.output:
+        return f"{exc}\n\n{exc.output.rstrip()}"
+    return str(exc)
+
+
 class JobStatus(str, Enum):
     """Job execution status."""
 
@@ -461,7 +480,7 @@ class JobManager:
                 job.scrubber.add(app_secret_values(domain))
             self._log_failure(job, exc)
             job.status = JobStatus.FAILED
-            job.error = job.scrubber.scrub(str(exc))
+            job.error = job.scrubber.scrub(_error_text(exc))
             job.add_log(f"Job failed: {exc}", "error")
         finally:
             job.completed_at = datetime.now()

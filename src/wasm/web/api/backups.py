@@ -19,6 +19,8 @@ things changed:
 
 from __future__ import annotations
 
+import shutil
+from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -105,6 +107,10 @@ class BackupStorageResponse(BaseModel):
         misplaced: Backups found elsewhere - in the old default directory, or
             where an empty ``backup.directory`` sent them - each with the
             ``wasm backup import`` command that moves them into ``path``.
+        filesystem_total: Size in bytes of the filesystem ``path`` is on, or
+            None when it could not be read.
+        filesystem_free: Bytes free on that filesystem, or None when it
+            could not be read.
     """
 
     path: str
@@ -113,6 +119,8 @@ class BackupStorageResponse(BaseModel):
     backup_count: int
     domains: list[str]
     misplaced: list[MisplacedBackupsInfo] = Field(default_factory=list)
+    filesystem_total: int | None = None
+    filesystem_free: int | None = None
 
 
 class CreateBackupRequest(BaseModel):
@@ -181,6 +189,33 @@ def _human_size(size: int) -> str:
         if size >= threshold:
             return f"{size / threshold:.2f} {unit}"
     return f"{size} B"
+
+
+def _filesystem_usage(directory: Path) -> tuple[int, int] | None:
+    """
+    Measure the filesystem a backup directory is on.
+
+    The console compared the backups with the machine's root disk, which is
+    not where they are when the backup directory is a mount of its own. A
+    directory that does not exist yet (no backup taken so far) is measured at
+    its nearest existing parent: that is where the first backup will land.
+
+    Args:
+        directory: The configured backup directory.
+
+    Returns:
+        The filesystem's total and free bytes, or None when neither the
+        directory nor any parent of it can be read.
+    """
+    for candidate in (directory, *directory.parents):
+        try:
+            if not candidate.exists():
+                continue
+            usage = shutil.disk_usage(candidate)
+        except OSError:
+            return None
+        return usage.total, usage.free
+    return None
 
 
 def _to_backup_info(backup: BackupMetadata) -> BackupInfo:
@@ -274,11 +309,12 @@ def get_storage_info(
         session: The authenticated session.
 
     Returns:
-        Totals and the applications that own them.
+        Totals, the applications that own them, and the filesystem they are on.
     """
     manager = BackupManager(verbose=False)
     usage = manager.get_storage_usage()
     total_size = int(usage["total_size_bytes"])
+    filesystem = _filesystem_usage(Path(manager.backup_dir))
 
     return BackupStorageResponse(
         path=str(manager.backup_dir),
@@ -292,6 +328,8 @@ def get_storage_info(
             )
             for found in manager.find_misplaced_backups()
         ],
+        filesystem_total=filesystem[0] if filesystem else None,
+        filesystem_free=filesystem[1] if filesystem else None,
     )
 
 

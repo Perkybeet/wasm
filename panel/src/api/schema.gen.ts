@@ -1745,7 +1745,7 @@ export interface paths {
          *         session: The authenticated session.
          *
          *     Returns:
-         *         Totals and the applications that own them.
+         *         Totals, the applications that own them, and the filesystem they are on.
          */
         get: operations["get_storage_info_api_backups_storage_get"];
         put?: never;
@@ -5951,12 +5951,20 @@ export interface components {
          *         misplaced: Backups found elsewhere - in the old default directory, or
          *             where an empty ``backup.directory`` sent them - each with the
          *             ``wasm backup import`` command that moves them into ``path``.
+         *         filesystem_total: Size in bytes of the filesystem ``path`` is on, or
+         *             None when it could not be read.
+         *         filesystem_free: Bytes free on that filesystem, or None when it
+         *             could not be read.
          */
         BackupStorageResponse: {
             /** Backup Count */
             backup_count: number;
             /** Domains */
             domains: string[];
+            /** Filesystem Free */
+            filesystem_free?: number | null;
+            /** Filesystem Total */
+            filesystem_total?: number | null;
             /** Misplaced */
             misplaced?: components["schemas"]["MisplacedBackupsInfo"][];
             /** Path */

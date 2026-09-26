@@ -10,9 +10,19 @@ export type DomainsTab = "certificates" | "sites";
 
 export interface DomainsSearch {
   tab?: DomainsTab;
+  /**
+   * What the certificates are filtered by when the page opens: a link from a health report or
+   * an alert about one certificate lands on that certificate alone.
+   */
+  q?: string;
 }
 
-/** The page's search params: the open tab, certificates unless the URL says sites. */
+/** The page's search params: the open tab (certificates unless the URL says sites) and the certificates' filter. */
 export function validateDomainsSearch(search: Record<string, unknown>): DomainsSearch {
-  return search["tab"] === "sites" ? { tab: "sites" } : search["tab"] === "certificates" ? { tab: "certificates" } : {};
+  const tab = search["tab"];
+  const q = search["q"];
+  return {
+    ...(tab === "sites" || tab === "certificates" ? { tab } : {}),
+    ...(typeof q === "string" && q.trim() !== "" ? { q: q.trim() } : {}),
+  };
 }

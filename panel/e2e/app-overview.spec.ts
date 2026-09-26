@@ -62,7 +62,7 @@ test("Update queues a job; the header follows it over the event stream to its en
 
   const queued = page.waitForRequest((request) => request.url().endsWith("/api/jobs/update") && request.method() === "POST");
   await header(page).getByRole("button", { name: "Update" }).click();
-  expect((await queued).postDataJSON()).toEqual({ domain: DOMAIN });
+  expect((await queued).postDataJSON()).toEqual({ domain: DOMAIN, force: false });
 
   // The sandbox has no checkout to update, so the job fails; the header keeps the failure,
   // in the updater's own words, until it is dismissed.
@@ -95,6 +95,52 @@ test("Update queues a job; the header follows it over the event stream to its en
   await expectNoA11yViolations(page, "a failed update in the header");
   await page.getByRole("button", { name: "Dismiss", exact: true }).click();
   await expect(failure).toBeHidden();
+});
+
+/** Seeded on releases with a remote whose main is the commit that is live (console_server.py). */
+const NOTHING_NEW_APP = "catalogo.cittek.es";
+
+/** The CSRF header every write through `page.request` carries, mirrored from its cookie. */
+async function csrf(page: Page): Promise<Record<string, string>> {
+  const cookie = (await page.context().cookies()).find((entry) => entry.name === "wasm_csrf");
+  return cookie ? { "X-WASM-CSRF": cookie.value } : {};
+}
+
+test("Update with nothing new asks, in the backend's words, and rebuilds only when told", async ({ page, consoleServer, problems }) => {
+  // Chromium logs the 409 that asks the question as a failed resource.
+  problems.expect(/status of 409 .* \/api\/jobs\/update$/);
+  await signIn(page, consoleServer, `/apps/${NOTHING_NEW_APP}`);
+  const releases = (await (await page.request.get(`/api/apps/${NOTHING_NEW_APP}/releases`)).json()) as { items: { id: string; active: boolean }[] };
+  const live = releases.items.find((release) => release.active)?.id ?? "";
+  const dialog = page.getByRole("dialog", { name: `Nothing new to deploy to ${NOTHING_NEW_APP}` });
+
+  // Cancelled: nothing is queued.
+  await header(page).getByRole("button", { name: "Update" }).click();
+  await expect(dialog.getByText("No new commits on main since 6d1e0b2, which is live")).toBeVisible();
+  await expect(dialog.getByText(/Rebuilding the same commit still makes sense when the environment or the dependencies changed/)).toBeVisible();
+  await settle(page);
+  await expectNoA11yViolations(page, "the nothing-new question");
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(dialog).toBeHidden();
+  expect(((await (await page.request.get("/api/jobs/active")).json()) as { jobs: { metadata?: { domain?: string } }[] }).jobs.some((job) => job.metadata?.domain === NOTHING_NEW_APP)).toBe(false);
+
+  // Rebuilt anyway: the same request, forced, and the header follows the job.
+  await header(page).getByRole("button", { name: "Update" }).click();
+  const forced = page.waitForRequest((request) => request.url().endsWith("/api/jobs/update") && request.method() === "POST" && (request.postDataJSON() as { force?: boolean }).force === true);
+  await dialog.getByRole("button", { name: "Rebuild anyway" }).click();
+  expect((await forced).postDataJSON()).toEqual({ domain: NOTHING_NEW_APP, force: true });
+  await expect(dialog).toBeHidden();
+  await expect
+    .poll(async () => {
+      const active = (await (await page.request.get("/api/jobs/active")).json()) as { jobs: { metadata?: { domain?: string } }[] };
+      return active.jobs.some((job) => job.metadata?.domain === NOTHING_NEW_APP);
+    }, { timeout: 60_000, intervals: [500] })
+    .toBe(false);
+
+  // The rebuild activated a release of its own; the seeded one goes back in service, so the
+  // branch head is the live commit again for the next test in this worker.
+  const restored = await page.request.post(`/api/apps/${NOTHING_NEW_APP}/releases/${live}/activate`, { headers: await csrf(page) });
+  expect(restored.ok(), await restored.text()).toBe(true);
 });
 
 test("Stop asks first; the header follows the unit down and back up", async ({ page, consoleServer }) => {

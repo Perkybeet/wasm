@@ -1,6 +1,5 @@
 # Copyright (c) 2024-2025 Yago López Prado
-# Licensed under WASM-NCSAL 1.0 (Commercial use prohibited)
-# https://github.com/Perkybeet/wasm/blob/main/LICENSE
+# SPDX-License-Identifier: AGPL-3.0-or-later
 
 """
 SQLite persistence layer for WASM.
@@ -27,7 +26,7 @@ import os
 import sqlite3
 import stat
 import threading
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -1678,10 +1677,20 @@ class WASMStore:
             check_health_timeout,
         )
 
+        def checked(field: str, check: Callable[[Any], Any], value: Any) -> Any:
+            if value is None:
+                return None
+            try:
+                return check(value)
+            except ValidationError as exc:
+                # Named so the API can put the refusal next to its input.
+                exc.field = field
+                raise
+
         values = (
-            None if path is None else check_health_path(path),
-            None if expect is None else check_health_expect(expect),
-            None if timeout is None else check_health_timeout(timeout),
+            checked("path", check_health_path, path),
+            checked("expect", check_health_expect, expect),
+            checked("timeout", check_health_timeout, timeout),
         )
         with self._transaction() as cursor:
             cursor.execute(

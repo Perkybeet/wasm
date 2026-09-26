@@ -19,9 +19,12 @@ import { Dialog } from "../../../components/ui/Dialog";
 import { Skeleton } from "../../../components/ui/Skeleton";
 import { toast } from "../../../components/ui/toast";
 import { formatBytes, formatCount } from "../../../lib/format";
+import { hasUnit } from "../../apps/AppRowActions";
 import { reportActionError } from "../../apps/useAppActions";
 import { useConfirmItsYou } from "../useDeleteApp";
+import { HealthCheckForm, StaticHealthNote } from "./HealthCheckForm";
 import { MigrationPlanView } from "./MigrationPlanView";
+import { RetentionForm } from "./RetentionForm";
 import { LINK, PANEL } from "./panel";
 
 /**
@@ -303,8 +306,9 @@ function MigrationCard({ app, onMigrated }: { app: App; onMigrated: (result: Mig
 }
 
 /**
- * How the app's deploys are laid out on disk: for an app on releases, the release serving and
- * how many are kept to go back to; for one still in place, the way onto releases.
+ * How the app's deploys are laid out on disk and what lets a new version serve: for an app on
+ * releases, the release serving, how many are kept to go back to and the retention; for one
+ * still in place, the way onto releases. Either way, the health check every activation passes.
  */
 export function ReleasesSection({ app }: { app: App }) {
   const [migrated, setMigrated] = useState<MigrationSummary | null>(null);
@@ -333,6 +337,8 @@ export function ReleasesSection({ app }: { app: App }) {
           </Link>
         </div>
       ) : null}
+      {onReleases ? <RetentionForm app={app} /> : null}
+      {hasUnit(app) ? <HealthCheckForm app={app} /> : <StaticHealthNote />}
     </Section>
   );
 }

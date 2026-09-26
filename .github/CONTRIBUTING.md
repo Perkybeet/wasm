@@ -8,16 +8,16 @@ WASM is a robust Python CLI tool for managing web applications, sites, services,
 
 ## 📜 License Notice
 
-**Important:** This project is licensed under the **WASM Non-Commercial Source-Available License (WASM-NCSAL)**. By contributing to this project, you agree that:
+WASM is licensed under the **GNU Affero General Public License, version 3 or later** (from
+2.1.0). By contributing, you agree that:
 
-1. Your contributions will be licensed under the same WASM-NCSAL license
-2. You have the right to submit the contribution
-3. You grant the author (Yago López Prado) a perpetual, irrevocable, sublicensable license to use, modify, and commercialize your contributions
-4. The author can include your contributions in commercial versions of the Software
+1. Your contribution is licensed under the AGPL-3.0-or-later, like the rest of the project.
+2. You have the right to submit it.
+3. You also grant the author (Yago López Prado) a perpetual, irrevocable licence to use your
+   contribution under other terms as well. This keeps it possible to offer WASM under a
+   separate commercial licence to those who need one, alongside the AGPL, which stays.
 
-**Commercial Use:** If you intend to use WASM commercially, please contact:
-- 📧 Email: yago.lopez.adeje@gmail.com | hello@bitbeet.dev  
-- 📱 Phone: +34 637 881 066
+For a licence on other terms, write to yago.lopez.adeje@gmail.com.
 
 ## 🏗️ Architecture
 

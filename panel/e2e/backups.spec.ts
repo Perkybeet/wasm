@@ -5,7 +5,8 @@
  * fixture.
  */
 
-import { expect, expectNoA11yViolations, settle, signIn, test, toasts } from "./fixtures";
+import { expect, expectNoA11yViolations, settle, signIn, startConsoleServer, test, toasts } from "./fixtures";
+import type { ConsoleServer } from "./fixtures";
 
 function rows(page: import("@playwright/test").Page) {
   return page.getByRole("region", { name: "Backups" }).getByRole("row").filter({ hasNot: page.getByRole("columnheader") });
@@ -149,10 +150,56 @@ test("verifying a backup updates its row with the result", async ({ page, consol
 
 test("the storage bar and schedules read from the API", async ({ page, consoleServer }) => {
   await signIn(page, consoleServer, "/backups");
-  await expect(page.getByText(/^\d+(\.\d+)? (B|KB|MB|GB)$/).first()).toBeVisible();
+  // The disk the backup directory is on, used and free - not the machine's root disk.
+  const storage = (await (await page.request.get("/api/backups/storage")).json()) as {
+    path: string;
+    filesystem_total: number | null;
+    filesystem_free: number | null;
+  };
+  expect(storage.filesystem_total, "the sandbox's backup directory is on a readable filesystem").toBeGreaterThan(0);
+  expect(storage.filesystem_free).not.toBeNull();
+  const meter = page.getByRole("meter", { name: "Disk holding the backups" });
+  await expect(meter).toHaveAttribute("aria-valuetext", /^[\d.]+ (B|KB|MB|GB|TB) used, [\d.]+ (B|KB|MB|GB|TB) free of [\d.]+ (B|KB|MB|GB|TB)$/);
+  await expect(page.getByText(/^[\d.]+ (B|KB|MB) in \d+ backups? of \d+ applications?, kept at/)).toContainText(storage.path);
+  // Nothing is outside the backup directory on the seeded machine, so there is no notice.
+  await expect(page.getByRole("region", { name: /outside the backup directory/ })).toHaveCount(0);
 
   const schedules = page.getByRole("region", { name: "Schedules" });
   await expect(schedules).toBeVisible();
   await settle(page);
   await expectNoA11yViolations(page, "the schedules section");
+});
+
+const withMisplacedBackups = test.extend<object, { consoleServer: ConsoleServer }>({
+  consoleServer: [
+    // eslint-disable-next-line no-empty-pattern -- Playwright requires the destructuring form
+    async ({}, use) => {
+      const server = await startConsoleServer(["--misplaced-backups"]);
+      try {
+        await use(server);
+      } finally {
+        await server.stop();
+      }
+    },
+    { scope: "worker", timeout: 75_000 },
+  ],
+});
+
+withMisplacedBackups("backups outside the backup directory are named, with the command that imports them", async ({ page, consoleServer }) => {
+  await signIn(page, consoleServer, "/backups");
+  const storage = (await (await page.request.get("/api/backups/storage")).json()) as {
+    misplaced: { directory: string; count: number; command: string }[];
+  };
+  expect(storage.misplaced).toHaveLength(1);
+  const [found] = storage.misplaced;
+  if (found === undefined) throw new Error("no misplaced backups seeded");
+
+  const notice = page.getByRole("region", { name: `${String(found.count)} backups are outside the backup directory` });
+  await expect(notice).toBeVisible();
+  await expect(notice.getByText(`${String(found.count)} backups in ${found.directory}`)).toBeVisible();
+  expect(found.command).toBe(`wasm backup import ${found.directory}`);
+  await expect(notice.locator("code").filter({ hasText: found.command })).toBeVisible();
+  await expect(notice.getByText(/--dry-run\s*to the command to see what would move first/)).toBeVisible();
+  await settle(page);
+  await expectNoA11yViolations(page, "the misplaced backups notice");
 });

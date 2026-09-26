@@ -8,13 +8,50 @@
 import { useState } from "react";
 
 import type { LogLine } from "../../../components/ui/LogViewer";
-import { parseTimestamp } from "../../../lib/format";
 import type { PhaseEvent } from "./phases";
 import { phaseOf, stepOf } from "./phases";
 
 export interface BuildLogLine extends LogLine {
-  /** When it was written, when the log says. */
+  /** When it was written, on the logs' clock (see logClock), when the log says. */
   at: Date | null;
+}
+
+const WALL = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.(\d+))?/;
+
+/**
+ * A time a log wrote, on the logs' clock: the server's wall clock, read as if it were UTC.
+ *
+ * Both logs stamp the server's local time with no zone (`datetime.now()`), and the browser
+ * does not know the server's zone, so reading them as the browser's local time placed them
+ * wherever the operator happened to be. Read as UTC they keep exactly the differences between
+ * them, which is all a phase's duration needs; `logClockOffset` (phases.ts) places them in
+ * time when the present is needed. Any zone suffix is ignored: the digits are what the server's
+ * clock said, like every other line of the same log.
+ */
+export function logClock(text: string): Date | null {
+  const match = WALL.exec(text.trim());
+  if (!match) return null;
+  const [, date, time, fraction] = match;
+  const millis = fraction === undefined ? "" : `.${fraction.slice(0, 3).padEnd(3, "0")}`;
+  const parsed = new Date(`${date ?? ""}T${time ?? ""}${millis}Z`);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+/** "21:53:39": a time on the logs' clock as the server wrote it. */
+export function logClockText(at: Date): string {
+  return at.toISOString().slice(11, 19);
+}
+
+/** The earliest and the latest of some log times, ignoring the lines that had none. */
+export function logSpan(times: Iterable<Date | null>): { first: Date | null; last: Date | null } {
+  let first: Date | null = null;
+  let last: Date | null = null;
+  for (const at of times) {
+    if (at === null) continue;
+    if (first === null || at < first) first = at;
+    if (last === null || at > last) last = at;
+  }
+  return { first, last };
 }
 
 const STAMP = /^\[(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})\] ?(.*)$/;
@@ -54,7 +91,7 @@ export function parseLine(raw: string, id: number): BuildLogLine {
   const stamped = STAMP.exec(raw);
   if (!stamped) return { id, text: raw, at: null, ...optionalLevel(levelOf(raw)) };
   const [, date, time, rest = ""] = stamped;
-  const at = parseTimestamp(`${date ?? ""}T${time ?? ""}`);
+  const at = logClock(`${date ?? ""}T${time ?? ""}`);
   const job = JOB_LEVEL.exec(rest);
   if (job) {
     const text = job[2] ?? "";

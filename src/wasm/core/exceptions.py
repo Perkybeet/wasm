@@ -13,7 +13,14 @@ class WASMError(Exception):
     All custom exceptions should inherit from this class.
     """
 
-    def __init__(self, message: str, details: str = "", *, output: str | None = None):
+    def __init__(
+        self,
+        message: str,
+        details: str = "",
+        *,
+        output: str | None = None,
+        field: str | None = None,
+    ):
         """
         Args:
             message: The bare, human-readable sentence describing the failure.
@@ -22,10 +29,14 @@ class WASMError(Exception):
                 wants it carried as a field of its own rather than folded into
                 ``details``. None for an error that has no external tool
                 output to show, which is most of them.
+            field: The request field the error is about, when there is one, so
+                the API can put it next to that input (``fields`` in its error
+                body) instead of a client guessing from the message.
         """
         self.message = message
         self.details = details
         self.output = output
+        self.field = field
         super().__init__(self.message)
 
     def __str__(self) -> str:

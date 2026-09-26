@@ -10,6 +10,8 @@ import { SitesTab } from "./SitesTab";
 
 export interface DomainsPageProps {
   tab: DomainsTab;
+  /** The certificates' filter as the page opens with it. */
+  filter?: string;
   onTabChange: (tab: DomainsTab) => void;
 }
 
@@ -17,7 +19,7 @@ export interface DomainsPageProps {
  * Certificates and web server sites, machine-wide, as two tabs whose choice is the URL.
  * An application's own names are managed from its Domains tab; this is every name on the box.
  */
-export function DomainsPage({ tab, onTabChange }: DomainsPageProps) {
+export function DomainsPage({ tab, filter, onTabChange }: DomainsPageProps) {
   const certs = useQuery(certsQuery());
   const sites = useQuery(sitesQuery());
   return (
@@ -38,7 +40,8 @@ export function DomainsPage({ tab, onTabChange }: DomainsPageProps) {
         {/* The tab names the panel for sight; the heading gives it a place in the outline. */}
         <TabPanel value="certificates">
           <h2 className="sr-only">Certificates</h2>
-          <CertificatesTab />
+          {/* Keyed by the filter, so following another link to this page starts from that one. */}
+          <CertificatesTab key={filter ?? ""} {...(filter !== undefined ? { initialFilter: filter } : {})} />
         </TabPanel>
         <TabPanel value="sites">
           <h2 className="sr-only">Sites</h2>

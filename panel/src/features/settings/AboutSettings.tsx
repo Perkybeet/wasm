@@ -23,7 +23,7 @@ const LINKS: readonly { label: string; href: string; description: string }[] = [
   { label: "Documentation", href: `${REPOSITORY}#readme`, description: "Installing, deploying and every command." },
   { label: "Release notes", href: `${REPOSITORY}/releases`, description: "What changed in each version." },
   { label: "Report a problem", href: `${REPOSITORY}/issues`, description: "Include the output of wasm health." },
-  { label: "License", href: `${REPOSITORY}/blob/main/LICENSE`, description: "WASM-NCSAL 1.0. Commercial use is not permitted." },
+  { label: "License", href: `${REPOSITORY}/blob/main/LICENSE`, description: "GNU AGPL 3.0 or later: free to use, study and change, commercially too; a modified version offered to others as a service must publish its source." },
 ];
 
 /** What the console does, and the command that does it from a terminal. */

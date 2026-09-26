@@ -1,6 +1,5 @@
 # Copyright (c) 2024-2026 Yago Lopez Prado
-# Licensed under WASM-NCSAL 1.0 (Commercial use prohibited)
-# https://github.com/Perkybeet/wasm/blob/main/LICENSE
+# SPDX-License-Identifier: AGPL-3.0-or-later
 
 """
 Tests for taking and checking backups through the JSON API.
@@ -21,6 +20,7 @@ counting on.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -450,3 +450,100 @@ def test_storage_lists_only_backup_directories_and_points_at_misplaced_ones(
     assert body["misplaced"] == [
         {"directory": str(home), "count": 1, "command": f"wasm backup import {home}"}
     ]
+
+
+def _storage_with_directory(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, directory: Path
+) -> dict[str, Any]:
+    """
+    Read ``/api/backups/storage`` with ``backup.directory`` set to ``directory``.
+
+    Args:
+        client: A signed-in client.
+        tmp_path: Per-test temporary directory, for the configuration file.
+        monkeypatch: Patching helper, scoped to the test.
+        directory: The backup directory to configure.
+
+    Returns:
+        The decoded answer.
+    """
+    from wasm.core.config import Config
+    from wasm.managers.backup_manager import BackupManager
+
+    config_file = tmp_path / "etc" / "config.yaml"
+    config_file.parent.mkdir(exist_ok=True)
+    config_file.write_text(f"backup:\n  directory: {directory}\n")
+    monkeypatch.setattr("wasm.core.config.DEFAULT_CONFIG_PATH", config_file)
+    monkeypatch.setattr(BackupManager, "MISPLACED_BACKUP_ROOTS", ())
+    Config.reset_instance()
+    try:
+        response = client.get("/api/backups/storage")
+    finally:
+        Config.reset_instance()
+    assert response.status_code == 200, response.text
+    body: dict[str, Any] = response.json()
+    return body
+
+
+def test_storage_reports_the_filesystem_the_backup_directory_is_on(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The bar read "X of <disk total>" against the root disk, whichever disk the
+    backups were on. The size and free space are now the backup directory's own.
+    """
+    import wasm.web.api.backups as backups_api
+
+    configured = tmp_path / "backups"
+    configured.mkdir()
+    measured: list[Path] = []
+
+    def disk_usage(path: Path) -> Any:
+        measured.append(Path(path))
+        return SimpleNamespace(total=500 * 1024**3, used=200 * 1024**3, free=300 * 1024**3)
+
+    monkeypatch.setattr(backups_api.shutil, "disk_usage", disk_usage)
+    body = _storage_with_directory(client, tmp_path, monkeypatch, configured)
+
+    assert measured == [configured]
+    assert body["filesystem_total"] == 500 * 1024**3
+    assert body["filesystem_free"] == 300 * 1024**3
+
+
+def test_storage_measures_a_missing_backup_directory_at_its_nearest_parent(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before the first backup the directory does not exist; its parent is where it will land."""
+    import wasm.web.api.backups as backups_api
+
+    missing = tmp_path / "not-yet" / "backups"
+    measured: list[Path] = []
+
+    def disk_usage(path: Path) -> Any:
+        measured.append(Path(path))
+        return SimpleNamespace(total=100, used=40, free=60)
+
+    monkeypatch.setattr(backups_api.shutil, "disk_usage", disk_usage)
+    body = _storage_with_directory(client, tmp_path, monkeypatch, missing)
+
+    assert measured == [tmp_path]
+    assert (body["filesystem_total"], body["filesystem_free"]) == (100, 60)
+
+
+def test_storage_answers_null_when_the_filesystem_cannot_be_read(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unreadable filesystem is reported as unknown, not as an empty disk."""
+    import wasm.web.api.backups as backups_api
+
+    configured = tmp_path / "backups"
+    configured.mkdir()
+
+    def disk_usage(path: Path) -> Any:
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(backups_api.shutil, "disk_usage", disk_usage)
+    body = _storage_with_directory(client, tmp_path, monkeypatch, configured)
+
+    assert body["filesystem_total"] is None
+    assert body["filesystem_free"] is None

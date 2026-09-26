@@ -1,38 +1,32 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Eye, EyeOff, Send, TriangleAlert } from "lucide-react";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { TriangleAlert } from "lucide-react";
 import { useId, useState } from "react";
 import type { ReactNode, SyntheticEvent } from "react";
 
-import { configKeys, configQuery, patchConfig, testNotificationChannel } from "../../api/queries/config";
-import type { ConsoleConfig, NotificationTestResult } from "../../api/queries/config";
+import { configQuery, patchConfig } from "../../api/queries/config";
+import type { ConsoleConfig } from "../../api/queries/config";
 import { useDocumentTitle } from "../../app/documentTitle";
-import { CommandHint } from "../../components/page/CommandHint";
 import { ErrorBlock, QueryState } from "../../components/page/QueryState";
 import { Sections } from "../../components/page/Section";
 import { Button } from "../../components/ui/Button";
 import { Checkbox } from "../../components/ui/Checkbox";
 import { Field } from "../../components/ui/Field";
-import { IconButton } from "../../components/ui/IconButton";
 import { Input } from "../../components/ui/Input";
 import { Skeleton } from "../../components/ui/Skeleton";
-import { StatusGlyph, StatusPill } from "../../components/ui/StatusPill";
-import { SystemOutput } from "../../components/ui/SystemOutput";
 import { Switch } from "../../components/ui/Switch";
 import { Textarea } from "../../components/ui/Textarea";
 import { toast } from "../../components/ui/toast";
 import { cx } from "../../lib/cx";
 import { reportActionError } from "../apps/useAppActions";
+import { ChannelHeader, DirtyActions, SecretInput, TestButton, TestOutcome, useChannelTest, useRefreshConfig } from "./channelParts";
+import { EmailChannel, EmailFormSkeleton } from "./EmailChannel";
 import { splitErrors } from "./formErrors";
 import { CHANNELS, EVENTS, REDACTED, channelValue, isChannelConfigured, parseHostList, readNotificationSettings } from "./notifications";
-import type { ChannelField, ChannelSpec, NotificationSettings as Settings } from "./notifications";
+import type { ChannelSpec, NotificationSettings as Settings } from "./notifications";
 import { configSetCommand } from "./shell";
 import { SettingsFormCard, SettingsFormSkeleton, SettingsSection } from "./SettingsForm";
+import { TelegramChannel } from "./TelegramChannel";
 import { useSettingsForm } from "./useSettingsForm";
-
-function useRefreshConfig() {
-  const queryClient = useQueryClient();
-  return (): Promise<void> => queryClient.invalidateQueries({ queryKey: configKeys.all });
-}
 
 const SURFACE = "rounded-card border border-border bg-surface shadow-raised";
 
@@ -81,158 +75,6 @@ function DeliverySection({ query }: { query: ConfigQuery }) {
 
 // ---------------------------------------------------------------------------------------
 // Channels
-
-function TestOutcome({ result, error }: { result: NotificationTestResult | undefined; error: unknown }) {
-  if (error !== null && error !== undefined) {
-    return <ErrorBlock compact error={error} title="The test could not be sent" />;
-  }
-  if (result === undefined) return null;
-  if (result.ok) {
-    return (
-      <p className="flex items-center gap-2 text-13 text-fg">
-        <StatusGlyph state="running" className="text-ok" />
-        {result.detail}
-      </p>
-    );
-  }
-  return (
-    <div className="flex min-w-0 flex-col gap-1.5">
-      <p className="flex items-center gap-2 text-13 font-medium text-fg">
-        <StatusGlyph state="failed" className="text-fail" />
-        The test failed. The server said:
-      </p>
-      <SystemOutput label="What the server said" maxHeight="max-h-40" className="rounded-control border border-border bg-bg-sunken px-3 py-2">
-        {result.detail}
-      </SystemOutput>
-    </div>
-  );
-}
-
-/** A write-only field: what is typed can be shown, what is stored never comes back. */
-function SecretInput({
-  field,
-  value,
-  configured,
-  onChange,
-  disabled,
-}: {
-  field: ChannelField;
-  value: string;
-  /** Whether a value is already stored, so the placeholder says so instead of showing the format hint. */
-  configured: boolean;
-  onChange: (value: string) => void;
-  disabled: boolean;
-}) {
-  const [shown, setShown] = useState(false);
-  return (
-    <Input
-      mono
-      type={shown ? "text" : "password"}
-      autoComplete="off"
-      autoCapitalize="off"
-      spellCheck={false}
-      placeholder={configured ? "Set - leave blank to keep it" : field.placeholder}
-      value={value}
-      disabled={disabled}
-      onValueChange={(next: string) => {
-        onChange(next);
-      }}
-      suffix={
-        <IconButton
-          size="sm"
-          label={shown ? `Hide the ${field.label.toLowerCase()}` : `Show the ${field.label.toLowerCase()}`}
-          icon={shown ? <EyeOff /> : <Eye />}
-          pressed={shown}
-          onClick={() => {
-            setShown((current) => !current);
-          }}
-        />
-      }
-    />
-  );
-}
-
-function useChannelTest(channel: string) {
-  return useMutation({ mutationFn: () => testNotificationChannel(channel) });
-}
-
-/** Sending a test needs a destination to send to; a dirty form needs saving before it means anything. */
-function TestButton({ test, disabled, reason }: { test: ReturnType<typeof useChannelTest>; disabled: boolean; reason?: string }) {
-  const reasonId = useId();
-  return (
-    <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
-      {reason !== undefined ? (
-        <span id={reasonId} className="text-12 text-fg-faint">
-          {reason}
-        </span>
-      ) : null}
-      <Button
-        size="sm"
-        icon={<Send aria-hidden="true" />}
-        loading={test.isPending}
-        disabled={disabled}
-        {...(reason !== undefined ? { "aria-describedby": reasonId } : {})}
-        onClick={() => {
-          test.mutate();
-        }}
-      >
-        Send test
-      </Button>
-    </span>
-  );
-}
-
-/** A channel's name, whether it has a destination, what it does, and the actions that do not need its form. */
-function ChannelHeader({
-  id,
-  label,
-  description,
-  configured,
-  actions,
-}: {
-  id: string;
-  label: string;
-  description: string;
-  configured: boolean;
-  actions: ReactNode;
-}) {
-  return (
-    <header className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
-      <div className="min-w-0 flex-1 basis-60">
-        <div className="flex flex-wrap items-center gap-2">
-          <h3 id={id} className="text-14 font-semibold text-fg">
-            {label}
-          </h3>
-          <StatusPill
-            state={configured ? "running" : "stopped"}
-            label={configured ? "Configured" : "Not configured"}
-            appearance="inline"
-            size="sm"
-          />
-        </div>
-        <p className="max-w-[60ch] text-13 text-fg-muted">{description}</p>
-      </div>
-      {/* Wraps on a phone: a reason, Remove and Send test do not fit one narrow row. */}
-      <div className="flex max-w-full min-w-0 flex-wrap items-center gap-1">{actions}</div>
-    </header>
-  );
-}
-
-/** Save and Discard, only once something changed: a clean channel shows no dead buttons. */
-function DirtyActions({ dirty, pending, onDiscard, note }: { dirty: boolean; pending: boolean; onDiscard: () => void; note?: string }) {
-  if (!dirty && !pending) return null;
-  return (
-    <div className="flex flex-wrap items-center gap-2">
-      <Button type="submit" size="sm" variant="primary" loading={pending}>
-        Save
-      </Button>
-      <Button size="sm" variant="ghost" disabled={pending} onClick={onDiscard}>
-        Discard
-      </Button>
-      {note !== undefined ? <p className="text-12 text-fg-muted">{note}</p> : null}
-    </div>
-  );
-}
 
 /** One webhook-style channel: its destination, saved on its own, and a test. */
 function HttpChannel({ spec, stored }: { spec: ChannelSpec; stored: Readonly<Record<string, string>> }) {
@@ -304,7 +146,8 @@ function HttpChannel({ spec, stored }: { spec: ChannelSpec; stored: Readonly<Rec
               <Field key={field.key} label={field.label} description={field.description} error={errors.fields[field.key]}>
                 {field.secret ? (
                   <SecretInput
-                    field={field}
+                    label={field.label}
+                    placeholder={field.placeholder}
                     value={draft[field.key] ?? ""}
                     configured={stored[field.key] === REDACTED}
                     disabled={save.isPending}
@@ -351,94 +194,20 @@ function HttpChannel({ spec, stored }: { spec: ChannelSpec; stored: Readonly<Rec
   );
 }
 
-/** Email: on or off here; the SMTP account itself is the monitor's. */
-function EmailChannel({ settings }: { settings: Settings }) {
-  const refresh = useRefreshConfig();
-  const headingId = useId();
-  const test = useChannelTest("email");
-  const [enabled, setEnabled] = useState<boolean | null>(null);
-  const value = enabled ?? settings.emailEnabled;
-  const dirty = enabled !== null && enabled !== settings.emailEnabled;
-  const save = useMutation({
-    mutationFn: (next: boolean) => patchConfig("notifications.channels.email", { enabled: next }),
-    onSuccess: async (_, next) => {
-      await refresh();
-      setEnabled(null);
-      test.reset();
-      toast.success(next ? "Turned email notifications on" : "Turned email notifications off");
-    },
-  });
-  const { smtp } = settings;
-  const configured = smtp.host !== "";
-  const testReason = !configured ? "Set up the SMTP server to test it." : dirty ? "Save your changes first." : undefined;
-  return (
-    <article aria-labelledby={headingId} className="flex min-w-0 flex-col gap-3 px-5 py-4">
-      <ChannelHeader
-        id={headingId}
-        label="Email"
-        description="Sent through the monitor's SMTP account to its recipients."
-        configured={configured}
-        actions={<TestButton test={test} disabled={dirty || !configured} {...(testReason !== undefined ? { reason: testReason } : {})} />}
-      />
-      <form
-        noValidate
-        onSubmit={(event) => {
-          event.preventDefault();
-          if (dirty && !save.isPending) save.mutate(value);
-        }}
-        className="flex min-w-0 flex-col gap-3"
-      >
-        {save.isError ? <ErrorBlock live compact error={save.error} title="Could not save email" /> : null}
-        <Checkbox
-          label="Send notifications by email"
-          checked={value}
-          disabled={save.isPending}
-          onCheckedChange={(next) => {
-            setEnabled(next);
-          }}
-        />
-        <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-6 gap-y-1 rounded-control border border-border bg-bg-sunken px-3 py-2 text-13">
-          <dt className="text-fg-muted">SMTP server</dt>
-          <dd translate="no" className={cx("truncate", configured ? "mono text-12 text-fg" : "text-fg-faint")}>
-            {configured ? `${smtp.host}${smtp.port === null ? "" : `:${String(smtp.port)}`}` : "Not set up"}
-          </dd>
-          <dt className="text-fg-muted">From</dt>
-          <dd translate="no" className={cx("truncate", smtp.from ? "mono text-12 text-fg" : "text-fg-faint")}>
-            {smtp.from || "Not set"}
-          </dd>
-          <dt className="text-fg-muted">Recipients</dt>
-          <dd translate="no" className={cx("break-words", smtp.recipients.length > 0 ? "mono text-12 text-fg" : "text-fg-faint")}>
-            {smtp.recipients.length > 0 ? smtp.recipients.join(", ") : "None"}
-          </dd>
-        </dl>
-        {!configured ? <CommandHint label="Set it up from a terminal" command="wasm config set monitor.smtp.host smtp.example.com" /> : null}
-        <DirtyActions
-          dirty={dirty}
-          pending={save.isPending}
-          onDiscard={() => {
-            setEnabled(null);
-          }}
-        />
-      </form>
-      <div role="status" className="min-w-0 empty:hidden">
-        <TestOutcome result={test.data} error={test.error} />
-      </div>
-    </article>
-  );
-}
-
 function ChannelsSection({ query }: { query: ConfigQuery }) {
   return (
     <SettingsSection
       title="Where alerts go"
-      description="Every channel with a destination receives the events turned on below. Webhook URLs and the bot token are write-only: once saved they are never shown again, and a field left empty keeps what is stored. Send a test to find out what a channel does."
+      description="Every channel with a destination receives the events turned on below. Webhook URLs, the bot token and the SMTP password are write-only: once saved they are never shown again, and a field left empty keeps what is stored. Send a test to find out what a channel does."
     >
       <WithSettings query={query} skeleton={<ChannelsSkeleton />}>
         {(settings) => (
           <div className={cx(SURFACE, "flex min-w-0 flex-col divide-y divide-border")}>
             {CHANNELS.map((spec) =>
               spec.id === "email" ? (
-                <EmailChannel key={spec.id} settings={settings} />
+                <EmailChannel key={spec.id} enabledStored={settings.emailEnabled} />
+              ) : spec.id === "telegram" ? (
+                <TelegramChannel key={spec.id} stored={settings.channels.telegram} />
               ) : (
                 <HttpChannel key={spec.id} spec={spec} stored={settings.channels[spec.id]} />
               ),
@@ -634,14 +403,16 @@ function ChannelsSkeleton() {
               ))}
             </div>
           ) : (
-            // Email: the switch, then the SMTP account's three lines.
-            <div className="flex flex-col gap-3">
-              <div className="flex h-5 items-center">
-                <Skeleton className="h-3.5 w-48" />
-              </div>
-              <Skeleton className="h-[5.375rem] w-full rounded-control" />
-            </div>
+            // Email: the switch, then the SMTP account's form.
+            <EmailFormSkeleton />
           )}
+          {spec.id === "telegram" ? (
+            // "Find my chat" and the line beside it.
+            <div className="flex h-7 items-center gap-2">
+              <Skeleton className="h-7 w-28" />
+              <Skeleton className="h-3 w-72 max-w-full" />
+            </div>
+          ) : null}
         </div>
       ))}
     </div>

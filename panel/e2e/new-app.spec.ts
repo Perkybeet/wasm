@@ -59,8 +59,9 @@ test("inspects a directory on the server, deploys it and lands on its deployment
   await inspectSource(page, consoleServer, problems, source);
   expect((await inspected).request().postDataJSON()).toEqual({ source });
 
-  // What the real inspection found: a Next.js project on npm with a lock file.
+  // What the real inspection found: a Next.js project on npm with a lock file, deployable here.
   const found = page.getByRole("region", { name: "What WASM found" });
+  await expect(found.getByText(/^WASM can deploy this as Next\.js/)).toBeVisible();
   await expect(found.getByText("npm ci")).toBeVisible();
   await expect(found.getByText("npm run build")).toBeVisible();
   await expect(page.getByRole("combobox", { name: "Deploy as" })).toHaveText(/Next\.js/);
@@ -200,4 +201,29 @@ test("also serving www and resource limits reach the deploy request", async ({ p
   expect(body).toMatchObject({ domain, ssl: false, include_www: true, memory_max_mb: 256, cpu_quota_percent: null, tasks_max: 64 });
 
   await forgetApp(page, consoleServer, domain);
+});
+
+
+test("a source WASM cannot deploy as it is gets the inspection's verdict and the file to add", async ({ page, consoleServer, problems }) => {
+  // Chromium logs the inspection's refusal as a failed resource.
+  problems.expect(/status of 400 .* \/api\/apps\/inspect$/);
+  problems.expect(/status of 403 .* \/api\/apps\/inspect$/);
+  await signIn(page, consoleServer, "/apps/new");
+  const source = await wizardSource(page, "container-api");
+  await page.getByLabel("Repository or directory").fill(source);
+  await page.getByRole("button", { name: "Inspect source" }).click();
+  const confirm = page.getByRole("dialog", { name: "Confirm it's you" });
+  const verdict = page.getByRole("alert").filter({ hasText: `WASM cannot deploy ${source} as it is` });
+  await expect(confirm.or(verdict)).toBeVisible();
+  if (await confirm.isVisible()) await confirmItsYou(page, consoleServer);
+
+  await expect(verdict.getByText("The repository has a Dockerfile but no Compose file.")).toBeVisible();
+  // The compose file to commit, as the file it is: indentation included.
+  await expect(verdict.locator("pre").filter({ hasText: /^services:\n {2}app:\n {4}build: \./ })).toBeVisible();
+  await expect(page.getByLabel("Repository or directory")).not.toHaveAttribute("aria-invalid", "true");
+  await settle(page);
+  await expectNoA11yViolations(page, "an inspection's verdict");
+
+  await verdict.getByRole("button", { name: "Choose the type yourself" }).click();
+  await expect(page.getByRole("heading", { level: 2, name: "Review" })).toBeFocused();
 });

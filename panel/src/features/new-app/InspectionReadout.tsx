@@ -1,6 +1,7 @@
-import { FolderOpen, GitBranch, GitCommitHorizontal } from "lucide-react";
+import { CircleCheck, FolderOpen, GitBranch, GitCommitHorizontal, TriangleAlert } from "lucide-react";
 
 import { Badge } from "../../components/ui/Badge";
+import { Suggestion } from "./Suggestion";
 import { sourceKind, typeName } from "./wizard";
 import type { AppTypeOption, Inspection } from "./wizard";
 
@@ -20,6 +21,42 @@ function Command({ step, argv, none }: { step: string; argv: string | null; none
           </code>
         )}
       </dd>
+    </div>
+  );
+}
+
+/**
+ * Whether this server can deploy the source as it is, in the backend's words: its verdict, and
+ * when something has to be done first, what. Only an explicit `compatible: false` warns; an
+ * inspection that did not say (an older backend) shows nothing rather than a guess.
+ */
+function Verdict({ inspection }: { inspection: Inspection }) {
+  const verdict = inspection.verdict ?? null;
+  const suggestion = inspection.suggestion ?? null;
+  if (verdict === null && suggestion === null) return null;
+  const blocked = inspection.compatible === false;
+  return (
+    <div
+      className={
+        blocked
+          ? "flex items-start gap-2.5 rounded-control border border-warn/40 bg-warn-soft px-3 py-2.5"
+          : "flex items-start gap-2.5"
+      }
+    >
+      {blocked ? (
+        <TriangleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warn" />
+      ) : inspection.compatible === true ? (
+        <CircleCheck aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-ok" />
+      ) : null}
+      <div className="flex min-w-0 flex-col gap-1.5">
+        {verdict !== null ? (
+          <p className="text-13 text-pretty text-fg">
+            {blocked ? <span className="sr-only">Not deployable as it is: </span> : null}
+            {verdict}
+          </p>
+        ) : null}
+        {suggestion !== null ? <Suggestion text={suggestion} /> : null}
+      </div>
     </div>
   );
 }
@@ -74,6 +111,7 @@ export function InspectionReadout({ inspection, types, source }: { inspection: I
         </p>
       ) : (
         <div className="flex flex-col gap-3 px-4 py-3">
+          <Verdict inspection={inspection} />
           <p className="text-13 text-pretty text-fg">
             {`Looks like a ${typeName(types, inspection.app_type)} app`}
             {inspection.package_manager ? (
@@ -82,7 +120,8 @@ export function InspectionReadout({ inspection, types, source }: { inspection: I
                 <code className="text-12">{inspection.package_manager}</code>
               </>
             ) : null}
-            {others.length > 0 ? (
+            {/* The verdict names the other types itself, with what choosing one would mean. */}
+            {others.length > 0 && !inspection.verdict ? (
               <span className="text-fg-muted">{`. It also matches ${others.map((type) => typeName(types, type)).join(", ")}.`}</span>
             ) : (
               "."

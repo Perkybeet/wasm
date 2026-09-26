@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { checkName, checkView, verdictView } from "./data";
+import { certificateMention, checkName, checkView, healthReasons, verdictView } from "./data";
 
 describe("verdictView", () => {
   it("draws the three verdicts collect_health_report can answer", () => {
@@ -28,5 +28,30 @@ describe("checkName", () => {
     expect(checkName("Disk Space")).toBe("Disk space");
     expect(checkName("SSL Certificates")).toBe("SSL certificates");
     expect(checkName("Nginx")).toBe("Nginx");
+  });
+});
+
+describe("healthReasons", () => {
+  it("lists the issues, then the warnings, in the report's own words", () => {
+    const reasons = healthReasons({
+      issues: ["Nginx is installed but not running"],
+      warnings: ["App 'shop.example.com' - the unit is not running"],
+    });
+    expect(reasons).toEqual([
+      { level: "issue", message: "Nginx is installed but not running", certificate: null },
+      { level: "warning", message: "App 'shop.example.com' - the unit is not running", certificate: null },
+    ]);
+    expect(healthReasons({ issues: [], warnings: [] })).toEqual([]);
+  });
+
+  it("finds the certificate a message names, keeping the sentence around it intact", () => {
+    expect(certificateMention("Certificate for shop.example.com expired 3 days ago")).toEqual({
+      before: "Certificate for ",
+      name: "shop.example.com",
+      after: " expired 3 days ago",
+    });
+    expect(certificateMention("Certificate for shop.example.com-0001 expires in 5 days")?.name).toBe("shop.example.com-0001");
+    expect(certificateMention("Certificate for x.io has an unreadable expiry date")?.after).toBe(" has an unreadable expiry date");
+    expect(certificateMention("Low disk space: 0.5GB free")).toBeNull();
   });
 });

@@ -112,7 +112,7 @@ function CertificateDrawer({
  * it expires, and renewing, revoking and deleting it. Issuing and renewing run as jobs, followed
  * above the table.
  */
-export function CertificatesTab() {
+export function CertificatesTab({ initialFilter = "" }: { initialFilter?: string }) {
   const queryClient = useQueryClient();
   const certs = useQuery(certsQuery());
   const active = useQuery(activeJobsQuery());
@@ -120,7 +120,7 @@ export function CertificatesTab() {
   const followed = useFollowedJob();
 
   const [words, setWords] = useState<JobWords | null>(null);
-  const [filter, setFilter] = useState("");
+  const [filter, setFilter] = useState(initialFilter);
   const [issuing, setIssuing] = useState(false);
   const [opened, setOpened] = useState<string | null>(null);
   const [revoking, setRevoking] = useState<CertEntry | null>(null);

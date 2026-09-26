@@ -6,8 +6,17 @@ import {
   channelValue,
   isChannelConfigured,
   parseHostList,
+  looksLikeEmail,
+  portForSecurity,
   readNotificationSettings,
+  refusedRecipients,
+  smtpBody,
+  smtpFormDirty,
+  smtpFormFrom,
+  splitAddresses,
   telegramChatIdWarning,
+  telegramChatName,
+  telegramChatType,
 } from "./notifications";
 import type { ChannelSpec } from "./notifications";
 
@@ -113,5 +122,88 @@ describe("telegramChatIdWarning", () => {
 
   it("ignores surrounding whitespace", () => {
     expect(telegramChatIdWarning("  1001234567890  ")).not.toBeNull();
+  });
+});
+
+describe("the SMTP form", () => {
+  const STORED = {
+    host: "smtp.example.com",
+    port: 587,
+    use_ssl: false,
+    use_tls: true,
+    username: "wasm@example.com",
+    from_address: "",
+    recipients: ["ops@example.com"],
+    password_set: true,
+  };
+
+  it("reads the two TLS switches as one choice, and never holds the password", () => {
+    const form = smtpFormFrom(STORED);
+    expect(form).toEqual({
+      host: "smtp.example.com",
+      port: "587",
+      security: "starttls",
+      username: "wasm@example.com",
+      password: "",
+      from_address: "",
+      recipients: ["ops@example.com"],
+    });
+    expect(smtpFormFrom({ ...STORED, use_ssl: true, use_tls: false }).security).toBe("ssl");
+    expect(smtpFormFrom({ ...STORED, use_ssl: false, use_tls: false }).security).toBe("none");
+  });
+
+  it("is dirty for a typed password or any other change, not for an empty password", () => {
+    const stored = smtpFormFrom(STORED);
+    expect(smtpFormDirty(stored, stored)).toBe(false);
+    expect(smtpFormDirty({ ...stored, password: "x" }, stored)).toBe(true);
+    expect(smtpFormDirty({ ...stored, port: " 587 " }, stored)).toBe(false);
+    expect(smtpFormDirty({ ...stored, recipients: ["ops@example.com", "dev@example.com"] }, stored)).toBe(true);
+    expect(smtpFormDirty({ ...stored, security: "ssl" }, stored)).toBe(true);
+  });
+
+  it("writes the choice back as the two switches, a port as a number, and anything else as typed", () => {
+    const form = { ...smtpFormFrom(STORED), host: " smtp.example.com ", security: "ssl" as const, port: "465" };
+    expect(smtpBody(form)).toEqual({
+      host: "smtp.example.com",
+      port: 465,
+      use_ssl: true,
+      use_tls: false,
+      username: "wasm@example.com",
+      password: "",
+      from_address: "",
+      recipients: ["ops@example.com"],
+    });
+    // The server rules on what is not a port; the console does not invent a message for it.
+    expect(smtpBody({ ...form, port: "abc" }).port).toBe("abc");
+  });
+
+  it("moves the port with the choice only while it is the old choice's usual one", () => {
+    expect(portForSecurity("465", "ssl", "starttls")).toBe("587");
+    expect(portForSecurity("587", "starttls", "none")).toBe("25");
+    expect(portForSecurity("2525", "ssl", "starttls")).toBe("2525");
+  });
+
+  it("checks an address's shape as wasm.core.config does, and splits a pasted list", () => {
+    expect(looksLikeEmail("ops@example.com")).toBe(true);
+    expect(looksLikeEmail("ops@example")).toBe(false);
+    expect(looksLikeEmail("o ps@example.com")).toBe(false);
+    expect(splitAddresses(" a@x.io, b@y.io;c@z.io  d@w.io ")).toEqual(["a@x.io", "b@y.io", "c@z.io", "d@w.io"]);
+  });
+
+  it("finds the addresses the server named in its refusal of the list", () => {
+    const message = "monitor.email_recipients contains an invalid email address: a@b, c@d Every recipient must be an address such as ops@example.com.";
+    expect([...refusedRecipients(message, ["a@b", "ops@example.com", "c@d"])]).toEqual(["a@b", "c@d"]);
+    expect(refusedRecipients(undefined, ["a@b"]).size).toBe(0);
+    expect(refusedRecipients("monitor.smtp.host is not a valid hostname: a@b", ["a@b"]).size).toBe(0);
+  });
+});
+
+describe("Telegram chats", () => {
+  it("names a chat by its title, else its username, else its type", () => {
+    expect(telegramChatName({ id: -100, type: "supergroup", title: "Alerts", username: "alerts" })).toBe("Alerts");
+    expect(telegramChatName({ id: 5, type: "private", title: null, username: "yago" })).toBe("@yago");
+    expect(telegramChatName({ id: 5, type: "private", title: null, username: null })).toBe("Private chat");
+    expect(telegramChatType("channel")).toBe("Channel");
+    expect(telegramChatType("something_new")).toBe("something_new");
   });
 });

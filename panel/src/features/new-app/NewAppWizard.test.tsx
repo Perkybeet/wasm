@@ -1,5 +1,5 @@
 import { screen, waitFor, within } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { expectNoAxeViolations } from "../../test/axe";
 import { renderConsole } from "../../test/console";
@@ -205,6 +205,104 @@ describe("the new-app wizard", () => {
     expect(await screen.findByRole("heading", { level: 2, name: "Review" })).toBeInTheDocument();
     expect(screen.getByText(/No type recognised this source/)).toBeInTheDocument();
     expect(screen.getByRole("combobox", { name: "Deploy as" })).toHaveTextContent("Choose a type");
+  });
+
+  it("says what WASM found and that it can deploy it, in the backend's words", async () => {
+    const { harness } = wizard({
+      "POST /api/apps/inspect": () =>
+        json(200, {
+          ...INSPECTION,
+          compatible: true,
+          verdict: "WASM can deploy this as Next.js. It also looks like Node.js; choose that type instead to deploy it that way.",
+          suggestion: null,
+        }),
+    });
+    await inspect(harness.user);
+    const found = screen.getByRole("region", { name: "What WASM found" });
+    expect(within(found).getByText(/WASM can deploy this as Next\.js\. It also looks like Node\.js/)).toBeInTheDocument();
+    // Said once: the verdict already names the other types.
+    expect(within(found).queryByText(/It also matches/)).not.toBeInTheDocument();
+  });
+
+  it("warns on the review step when this server cannot deploy it as it is, with what to do first", async () => {
+    const { harness } = wizard({
+      "POST /api/apps/inspect": () =>
+        json(200, {
+          ...INSPECTION,
+          app_type: "python",
+          detected_types: ["python"],
+          compatible: false,
+          verdict: "This is a Python (Django/Flask/FastAPI) project, but this server does not have python3.",
+          suggestion: "Install what it needs with `wasm setup init`, then deploy it.",
+        }),
+    });
+    await inspect(harness.user);
+    const found = screen.getByRole("region", { name: "What WASM found" });
+    expect(within(found).getByText(/this server does not have python3/)).toBeInTheDocument();
+    expect(within(found).getByText("Not deployable as it is:", { exact: false })).toBeInTheDocument();
+    expect(within(found).getByText("wasm setup init").tagName).toBe("CODE");
+    await expectNoAxeViolations(found);
+  });
+
+  it("shows the inspection's verdict on a source it cannot deploy, and the file to add as one, verbatim", async () => {
+    const compose = "services:\n  app:\n    build: .\n    ports:\n      - \"3000:3000\"";
+    const { harness } = wizard({
+      "POST /api/apps/inspect": () =>
+        problem(400, "validationerror", "The repository has a Dockerfile but no Compose file.", {
+          hint: `WASM runs containers through Docker Compose. Commit a compose.yaml next to the Dockerfile that builds it:\n\n${compose}\n\nwith the port the image listens on, then deploy it as Docker Compose.`,
+        }),
+    });
+    const { user, container } = harness;
+    await screen.findByRole("heading", { level: 1, name: "New application" });
+    await user.type(screen.getByLabelText("Repository or directory"), "https://github.com/acme/api.git");
+    await user.click(screen.getByRole("button", { name: "Inspect source" }));
+    const detail = await screen.findByText("The repository has a Dockerfile but no Compose file.");
+    expect(detail.closest("[role=alert]")).not.toBeNull();
+    expect(screen.getByText("WASM cannot deploy https://github.com/acme/api.git as it is")).toBeInTheDocument();
+    // The compose file keeps its indentation: it is shown as the file it is.
+    const file = screen.getByText((_, element) => element?.tagName === "PRE" && element.textContent === compose);
+    expect(file).toBeInTheDocument();
+    expect(screen.getByText(/with the port the image listens on/)).toBeInTheDocument();
+    // Not a fetch failure: the source field is not marked.
+    expect(screen.getByLabelText("Repository or directory")).not.toHaveAttribute("aria-invalid", "true");
+    await expectNoAxeViolations(container);
+    await user.click(screen.getByRole("button", { name: "Choose the type yourself" }));
+    expect(await screen.findByRole("heading", { level: 2, name: "Review" })).toBeInTheDocument();
+  });
+
+  it("says honestly what it is doing while it inspects, and Cancel stops the request", async () => {
+    const { harness } = wizard();
+    let aborted = false;
+    const inner = globalThis.fetch;
+    vi.stubGlobal("fetch", (input: RequestInfo | URL, init: RequestInit = {}) => {
+      const href = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (!href.endsWith("/api/apps/inspect")) return inner(input, init);
+      // Answers nothing until the console gives up on it, as a slow clone would.
+      return new Promise<Response>((_, reject) => {
+        init.signal?.addEventListener("abort", () => {
+          aborted = true;
+          reject(new DOMException("The operation was aborted.", "AbortError"));
+        });
+      });
+    });
+    const { user } = harness;
+    await screen.findByRole("heading", { level: 1, name: "New application" });
+    await user.type(screen.getByLabelText("Repository or directory"), "https://github.com/acme/shop.git");
+    await user.click(screen.getByRole("button", { name: "Inspect source" }));
+    const reading = await screen.findByText("Reading the repository…");
+    expect(reading.closest("[role=status]")).not.toBeNull();
+    expect(screen.getByText(/Cancel stops it on the server too/)).toBeInTheDocument();
+    // No invented steps: nothing claims to be cloning, installing or detecting.
+    expect(screen.queryByText(/Cloning|Detecting|Installing/)).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(aborted).toBe(true);
+    await waitFor(() => {
+      expect(screen.queryByText("Reading the repository…")).not.toBeInTheDocument();
+    });
+    expect(screen.getByRole("button", { name: "Inspect source" })).toBeInTheDocument();
+    // Cancelling is not a failure.
+    expect(screen.queryByText(/Could not inspect/)).not.toBeInTheDocument();
   });
 
   it("shows the fetch failure on the source field, verbatim, with its hint above it", async () => {

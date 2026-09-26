@@ -28,6 +28,12 @@ function look(state: PhaseState, afterFailure: boolean): NodeLook {
         glyph: <Minus aria-hidden="true" className="size-3.5" />,
         word: afterFailure ? "Not reached" : "Not in the log",
       };
+    case "not_applicable":
+      return {
+        node: "border-dashed border-border bg-surface text-fg-faint",
+        glyph: <Minus aria-hidden="true" className="size-3.5" />,
+        word: "Not applicable",
+      };
   }
 }
 
@@ -71,7 +77,7 @@ export function PhaseTimeline({ phases, outcome, className }: PhaseTimelineProps
               {glyph}
             </span>
             <span className="flex min-w-0 flex-col items-center gap-0.5">
-              <span className={cx("text-13 font-medium", phase.state === "unrecorded" || phase.state === "pending" ? "text-fg-muted" : "text-fg")}>
+              <span className={cx("text-13 font-medium", phase.state === "unrecorded" || phase.state === "pending" || phase.state === "not_applicable" ? "text-fg-muted" : "text-fg")}>
                 {phase.label}
               </span>
               {duration !== null ? (

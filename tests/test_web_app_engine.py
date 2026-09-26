@@ -1,6 +1,5 @@
 # Copyright (c) 2024-2026 Yago Lopez Prado
-# Licensed under WASM-NCSAL 1.0 (Commercial use prohibited)
-# https://github.com/Perkybeet/wasm/blob/main/LICENSE
+# SPDX-License-Identifier: AGPL-3.0-or-later
 
 """
 Tests for the application endpoints the deploy engine v2 adds or changes.
@@ -577,6 +576,9 @@ def test_a_bad_health_setting_is_a_400_and_nothing_is_written(
     response = client.patch(f"/api/apps/{DOMAIN}/health", json=body)
 
     assert response.status_code == 400, response.text
+    # The refusal names its input, so the console puts it next to that field.
+    (field,) = response.json()["fields"]
+    assert field in body
     app = store.get_app(DOMAIN)
     assert (app.health_path, app.health_expect, app.health_timeout) == (None, None, None)
 

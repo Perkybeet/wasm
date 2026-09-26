@@ -1,6 +1,5 @@
 # Copyright (c) 2024-2026 Yago Lopez Prado
-# Licensed under WASM-NCSAL 1.0 (Commercial use prohibited)
-# https://github.com/Perkybeet/wasm/blob/main/LICENSE
+# SPDX-License-Identifier: AGPL-3.0-or-later
 
 """
 Moving an in-place application onto the release layout, without losing a byte.

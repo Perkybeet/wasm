@@ -51,3 +51,31 @@ export function splitErrors<K extends string>(error: unknown, names: readonly K[
   }
   return { fields: {}, form: error };
 }
+
+/**
+ * `splitErrors`, plus the configuration's own refusals placed beside their field.
+ *
+ * A typed endpoint that writes through `Config.set` answers a value the configuration's rules
+ * refuse as a 400 with no `fields`, in the words `wasm config set` uses, which always begin
+ * with the dotted key: "monitor.smtp.host is not a valid hostname: ...". That key names the
+ * field as surely as `fields` would, so the message goes beside it, verbatim, instead of
+ * above the form.
+ *
+ * @param keys Dotted configuration key to the form field it is about.
+ */
+export function splitConfigErrors<K extends string>(
+  error: unknown,
+  names: readonly K[],
+  keys: Readonly<Record<string, K>>,
+): SplitErrors<K> {
+  const split = splitErrors(error, names);
+  const refusal = split.form;
+  if (!isApiError(refusal) || refusal.status !== 400 || refusal.fields !== null) return split;
+  // Longest first, so "monitor.smtp.port" is not claimed by a shorter key it starts with.
+  const key = Object.keys(keys)
+    .sort((a, b) => b.length - a.length)
+    .find((candidate) => refusal.detail.startsWith(`${candidate} `));
+  const field = key === undefined ? undefined : keys[key];
+  if (field === undefined) return split;
+  return { fields: { ...split.fields, [field]: sentence(refusal.detail, refusal.hint) }, form: null };
+}

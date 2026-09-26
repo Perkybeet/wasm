@@ -4,7 +4,7 @@ Python 3.10+ CLI for deploying web apps on Linux servers. Automates Nginx/Apache
 systemd, databases and backups; builds every deploy as a health-gated release with instant
 rollback; and serves an optional browser console (React SPA) over a JSON API.
 
-**Repository**: https://github.com/Perkybeet/wasm | **License**: WASM-NCSAL 1.0
+**Repository**: https://github.com/Perkybeet/wasm | **License**: AGPL-3.0-or-later (from 2.1.0; releases up to 2.0.x were WASM-NCSAL 1.0)
 
 ---
 

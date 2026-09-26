@@ -8,6 +8,7 @@ import type { RouteHandler } from "../../../test/fakes";
 import { deletionSummary } from "./DangerSection";
 import { planItems } from "./MigrationPlanView";
 import { confirmation } from "./ReleasesSection";
+import { retentionOutcome } from "./RetentionForm";
 
 const DOMAIN = "shop.example.com";
 const BASE = APPS[0];
@@ -255,6 +256,149 @@ describe("resource limits", () => {
   });
 });
 
+describe("the health check", () => {
+  it("shows what the gate asks now, defaults marked, and saves exactly what the form says", async () => {
+    let app: object = RELEASE_APP;
+    const { user, backend } = await settingsOf(RELEASE_APP, {
+      "GET /api/auth/session": () => json(200, ELEVATED),
+      [`GET /api/apps/${DOMAIN}`]: () => json(200, app),
+      [`PATCH /api/apps/${DOMAIN}/health`]: () => {
+        app = { ...RELEASE_APP, health_path: "/healthz", health_expect: "200-299", health_timeout: null };
+        return json(200, {
+          domain: DOMAIN,
+          path: "/healthz",
+          expect: "200-299",
+          timeout: null,
+          effective_path: "/healthz",
+          effective_expect: "200-299",
+          effective_timeout: 30,
+        });
+      },
+    });
+    const health = section("Health check");
+    expect(within(health).getByText("GET /")).toBeInTheDocument();
+    expect(within(health).getByText("any status below 500")).toBeInTheDocument();
+    expect(within(health).getAllByText("(default)")).toHaveLength(3);
+
+    await user.type(within(health).getByRole("textbox", { name: "Path" }), "/healthz");
+    await user.type(within(health).getByRole("textbox", { name: "Accepted statuses" }), "200-299");
+    await user.click(within(health).getByRole("button", { name: "Save" }));
+    await waitFor(() => {
+      expect(backend.callsTo(`PATCH /api/apps/${DOMAIN}/health`)[0]?.body).toEqual({ path: "/healthz", expect: "200-299", timeout: null });
+    });
+    expect(await within(health).findByText(/Saved\. The next activation requests/)).toBeInTheDocument();
+    expect(within(health).getByText("GET /healthz")).toBeInTheDocument();
+    expect(within(health).getAllByText("(default)")).toHaveLength(1);
+  });
+
+  it("refuses what the gate could not use on the field it is about, before asking the backend", async () => {
+    const { user, backend } = await settingsOf(RELEASE_APP);
+    const health = section("Health check");
+    const path = within(health).getByRole("textbox", { name: "Path" });
+    await user.type(path, "https://example.com/health");
+    await user.type(within(health).getByRole("textbox", { name: "Timeout" }), "2");
+    await user.click(within(health).getByRole("button", { name: "Save" }));
+    expect(await within(health).findByText(/A scheme or a host is not accepted/)).toBeInTheDocument();
+    expect(path).toHaveAttribute("aria-invalid", "true");
+    expect(within(health).getByText(/Give it from 5 to 600 seconds/)).toBeInTheDocument();
+    expect(backend.callsTo(`PATCH /api/apps/${DOMAIN}/health`)).toHaveLength(0);
+  });
+
+  it("puts the backend's refusal under the field it names, verbatim", async () => {
+    const { user } = await settingsOf(RELEASE_APP, {
+      "GET /api/auth/session": () => json(200, ELEVATED),
+      [`PATCH /api/apps/${DOMAIN}/health`]: () =>
+        problem(400, "validationerror", "'199-200' is not a status range from 100 to 599", { hint: "Use statuses and ranges from 100 to 599." }),
+    });
+    const health = section("Health check");
+    const expect_ = within(health).getByRole("textbox", { name: "Accepted statuses" });
+    await user.type(expect_, "204");
+    await user.click(within(health).getByRole("button", { name: "Save" }));
+    expect(await within(health).findByText("'199-200' is not a status range from 100 to 599. Use statuses and ranges from 100 to 599.")).toBeInTheDocument();
+    expect(expect_).toHaveAttribute("aria-invalid", "true");
+  });
+
+  it("asks who it is before saving", async () => {
+    const { user, backend } = await settingsOf(IN_PLACE_APP, {
+      "POST /api/auth/elevate": () => json(200, { elevated_until: "2999-01-01T00:00:00+00:00" }),
+      [`PATCH /api/apps/${DOMAIN}/health`]: () =>
+        json(200, { domain: DOMAIN, path: null, expect: null, timeout: 90, effective_path: "/", effective_expect: "any status below 500", effective_timeout: 90 }),
+    });
+    const health = section("Health check");
+    await user.type(within(health).getByRole("textbox", { name: "Timeout" }), "90");
+    await user.click(within(health).getByRole("button", { name: "Save" }));
+    const elevate = await screen.findByRole("dialog", { name: "Confirm it's you" });
+    expect(backend.callsTo(`PATCH /api/apps/${DOMAIN}/health`)).toHaveLength(0);
+    await user.type(within(elevate).getByRole("textbox"), "123456");
+    await user.click(within(elevate).getByRole("button", { name: "Confirm" }));
+    await waitFor(() => {
+      expect(backend.callsTo(`PATCH /api/apps/${DOMAIN}/health`)[0]?.body).toEqual({ path: null, expect: null, timeout: 90 });
+    });
+  });
+
+  it("goes back to every default", async () => {
+    const { user, backend } = await settingsOf(
+      { ...RELEASE_APP, health_path: "/healthz", health_expect: "200", health_timeout: 60 },
+      {
+        "GET /api/auth/session": () => json(200, ELEVATED),
+        [`PATCH /api/apps/${DOMAIN}/health`]: () =>
+          json(200, { domain: DOMAIN, path: null, expect: null, timeout: null, effective_path: "/", effective_expect: "any status below 500", effective_timeout: 30 }),
+      },
+    );
+    const health = section("Health check");
+    expect(within(health).getByRole("textbox", { name: "Path" })).toHaveValue("/healthz");
+    await user.click(within(health).getByRole("button", { name: "Use defaults" }));
+    await user.click(within(health).getByRole("button", { name: "Save" }));
+    await waitFor(() => {
+      expect(backend.callsTo(`PATCH /api/apps/${DOMAIN}/health`)[0]?.body).toEqual({ path: null, expect: null, timeout: null });
+    });
+  });
+
+  it("explains why a static site has none", async () => {
+    await settingsOf(STATIC_APP);
+    const releases = section("Releases");
+    expect(within(releases).getByText(/A static site is served as files by the web server/)).toBeInTheDocument();
+    expect(within(releases).queryByRole("textbox", { name: "Path" })).not.toBeInTheDocument();
+  });
+});
+
+describe("release retention", () => {
+  it("saves how many releases to keep and says which were removed", async () => {
+    const { user, backend } = await settingsOf(RELEASE_APP, {
+      "GET /api/auth/session": () => json(200, ELEVATED),
+      [`PATCH /api/apps/${DOMAIN}/releases/retention`]: () =>
+        json(200, { domain: DOMAIN, keep_releases: 2, pruned: ["20260916-182823-d08e4f7"] }),
+    });
+    const retention = section("Retention");
+    const keep = within(retention).getByRole("textbox", { name: "Keep" });
+    expect(keep).toHaveValue("5");
+    await user.clear(keep);
+    await user.type(keep, "2");
+    await user.click(within(retention).getByRole("button", { name: "Save" }));
+    await waitFor(() => {
+      expect(backend.callsTo(`PATCH /api/apps/${DOMAIN}/releases/retention`)[0]?.body).toEqual({ keep: 2 });
+    });
+    expect(await within(retention).findByText("Saved. It keeps 2 releases; removed 1 release: 20260916-182823-d08e4f7.")).toBeInTheDocument();
+  });
+
+  it("refuses a number out of range before asking", async () => {
+    const { user, backend } = await settingsOf(RELEASE_APP);
+    const retention = section("Retention");
+    const keep = within(retention).getByRole("textbox", { name: "Keep" });
+    await user.clear(keep);
+    await user.type(keep, "80");
+    await user.click(within(retention).getByRole("button", { name: "Save" }));
+    expect(await within(retention).findByText("Keep from 1 to 50 releases.")).toBeInTheDocument();
+    expect(backend.callsTo(`PATCH /api/apps/${DOMAIN}/releases/retention`)).toHaveLength(0);
+  });
+
+  it("is only there for an app on releases", async () => {
+    await settingsOf(IN_PLACE_APP);
+    expect(screen.queryByRole("region", { name: "Retention" })).not.toBeInTheDocument();
+    expect(section("Health check")).toBeInTheDocument();
+  });
+});
+
 describe("the deploy webhook", () => {
   it("shows a new secret once, with the URL, then forgets it", async () => {
     const app = { ...RELEASE_APP, webhook_enabled: false };
@@ -464,6 +608,10 @@ describe("deleting the app", () => {
 });
 
 describe("what the dialogs say", () => {
+  it("says a save that pruned nothing removed nothing", () => {
+    expect(retentionOutcome({ keep_releases: 10, pruned: [] })).toBe("Saved. It keeps 10 releases; nothing was removed.");
+  });
+
   it("names exactly what a deletion removes and keeps", () => {
     expect(deletionSummary({ path: "/srv/a" }, true, true)).toBe(
       "Stops the app and removes the service, the web server site, the certificate and the files in /srv/a. Kept: backups. This cannot be undone.",

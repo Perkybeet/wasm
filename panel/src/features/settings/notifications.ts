@@ -10,7 +10,7 @@
  * another it shares a channel with.
  */
 
-import type { ConsoleConfig } from "../../api/queries/config";
+import type { ConsoleConfig, SmtpBody, SmtpSettings, TelegramChat } from "../../api/queries/config";
 
 /** What the server sends in place of a secret, and accepts back as "keep the stored one". */
 export const REDACTED = "***";
@@ -90,7 +90,7 @@ export const CHANNELS: readonly ChannelSpec[] = [
   {
     id: "email",
     label: "Email",
-    description: "Sends through the monitor's SMTP account to its recipients.",
+    description: "Sent through your SMTP server to the recipients below. The resource monitor's own reports use the same account.",
     fields: [],
   },
 ];
@@ -233,4 +233,171 @@ export function parseHostList(value: string): string[] {
     .map((host) => host.trim().toLowerCase())
     .filter((host) => host !== "");
   return [...new Set(hosts)];
+}
+
+// ---------------------------------------------------------------------------------------
+// Email: the monitor's SMTP account (GET/PUT /api/config/smtp)
+
+/**
+ * How the connection to the SMTP server is secured. The configuration holds two switches,
+ * `use_ssl` and `use_tls`, that must never both be on, so the form offers the three
+ * combinations that describe a real connection as one choice.
+ */
+export type SmtpSecurity = "ssl" | "starttls" | "none";
+
+export const SMTP_SECURITY: readonly { value: SmtpSecurity; label: string; port: number; description: string }[] = [
+  { value: "ssl", label: "SSL/TLS", port: 465, description: "Encrypted from the first byte (implicit TLS), usually on port 465." },
+  { value: "starttls", label: "STARTTLS", port: 587, description: "Connects in the clear and upgrades to TLS before anything is sent, usually on port 587." },
+  {
+    value: "none",
+    label: "None",
+    port: 25,
+    description: "Unencrypted, for an anonymous relay on this machine or a private network. A username or password is never sent this way.",
+  },
+];
+
+export interface SmtpForm {
+  host: string;
+  /** As typed: the server rules on whether it is a port. */
+  port: string;
+  security: SmtpSecurity;
+  username: string;
+  /** Write-only: empty keeps the stored password. */
+  password: string;
+  from_address: string;
+  recipients: readonly string[];
+}
+
+export type SmtpField = "host" | "port" | "security" | "username" | "password" | "from_address" | "recipients";
+
+export const SMTP_FIELDS: readonly SmtpField[] = ["host", "port", "security", "username", "password", "from_address", "recipients"];
+
+/**
+ * The model field each configuration key is validated under (wasm.core.config._KEY_VALIDATORS),
+ * so a refusal naming the key lands beside the field that holds it.
+ */
+export const SMTP_CONFIG_KEYS: Readonly<Record<string, SmtpField>> = {
+  "monitor.smtp.host": "host",
+  "monitor.smtp.port": "port",
+  "monitor.smtp.use_ssl": "security",
+  "monitor.smtp.use_tls": "security",
+  "monitor.smtp.username": "username",
+  "monitor.smtp.password": "password",
+  "monitor.smtp.from_address": "from_address",
+  "monitor.email_recipients": "recipients",
+};
+
+export function smtpSecurityOf(settings: Pick<SmtpSettings, "use_ssl" | "use_tls">): SmtpSecurity {
+  if (settings.use_ssl) return "ssl";
+  return settings.use_tls ? "starttls" : "none";
+}
+
+/** The form's starting values: what the server holds, with the password field empty. */
+export function smtpFormFrom(settings: SmtpSettings): SmtpForm {
+  return {
+    host: settings.host,
+    port: String(settings.port),
+    security: smtpSecurityOf(settings),
+    username: settings.username,
+    password: "",
+    from_address: settings.from_address,
+    recipients: settings.recipients,
+  };
+}
+
+/**
+ * Whether a form differs from what is stored. A typed password is a change; an empty one keeps
+ * the stored password, so it is not.
+ */
+export function smtpFormDirty(form: SmtpForm, stored: SmtpForm): boolean {
+  return (
+    form.host !== stored.host ||
+    form.port.trim() !== stored.port ||
+    form.security !== stored.security ||
+    form.username !== stored.username ||
+    form.password !== "" ||
+    form.from_address !== stored.from_address ||
+    form.recipients.length !== stored.recipients.length ||
+    form.recipients.some((address, index) => address !== stored.recipients[index])
+  );
+}
+
+/**
+ * The PUT body for a form. The port goes as a number when it is one; anything else is sent as
+ * typed, so the server's own message about it lands beside the field instead of the console
+ * inventing one.
+ */
+export function smtpBody(form: SmtpForm): SmtpBody {
+  const typedPort = form.port.trim();
+  const port = /^\d+$/.test(typedPort) ? Number(typedPort) : (typedPort as unknown as number);
+  return {
+    host: form.host.trim(),
+    port,
+    use_ssl: form.security === "ssl",
+    use_tls: form.security === "starttls",
+    username: form.username.trim(),
+    password: form.password,
+    from_address: form.from_address.trim(),
+    recipients: [...form.recipients],
+  };
+}
+
+/**
+ * When the security choice changes and the port is still the old choice's usual one, the new
+ * choice's usual port; otherwise the port as it is, since the operator chose it on purpose.
+ */
+export function portForSecurity(port: string, from: SmtpSecurity, to: SmtpSecurity): string {
+  const previous = SMTP_SECURITY.find((option) => option.value === from)?.port;
+  const next = SMTP_SECURITY.find((option) => option.value === to)?.port;
+  return next !== undefined && port.trim() === String(previous) ? String(next) : port;
+}
+
+/** The same shape `wasm.core.config._EMAIL_PATTERN` accepts: something@something.tld, no spaces. */
+const EMAIL_SHAPE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+
+export function looksLikeEmail(value: string): boolean {
+  return EMAIL_SHAPE.test(value);
+}
+
+/** Addresses typed into the recipients box: one or several, separated by commas, semicolons or spaces. */
+export function splitAddresses(value: string): string[] {
+  return value
+    .split(/[\s,;]+/)
+    .map((address) => address.trim())
+    .filter((address) => address !== "");
+}
+
+/**
+ * The addresses a refusal of `monitor.email_recipients` names: the server lists the invalid
+ * ones after the colon ("... contains an invalid email address: a, b").
+ */
+export function refusedRecipients(message: string | undefined, recipients: readonly string[]): ReadonlySet<string> {
+  if (message === undefined) return new Set();
+  const colon = message.indexOf(": ");
+  if (!message.startsWith("monitor.email_recipients") || colon === -1) return new Set();
+  // The hint follows the list after a sentence break; only exact addresses of the form count.
+  const named = message.slice(colon + 2).split(/,\s*|\s+/);
+  return new Set(recipients.filter((address) => named.includes(address)));
+}
+
+// ---------------------------------------------------------------------------------------
+// Telegram: the chats the bot has seen
+
+const CHAT_TYPES: Readonly<Record<string, string>> = {
+  private: "Private chat",
+  group: "Group",
+  supergroup: "Supergroup",
+  channel: "Channel",
+};
+
+/** A chat's type in words. */
+export function telegramChatType(type: string): string {
+  return CHAT_TYPES[type] ?? type;
+}
+
+/** What a chat is called: its title, else its @username, else its type. */
+export function telegramChatName(chat: TelegramChat): string {
+  if (chat.title) return chat.title;
+  if (chat.username) return `@${chat.username}`;
+  return telegramChatType(chat.type);
 }

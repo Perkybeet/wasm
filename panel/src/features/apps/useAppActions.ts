@@ -1,7 +1,9 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
 
-import { request } from "../../api/client";
+import { isApiError, request } from "../../api/client";
 import { ElevationCancelledError } from "../../api/errors";
+import type { ApiError } from "../../api/errors";
 import { appKeys } from "../../api/queries/apps";
 import { jobKeys } from "../../api/queries/jobs";
 import type { Job } from "../../api/queries/jobs";
@@ -28,6 +30,14 @@ export function reportActionError(title: string, error: unknown): void {
   }
   const { hint, detail, output } = describeError(error);
   toast.error(title, { detail, ...(hint !== null ? { description: hint } : {}), ...(output !== null ? { output } : {}) });
+}
+
+/**
+ * An update the API refused because the branch has nothing the live build lacks (`409
+ * nothing_new`): not a failure, a question - rebuild the same commit anyway?
+ */
+export function isNothingNew(error: unknown): error is ApiError {
+  return isApiError(error) && error.error === "nothing_new";
 }
 
 type UnitVerb = "restart" | "start" | "stop";
@@ -103,12 +113,33 @@ export function useAppActions(domain: string, { onJobQueued }: AppActionOptions 
   const start = useUnitAction(domain, "start", refresh);
   const stop = useUnitAction(domain, "stop", refresh);
 
+  // The refusal that asks "rebuild anyway?", kept apart from the mutations' own errors so the
+  // question stays open while the forced retry is in flight.
+  const [nothingNew, setNothingNew] = useState<ApiError | null>(null);
+  const callUpdate = (force: boolean) => request("post", "/api/jobs/update", { body: { domain, force } });
   const update = useMutation({
-    mutationFn: () => request("post", "/api/jobs/update", { body: { domain } }),
+    mutationFn: () => callUpdate(false),
     onSuccess: (result) => {
+      setNothingNew(null);
       queued(result.job, "Update");
     },
     onError: (error) => {
+      if (isNothingNew(error)) {
+        setNothingNew(error);
+        return;
+      }
+      reportActionError(`Update of ${domain} could not be queued`, error);
+    },
+  });
+  // The same update, told to rebuild the commit that is live: only after nothing_new asked.
+  const rebuildAnyway = useMutation({
+    mutationFn: () => callUpdate(true),
+    onSuccess: (result) => {
+      setNothingNew(null);
+      queued(result.job, "Update");
+    },
+    onError: (error) => {
+      setNothingNew(null);
       reportActionError(`Update of ${domain} could not be queued`, error);
     },
   });
@@ -136,5 +167,18 @@ export function useAppActions(domain: string, { onJobQueued }: AppActionOptions 
 
   // Deleting is not here: it goes through features/app/useDeleteApp, the endpoint behind sudo
   // mode (DELETE /api/apps/{domain}), never POST /api/jobs/delete, which does not ask.
-  return { restart, start, stop, update, rollbackToBackup, activateRelease };
+  return {
+    restart,
+    start,
+    stop,
+    update,
+    rebuildAnyway,
+    /** The update's `nothing_new` refusal, while its question is open (see NothingNewDialog). */
+    nothingNew,
+    dismissNothingNew: () => {
+      setNothingNew(null);
+    },
+    rollbackToBackup,
+    activateRelease,
+  };
 }

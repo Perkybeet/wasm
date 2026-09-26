@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import { Link } from "@tanstack/react-router";
+import { useId, useState } from "react";
 
 import { networkQuery, processesQuery, systemHealthQuery, systemInfoQuery, versionQuery } from "../../api/queries/system";
 import { PageHeader } from "../../app/PageHeader";
@@ -14,11 +15,13 @@ import { Skeleton } from "../../components/ui/Skeleton";
 import { StatusGlyph, StatusPill, stateTextClass } from "../../components/ui/StatusPill";
 import { formatBytes, formatPercent } from "../../lib/format";
 import { MonitorCard } from "./MonitorCard";
-import { checkName, checkView, verdictView } from "./data";
-import type { HealthCheck } from "./data";
+import { checkName, checkView, healthReasons, verdictView } from "./data";
+import type { HealthCheck, HealthReason } from "./data";
 
 /** The checks `wasm health` runs on a typical machine, for the placeholder's height. */
 const TYPICAL_CHECKS = 6;
+/** Reasons a report usually gives when it gives any: an app down, a certificate close to expiry. */
+const TYPICAL_REASONS = 2;
 /** Mounts a server usually has: the root, a boot partition, a data volume. */
 const TYPICAL_DISKS = 3;
 /** The loopback and one network card. */
@@ -26,9 +29,63 @@ const TYPICAL_INTERFACES = 2;
 /** The processes the table asks for; a machine always runs at least that many. */
 const PROCESS_LIMIT = 25;
 
+/** One reason for the verdict, in the report's words; a certificate it names links to that certificate. */
+function ReasonText({ reason }: { reason: HealthReason }) {
+  const mention = reason.certificate;
+  if (mention === null) return <>{reason.message}</>;
+  return (
+    <>
+      {mention.before}
+      <Link
+        to="/domains"
+        search={{ q: mention.name }}
+        translate="no"
+        className="rounded-[4px] font-medium text-accent-fg underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-focus"
+      >
+        {mention.name}
+      </Link>
+      {mention.after}
+    </>
+  );
+}
+
+/**
+ * Why the verdict is what it is: every issue (what fails the check) and warning (what only
+ * needs attention) the report gives, each with its level as colour, shape and word.
+ */
+function HealthReasons({ reasons }: { reasons: readonly HealthReason[] }) {
+  const headingId = useId();
+  return (
+    <div aria-labelledby={headingId} role="group" className="flex min-w-0 flex-col py-2">
+      <h3 id={headingId} className="py-1 text-12 font-medium text-fg-muted">
+        Reasons
+      </h3>
+      {reasons.length === 0 ? (
+        <p className="py-1 text-13 text-fg-muted">Nothing needs attention.</p>
+      ) : (
+        <ul className="flex flex-col">
+          {reasons.map((reason, index) => (
+            <li key={`${reason.level}-${String(index)}`} className="grid grid-cols-[5.5rem_minmax(0,1fr)] items-baseline gap-x-2 py-1">
+              <StatusPill
+                state={reason.level === "issue" ? "failed" : "warning"}
+                label={reason.level === "issue" ? "Critical" : "Warning"}
+                appearance="inline"
+                size="sm"
+              />
+              <span className="text-13 text-pretty text-fg">
+                <ReasonText reason={reason} />
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 function HealthChecks({ checks }: { checks: readonly HealthCheck[] }) {
   return (
-    <ul className="flex flex-col divide-y divide-border">
+    <ul aria-label="Checks" className="flex flex-col divide-y divide-border">
       {checks.map((check) => {
         const view = checkView(check.status);
         return (
@@ -54,13 +111,27 @@ function HealthSkeleton() {
         <div className="flex h-12 items-center border-b border-border">
           <Skeleton className="h-6 w-20 rounded-pill" />
         </div>
-        <div className="flex flex-col divide-y divide-border">
-          {Array.from({ length: TYPICAL_CHECKS }, (_, index) => (
-            <div key={index} className="flex h-9 items-center justify-between gap-3">
-              <Skeleton className="h-3 w-28" />
-              <Skeleton className="h-3 w-40" />
+        <div className="grid min-w-0 gap-x-6 max-lg:divide-y max-lg:divide-border lg:grid-cols-2">
+          {/* The reasons' heading and a couple of them: the count is not known until the answer. */}
+          <div className="flex flex-col py-2">
+            <div className="flex h-6 items-center">
+              <Skeleton className="h-3 w-16" />
             </div>
-          ))}
+            {Array.from({ length: TYPICAL_REASONS }, (_, index) => (
+              <div key={index} className="flex h-7 items-center gap-2">
+                <Skeleton className="h-3 w-[5.5rem]" />
+                <Skeleton className="h-3 w-64 max-w-full" />
+              </div>
+            ))}
+          </div>
+          <div className="flex flex-col divide-y divide-border lg:border-l lg:border-border lg:pl-6">
+            {Array.from({ length: TYPICAL_CHECKS }, (_, index) => (
+              <div key={index} className="flex h-9 items-center justify-between gap-3">
+                <Skeleton className="h-3 w-28" />
+                <Skeleton className="h-3 w-40" />
+              </div>
+            ))}
+          </div>
         </div>
       </div>
     </div>
@@ -80,7 +151,13 @@ function Health() {
           <div className="flex items-center gap-2 border-b border-border py-3">
             <StatusPill state={verdictView(health.data.verdict).state} label={verdictView(health.data.verdict).label} />
           </div>
-          <HealthChecks checks={health.data.checks} />
+          {/* The reasons beside the checks on a wide screen, so a verdict never stands without them. */}
+          <div className="grid min-w-0 gap-x-6 max-lg:divide-y max-lg:divide-border lg:grid-cols-2">
+            <HealthReasons reasons={healthReasons(health.data)} />
+            <div className="min-w-0 lg:border-l lg:border-border lg:pl-6">
+              <HealthChecks checks={health.data.checks} />
+            </div>
+          </div>
         </div>
       )}
       <CommandHint command="wasm health" label="From a terminal" />

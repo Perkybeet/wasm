@@ -61,7 +61,7 @@ test("tests each channel and reports what the receiving server answered", async 
     const email = page.getByRole("article", { name: "Email" });
     await expect(email.getByText("Not configured")).toBeVisible();
     await expect(email.getByRole("button", { name: "Send test" })).toBeDisabled();
-    await expect(email.getByText("Set up the SMTP server to test it.")).toBeVisible();
+    await expect(email.getByText("Set up the SMTP server and a recipient to test it.")).toBeVisible();
     await expectNoA11yViolations(page, "unconfigured channels");
 
     // Allow this machine as a destination, which the SSRF guard refuses otherwise.

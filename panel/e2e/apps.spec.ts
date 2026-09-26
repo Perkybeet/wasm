@@ -104,7 +104,7 @@ test("a row's menu restarts the app and queues an update through the API", async
   await page.getByRole("button", { name: "Actions for picconia.com" }).click();
   const queued = page.waitForRequest((request) => request.url().endsWith("/api/jobs/update") && request.method() === "POST");
   await page.getByRole("menuitem", { name: "Update" }).click();
-  expect((await queued).postDataJSON()).toEqual({ domain: "picconia.com" });
+  expect((await queued).postDataJSON()).toEqual({ domain: "picconia.com", force: false });
   await expect(toasts(page).getByText("Update of picconia.com queued")).toBeVisible();
 });
 

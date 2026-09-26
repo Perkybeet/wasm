@@ -1,12 +1,15 @@
 /**
  * An application's deployments against the real backend: the history with keyset "Load
  * more", a failed deploy's page with its error verbatim and the phase it stopped in, an
- * instant rollback of a release app, and a live update streaming its build log until it
- * succeeds. Runs in both themes, with the CSP and console gates of the `problems` fixture.
+ * instant rollback of a release app, a live update streaming its build log until it
+ * succeeds, and a deploy's own actions: rebuilding its commit and going back to it. Runs in
+ * both themes, with the CSP and console gates of the `problems` fixture.
  *
- * The seeded machine (scripts/console_server.py, "an application's tabs"): tienda.cittek.es is
- * on releases with thirteen deploys, pedidos.cittek.es is in place with a real tree whose update
- * runs the real update sequence, its npm output streamed a line at a time.
+ * The seeded machine (scripts/console_server.py, "an application's tabs" and "a deploy's
+ * actions"): tienda.cittek.es is on releases with thirteen deploys, two of whose releases are
+ * on disk and not serving; pedidos.cittek.es is in place with a real tree whose update runs the
+ * real update sequence, its npm output streamed a line at a time, and a deployment whose
+ * snapshot backup still exists; bodas.arennalabs.com is a static site with one deploy.
  */
 
 import type { Page } from "@playwright/test";
@@ -15,12 +18,48 @@ import { expect, expectNoA11yViolations, settle, signIn, stillness, test } from 
 
 const RELEASES_APP = "tienda.cittek.es";
 const LIVE_APP = "pedidos.cittek.es";
+const STATIC_APP = "bodas.arennalabs.com";
 
 interface Row {
   id: number;
   status: string;
   error: string | null;
   commit_message: string | null;
+  git_commit: string | null;
+  release_id: string | null;
+  job_id: string | null;
+  rollback_available: boolean;
+  rollback_unavailable_reason: string | null;
+  snapshot_backup: string | null;
+}
+
+interface ReleaseRow {
+  id: string;
+  active: boolean;
+}
+
+/** The CSRF header every write through `page.request` carries, mirrored from its cookie. */
+async function csrf(page: Page): Promise<Record<string, string>> {
+  const cookie = (await page.context().cookies()).find((entry) => entry.name === "wasm_csrf");
+  return cookie ? { "X-WASM-CSRF": cookie.value } : {};
+}
+
+async function serving(page: Page, domain: string): Promise<string> {
+  const body = (await (await page.request.get(`/api/apps/${domain}/releases`)).json()) as { items: ReleaseRow[] };
+  const active = body.items.find((release) => release.active);
+  if (!active) throw new Error(`nothing serves ${domain}`);
+  return active.id;
+}
+
+/** Puts a release back in service through the API, as the Deployments tab's Activate does. */
+/** The seeded deploy of 19d3f6e, whose release is on disk: not a row a rollback to it wrote since. */
+function seededOnDisk(row: Row): boolean {
+  return row.git_commit === "19d3f6e" && row.release_id !== null && row.rollback_available;
+}
+
+async function activate(page: Page, domain: string, release: string): Promise<void> {
+  const response = await page.request.post(`/api/apps/${domain}/releases/${release}/activate`, { headers: await csrf(page) });
+  expect(response.ok(), await response.text()).toBe(true);
 }
 
 async function deployment(page: Page, domain: string, pick: (row: Row) => boolean): Promise<number> {
@@ -120,19 +159,24 @@ test("a release app rolls back to an earlier release in seconds, and forward aga
   await expect(serving.locator(".mono").first()).toHaveText(before);
 });
 
-test("a redeploy streams its build log live and flips to success", async ({ page, consoleServer }) => {
+test("an update streams its build log live and flips to success", async ({ page, consoleServer }) => {
   await signIn(page, consoleServer, `/apps/${LIVE_APP}/deployments`);
   const latest = await deployment(page, LIVE_APP, () => true);
-  await page.goto(`/apps/${LIVE_APP}/deployments/${String(latest)}`);
-  await expect(page.getByRole("heading", { level: 2, name: `Deployment ${String(latest)}` })).toBeVisible();
 
-  await page.getByRole("button", { name: "Redeploy" }).click();
-  // The console opens the deploy the update started as soon as it is recorded.
-  await expect(page).not.toHaveURL(new RegExp(`/deployments/${String(latest)}$`));
-  const heading = page.getByRole("heading", { level: 2, name: /^Deployment \d+$/ });
-  await expect(heading).not.toHaveText(`Deployment ${String(latest)}`);
-  const title = (await heading.textContent()) ?? "";
-  const log = page.getByRole("region", { name: `Build log of ${title.toLowerCase()} of ${LIVE_APP}` });
+  await page.locator("main header").getByRole("button", { name: "Update", exact: true }).click();
+  // The update records its deploy within moments; opened as soon as it is there.
+  let next = latest;
+  await expect
+    .poll(
+      async () => {
+        next = await deployment(page, LIVE_APP, () => true);
+        return next;
+      },
+      { intervals: [250] },
+    )
+    .not.toBe(latest);
+  await page.goto(`/apps/${LIVE_APP}/deployments/${String(next)}`);
+  const log = page.getByRole("region", { name: `Build log of deployment ${String(next)} of ${LIVE_APP}` });
 
   // Streamed while running: the install's output arrives before the build's.
   await expect(page.getByText("In progress", { exact: true }).first()).toBeVisible();
@@ -141,11 +185,103 @@ test("a redeploy streams its build log live and flips to success", async ({ page
   await expect(page.getByText("Succeeded", { exact: true }).first()).toBeVisible({ timeout: 20_000 });
   await expect(phase(page, "build")).toHaveAttribute("data-state", "done");
   await expect(phase(page, "activate")).toHaveAttribute("data-state", "done");
+  // The header's pill pulses once when the app comes back up; axe judges it after that.
+  await expect(page.locator("main header").locator("[data-state]").first()).toHaveAttribute("data-state", "running");
 
   await dismissToasts(page);
   await settle(page);
   await stillness(page);
   await expectNoA11yViolations(page, "a deploy that just succeeded");
+});
+
+test("rebuilding a deploy's commit says what it does first, then follows the job to its end", async ({ page, consoleServer }) => {
+  await signIn(page, consoleServer, `/apps/${RELEASES_APP}/deployments`);
+  const id = await deployment(page, RELEASES_APP, seededOnDisk);
+  await page.goto(`/apps/${RELEASES_APP}/deployments/${String(id)}`);
+
+  await page.getByRole("button", { name: "Rebuild this commit" }).click();
+  const dialog = page.getByRole("dialog", { name: "Rebuild commit 19d3f6e?" });
+  await expect(dialog.getByText(/If a release built from 19d3f6e is still on disk and is not the one serving, it is activated in seconds/)).toBeVisible();
+  await settle(page);
+  await expectNoA11yViolations(page, "the rebuild confirmation");
+
+  const queued = page.waitForResponse((response) => response.url().endsWith(`/api/apps/${RELEASES_APP}/deployments/${String(id)}/rebuild`));
+  await dialog.getByRole("button", { name: "Rebuild" }).click();
+  expect((await queued).status()).toBe(202);
+  await expect(dialog).toBeHidden();
+  // The sandbox's repository cache holds no commits, so the job ends in the updater's own
+  // words - the part that matters here is that the page followed the job to its end.
+  await expect(page.getByText("The rebuild failed")).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator("pre").filter({ hasText: "Commit 19d3f6e does not exist in the repository" }).first()).toBeVisible();
+});
+
+test("a release app goes back to a deployment through its own endpoint, and forward again", async ({ page, consoleServer }) => {
+  await signIn(page, consoleServer, `/apps/${RELEASES_APP}/deployments`);
+  const before = await serving(page, RELEASES_APP);
+  const id = await deployment(page, RELEASES_APP, seededOnDisk);
+  await page.goto(`/apps/${RELEASES_APP}/deployments/${String(id)}`);
+
+  await page.getByRole("button", { name: "Roll back to this" }).click();
+  const dialog = page.getByRole("dialog", { name: `Roll back to deployment ${String(id)}?` });
+  await expect(dialog.getByText(/is activated in seconds and the app restarts/)).toBeVisible();
+  await settle(page);
+  await expectNoA11yViolations(page, "the rollback-to-a-deployment confirmation");
+  const queued = page.waitForResponse((response) => response.url().endsWith(`/api/apps/${RELEASES_APP}/deployments/${String(id)}/rollback`));
+  await dialog.getByRole("button", { name: "Roll back", exact: true }).click();
+  expect((await queued).status()).toBe(202);
+  await expect(page.getByText(`Rolled back to deployment ${String(id)}.`)).toBeVisible({ timeout: 30_000 });
+  expect(await serving(page, RELEASES_APP)).toMatch(/-19d3f6e$/);
+
+  // Forward again, so the worker's machine is as it was for the next test.
+  await activate(page, RELEASES_APP, before);
+});
+
+test("the deploy that is live says why it cannot be gone back to, and offers the other versions", async ({ page, consoleServer }) => {
+  await signIn(page, consoleServer, `/apps/${RELEASES_APP}/deployments`);
+  const live = await serving(page, RELEASES_APP);
+  const id = await deployment(page, RELEASES_APP, (row) => row.release_id === live);
+  await page.goto(`/apps/${RELEASES_APP}/deployments/${String(id)}`);
+  await expect(page.getByText(`Can't roll back to this deployment: Release ${live} is already live.`)).toBeVisible();
+  await page.getByRole("button", { name: "Roll back…" }).click();
+  const chooser = page.getByRole("dialog", { name: `Roll back ${RELEASES_APP}` });
+  await expect(chooser.getByRole("radio").first()).toBeVisible();
+  await chooser.getByRole("button", { name: "Cancel" }).click();
+  await expect(chooser).toBeHidden();
+});
+
+test("an in-place deploy whose snapshot still exists offers to go back to it", async ({ page, consoleServer }) => {
+  await signIn(page, consoleServer, `/apps/${LIVE_APP}/deployments`);
+  const response = await page.request.get(`/api/deployments?domain=${LIVE_APP}&limit=50`);
+  const rows = ((await response.json()) as { items: Row[] }).items;
+  const restorable = rows.find((row) => row.rollback_available && row.snapshot_backup !== null);
+  if (!restorable?.snapshot_backup) throw new Error(`no seeded deployment of ${LIVE_APP} has a snapshot`);
+  await page.goto(`/apps/${LIVE_APP}/deployments/${String(restorable.id)}`);
+  await page.getByRole("button", { name: "Roll back to this" }).click();
+  const dialog = page.getByRole("dialog", { name: `Roll back to deployment ${String(restorable.id)}?` });
+  await expect(dialog.getByText(new RegExp(`restored from backup ${restorable.snapshot_backup}.*A backup of the current state is taken first`))).toBeVisible();
+  await settle(page);
+  await expectNoA11yViolations(page, "an in-place rollback to a deployment");
+  // Not confirmed: the worker's app keeps its files.
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(dialog).toBeHidden();
+});
+
+test.describe("in a browser five and a half hours from the server", () => {
+  test.use({ timezoneId: "Asia/Kolkata" });
+
+  test("a static site's deploy has no health check, and its phases take the log's own seconds", async ({ page, consoleServer }) => {
+    await signIn(page, consoleServer, `/apps/${STATIC_APP}/deployments`);
+    const id = await deployment(page, STATIC_APP, () => true);
+    await page.goto(`/apps/${STATIC_APP}/deployments/${String(id)}`);
+    await expect(phase(page, "health")).toHaveAttribute("data-state", "not_applicable");
+    await expect(phase(page, "health")).toContainText("Not applicable");
+    await expect(page.getByText(/Health does not apply: a static site is served as files/)).toBeVisible();
+    // Activating to the last line: four seconds, whatever zone the browser is in.
+    await expect(phase(page, "activate")).toContainText("4.0s");
+    await expect(phase(page, "fetch")).toContainText("6.0s");
+    await settle(page);
+    await expectNoA11yViolations(page, "a static site's deploy");
+  });
 });
 
 test("an in-place app offers its backups to roll back to", async ({ page, consoleServer }) => {

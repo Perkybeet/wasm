@@ -8,6 +8,7 @@ import { byUrgency, certificateJobFor, certificateView, covers, issuerName } fro
 import { configRejection, failingLine, lineOffset } from "./configErrors";
 import { dnsVerdict, isPrivateAddress, recordsToCreate } from "./dns";
 import { domainProblem, parseNames, truncatedNames, wwwOf } from "./names";
+import { validateDomainsSearch } from "./search";
 
 describe("domain names", () => {
   it("accepts ordinary and internationalised names, trimmed and lowercased", () => {
@@ -206,5 +207,16 @@ describe("creating a site", () => {
     expect(createSiteBody({ ...form, domain: "nope", port: "70000" })).toEqual({
       errors: { domain: expect.stringMatching(/two parts/) as string, port: expect.stringMatching(/between 1 and 65535/) as string },
     });
+  });
+});
+
+describe("the page's search params", () => {
+  it("keeps the tab and the certificates' filter a link opens them with, and drops anything else", () => {
+    expect(validateDomainsSearch({})).toEqual({});
+    expect(validateDomainsSearch({ tab: "sites" })).toEqual({ tab: "sites" });
+    expect(validateDomainsSearch({ tab: "certificates", q: " shop.example.com " })).toEqual({ tab: "certificates", q: "shop.example.com" });
+    expect(validateDomainsSearch({ q: "shop.example.com" })).toEqual({ q: "shop.example.com" });
+    expect(validateDomainsSearch({ tab: "nope", q: "" })).toEqual({});
+    expect(validateDomainsSearch({ q: 42 })).toEqual({});
   });
 });
