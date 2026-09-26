@@ -261,6 +261,27 @@ What does not come back:
 - Deployment history, jobs and audit entries recorded under 2.0 (kept in
   `/var/lib/wasm.2.0` and `/etc/wasm.2.0`).
 
+## 2.1
+
+What changes when a 2.0 server upgrades to 2.1 (see [CHANGELOG-2.1.md](CHANGELOG-2.1.md)):
+
+- **Licence**: 2.1.0 is under the GNU AGPL 3.0 or later.
+- **The store moves to schema 9** on the first command (health check settings per
+  application, and the link between an in-place deployment and its backup). 2.0.x cannot
+  read a migrated store; back it up first, as for 2.0.
+- **Cron jobs**: a job's unit now records the command as typed. Units written by 2.0 keep
+  working and are read back correctly; each is rewritten in the new form the next time it is
+  saved.
+- **Rate limits**: signed-in requests count per credential (1200 a minute); only requests
+  without a valid credential count against `web.rate_limit_requests`. `/health` and `/hooks/`
+  always count by address.
+- **Services API**: WASM's own units (`wasm-web`, `wasm-monitor`, `wasm-cron-*`,
+  `wasm-backup-*`) are refused there; use `wasm web`, `wasm monitor`, and the cron and backup
+  pages or commands.
+- **SMTP**: changing the server, user or TLS settings asks for the password again.
+- **The console as a service**: after upgrading, `wasm web enable` (with the options you use
+  with `wasm web start`) keeps it running across reboots; upgrades restart it.
+
 ## 2.0.1
 
 **Backups: check where yours went**

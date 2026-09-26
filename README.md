@@ -523,6 +523,7 @@ When `/var/lib/wasm` is not writable the store lives in `~/.local/share/wasm/`;
 - [docs/security.md](docs/security.md): threat model, controls, reporting vulnerabilities
 - [docs/MONITOR.md](docs/MONITOR.md): the resource monitor
 - [docs/UPGRADING-2.0.md](docs/UPGRADING-2.0.md): upgrading from 1.6
+- [docs/CHANGELOG-2.1.md](docs/CHANGELOG-2.1.md): what changed in 2.1
 - [docs/CHANGELOG-2.0.md](docs/CHANGELOG-2.0.md): what changed in 2.0
 - `man wasm`, and `wasm <command> --help`
 
