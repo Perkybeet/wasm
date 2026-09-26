@@ -1,0 +1,1 @@
+import{r as e}from"./cx-DTdc60p7.js";import{n as t,r as n}from"./status-BIb5TRtG.js";import{r}from"./StatusPill-BUinigRY.js";var i=e();function a({status:e,...n}){let a=t(e);return(0,i.jsx)(r,{state:a.state,label:a.label,...n})}function o({status:e,...t}){let a=n(e);return(0,i.jsx)(r,{state:a.state,label:a.label,...t})}export{o as n,a as t};

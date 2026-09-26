@@ -1,1 +1,0 @@
-import{r as e}from"./cx-DTdc60p7.js";import{n as t,t as n}from"./domains-UaMnA-hL.js";var r=e();function i(){let{tab:e=`certificates`}=n.useSearch(),i=n.useNavigate();return(0,r.jsx)(t,{tab:e,onTabChange:e=>void i({search:e===`certificates`?{}:{tab:e}})})}export{i as component};

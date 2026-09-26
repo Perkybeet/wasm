@@ -1,0 +1,1 @@
+import{t as e}from"./useBaseUiId-B-rEdL01.js";import{R as t}from"./errors-DiqCMoSt.js";function n(n,r){let i=e(n);return t(()=>(r(i),()=>{r(e=>e===i?void 0:e)}),[i,r]),i}export{n as t};

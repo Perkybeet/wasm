@@ -1,0 +1,1 @@
+import{i as e,o as t}from"./cx-DTdc60p7.js";var n=t(e(),1),r=n.createContext(void 0),i={disableStyleElements:!1};function a(){return n.useContext(r)??i}export{a as n,r as t};
