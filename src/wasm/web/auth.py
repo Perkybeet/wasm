@@ -50,6 +50,7 @@ import stat
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -3454,16 +3455,159 @@ def credential_key(payload: Mapping[str, Any]) -> str:
     return str(payload.get("sid") or "unknown")
 
 
+#: Paths whose endpoints verify a credential the request carries. Anywhere
+#: else - ``/health``, the forge webhooks - nothing ever checks one, so the
+#: rate limiter does not either: a credential it looked at there would land a
+#: valid guess in the roomy budget, say so in ``X-RateLimit-Limit``, and never
+#: count a wrong one.
+CREDENTIAL_PATH_PREFIXES = ("/api", "/events", "/ws")
+
+
+def carries_credentials(path: str) -> bool:
+    """
+    Report whether a request path is one whose endpoints verify credentials.
+
+    Args:
+        path: The request path.
+
+    Returns:
+        True for a path equal to or below one of
+        :data:`CREDENTIAL_PATH_PREFIXES`, matched by whole segment.
+    """
+    return any(
+        path == prefix or path.startswith(prefix + "/") for prefix in CREDENTIAL_PATH_PREFIXES
+    )
+
+
+@dataclass
+class CredentialLedger:
+    """
+    The wrong credentials one request presented, and whether each was counted.
+
+    The rate limiter checks a credential before any endpoint does, and an
+    endpoint may never check it (a public route, a 404). Without a ledger the
+    limiter had two bad choices: count the failure itself, so every endpoint
+    that also counts it counted it twice, or count nothing, and be an oracle
+    wherever no endpoint looked. So the limiter notes each wrong credential
+    here, :func:`verify_credential` and :func:`authenticate_connection` mark
+    the ones they count, and :func:`settle_credential_failures` counts the
+    rest once the request is over.
+
+    Attributes:
+        client_ip: The address the request came from.
+        resource: The path it reached, for the audit record.
+        pending: Fingerprint of each wrong credential not yet counted, mapped
+            to the channel it arrived on.
+    """
+
+    client_ip: str
+    resource: str
+    pending: dict[str, str] = field(default_factory=dict)
+
+
+_credential_ledger: ContextVar[CredentialLedger | None] = ContextVar(
+    "wasm_credential_ledger", default=None
+)
+
+
+def _fingerprint(credential: str) -> str:
+    """
+    Name a credential without keeping it.
+
+    Args:
+        credential: The credential.
+
+    Returns:
+        Its SHA-256, hexadecimal.
+    """
+    return hashlib.sha256(credential.encode("utf-8", "surrogateescape")).hexdigest()
+
+
+def open_credential_ledger(client_ip: str, resource: str) -> Token[CredentialLedger | None]:
+    """
+    Start accounting for the wrong credentials of one request.
+
+    Args:
+        client_ip: The resolved client address.
+        resource: The request path.
+
+    Returns:
+        The token :func:`settle_credential_failures` closes the ledger with.
+    """
+    return _credential_ledger.set(CredentialLedger(client_ip, resource))
+
+
+def settle_credential_failures(token: Token[CredentialLedger | None]) -> None:
+    """
+    Count every wrong credential the request presented that nothing counted.
+
+    Args:
+        token: What :func:`open_credential_ledger` returned for this request.
+    """
+    ledger = _credential_ledger.get()
+    _credential_ledger.reset(token)
+    if ledger is None:
+        return
+    for source in ledger.pending.values():
+        record_auth_failure(ledger.client_ip, ledger.resource, source)
+
+
+def _note_wrong_credential(credential: str, source: str) -> None:
+    """
+    Note a wrong credential the rate limiter found, for counting later.
+
+    Args:
+        credential: The credential.
+        source: Channel it arrived on.
+    """
+    ledger = _credential_ledger.get()
+    if ledger is not None:
+        ledger.pending.setdefault(_fingerprint(credential), source)
+
+
+def _mark_counted(*credentials: str | None) -> None:
+    """
+    Take credentials off the ledger because their failure has been counted.
+
+    Args:
+        *credentials: The credentials whose failure was just recorded.
+    """
+    ledger = _credential_ledger.get()
+    if ledger is None:
+        return
+    for credential in credentials:
+        if credential:
+            ledger.pending.pop(_fingerprint(credential), None)
+
+
+def _is_guess(credential: str) -> bool:
+    """
+    Report whether a credential that did not verify counts as a guess.
+
+    Args:
+        credential: A credential :func:`check_credential` refused.
+
+    Returns:
+        False for a session token this server signed: it can be expired,
+        revoked or presented from the wrong address, but producing one takes
+        the signing key, and counting it would lock out the operator whose
+        browser simply outlived its session.
+    """
+    manager = get_global_token_manager()
+    return manager is None or not manager.signed_session_token(credential)
+
+
 def rate_limit_identity(connection: HTTPConnection, client_ip: str) -> str | None:
     """
     Name the valid credential a request carries, for the rate limiter.
 
     Checks the channels a request can carry a credential on - the session
     cookie, the ``wasm.token.`` subprotocol of a WebSocket handshake, the
-    ``Authorization`` header - with :func:`check_credential`, which records
-    nothing: a wrong credential is counted against the lockout by the
-    endpoint that refuses it, once, not here as well. A single-use WebSocket
-    ticket is not looked at, because checking it would spend it.
+    ``Authorization`` header - with :func:`check_credential`. A wrong one is
+    noted on the request's :class:`CredentialLedger`, and counted against the
+    lockout once: by the endpoint that refuses it, or when the request ends if
+    no endpoint looked at it. A single-use WebSocket ticket is not looked at,
+    because checking it would spend it.
 
     Args:
         connection: The incoming request or handshake.
@@ -3473,16 +3617,18 @@ def rate_limit_identity(connection: HTTPConnection, client_ip: str) -> str | Non
         :func:`credential_key` of the first valid credential, or None when the
         request carries none, in which case it is counted by address.
     """
-    candidates = [connection.cookies.get(SESSION_COOKIE_NAME)]
+    candidates = [("cookie", connection.cookies.get(SESSION_COOKIE_NAME))]
     if connection.scope["type"] == "websocket":
-        candidates.append(subprotocol_token(connection))
-    candidates.append(bearer_token(connection))
-    for credential in candidates:
+        candidates.append(("websocket", subprotocol_token(connection)))
+    candidates.append(("bearer", bearer_token(connection)))
+    for source, credential in candidates:
         if not credential:
             continue
         payload = check_credential(credential, client_ip)
         if payload is not None:
             return credential_key(payload)
+        if _is_guess(credential):
+            _note_wrong_credential(credential, source)
     return None
 
 
@@ -3538,14 +3684,10 @@ def verify_credential(
     """
     payload = check_credential(credential, client_ip)
     if payload is None:
-        manager = get_global_token_manager()
-        # A session token that carries our own signature was issued by this
-        # server: it can be expired, revoked or presented from the wrong
-        # address, but it cannot be a guess, because producing one takes the
-        # signing key. Counting it would lock out the operator whose browser
-        # simply outlived its session - on the sign-in page it was sent to.
-        if manager is None or not manager.signed_session_token(credential):
+        if _is_guess(credential):
             record_auth_failure(client_ip, resource, source)
+            # The rate limiter may have noted the same guess; it is paid for.
+            _mark_counted(credential)
         return None
     payload["source"] = source
     return payload
@@ -3595,6 +3737,8 @@ def authenticate_connection(
             return payload
 
     record_auth_failure(client_ip, resource, "websocket")
+    # One failure per handshake, whichever channels the rate limiter noted.
+    _mark_counted(*candidates)
     return None
 
 

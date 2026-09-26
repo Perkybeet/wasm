@@ -35,7 +35,7 @@ from typing import Any
 
 import click
 
-from wasm.cli.app import Context, WasmGroup, json_option, pass_context
+from wasm.cli.app import Context, WasmGroup, global_flags, json_option, pass_context
 from wasm.cli.panel_links import open_in_panel
 from wasm.core.exceptions import WASMError
 from wasm.core.logger import Logger
@@ -992,6 +992,7 @@ def backup_storage(state: Context) -> None:
 
 @backup.command("import")
 @click.argument("directory", type=click.Path(file_okay=False, resolve_path=True))
+@global_flags
 @pass_context
 def backup_import(state: Context, directory: str) -> None:
     """

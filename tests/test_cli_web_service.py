@@ -544,6 +544,64 @@ def test_a_console_that_does_not_come_up_shows_the_journal_and_no_token(
     assert "Access Token" not in result.output
 
 
+def test_enable_retires_the_old_token_before_the_service_restarts(
+    cli_runner: CliRunner,
+    systemd_up: FakeRunner,
+    listening: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The token was issued after the restart and the wait, so the previous one
+    kept opening the console in the meantime, and for good when the wait
+    failed. The hash is written first; the token is printed once it serves.
+    """
+    from wasm.web.auth import SecurityConfig, TokenManager
+
+    old = TokenManager(SecurityConfig()).generate_master_token()
+    at_restart: list[bool] = []
+    real_run = systemd_up.run
+
+    def run(argv: Any, **kwargs: Any) -> Any:
+        if tuple(argv[:3]) == ("systemctl", "restart", "wasm-web.service"):
+            at_restart.append(TokenManager(SecurityConfig()).verify_master_token(old))
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(systemd_up, "run", run)
+
+    result = cli_runner.invoke(web.cli, ["enable"])
+
+    assert result.exit_code == 0, result.output
+    assert at_restart == [False], "the old token still worked when the service restarted"
+    new = _printed_token(result.output)
+    assert TokenManager(SecurityConfig()).verify_master_token(new) is True
+
+
+def test_a_console_that_does_not_come_up_has_still_retired_the_old_token(
+    cli_runner: CliRunner,
+    runner: FakeRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed wait must not leave the token enable meant to replace in force."""
+    from wasm.web.auth import SecurityConfig, TokenManager
+
+    old = TokenManager(SecurityConfig()).generate_master_token()
+    monkeypatch.setattr(web, "_port_in_use", lambda host, port: False)
+    runner.script(["systemctl", "is-active"], stdout="failed\n")
+    runner.script(["systemctl", "show", "wasm-web.service", "--no-pager"], stdout=CRASHED)
+    runner.script(["journalctl", "-u", "wasm-web.service"], stdout="OSError: [Errno 98] in use")
+
+    result = cli_runner.invoke(web.cli, ["enable"])
+
+    assert isinstance(result.exception, ServiceError)
+    assert TokenManager(SecurityConfig()).verify_master_token(old) is False
+    assert "Access Token" not in result.output
+    details = result.exception.details
+    assert "previous access token" in details
+    assert "wasm web enable" in details
+    # The fix first, systemd's own words after it.
+    assert details.index("previous access token") < details.index("OSError")
+
+
 def test_enable_twice_replaces_the_options_and_restarts(
     cli_runner: CliRunner,
     systemd_up: FakeRunner,
@@ -924,3 +982,48 @@ def test_install_unit_refuses_to_replace_a_file_wasm_did_not_write(
         ServiceManager().install_unit("nginx", "wasm-web", {"exec_start": "/bin/true"})
 
     assert "wasm" not in foreign.read_text()
+
+
+def test_install_unit_refuses_the_legacy_unit_of_an_application_named_web(
+    runner: FakeRunner, unit_dirs: dict[str, Path]
+) -> None:
+    """
+    Before 0.14.1 an application's unit was wasm-<name>: one deployed at the
+    domain ``web`` runs as wasm-web, the console's own name. Enabling the
+    console must not overwrite it.
+    """
+    from wasm.core.store import App, WASMStore, get_store
+
+    WASMStore.reset_instance()
+    try:
+        get_store().create_app(App(domain="web", app_type="nodejs", port=3000))
+        legacy = unit_dirs["managed"] / "wasm-web.service"
+        body = f"# {WASM_UNIT_MARKER}\n[Service]\nWorkingDirectory=/var/www/apps/wasm-web\n"
+        legacy.write_text(body)
+
+        with pytest.raises(ServiceError, match="web") as refused:
+            ServiceManager().install_unit(
+                "wasm-web", "wasm-web", {"exec_start": f"{WASM_BIN} web start --under-systemd"}
+            )
+
+        assert "web" in (refused.value.details or "")
+        assert legacy.read_text() == body
+    finally:
+        WASMStore.reset_instance()
+
+
+def test_install_unit_still_rewrites_its_own_unit_when_no_application_claims_it(
+    runner: FakeRunner, unit_dirs: dict[str, Path]
+) -> None:
+    """Applications that merely exist do not stop the console from updating its unit."""
+    from wasm.core.store import App, WASMStore, get_store
+
+    WASMStore.reset_instance()
+    try:
+        get_store().create_app(App(domain="shop.example.com", app_type="nodejs", port=3000))
+        path = ServiceManager().install_unit("wasm-web", "wasm-web", {"exec_start": "/bin/true"})
+        path = ServiceManager().install_unit("wasm-web", "wasm-web", {"exec_start": "/bin/false"})
+
+        assert "/bin/false" in path.read_text()
+    finally:
+        WASMStore.reset_instance()

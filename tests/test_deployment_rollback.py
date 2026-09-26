@@ -124,7 +124,7 @@ def rollback_manager(
     monkeypatch.setattr(backup_module, "get_store", lambda: store)
     manager = RollbackManager()
     manager.config = SimpleNamespace(apps_directory=tmp_path / "apps")  # type: ignore[assignment]
-    made: list[Any] = [backup()]
+    made: list[Any] = [backup(commit="abc1234def56")]
     manager.backup_manager.create = lambda **kwargs: made[0]  # type: ignore[method-assign]
     manager.made = made  # type: ignore[attr-defined]
     return manager
@@ -229,26 +229,43 @@ def backups(monkeypatch: pytest.MonkeyPatch) -> set[str]:
     return existing
 
 
-def test_in_place_a_deployment_with_a_snapshot_can_be_gone_back_to(
+def test_in_place_without_history_a_snapshot_is_restored_through_the_rollback_manager(
     tmp_path: Path, store: WASMStore, backups: set[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The snapshot is restored through RollbackManager.rollback."""
+    """Keeping .git and the .env, rebuilt as the recorded type, behind the gate."""
     inplace_app(store, tmp_path)
     target = deployment(store, "success")
     store.set_deployment_snapshot(target, "snap-1")
     backups.add("snap-1")
     restored: list[dict[str, Any]] = []
-    monkeypatch.setattr(
-        lifecycle,
-        "RollbackManager",
-        lambda verbose=False: SimpleNamespace(rollback=lambda **kw: restored.append(kw) or True),
-    )
+
+    class Manager:
+        logger = None
+        last_deployment_id = 42
+
+        def __init__(self, verbose: bool = False) -> None:
+            pass
+
+        def rollback(self, **kw: Any) -> bool:
+            restored.append(kw)
+            return True
+
+    monkeypatch.setattr(lifecycle, "RollbackManager", Manager)
 
     assert lifecycle.rollback_availability([store.get_deployment(target)]) == {target: None}
     outcome = lifecycle.rollback_to_deployment(INPLACE, target, trigger="panel")
 
-    assert restored == [{"domain": INPLACE, "backup_id": "snap-1", "trigger": "panel"}]
-    assert (outcome.backup_id, outcome.release_id) == ("snap-1", None)
+    (call,) = restored
+    assert {k: call[k] for k in ("domain", "backup_id", "trigger", "restore_env", "keep")} == {
+        "domain": INPLACE,
+        "backup_id": "snap-1",
+        "trigger": "panel",
+        "restore_env": False,
+        "keep": (".git",),
+    }
+    assert call["app_type"] == "nodejs"
+    assert callable(call["gate"])
+    assert (outcome.backup_id, outcome.release_id, outcome.history_id) == ("snap-1", None, 42)
 
 
 def test_in_place_without_a_snapshot_the_refusal_says_to_rebuild(
@@ -528,3 +545,19 @@ def test_both_actions_need_the_deploy_scope_like_an_update(action: str) -> None:
     assert web_auth.required_scope("POST", f"/api/apps/{INPLACE}/deployments/x/{action}") == (
         "admin"
     )
+
+
+def test_on_releases_a_release_that_failed_its_gate_is_not_offered(
+    store: WASMStore, machine: SimpleNamespace, two_releases: tuple[str, str]
+) -> None:
+    """Still on disk after a failed activation, and still not something to go back to."""
+    first, _ = two_releases
+    app = store.get_app(DOMAIN)
+    assert app is not None and app.id is not None
+    store.set_release_status(app.id, first, "failed")
+    target = {row.release_id: row for row in store.list_deployments(DOMAIN)}[first]
+    assert target.id is not None
+
+    reason = lifecycle.rollback_availability([target])[target.id]
+
+    assert reason is not None and "did not pass its health check" in reason

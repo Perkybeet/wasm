@@ -193,3 +193,43 @@ def test_a_deletion_is_refused_while_another_operation_runs(
 def test_nothing_deployed_is_an_error(tmp_path: Path, store: WASMStore, machine: Any) -> None:
     with pytest.raises(WASMError, match="Application not found"):
         lifecycle.delete_app("other.example.com")
+
+
+def test_the_images_an_update_kept_for_going_back_go_with_the_stack(
+    tmp_path: Path, store: WASMStore, machine: Any
+) -> None:
+    """
+    Each update tags what served as <project>-<service>:wasm-previous so that
+    it survives a prune; deleting the stack must not leave them on disk for
+    ever. Only this stack's are removed.
+    """
+    compose_app(store, tmp_path / "apps" / "shop-example-com")
+    machine.runner.script(
+        ["docker", "image", "ls"],
+        stdout="shop-example-com-db:wasm-previous\nother-app-web:wasm-previous\n",
+    )
+
+    outcome = lifecycle.delete_app(DOMAIN)
+
+    removed = [call for call in machine.runner.calls if call[:3] == ("docker", "image", "rm")]
+    assert removed == [("docker", "image", "rm", "shop-example-com-db:wasm-previous")]
+    assert outcome.warnings == ()
+    rm_at = machine.runner.calls.index(removed[0])
+    down_at = machine.runner.calls.index(downs(machine.runner)[0])
+    assert down_at < rm_at, "the containers are gone before their images"
+
+
+def test_a_kept_image_that_cannot_be_removed_is_a_warning(
+    tmp_path: Path, store: WASMStore, machine: Any
+) -> None:
+    """The rest of the deletion goes on; the operator is told what is left."""
+    compose_app(store, tmp_path / "apps" / "shop-example-com")
+    machine.runner.script(["docker", "image", "ls"], stdout="shop-example-com-db:wasm-previous\n")
+    machine.runner.script(
+        ["docker", "image", "rm"], exit_code=1, stderr="Error: image is being used"
+    )
+
+    outcome = lifecycle.delete_app(DOMAIN)
+
+    assert any("image is being used" in warning for warning in outcome.warnings)
+    assert store.get_app(DOMAIN) is None

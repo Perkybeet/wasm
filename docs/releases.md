@@ -10,7 +10,7 @@ application deployed by 1.x is moved onto it.
 | Layout | Who gets it | Deploy | Rollback |
 |---|---|---|---|
 | `releases` | Every application created by 2.0, unless told otherwise | A new directory per deploy, health-gated activation, automatic rollback | Re-point `current` and restart: seconds |
-| `inplace` | Every application deployed by 1.x, and types that cannot build releases yet | Backup, pull and rebuild over the tree the service is running, restart. A failed health check after the restart is reported, not rolled back, except for Docker Compose and monorepo applications, which [go back automatically](#docker-compose-and-monorepo-applications). | Restore a backup |
+| `inplace` | Every application deployed by 1.x, and types that cannot build releases yet | Backup, pull and rebuild over the tree the service is running, restart. A failed health check after the restart is reported, not rolled back, except for Docker Compose and monorepo applications, which [go back automatically](#docker-compose-and-monorepo-applications). | Rebuild an earlier deployment's commit behind the health gate, or restore a backup ([rolling back to a deployment](#rolling-back-to-a-deployment)) |
 
 The layout of a new application comes from `--layout` on `wasm create` (or `layout` on
 `POST /api/apps`), and otherwise from the `deploy.layout` setting, which defaults to
@@ -92,7 +92,7 @@ Then the unit is restarted and probed.
 
 | Application | Probe |
 |---|---|
-| Runs a process (Node, Next.js, Python, ...) | `GET http://127.0.0.1:<port><path>`, one attempt every 2 seconds for the timeout, 5 seconds each. By default the path is `/`, the timeout 30 seconds (15 attempts), and any status below 500 passes, redirects included (they are not followed). |
+| Runs a process (Node, Next.js, Python, ...) | `GET http://127.0.0.1:<port><path>`, one attempt every 2 seconds until the timeout, each allowed 5 seconds or whatever is left of the timeout, if less. The timeout is wall-clock time: an application that accepts connections and never answers is given up on when it runs out, not after its attempts have each waited their 5 seconds. By default the path is `/`, the timeout 30 seconds (at most 15 attempts), and any status below 500 passes, redirects included (they are not followed). |
 | Serves files only (static sites, Vite builds without SSR) | The files it serves are there: an `index.html` in the directory the web server serves. |
 
 The same gate judges a deploy, an update, an instant rollback, a migration and a change of
@@ -109,7 +109,7 @@ up can say so. Three settings, each with the default above when unset:
 |---|---|---|
 | Path | A path on the application: begins with a single `/`, printable ASCII, no spaces. A query string is fine (`/health?deep=1`); a scheme or a host is refused, because the probe always asks the application itself on `127.0.0.1`. | `/` |
 | Expected statuses | Statuses and inclusive ranges from 100 to 599, separated by commas: `200`, `200-399`, `200,204`, `200-299,301`. Only these pass; a redirect is not followed, so a `301` passes only if it is listed. | any status below 500 |
-| Timeout | Seconds from 5 to 600 the release gets to answer: one probe every 2 seconds for that long. | 30 |
+| Timeout | Seconds from 5 to 600 the release gets to answer, wall-clock: one probe every 2 seconds until they run out. | 30 |
 
 ```bash
 wasm app health shop.example.com                                   # the current settings, defaults marked
@@ -197,9 +197,9 @@ rest of the history when the clone is shallow). An id that names more than one c
 for more characters; one that names none is an error. `--commit` does not combine with
 `--source` or `--branch`.
 
-- **On releases**, when a release built from that commit is still on disk and is not the
-  active one, it is activated behind the health gate, as `wasm releases rollback` would:
-  nothing is built. Otherwise, including when the commit is the one that is live, the commit
+- **On releases**, when a release built from that commit is still on disk, is not the
+  active one and did not fail its health gate when it was last activated, it is activated
+  behind the health gate, as `wasm releases rollback` would: nothing is built. Otherwise, including when the commit is the one that is live, the commit
   is exported from `repo/` into a new release and built like any update. Rebuilding the live
   commit is how a changed environment or a broken dependency install gets a clean build.
 - **In place**, the pre-update backup is taken, the checkout is detached at the commit
@@ -214,7 +214,15 @@ for more characters; one that names none is an error. `--commit` does not combin
 
 Before an update from the console or from `wasm update`, WASM asks the remote for the head
 of the branch the application follows (`git ls-remote`: nothing is downloaded) and compares
-it with the commit that is live, the active release's or the in-place checkout's.
+it with the commit that is live: the active release's on releases, and in place the commit
+of the last successful deployment (the checkout's own commit only when the history recorded
+none). Not the checkout's: after an update whose build failed, the checkout is on the new
+commit while the old build still serves, and the new commit is exactly what is still to be
+deployed.
+
+The remote gets 15 seconds to answer. One application is asked about once at a time: a
+second update asked for while the first question is out waits for its answer, and an
+answer is reused for 10 seconds (an update, an activation or a rollback forgets it at once).
 
 When they are the same:
 
@@ -240,18 +248,43 @@ queues it as a job (`202`), with the `deploy` scope; a deployment that cannot be
 answers `409 rollback_unavailable` with the reason.
 
 - **On releases**, going back to a deployment activates the release it built, behind the
-  health gate. It must still be on disk and not already active; a pruned one can be rebuilt
-  from its commit instead.
-- **In place**, it restores the deployment's snapshot. When an in-place update takes its
-  pre-update backup, that backup holds exactly what the previous deployment produced, so it
-  is recorded as that deployment's `snapshot_backup`. It is only recorded when it is true:
-  the most recent finished deployment must have succeeded (after a failed build the tree is
-  whatever the failure left) and its commit must match the tree's. Going back restores the
-  snapshot with `wasm rollback`'s machinery: a safety backup of the current state first, the
-  restore, a rebuild and a start, recorded as its own history row. The deployment that is live
-  has no snapshot until the next update takes one; the typical use is the update that broke,
-  whose pre-update backup is the snapshot of the deployment before it. A snapshot whose backup
-  was rotated away is no longer offered.
+  health gate. It must still be on disk, not already active, and not one that failed its
+  health gate the last time it was activated; a pruned or failed one can be rebuilt from its
+  commit instead.
+- **In place, in a git checkout** (every type, monorepos and Docker Compose included), going
+  back rebuilds the deployment's commit where the application runs: exactly
+  `wasm update <domain> --commit <commit>`, recorded as a rollback. The pre-update backup is
+  taken, the checkout is detached at the commit (tracked files are rewritten; `.git`, uploads,
+  SQLite files, the `.env` and anything else untracked stay as they are), and the tree is
+  rebuilt. The restart passes the health gate: one that does not answer fails the rollback,
+  its row in the history is `failed` with the probes and the journal, and the deployment that
+  was serving stays the live one in the history. A monorepo restarts and probes every
+  workspace and a stack recreates its containers, and both go back to what served when the
+  result does not pass, as their updates do (see
+  [Docker Compose and monorepo applications](#docker-compose-and-monorepo-applications)). A
+  build that fails restarts nothing: the previous build keeps serving. When it succeeds, the
+  deployment it replaced is marked `rolled_back`. Every finished, successful deployment with a
+  commit can be gone back to except the one that is live (the newest finished deployment, when
+  it succeeded; after a failed update, the last good one can be rebuilt to repair the tree).
+- **In place, without history** (a tree that is not a git checkout, or a deployment that
+  recorded no commit), going back restores the deployment's snapshot. When an in-place update
+  takes its pre-update backup, that backup holds exactly what the previous deployment produced,
+  so it is recorded as that deployment's `snapshot_backup`. It is only recorded when it is
+  true: the most recent finished deployment must have succeeded, and both the backup and the
+  deployment must know the commit, and agree on it. An update that never finished leaves its
+  row `running` and the tree half-changed, and only the commit tells that apart; so a tree
+  without history gets no new snapshots, and this path serves the snapshots linked before 2.1.
+  Going back restores the snapshot with `wasm rollback`'s machinery, held to what a deploy is
+  held to: a safety backup of the current state first, the restore (keeping `.git` if the tree
+  has one, and the deployed `.env` unless `restore_env` is asked for), a rebuild that must
+  succeed, the tree handed back to the service user, and the health gate. A failed rebuild or
+  a gate that does not pass fails the rollback, and the error names the safety backup that
+  holds what served before it (`wasm rollback <domain> <backup>`). A restore puts back the
+  whole tree as it was: files the application wrote into it since (uploads, a SQLite file)
+  go back in time too, which is why a git checkout is never gone back to this way. Monorepo
+  and Docker Compose applications without history are not offered it: a restored tree does not
+  bring back their workspaces' builds or their images. A snapshot whose backup was rotated
+  away is no longer offered either.
 
 ## Persistent paths and `shared/`
 

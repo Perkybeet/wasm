@@ -292,6 +292,30 @@ def _resolve_log_units(target: str) -> tuple[list[UnitOwnership], str | None]:
     return units, None
 
 
+def _journal_scope_refusal(units: list[UnitOwnership], session: dict[str, Any]) -> str | None:
+    """
+    Refuse the console's or the monitor's journal to a credential below admin.
+
+    ``GET /api/services/{name}/logs`` asks the same, from the same list
+    (:data:`~wasm.web.api.services.OWN_JOURNAL_UNITS`): the console logs every
+    SQL statement run from it and the verbatim output of failed git, certbot
+    and notification calls, and a stream must not be the way around that.
+
+    Args:
+        units: The units the stream would follow.
+        session: The handshake's verified payload.
+
+    Returns:
+        The message that refuses the stream, or None when it may go ahead.
+    """
+    from wasm.web.api.services import OWN_JOURNAL_UNITS
+
+    own = next((unit.unit for unit in units if unit.unit in OWN_JOURNAL_UNITS), None)
+    if own is None or scope_satisfies(str(session.get("scope") or "read"), "admin"):
+        return None
+    return f"The journal of {own} needs an admin credential: it records the console's own work."
+
+
 async def _report_journal_exit(
     websocket: WebSocket,
     process: asyncio.subprocess.Process,
@@ -385,6 +409,8 @@ async def websocket_logs(
         await _close(websocket)
         return
 
+    if refusal is None:
+        refusal = _journal_scope_refusal(units, session)
     if refusal is not None:
         await websocket.send_json({"type": "error", "message": refusal})
         await _close(websocket, WS_CLOSE_FORBIDDEN)

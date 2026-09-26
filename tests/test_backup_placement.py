@@ -478,6 +478,20 @@ class TestImportCommand:
         assert not (dest / "shop-example-com").exists()
         assert "Would move 1 backup" in output
 
+    def test_dry_run_after_the_command_name_moves_nothing(
+        self, tmp_path: Path, dest: Path, runner: FakeRunner
+    ) -> None:
+        """The help says 'Use --dry-run'; typed where the help puts it, it works."""
+        home = tmp_path / "root"
+        archive, _ = plant_backup(home, "shop.example.com")
+
+        code, output = run_wasm("backup", "import", "--dry-run", str(home))
+
+        assert code == 0, output
+        assert archive.exists()
+        assert not (dest / "shop-example-com").exists()
+        assert "Would move 1 backup" in output
+
     def test_a_collision_fails_the_command(
         self, tmp_path: Path, dest: Path, runner: FakeRunner
     ) -> None:

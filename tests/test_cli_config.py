@@ -887,12 +887,30 @@ def test_set_stdin_without_a_trailing_newline_is_kept_whole(
 def test_set_prompt_reads_the_value_without_echoing_it_in_the_transcript(
     wasm: Wasm, real_config_path: Path
 ) -> None:
-    result = wasm("config", "set", "monitor.smtp.password", "--prompt", input="hunter2\n")
+    result = wasm("config", "set", "monitor.smtp.password", "--prompt", input="hunter2\nhunter2\n")
 
     assert result.exit_code == 0, result.output
     stored = yaml.safe_load(real_config_path.read_text())
     assert stored["monitor"]["smtp"]["password"] == "hunter2"
     assert "hunter2" not in result.output
+
+
+def test_set_prompt_asks_twice_so_a_typo_is_not_saved_unseen(
+    wasm: Wasm, real_config_path: Path
+) -> None:
+    """Nothing is echoed, so a mistyped secret would otherwise be stored silently."""
+    result = wasm(
+        "config",
+        "set",
+        "monitor.smtp.password",
+        "--prompt",
+        input="hunter2\nhunter3\nhunter2\nhunter2\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "do not match" in result.output.lower() or "don't match" in result.output.lower()
+    stored = yaml.safe_load(real_config_path.read_text())
+    assert stored["monitor"]["smtp"]["password"] == "hunter2"
 
 
 def test_set_refuses_a_value_together_with_stdin(wasm: Wasm, real_config_path: Path) -> None:
@@ -952,7 +970,9 @@ def test_warn_if_secret_typed_in_argv_warns_on_a_real_terminal(
     monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
     buffer = io.StringIO()
 
-    config_cmd._warn_if_secret_typed_in_argv("monitor.smtp.password", Logger(stream=buffer))
+    config_cmd._warn_if_secret_typed_in_argv(
+        "monitor.smtp.password", Logger(stream=buffer), "hunter2"
+    )
 
     assert "--stdin" in buffer.getvalue()
     assert "monitor.smtp.password" in buffer.getvalue()
@@ -965,7 +985,7 @@ def test_warn_if_secret_typed_in_argv_is_silent_for_a_non_secret_key(
     monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
     buffer = io.StringIO()
 
-    config_cmd._warn_if_secret_typed_in_argv("apps_directory", Logger(stream=buffer))
+    config_cmd._warn_if_secret_typed_in_argv("apps_directory", Logger(stream=buffer), "/srv")
 
     assert buffer.getvalue() == ""
 
@@ -977,7 +997,9 @@ def test_warn_if_secret_typed_in_argv_is_silent_without_a_real_terminal(
     monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
     buffer = io.StringIO()
 
-    config_cmd._warn_if_secret_typed_in_argv("monitor.smtp.password", Logger(stream=buffer))
+    config_cmd._warn_if_secret_typed_in_argv(
+        "monitor.smtp.password", Logger(stream=buffer), "hunter2"
+    )
 
     assert buffer.getvalue() == ""
 
@@ -1050,3 +1072,45 @@ def test_a_group_chat_id_without_its_minus_is_refused_at_the_config_chokepoint()
         Config().set("notifications.channels.telegram.chat_id", "1004482709713")
 
     assert "-1004482709713" in (caught.value.details or "")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        '{"host": "smtp.example.com", "password": "hunter2"}',
+        '{"host": "smtp.example.com", "auth": {"api_key": "k-123"}}',
+        '[{"name": "ops", "token": "t-123"}]',
+    ],
+)
+def test_warn_if_secret_typed_in_argv_sees_a_secret_inside_a_json_value(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """'wasm config set monitor.smtp {"password": ...}' puts the password in argv too."""
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    buffer = io.StringIO()
+
+    config_cmd._warn_if_secret_typed_in_argv("monitor.smtp", Logger(stream=buffer), value)
+
+    assert "--stdin" in buffer.getvalue()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        '{"host": "smtp.example.com", "port": 587}',
+        '{"host": "smtp.example.com", "password": ""}',
+        "smtp.example.com",
+        "not json {",
+    ],
+)
+def test_warn_if_secret_typed_in_argv_is_silent_for_a_json_value_without_a_secret(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    buffer = io.StringIO()
+
+    config_cmd._warn_if_secret_typed_in_argv("monitor.smtp", Logger(stream=buffer), value)
+
+    assert buffer.getvalue() == ""

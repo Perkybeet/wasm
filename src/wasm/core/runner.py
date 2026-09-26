@@ -150,8 +150,12 @@ def _kill_session(process: subprocess.Popen, *, drain: bool = True) -> None:
             process.wait(timeout=5)
     except subprocess.TimeoutExpired:
         # Something left the group (setsid) and holds the pipes. The child
-        # itself is dead; the pipes close when the object is collected.
+        # itself is dead; the pipes close when the object is collected. It
+        # still has to be reaped, or it stays a zombie for as long as this
+        # process lives: wait() only waits for the exit, not for the pipes.
         process.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=5)
 
 
 @dataclass(frozen=True)

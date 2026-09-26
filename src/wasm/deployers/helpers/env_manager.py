@@ -22,13 +22,15 @@ protected by the file mode.
 """
 
 import json
+import os
 import re
 import secrets
+import stat
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
 
-from wasm.core.config import REDACTED
+from wasm.core.config import REDACTED, is_secret_key
 from wasm.core.exceptions import SecurityError, WASMError
 from wasm.core.fs import SECRET_DIR_MODE, SECRET_MODE, FileSystem, get_fs
 from wasm.core.logger import Logger
@@ -59,6 +61,22 @@ def redact_url_credentials(value: str, placeholder: str = REDACTED) -> str:
         credential is returned unchanged.
     """
     return URL_CREDENTIALS.sub(lambda match: f"{match.group('prefix')}{placeholder}@", value)
+
+
+def _is_real_directory(path: Path) -> bool:
+    """
+    Report whether a path is a directory in its own right, not a link to one.
+
+    Args:
+        path: Path inside a checkout.
+
+    Returns:
+        True for a directory that is not a symlink.
+    """
+    try:
+        return stat.S_ISDIR(path.lstat().st_mode)
+    except OSError:
+        return False
 
 
 class EnvConfigError(WASMError):
@@ -222,12 +240,25 @@ class EnvManager:
         """
         return self._fs or get_fs()
 
+    #: Example files read by :meth:`discover`, in precedence order.
+    EXAMPLE_FILE_NAMES: ClassVar[tuple[str, ...]] = (".env.example", ".env.template", ".env.sample")
+
+    #: Directories whose children :meth:`discover` also searches.
+    WORKSPACE_PARENTS: ClassVar[tuple[str, ...]] = ("apps", "packages", "services")
+
     def discover(self, app_path: Path) -> list[EnvVariable]:
         """
         Discover environment variables from .env.example files.
 
-        Scans root and subdirectories (apps/*, packages/*) for
-        .env.example files.
+        Scans root and subdirectories (apps/*, packages/*, services/*) for
+        .env.example, .env.template and .env.sample files.
+
+        The tree is a repository, which is untrusted input read as root, so
+        nothing inside it is followed through a symlink: not an example file,
+        not a workspace directory, not ``apps`` itself. A link to
+        ``/etc/shadow`` or to another application's ``.env`` would otherwise
+        come back as a list of defaults. ``app_path`` itself may be a link
+        (``current`` on the releases layout is one WASM made).
 
         Args:
             app_path: Path to the application root.
@@ -238,37 +269,67 @@ class EnvManager:
         variables = []
         seen_names = set()
 
-        # Search paths: root, then subdirectories
         search_paths = [app_path]
-        for subdir in ["apps", "packages", "services"]:
+        for subdir in self.WORKSPACE_PARENTS:
             sub_path = app_path / subdir
-            if sub_path.is_dir():
+            if _is_real_directory(sub_path):
                 for child in sorted(sub_path.iterdir()):
-                    if child.is_dir():
+                    if _is_real_directory(child):
                         search_paths.append(child)
 
         for search_path in search_paths:
-            for env_example in sorted(search_path.glob(".env.example")):
-                parsed = self._parse_env_example(env_example)
-                for var in parsed:
+            for name in self.EXAMPLE_FILE_NAMES:
+                content = self._read_example(search_path / name)
+                if content is None:
+                    continue
+                for var in self._parse_env_content(content):
                     if var.name not in seen_names:
                         variables.append(var)
                         seen_names.add(var.name)
 
-            # Also check .env.template and .env.sample
-            for pattern in [".env.template", ".env.sample"]:
-                for env_file in sorted(search_path.glob(pattern)):
-                    parsed = self._parse_env_example(env_file)
-                    for var in parsed:
-                        if var.name not in seen_names:
-                            variables.append(var)
-                            seen_names.add(var.name)
-
         return variables
 
-    def _parse_env_example(self, path: Path) -> list[EnvVariable]:
+    def _read_example(self, path: Path) -> str | None:
         """
-        Parse a .env.example file into EnvVariable objects.
+        Read an example file only if it is a regular file, not a link to one.
+
+        ``O_NOFOLLOW`` refuses a symlink at open time, so there is no window
+        between checking the path and reading it; ``O_NONBLOCK`` keeps a FIFO
+        planted under the name from hanging the open, and the ``fstat`` then
+        turns it, or a directory, away.
+
+        Args:
+            path: Candidate example file.
+
+        Returns:
+            The file's text, or None when it is absent, a link, not a regular
+            file, or unreadable.
+        """
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            # ELOOP is how O_NOFOLLOW reports a symlink.
+            self.logger.warning(f"Not reading {path}: {e.strerror}")
+            return None
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                self.logger.warning(f"Not reading {path}: not a regular file")
+                return None
+            with os.fdopen(fd, "rb") as handle:
+                fd = -1
+                return handle.read().decode("utf-8", errors="replace")
+        except OSError as e:
+            self.logger.warning(f"Could not read {path}: {e}")
+            return None
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
+    def _parse_env_content(self, content: str) -> list[EnvVariable]:
+        """
+        Parse the text of a .env.example file into EnvVariable objects.
 
         Supports comment-based descriptions and metadata:
             # Comment becomes description
@@ -277,19 +338,13 @@ class EnvManager:
             REQUIRED_KEY=
 
         Args:
-            path: Path to the .env.example file.
+            content: The file's text.
 
         Returns:
             List of parsed environment variables.
         """
         variables: list[EnvVariable] = []
         current_description = ""
-
-        try:
-            content = path.read_text(encoding="utf-8")
-        except OSError as e:
-            self.logger.warning(f"Could not read {path}: {e}")
-            return variables
 
         for line in content.splitlines():
             line = line.strip()
@@ -759,3 +814,24 @@ class EnvManager:
             pass
 
         return values
+
+
+def is_secret_env_name(name: str) -> bool:
+    """
+    Decide whether an environment variable's name marks its value as a secret.
+
+    The one classifier for anything that decides whether a value may be shown:
+    :data:`EnvManager.SECRET_PATTERNS` matches substrings (``ADMIN_PASS``,
+    ``STRIPE_API_KEY``), :func:`~wasm.core.config.is_secret_key` matches whole
+    words the configuration redacts (``AUTH``, ``SLACK_WEBHOOK``,
+    ``apiKey``). Each misses names the other catches, so a name is a secret
+    when either says so.
+
+    Args:
+        name: Variable name.
+
+    Returns:
+        True if the value behind this name must not be shown in clear.
+    """
+    upper = name.upper()
+    return any(pattern in upper for pattern in EnvManager.SECRET_PATTERNS) or is_secret_key(name)

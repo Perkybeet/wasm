@@ -28,10 +28,15 @@ from pathlib import Path
 import pytest
 
 from wasm.core.config import Config
-from wasm.core.exceptions import ServiceError
+from wasm.core.exceptions import ServiceError, WASMError
 from wasm.core.runner import FakeRunner
 from wasm.core.store import App, WASMStore
-from wasm.managers.cron_manager import CronJob, CronManager
+from wasm.managers.cron_manager import (
+    CronJob,
+    CronManager,
+    command_comment,
+    read_command_comment,
+)
 
 #: What ``systemctl list-unit-files`` prints for one enabled WASM cron timer.
 LIST_UNIT_FILES_LINE = "wasm-cron-cleanup.timer enabled enabled\n"
@@ -600,3 +605,208 @@ def test_runs_tolerates_journal_noise(runner: FakeRunner, systemd_dir: Path) -> 
     )
 
     assert len(CronManager().runs("cleanup")) == 2
+
+
+# ------------------------------------------------------ editing round trip
+
+#: Commands whose ExecStart form differs from what the operator typed: every
+#: character build_exec_start escapes, quoting of both kinds, and spacing
+#: that only survives inside quotes.
+ROUND_TRIP_COMMANDS = [
+    "/bin/sh -c 'echo $HOME ${USER} $$'",
+    "/usr/bin/date +%Y-%m-%d",
+    "/bin/sh -c 'echo 100%% done'",
+    "/usr/bin/printf '%s\\n' \"it's quoted\" 'say \"hi\"'",
+    "/usr/bin/echo 'two  spaces'   \"and  more\"",
+    "/usr/bin/echo back\\\\slash 'tab\\there'",
+    "/usr/bin/echo héllo wörld",
+]
+
+
+@pytest.mark.parametrize("command", ROUND_TRIP_COMMANDS)
+def test_editing_a_job_leaves_its_command_as_typed(
+    runner: FakeRunner, systemd_dir: Path, command: str
+) -> None:
+    """
+    Create, read back, save again: the unit must not change by one byte.
+
+    The console's edit dialog sends back the command the listing gave it.
+    When that was the escaped ExecStart, every save doubled each ``$`` and
+    ``%`` again, so ``$HOME`` became ``$$HOME`` and then ``$$$$HOME`` - the
+    shell's PID - and the job silently ran something else.
+    """
+    manager = CronManager()
+    manager.create_job(job(command=command))
+    _, service = written_units(systemd_dir)
+    first = service.read_bytes()
+
+    entry = manager.get_job("cleanup")
+    assert entry is not None
+    assert entry["command"] == command
+
+    manager.create_job(job(command=entry["command"]))
+    assert service.read_bytes() == first
+
+    again = manager.get_job("cleanup")
+    assert again is not None
+    assert again["command"] == command
+
+
+def test_the_listing_reads_the_command_the_operator_typed(
+    runner: FakeRunner, systemd_dir: Path
+) -> None:
+    """list_jobs answers the raw command, not the escaped ExecStart."""
+    CronManager().create_job(job(command="/bin/sh -c 'echo $HOME 50%'"))
+    runner.script(("systemctl", "list-unit-files"), stdout=LIST_UNIT_FILES_LINE)
+
+    entry = CronManager().list_jobs()[0]
+
+    assert entry["command"] == "/bin/sh -c 'echo $HOME 50%'"
+    _, service = written_units(systemd_dir)
+    assert 'ExecStart=/bin/sh -c "echo $$HOME 50%%"' in service.read_text()
+
+
+def test_the_raw_command_is_recorded_as_one_quoted_comment_line(
+    runner: FakeRunner, systemd_dir: Path
+) -> None:
+    """The record is a comment systemd ignores, JSON-quoted so it always ends in a quote."""
+    CronManager().create_job(job(command="/bin/sh -c 'echo \"$HOME\"'"))
+
+    _, service = written_units(systemd_dir)
+    lines = service.read_text().split("\n")
+    recorded = [line for line in lines if line.startswith("# Command: ")]
+    assert recorded == ['# Command: "/bin/sh -c \'echo \\"$HOME\\"\'"']
+
+
+def test_a_command_is_stored_without_surrounding_whitespace(
+    runner: FakeRunner, systemd_dir: Path
+) -> None:
+    """The dialog trims before saving; the record must agree with it so a save is a no-op."""
+    manager = CronManager()
+    manager.create_job(job(command="  /usr/bin/date +%s  "))
+    _, service = written_units(systemd_dir)
+    first = service.read_bytes()
+
+    manager.create_job(job(command="/usr/bin/date +%s"))
+
+    assert service.read_bytes() == first
+    entry = manager.get_job("cleanup")
+    assert entry is not None
+    assert entry["command"] == "/usr/bin/date +%s"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/usr/bin/echo hi\nExecStartPre=/bin/sh -c evil",
+        "/usr/bin/echo hi\rExecStartPre=/bin/sh -c evil",
+        "/usr/bin/echo hi\x00",
+        "/usr/bin/echo hi\x0bthere",
+        "/usr/bin/echo hi\x7f",
+    ],
+)
+def test_a_command_with_a_control_character_is_refused_before_anything_is_written(
+    runner: FakeRunner, systemd_dir: Path, command: str
+) -> None:
+    """The comment line can only be one line: a line break never reaches it."""
+    with pytest.raises(WASMError, match=r"contains a"):
+        CronManager().create_job(job(command=command))
+
+    assert list(systemd_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "/usr/bin/echo hi\nExecStartPre=/bin/evil",
+        "/usr/bin/echo hi\r[Service]",
+        "/usr/bin/echo trailing\\",
+        "/usr/bin/echo \u2028 separators \u2029 \x85",
+    ],
+)
+def test_the_command_comment_cannot_become_a_directive_even_unvalidated(raw: str) -> None:
+    """
+    Escaping is the last line of defence, independent of validation.
+
+    Whatever the value, the record is one line, starts with ``#`` and does
+    not end in a lone backslash - which systemd would read as a continuation
+    swallowing the next line into the comment - and it decodes back exactly.
+    """
+    line = command_comment(raw)
+
+    assert "\n" not in line
+    assert "\r" not in line
+    assert line.startswith("# Command: ")
+    assert line.endswith('"')
+    assert read_command_comment(line) == raw
+
+
+# ------------------------------------------------ units written before 2.1
+
+
+@pytest.mark.parametrize(
+    ("exec_start", "expected"),
+    [
+        ('/bin/sh -c "echo $$HOME $${USER}"', "/bin/sh -c 'echo $HOME ${USER}'"),
+        ('/usr/bin/date "+%%Y-%%m-%%d"', "/usr/bin/date +%Y-%m-%d"),
+        ('/bin/sh -c "echo \\"hi\\" && date"', "/bin/sh -c 'echo \"hi\" && date'"),
+        (
+            '/usr/bin/echo "two  spaces" "back\\\\slash"',
+            "/usr/bin/echo 'two  spaces' 'back\\slash'",
+        ),
+        ("/usr/bin/find /tmp/caches -delete", "/usr/bin/find /tmp/caches -delete"),
+    ],
+)
+def test_a_unit_without_the_record_reads_back_unescaped(
+    runner: FakeRunner, systemd_dir: Path, exec_start: str, expected: str
+) -> None:
+    """
+    Before the record existed only ExecStart was written. Its systemd escaping
+    is undone - ``$$`` and ``%%`` halved, the quoting stripped - so the first
+    edit of an old job saves what it ran, not a doubled copy of it.
+    """
+    timer, service = written_units(systemd_dir)
+    timer.write_text("# Generated by WASM\n[Timer]\nOnCalendar=*-*-* 02:00:00\n")
+    service.write_text(f"# Generated by WASM\n[Service]\nUser=www-data\nExecStart={exec_start}\n")
+
+    manager = CronManager()
+    entry = manager.get_job("cleanup")
+    assert entry is not None
+    assert entry["command"] == expected
+
+    manager.create_job(job(command=entry["command"]))
+    assert f"ExecStart={exec_start}\n" in service.read_text()
+
+
+def test_a_hand_edited_exec_start_wins_over_a_stale_record(
+    runner: FakeRunner, systemd_dir: Path
+) -> None:
+    """The console shows what runs: a record that no longer matches ExecStart is ignored."""
+    CronManager().create_job(job(command="/usr/bin/date +%s"))
+    _, service = written_units(systemd_dir)
+    service.write_text(
+        service.read_text().replace(
+            'ExecStart=/usr/bin/date "+%%s"', 'ExecStart=/usr/bin/date "+%%F"'
+        )
+    )
+
+    entry = CronManager().get_job("cleanup")
+
+    assert entry is not None
+    assert entry["command"] == "/usr/bin/date +%F"
+
+
+def test_a_record_naming_a_program_resolved_on_path_still_matches(
+    runner: FakeRunner, systemd_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bare program name becomes an absolute path in ExecStart; the record keeps the name."""
+    monkeypatch.setattr(
+        "wasm.managers.cron_manager.shutil.which",
+        lambda program: f"/usr/bin/{program}",
+    )
+    CronManager().create_job(job(command="php artisan schedule:run"))
+
+    entry = CronManager().get_job("cleanup")
+
+    assert entry is not None
+    assert entry["command"] == "php artisan schedule:run"

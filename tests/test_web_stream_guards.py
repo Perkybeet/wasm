@@ -189,6 +189,45 @@ def test_the_log_stream_follows_a_unit_wasm_manages(
     assert spawned and spawned[0][:3] == ("journalctl", "-u", "app-example-com.service")
 
 
+@pytest.mark.parametrize("unit", ["wasm-web", "wasm-monitor"])
+def test_the_consoles_own_journal_streams_only_to_admin(
+    sandbox: Path,
+    runner: object,
+    unit_dir: Path,
+    spawned: list[tuple[str, ...]],
+    unit: str,
+) -> None:
+    """
+    The console's journal holds every SQL statement run from it and the
+    verbatim output of failed git calls; ``GET /api/services/{name}/logs``
+    asks for admin, and the stream must not be the way around it.
+    """
+    (unit_dir / f"{unit}.service").write_text(
+        f"# {WASM_UNIT_MARKER}\n[Service]\nExecStart=/usr/bin/wasm\n"
+    )
+    client = build_client(sandbox)
+    manager = get_token_manager()
+    read_token = manager.create_api_token("reader", "read")["token"]
+    admin_token = manager.create_api_token("operator", "admin")["token"]
+
+    with client.websocket_connect(
+        f"/ws/logs/{unit}", subprotocols=token_subprotocols(read_token)
+    ) as ws:
+        refused = ws.receive_json()
+
+    assert refused["type"] == "error"
+    assert "admin" in refused["message"]
+    assert spawned == []
+
+    with client.websocket_connect(
+        f"/ws/logs/{unit}", subprotocols=token_subprotocols(admin_token)
+    ) as ws:
+        connected = ws.receive_json()
+
+    assert connected["type"] == "connected"
+    assert spawned and spawned[0][:3] == ("journalctl", "-u", f"{unit}.service")
+
+
 # ------------------------------------------------------ one budget per credential
 
 

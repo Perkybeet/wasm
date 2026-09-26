@@ -15,9 +15,12 @@ sending a message through a channel, reached from two places.
 
 from __future__ import annotations
 
+import dataclasses
+import json
+
 import click
 
-from wasm.cli.app import Context, WasmGroup, pass_context
+from wasm.cli.app import Context, WasmGroup, global_flags, json_option, pass_context
 from wasm.core.config import Config
 from wasm.core.notifier import CHANNELS, Notifier
 
@@ -47,21 +50,31 @@ def test_command(ctx: Context, channel: str) -> None:
 
 
 @cli.command("telegram-chats")
+@global_flags
+@json_option("Print the chats as a JSON array.")
 @pass_context
 def telegram_chats_command(ctx: Context) -> None:
     """
-    List the chats the configured Telegram bot has seen.
+    List the chats the Telegram bot can send to, with their ids.
 
-    Finding a chat id today means opening the Bot API's getUpdates URL by hand
-    and reading raw JSON. Send the bot a message, or add it to the group or
-    channel, then run this to read the id back - Telegram only queues an
-    update the bot has not already been asked for.
+    Send the bot a message, or add it to the group or channel, then run this.
+    The first column is the chat id: set it with 'wasm config set
+    notifications.channels.telegram.chat_id ID'. Group and channel ids start
+    with a minus sign, and it is part of the id. A chat shows up only after
+    it has sent the bot something recently, so if the one you want is
+    missing, send the bot another message and run this again.
+
+    Needs notifications.channels.telegram.bot_token to be set first.
     """
     try:
         chats = Notifier(Config()).list_telegram_chats()
     except (OSError, ValueError) as exc:
         ctx.logger.error("Could not list Telegram chats", details=str(exc))
         raise SystemExit(1) from exc
+
+    if ctx.json_output:
+        click.echo(json.dumps([dataclasses.asdict(chat) for chat in chats]))
+        return
 
     if not chats:
         ctx.logger.warning(

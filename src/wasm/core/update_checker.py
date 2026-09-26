@@ -5,15 +5,24 @@
 Update checker for WASM.
 
 Checks for new versions on GitHub in the background without blocking the user's command.
+
+The result is announced on stderr, and only to a person: never under
+``--json`` and never when either stream is not a terminal. It was printed to
+stdout after every command, which appended a banner to the JSON document of
+``wasm app list --json | jq`` and broke the parse.
 """
 
+import http.client
 import json
 import logging
+import sys
 import threading
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 from wasm import __version__
+from wasm.core.exceptions import WASMError
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +73,26 @@ class UpdateChecker:
             )
             return True
 
+    @staticmethod
+    def should_announce(argv: Sequence[str]) -> bool:
+        """
+        Report whether this invocation may carry the update banner at all.
+
+        Args:
+            argv: The command line, without the program name.
+
+        Returns:
+            False under ``--json``, whose output is a document and nothing
+            else, and when stdout or stderr is not a terminal: output being
+            piped or captured is read by a program, and an ANSI-coloured
+            banner is noise in a log file. True otherwise.
+        """
+        if "--json" in argv:
+            return False
+        return all(
+            bool(getattr(stream, "isatty", lambda: False)()) for stream in (sys.stdout, sys.stderr)
+        )
+
     @classmethod
     def start_background_check(cls):
         """
@@ -91,8 +120,9 @@ class UpdateChecker:
             cls._update_version = None
             cls._check_thread = threading.Thread(target=cls._background_check, daemon=True)
             cls._check_thread.start()
-        except Exception:
-            pass
+        except RuntimeError as exc:
+            # "can't start new thread": the check is cosmetic, the command is not.
+            logger.debug("Could not start the update check: %s", exc)
 
     @classmethod
     def _background_check(cls):
@@ -119,8 +149,11 @@ class UpdateChecker:
             if has_update:
                 cls._update_version = latest_version
 
-        except Exception as e:
-            logger.debug(f"Background update check failed: {e}")
+        except Exception as exc:
+            # The top of a daemon thread: nothing above it would catch this,
+            # and an uncaught exception there is printed over the command's
+            # own output. It is the one error boundary here, and it logs.
+            logger.debug("Background update check failed: %s", exc, exc_info=True)
 
     @classmethod
     def show_update_if_available(cls, timeout: float = 0.1):
@@ -132,18 +165,21 @@ class UpdateChecker:
         Args:
             timeout: Max seconds to wait for background check to complete.
         """
+        # Wait briefly for background thread if still running
+        if cls._check_thread and cls._check_thread.is_alive():
+            cls._check_thread.join(timeout=timeout)
+
+        if not cls._update_version:
+            return
+
+        latest, cls._update_version = cls._update_version, None
         try:
-            # Wait briefly for background thread if still running
-            if cls._check_thread and cls._check_thread.is_alive():
-                cls._check_thread.join(timeout=timeout)
-
-            # Show message if update found
-            if cls._update_version:
-                cls._show_update_message(cls._update_version)
-                cls._update_version = None  # Reset for next command
-
-        except Exception:
-            pass
+            cls._show_update_message(latest)
+        except (OSError, UnicodeError, WASMError) as exc:
+            # A reader that went away (`wasm ... | head`), a terminal that
+            # cannot encode the banner, or a package manager probe that was
+            # cancelled: none of them may change the command's exit.
+            logger.debug("Could not announce update %s: %s", latest, exc)
 
     @classmethod
     def check_for_updates(cls):
@@ -166,36 +202,30 @@ class UpdateChecker:
         Returns:
             Latest version string or None if failed.
         """
+        import urllib.request
+
+        req = urllib.request.Request(
+            cls.GITHUB_API, headers={"Accept": "application/vnd.github.v3+json"}
+        )
+
         try:
-            import urllib.error
-            import urllib.request
-
-            req = urllib.request.Request(
-                cls.GITHUB_API, headers={"Accept": "application/vnd.github.v3+json"}
-            )
-
             # GITHUB_API is a module constant, not caller input.
             with urllib.request.urlopen(req, timeout=cls.TIMEOUT) as response:
-                if response.status == 200:
-                    data = json.loads(response.read().decode())
-                    tag_name = data.get("tag_name", "")
-                    # Remove 'v' prefix if present (e.g., "v0.13.11" -> "0.13.11")
-                    return tag_name.lstrip("v")
+                if response.status != 200:
+                    return None
+                data = json.loads(response.read().decode())
+        except (OSError, http.client.HTTPException, ValueError) as exc:
+            # OSError covers URLError, HTTPError (a 403 rate limit, a 404) and
+            # timeouts; ValueError a body that is not UTF-8 JSON.
+            logger.debug("Could not fetch the latest release: %s", exc)
+            return None
 
-        except urllib.error.HTTPError:
-            # Handle HTTP errors (404, 403 rate limit, etc.)
-            pass
-        except urllib.error.URLError:
-            # Handle network errors (no internet, timeout, etc.)
-            pass
-        except json.JSONDecodeError:
-            # Handle invalid JSON response
-            pass
-        except Exception:
-            # Catch all other errors
-            pass
-
-        return None
+        tag_name = data.get("tag_name") if isinstance(data, dict) else None
+        if not isinstance(tag_name, str):
+            logger.debug("The latest release carries no tag name: %r", data)
+            return None
+        # Remove 'v' prefix if present (e.g., "v0.13.11" -> "0.13.11")
+        return tag_name.lstrip("v")
 
     @classmethod
     def _is_cache_valid(cls) -> bool:
@@ -205,21 +235,14 @@ class UpdateChecker:
         Returns:
             True if cache is valid and should be used.
         """
-        try:
-            if not cls.CACHE_FILE.exists():
-                return False
-
-            data = cls._read_cache()
-            if not data or "checked_at" not in data:
-                return False
-
-            checked_at = data["checked_at"]
-            elapsed = time.time() - checked_at
-
-            return elapsed < cls.CHECK_INTERVAL
-
-        except Exception:
+        data = cls._read_cache()
+        if not data:
             return False
+
+        checked_at = data.get("checked_at")
+        if not isinstance(checked_at, (int, float)):
+            return False
+        return time.time() - checked_at < cls.CHECK_INTERVAL
 
     @classmethod
     def _read_cache(cls) -> dict | None:
@@ -230,15 +253,13 @@ class UpdateChecker:
             Cached data dict or None if failed.
         """
         try:
-            if cls.CACHE_FILE.exists():
-                content = cls.CACHE_FILE.read_text()
-                return json.loads(content)
-        except (json.JSONDecodeError, OSError):
-            pass
-        except Exception:
-            pass
-
-        return None
+            if not cls.CACHE_FILE.exists():
+                return None
+            data = json.loads(cls.CACHE_FILE.read_text())
+        except (OSError, ValueError) as exc:
+            logger.debug("Could not read %s: %s", cls.CACHE_FILE, exc)
+            return None
+        return data if isinstance(data, dict) else None
 
     @classmethod
     def _write_cache(cls, data: dict):
@@ -255,12 +276,9 @@ class UpdateChecker:
             # Write cache file
             cls.CACHE_FILE.write_text(json.dumps(data, indent=2))
 
-        except OSError:
+        except OSError as exc:
             # Permission errors, disk full, etc.
-            pass
-        except Exception:
-            # Any other error
-            pass
+            logger.debug("Could not write %s: %s", cls.CACHE_FILE, exc)
 
     @classmethod
     def _is_newer_version(cls, remote: str, local: str) -> bool:
@@ -285,9 +303,6 @@ class UpdateChecker:
         except (ValueError, AttributeError):
             # Invalid version format
             return False
-        except Exception:
-            # Any other parsing error
-            return False
 
     @classmethod
     def _detect_installation_method(cls) -> str:
@@ -297,7 +312,6 @@ class UpdateChecker:
         Returns:
             Installation method: 'pip', 'pipx', 'apt', 'dnf', 'yum', 'zypper', or 'unknown'.
         """
-        import sys
 
         from wasm.core.runner import get_runner
 
@@ -365,22 +379,22 @@ class UpdateChecker:
     @classmethod
     def _show_update_message(cls, latest_version: str):
         """
-        Display update notification to user.
+        Display update notification to user, on stderr.
 
         Args:
             latest_version: The latest available version.
-        """
-        try:
-            method = cls._detect_installation_method()
-            update_command = cls._get_update_command(method)
 
-            print(
-                f"\n\033[33m⚠  New version available: {latest_version} (current: {__version__})\033[0m"
-            )
-            print(f"\033[33m   Update with: {update_command}\033[0m")
-            print(
-                f"\033[33m   Release notes: https://github.com/Perkybeet/wasm/releases/tag/v{latest_version}\033[0m\n"
-            )
-        except Exception:
-            # Even printing can fail in some edge cases
-            pass
+        Raises:
+            OSError: When stderr cannot be written.
+            UnicodeError: When the terminal cannot encode the banner.
+        """
+        method = cls._detect_installation_method()
+        update_command = cls._get_update_command(method)
+
+        release_notes = f"https://github.com/Perkybeet/wasm/releases/tag/v{latest_version}"
+        sys.stderr.write(
+            f"\n\033[33m⚠  New version available: {latest_version} (current: {__version__})\033[0m\n"
+            f"\033[33m   Update with: {update_command}\033[0m\n"
+            f"\033[33m   Release notes: {release_notes}\033[0m\n\n"
+        )
+        sys.stderr.flush()

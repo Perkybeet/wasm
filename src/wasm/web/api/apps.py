@@ -46,7 +46,7 @@ from wasm.core.store import (
 from wasm.core.utils import domain_to_app_name
 from wasm.deployers.base import BaseDeployer
 from wasm.deployers.helpers.app_env import read_app_env, write_app_env
-from wasm.deployers.helpers.env_manager import EnvManager, redact_url_credentials
+from wasm.deployers.helpers.env_manager import is_secret_env_name, redact_url_credentials
 from wasm.deployers.helpers.health_gate import HealthCheck
 from wasm.deployers.helpers.layout import RELEASES
 from wasm.deployers.helpers.package_manager import SUPPORTED_PACKAGE_MANAGERS
@@ -564,7 +564,7 @@ def _deployer_build_command(app: App) -> list[str]:
 
 def _looks_secret(name: str) -> bool:
     """
-    Check a variable name against the deployer's secret patterns.
+    Check a variable name against the one secret-name classifier.
 
     Args:
         name: Environment variable name.
@@ -572,8 +572,7 @@ def _looks_secret(name: str) -> bool:
     Returns:
         True if the value behind this name must not be shown in clear.
     """
-    upper = name.upper()
-    return any(pattern in upper for pattern in EnvManager.SECRET_PATTERNS)
+    return is_secret_env_name(name)
 
 
 def _redact_env(values: Mapping[str, str]) -> dict[str, str]:
@@ -582,7 +581,7 @@ def _redact_env(values: Mapping[str, str]) -> dict[str, str]:
 
     The same three-classifier approach ``wasm env show`` uses on the
     terminal: a key-based pass (:func:`~wasm.core.config.redact_secrets`), a
-    substring match against :data:`EnvManager.SECRET_PATTERNS` for the names
+    name match with :func:`is_secret_env_name` for the names
     it misses, and a value-based pass for a password embedded inside a
     connection string such as ``DATABASE_URL``. The placeholder is fixed
     width, so a response never reveals the length of a secret or whether one

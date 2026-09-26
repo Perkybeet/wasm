@@ -222,6 +222,13 @@ class StoreSpy:
         """
         return list(self.services)
 
+    def list_deployments(self, domain: str | None = None, limit: int = 20) -> list[Any]:
+        """
+        Returns:
+            No history: the nothing-new check falls back to the checkout.
+        """
+        return []
+
     def get_app(self, domain: str) -> Any:
         """
         Args:

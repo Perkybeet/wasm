@@ -65,7 +65,12 @@ from wasm.core.exceptions import DeploymentError
 from wasm.core.runner import CommandCancelled, cancellable, get_runner
 from wasm.deployers.base import BaseDeployer
 from wasm.deployers.docker_compose import COMPOSE_FILE_PRIORITY
-from wasm.deployers.helpers.env_manager import EnvManager
+from wasm.deployers.helpers.env_manager import (
+    URL_CREDENTIALS,
+    EnvManager,
+    EnvVariable,
+    is_secret_env_name,
+)
 from wasm.deployers.helpers.package_manager import PackageManagerHelper
 from wasm.deployers.interface import AppDeployer
 from wasm.deployers.registry import DeployerRegistry, _import_deployers
@@ -83,8 +88,8 @@ STALE_CHECKOUT_AGE = 3600
 
 #: Where :meth:`EnvManager.discover` looks for example environment files,
 #: besides the root, and the names it looks for.
-ENV_EXAMPLE_PARENTS = ("apps", "packages", "services")
-ENV_EXAMPLE_FILES = (".env.example", ".env.template", ".env.sample")
+ENV_EXAMPLE_PARENTS = EnvManager.WORKSPACE_PARENTS
+ENV_EXAMPLE_FILES = EnvManager.EXAMPLE_FILE_NAMES
 
 #: Root files read by detection beyond the deployers' ``DETECTION_FILES``,
 #: each with its reader. :func:`sparse_patterns` adds these to what it reads
@@ -160,10 +165,37 @@ def _looks_secret(name: str) -> bool:
         name: The variable's name, as written in ``.env.example``.
 
     Returns:
-        True when the name contains any of :data:`SECRET_NAME_MARKERS`.
+        True when the name contains any of :data:`SECRET_NAME_MARKERS`, or
+        :func:`is_secret_env_name` calls it a secret: every key whose default
+        is withheld is also shown as a password field.
     """
     upper = name.upper()
-    return any(marker in upper for marker in SECRET_NAME_MARKERS)
+    return any(marker in upper for marker in SECRET_NAME_MARKERS) or is_secret_env_name(name)
+
+
+def _shareable_default(variable: EnvVariable) -> str | None:
+    """
+    The default an inspection may hand back for a variable.
+
+    An example file is not always an example: repositories commit real keys
+    and connection strings to it. So a variable :func:`is_secret_env_name`
+    calls a secret, or whose default carries a password inside a URL, comes
+    back without one. The deploy itself reads the file again on the machine
+    and still uses the default there; only the caller of the inspection, who
+    may hold nothing more than an API token, never sees it.
+
+    Args:
+        variable: A variable discovered in the checkout.
+
+    Returns:
+        The default, or None when there is none or it may not be shown.
+    """
+    default = variable.default
+    if not default:
+        return None
+    if is_secret_env_name(variable.name) or URL_CREDENTIALS.search(default):
+        return None
+    return default
 
 
 @dataclass
@@ -174,7 +206,7 @@ class EnvKey:
     Attributes:
         name: Variable name.
         default: Default value from ``.env.example``, or None when it has
-            none.
+            none or it may not be shown (see :func:`_shareable_default`).
         secret: Whether the name looks like it holds a credential.
         required: Whether the application needs a value because
             ``.env.example`` gave it none.
@@ -544,7 +576,7 @@ def _describe(
     env_keys = [
         EnvKey(
             name=variable.name,
-            default=variable.default or None,
+            default=_shareable_default(variable),
             secret=_looks_secret(variable.name),
             required=variable.required,
         )

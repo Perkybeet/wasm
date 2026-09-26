@@ -289,3 +289,9 @@ def test_health_reset_with_a_value_is_a_usage_error(checked: Any) -> None:
     result = invoke(["app", "health", DOMAIN, "--reset", "--timeout", "10"])
 
     assert result.exit_code == 2
+
+
+def test_health_accepts_the_global_flags_after_its_name(checked: Any) -> None:
+    result = invoke(["app", "health", DOMAIN, "--verbose", "--no-color"])
+
+    assert result.exit_code == 0, result.output

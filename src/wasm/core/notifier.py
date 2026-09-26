@@ -117,10 +117,39 @@ CHANNELS: tuple[str, ...] = ("webhook", "slack", "discord", "telegram", "email")
 
 #: ``<bot id>:<secret>``, the only shape the Bot API issues. The token becomes
 #: part of the request path, so anything else is refused before it can reshape
-#: the URL.
-_TELEGRAM_TOKEN_RE = re.compile(r"^[0-9]+:[A-Za-z0-9_-]+$")
+#: the URL. Always applied with ``fullmatch``: ``$`` also matches just before a
+#: trailing newline, which let a token ending in a line break through.
+_TELEGRAM_TOKEN_RE = re.compile(r"[0-9]+:[A-Za-z0-9_-]+")
 
 _TELEGRAM_API = "https://api.telegram.org"
+
+
+def validate_telegram_bot_token(value: str) -> str:
+    """
+    Check that a value is, in full, the shape of a Bot API token.
+
+    The one rule for a token's shape: the settings endpoint applies it on
+    save, and the notifier again before the token becomes part of a URL, for
+    a value written some other way.
+
+    Args:
+        value: The bot token.
+
+    Returns:
+        The value, unchanged.
+
+    Raises:
+        ValueError: When it is not ``<digits>:<secret>`` from its first
+            character to its last. The value itself is never quoted: it is a
+            credential.
+    """
+    if not _TELEGRAM_TOKEN_RE.fullmatch(value):
+        raise ValueError(
+            "notifications.channels.telegram.bot_token does not look like a "
+            "Telegram bot token (expected <digits>:<secret>)"
+        )
+    return value
+
 
 _REDACTED = "***"
 
@@ -560,11 +589,7 @@ def _telegram_request(bot_token: str, chat_id: str, event: NotificationEvent) ->
             chat id does not look like one Telegram would recognise. Neither
             is ever included in the message.
     """
-    if not _TELEGRAM_TOKEN_RE.match(bot_token):
-        raise ValueError(
-            "notifications.channels.telegram.bot_token does not look like a "
-            "Telegram bot token (expected <digits>:<secret>)"
-        )
+    validate_telegram_bot_token(bot_token)
     chat_id = validate_telegram_chat_id(chat_id)
     url = f"{_TELEGRAM_API}/bot{bot_token}/sendMessage"
     return _json_request(url, {"chat_id": chat_id, "text": _message_text(event)})
@@ -837,11 +862,7 @@ class Notifier:
         bot_token = str(telegram.get("bot_token") or "")
         if not bot_token:
             raise ValueError(_SETTING_HINTS["telegram"] + " must be set first.")
-        if not _TELEGRAM_TOKEN_RE.match(bot_token):
-            raise ValueError(
-                "notifications.channels.telegram.bot_token does not look like a "
-                "Telegram bot token (expected <digits>:<secret>)"
-            )
+        validate_telegram_bot_token(bot_token)
 
         url = f"{_TELEGRAM_API}/bot{bot_token}/getUpdates"
         _require_public_destination(url, self._config)

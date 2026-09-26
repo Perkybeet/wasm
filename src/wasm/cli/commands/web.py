@@ -1702,10 +1702,11 @@ def _enable(options: StartOptions, verbose: bool, *, dry_run: bool = False) -> i
 
     The options are validated by the very function ``wasm web start`` uses, so
     a service cannot be written for an exposure a start would refuse. The
-    token is issued here and printed on this terminal, once the service
-    listens; the service serves it and prints none, because its output is the
-    journal. Running it again with other options rewrites the unit and
-    restarts the service.
+    token is issued here, before the restart, so the one it replaces stops
+    working at once, and printed on this terminal once the service listens;
+    the service serves it and prints none, because its output is the journal.
+    Running it again with other options rewrites the unit, issues a new token
+    and restarts the service.
 
     Args:
         options: How the operator asked for the console to be exposed.
@@ -1761,12 +1762,25 @@ def _enable(options: StartOptions, verbose: bool, *, dry_run: bool = False) -> i
         return 0
 
     manager.enable(WEB_UNIT)
-    manager.restart(WEB_UNIT)
-    _wait_until_serving(manager, host, config.port)
+    # The hash is written before the restart: every console verifies against
+    # the file on each request, so the token being replaced stops working now
+    # rather than after the wait - or never, when the wait fails. The service
+    # serves whatever hash is on disk and issues none of its own.
+    token = _issue_token(config)
+    try:
+        manager.restart(WEB_UNIT)
+        _wait_until_serving(manager, host, config.port)
+    except ServiceError as exc:
+        retired = (
+            "The previous access token no longer works. Once the console serves, "
+            "the next 'wasm web enable' prints a new one (or 'wasm web token --new')."
+        )
+        exc.details = f"{retired}\n{exc.details}" if exc.details else retired
+        raise
 
     _print_banner(
         config,
-        _issue_token(config),
+        token,
         (
             f"Runs as {WEB_UNIT_FILE}: started at boot, restarted if it fails.",
             "Change its options with 'wasm web enable'; stop and remove it with "

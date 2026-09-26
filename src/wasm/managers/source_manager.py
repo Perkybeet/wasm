@@ -18,6 +18,10 @@ WASM runs as root, so it is written defensively:
 - **Git URLs are validated before they reach argv.** ``ext::`` and friends turn
   a URL into a command, and a URL starting with ``-`` becomes an option, so
   both are rejected and every clone passes ``--`` before the URL.
+- **A credential in a source URL never reaches argv or a message.** Older
+  releases stored ``https://user:token@host/...``; the userinfo is taken off
+  before git sees the URL and travels in git's environment instead (see
+  :func:`split_url_credentials`), and every message is redacted.
 - **Processes go through the CommandRunner**, never through ``subprocess``.
 - **Filesystem changes go through :mod:`wasm.core.fs`**, so ``--dry-run`` is
   true for what this module writes and deletes, not only for what it executes.
@@ -35,6 +39,7 @@ allowed at all, and a rehearsal extracts nothing and creates no destination.
 
 from __future__ import annotations
 
+import base64
 import os
 import re
 import shutil
@@ -43,12 +48,12 @@ import stat
 import tarfile
 import tempfile
 import zipfile
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import IO, Any
 from urllib.error import URLError
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse, urlsplit, urlunsplit
 from urllib.request import (
     HTTPDefaultErrorHandler,
     HTTPErrorProcessor,
@@ -59,6 +64,7 @@ from urllib.request import (
     ProxyHandler,
 )
 
+from wasm.core.config import REDACTED
 from wasm.core.exceptions import SourceError
 from wasm.core.fs import FileSystem, RealFileSystem, get_fs
 from wasm.core.runner import CommandResult, CommandRunner
@@ -199,6 +205,129 @@ def git_environment() -> dict[str, str]:
     return env
 
 
+#: Userinfo of an http(s) URL, password or not: ``https://token@host`` carries
+#: a credential as surely as ``https://user:token@host``. ssh and scp-like URLs
+#: are not matched, because their user (``git@``) names an account, not a secret.
+_HTTP_USERINFO = re.compile(r"(?P<prefix>\bhttps?://)[^@\s/?#'\"]+@", re.IGNORECASE)
+
+
+def redact_git_text(text: str) -> str:
+    """
+    Take every credential out of a URL inside a message, a log line or git output.
+
+    Args:
+        text: Anything that may name a repository URL.
+
+    Returns:
+        The text with the password of every connection string, and the whole
+        userinfo of every http(s) URL, replaced by ``***``.
+    """
+    if not text or "@" not in text:
+        return text
+    # Imported here: wasm.deployers imports this module, so a module-level
+    # import of one of its helpers would be circular.
+    from wasm.deployers.helpers.env_manager import redact_url_credentials
+
+    redacted = redact_url_credentials(text)
+    return _HTTP_USERINFO.sub(lambda match: f"{match.group('prefix')}{REDACTED}@", redacted)
+
+
+def _inherited_config_count() -> int:
+    """
+    Count the configuration entries the operator already passes to git by environment.
+
+    Returns:
+        The value of ``GIT_CONFIG_COUNT`` in WASM's own environment, or 0.
+    """
+    try:
+        return max(int(os.environ.get("GIT_CONFIG_COUNT", "0") or 0), 0)
+    except ValueError:
+        return 0
+
+
+def split_url_credentials(url: str) -> tuple[str, dict[str, str]]:
+    """
+    Separate the credential of an http(s) URL from the URL git is given.
+
+    Older releases stored sources such as ``https://user:token@host/repo``
+    and passed them to git as they were, which put the token in the argv of
+    ``git clone``, ``git ls-remote`` and ``git remote set-url`` (every local
+    user reads those in ``ps``) and in ``.git/config``. The credential now
+    travels as git configuration in the environment::
+
+        GIT_CONFIG_COUNT=1
+        GIT_CONFIG_KEY_0=http.https://host/.extraHeader
+        GIT_CONFIG_VALUE_0=Authorization: Basic base64(user:password)
+
+    That rather than a ``GIT_ASKPASS`` helper: a helper is a program on disk
+    that git runs as root and that has to be written, made executable and
+    cleaned up, while this is two variables only root can read in
+    ``/proc/<pid>/environ``. ``GIT_CONFIG_COUNT`` needs git 2.31; every
+    supported distribution ships 2.34 or later (Ubuntu 22.04). The header is
+    scoped to the scheme, host and port the credential was stored for, so a
+    submodule or a redirect to another host never receives it (curl drops a
+    custom ``Authorization`` header when a redirect changes host), and it is
+    sent on the first request, so no prompt is ever needed.
+
+    Args:
+        url: A repository URL, optionally with ``#branch``.
+
+    Returns:
+        The URL without userinfo, and the variables to add to git's
+        environment; the URL unchanged and no variables when it carries no
+        http(s) credential.
+    """
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https") or "@" not in parts.netloc:
+        return url, {}
+    userinfo, _, host = parts.netloc.rpartition("@")
+    user, _, password = userinfo.partition(":")
+    bare = urlunsplit(parts._replace(netloc=host))
+    token = base64.b64encode(f"{unquote(user)}:{unquote(password)}".encode()).decode("ascii")
+    index = _inherited_config_count()
+    return bare, {
+        "GIT_CONFIG_COUNT": str(index + 1),
+        f"GIT_CONFIG_KEY_{index}": f"http.{scheme}://{host}/.extraHeader",
+        f"GIT_CONFIG_VALUE_{index}": f"Authorization: Basic {token}",
+    }
+
+
+def _validate_source_keeping_credentials(source: str) -> tuple[str, str]:
+    """
+    Classify a source, judging a URL by what it is without its credential.
+
+    :func:`~wasm.validators.source.validate_source` cannot tell the host of
+    ``https://user:token@host/owner/repo.git``, so a source stored that way by
+    an older release was refused before any git ran. The URL is judged
+    without its userinfo, and handed on with it: every git call splits the
+    credential off again at the last moment (:func:`split_url_credentials`),
+    so it only ever travels in git's environment.
+
+    Args:
+        source: Source as stored or given.
+
+    Returns:
+        ``(source_type, normalized)`` as ``validate_source`` returns them; a
+        git source that carried a credential keeps it in ``normalized``.
+
+    Raises:
+        SourceError: If the source is invalid.
+    """
+    stripped = (source or "").strip()
+    bare, auth = split_url_credentials(stripped)
+    if not auth:
+        return validate_source(source)
+    try:
+        source_type, _ = validate_source(bare)
+    except SourceError as exc:
+        raise SourceError(redact_git_text(exc.message), details=exc.details) from None
+    if source_type != "git":
+        return validate_source(source)
+    # validate_source returns an http(s) git URL exactly as given, stripped.
+    return source_type, stripped
+
+
 def is_git_auth_failure(output: str) -> bool:
     """
     Tell whether git failed because the repository wanted credentials.
@@ -271,10 +400,11 @@ def git_auth_error(url: str | None, result: CommandResult) -> SourceError:
     Returns:
         The error to raise, carrying git's own output verbatim.
     """
+    bare = split_url_credentials(url)[0] if url else None
     return SourceError(
         GIT_AUTH_FAILURE_MESSAGE,
-        details=git_auth_fix(url),
-        output=result.stderr or result.stdout,
+        details=git_auth_fix(bare),
+        output=redact_git_text(result.stderr or result.stdout),
     )
 
 
@@ -563,7 +693,7 @@ def _open_url(url: str, timeout: int = DOWNLOAD_TIMEOUT) -> IO[bytes]:
     response = _build_opener().open(url, timeout=timeout)
     if response is None:
         raise SourceError(
-            f"No handler could open the URL: {url}",
+            f"No handler could open the URL: {redact_git_text(url)}",
             details="Only http:// and https:// downloads are supported",
         )
     return response
@@ -594,9 +724,11 @@ def _download_to_file(
     try:
         response = _open_url(url, timeout)
     except URLError as exc:
-        raise SourceError(f"Download failed: {url}", details=str(exc.reason)) from exc
+        raise SourceError(
+            f"Download failed: {redact_git_text(url)}", details=str(exc.reason)
+        ) from exc
     except OSError as exc:
-        raise SourceError(f"Download failed: {url}", details=str(exc)) from exc
+        raise SourceError(f"Download failed: {redact_git_text(url)}", details=str(exc)) from exc
 
     written = 0
     completed = False
@@ -607,13 +739,15 @@ def _download_to_file(
                 try:
                     chunk = response.read(_COPY_CHUNK)
                 except (URLError, OSError) as exc:
-                    raise SourceError(f"Download failed: {url}", details=str(exc)) from exc
+                    raise SourceError(
+                        f"Download failed: {redact_git_text(url)}", details=str(exc)
+                    ) from exc
                 if not chunk:
                     break
                 written += len(chunk)
                 if written > max_bytes:
                     raise SourceError(
-                        f"Download exceeds {max_bytes} bytes: {url}",
+                        f"Download exceeds {max_bytes} bytes: {redact_git_text(url)}",
                         details="Refusing to fill the disk from a remote archive",
                     )
                 sink.write(chunk)
@@ -1256,6 +1390,12 @@ class SourceManager(BaseManager):
         """
         super().__init__(verbose=verbose, runner=runner)
         self._fs = fs
+        #: The credential environment (see :func:`split_url_credentials`) of
+        #: every repository this manager cloned or fetched from a URL that
+        #: carried one, by path. Its ``origin`` no longer carries the
+        #: credential, so a later fetch there, such as the one
+        #: :meth:`resolve_commit` makes after :meth:`sync_cache`, needs it.
+        self._remote_auth: dict[str, dict[str, str]] = {}
 
     @property
     def fs(self) -> FileSystem:
@@ -1267,12 +1407,28 @@ class SourceManager(BaseManager):
         """
         return self._fs if self._fs is not None else get_fs()
 
+    def _remember_auth(self, repository: Path, auth: Mapping[str, str]) -> None:
+        """
+        Record the credential environment a repository is fetched with.
+
+        Args:
+            repository: The clone.
+            auth: Variables from :func:`split_url_credentials`; empty forgets
+                any credential recorded for the clone.
+        """
+        key = os.path.abspath(repository)
+        if auth:
+            self._remote_auth[key] = dict(auth)
+        else:
+            self._remote_auth.pop(key, None)
+
     def _git(
         self,
         args: Sequence[str],
         *,
         cwd: Path | None = None,
         timeout: int = GIT_TIMEOUT,
+        auth: Mapping[str, str] | None = None,
     ) -> CommandResult:
         """
         Run a git command through the command runner.
@@ -1281,15 +1437,25 @@ class SourceManager(BaseManager):
             args: Arguments after ``git``.
             cwd: Working directory.
             timeout: Deadline in seconds.
+            auth: Credential environment for a remote named by URL (see
+                :func:`split_url_credentials`). None uses the one recorded
+                for ``cwd``, if any.
 
         Returns:
-            The command outcome.
+            The command outcome, with credentials redacted from its stderr.
+            Its stdout is returned as git wrote it, because callers parse it.
         """
         argv = ["git", *_GIT_SAFE_CONFIG, *args]
-        self.logger.debug(f"Running: {' '.join(argv)}")
-        result = self.runner.run(argv, cwd=cwd, env=git_environment(), timeout=timeout)
-        self.logger.command_output(result.stdout, result.stderr)
-        return result
+        env = git_environment()
+        if auth is None and cwd is not None:
+            auth = self._remote_auth.get(os.path.abspath(cwd))
+        if auth:
+            env.update(auth)
+        self.logger.debug(redact_git_text(f"Running: {' '.join(argv)}"))
+        result = self.runner.run(argv, cwd=cwd, env=env, timeout=timeout)
+        stderr = redact_git_text(result.stderr)
+        self.logger.command_output(redact_git_text(result.stdout), stderr)
+        return replace(result, stderr=stderr) if stderr != result.stderr else result
 
     def _git_failed(
         self,
@@ -1316,7 +1482,7 @@ class SourceManager(BaseManager):
             The error to raise.
         """
         if not is_git_auth_failure(f"{result.stderr}\n{result.stdout}"):
-            return SourceError(message, details=result.stderr)
+            return SourceError(redact_git_text(message), details=redact_git_text(result.stderr))
         if url is None and repository is not None:
             origin = self._git(["remote", "get-url", "origin"], cwd=repository)
             url = origin.stdout.strip() if origin.success else None
@@ -1363,7 +1529,7 @@ class SourceManager(BaseManager):
             SourceError: If fetch fails.
         """
         # Validate source
-        source_type, normalized = validate_source(source)
+        source_type, normalized = _validate_source_keeping_credentials(source)
 
         # Handle force update for existing Git repos
         if force and destination.exists() and (destination / ".git").exists():
@@ -1419,8 +1585,10 @@ class SourceManager(BaseManager):
         Raises:
             SourceError: If the URL is unsafe or the update fails.
         """
-        safe_url = validate_git_remote_url(url)
+        bare, auth = split_url_credentials(url)
+        safe_url = validate_git_remote_url(bare)
         safe_branch = validate_git_ref(branch) if branch else None
+        self._remember_auth(destination, auth)
 
         # Ensure directory is marked as safe (handles dubious ownership)
         self._ensure_safe_directory(destination)
@@ -1429,6 +1597,8 @@ class SourceManager(BaseManager):
         result = self._git(["remote", "get-url", "origin"], cwd=destination)
         current_url = result.stdout.strip() if result.success else ""
 
+        # An origin an older release wrote with the credential in it is
+        # rewritten without it here, so .git/config stops holding the token.
         if current_url != safe_url:
             self.logger.debug(f"Updating remote URL to: {safe_url}")
             self._git(["remote", "set-url", "origin", "--", safe_url], cwd=destination)
@@ -1486,10 +1656,10 @@ class SourceManager(BaseManager):
             SourceError: If the source is not a git URL, the branch cannot be
                 determined, or git fails.
         """
-        source_type, normalized = validate_source(source)
+        source_type, normalized = _validate_source_keeping_credentials(source)
         if source_type != "git":
             raise SourceError(
-                f"Not a git source: {source}",
+                f"Not a git source: {redact_git_text(source)}",
                 details="Only git sources have a repository cache; local directories "
                 "and archives are copied into each release instead.",
             )
@@ -1525,7 +1695,9 @@ class SourceManager(BaseManager):
             SourceError: If the URL or branch is unsafe, the branch cannot be
                 determined, or git fails.
         """
-        safe_url = validate_git_remote_url(url)
+        bare, auth = split_url_credentials(url)
+        safe_url = validate_git_remote_url(bare)
+        self._remember_auth(cache, auth)
         self._ensure_safe_directory(cache)
 
         result = self._git(["remote", "get-url", "origin"], cwd=cache)
@@ -1609,7 +1781,13 @@ class SourceManager(BaseManager):
         finally:
             self.fs.remove(archive, missing_ok=True)
 
-    def remote_head(self, source: str, branch: str | None = None) -> RemoteHead:
+    def remote_head(
+        self,
+        source: str,
+        branch: str | None = None,
+        *,
+        timeout: int = GIT_NETWORK_TIMEOUT,
+    ) -> RemoteHead:
         """
         Ask the remote which commit a branch points at, downloading nothing.
 
@@ -1620,6 +1798,9 @@ class SourceManager(BaseManager):
             source: Git URL, optionally with ``#branch``.
             branch: Branch to ask about. None asks about the branch in the
                 URL, or else the remote's default branch.
+            timeout: Deadline in seconds for the one ``git ls-remote``. A
+                caller that only wants to show whether there is anything new
+                can ask for less than a deploy would wait.
 
         Returns:
             The branch and the full id of the commit it points at.
@@ -1629,21 +1810,23 @@ class SourceManager(BaseManager):
                 exist on the remote, or the remote cannot be read (a refused
                 credential gets the error that says how to grant access).
         """
-        source_type, normalized = validate_source(source)
+        source_type, normalized = _validate_source_keeping_credentials(source)
         if source_type != "git":
             raise SourceError(
-                f"Not a git source: {source}",
+                f"Not a git source: {redact_git_text(source)}",
                 details="Only a git remote has a branch head to compare with.",
             )
         parsed = parse_git_url(normalized)
         branch = branch or parsed["branch"] or None
-        url = validate_git_remote_url(normalized.split("#")[0])
+        bare, auth = split_url_credentials(normalized.split("#")[0])
+        url = validate_git_remote_url(bare)
 
         if branch:
             safe_branch = validate_git_ref(branch)
             result = self._git(
                 ["ls-remote", "--exit-code", "--", url, f"refs/heads/{safe_branch}"],
-                timeout=GIT_NETWORK_TIMEOUT,
+                timeout=timeout,
+                auth=auth,
             )
             # --exit-code: 2 means the remote answered and has no such ref.
             if result.exit_code == 2:
@@ -1662,9 +1845,7 @@ class SourceManager(BaseManager):
                 details=result.stdout.strip() or "git ls-remote answered nothing.",
             )
 
-        result = self._git(
-            ["ls-remote", "--symref", "--", url, "HEAD"], timeout=GIT_NETWORK_TIMEOUT
-        )
+        result = self._git(["ls-remote", "--symref", "--", url, "HEAD"], timeout=timeout, auth=auth)
         if not result.success:
             raise self._git_failed(result, f"Cannot read the branches of {url}", url=url)
         default: str | None = None
@@ -1875,7 +2056,8 @@ class SourceManager(BaseManager):
             branch = parsed["branch"]
             url = url.split("#")[0]
 
-        safe_url = validate_git_remote_url(url)
+        bare, auth = split_url_credentials(url)
+        safe_url = validate_git_remote_url(bare)
         safe_branch = validate_git_ref(branch) if branch else None
 
         # Validate SSH setup for SSH URLs
@@ -1899,11 +2081,12 @@ class SourceManager(BaseManager):
         cmd.extend(["--", safe_url, str(destination)])
 
         self.logger.debug(f"Cloning: {safe_url}")
-        result = self._git(cmd, timeout=GIT_CLONE_TIMEOUT)
+        result = self._git(cmd, timeout=GIT_CLONE_TIMEOUT, auth=auth)
 
         if not result.success:
             raise self._git_failed(result, f"Git clone failed: {safe_url}", url=safe_url)
 
+        self._remember_auth(destination, auth)
         return True
 
     def sparse_clone(
@@ -1946,13 +2129,14 @@ class SourceManager(BaseManager):
                 anchored, or the remote refused or could not be reached; those
                 would fail a full clone just the same.
         """
-        source_type, normalized = validate_source(source)
+        source_type, normalized = _validate_source_keeping_credentials(source)
         if source_type != "git":
             raise SourceError(
-                f"Not a git source: {source}",
+                f"Not a git source: {redact_git_text(source)}",
                 details="Only a git remote can be checked out sparsely.",
             )
-        url = validate_git_remote_url(normalized.split("#")[0])
+        bare, auth = split_url_credentials(normalized.split("#")[0])
+        url = validate_git_remote_url(bare)
         ref = branch or parse_git_url(normalized)["branch"] or None
         branch_args = ["--branch", validate_git_ref(ref)] if ref else []
         for pattern in patterns:
@@ -1977,12 +2161,14 @@ class SourceManager(BaseManager):
                 str(destination),
             ],
             timeout=GIT_NETWORK_TIMEOUT,
+            auth=auth,
         )
         if result.exit_code == _GIT_USAGE_ERROR:
             self.logger.debug(f"git cannot clone without blobs: {result.stderr.strip()}")
             return False
         if not result.success:
             raise self._git_failed(result, f"Git clone failed: {url}", url=url)
+        self._remember_auth(destination, auth)
 
         result = self._git(["sparse-checkout", "set", "--no-cone", *patterns], cwd=destination)
         if not result.success:
@@ -2196,8 +2382,9 @@ class SourceManager(BaseManager):
         """
         Force pull by fetching and resetting to remote.
 
-        This is a more aggressive approach when normal pull fails.
-        Preserves untracked files like .env.
+        This is a more aggressive approach when normal pull fails. Tracked
+        files are rewritten; untracked ones, ignored or not, are left exactly
+        where they are.
 
         Args:
             path: Repository path.
@@ -2223,13 +2410,14 @@ class SourceManager(BaseManager):
             current_branch = result.stdout.strip() if result.success else "main"
             target_ref = f"origin/{current_branch}"
 
-        # Reset hard to remote (preserves untracked files)
+        # reset --hard rewrites tracked files only. There is deliberately no
+        # `git clean` after it: `clean -fd` deletes every untracked file that
+        # is not ignored, which in an in-place application is its uploads, a
+        # hand-written .env the repository does not ignore, and whatever else
+        # it wrote into its own tree (see _force_update_git).
         result = self._git(["reset", "--hard", target_ref], cwd=path)
         if not result.success:
             raise SourceError("Git reset failed", details=result.stderr)
-
-        # Clean only tracked files (not untracked like .env)
-        self._git(["clean", "-fd"], cwd=path)
 
         return True
 
@@ -2258,10 +2446,12 @@ class SourceManager(BaseManager):
         if not _writes_directly(self.fs):
             # A rehearsal does not pull a gigabyte off the network to unpack it
             # into a directory it was not allowed to create.
-            self.logger.debug(f"Would download and extract: {safe_url} -> {destination}")
+            self.logger.debug(
+                f"Would download and extract: {redact_git_text(safe_url)} -> {destination}"
+            )
             return True
 
-        self.logger.debug(f"Downloading: {safe_url}")
+        self.logger.debug(f"Downloading: {redact_git_text(safe_url)}")
 
         with tempfile.TemporaryDirectory(prefix="wasm-source-") as workdir:
             archive = Path(workdir) / "archive"

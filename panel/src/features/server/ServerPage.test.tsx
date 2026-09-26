@@ -74,6 +74,11 @@ describe("the server page", () => {
     ]);
     expect(within(reasons).getByRole("link", { name: "shop.example.com" })).toHaveAttribute("href", "/domains?q=shop.example.com");
     expect(screen.getAllByText("Critical").length).toBeGreaterThanOrEqual(2);
+    // A verdict that changes while the page is open is read out, with the reasons that changed.
+    const verdict = screen.getByRole("status", { name: "Health verdict" });
+    expect(verdict).toHaveTextContent("Critical");
+    expect(verdict).toHaveAttribute("aria-atomic", "true");
+    expect(reasons).toHaveAttribute("aria-live", "polite");
     await expectNoAxeViolations(container);
   });
 

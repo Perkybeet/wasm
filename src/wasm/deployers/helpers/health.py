@@ -74,13 +74,16 @@ def wait_until_healthy(
     delay: float = 2.0,
     on_attempt: Callable[[str], None] | None = None,
     accept: Callable[[int], bool] | None = None,
+    within: float | None = None,
+    clock: Callable[[], float] | None = None,
+    sleep: Callable[[float], None] | None = None,
 ) -> bool:
     """
-    Poll an endpoint until it answers 200 or the attempts run out.
+    Poll an endpoint until it answers as required, the attempts run out or time is up.
 
     Args:
         url: Endpoint to request.
-        retries: Number of attempts.
+        retries: Most attempts to make.
         delay: Seconds to wait between attempts.
         on_attempt: Called with a description of each failed attempt.
         accept: Decides which status codes count as healthy, such as
@@ -88,20 +91,35 @@ def wait_until_healthy(
             redirect itself is the answer, and following one to the public
             HTTPS name would probe something other than this process. None
             keeps the strict "200 after redirects" check.
+        within: Seconds of wall-clock time the whole poll may take, measured
+            on a monotonic clock. No attempt waits longer than what is left,
+            and no pause runs past it. None bounds the poll by ``retries``
+            alone, each attempt allowed :data:`PROBE_TIMEOUT`.
+        clock: Monotonic time source; :func:`time.monotonic` when None.
+        sleep: How to pause; :func:`time.sleep` when None.
 
     Returns:
         True when the endpoint answered as required.
     """
+    now = clock or time.monotonic
+    pause = sleep or time.sleep
+    deadline = now() + within if within is not None else None
     opener = (
         urllib.request.build_opener(_NoRedirect())
         if accept is not None
         else urllib.request.build_opener()
     )
     for attempt in range(retries):
+        probe_timeout: float = PROBE_TIMEOUT
+        if deadline is not None:
+            left = deadline - now()
+            if left <= 0:
+                break
+            probe_timeout = min(PROBE_TIMEOUT, left)
         try:
             # The URL is always http://127.0.0.1:<port><path>, built here; S310
             # guards against a caller-supplied scheme, which cannot occur.
-            with opener.open(url, timeout=PROBE_TIMEOUT) as response:
+            with opener.open(url, timeout=probe_timeout) as response:
                 # With an expectation, it alone decides: an application told
                 # to answer 204 is not healthy because it answered 200.
                 if accept(response.status) if accept is not None else response.status == 200:
@@ -124,8 +142,15 @@ def wait_until_healthy(
             if on_attempt is not None:
                 on_attempt(f"Health check attempt {attempt + 1} failed: {e}")
 
-        if attempt < retries - 1:
-            time.sleep(delay)
+        if attempt == retries - 1:
+            break
+        if deadline is None:
+            pause(delay)
+            continue
+        left = deadline - now()
+        if left <= 0:
+            break
+        pause(min(delay, left))
 
     return False
 

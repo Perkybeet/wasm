@@ -258,3 +258,24 @@ def test_keep_without_a_number_shows_the_retention(
 
     assert result.exit_code == 0, result.output
     assert any("8" in line for line in log)
+
+
+def test_keep_usage_shows_n_is_optional() -> None:
+    result = CliRunner().invoke(root_cli, ["releases", "keep", "--help"])
+
+    assert result.exit_code == 0
+    assert "DOMAIN [N]" in result.output
+
+
+def test_keep_accepts_the_global_flags_after_its_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    from wasm.deployers.lifecycle import RetentionChange
+
+    monkeypatch.setattr(
+        releases_module,
+        "set_release_retention",
+        lambda domain, keep, **kw: RetentionChange(domain=domain, keep_releases=keep, pruned=()),
+    )
+
+    result = invoke(["releases", "keep", DOMAIN, "7", "--verbose", "--no-color"])
+
+    assert result.exit_code == 0, result.output

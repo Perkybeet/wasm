@@ -142,6 +142,36 @@ test("email: the SMTP account is a form, refusals land on their field, a failed 
   }
 });
 
+test("telegram: the missing-minus warning is announced once the chat ID field is left, not on every keystroke", async ({
+  page,
+  consoleServer,
+}) => {
+  await signIn(page, consoleServer, "/settings/notifications");
+  const telegram = page.getByRole("article", { name: "Telegram" });
+  const chatId = telegram.getByLabel("Chat ID");
+  const warning = telegram.getByText(/without its minus sign/);
+  const announcer = page.getByTestId("announcer-polite");
+
+  await chatId.clear();
+  await chatId.pressSequentially("1001987654321");
+  // Drawn as it is typed, so a click on Save that leaves the field never lands on a moved button,
+  // but never inside a live region: that would be read out on every digit.
+  await expect(warning).toHaveText(/try -1001987654321\.$/);
+  await expect(telegram.getByRole("alert")).toHaveCount(0);
+  await expect(announcer).not.toContainText("minus sign");
+
+  await chatId.press("Tab");
+  await expect(announcer).toContainText(/without its minus sign.*try -1001987654321\.$/);
+  await settle(page);
+  await expectNoA11yViolations(page, "the missing-minus warning");
+
+  // Adding the sign clears it.
+  await chatId.press("Home");
+  await chatId.pressSequentially("-");
+  await expect(chatId).toHaveValue("-1001987654321");
+  await expect(warning).toHaveCount(0);
+});
+
 test("telegram: finds the chats the bot has seen, fills the chat ID, and shows Telegram's own words", async ({
   page,
   consoleServer,

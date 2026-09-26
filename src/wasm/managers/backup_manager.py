@@ -57,14 +57,15 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import os
 import re
 import shutil
 import sqlite3
 import tarfile
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, ClassVar, Protocol, runtime_checkable
 
@@ -91,7 +92,7 @@ from wasm.core.logger import Logger
 from wasm.core.runner import DEFAULT_TIMEOUT, CommandResult, CommandRunner, get_runner
 from wasm.core.store import AppType, DeploymentStatus, DeploymentTrigger, get_store
 from wasm.core.utils import domain_to_app_name
-from wasm.deployers.helpers.layout import RELEASES, env_file_in, layout_on_disk
+from wasm.deployers.helpers.layout import INPLACE, RELEASES, env_file_in, layout_on_disk
 from wasm.deployers.helpers.permissions import hand_over_tree
 from wasm.deployers.recorder import CapturingLogger, DeploymentRecorder
 from wasm.deployers.releases import (
@@ -561,11 +562,25 @@ class BackupManager:
         Args:
             domain: Domain the backup belongs to.
 
+        Two backups within the same second used to get the same id, so a
+        rollback's safety backup could overwrite the very backup it was about
+        to restore. The id keeps its format (other code and the import command
+        parse it), and a taken second moves the stamp forward instead.
+
         Returns:
             An identifier of the form ``<domain-with-dashes>_<timestamp>``.
         """
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return f"{domain.replace('.', '-')}_{timestamp}"
+        app_name = domain.replace(".", "-")
+        directory = self._get_app_backup_dir(app_name)
+        moment = datetime.now().replace(microsecond=0)
+        while True:
+            backup_id = f"{app_name}_{moment.strftime('%Y%m%d_%H%M%S')}"
+            taken = (directory / f"{backup_id}{ARCHIVE_SUFFIX}").exists() or (
+                directory / f"{backup_id}.json"
+            ).exists()
+            if not taken:
+                return backup_id
+            moment += timedelta(seconds=1)
 
     def _calculate_checksum(self, file_path: Path) -> str:
         """
@@ -1229,6 +1244,7 @@ class BackupManager:
         verify_checksum: bool = True,
         pre_restore_hook: str | None = None,
         post_restore_hook: str | None = None,
+        keep: Sequence[str] = (),
     ) -> bool:
         """
         Restore an application from a backup this manager knows about.
@@ -1241,6 +1257,9 @@ class BackupManager:
             verify_checksum: Check the archive against the recorded checksum.
             pre_restore_hook: Command to run before the restore.
             post_restore_hook: Command to run after the restore.
+            keep: Top-level names in the application directory carried from
+                the tree being replaced into the restored one when the archive
+                does not have them, such as ``.git``, which no archive holds.
 
         Returns:
             True if the restore succeeded.
@@ -1273,6 +1292,7 @@ class BackupManager:
             fallback=metadata,
             pre_restore_hook=pre_restore_hook,
             post_restore_hook=post_restore_hook,
+            keep=keep,
         )
 
     def restore_archive(
@@ -1286,6 +1306,7 @@ class BackupManager:
         fallback: BackupMetadata | None = None,
         pre_restore_hook: str | None = None,
         post_restore_hook: str | None = None,
+        keep: Sequence[str] = (),
     ) -> bool:
         """
         Restore an application from an archive file, wherever it lives.
@@ -1306,6 +1327,8 @@ class BackupManager:
             fallback: Metadata of an older archive that carries no manifest.
             pre_restore_hook: Command to run before the restore.
             post_restore_hook: Command to run after the restore.
+            keep: Top-level names carried from the tree being replaced; see
+                :meth:`restore`.
 
         Returns:
             True if the restore succeeded.
@@ -1355,6 +1378,7 @@ class BackupManager:
                 fallback=fallback,
                 pre_restore_hook=pre_restore_hook,
                 post_restore_hook=post_restore_hook,
+                keep=keep,
             )
 
     def _restore_locked(
@@ -1367,6 +1391,7 @@ class BackupManager:
         fallback: BackupMetadata | None,
         pre_restore_hook: str | None,
         post_restore_hook: str | None,
+        keep: Sequence[str] = (),
     ) -> bool:
         """
         Run a real restore, with the target application's lock already held.
@@ -1387,6 +1412,7 @@ class BackupManager:
             fallback: Metadata of an older archive that carries no manifest.
             pre_restore_hook: Command to run before the restore.
             post_restore_hook: Command to run after the restore.
+            keep: Top-level names carried from the tree being replaced.
 
         Returns:
             True once the restore has fully succeeded.
@@ -1458,6 +1484,7 @@ class BackupManager:
 
             self._swap_in_tree(app_root, app_path, workspace)
             swapped = True
+            self._carry_over(workspace / "previous", app_path, keep)
 
             # Where the .env goes depends on the tree that came back, which
             # need not be on the layout of the one it replaced.
@@ -1871,6 +1898,34 @@ class BackupManager:
                 f"Failed to restore files into {app_path}",
                 details=str(exc),
             ) from exc
+
+    def _carry_over(self, previous: Path, app_path: Path, names: Sequence[str]) -> None:
+        """
+        Copy top-level entries of the replaced tree into the restored one.
+
+        Copied, not moved: the safety copy must stay whole, because it is what
+        a restore that fails after the swap puts back.
+
+        Args:
+            previous: The safety copy of the replaced tree.
+            app_path: The restored application directory.
+            names: Top-level names to carry. One the archive brought back is
+                left as the archive has it, and a link is never followed.
+
+        Raises:
+            OSError: The copy failed; the caller puts the previous tree back.
+        """
+        for name in names:
+            carried = previous / name
+            target = app_path / name
+            if carried.is_symlink() or not carried.exists() or os.path.lexists(target):
+                continue
+            self.logger.debug(f"Keeping {name} from the tree being replaced")
+            if carried.is_dir():
+                self.fs.copy_tree(carried, target)
+            else:
+                # A worktree's .git is a one-line file naming its directory.
+                self.fs.write_text(target, carried.read_text())
 
     def _read_manifest(self, extracted: Path) -> dict[str, Any] | None:
         """
@@ -3120,6 +3175,8 @@ class RollbackManager:
         self.backup_manager = BackupManager(verbose=verbose, runner=runner, fs=fs)
         self.service_manager = ServiceManager(verbose=verbose, runner=runner)
         self.config = Config()
+        #: The history row the last :meth:`rollback` wrote, when it wrote one.
+        self.last_deployment_id: int | None = None
 
     def create_pre_deploy_backup(
         self,
@@ -3166,9 +3223,12 @@ class RollbackManager:
 
         The tree being backed up is what the most recent finished deployment
         left, provided it succeeded: after a failed one the tree is whatever
-        the failure left behind, which is nobody's snapshot. The commit, when
-        both sides know it, must agree too, so a tree changed by hand since is
-        not passed off as the deployment's.
+        the failure left behind, which is nobody's snapshot. Both sides must
+        know the commit and it must be the deployment's: a tree changed by
+        hand since, or one an update that never finished (its row still
+        ``running``, skipped below) left half-changed, is not passed off as
+        the deployment's. A tree without history therefore gets no snapshot;
+        going back to it is a backup restored by hand.
 
         Args:
             domain: The application's domain.
@@ -3183,10 +3243,11 @@ class RollbackManager:
                     continue
                 if record.status != DeploymentStatus.SUCCESS.value or record.id is None:
                     return
-                if backup.git_commit and record.git_commit:
-                    short = min(len(backup.git_commit), len(record.git_commit))
-                    if backup.git_commit[:short] != record.git_commit[:short]:
-                        return
+                if not backup.git_commit or not record.git_commit:
+                    return
+                short = min(len(backup.git_commit), len(record.git_commit))
+                if backup.git_commit[:short].lower() != record.git_commit[:short].lower():
+                    return
                 store.set_deployment_snapshot(record.id, backup.id)
                 self.logger.debug(f"Backup {backup.id} holds deployment {record.id}")
                 return
@@ -3202,6 +3263,11 @@ class RollbackManager:
         backup_id: str | None = None,
         rebuild: bool = True,
         trigger: str = DeploymentTrigger.CLI.value,
+        *,
+        restore_env: bool = True,
+        keep: Sequence[str] = (),
+        app_type: str | None = None,
+        gate: Callable[[], tuple[bool, str]] | None = None,
     ) -> bool:
         """
         Roll an application back to a previous state.
@@ -3215,12 +3281,28 @@ class RollbackManager:
         deployment stopped serving. Refusals before anything is attempted (no
         backup to roll back to) are not recorded: nothing ran.
 
+        With a ``gate`` the rollback is held to what a deploy is held to: the
+        restored tree must rebuild (a deployer that cannot rebuild in place,
+        or a failed install or build, fails the rollback instead of warning),
+        is handed back to the service account, and is restarted and probed by
+        the gate; one that does not answer fails the rollback, and the error
+        names the safety backup that holds what served before it.
+
         Args:
             domain: Domain name.
             backup_id: Specific backup (defaults to the latest manual one).
             rebuild: Rebuild the application after the restore.
             trigger: What initiated the rollback, recorded in the history:
                 ``cli`` (the default), ``panel`` or ``webhook``.
+            restore_env: Restore the ``.env`` files from the archive. False
+                keeps the ``.env`` that is deployed.
+            keep: Top-level names carried from the tree being replaced, such
+                as ``.git`` (see :meth:`BackupManager.restore`).
+            app_type: The type to rebuild as, as the store records it. None
+                detects it from the restored files.
+            gate: Restarts the application and judges whether it answers,
+                returning that and the evidence when it does not. None starts
+                the unit without judging it, as 1.x did.
 
         Returns:
             True if the rollback succeeded.
@@ -3228,9 +3310,12 @@ class RollbackManager:
         Raises:
             BackupError: If there is no backup to roll back to, or the restore
                 fails.
+            DeploymentError: With a gate, the restored tree did not rebuild or
+                did not pass the health check.
             AppBusyError: Another deploy, update, rollback, migration or
                 restore is already running on the application.
         """
+        self.last_deployment_id = None
         with app_lock(domain, "rollback"):
             if backup_id:
                 metadata = self.backup_manager.get_backup(backup_id)
@@ -3255,6 +3340,7 @@ class RollbackManager:
             recorder = DeploymentRecorder(get_store(), domain, trigger, logger=self.logger)
             recorder.start()
             recorder.annotate(git_commit=metadata.git_commit, git_branch=metadata.git_branch)
+            self.last_deployment_id = recorder.deployment_id
 
             try:
                 # A safety backup of the current state, taken here so that both
@@ -3264,8 +3350,11 @@ class RollbackManager:
                 # went wrong. A missing safety net is worth a warning, not an
                 # abort - the operator already has a reason to go back.
                 self.logger.info("Creating a safety backup of the current state")
+                safety: BackupMetadata | None = None
                 try:
-                    self.create_pre_deploy_backup(domain, description="Pre-rollback safety backup")
+                    safety = self.create_pre_deploy_backup(
+                        domain, description="Pre-rollback safety backup"
+                    )
                 except WASMError as exc:
                     self.logger.warning(f"Could not create safety backup: {exc}")
 
@@ -3276,8 +3365,9 @@ class RollbackManager:
 
                 self.backup_manager.restore(
                     backup_id=metadata.id,
-                    restore_env=True,
+                    restore_env=restore_env,
                     stop_service=True,
+                    keep=keep,
                 )
 
                 app_name = domain_to_app_name(domain)
@@ -3293,44 +3383,31 @@ class RollbackManager:
                         f"rebuilt. Run 'wasm update {domain}' to build a release from it."
                     )
                 elif rebuild:
-                    self.logger.info("Rebuilding application...")
+                    self._rebuild(
+                        domain, app_path, recorder, app_type=app_type, strict=gate is not None
+                    )
 
-                    from wasm.deployers import detect_app_type, get_deployer
-
-                    app_type = detect_app_type(app_path, verbose=self.verbose)
-                    if app_type:
-                        deployer = get_deployer(app_type, verbose=self.verbose)
-                        # The rebuild happens through the deployer's own logger;
-                        # capturing it puts the build output in this rollback's
-                        # log. The interface does not promise a logger, so one
-                        # that is missing or not capturable is simply not mirrored.
-                        delegate_logger = getattr(deployer, "logger", None)
-                        if isinstance(delegate_logger, Logger):
-                            recorder.also_capture(delegate_logger)
-                        # The source is already on disk: this is a rebuild in
-                        # place, not a deployment, so the restored directory is
-                        # its own source.
-                        deployer.configure(domain, source=str(app_path), app_path=app_path)
-
-                        if isinstance(deployer, _InPlaceRebuilder):
-                            try:
-                                deployer.install_dependencies()
-                                deployer.build()
-                            except WASMError as exc:
-                                self.logger.warning(f"Rebuild failed: {exc}")
-                                self.logger.info("Application restored but may need manual rebuild")
-                        else:
-                            self.logger.warning(
-                                f"The {app_type} deployer cannot rebuild in place; "
-                                "the files are restored but not rebuilt"
-                            )
-
-                try:
-                    status = self.service_manager.get_status(app_name)
-                    if status.get("exists"):
-                        self.service_manager.start(app_name)
-                except ServiceError as exc:
-                    self.logger.debug(f"Could not start service: {exc}")
+                if gate is not None:
+                    self.logger.info("Restarting behind the health check")
+                    healthy, evidence = gate()
+                    if not healthy:
+                        way_back = (
+                            f"What served before the rollback is in backup {safety.id}: "
+                            f"wasm rollback {domain} {safety.id}"
+                            if safety is not None
+                            else "No safety backup could be taken before the rollback."
+                        )
+                        raise DeploymentError(
+                            f"{domain} did not pass its health check after the rollback",
+                            details=f"{evidence}\n\n{way_back}",
+                        )
+                else:
+                    try:
+                        status = self.service_manager.get_status(app_name)
+                        if status.get("exists"):
+                            self.service_manager.start(app_name)
+                    except ServiceError as exc:
+                        self.logger.debug(f"Could not start service: {exc}")
             except Exception as exc:
                 # Not handling: the failure is recorded and re-raised unchanged.
                 recorder.finish_failure(exc)
@@ -3341,6 +3418,93 @@ class RollbackManager:
             recorder.mark_previous_success_rolled_back()
             recorder.finish_success()
             return True
+
+    def _rebuild(
+        self,
+        domain: str,
+        app_path: Path,
+        recorder: DeploymentRecorder,
+        *,
+        app_type: str | None,
+        strict: bool,
+    ) -> None:
+        """
+        Install and build a restored in-place tree, where it is.
+
+        Args:
+            domain: The application's domain.
+            app_path: The restored application directory.
+            recorder: The rollback's recording, which captures the build.
+            app_type: The type to rebuild as, or None to detect it.
+            strict: Fail instead of warning when the tree cannot be rebuilt,
+                and hand the rebuilt tree back to the service account.
+
+        Raises:
+            DeploymentError: Strict, the deployer cannot rebuild in place, or
+                the install or the build failed.
+        """
+        self.logger.info("Rebuilding application...")
+
+        from wasm.deployers import detect_app_type, get_deployer
+
+        app_type = app_type or detect_app_type(app_path, verbose=self.verbose)
+        if not app_type:
+            if strict:
+                raise DeploymentError(
+                    f"Cannot tell what kind of application the restored tree of {domain} is",
+                    details="Nothing was rebuilt. Redeploy it with: wasm update " + domain,
+                )
+            return
+        deployer = get_deployer(app_type, verbose=self.verbose)
+        # The rebuild happens through the deployer's own logger; capturing it
+        # puts the build output in this rollback's log. The interface does not
+        # promise a logger, so one that is missing or not capturable is simply
+        # not mirrored.
+        delegate_logger = getattr(deployer, "logger", None)
+        if isinstance(delegate_logger, Logger):
+            recorder.also_capture(delegate_logger)
+        # The source is already on disk: this is a rebuild in place, not a
+        # deployment, so the restored directory is its own source.
+        deployer.configure(domain, source=str(app_path), app_path=app_path)
+
+        if not isinstance(deployer, _InPlaceRebuilder):
+            message = f"The {app_type} deployer cannot rebuild in place"
+            if strict:
+                raise DeploymentError(
+                    message, details="The files are restored but not rebuilt; nothing restarted."
+                )
+            self.logger.warning(f"{message}; the files are restored but not rebuilt")
+            return
+
+        try:
+            built = deployer.install_dependencies() and deployer.build()
+        except WASMError as exc:
+            if strict:
+                raise
+            self.logger.warning(f"Rebuild failed: {exc}")
+            self.logger.info("Application restored but may need manual rebuild")
+            return
+        if not built:
+            if strict:
+                raise DeploymentError(
+                    f"The restored tree of {domain} did not build",
+                    details="The install or the build reported a failure; nothing restarted.",
+                )
+            self.logger.warning("Rebuild failed; the application may need a manual rebuild")
+            return
+
+        if strict:
+            # The install and the build ran as root; the service writes into
+            # what they produced.
+            hand_over_tree(
+                app_path,
+                user=self.config.service_user,
+                group=self.config.service_group,
+                runner=self.backup_manager.runner,
+                fs=self.backup_manager.fs,
+                logger=self.logger,
+                env_files=(env_file_in(app_path, INPLACE),),
+            )
 
     def list_rollback_points(self, domain: str) -> list[BackupMetadata]:
         """

@@ -118,6 +118,11 @@ describe("the metrics tab", { timeout: 20_000 }, () => {
     expect(await screen.findByRole("heading", { name: "A static site has no process to measure" })).toBeInTheDocument();
   });
 
+  it("says Docker measures a Compose application, instead of charting zeros", async () => {
+    await metricsAt(undefined, { app_type: "docker-compose" });
+    expect(await screen.findByRole("heading", { name: "Docker measures this application's containers" })).toBeInTheDocument();
+  });
+
   it("has no accessibility violations", async () => {
     await metricsAt();
     await screen.findByRole("img", { name: /^Memory, last 24 hours/ });

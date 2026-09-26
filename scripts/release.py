@@ -326,7 +326,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check or not args.version:
         return check()
-    return bump(args.version, args.message)
+    # The man pages carry the version in their header and CI checks them, so a bump
+    # that leaves them behind fails the release gate. After bump(), here and not in it: regenerating
+    # runs the real CLI against the real tree, which a test of bump() must not.
+    status = bump(args.version, args.message)
+    subprocess.run([sys.executable, str(ROOT / "scripts" / "generate_man.py")], check=True)
+    print("  updated man pages")
+    return status
 
 
 if __name__ == "__main__":

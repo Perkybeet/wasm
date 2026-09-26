@@ -41,6 +41,7 @@ from wasm.core.notifier import (
     USER_AGENT,
     NotificationEvent,
     Notifier,
+    validate_telegram_bot_token,
     validate_telegram_chat_id,
 )
 
@@ -358,6 +359,26 @@ class TestTelegramChannel:
         assert opener.requests == []
         assert "telegram" in caplog.text
 
+    @pytest.mark.parametrize("suffix", ["\n", "\r\n", "\n/../evil"])
+    def test_a_token_with_a_trailing_line_break_is_refused(
+        self, config: Config, caplog: pytest.LogCaptureFixture, suffix: str
+    ) -> None:
+        """
+        ``$`` also matches just before a final newline, so ``match`` against
+        ``^...$`` accepted a token followed by a line break: the whole value
+        has to be the Bot API's shape, not just everything before its end.
+        """
+        config.set("notifications.enabled", True)
+        config._config["notifications"]["channels"]["telegram"]["bot_token"] = BOT_TOKEN + suffix
+        config.set("notifications.channels.telegram.chat_id", "42")
+        opener = CapturingOpener()
+
+        with caplog.at_level(logging.WARNING, logger="wasm.core.notifier"):
+            Notifier(config, opener=opener).notify(make_event())
+
+        assert opener.requests == []
+        assert "telegram" in caplog.text
+
     def test_a_malformed_chat_id_is_refused_before_it_reaches_telegram(
         self, config: Config, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -404,6 +425,37 @@ class TestTelegramChatIdValidation:
     def test_a_short_positive_id_is_not_flagged_as_missing_a_sign(self) -> None:
         """A private chat id is a plain positive integer; it must not be second-guessed."""
         assert validate_telegram_chat_id("100200") == "100200"
+
+
+class TestTelegramBotTokenValidation:
+    """The one rule for a bot token's shape, used on save and before every request."""
+
+    def test_accepts_the_bot_api_shape(self) -> None:
+        assert validate_telegram_bot_token(BOT_TOKEN) == BOT_TOKEN
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "",
+            "junk",
+            "110201543:",
+            ":AAHtoken",
+            "110201543:AAH token",
+            "110201543:AAH/../evil",
+            BOT_TOKEN + "\n",
+            BOT_TOKEN + "\r\n",
+            "\n" + BOT_TOKEN,
+        ],
+    )
+    def test_refuses_anything_else(self, value: str) -> None:
+        with pytest.raises(ValueError, match="does not look like a Telegram bot token"):
+            validate_telegram_bot_token(value)
+
+    def test_the_refusal_never_quotes_the_value(self) -> None:
+        with pytest.raises(ValueError) as raised:
+            validate_telegram_bot_token("110201543:secret part\n")
+
+        assert "secret part" not in str(raised.value)
 
 
 class TestTestChannel:
@@ -766,6 +818,15 @@ class TestTelegramChats:
 
     def test_refuses_a_malformed_token_before_any_request(self, config: Config) -> None:
         config.set("notifications.channels.telegram.bot_token", "junk/../../evil")
+        opener = _JsonOpener(b"{}")
+
+        with pytest.raises(ValueError, match="does not look like"):
+            Notifier(config, opener=opener).list_telegram_chats()
+
+        assert opener.requests == []
+
+    def test_refuses_a_token_with_a_trailing_newline(self, config: Config) -> None:
+        config._config["notifications"]["channels"]["telegram"]["bot_token"] = BOT_TOKEN + "\n"
         opener = _JsonOpener(b"{}")
 
         with pytest.raises(ValueError, match="does not look like"):

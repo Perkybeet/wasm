@@ -32,6 +32,7 @@ from __future__ import annotations
 import sqlite3
 from abc import abstractmethod
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, ClassVar, Literal
@@ -156,6 +157,7 @@ class BaseDeployer(AppDeployer):
     _staged: StagedRelease | None = None
     _app_record: App | None = None
     _replace_existing: bool = False
+    _gate_in_place: bool = False
 
     def __init__(
         self,
@@ -414,6 +416,10 @@ class BaseDeployer(AppDeployer):
         # Deploying over a directory that already holds files is refused
         # unless asked for (wasm create --force); see claim_deploy_target.
         self._replace_existing = bool(options.get("replace_existing", False))
+        # An in-place update that must restart behind the health gate itself
+        # (going back to a deployment), rather than leave the restart to the
+        # caller; see _update_in_place.
+        self._gate_in_place = bool(options.get("gate_in_place", False))
         self.deploy_target = None
 
         # Set app name and path
@@ -2412,7 +2418,16 @@ class BaseDeployer(AppDeployer):
         # in directories a pull may have just added.
         self._set_permissions()
 
-        return self._update_result(prisma_updated)
+        result = self._update_result(prisma_updated)
+        if not (self._gate_in_place and result.start_command):
+            return result
+        # Inside the recording: a build that does not answer is a failed row
+        # whose log holds the probes and the journal.
+        report("Restarting behind the health check")
+        healthy, evidence = self._restart_and_probe()
+        if not healthy:
+            raise DeploymentError(f"{self.domain} did not pass its health check", details=evidence)
+        return replace(result, restarted=(self.app_name,) if self.app_name else ())
 
     def _update_release(self, report: StepReporter) -> UpdateResult:
         """

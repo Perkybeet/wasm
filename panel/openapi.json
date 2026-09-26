@@ -2284,7 +2284,7 @@
         "type": "object"
       },
       "CronJobInfo": {
-        "description": "One cron job as systemd reports it.\n\nAttributes:\n    name: Job name the ``wasm-cron-{name}`` unit names are built from.\n    command: The unit's ``ExecStart`` value, verbatim.\n    user: Unix user the command runs as.\n    working_directory: Directory the command runs in, empty when unset.\n    app_domain: Domain of the associated application, empty when none.\n    schedule: The schedule in words: an alias such as ``daily`` when the\n        expression matches one, ``custom`` otherwise.\n    on_calendar: The systemd ``OnCalendar`` expression, verbatim.\n    enabled: Whether the timer is enabled.\n    next_run: When the timer fires next, as systemd prints it, or\n        ``pending`` when it cannot say.\n    last_run: When the timer last fired, or ``never``.\n    last_exit_code: Exit code of the last run, or None when the job never\n        ran.\n    last_result: Systemd's ``Result`` for the last run, or ``never ran``.",
+        "description": "One cron job as systemd reports it.\n\nAttributes:\n    name: Job name the ``wasm-cron-{name}`` unit names are built from.\n    command: The command as the operator typed it (what the unit runs, before systemd escaping).\n    user: Unix user the command runs as.\n    working_directory: Directory the command runs in, empty when unset.\n    app_domain: Domain of the associated application, empty when none.\n    schedule: The schedule in words: an alias such as ``daily`` when the\n        expression matches one, ``custom`` otherwise.\n    on_calendar: The systemd ``OnCalendar`` expression, verbatim.\n    enabled: Whether the timer is enabled.\n    next_run: When the timer fires next, as systemd prints it, or\n        ``pending`` when it cannot say.\n    last_run: When the timer last fired, or ``never``.\n    last_exit_code: Exit code of the last run, or None when the job never\n        ran.\n    last_result: Systemd's ``Result`` for the last run, or ``never ran``.",
         "properties": {
           "app_domain": {
             "title": "App Domain",
@@ -5276,7 +5276,7 @@
         "type": "object"
       },
       "SMTPConfig": {
-        "description": "SMTP settings for the monitor's email notifications and test message.\n\n``password`` is write-only: it is never sent back by ``GET /config/smtp``\n(see :class:`SMTPSettingsResponse`), so unlike a secret round-tripped\nthrough the generic ``PUT``/``PATCH /api/config`` there is no\n:data:`~wasm.core.config.REDACTED` placeholder for the console to echo\nback untouched. Instead an empty ``password`` keeps whatever is already\nstored, the same as leaving a webhook URL field blank leaves its channel\nalone - only a non-empty value replaces it. There is no way to explicitly\nblank the password through this endpoint; ``wasm config set\nmonitor.smtp.password ''`` still does that directly.",
+        "description": "SMTP settings for the monitor's email notifications and test message.\n\n``password`` is write-only: it is never sent back by ``GET /config/smtp``\n(see :class:`SMTPSettingsResponse`), so unlike a secret round-tripped\nthrough the generic ``PUT``/``PATCH /api/config`` there is no\n:data:`~wasm.core.config.REDACTED` placeholder for the console to echo\nback untouched. Instead an empty ``password`` keeps whatever is already\nstored - but only while it would still go where it went before: the same\nhost, port, username and transport. Changing any of those with a blank\npassword is refused (see :func:`_refuse_smtp_password_move`), so a\ncredential that may write this section but never saw the password cannot\npoint it at a server of its own and send itself a test email. There is no\nway to explicitly blank the password through this endpoint; ``wasm config\nset monitor.smtp.password ''`` still does that directly.",
         "properties": {
           "from_address": {
             "default": "",
@@ -7661,7 +7661,7 @@
     },
     "/api/apps/{domain}/deployments/{deployment_id}/rollback": {
       "post": {
-        "description": "Queue going back to what a deployment produced.\n\nOn releases its release is activated behind the health gate; in place\nits snapshot backup (taken by the update that followed it) is restored,\nafter a safety backup of the current state.\n\nArgs:\n    domain: Domain of the application.\n    deployment_id: The deployment to go back to.\n    session: The authenticated session.\n\nReturns:\n    The queued job.\n\nRaises:\n    HTTPException: 404 for an unknown deployment of the application, 409\n        ``rollback_unavailable`` with the reason when it cannot be gone\n        back to.",
+        "description": "Queue going back to what a deployment produced.\n\nOn releases its release is activated behind the health gate. In place in\na git checkout its commit is rebuilt where the application runs, behind\nthe same gate; in place without history its snapshot backup (taken by\nthe update that followed it) is restored after a safety backup, rebuilt\nand gated, keeping the deployed ``.env``. See\n:func:`~wasm.deployers.lifecycle.rollback_to_deployment`.\n\nArgs:\n    domain: Domain of the application.\n    deployment_id: The deployment to go back to.\n    session: The authenticated session.\n\nReturns:\n    The queued job.\n\nRaises:\n    HTTPException: 404 for an unknown deployment of the application, 409\n        ``rollback_unavailable`` with the reason when it cannot be gone\n        back to.",
         "operationId": "rollback_deployment_api_apps__domain__deployments__deployment_id__rollback_post",
         "parameters": [
           {
@@ -10588,7 +10588,7 @@
         ]
       },
       "put": {
-        "description": "Update the monitor's SMTP settings.\n\nGoes through :meth:`~wasm.core.config.Config.set`, so the same rule 'wasm\nconfig set monitor.smtp.*' enforces - a hostname for ``host``, a port in\nrange, ``use_ssl`` and ``use_tls`` not both on, a valid address for\n``from_address`` and every recipient - rejects a value here too, in the\nsame words. An empty ``password`` is translated to the\n:data:`~wasm.core.config.REDACTED` placeholder before the write, which is\nwhat actually keeps the stored password: see :class:`SMTPConfig`.\n\nArgs:\n    body: Body carrying the SMTP settings.\n    request: The incoming request, for the audit record.\n    session: Authenticated session, injected by the dependency.\n\nReturns:\n    Confirmation message.\n\nRaises:\n    ConfigError: 400, through the error boundary, for a host that is not\n        a hostname, a port out of range, both ``use_ssl`` and ``use_tls``\n        enabled, or an invalid ``from_address`` or recipient.\n    HTTPException: If the configuration cannot be written.",
+        "description": "Update the monitor's SMTP settings.\n\nGoes through :meth:`~wasm.core.config.Config.set`, so the same rule 'wasm\nconfig set monitor.smtp.*' enforces - a hostname for ``host``, a port in\nrange, ``use_ssl`` and ``use_tls`` not both on, a valid address for\n``from_address`` and every recipient - rejects a value here too, in the\nsame words. An empty ``password`` is translated to the\n:data:`~wasm.core.config.REDACTED` placeholder before the write, which is\nwhat actually keeps the stored password, and is refused when the\npassword would go somewhere else: see :class:`SMTPConfig`.\n\nArgs:\n    body: Body carrying the SMTP settings.\n    request: The incoming request, for the audit record.\n    session: Authenticated session, injected by the dependency.\n\nReturns:\n    Confirmation message.\n\nRaises:\n    ConfigError: 400, through the error boundary, for a host that is not\n        a hostname, a port out of range, both ``use_ssl`` and ``use_tls``\n        enabled, or an invalid ``from_address`` or recipient.\n    HTTPException: 422 on ``password`` when it is blank, a password is\n        stored, and the host, port, username or transport changed; or if\n        the configuration cannot be written.",
         "operationId": "update_smtp_config_api_config_smtp_put",
         "requestBody": {
           "content": {
@@ -13904,7 +13904,7 @@
     },
     "/api/services/{name}/logs": {
       "get": {
-        "description": "Get service logs from journalctl.",
+        "description": "Get service logs from journalctl.\n\nThe console's and the monitor's journals need an admin credential, not\nthe ``read`` a GET would otherwise ask for: the console logs every SQL\nstatement run from it (``wasm.audit``), the paths and client addresses of\nevery request, and the verbatim output of failed git, certbot and\nnotification calls; the monitor logs what it saw of other processes.\nAn application's journal is its own output and stays ``read``.",
         "operationId": "get_service_logs_api_services__name__logs_get",
         "parameters": [
           {

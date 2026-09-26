@@ -20,7 +20,7 @@ import json
 
 import click
 
-from wasm.cli.app import Context, WasmGroup, json_option, pass_context
+from wasm.cli.app import Context, WasmGroup, global_flags, json_option, pass_context
 from wasm.core.exceptions import WASMError
 from wasm.core.logger import Logger
 from wasm.core.store import DeploymentTrigger, get_store
@@ -120,7 +120,8 @@ def rollback(ctx: Context, domain: str, release: str | None) -> None:
 
 @cli.command("keep")
 @click.argument("domain")
-@click.argument("count", required=False, type=int, metavar="N")
+@click.argument("count", required=False, type=int, metavar="[N]")
+@global_flags
 @json_option("Print the retention and what was pruned as JSON.")
 @pass_context
 def keep_command(ctx: Context, domain: str, count: int | None) -> None:

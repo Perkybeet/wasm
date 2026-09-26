@@ -236,10 +236,13 @@ class SMTPConfig(BaseModel):
     through the generic ``PUT``/``PATCH /api/config`` there is no
     :data:`~wasm.core.config.REDACTED` placeholder for the console to echo
     back untouched. Instead an empty ``password`` keeps whatever is already
-    stored, the same as leaving a webhook URL field blank leaves its channel
-    alone - only a non-empty value replaces it. There is no way to explicitly
-    blank the password through this endpoint; ``wasm config set
-    monitor.smtp.password ''`` still does that directly.
+    stored - but only while it would still go where it went before: the same
+    host, port, username and transport. Changing any of those with a blank
+    password is refused (see :func:`_refuse_smtp_password_move`), so a
+    credential that may write this section but never saw the password cannot
+    point it at a server of its own and send itself a test email. There is no
+    way to explicitly blank the password through this endpoint; ``wasm config
+    set monitor.smtp.password ''`` still does that directly.
     """
 
     host: str = Field("", description="SMTP server hostname; empty means not configured")
@@ -425,7 +428,9 @@ def update_config(
     """
     config = load_config()
     before = config.to_dict()
+    smtp_before = _smtp_destination(config)
     config.replace(body.config)
+    _refuse_smtp_password_move(smtp_before, config)
     path = persist(config)
 
     after = config.to_dict()
@@ -467,10 +472,12 @@ def patch_config(
         HTTPException: If the configuration cannot be written.
     """
     config = load_config()
+    smtp_before = _smtp_destination(config)
     value = body.value
     if isinstance(value, str):
         value = coerce_config_value(config.get(body.path, NO_DEFAULT), value)
     config.set(body.path, value)
+    _refuse_smtp_password_move(smtp_before, config)
     path = persist(config)
     _audit_write(request, session, changed=[body.path.split(".", 1)[0]])
 
@@ -756,6 +763,85 @@ def get_smtp_config(session: dict = Depends(get_current_session)) -> SMTPSetting
     )
 
 
+#: What decides where the SMTP password goes: a new host or port is a new
+#: recipient of it, a new username a new account, and dropping or switching
+#: TLS changes who on the path can read it.
+_SMTP_DESTINATION_KEYS = ("host", "port", "username", "use_ssl", "use_tls")
+
+
+def _smtp_destination(config: Config) -> tuple[tuple[Any, ...], str]:
+    """
+    Read where the stored SMTP password would be sent, and the password.
+
+    Args:
+        config: The configuration, as stored or as about to be written.
+
+    Returns:
+        The destination, normalised (host names compare case-insensitively,
+        as DNS does), and the password.
+    """
+    defaults: dict[str, Any] = DEFAULT_CONFIG["monitor"]["smtp"]
+    value = {
+        key: config.get(f"monitor.smtp.{key}", defaults[key]) for key in _SMTP_DESTINATION_KEYS
+    }
+    port = value["port"]
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        pass  # A hand-edited value is compared as it is written.
+    destination = (
+        str(value["host"] or "").strip().lower(),
+        port,
+        str(value["username"] or ""),
+        bool(value["use_ssl"]),
+        bool(value["use_tls"]),
+    )
+    return destination, str(config.get("monitor.smtp.password", "") or "")
+
+
+def _refuse_smtp_password_move(before: tuple[tuple[Any, ...], str], config: Config) -> None:
+    """
+    Refuse a write that would send the stored SMTP password somewhere new.
+
+    A secret the caller was never shown is kept on a write that does not name
+    it - a blank field on ``PUT /api/config/smtp``, ``***`` echoed back to
+    ``PUT /api/config``, a ``PATCH`` of another key - because the console
+    never receives it. That only means "leave it alone" while it keeps
+    authenticating the same account on the same server over the same
+    transport. Otherwise a credential allowed to write the settings could
+    point the password at a server of its own and send itself a test email.
+    Every API write of the configuration passes here, after the change is
+    applied in memory and before it is persisted.
+
+    Args:
+        before: :func:`_smtp_destination` of the configuration as stored.
+        config: The configuration with the change applied, not yet written.
+
+    Raises:
+        HTTPException: 422 on ``password`` when a password is stored, the
+            write keeps it, and the destination changed.
+    """
+    destination, password = _smtp_destination(config)
+    old_destination, old_password = before
+    if not old_password or password != old_password or destination == old_destination:
+        return
+    raise HTTPException(
+        status_code=422,
+        detail={
+            "error": "validation_error",
+            "detail": "Validation failed",
+            "hint": None,
+            "fields": {
+                "password": (
+                    "Enter the password again: the server, port, username or "
+                    "transport changed, and the stored password is only kept "
+                    "for the server it was entered for."
+                )
+            },
+        },
+    )
+
+
 @router.put("/smtp", response_model=MessageResponse)
 def update_smtp_config(
     body: SMTPConfig,
@@ -771,7 +857,8 @@ def update_smtp_config(
     ``from_address`` and every recipient - rejects a value here too, in the
     same words. An empty ``password`` is translated to the
     :data:`~wasm.core.config.REDACTED` placeholder before the write, which is
-    what actually keeps the stored password: see :class:`SMTPConfig`.
+    what actually keeps the stored password, and is refused when the
+    password would go somewhere else: see :class:`SMTPConfig`.
 
     Args:
         body: Body carrying the SMTP settings.
@@ -785,9 +872,12 @@ def update_smtp_config(
         ConfigError: 400, through the error boundary, for a host that is not
             a hostname, a port out of range, both ``use_ssl`` and ``use_tls``
             enabled, or an invalid ``from_address`` or recipient.
-        HTTPException: If the configuration cannot be written.
+        HTTPException: 422 on ``password`` when it is blank, a password is
+            stored, and the host, port, username or transport changed; or if
+            the configuration cannot be written.
     """
     config = load_config()
+    before = _smtp_destination(config)
     config.set(
         "monitor.smtp",
         {
@@ -801,6 +891,7 @@ def update_smtp_config(
         },
     )
     config.set("monitor.email_recipients", body.recipients)
+    _refuse_smtp_password_move(before, config)
     persist(config)
     _audit_write(request, session, changed=["monitor"])
     return MessageResponse(message="SMTP configuration updated")
@@ -854,6 +945,34 @@ class TelegramConfig(BaseModel):
         "", description="Bot API token; leave blank to keep the one already stored"
     )
     chat_id: str = Field("", description="Destination chat: an integer id, or an @channel username")
+
+    @field_validator("bot_token")
+    @classmethod
+    def _bot_token_has_the_bot_api_shape(cls, value: str) -> str:
+        """
+        Refuse a token that is not ``<digits>:<secret>``, from end to end.
+
+        The token becomes part of the Bot API's request path, so the notifier
+        refuses any other shape before sending; checking it here too turns
+        that into an error at save time, next to the field, instead of a
+        warning in the log at the next deploy. Empty is left alone: it means
+        "keep the stored token".
+
+        Args:
+            value: The token as it arrived.
+
+        Returns:
+            The value unchanged.
+
+        Raises:
+            ValueError: When it has any other shape. The message never quotes
+                the value. FastAPI answers this as a 422 on ``bot_token``.
+        """
+        if not value:
+            return value
+        from wasm.core.notifier import validate_telegram_bot_token
+
+        return validate_telegram_bot_token(value)
 
     @field_validator("chat_id")
     @classmethod

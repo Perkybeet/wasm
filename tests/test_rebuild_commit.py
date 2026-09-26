@@ -456,6 +456,10 @@ def test_a_commit_with_a_source_or_a_branch_is_refused(inplace: Any, extra: dict
 class HistoryGit(FakeGit):
     """FakeGit that resolves any commit it published and answers ls-remote."""
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.timeouts: list[int | None] = []
+
     def resolve_commit(self, repository: Path, commit: str) -> str:
         self.calls.append(("resolve", commit))
         matches = [c for c in self.commits if c.startswith(commit.lower())]
@@ -463,8 +467,11 @@ class HistoryGit(FakeGit):
             raise SourceError(f"Commit {commit} does not exist in the repository")
         return matches[0]
 
-    def remote_head(self, source: str, branch: str | None = None) -> RemoteHead:
+    def remote_head(
+        self, source: str, branch: str | None = None, *, timeout: int | None = None
+    ) -> RemoteHead:
         self.calls.append(("ls-remote", source, branch))
+        self.timeouts.append(timeout)
         assert self.head is not None
         return RemoteHead(branch=branch or "main", commit=self.head)
 
@@ -630,8 +637,10 @@ def inplace_git(
     """Fake the SourceManager the in-place check asks."""
     asked: list[tuple[Any, ...]] = []
 
-    def remote_head(source: str, branch: str | None = None) -> RemoteHead:
-        asked.append((source, branch))
+    def remote_head(
+        source: str, branch: str | None = None, *, timeout: int | None = None
+    ) -> RemoteHead:
+        asked.append((source, branch, timeout))
         if isinstance(remote, Exception):
             raise remote
         return RemoteHead(branch=branch or "main", commit=remote)
@@ -657,7 +666,7 @@ def test_in_place_with_nothing_new_compares_the_checkout(
     upstream = lifecycle.check_upstream(INPLACE_DOMAIN)
 
     assert upstream is not None and not upstream.has_new_commits
-    assert asked == [("https://github.com/example/app.git", "main")]
+    assert asked == [("https://github.com/example/app.git", "main", lifecycle.UPSTREAM_TIMEOUT)]
 
 
 def test_in_place_a_tree_that_is_not_a_checkout_is_not_compared(
@@ -702,3 +711,114 @@ def test_the_live_release_link_is_what_is_compared(
     upstream = lifecycle.check_upstream(DOMAIN)
 
     assert upstream is not None and upstream.live_commit == first.split("-")[2]
+
+
+def test_in_place_after_a_failed_build_the_new_commit_is_still_news(
+    tmp_path: Path, inplace_store: WASMStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The checkout moved to the new commit; the old build serves; there is something new."""
+    make_app(inplace_store, tmp_path / "example-com")
+    good = inplace_store.record_deployment_start(INPLACE_DOMAIN, "cli", git_commit="aaaaaaa")
+    inplace_store.finish_deployment(good, "success")
+    broken = inplace_store.record_deployment_start(INPLACE_DOMAIN, "cli", git_commit=FULL[:7])
+    inplace_store.finish_deployment(broken, "failed")
+    inplace_git(monkeypatch, commit=FULL[:7], remote=FULL)
+
+    upstream = lifecycle.check_upstream(INPLACE_DOMAIN)
+
+    assert upstream is not None and upstream.has_new_commits
+    assert upstream.live_commit == "aaaaaaa"
+
+
+def test_in_place_the_last_successful_deployment_is_what_is_live(
+    tmp_path: Path, inplace_store: WASMStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Its commit, not HEAD, is compared: the head of the branch built fine."""
+    make_app(inplace_store, tmp_path / "example-com")
+    good = inplace_store.record_deployment_start(INPLACE_DOMAIN, "cli", git_commit=FULL[:7])
+    inplace_store.finish_deployment(good, "success")
+    inplace_git(monkeypatch, commit="bbbbbbb", remote=FULL)
+
+    upstream = lifecycle.check_upstream(INPLACE_DOMAIN)
+
+    assert upstream is not None and not upstream.has_new_commits
+
+
+def test_one_question_per_application_at_a_time(
+    tmp_path: Path, inplace_store: WASMStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two requests at once share one ls-remote; the second waits for its answer."""
+    import threading
+
+    make_app(inplace_store, tmp_path / "example-com")
+    asked = inplace_git(monkeypatch, commit=FULL[:7], remote=FULL)
+    release = threading.Event()
+    started = threading.Event()
+    fake = lifecycle.SourceManager()
+    answer = fake.remote_head
+
+    def slow(source: str, branch: str | None = None, *, timeout: int | None = None) -> Any:
+        started.set()
+        release.wait(5)
+        return answer(source, branch, timeout=timeout)
+
+    fake.remote_head = slow
+    monkeypatch.setattr(lifecycle, "SourceManager", lambda verbose=False: fake)
+    results: list[Any] = []
+    threads = [
+        threading.Thread(target=lambda: results.append(lifecycle.check_upstream(INPLACE_DOMAIN)))
+        for _ in range(2)
+    ]
+    threads[0].start()
+    assert started.wait(5)
+    threads[1].start()
+    release.set()
+    for thread in threads:
+        thread.join(5)
+
+    assert len(asked) == 1
+    assert len(results) == 2 and results[0] == results[1]
+
+
+def test_an_answer_is_reused_for_a_few_seconds_then_asked_again(
+    tmp_path: Path, inplace_store: WASMStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A burst of clicks is one ls-remote; a later click asks again."""
+    make_app(inplace_store, tmp_path / "example-com")
+    asked = inplace_git(monkeypatch, commit=FULL[:7], remote=FULL)
+    now = [1000.0]
+    monkeypatch.setattr(lifecycle.time, "monotonic", lambda: now[0])
+
+    lifecycle.check_upstream(INPLACE_DOMAIN)
+    now[0] += lifecycle.UPSTREAM_CACHE_SECONDS - 1
+    lifecycle.check_upstream(INPLACE_DOMAIN)
+    assert len(asked) == 1
+
+    now[0] += 2
+    lifecycle.check_upstream(INPLACE_DOMAIN)
+    assert len(asked) == 2
+
+
+def test_an_update_forgets_the_answer(inplace: Any) -> None:
+    """What is live changed; the next question goes to the remote."""
+    lifecycle._upstream_answers[(INPLACE_DOMAIN, None)] = (lifecycle.time.monotonic(), None)
+
+    lifecycle.update_app(INPLACE_DOMAIN)
+
+    assert (INPLACE_DOMAIN, None) not in lifecycle._upstream_answers
+
+
+def test_a_release_that_failed_its_gate_is_rebuilt_not_activated_again(
+    root: Path, store: WASMStore, machine: SimpleNamespace, two_releases: tuple[str, str]
+) -> None:
+    """A failed activation leaves the release on disk; the commit is built afresh."""
+    first, second = two_releases
+    app = store.get_app(DOMAIN)
+    assert app is not None and app.id is not None
+    store.set_release_status(app.id, first, "failed")
+
+    lifecycle.update_app(DOMAIN, commit=commit_of(machine, first)[:9])
+
+    rebuilt = active_id(root)
+    assert rebuilt not in {first, second}
+    assert rebuilt.split("-")[2] == first.split("-")[2]

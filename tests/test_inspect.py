@@ -180,7 +180,9 @@ def test_inspect_flags_env_keys_by_broad_secret_heuristics(
 
     assert keys["SOME_API_KEY"].secret is True
     assert keys["SOME_API_KEY"].required is False
-    assert keys["SOME_API_KEY"].default == "abc123"
+    # A secret's default never leaves the machine: see
+    # test_inspect_never_returns_a_default_for_a_secret.
+    assert keys["SOME_API_KEY"].default is None
 
     assert keys["AUTH_TOKEN"].secret is True
     assert keys["DB_PASSWORD"].secret is True
@@ -194,6 +196,65 @@ def test_inspect_flags_env_keys_by_broad_secret_heuristics(
     assert keys["APP_NAME"].secret is False
     assert keys["APP_NAME"].required is True
     assert keys["APP_NAME"].default is None
+
+
+def test_inspect_never_returns_a_default_for_a_secret(tmp_path: Path, store: WASMStore) -> None:
+    """
+    An example file is not always an example: repositories commit real keys.
+
+    Whatever the one classifier (EnvManager.SECRET_PATTERNS plus the config's
+    secret words) calls a secret comes back flagged and without its default,
+    and so does a connection string carrying a password, whatever its name.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "next.config.js").write_text("module.exports = {}\n")
+    (project / ".env.example").write_text(
+        "\n".join(
+            [
+                "DB_PASSWORD=hunter2",
+                "STRIPE_API_KEY=sk_live_abc",
+                "SLACK_WEBHOOK=https://hooks.slack.com/services/T0/B0/xyz",
+                "AWS_CREDENTIALS=AKIA:shh",
+                "DATABASE_URL=postgres://app:s3cret@db:5432/app",
+                "REDIS_URL=redis://localhost:6379",
+                "PORT=3000",
+                "",
+            ]
+        )
+    )
+
+    result = inspect_source(str(project))
+
+    keys = {key.name: key for key in result.env_keys}
+    for name in ("DB_PASSWORD", "STRIPE_API_KEY", "SLACK_WEBHOOK", "AWS_CREDENTIALS"):
+        assert keys[name].default is None, name
+        assert keys[name].secret is True, name
+    assert keys["DATABASE_URL"].default is None
+    assert keys["REDIS_URL"].default == "redis://localhost:6379"
+    assert keys["PORT"].default == "3000"
+    assert "hunter2" not in repr(result)
+    assert "s3cret" not in repr(result)
+
+
+def test_inspect_does_not_read_a_symlinked_env_example(tmp_path: Path, store: WASMStore) -> None:
+    """
+    A .env.example that links outside the checkout is not read.
+
+    Inspection runs as root: a link to /etc/shadow or to another
+    application's .env would otherwise come back as a list of defaults.
+    """
+    outside = tmp_path / "other-app.env"
+    outside.write_text("OTHER_APP_VALUE=not-yours\nPUBLIC_NAME=also-not-yours\n")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "next.config.js").write_text("module.exports = {}\n")
+    (project / ".env.example").symlink_to(outside)
+
+    result = inspect_source(str(project))
+
+    assert result.env_keys == []
+    assert "not-yours" not in repr(result)
 
 
 def test_inspect_detects_package_manager_from_the_lock_file(

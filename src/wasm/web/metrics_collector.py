@@ -16,7 +16,10 @@ filesystem: systemd already accounts CPU time and resident memory for
 systemctl - a subprocess per app per tick - would be paying process spawns for
 numbers the kernel publishes as two files. On a host without a unified cgroup
 hierarchy (a container, cgroup v1, a stopped unit) the files are simply absent
-and that application's metrics are skipped for the tick.
+and that application's metrics are skipped for the tick. A Docker Compose
+stack is never sampled: its unit is a oneshot and its containers are accounted
+in Docker's cgroups, so its unit's numbers would be a chart that lies
+(:func:`metrics_unavailable_reason` says so for every surface).
 
 The collector does not raise for anything a running machine can do to it. It
 runs unattended for the life of the web process, and a panel whose metrics
@@ -78,6 +81,34 @@ CONSOLIDATE_SECONDS = 300.0
 
 #: cpu.stat counts in microseconds.
 USEC_PER_SECOND = 1_000_000
+
+#: Why a Docker Compose stack has no CPU or memory series. Its unit is a
+#: oneshot that runs ``docker compose up`` and exits, and its containers are
+#: accounted in Docker's own cgroups, not under the unit: the unit's numbers
+#: are near zero whatever the stack does.
+COMPOSE_METRICS_UNAVAILABLE = (
+    "Not available for Docker Compose applications: their containers run in Docker's own "
+    "cgroups, not under the application's unit. Use 'docker stats' for their usage."
+)
+
+
+def metrics_unavailable_reason(app: Any) -> str | None:
+    """
+    Say why an application has no CPU and memory series, when it has none by design.
+
+    The one answer for the collector, which skips such an application, and
+    for whatever shows its charts, which should say this instead of drawing
+    an empty or misleading one.
+
+    Args:
+        app: The application's row (anything with ``app_type``).
+
+    Returns:
+        The reason, or None when it is sampled like any other.
+    """
+    if getattr(app, "app_type", None) == "docker-compose":
+        return COMPOSE_METRICS_UNAVAILABLE
+    return None
 
 
 class MetricsCollector:
@@ -325,6 +356,8 @@ class MetricsCollector:
         else:
             units: dict[str, list[str]] = {}
             for app in apps:
+                if metrics_unavailable_reason(app) is not None:
+                    continue
                 try:
                     units[app.domain] = self._units_for(app)
                 except WASMError as exc:

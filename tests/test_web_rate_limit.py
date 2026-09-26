@@ -19,6 +19,10 @@ What is defended here:
 - A 429 is the API's error contract, with a ``Retry-After`` that says when.
 - Credential guessing is the lockout's job and still is: a wrong credential
   buys nothing from the per-credential budget.
+- The limiter is not a credential oracle. It only looks at a credential where
+  an endpoint would (``/api``, ``/events``, ``/ws``), a wrong one it looked at
+  is counted against the lockout exactly once even when no endpoint checks it,
+  and an address already over the anonymous budget gets no credential check.
 """
 
 from __future__ import annotations
@@ -28,8 +32,9 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from wasm.web import auth
 from wasm.web.auth import RateLimiter, SecurityConfig
-from wasm.web.server import create_app, get_token_manager
+from wasm.web.server import create_app, get_brute_force, get_token_manager
 
 
 def build_client(sandbox: Path, **overrides: object) -> TestClient:
@@ -214,6 +219,136 @@ def test_the_lockout_still_stops_credential_guessing(sandbox: Path) -> None:
     locked = client.get("/api/auth/verify", headers=bearer(token))
     assert locked.status_code == 429
     assert locked.json()["error"] == "locked_out"
+
+
+def spy_on_credential_checks(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """
+    Record every credential the server checks, still checking it.
+
+    Args:
+        monkeypatch: Patching helper, scoped to the test.
+
+    Returns:
+        The list the checked credentials are appended to.
+    """
+    checked: list[str] = []
+    real = auth.check_credential
+
+    def spy(credential: str, client_ip: str) -> dict[str, object] | None:
+        checked.append(credential)
+        return real(credential, client_ip)
+
+    monkeypatch.setattr(auth, "check_credential", spy)
+    return checked
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [("GET", "/health"), ("POST", "/hooks/deploy/example.com")],
+)
+def test_a_path_that_checks_no_credential_counts_by_address_whatever_it_carries(
+    sandbox: Path, monkeypatch: pytest.MonkeyPatch, method: str, path: str
+) -> None:
+    """
+    Neither /health nor a forge webhook verifies a bearer token, so neither may
+    tell a valid one from a guess: before, the valid one landed in the roomy
+    budget and X-RateLimit-Limit said so, while the guess was never recorded.
+    """
+    client = build_client(sandbox)
+    token = get_token_manager().generate_master_token()
+    checked = spy_on_credential_checks(monkeypatch)
+
+    valid = client.request(method, path, headers=bearer(token), json={})
+    wrong = client.request(method, path, headers=bearer("wasm_guess"), json={})
+
+    assert checked == []
+    assert valid.headers["X-RateLimit-Limit"] == "3"
+    assert wrong.headers["X-RateLimit-Limit"] == "3"
+    assert (valid.headers["X-RateLimit-Remaining"], wrong.headers["X-RateLimit-Remaining"]) == (
+        "2",
+        "1",
+    )
+    assert get_brute_force().get_attempts_remaining("127.0.0.1") == 5
+
+
+def test_a_wrong_credential_no_endpoint_checks_still_counts_towards_the_lockout(
+    sandbox: Path,
+) -> None:
+    """The limiter checked it, so the guess is paid for even on a 404."""
+    client = build_client(
+        sandbox, rate_limit_requests=1000, max_failed_attempts=2, lockout_duration=60
+    )
+    token = get_token_manager().generate_master_token()
+
+    first = client.get("/api/does-not-exist", headers=bearer("wasm_guess1"))
+    assert first.status_code == 404
+    assert get_brute_force().get_attempts_remaining("127.0.0.1") == 1
+    assert client.get("/api/does-not-exist", headers=bearer("wasm_guess2")).status_code == 404
+
+    locked = client.get("/api/auth/verify", headers=bearer(token))
+    assert locked.status_code == 429
+    assert locked.json()["error"] == "locked_out"
+
+
+@pytest.mark.parametrize("path", ["/api/auth/verify", "/api/auth/session"])
+def test_a_wrong_credential_an_endpoint_checks_counts_once(sandbox: Path, path: str) -> None:
+    """The limiter and the endpoint both look at it; the lockout hears once."""
+    client = build_client(sandbox, rate_limit_requests=1000, max_failed_attempts=5)
+
+    client.get(path, headers=bearer("wasm_guess"))
+
+    assert get_brute_force().get_attempts_remaining("127.0.0.1") == 4
+
+
+def test_a_websocket_guess_counts_once(sandbox: Path) -> None:
+    """The handshake is checked by the limiter and by the handshake itself."""
+    from starlette.websockets import WebSocketDisconnect
+
+    from wasm.web.websockets.router import WS_SUBPROTOCOL, WS_TOKEN_PREFIX
+
+    client = build_client(sandbox, rate_limit_requests=1000, max_failed_attempts=5)
+
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect(
+            "/ws/events", subprotocols=[WS_SUBPROTOCOL, f"{WS_TOKEN_PREFIX}wasm_guess"]
+        ):
+            pass
+
+    assert get_brute_force().get_attempts_remaining("127.0.0.1") == 4
+
+
+def test_a_signed_in_browser_with_an_expired_session_is_not_counted(sandbox: Path) -> None:
+    """A cookie this server signed is not a guess, for the limiter either."""
+    client = build_client(sandbox, rate_limit_requests=1000, max_failed_attempts=2)
+    token = get_token_manager().generate_master_token()
+    assert client.post("/api/auth/login", json={"token": token}).status_code == 200
+    session = client.cookies["wasm_session"]
+    csrf = {"X-WASM-CSRF": client.cookies["wasm_csrf"]}
+    assert client.post("/api/auth/logout", headers=csrf).status_code in (200, 204)
+    client.cookies.set("wasm_session", session)
+
+    for _ in range(3):
+        client.get("/api/does-not-exist")
+
+    assert get_brute_force().get_attempts_remaining("127.0.0.1") == 2
+
+
+def test_an_address_over_the_anonymous_budget_gets_no_credential_check(
+    sandbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A flood that is refused anyway must not cost a SQLite query and a file read each."""
+    client = build_client(sandbox)
+    token = get_token_manager().generate_master_token()
+    for _ in range(3):
+        client.get("/api/auth/session")
+    checked = spy_on_credential_checks(monkeypatch)
+
+    response = client.get("/api/auth/verify", headers=bearer(token))
+
+    assert response.status_code == 429
+    assert response.json()["error"] == "rate_limited"
+    assert response.headers["X-RateLimit-Limit"] == "3"
+    assert checked == []
 
 
 def test_retry_after_is_when_the_oldest_request_leaves_the_window(

@@ -187,7 +187,9 @@ class TestErrorHandling:
     #: the specific exception it guards against (WebSocketDisconnect,
     #: RuntimeError, json.JSONDecodeError), and the four remaining broad
     #: catches are the genuine per-connection error boundaries, and they log.
-    MAX_BLIND_EXCEPTS = 38
+    #: wasm/core/update_checker.py kept one of its eight: the top of its
+    #: background thread, which logs; the rest catch what they guard against.
+    MAX_BLIND_EXCEPTS = 29
 
     def test_blind_excepts_do_not_grow(self):
         found: list[str] = []
@@ -838,6 +840,90 @@ class TestPackaging:
         test_version_is_consistent_across_packaging_files
     )
 
+    @staticmethod
+    def _pyproject_project() -> dict:
+        import sys
+
+        if sys.version_info >= (3, 11):
+            import tomllib
+        else:  # pragma: no cover - only on 3.10
+            import tomli as tomllib
+
+        return tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+
+    def _pyproject_licence(self) -> str:
+        licence = self._pyproject_project()["license"]
+        return licence if isinstance(licence, str) else licence["text"]
+
+    @staticmethod
+    def _man_section(text: str, name: str) -> str:
+        lines = text.splitlines()
+        start = lines.index(f".SH {name}") + 1
+        end = next(i for i in range(start, len(lines)) if lines[i].startswith(".SH "))
+        # roff escapes every hyphen; the licence expression is compared as written.
+        return "\n".join(lines[start:end]).replace("\\-", "-")
+
+    @pytest.mark.parametrize("page", ["man/wasm.1", "obs/wasm.1"])
+    def test_the_man_page_declares_the_licence_pyproject_declares(self, page: str):
+        """
+        The man page shipped "WASM-NCSAL 1.0. Source-available, non-commercial
+        use only." after the project was relicensed, because the licence was a
+        literal in scripts/generate_man.py. It is read from pyproject.toml now.
+        """
+        section = self._man_section((REPO / page).read_text(encoding="utf-8"), "LICENSE")
+        first_line = section.splitlines()[0]
+
+        assert first_line == f"{self._pyproject_licence()}.", (
+            f"{page} declares {first_line!r}; run scripts/generate_man.py"
+        )
+
+    @pytest.mark.parametrize("page", ["man/wasm.1", "obs/wasm.1"])
+    def test_the_man_page_names_the_version_pyproject_declares(self, page: str):
+        """
+        The version came from the installed distribution's metadata, so a
+        stale editable install wrote 2.0.0 into the manual of 2.0.1.
+        """
+        header = (REPO / page).read_text(encoding="utf-8").splitlines()[0]
+        version = self._pyproject_project()["version"]
+
+        assert f'"WASM {version}"' in header, (
+            f"{page} header is {header!r}, not version {version}; run scripts/generate_man.py"
+        )
+
+    def test_the_man_page_generator_holds_no_licence_literal(self):
+        """The fix is the source, not the output: no licence name in the generator."""
+        source = (REPO / "scripts/generate_man.py").read_text(encoding="utf-8")
+        for literal in ("NCSAL", "AGPL", "GPL-"):
+            assert literal not in source, f"scripts/generate_man.py hardcodes {literal!r}"
+
+    def test_every_packaging_file_spells_the_licence_as_pyproject_does(self):
+        """
+        One SPDX expression everywhere. debian/copyright said ``AGPL-3.0+``
+        (the deprecated spelling) while every other file said
+        ``AGPL-3.0-or-later``; DEP-5 accepts the SPDX name as a short name
+        when, as here, the full text is included.
+        """
+        expected = self._pyproject_licence()
+        found: dict[str, list[str]] = {}
+
+        setup = (REPO / "setup.py").read_text(encoding="utf-8")
+        found["setup.py"] = re.findall(r'^\s*license="([^"]+)"', setup, re.MULTILINE)
+
+        spec = (REPO / "rpm/wasm.spec").read_text(encoding="utf-8")
+        found["rpm/wasm.spec"] = re.findall(r"^License:\s*(\S+)", spec, re.MULTILINE)
+
+        copyright_text = (REPO / "obs/debian.copyright").read_text(encoding="utf-8")
+        found["obs/debian.copyright"] = re.findall(
+            r"^License:\s*(\S+)", copyright_text, re.MULTILINE
+        )
+
+        offenders = {
+            name: values
+            for name, values in found.items()
+            if not values or any(value != expected for value in values)
+        }
+        assert not offenders, f"expected every licence field to read {expected!r}: {offenders}"
+
 
 class TestMaintainerScripts:
     """
@@ -1140,6 +1226,81 @@ class TestMaintainerScripts:
         upgrade_start = after_remove.index("upgrade")
         upgrade_body = after_remove[upgrade_start : after_remove.index(";;", upgrade_start)]
         assert "systemctl" not in upgrade_body, "prerm must not touch the unit on upgrade"
+
+    #: The units WASM writes at runtime that no package ships.
+    RUNTIME_UNITS = ("wasm-web.service", "wasm-monitor.service")
+
+    def _debian_postrm_branch(self, branch: str) -> str:
+        postrm = (REPO / "obs/debian.postrm").read_text(encoding="utf-8")
+        start = postrm.index(f"{branch})")
+        return postrm[start : postrm.index(";;", start)]
+
+    def test_debian_purge_removes_the_units_wasm_wrote(self):
+        """
+        'wasm web enable' and 'wasm monitor install' write their units under
+        /etc/systemd/system, where dpkg never knew about them, so a purge
+        left both behind naming a /usr/bin/wasm that no longer existed.
+        """
+        purge = self._debian_postrm_branch("purge")
+
+        for unit in self.RUNTIME_UNITS:
+            assert unit in purge, f"postrm purge never removes {unit}"
+        assert "Generated by WASM" in purge, (
+            "postrm purge removes the units without checking WASM's marker"
+        )
+        assert re.search(r"systemctl\s+daemon-reload", purge), (
+            "postrm purge removes unit files without reloading systemd"
+        )
+
+    def test_debian_remove_leaves_the_unit_files(self):
+        """A plain remove keeps configuration; only purge deletes files."""
+        remove = self._debian_postrm_branch("remove")
+        for unit in self.RUNTIME_UNITS:
+            assert unit not in remove, f"postrm remove deletes {unit}; only purge may"
+
+    @pytest.mark.allow_subprocess
+    def test_debian_purge_removes_only_marked_units(self, tmp_path: Path):
+        """
+        Run the purge branch with every absolute path moved into a sandbox and
+        systemctl stubbed: the marked unit goes, one the operator wrote under
+        the same name stays, and systemd is reloaded.
+        """
+        import os
+        import subprocess
+
+        script = (REPO / "obs/debian.postrm").read_text(encoding="utf-8")
+        sandboxed = script.replace("/etc/", f"{tmp_path}/etc/").replace("/var/", f"{tmp_path}/var/")
+        assert "rm -rf /" not in sandboxed.replace(f"rm -rf {tmp_path}", "")
+
+        units = tmp_path / "etc/systemd/system"
+        units.mkdir(parents=True)
+        (units / "wasm-web.service").write_text(
+            "# Generated by WASM. Written by 'wasm web enable'\n"
+        )
+        (units / "wasm-monitor.service").write_text("[Service]\nExecStart=/usr/local/bin/mine\n")
+
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        calls = tmp_path / "systemctl.calls"
+        stub = bin_dir / "systemctl"
+        stub.write_text(f'#!/bin/sh\necho "$@" >> {calls}\n')
+        stub.chmod(0o755)
+
+        (tmp_path / "postrm").write_text(sandboxed)
+        env = {**os.environ, "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}"}
+        result = subprocess.run(
+            ["bash", str(tmp_path / "postrm"), "purge"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            env=env,
+        )
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert not (units / "wasm-web.service").exists(), "the marked unit survived the purge"
+        assert (units / "wasm-monitor.service").exists(), "purge removed a unit WASM did not write"
+        assert "daemon-reload" in calls.read_text(), "systemd was not reloaded"
 
     def test_rpm_preun_only_stops_units_on_an_actual_removal(self):
         """$1 is 0 in %preun only on final removal, never on an upgrade."""

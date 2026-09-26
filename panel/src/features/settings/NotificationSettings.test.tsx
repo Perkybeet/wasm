@@ -201,14 +201,31 @@ describe("Settings > Notifications", () => {
     expect(within(telegram).queryByRole("alert")).toBeNull();
 
     // 13+ digits, positive: the shape of a supergroup ID typed without its leading minus sign.
+    // The warning is drawn as it is typed (so it never pushes the Save button away from a
+    // click that leaves the field), but it is not a live region: one that re-renders on every
+    // digit would be read out on every digit. Leaving the field says it, once.
     await user.clear(chatId);
     await user.type(chatId, "1001234567890");
-    expect(
-      await within(telegram).findByText(
-        "This looks like a group's chat ID without its minus sign. Groups and supergroups use a negative ID (a supergroup's starts with -100); try -1001234567890.",
-      ),
-    ).toBeInTheDocument();
+    const warning =
+      "This looks like a group's chat ID without its minus sign. Groups and supergroups use a negative ID (a supergroup's starts with -100); try -1001234567890.";
+    expect(within(telegram).getByText(warning).closest("[role=alert], [role=status], [aria-live]")).toBeNull();
+    const announcer = screen.getByTestId("announcer-polite");
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(announcer).toHaveTextContent("");
+
+    await user.tab();
+    await waitFor(() => {
+      expect(announcer).toHaveTextContent(warning);
+    });
     await expectNoAxeViolations(container);
+
+    // A fixed value clears the warning; breaking it again brings it back.
+    await user.click(chatId);
+    await user.type(chatId, "{Home}-");
+    expect(within(telegram).queryByText(warning)).toBeNull();
+    await user.click(chatId);
+    await user.type(chatId, "{Home}{Delete}");
+    expect(within(telegram).getByText(warning)).toBeInTheDocument();
 
     // The warning does not block saving: it is a hint, not a validation failure.
     await user.click(within(telegram).getByRole("button", { name: "Save" }));

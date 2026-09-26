@@ -133,6 +133,47 @@ describe("the cron jobs list", () => {
     expect(await screen.findByText("Created e2e-report")).toBeInTheDocument();
   });
 
+  it("edits the command as the operator typed it and saves it back unchanged", async () => {
+    // The API answers the command as typed, not the unit's escaped ExecStart ($$HOME, 50%%):
+    // the dialog shows that and sends it back as-is, so a save without changes changes nothing.
+    const typed = "/bin/sh -c 'echo \"$HOME\" 50%'";
+    const job = { ...JOBS[1], name: "report", command: typed };
+    const { user, backend, table } = await cronAt("/cron", {
+      "GET /api/cron": () => json(200, { jobs: [job], total: 1 }),
+      "POST /api/cron": () => json(201, { success: true, message: "Cron job report created", job }),
+    });
+    const row = (await within(table).findByText("report")).closest("tr");
+    if (!row) throw new Error("no row");
+    await user.click(within(row).getByRole("button", { name: "Actions for report" }));
+    await user.click(await screen.findByRole("menuitem", { name: "Edit" }));
+    const dialog = await screen.findByRole("dialog", { name: "Edit report" });
+    expect(within(dialog).getByLabelText("Command", { exact: true })).toHaveValue(typed);
+    await user.click(within(dialog).getByRole("button", { name: "Save job" }));
+    await waitFor(() => {
+      expect(backend.callsTo("POST /api/cron")).toHaveLength(1);
+    });
+    expect(backend.callsTo("POST /api/cron")[0]?.body).toMatchObject({ name: "report", command: typed });
+  });
+
+  it("keeps a job's application when it is saved again", async () => {
+    const job = JOBS[0];
+    if (!job) throw new Error("no seeded job");
+    const { user, backend, table } = await cronAt("/cron", {
+      "GET /api/cron": () => json(200, { jobs: [job], total: 1 }),
+      "POST /api/cron": () => json(201, { success: true, message: "saved", job }),
+    });
+    const row = (await within(table).findByText(job.name)).closest("tr");
+    if (!row) throw new Error("no row");
+    await user.click(within(row).getByRole("button", { name: `Actions for ${job.name}` }));
+    await user.click(await screen.findByRole("menuitem", { name: "Edit" }));
+    const dialog = await screen.findByRole("dialog", { name: `Edit ${job.name}` });
+    await user.click(within(dialog).getByRole("button", { name: "Save job" }));
+    await waitFor(() => {
+      expect(backend.callsTo("POST /api/cron")).toHaveLength(1);
+    });
+    expect(backend.callsTo("POST /api/cron")[0]?.body).toMatchObject({ app_domain: "shop.example.com" });
+  });
+
   it("invites the first job on a machine with none scheduled", async () => {
     fakeBackend({ ...signedInRoutes(), "GET /api/cron": () => json(200, { jobs: [], total: 0 }) });
     renderConsole("/cron");

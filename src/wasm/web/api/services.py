@@ -14,6 +14,10 @@ Two rules govern this module:
   Declared ``async def`` they would run on the event loop and freeze the whole
   panel for every other request; declared ``def``, FastAPI runs them in the
   threadpool.
+- **WASM's own units are not services here.** The console, the monitor and
+  the units behind cron jobs and backup schedules are refused to every
+  mutation, and the console's and the monitor's journals need ``admin``: see
+  :func:`_refuse_own_unit` and :func:`get_service_logs`.
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from wasm.core.config import SYSTEMD_DIR, Config
+from wasm.core.exceptions import PermissionError as WASMPermissionError
 from wasm.core.exceptions import ServiceError, ValidationError, WASMError
 from wasm.core.store import get_store
 from wasm.managers.service_manager import ServiceManager, readable_unit_name
@@ -47,6 +52,38 @@ SYSTEMD_UNIT_DIR: Path = SYSTEMD_DIR
 
 #: Units created by older WASM versions carry this prefix.
 LEGACY_PREFIX = "wasm-"
+
+#: The one classifier of WASM's own units, bound when this module is
+#: imported: the tests swap ``ServiceManager`` for a recording stub, and the
+#: refusal must not depend on what a stub chose to implement.
+_is_own_unit_name = ServiceManager._is_own_unit_name
+
+#: Where each of WASM's own units is managed instead, keyed by the unit name
+#: or, for scheduled work, by its prefix. Every key is covered by
+#: ``ServiceManager.OWN_UNITS`` or ``ServiceManager.OWN_UNIT_PREFIXES``.
+_OWN_UNIT_HINTS: dict[str, str] = {
+    "wasm-web": (
+        "wasm-web is the console itself. Manage it on the machine with 'wasm web stop', "
+        "'wasm web restart', 'wasm web enable' or 'wasm web disable'."
+    ),
+    "wasm-monitor": (
+        "wasm-monitor is WASM's process monitor. Manage it on the machine with "
+        "'wasm monitor enable', 'wasm monitor disable' or 'wasm monitor uninstall'."
+    ),
+    "wasm-cron-": (
+        "This unit runs a cron job. Manage it from Cron (/api/cron) or with 'wasm cron ...', "
+        "which keeps its timer in step."
+    ),
+    "wasm-backup-": (
+        "This unit runs a backup schedule. Manage it from Backups (/api/backup-schedules) "
+        "or with 'wasm backup schedule ...', which keeps its timer in step."
+    ),
+}
+
+#: Units whose journal is the console's or the monitor's own output, which only an
+#: admin credential reads, here and on ``/ws/logs``.
+OWN_JOURNAL_UNITS = frozenset({"wasm-web", "wasm-monitor"})
+
 
 #: Values systemd accepts for ``Restart=``.
 VALID_RESTART_POLICIES = frozenset(
@@ -239,6 +276,69 @@ def _resolve_unit(name: str) -> tuple[str, Path]:
         return legacy_name, legacy_path
 
     return base, _unit_path(base)
+
+
+def _own_unit(*names: str) -> str | None:
+    """
+    Find which of the given names, if any, is one of WASM's own units.
+
+    Args:
+        names: Unit names without the ``.service`` suffix: the one the client
+            spelled and the one it resolved to, which differ when ``web``
+            resolves to a ``wasm-web.service`` on disk.
+
+    Returns:
+        The first of them that is WASM's own, or None.
+    """
+    return next((name for name in names if _is_own_unit_name(name)), None)
+
+
+def _refuse_own_unit(*names: str) -> None:
+    """
+    Refuse a mutation of WASM's own units through the services API.
+
+    The console and the monitor are managed units, so every services
+    endpoint used to accept them: an admin token could stop ``wasm-web``
+    without sudo mode and take the console down under its own operator. The
+    units behind cron jobs and backup schedules have their own API, which
+    keeps each one's timer and store row in step; acting on the unit alone
+    leaves them out of step. Checked here, before the manager is built,
+    because the manager itself must keep managing these units for the CLI.
+
+    Args:
+        names: Unit names without the ``.service`` suffix, as for
+            :func:`_own_unit`.
+
+    Raises:
+        WASMPermissionError: 403, naming where the unit is managed instead.
+    """
+    own = _own_unit(*names)
+    if own is None:
+        return
+    hint = _OWN_UNIT_HINTS.get(own) or next(
+        (text for prefix, text in _OWN_UNIT_HINTS.items() if own.startswith(prefix)),
+        "Manage it with the 'wasm' command that created it.",
+    )
+    raise WASMPermissionError(
+        f"{own} is one of WASM's own units and cannot be changed through the services API",
+        details=hint,
+    )
+
+
+def _requested_name(name: str) -> str:
+    """
+    Validate a client-supplied unit name and strip its ``.service`` suffix.
+
+    Args:
+        name: Service name as supplied by the client.
+
+    Returns:
+        The bare unit name.
+
+    Raises:
+        ValidationError: When the name is not a safe unit name.
+    """
+    return validate_service_name(name).removesuffix(".service")
 
 
 def _reject_control_characters(value: str, field: str) -> str:
@@ -472,11 +572,13 @@ def _run_service_action(name: str, action: str, past_tense: str) -> ServiceActio
     Raises:
         ValidationError: For an unsafe name.
         SecurityError: For a path that would leave the unit directory.
+        WASMPermissionError: 403 for one of WASM's own units.
         HTTPException: 404 when the unit does not exist. A failure inside
             ``action`` propagates as whatever WASMError systemd's manager
             raised, mapped by :data:`~wasm.web.api.deps._STATUS_BY_ERROR`.
     """
     service_name, service_path = _resolve_unit(name)
+    _refuse_own_unit(_requested_name(name), service_name)
 
     if not service_path.exists():
         raise HTTPException(status_code=404, detail=f"Service not found: {service_name}")
@@ -540,8 +642,17 @@ def get_service_logs(
 ) -> ServiceLogsResponse:
     """
     Get service logs from journalctl.
+
+    The console's and the monitor's journals need an admin credential, not
+    the ``read`` a GET would otherwise ask for: the console logs every SQL
+    statement run from it (``wasm.audit``), the paths and client addresses of
+    every request, and the verbatim output of failed git, certbot and
+    notification calls; the monitor logs what it saw of other processes.
+    An application's journal is its own output and stays ``read``.
     """
     service_name, _ = _resolve_unit(name)
+    if _own_unit(_requested_name(name), service_name) in OWN_JOURNAL_UNITS:
+        ensure_scope(request, session, "admin")
 
     service_manager = ServiceManager(verbose=False)
     try:
@@ -588,6 +699,7 @@ def update_service_config(
     Update the systemd unit file content for a service.
     """
     service_name, service_path = _resolve_unit(name)
+    _refuse_own_unit(_requested_name(name), service_name)
 
     if not service_path.is_file():
         raise HTTPException(status_code=404, detail=f"Service not found: {service_name}")
@@ -633,9 +745,12 @@ def create_service(
     # ServiceError is caught explicitly for the same reason as in
     # update_service_config: a name collision is a conflict, not the 500
     # WASMErrorRoute's default would answer for an unmapped WASMError.
+    service_name = _requested_name(data.name)
+    # A unit named after the console or the monitor would be the one
+    # 'wasm web enable' or 'wasm monitor enable' then finds in their place.
+    _refuse_own_unit(service_name)
     service_manager = ServiceManager(verbose=False)
     try:
-        service_name = validate_service_name(data.name).removesuffix(".service")
         if data.raw_content is not None:
             service_manager.create_from_unit(service_name, data.raw_content)
         else:
@@ -668,6 +783,7 @@ def delete_service(name: str, request: Request, session: dict = Depends(require_
     Delete a systemd service.
     """
     service_name, service_path = _resolve_unit(name)
+    _refuse_own_unit(_requested_name(name), service_name)
 
     if not service_path.is_file():
         raise HTTPException(status_code=404, detail=f"Service not found: {service_name}")

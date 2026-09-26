@@ -141,6 +141,9 @@ class HealthCheck:
         """
         Turn the wait into probes.
 
+        The most probes the gate makes; the wait itself is bounded by
+        :attr:`seconds` of wall-clock time, whichever comes first.
+
         Args:
             delay: Seconds between probes.
 
@@ -225,6 +228,7 @@ class HealthGate:
             attempts if attempts is not None else (check or HealthCheck()).attempts(delay)
         )
         self._accept: Callable[[int], bool] = check.accepts if check is not None else answers
+        self._within = float((check or HealthCheck()).seconds)
         self._delay = delay
         self._failures: list[str] = []
 
@@ -258,6 +262,10 @@ class HealthGate:
             delay=self._delay,
             on_attempt=self._note_attempt,
             accept=self._accept,
+            # The timeout is wall-clock time: probes that each hang for
+            # their own five seconds must not stretch it (and the lock the
+            # caller holds) to several times what the operator set.
+            within=self._within,
         )
         if healthy:
             return True, ""

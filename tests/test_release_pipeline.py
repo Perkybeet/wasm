@@ -894,9 +894,8 @@ def test_old_releases_are_pruned_to_the_retention(
     """keep_releases survive on disk and in the store; older ones go from both."""
     machine.git.publish(node_tree(tmp_path / "v1"))
     deploy_new(root, machine)
+    store.set_keep_releases(DOMAIN, 2)
     app = store.get_app(DOMAIN)
-    app.keep_releases = 2
-    store.update_app(app)
 
     for version in (2, 3):
         machine.git.publish(node_tree(tmp_path / f"v{version}", server=f"{GOOD_SERVER}//{version}"))

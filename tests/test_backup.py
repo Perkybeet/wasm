@@ -3,6 +3,7 @@ Tests for backup manager.
 """
 
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -219,6 +220,24 @@ class TestBackupManager:
 
         assert backup_id.startswith("test-example-com_")
         assert len(backup_id) > 20  # Should have timestamp
+
+    def test_two_backups_in_one_second_get_different_ids(self, tmp_path, monkeypatch):
+        """A rollback's safety backup used to overwrite the backup it was about to restore."""
+        manager = BackupManager(verbose=False)
+        manager.backup_dir = tmp_path
+        frozen = datetime(2026, 9, 26, 12, 0, 0, 500000)
+        monkeypatch.setattr(
+            "wasm.managers.backup_manager.datetime",
+            type("FrozenDatetime", (datetime,), {"now": classmethod(lambda cls, tz=None: frozen)}),
+        )
+        first = manager._generate_backup_id("test.example.com")
+        (tmp_path / "test-example-com").mkdir()
+        (tmp_path / "test-example-com" / f"{first}.tar.gz").write_bytes(b"")
+
+        second = manager._generate_backup_id("test.example.com")
+
+        assert first == "test-example-com_20260926_120000"
+        assert second == "test-example-com_20260926_120001"
 
     def test_detect_app_type_nextjs(self, manager):
         """Test Next.js app detection."""

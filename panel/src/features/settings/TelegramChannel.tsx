@@ -1,8 +1,9 @@
 import { useMutation } from "@tanstack/react-query";
 import { Check, Search, TriangleAlert } from "lucide-react";
-import { useId, useState } from "react";
+import { useId, useRef, useState } from "react";
 import type { SyntheticEvent } from "react";
 
+import { announce } from "../../app/Announcer";
 import { findTelegramChats, patchConfig, saveTelegramSettings } from "../../api/queries/config";
 import type { TelegramChat } from "../../api/queries/config";
 import { ErrorBlock } from "../../components/page/QueryState";
@@ -138,6 +139,11 @@ export function TelegramChannel({ stored }: { stored: Readonly<Record<string, st
   const headingId = useId();
   const [draft, setDraft] = useState<Partial<Record<TelegramField, string>>>({});
   const [edited, setEdited] = useState<ReadonlySet<TelegramField>>(new Set());
+  // The chat ID the "missing minus" warning was last announced for, cleared by an edit. The
+  // warning is drawn as the ID is typed (so it never moves the Save button under a click that
+  // leaves the field) but is not a live region: its text holds the ID, so a live region would
+  // be read out again on every digit. It is announced once, when the field is left with it.
+  const announcedFor = useRef<string | null>(null);
   const test = useChannelTest("telegram");
 
   const tokenSaved = stored["bot_token"] === REDACTED;
@@ -239,11 +245,17 @@ export function TelegramChannel({ stored }: { stored: Readonly<Record<string, st
               value={chatId}
               disabled={pending}
               onValueChange={(next: string) => {
+                announcedFor.current = null;
                 set("chat_id", next);
+              }}
+              onBlur={() => {
+                if (warning === null || announcedFor.current === chatId) return;
+                announcedFor.current = chatId;
+                announce(warning);
               }}
             />
             {warning !== null ? (
-              <p role="alert" className="flex items-start gap-1.5 text-13 text-warn">
+              <p className="flex items-start gap-1.5 text-13 text-warn">
                 <TriangleAlert aria-hidden="true" className="mt-0.5 size-3.5 shrink-0" />
                 <span>{warning}</span>
               </p>

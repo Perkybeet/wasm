@@ -18,7 +18,11 @@ test("a report that needs attention lists its warnings beside the checks", async
   await signIn(page, consoleServer, "/server");
   const health = healthSection(page);
   await expect(health.getByText("Needs attention", { exact: true })).toBeVisible();
+  // The report refreshes in place: the verdict and its reasons are live regions, so a change
+  // while the page is open is read out.
+  await expect(health.getByRole("status", { name: "Health verdict" })).toContainText("Needs attention");
   const reasons = health.getByRole("group", { name: "Reasons" });
+  await expect(reasons).toHaveAttribute("aria-live", "polite");
   await expect(reasons.getByRole("listitem").first()).toBeVisible();
   // Every reason carries its level as a word, beside the report's own sentence.
   await expect(reasons.getByRole("listitem").filter({ hasText: "Warning" }).filter({ hasText: /^Warning.*App '.+' - / }).first()).toBeVisible();

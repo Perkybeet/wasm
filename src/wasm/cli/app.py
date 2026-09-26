@@ -546,8 +546,12 @@ def entrypoint() -> None:
     except ImportError as exc:
         log.debug("Update checker unavailable: %s", exc)
     else:
-        checker = UpdateChecker
-        checker.start_background_check()
+        # Decided before the command runs: under --json or with output
+        # piped, the banner would corrupt what a program reads, so the
+        # request that could only feed it is not made either.
+        if UpdateChecker.should_announce(sys.argv[1:]):
+            checker = UpdateChecker
+            checker.start_background_check()
 
     exit_code = main()
 

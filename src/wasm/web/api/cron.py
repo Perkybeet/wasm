@@ -52,7 +52,7 @@ class CronJobInfo(BaseModel):
 
     Attributes:
         name: Job name the ``wasm-cron-{name}`` unit names are built from.
-        command: The unit's ``ExecStart`` value, verbatim.
+        command: The command as the operator typed it (what the unit runs, before systemd escaping).
         user: Unix user the command runs as.
         working_directory: Directory the command runs in, empty when unset.
         app_domain: Domain of the associated application, empty when none.

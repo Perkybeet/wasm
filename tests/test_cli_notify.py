@@ -153,3 +153,51 @@ def test_telegram_chats_reports_a_missing_token(
 
     assert result.exit_code != 0
     assert "bot_token" in result.output
+
+
+def test_telegram_chats_prints_json(cli_runner: CliRunner, fake_notifier: dict[str, Any]) -> None:
+    import json
+
+    fake_notifier["chats"] = [
+        TelegramChat(id=123, type="private", username="ops"),
+        TelegramChat(id=-1001234567890, type="supergroup", title="Ops Room"),
+    ]
+
+    result = cli_runner.invoke(root_cli, ["notify", "telegram-chats", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == [
+        {"id": 123, "type": "private", "title": None, "username": "ops"},
+        {"id": -1001234567890, "type": "supergroup", "title": "Ops Room", "username": None},
+    ]
+
+
+def test_telegram_chats_json_with_none_found_is_an_empty_list(
+    cli_runner: CliRunner, fake_notifier: dict[str, Any]
+) -> None:
+    import json
+
+    result = cli_runner.invoke(root_cli, ["--json", "notify", "telegram-chats"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == []
+
+
+def test_telegram_chats_accepts_the_global_flags_after_its_name(
+    cli_runner: CliRunner, fake_notifier: dict[str, Any]
+) -> None:
+    result = cli_runner.invoke(root_cli, ["notify", "telegram-chats", "--verbose", "--no-color"])
+
+    assert result.exit_code == 0, result.output
+
+
+def test_telegram_chats_help_tells_the_operator_what_to_do() -> None:
+    """The help is for the operator running it, not a note on why it was written."""
+    result = CliRunner().invoke(root_cli, ["notify", "telegram-chats", "--help"])
+
+    assert result.exit_code == 0
+    text = " ".join(result.output.split())
+    assert "notifications.channels.telegram.chat_id" in text
+    assert "minus" in text
+    assert "getUpdates" not in text
+    assert "today" not in text

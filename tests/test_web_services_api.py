@@ -153,6 +153,31 @@ class FakeServiceManager:
         self.calls.append(("stop", name))
         return True
 
+    def start(self, name: str) -> bool:
+        """Record a start request."""
+        self.calls.append(("start", name))
+        return True
+
+    def restart(self, name: str) -> bool:
+        """Record a restart request."""
+        self.calls.append(("restart", name))
+        return True
+
+    def update_config(self, name: str, content: str) -> bool:
+        """Record a unit rewrite."""
+        self.calls.append(("update_config", name))
+        return True
+
+    def delete_service(self, name: str) -> bool:
+        """Record a deletion."""
+        self.calls.append(("delete_service", name))
+        return True
+
+    def create_from_unit(self, name: str, content: str) -> bool:
+        """Record a creation from a raw unit."""
+        self.calls.append(("create_from_unit", name))
+        return True
+
     def logs(self, name: str, lines: int = 50) -> str:
         """Return canned log output."""
         self.calls.append(("logs", name))
@@ -827,3 +852,155 @@ class TestResolveWithin:
         """An empty candidate would silently return the base directory itself."""
         with pytest.raises(ValidationError):
             resolve_within(tmp_path, "")
+
+
+def _mutations(client: TestClient, name: str) -> dict[str, object]:
+    """
+    Send every mutating services request for one unit name.
+
+    Args:
+        client: The authenticated test client.
+        name: Unit name, as a client would put it in the path or body.
+
+    Returns:
+        Each operation's response, keyed by a short label.
+    """
+    segment = _path_segment(name)
+    responses: dict[str, object] = {
+        verb: client.post(f"/api/services/{segment}/{verb}")
+        for verb in ("start", "stop", "restart", "enable", "disable")
+    }
+    responses["config"] = client.put(f"/api/services/{segment}/config", json={"config": RAW_UNIT})
+    responses["delete"] = client.delete(f"/api/services/{segment}")
+    responses["create"] = client.post("/api/services", json={"name": name, "raw_content": RAW_UNIT})
+    return responses
+
+
+def _scoped_client(unit_dir: Path, scope: str) -> TestClient:
+    """
+    Build a client whose credential is an API token of one scope.
+
+    Args:
+        unit_dir: The sandbox unit directory (already patched in by its fixture).
+        scope: The token's scope.
+
+    Returns:
+        The client.
+    """
+    app = FastAPI()
+    app.include_router(services_api.router, prefix="/api/services")
+    app.dependency_overrides[get_current_session] = lambda: {
+        "session_id": "token",
+        "type": "token",
+        "scope": scope,
+        "token_name": "ci",
+    }
+    return TestClient(app, raise_server_exceptions=False)
+
+
+class TestWasmOwnUnits:
+    """
+    The console and the monitor are not services the API may act on.
+
+    ``wasm-web`` and ``wasm-monitor`` are units WASM manages, so every
+    services endpoint used to accept them: an admin token could
+    ``POST /api/services/wasm-web/stop`` without sudo mode and take the
+    console down under its own operator, and a ``read`` token could read the
+    console's journal.
+    """
+
+    @pytest.mark.parametrize(
+        ("name", "hint"),
+        [
+            ("wasm-web", "wasm web"),
+            ("wasm-web.service", "wasm web"),
+            ("wasm-monitor", "wasm monitor"),
+        ],
+    )
+    def test_every_mutation_of_the_console_or_monitor_is_refused(
+        self, client: TestClient, unit_dir: Path, fake_manager, name: str, hint: str
+    ) -> None:
+        """Start, stop, restart, enable, disable, rewrite, delete and create all refuse."""
+        unit = unit_dir / f"{name.removesuffix('.service')}.service"
+        unit.write_text(RAW_UNIT)
+
+        for label, response in _mutations(client, name).items():
+            assert response.status_code == 403, f"{label}: {response.text}"
+            body = response.json()
+            assert body["error"] == "permissionerror", label
+            assert hint in body["hint"], f"{label}: {body}"
+
+        assert all(not manager.calls for manager in fake_manager.instances)
+        assert unit.read_text() == RAW_UNIT
+
+    def test_a_short_name_resolving_to_the_legacy_console_unit_is_refused(
+        self, client: TestClient, unit_dir: Path, fake_manager
+    ) -> None:
+        """
+        ``web`` resolves to ``wasm-web`` when that legacy-looking file exists.
+
+        The check is on the unit the request would reach, not only on the
+        name it spelled.
+        """
+        (unit_dir / "wasm-web.service").write_text(RAW_UNIT)
+
+        response = client.post("/api/services/web/stop")
+
+        assert response.status_code == 403, response.text
+        assert "wasm web" in response.json()["hint"]
+        assert all(not manager.calls for manager in fake_manager.instances)
+
+    @pytest.mark.parametrize(
+        ("name", "hint"),
+        [("wasm-cron-nightly", "wasm cron"), ("wasm-backup-shop-example-com", "backup")],
+    )
+    def test_scheduled_work_units_are_refused_with_their_own_hint(
+        self, client: TestClient, unit_dir: Path, fake_manager, name: str, hint: str
+    ) -> None:
+        """A cron or backup unit belongs to its own API, which also owns its timer."""
+        (unit_dir / f"{name}.service").write_text(RAW_UNIT)
+
+        response = client.post(f"/api/services/{name}/stop")
+
+        assert response.status_code == 403, response.text
+        assert hint in response.json()["hint"]
+        assert all(not manager.calls for manager in fake_manager.instances)
+
+    def test_an_application_unit_is_still_managed(
+        self, client: TestClient, unit_dir: Path, fake_manager
+    ) -> None:
+        """The refusal is about WASM's own units, not every ``wasm-`` name."""
+        (unit_dir / "shop-example-com.service").write_text(RAW_UNIT)
+
+        response = client.post("/api/services/shop-example-com/stop")
+
+        assert response.status_code == 200, response.text
+        assert ("stop", "shop-example-com") in fake_manager.instances[-1].calls
+
+    @pytest.mark.parametrize("name", ["wasm-web", "wasm-monitor"])
+    def test_reading_the_console_journal_needs_admin(
+        self, unit_dir: Path, fake_manager, name: str
+    ) -> None:
+        """
+        The console's journal carries SQL statements, sources and addresses.
+
+        A ``read`` token sees applications' journals, not WASM's own.
+        """
+        (unit_dir / f"{name}.service").write_text(RAW_UNIT)
+
+        read = _scoped_client(unit_dir, "read").get(f"/api/services/{name}/logs")
+        admin = _scoped_client(unit_dir, "admin").get(f"/api/services/{name}/logs")
+
+        assert read.status_code == 403, read.text
+        assert admin.status_code == 200, admin.text
+        assert admin.json()["logs"] == f"logs for {name}"
+
+    def test_a_read_token_still_reads_an_application_journal(
+        self, unit_dir: Path, fake_manager
+    ) -> None:
+        """Only WASM's own units are raised to admin."""
+        (unit_dir / "shop-example-com.service").write_text(RAW_UNIT)
+
+        response = _scoped_client(unit_dir, "read").get("/api/services/shop-example-com/logs")
+
+        assert response.status_code == 200, response.text

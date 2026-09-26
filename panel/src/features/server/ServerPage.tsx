@@ -56,7 +56,9 @@ function ReasonText({ reason }: { reason: HealthReason }) {
 function HealthReasons({ reasons }: { reasons: readonly HealthReason[] }) {
   const headingId = useId();
   return (
-    <div aria-labelledby={headingId} role="group" className="flex min-w-0 flex-col py-2">
+    // Live, so a reason that appears while the page is open (a refresh after a certificate
+    // expired) is read out with the verdict it changed; the first render is not announced.
+    <div aria-labelledby={headingId} role="group" aria-live="polite" className="flex min-w-0 flex-col py-2">
       <h3 id={headingId} className="py-1 text-12 font-medium text-fg-muted">
         Reasons
       </h3>
@@ -148,7 +150,9 @@ function Health() {
         <HealthSkeleton />
       ) : (
         <div className="rounded-card border border-border bg-surface px-4 shadow-raised">
-          <div className="flex items-center gap-2 border-b border-border py-3">
+          {/* A status region like the overview's announcements: the report refreshes in place,
+              and a verdict that turns critical meanwhile must be heard, not only seen. */}
+          <div role="status" aria-label="Health verdict" aria-atomic="true" className="flex items-center gap-2 border-b border-border py-3">
             <StatusPill state={verdictView(health.data.verdict).state} label={verdictView(health.data.verdict).label} />
           </div>
           {/* The reasons beside the checks on a wide screen, so a verdict never stands without them. */}

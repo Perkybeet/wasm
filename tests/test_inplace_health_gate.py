@@ -103,6 +103,7 @@ class Probe:
         delay: float = 2.0,
         on_attempt: Callable[[str], None] | None = None,
         accept: Callable[[int], bool] | None = None,
+        within: float | None = None,
     ) -> bool:
         self.urls.append(url)
         self._seen[url] = self._seen.get(url, 0) + 1

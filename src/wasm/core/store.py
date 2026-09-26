@@ -163,6 +163,11 @@ DEFAULT_KEEP_RELEASES = 5
 MIN_KEEP_RELEASES = 1
 MAX_KEEP_RELEASES = 50
 
+#: Columns of ``apps`` written only by their own setters
+#: (:meth:`WASMStore.set_app_health`, :meth:`WASMStore.set_keep_releases`),
+#: never by :meth:`WASMStore.update_app`'s full-row write.
+_OWN_SETTER_COLUMNS = ("health_path", "health_expect", "health_timeout", "keep_releases")
+
 
 @dataclass
 class App:
@@ -1528,6 +1533,11 @@ class WASMStore:
         """
         Update an application.
 
+        The columns with setters of their own (:data:`_OWN_SETTER_COLUMNS`)
+        are not written: a deploy writes back the row it read when it
+        started, and would otherwise put back a health check or a retention
+        changed while it ran.
+
         Args:
             app: Application with updated data.
 
@@ -1540,6 +1550,8 @@ class WASMStore:
             data = app.to_dict()
             app_id = data.pop("id")
             data.pop("created_at")  # Don't update created_at
+            for column in _OWN_SETTER_COLUMNS:
+                data.pop(column, None)
 
             set_clause = ", ".join([f"{k} = ?" for k in data.keys()])
 

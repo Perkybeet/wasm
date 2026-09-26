@@ -64,6 +64,7 @@ from wasm.web.auth import (
     actor_label,
     authenticate_connection,
     bearer_token,
+    carries_credentials,
     credential_key,
     get_audit_logger,
     get_client_ip,
@@ -71,11 +72,13 @@ from wasm.web.auth import (
     ip_matches,
     is_allowed_origin,
     is_secure_request,
+    open_credential_ledger,
     rate_limit_identity,
     set_audit_logger,
     set_brute_force_protection,
     set_security_config,
     set_token_manager,
+    settle_credential_failures,
 )
 from wasm.web.events import (
     AppStatePublisher,
@@ -240,28 +243,46 @@ class RateBucket:
     key: str
 
 
-def rate_bucket(connection: HTTPConnection, client_ip: str) -> RateBucket:
+def rate_bucket(connection: HTTPConnection, client_ip: str, path: str) -> RateBucket:
     """
     Pick the budget a request spends.
 
     A request with a valid credential is counted per credential, against
     ``rate_limit_authenticated_requests``; anything else per client IP,
-    against the strict ``rate_limit_requests``. An address the lockout has
-    refused is not given the benefit of a credential check: it is counted as
-    anonymous, and the lockout refuses it right after.
+    against the strict ``rate_limit_requests``. Three kinds of request are
+    counted by address without their credential being looked at, because
+    looking would make the limiter a credential oracle or an amplifier:
+
+    - one outside :data:`~wasm.web.auth.CREDENTIAL_PATH_PREFIXES` (``/health``,
+      the forge webhooks), where no endpoint checks a credential either;
+    - one from an address the lockout has refused, which the lockout refuses
+      right after;
+    - one from an address already over the anonymous budget: it is refused
+      anyway, and checking its credential first would buy a flood a SQLite
+      query and a read of ``web-token`` per request.
+
+    A wrong credential the check does find is noted for the lockout by
+    :func:`~wasm.web.auth.rate_limit_identity`.
 
     Args:
         connection: The incoming request or handshake.
         client_ip: The resolved client address.
+        path: The request path.
 
     Returns:
         The bucket to count the request in.
     """
-    if not get_brute_force().is_locked(client_ip):
-        identity = rate_limit_identity(connection, client_ip)
-        if identity is not None:
-            return RateBucket(get_authenticated_rate_limiter(), identity)
-    return RateBucket(get_rate_limiter(), client_ip)
+    anonymous = RateBucket(get_rate_limiter(), client_ip)
+    if (
+        not carries_credentials(path)
+        or get_brute_force().is_locked(client_ip)
+        or anonymous.limiter.get_remaining(client_ip) <= 0
+    ):
+        return anonymous
+    identity = rate_limit_identity(connection, client_ip)
+    if identity is not None:
+        return RateBucket(get_authenticated_rate_limiter(), identity)
+    return anonymous
 
 
 #: Endpoints that check a credential carried in the request itself - the
@@ -861,10 +882,38 @@ class SecurityMiddleware:
             await self.app(scope, receive, send)
             return
 
-        config = self.config
         connection = HTTPConnection(scope)
-        client_ip = get_client_ip(connection, config)
+        client_ip = get_client_ip(connection, self.config)
         path = str(scope.get("path", ""))
+        # Every wrong credential the rate limiter finds is counted once when
+        # the request is over, unless an endpoint counted it first.
+        ledger = open_credential_ledger(client_ip, path)
+        try:
+            await self._serve(scope, receive, send, connection, client_ip, path)
+        finally:
+            settle_credential_failures(ledger)
+
+    async def _serve(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        connection: HTTPConnection,
+        client_ip: str,
+        path: str,
+    ) -> None:
+        """
+        Apply the security policy to one HTTP request or handshake.
+
+        Args:
+            scope: The ASGI connection scope.
+            receive: ASGI receive channel.
+            send: ASGI send channel.
+            connection: A view over the scope.
+            client_ip: The resolved client address.
+            path: The request path.
+        """
+        config = self.config
         audit = get_audit_logger()
 
         if config.ip_whitelist and not ip_matches(client_ip, config.ip_whitelist):
@@ -903,7 +952,7 @@ class SecurityMiddleware:
 
         rate: RateBucket | None = None
         if config.rate_limit_enabled and not _spends_no_rate_budget(scope, path):
-            rate = rate_bucket(connection, client_ip)
+            rate = rate_bucket(connection, client_ip, path)
         if rate is not None and not rate.limiter.is_allowed(rate.key):
             await self._deny(
                 scope,

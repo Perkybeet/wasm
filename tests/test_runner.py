@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import gzip
+import subprocess
 import sys
 import threading
 import time
@@ -623,3 +624,55 @@ def test_a_stream_in_a_scope_still_keeps_its_deadline():
 
     assert result.timed_out
     assert result.exit_code == EXIT_TIMEOUT
+
+
+class _EscapedPipes:
+    """
+    A killed process whose pipes a grandchild that left the group still holds.
+
+    ``communicate`` never sees the end of the pipes; ``wait`` reaps the child.
+    """
+
+    def __init__(self) -> None:
+        self.pid = 999_999_999
+        self.calls: list[str] = []
+        self.reaped = False
+
+    def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+        self.calls.append("communicate")
+        raise subprocess.TimeoutExpired("x", timeout or 0)
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.calls.append("wait")
+        self.reaped = True
+        return -9
+
+    def kill(self) -> None:
+        self.calls.append("kill")
+
+
+@pytest.mark.parametrize("drain", [True, False])
+def test_a_killed_session_is_reaped_even_when_its_pipes_stay_open(
+    monkeypatch: pytest.MonkeyPatch, drain: bool
+) -> None:
+    """The second kill is followed by a wait, so no zombie is left behind."""
+    from wasm.core import runner as runner_module
+
+    monkeypatch.setattr(runner_module.os, "killpg", lambda pid, sig: None)
+    process = _EscapedPipes()
+    if not drain:
+        # wait() is what times out when another thread drains the pipes.
+        def wait(timeout: float | None = None) -> int:
+            process.calls.append("wait")
+            if process.calls.count("wait") == 1:
+                raise subprocess.TimeoutExpired("x", timeout or 0)
+            process.reaped = True
+            return -9
+
+        process.wait = wait  # type: ignore[method-assign]
+
+    runner_module._kill_session(process, drain=drain)  # type: ignore[arg-type]
+
+    assert "kill" in process.calls
+    assert process.calls[-1] == "wait"
+    assert process.reaped

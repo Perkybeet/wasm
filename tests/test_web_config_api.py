@@ -33,6 +33,7 @@ from fastapi.testclient import TestClient
 from wasm.core.config import DEFAULT_CONFIG, REDACTED, Config
 from wasm.web.api import config as config_api
 from wasm.web.api.auth import get_current_session
+from wasm.web.api.deps import install_error_handlers
 from wasm.web.auth import CSRF_HEADER_NAME, AuditLogger, SecurityConfig, set_audit_logger
 from wasm.web.server import create_app, get_token_manager
 
@@ -81,6 +82,9 @@ def client(config_path: Path) -> TestClient:
     """
     app = FastAPI()
     app.include_router(config_api.router, prefix="/api/config")
+    # The same error contract the real application answers in, so a 422 is
+    # asserted field by field rather than in FastAPI's own shape.
+    install_error_handlers(app)
     app.dependency_overrides[get_current_session] = lambda: {"session_id": "test", "type": "master"}
     return TestClient(app, raise_server_exceptions=False)
 
@@ -880,6 +884,155 @@ class TestSMTPSettings:
         assert stored_value(config_path, "monitor.smtp.password") == "hunter2"
         assert client.get("/api/config/smtp").json()["password_set"] is True
 
+    #: What the first write stores; every redirection test starts from it.
+    _STORED_SMTP: dict[str, Any] = {
+        "host": "smtp.example.com",
+        "port": 465,
+        "use_ssl": True,
+        "use_tls": False,
+        "username": "wasm",
+        "password": "hunter2",
+        "from_address": "",
+        "recipients": ["ops@example.com"],
+    }
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            {"host": "smtp.attacker.example"},
+            {"port": 2525},
+            {"username": "someone-else"},
+            {"use_ssl": False, "use_tls": False},
+            {"use_ssl": False, "use_tls": True},
+        ],
+    )
+    def test_a_blank_password_cannot_follow_the_server_somewhere_else(
+        self, client: TestClient, config_path: Path, change: dict[str, Any]
+    ) -> None:
+        """
+        The regression: a blank password meant "keep the stored one" whatever
+        else changed, so a credential that may write this section but was never
+        told the password could point it at its own server, press "send a test
+        email", and receive it. Keeping it is only safe while it would still
+        go to the same account on the same server, over the same transport.
+        """
+        first = client.put("/api/config/smtp", json=self._STORED_SMTP)
+        assert first.status_code == 200, first.text
+
+        response = client.put(
+            "/api/config/smtp", json={**self._STORED_SMTP, "password": "", **change}
+        )
+
+        assert response.status_code == 422, response.text
+        body = response.json()
+        assert body["error"] == "validation_error"
+        assert set(body["fields"]) == {"password"}
+        assert "password" in body["fields"]["password"].lower()
+        assert "hunter2" not in response.text
+        # Nothing was written: the stored server and password are as they were.
+        assert stored_value(config_path, "monitor.smtp.host") == "smtp.example.com"
+        assert stored_value(config_path, "monitor.smtp.port") == 465
+        assert stored_value(config_path, "monitor.smtp.username") == "wasm"
+        assert stored_value(config_path, "monitor.smtp.password") == "hunter2"
+
+    @pytest.mark.parametrize(
+        ("path", "value"),
+        [
+            ("monitor.smtp.host", "smtp.attacker.example"),
+            ("monitor.smtp.port", 2525),
+            ("monitor.smtp.username", "someone-else"),
+            ("monitor.smtp.use_ssl", False),
+        ],
+    )
+    def test_the_generic_patch_cannot_move_the_stored_password_either(
+        self, client: TestClient, config_path: Path, path: str, value: Any
+    ) -> None:
+        """The same redirection, one key at a time, through PATCH /api/config."""
+        assert client.put("/api/config/smtp", json=self._STORED_SMTP).status_code == 200
+
+        response = client.patch("/api/config", json={"path": path, "value": value})
+
+        assert response.status_code == 422, response.text
+        assert set(response.json()["fields"]) == {"password"}
+        assert stored_value(config_path, "monitor.smtp.host") == "smtp.example.com"
+        assert stored_value(config_path, "monitor.smtp.password") == "hunter2"
+
+    def test_the_generic_patch_may_move_the_server_with_its_password(
+        self, client: TestClient, config_path: Path
+    ) -> None:
+        assert client.put("/api/config/smtp", json=self._STORED_SMTP).status_code == 200
+        smtp = {**self._STORED_SMTP, "host": "mail.example.org", "password": "new-secret"}
+        smtp.pop("recipients")
+
+        response = client.patch("/api/config", json={"path": "monitor.smtp", "value": smtp})
+
+        assert response.status_code == 200, response.text
+        assert stored_value(config_path, "monitor.smtp.password") == "new-secret"
+
+    def test_the_whole_config_put_cannot_move_the_stored_password_either(
+        self, client: TestClient, config_path: Path
+    ) -> None:
+        """The console's raw editor echoes ``***`` back, which keeps the password."""
+        assert client.put("/api/config/smtp", json=self._STORED_SMTP).status_code == 200
+        shown = client.get("/api/config").json()["config"]
+        assert shown["monitor"]["smtp"]["password"] == "***"
+        shown["monitor"]["smtp"]["host"] = "smtp.attacker.example"
+
+        response = client.put("/api/config", json={"config": shown})
+
+        assert response.status_code == 422, response.text
+        assert set(response.json()["fields"]) == {"password"}
+        assert stored_value(config_path, "monitor.smtp.host") == "smtp.example.com"
+
+    def test_a_new_server_with_its_password_is_accepted(
+        self, client: TestClient, config_path: Path
+    ) -> None:
+        first = client.put("/api/config/smtp", json=self._STORED_SMTP)
+        assert first.status_code == 200, first.text
+
+        response = client.put(
+            "/api/config/smtp",
+            json={**self._STORED_SMTP, "host": "mail.example.org", "password": "new-secret"},
+        )
+
+        assert response.status_code == 200, response.text
+        assert stored_value(config_path, "monitor.smtp.host") == "mail.example.org"
+        assert stored_value(config_path, "monitor.smtp.password") == "new-secret"
+
+    def test_a_blank_password_keeps_the_stored_one_when_only_the_rest_changes(
+        self, client: TestClient, config_path: Path
+    ) -> None:
+        """Sender and recipients are not where the password goes."""
+        first = client.put("/api/config/smtp", json=self._STORED_SMTP)
+        assert first.status_code == 200, first.text
+
+        response = client.put(
+            "/api/config/smtp",
+            json={
+                **self._STORED_SMTP,
+                "host": "SMTP.Example.com",
+                "password": "",
+                "from_address": "wasm@example.com",
+                "recipients": ["oncall@example.com"],
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        assert stored_value(config_path, "monitor.smtp.password") == "hunter2"
+        assert stored_value(config_path, "monitor.email_recipients") == ["oncall@example.com"]
+
+    def test_a_blank_password_with_nothing_stored_is_not_a_redirection(
+        self, client: TestClient, config_path: Path
+    ) -> None:
+        """An anonymous relay has no password to carry anywhere."""
+        response = client.put(
+            "/api/config/smtp",
+            json={**self._STORED_SMTP, "host": "relay.example.com", "password": ""},
+        )
+
+        assert response.status_code == 200, response.text
+        assert stored_value(config_path, "monitor.smtp.password") == ""
+
     @pytest.mark.parametrize(
         "body",
         [
@@ -1252,6 +1405,34 @@ class TestTelegramSettings:
         assert response.status_code == 200, response.text
         config = Config()
         assert config.get("notifications.channels.telegram.chat_id") == "@ops_alerts"
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            "not-a-token",
+            "110201543:AAH/../../evil",
+            "110201543:AAHtoken\n",
+            "110201543:AAH token",
+        ],
+    )
+    def test_a_malformed_bot_token_is_refused_on_save(
+        self, client: TestClient, config_path: Path, token: str
+    ) -> None:
+        """
+        The token becomes part of the Bot API's URL path, so the shape is
+        refused where it is saved, not first discovered at the next deploy.
+        """
+        response = client.put(
+            "/api/config/notifications/telegram",
+            json={"bot_token": token, "chat_id": "42"},
+        )
+
+        assert response.status_code == 422, response.text
+        body = response.json()
+        assert set(body["fields"]) == {"bot_token"}
+        assert "Telegram bot token" in body["fields"]["bot_token"]
+        assert "evil" not in response.text
+        assert not config_path.exists()
 
     def test_a_junk_chat_id_is_refused(self, client: TestClient, config_path: Path) -> None:
         response = client.put(

@@ -14,6 +14,7 @@ opt out with ``@pytest.mark.allow_subprocess``.
 from __future__ import annotations
 
 import subprocess
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -182,6 +183,28 @@ def default_filesystem() -> Iterator[None]:
     """
     yield
     set_fs(None)
+
+
+@pytest.fixture(autouse=True)
+def fresh_upstream_answers() -> Iterator[None]:
+    """
+    Forget what the remote said about any application, before and after every test.
+
+    :func:`~wasm.deployers.lifecycle.check_upstream` reuses an answer for a
+    few seconds; one test's remote must not answer the next test's question.
+
+    Yields:
+        Nothing; the answers are dropped on the way in and out.
+    """
+
+    def forget() -> None:
+        lifecycle = sys.modules.get("wasm.deployers.lifecycle")
+        if lifecycle is not None:
+            lifecycle._upstream_answers.clear()
+
+    forget()
+    yield
+    forget()
 
 
 @pytest.fixture

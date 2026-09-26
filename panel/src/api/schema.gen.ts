@@ -254,9 +254,12 @@ export interface paths {
          * Rollback Deployment
          * @description Queue going back to what a deployment produced.
          *
-         *     On releases its release is activated behind the health gate; in place
-         *     its snapshot backup (taken by the update that followed it) is restored,
-         *     after a safety backup of the current state.
+         *     On releases its release is activated behind the health gate. In place in
+         *     a git checkout its commit is rebuilt where the application runs, behind
+         *     the same gate; in place without history its snapshot backup (taken by
+         *     the update that followed it) is restored after a safety backup, rebuilt
+         *     and gated, keeping the deployed ``.env``. See
+         *     :func:`~wasm.deployers.lifecycle.rollback_to_deployment`.
          *
          *     Args:
          *         domain: Domain of the application.
@@ -2420,7 +2423,8 @@ export interface paths {
          *     ``from_address`` and every recipient - rejects a value here too, in the
          *     same words. An empty ``password`` is translated to the
          *     :data:`~wasm.core.config.REDACTED` placeholder before the write, which is
-         *     what actually keeps the stored password: see :class:`SMTPConfig`.
+         *     what actually keeps the stored password, and is refused when the
+         *     password would go somewhere else: see :class:`SMTPConfig`.
          *
          *     Args:
          *         body: Body carrying the SMTP settings.
@@ -2434,7 +2438,9 @@ export interface paths {
          *         ConfigError: 400, through the error boundary, for a host that is not
          *             a hostname, a port out of range, both ``use_ssl`` and ``use_tls``
          *             enabled, or an invalid ``from_address`` or recipient.
-         *         HTTPException: If the configuration cannot be written.
+         *         HTTPException: 422 on ``password`` when it is blank, a password is
+         *             stored, and the host, port, username or transport changed; or if
+         *             the configuration cannot be written.
          */
         put: operations["update_smtp_config_api_config_smtp_put"];
         post?: never;
@@ -4599,6 +4605,13 @@ export interface paths {
         /**
          * Get Service Logs
          * @description Get service logs from journalctl.
+         *
+         *     The console's and the monitor's journals need an admin credential, not
+         *     the ``read`` a GET would otherwise ask for: the console logs every SQL
+         *     statement run from it (``wasm.audit``), the paths and client addresses of
+         *     every request, and the verbatim output of failed git, certbot and
+         *     notification calls; the monitor logs what it saw of other processes.
+         *     An application's journal is its own output and stays ``read``.
          */
         get: operations["get_service_logs_api_services__name__logs_get"];
         put?: never;
@@ -6591,7 +6604,7 @@ export interface components {
          *
          *     Attributes:
          *         name: Job name the ``wasm-cron-{name}`` unit names are built from.
-         *         command: The unit's ``ExecStart`` value, verbatim.
+         *         command: The command as the operator typed it (what the unit runs, before systemd escaping).
          *         user: Unix user the command runs as.
          *         working_directory: Directory the command runs in, empty when unset.
          *         app_domain: Domain of the associated application, empty when none.
@@ -8179,10 +8192,13 @@ export interface components {
          *     through the generic ``PUT``/``PATCH /api/config`` there is no
          *     :data:`~wasm.core.config.REDACTED` placeholder for the console to echo
          *     back untouched. Instead an empty ``password`` keeps whatever is already
-         *     stored, the same as leaving a webhook URL field blank leaves its channel
-         *     alone - only a non-empty value replaces it. There is no way to explicitly
-         *     blank the password through this endpoint; ``wasm config set
-         *     monitor.smtp.password ''`` still does that directly.
+         *     stored - but only while it would still go where it went before: the same
+         *     host, port, username and transport. Changing any of those with a blank
+         *     password is refused (see :func:`_refuse_smtp_password_move`), so a
+         *     credential that may write this section but never saw the password cannot
+         *     point it at a server of its own and send itself a test email. There is no
+         *     way to explicitly blank the password through this endpoint; ``wasm config
+         *     set monitor.smtp.password ''`` still does that directly.
          */
         SMTPConfig: {
             /**

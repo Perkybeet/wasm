@@ -29,6 +29,7 @@ from wasm.deployers.helpers.env_manager import (
     EnvConfig,
     EnvManager,
     EnvVariable,
+    is_secret_env_name,
     redact_url_credentials,
 )
 
@@ -172,6 +173,95 @@ class TestCategoryDetection:
 
     def test_unknown_category(self, env_manager):
         assert env_manager._detect_category("CUSTOM_THING") == "General"
+
+
+class TestDiscoveryStaysInsideTheCheckout:
+    """
+    A repository is untrusted input, and discovery reads it as root.
+
+    A ``.env.example`` that is a symlink to ``/etc/shadow`` or to another
+    application's ``.env`` would otherwise have its lines parsed into
+    variables whose defaults go back to whoever asked for the inspection.
+    """
+
+    def test_a_symlinked_example_outside_the_checkout_is_skipped(self, env_manager, tmp_path):
+        outside = tmp_path / "outside.env"
+        outside.write_text("STOLEN_VALUE=hunter2\n")
+        checkout = tmp_path / "checkout"
+        checkout.mkdir()
+        (checkout / ".env.example").symlink_to(outside)
+
+        assert env_manager.discover(checkout) == []
+
+    def test_a_symlinked_example_inside_the_checkout_is_skipped_too(self, env_manager, tmp_path):
+        # Refusing every link is simpler to reason about than resolving and
+        # comparing, and an example file never needs to be one.
+        (tmp_path / "real.env").write_text("LINKED=1\n")
+        (tmp_path / ".env.template").symlink_to(tmp_path / "real.env")
+        (tmp_path / ".env.example").write_text("PLAIN=1\n")
+
+        names = [v.name for v in env_manager.discover(tmp_path)]
+
+        assert names == ["PLAIN"]
+
+    def test_a_symlinked_workspace_directory_is_not_followed(self, env_manager, tmp_path):
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / ".env.example").write_text("FOREIGN=1\n")
+        checkout = tmp_path / "checkout"
+        (checkout / "apps").mkdir(parents=True)
+        (checkout / "apps" / "web").symlink_to(elsewhere, target_is_directory=True)
+
+        assert env_manager.discover(checkout) == []
+
+    def test_a_symlinked_workspace_parent_is_not_followed(self, env_manager, tmp_path):
+        elsewhere = tmp_path / "elsewhere"
+        (elsewhere / "api").mkdir(parents=True)
+        (elsewhere / "api" / ".env.example").write_text("FOREIGN=1\n")
+        checkout = tmp_path / "checkout"
+        checkout.mkdir()
+        (checkout / "packages").symlink_to(elsewhere, target_is_directory=True)
+
+        assert env_manager.discover(checkout) == []
+
+    def test_a_root_reached_through_a_symlink_still_works(self, env_manager, tmp_path):
+        # On the releases layout the running code is app_path/current, a
+        # link WASM made itself: the root may be one, only its content may not.
+        release = tmp_path / "releases" / "1"
+        release.mkdir(parents=True)
+        (release / ".env.example").write_text("PORT=3000\n")
+        (tmp_path / "current").symlink_to(release, target_is_directory=True)
+
+        names = [v.name for v in env_manager.discover(tmp_path / "current")]
+
+        assert names == ["PORT"]
+
+    def test_a_directory_named_like_an_example_is_ignored(self, env_manager, tmp_path):
+        (tmp_path / ".env.example").mkdir()
+
+        assert env_manager.discover(tmp_path) == []
+
+
+class TestTheOneSecretNameClassifier:
+    """``is_secret_env_name`` is the deployer's patterns plus the config's words."""
+
+    @pytest.mark.parametrize(
+        "name",
+        ["DB_PASSWORD", "ADMIN_PASS", "STRIPE_API_KEY", "JWT_SECRET", "GITHUB_TOKEN"],
+    )
+    def test_the_deployer_patterns_are_secrets(self, name):
+        assert is_secret_env_name(name) is True
+
+    @pytest.mark.parametrize("name", ["AUTH", "SLACK_WEBHOOK", "AWS_CREDENTIALS", "apiKey"])
+    def test_the_config_words_are_secrets(self, name):
+        # None of these contains a SECRET_PATTERNS substring; every one is a
+        # word config.redact_secrets hides.
+        assert not any(p in name.upper() for p in EnvManager.SECRET_PATTERNS)
+        assert is_secret_env_name(name) is True
+
+    @pytest.mark.parametrize("name", ["PORT", "NODE_ENV", "PUBLIC_URL", "KEYBOARD_LAYOUT"])
+    def test_ordinary_names_are_not(self, name):
+        assert is_secret_env_name(name) is False
 
 
 class TestSecretDetection:
@@ -710,6 +800,30 @@ class TestNoMutationEscapesTheSeam:
     #: spelling has to be added here on purpose rather than by accident.
     SEAM = frozenset({"fs", "self.fs", "self._fs", "filesystem", "self.filesystem"})
 
+    #: ``os.open`` flags that can change a file. A call naming none of them
+    #: and naming ``O_RDONLY`` only reads.
+    WRITE_FLAGS = ("O_WRONLY", "O_RDWR", "O_CREAT", "O_TRUNC", "O_APPEND", "O_TMPFILE")
+
+    def _is_read_only_os_open(self, node: ast.Call, name: str, receiver: str) -> bool:
+        """
+        Recognise ``os.open(path, os.O_RDONLY | ...)`` with no write flag.
+
+        Discovery reads example files with ``O_NOFOLLOW``, which only
+        ``os.open`` offers; reading is not a mutation the seam has to see.
+
+        Args:
+            node: The call.
+            name: The called attribute or function name.
+            receiver: The expression it is called on.
+
+        Returns:
+            True for a read-only ``os.open``.
+        """
+        if name != "open" or receiver != "os" or len(node.args) < 2:
+            return False
+        flags = ast.unparse(node.args[1])
+        return "O_RDONLY" in flags and not any(flag in flags for flag in self.WRITE_FLAGS)
+
     def _offenders(self, path: Path) -> list[str]:
         """
         Collect every mutating call in a module that bypasses the seam.
@@ -735,6 +849,9 @@ class TestNoMutationEscapesTheSeam:
             else:
                 continue
 
+            if self._is_read_only_os_open(node, name, receiver):
+                continue
+
             if name in self.MUTATING and receiver not in self.SEAM:
                 found.append(f"{name} on {receiver or '<bare call>'} (line {node.lineno})")
 
@@ -750,6 +867,13 @@ class TestNoMutationEscapesTheSeam:
         """A guard that cannot fail protects nothing."""
         sample = tmp_path / "sample.py"
         sample.write_text("from pathlib import Path\nPath('/x/.env').write_text('K=v')\n")
+
+        assert self._offenders(sample) != []
+
+    def test_the_guard_notices_a_writing_os_open(self, tmp_path):
+        """Only a read-only os.open is let through."""
+        sample = tmp_path / "sample.py"
+        sample.write_text("import os\nos.open('/x/.env', os.O_RDONLY | os.O_CREAT)\n")
 
         assert self._offenders(sample) != []
 

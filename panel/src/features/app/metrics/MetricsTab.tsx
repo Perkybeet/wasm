@@ -270,6 +270,25 @@ export function MetricsTab({ domain, range, onRangeChange }: MetricsTabProps) {
     );
   }
 
+  // A Compose stack's unit only starts it; the containers live in Docker's own cgroups,
+  // which WASM does not sample, so charts here would read near zero and mislead.
+  if (app.data.app_type === "docker-compose") {
+    return (
+      <EmptyState
+        level={2}
+        icon={<ChartLine />}
+        title="Docker measures this application's containers"
+        description="The unit only starts the stack; the containers run in Docker's own cgroups, which WASM does not sample. Use docker stats on the server for their CPU and memory. The machine's own charts are on the overview."
+        action={
+          <Link to="/" className="rounded-[4px] text-13 font-medium text-accent-fg hover:underline hover:underline-offset-2 focus-visible:outline-2 focus-visible:outline-focus">
+            Machine overview
+          </Link>
+        }
+        className="py-16"
+      />
+    );
+  }
+
   const from = now - rangeSpec(range).seconds;
   const marks: DeployMark[] = (deploys.data?.items ?? []).flatMap((deploy) => {
     const at = parseTimestamp(deploy.started_at);

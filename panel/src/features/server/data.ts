@@ -76,6 +76,12 @@ export interface CertificateMention {
  * "Certificate for <name> expired N days ago", "... expires in N days" or "... has an
  * unreadable expiry date" (wasm.managers.health._check_certificates), with the certbot lineage
  * name, which carries no spaces.
+ *
+ * The contract is that wording, not a field: src/wasm/managers/health.py builds these strings
+ * with f"Certificate for {label} ..." where the label comes from _certificate_label (the lineage
+ * name, else the first covered domain). Rewording them there, or naming a certificate with
+ * something that can hold a space, silently stops the link from appearing here: change this
+ * pattern and its cases in data.test.ts in the same commit.
  */
 export function certificateMention(message: string): CertificateMention | null {
   const match = /^(Certificate for )(\S+)( .+)$/.exec(message);

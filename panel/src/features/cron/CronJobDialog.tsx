@@ -123,6 +123,9 @@ export function CronJobDialog({ open, onOpenChange, job }: CronJobDialogProps) {
       schedule,
       ...(user.trim() !== "" ? { user: user.trim() } : {}),
       ...(workingDirectory.trim() !== "" ? { working_directory: workingDirectory.trim() } : {}),
+      // Saving an existing job rewrites it: without its application it would lose the link
+      // (and the working directory default that follows the app's layout).
+      ...(job?.app_domain ? { app_domain: job.app_domain } : {}),
     };
     create.mutate(body, { onSuccess: () => close(false) });
   };

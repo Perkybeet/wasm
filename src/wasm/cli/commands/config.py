@@ -274,7 +274,49 @@ def _read_stdin_value() -> str:
     return raw
 
 
-def _warn_if_secret_typed_in_argv(key: str, logger: Logger) -> None:
+def _secrets_in_value(key: str, raw_value: str) -> list[str]:
+    """
+    Name the secrets a value typed for ``key`` carries.
+
+    A secret-bearing section can be set whole, as a JSON object - ``wasm
+    config set monitor.smtp '{"password": "..."}'`` - and that puts the
+    password on the command line exactly as ``monitor.smtp.password`` would.
+    The nested keys are judged by the same classifier the redaction uses.
+
+    Args:
+        key: Dotted key exactly as given on the command line.
+        raw_value: The value exactly as typed.
+
+    Returns:
+        Dotted paths of the secrets in the value; empty when there is none.
+        An empty string or null behind a secret key is no secret.
+    """
+    if is_secret_key(key.rsplit(".", 1)[-1]):
+        return [key]
+    try:
+        parsed = json.loads(raw_value)
+    except ValueError:
+        return []
+
+    found: list[str] = []
+
+    def walk(node: Any, path: str) -> None:
+        if isinstance(node, dict):
+            for name, child in node.items():
+                child_path = f"{path}.{name}"
+                if isinstance(child, (dict, list)):
+                    walk(child, child_path)
+                elif is_secret_key(str(name)) and child not in ("", None):
+                    found.append(child_path)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, path)
+
+    walk(parsed, key)
+    return found
+
+
+def _warn_if_secret_typed_in_argv(key: str, logger: Logger, raw_value: str) -> None:
     """
     Nudge an operator typing a secret on the command line towards ``--stdin``.
 
@@ -285,14 +327,19 @@ def _warn_if_secret_typed_in_argv(key: str, logger: Logger) -> None:
     Args:
         key: Dotted key exactly as given on the command line.
         logger: Logger the warning is printed through.
+        raw_value: The value typed for it, checked for nested secrets when it
+            is a JSON object or array.
     """
-    leaf = key.rsplit(".", 1)[-1]
-    if not is_secret_key(leaf):
+    secrets = _secrets_in_value(key, raw_value)
+    if not secrets:
         return
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return
+    what = (
+        f"{key} looks like a secret" if secrets == [key] else f"{key} carries {', '.join(secrets)}"
+    )
     logger.warning(
-        f"{key} looks like a secret. Typing it here puts it in this shell's history "
+        f"{what}. Typing it here puts it in this shell's history "
         "and lets other users on this machine see it with 'ps'. Use "
         f"'wasm config set {key} --stdin' (or --prompt) instead."
     )
@@ -463,7 +510,7 @@ def get(ctx: Context, key: str) -> None:
     "--prompt",
     "from_prompt",
     is_flag=True,
-    help="Prompt for VALUE without echoing it back, like a password prompt.",
+    help="Prompt for VALUE without echoing it back, twice, like a password prompt.",
 )
 @global_flags
 @pass_context
@@ -503,10 +550,11 @@ def set_(
     apps_directory, not for monitor.smtp.password. '--stdin' reads VALUE from
     standard input instead, stripping exactly one trailing newline, so
     'printf '%s' "$PASSWORD" | wasm config set monitor.smtp.password --stdin'
-    never puts it on the command line; '--prompt' asks for it interactively
-    without echoing it back. Typing a value for a key that looks like a
-    secret straight into VALUE on a real terminal prints a warning suggesting
-    one of the two.
+    never puts it on the command line; '--prompt' asks for it interactively,
+    twice, without echoing it back. Typing a secret straight into VALUE on a
+    real terminal, for a key that looks like one or inside a JSON object such
+    as monitor.smtp '{"password": ...}', prints a warning suggesting one of
+    the two.
     """
     sources = (value is not None, from_stdin, from_prompt)
     if sources.count(True) != 1:
@@ -515,10 +563,12 @@ def set_(
     if from_stdin:
         resolved_value = _read_stdin_value()
     elif from_prompt:
-        resolved_value = click.prompt("Value", hide_input=True)
+        # Asked twice: nothing is echoed, so a typo would otherwise be saved
+        # unseen and found only when the credential is refused.
+        resolved_value = click.prompt("Value", hide_input=True, confirmation_prompt=True)
     elif value is not None:
         resolved_value = value
-        _warn_if_secret_typed_in_argv(key, ctx.logger)
+        _warn_if_secret_typed_in_argv(key, ctx.logger, value)
     else:
         # Unreachable: the count check above guarantees exactly one of VALUE,
         # --stdin or --prompt was given.

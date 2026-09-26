@@ -72,7 +72,7 @@ import os
 import re
 import sqlite3
 import tempfile
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -732,6 +732,7 @@ class ServiceManager(BaseManager):
         services: list[Service] | None = None,
         marked: Mapping[str, bool] | None = None,
         listed: Collection[str] = (),
+        apps: Sequence[App] | None = None,
     ) -> list[str]:
         """
         Name the unit(s) an application runs as.
@@ -742,7 +743,11 @@ class ServiceManager(BaseManager):
         1. The rows of the services table that carry the application's id: a
            monorepo has one per workspace.
         2. For a monorepo without rows, the marked unit files named
-           ``<app-name>-<workspace>`` in the managed directory.
+           ``<app-name>-<workspace>`` in the managed directory, except those
+           that belong to another application: a row of the services table
+           carrying its id, its own unit name (``shop-api`` is the
+           application ``shop-api``, not a workspace of ``shop``), or a
+           workspace of a monorepo whose name is longer and matches too.
         3. The unit named after the application, or the legacy ``wasm-``
            prefixed one when that is the one installed (units from before
            0.14.1): its file is in the managed directory, or systemd lists it
@@ -755,6 +760,8 @@ class ServiceManager(BaseManager):
             marked: What :meth:`_marked_unit_files` returned, when the caller
                 has already scanned the directory.
             listed: Unit names systemd listed, when the caller has asked.
+            apps: The applications in the store, when the caller has already
+                read them; only a monorepo without rows needs them.
 
         Returns:
             Unit names without the ``.service`` suffix, primary first. Empty
@@ -776,10 +783,29 @@ class ServiceManager(BaseManager):
         base = domain_to_app_name(app.domain)
         if app.app_type == "monorepo":
             files = marked if marked is not None else self._marked_unit_files()
+            others = [
+                other
+                for other in (apps if apps is not None else self._stored_apps())
+                if other.domain != app.domain
+            ]
+            taken = {
+                row.name.removesuffix(".service")
+                for row in rows
+                if row.app_id is not None and row.app_id != app.id
+            }
+            longer: list[str] = []
+            for other in others:
+                other_base = domain_to_app_name(other.domain)
+                taken |= {other_base, f"{self.LEGACY_PREFIX}{other_base}"}
+                if other.app_type == "monorepo" and other_base.startswith(f"{base}-"):
+                    longer.append(f"{other_base}-")
             workspaces = sorted(
                 name
                 for name, has_marker in files.items()
-                if has_marker and name.startswith(f"{base}-")
+                if has_marker
+                and name.startswith(f"{base}-")
+                and name not in taken
+                and not any(name.startswith(prefix) for prefix in longer)
             )
             if workspaces:
                 return workspaces
@@ -813,7 +839,9 @@ class ServiceManager(BaseManager):
         """
         owners: dict[str, str] = {}
         for app in apps:
-            for unit in self.app_units(app, services=services, marked=marked, listed=listed):
+            for unit in self.app_units(
+                app, services=services, marked=marked, listed=listed, apps=apps
+            ):
                 owners.setdefault(unit, app.domain)
         return owners
 
@@ -1706,8 +1734,9 @@ class ServiceManager(BaseManager):
             The unit file that was written.
 
         Raises:
-            ServiceError: When the unit is not WASM's to write, the rendered
-                body lacks the marker, or the file cannot be written.
+            ServiceError: When the unit is not WASM's to write, it is an
+                application's unit, the rendered body lacks the marker, or the
+                file cannot be written.
             TemplateError: If the template is missing or invalid.
             ValidationError: When the name is not a safe unit name.
         """
@@ -1729,6 +1758,22 @@ class ServiceManager(BaseManager):
             raise ServiceError(
                 f"Refusing to write a unit WASM does not manage: {unit}",
                 details=f"{reason}. Remove or rename that unit first.",
+            )
+
+        # WASM's own units keep the legacy prefix, and so do applications
+        # deployed before 0.14.1: an application at the domain "web" runs as
+        # wasm-web. Its file is WASM's too, so the ownership rule above lets
+        # it through; the mapping of applications to units does not.
+        owner = (
+            self._app_unit_owners(self._stored_apps(), self._stored_services()).get(unit)
+            if path.exists()
+            else None
+        )
+        if owner is not None:
+            raise ServiceError(
+                f"Refusing to overwrite {unit}: it is the unit of the application {owner}",
+                details=f"{path} runs {owner}, deployed before units lost the wasm- prefix. "
+                f"Redeploy {owner} so its unit is renamed, then run this again.",
             )
 
         self._write_unit_atomically(path, content)

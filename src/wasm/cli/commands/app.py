@@ -22,7 +22,7 @@ import re
 
 import click
 
-from wasm.cli.app import Context, WasmGroup, json_option, pass_context
+from wasm.cli.app import Context, WasmGroup, global_flags, json_option, pass_context
 from wasm.core.exceptions import WASMError
 from wasm.core.logger import Logger
 from wasm.core.store import App, DeploymentTrigger, get_store
@@ -297,6 +297,7 @@ def health_settings(app: App) -> dict[str, object]:
 )
 @click.option("--timeout", type=int, metavar="SECONDS", help="Seconds it gets to answer, 5 to 600.")
 @click.option("--reset", is_flag=True, default=False, help="Go back to the defaults for all three.")
+@global_flags
 @json_option("Print the health check settings as JSON.")
 @pass_context
 def health_command(

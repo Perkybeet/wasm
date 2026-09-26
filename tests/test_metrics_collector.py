@@ -79,8 +79,9 @@ class FakePsutil:
 class FakeApp:
     """An application row, with only what the collector reads off it."""
 
-    def __init__(self, domain: str) -> None:
+    def __init__(self, domain: str, app_type: str = "nodejs") -> None:
         self.domain = domain
+        self.app_type = app_type
 
 
 class FakeAppStore:
@@ -90,7 +91,10 @@ class FakeAppStore:
         self.domains = domains
 
     def list_apps(self) -> list[FakeApp]:
-        return [FakeApp(domain) for domain in self.domains]
+        return [
+            FakeApp(domain, "docker-compose" if domain.startswith("stack.") else "nodejs")
+            for domain in self.domains
+        ]
 
 
 @pytest.fixture
@@ -573,3 +577,44 @@ def test_an_application_with_several_units_is_their_sum(
     collector.sample_once()
 
     assert collector.latest()["app.mono.example.com.mem.bytes"] == 1500
+
+
+def test_a_compose_stack_is_not_sampled_through_its_unit(
+    store: MetricsStore,
+    clock: FrozenClock,
+    tmp_path: Path,
+    fake_psutil: FakePsutil,
+    domains: FakeAppStore,
+) -> None:
+    """
+    Its unit is a oneshot that ran ``docker compose up`` and exited; its
+    containers live in Docker's cgroups. The unit's near-zero numbers would
+    be a chart that lies, so the stack has no series at all.
+    """
+    root = tmp_path / "cgroup"
+    write_cgroup(root, "stack.example.com", usage_usec=1, memory=4096)
+    write_cgroup(root, "shop.example.com", usage_usec=1, memory=8192)
+    domains.domains = ["stack.example.com", "shop.example.com"]
+    asked: list[str] = []
+    collector = MetricsCollector(
+        store,
+        cgroup_root=root,
+        clock=clock,
+        units_for=lambda app: asked.append(app.domain) or [unit_of(app.domain)],
+    )
+
+    collector.sample_once()
+
+    latest = collector.latest()
+    assert "app.stack.example.com.mem.bytes" not in latest
+    assert latest["app.shop.example.com.mem.bytes"] == 8192
+    assert asked == ["shop.example.com"]
+
+
+def test_why_an_application_has_no_metrics_is_said_once_for_every_surface() -> None:
+    """The API and the console show this sentence rather than an empty chart."""
+    reason = metrics_collector.metrics_unavailable_reason(
+        FakeApp("stack.example.com", "docker-compose")
+    )
+    assert reason is not None and "Docker" in reason
+    assert metrics_collector.metrics_unavailable_reason(FakeApp("shop.example.com")) is None

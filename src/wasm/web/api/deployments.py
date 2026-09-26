@@ -403,9 +403,12 @@ def rollback_deployment(
     """
     Queue going back to what a deployment produced.
 
-    On releases its release is activated behind the health gate; in place
-    its snapshot backup (taken by the update that followed it) is restored,
-    after a safety backup of the current state.
+    On releases its release is activated behind the health gate. In place in
+    a git checkout its commit is rebuilt where the application runs, behind
+    the same gate; in place without history its snapshot backup (taken by
+    the update that followed it) is restored after a safety backup, rebuilt
+    and gated, keeping the deployed ``.env``. See
+    :func:`~wasm.deployers.lifecycle.rollback_to_deployment`.
 
     Args:
         domain: Domain of the application.

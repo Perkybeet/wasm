@@ -120,7 +120,15 @@ The console acts as root, so how it is reached matters more than anything else o
   (`web.rate_limit_authenticated_requests`): over an SSH tunnel every request comes from
   `127.0.0.1`, and a per-address budget made every tab and script share one. A wrong
   credential buys nothing: it is counted as anonymous, and guessing is stopped by the
-  lockout below, which is separate. The console's shell (`index.html` on any console
+  lockout below, which is separate.
+  The limiter is not a way to test a credential. It only looks at one on `/api`, `/events`
+  and `/ws`, where an endpoint checks it too; `/health` and the forge webhooks, which never
+  check one, are always counted by address, whatever they carry. A wrong credential it does
+  look at counts towards the lockout exactly once, like one an endpoint refuses, even on a
+  route that never checks it (a public endpoint, a `404`). An address that is locked out,
+  or already over the anonymous budget, is counted by address without its credential being
+  checked at all, so a flood that is refused anyway costs no database query per request.
+  The console's shell (`index.html` on any console
   address) and its hashed build assets spend no budget, so reloading the page cannot lock
   the operator out. A refusal is `429` with `"error": "rate_limited"` and a `Retry-After`
   of the seconds until the budget frees; every counted response carries
@@ -134,16 +142,23 @@ The console acts as root, so how it is reached matters more than anything else o
 
 ## Authentication
 
-**The master token.** Every start of the console issues a new access token and prints it
-once, in the same banner whether `wasm web start` runs in the foreground or, with `-d`, in
-the background. Only a hash is stored, salted with the console's signing key, in
-`/etc/wasm/web-token` (`0600`); a token cannot be shown again, only replaced with `wasm web
-token --new`.
+**The master token.** Every `wasm web start` issues a new access token and prints it once,
+in the same banner whether it runs in the foreground or, with `-d`, in the background. Only
+a hash is stored, salted with the console's signing key, in `/etc/wasm/web-token` (`0600`);
+a token cannot be shown again, only replaced with `wasm web token --new`.
+
+Under systemd it is different. `wasm web enable` issues the token: it writes the new hash
+before it restarts `wasm-web.service`, so the token it replaces stops working at once, and
+prints the new one when the service is serving. The service itself issues none and prints
+none (its output is the journal); it serves whatever hash is on disk. So the same token
+stays valid across every restart of the unit - a crash, a reboot, `systemctl restart
+wasm-web`, a package upgrade - until you rotate it with `wasm web token --new` (or run
+`wasm web enable` again, which also issues a new one).
 
 A running console reads the token hash from disk on every request, so rotating it takes
 effect immediately - no restart needed. To retire a token that may have leaked, just run
-`wasm web token --new`; the token it was started with stops working at once, in every
-console already running, including one in the background.
+`wasm web token --new`; the token in force stops working at once, in every console already
+running: in the background, or as `wasm-web.service`.
 
 `--regenerate` goes further: it rotates the signing key too, which immediately signs out
 every session, and, because API tokens and TOTP backup codes are salted with that same key,
@@ -213,6 +228,17 @@ listings (`GET /api/system/processes`, `GET /api/monitor/processes`, monitor obs
 show command lines, which often carry passwords, only to `admin`; other scopes see the
 process name. The master token and console sessions are always `admin`.
 
+**WASM's own units.** The console (`wasm-web`), the monitor (`wasm-monitor`) and the
+`wasm-cron-*` and `wasm-backup-*` units behind cron jobs and backup schedules cannot be
+started, stopped, enabled, disabled, rewritten, created or deleted through `/api/services`,
+whatever the credential: an admin token could otherwise stop the console it is talking to.
+The console and the monitor are managed on the machine with `wasm web ...` and
+`wasm monitor ...`, and scheduled work through its own API. Reading the console's or the
+monitor's journal, through `GET /api/services/{name}/logs` or `/ws/logs/{name}`, needs
+`admin`: the console logs every SQL statement run from it and the verbatim output of failed
+git, certbot and notification calls, and the monitor what it saw of other processes. An
+application's journal stays `read`.
+
 **Local paths.** Creating an application from, or inspecting, a directory on the machine
 rather than a repository URL reaches every file on it. It is accepted from the master token,
 and from a console session in sudo mode; an API token is refused with `403` whatever its
@@ -221,7 +247,13 @@ scope. Scripts deploy from repositories.
 **Stored sources.** A clone URL with a credential in it (`https://user:token@host/...`, or
 `https://token@host/...`), stored by an older release, is shown with the credential replaced
 by `***` in every application read; the stored value is left as it was, because updates clone
-from it.
+from it. It never reaches a command line: WASM takes the credential off the URL before git
+sees it and hands it to git in the environment, as an `Authorization` header scoped to the
+scheme, host and port it was stored for (`GIT_CONFIG_COUNT` with
+`http.<scheme>://<host>/.extraHeader`), so a submodule or a redirect to another host never
+receives it. The next forced update or cache sync rewrites the checkout's `origin` without
+it, and every error, log line and piece of git output WASM relays has URL credentials
+replaced by `***`. This needs git 2.31 or later, which every supported distribution ships.
 
 ## Sudo mode
 
@@ -343,6 +375,16 @@ outside its COPY data is refused before anything is dropped, pg_dump's own
   public name that redirects or rebinds to a private address is still refused. Names you
   trust can be exempted with `notifications.allow_private_hosts`. Only `http` and `https` are
   accepted, and the "test" button never echoes the remote response back.
+- **The stored SMTP password stays with its server.** The console never receives it, so a
+  write that does not name it keeps it: a blank password on `PUT /api/config/smtp`, `***`
+  echoed back to `PUT /api/config`, a `PATCH /api/config` of another key. That holds only
+  while the host, port, username and transport (`use_ssl`, `use_tls`) stay as they are;
+  changing any of them without entering the password again is refused with `422` on
+  `password`, so a credential that may write the settings cannot point the password at a
+  server of its own and send itself a test email.
+- **A Telegram bot token** must be `<digits>:<secret>` from its first character to its last,
+  a trailing line break included; any other shape is refused on save (`422` on `bot_token`)
+  and again before it becomes part of a Bot API URL.
 - **Deploy webhooks** (`POST /hooks/deploy/{domain}`) verify `X-Hub-Signature-256` (GitHub)
   or `X-Gitea-Signature` (Gitea) as HMAC-SHA256 of the body, or `X-Gitlab-Token` (GitLab),
   all in constant time. An unknown application and one without a webhook secret look the
@@ -363,6 +405,12 @@ There is no setting to turn that check off in 2.0.
 
 - Nothing is written through a symlink found inside a release or under `shared/`. A tracked
   link to `/etc` does not become a path WASM writes to as root.
+- Inspecting a source reads its example environment files (`.env.example`, `.env.template`,
+  `.env.sample`, at the root and under `apps/*`, `packages/*` and `services/*`) without
+  following a symlink: each file is opened with `O_NOFOLLOW` and must be a regular file, and
+  a linked workspace directory is not entered, so a link to `/etc/shadow` or another
+  application's `.env` is not read. An inspection never returns the default of a variable
+  whose name marks it as a secret, or whose default carries a password inside a URL.
 - Persistent paths must be relative and may not contain `..`.
 - Every value interpolated into a systemd unit (the start command, the working directory,
   environment variables) is validated and escaped: a newline cannot start a new directive.

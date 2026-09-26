@@ -84,6 +84,18 @@ _ON_CALENDAR = re.compile(r"OnCalendar=([^;}]+)")
 #: this module's own writing.
 _APP_COMMENT = "# Application: "
 
+#: How the service unit records the command line exactly as the operator
+#: typed it. ExecStart holds it split and escaped for systemd - ``$`` and
+#: ``%`` doubled, tokens re-quoted - which is not something to hand back for
+#: editing: a dialog that saved the escaped form doubled every ``$`` and ``%``
+#: again on each save.
+_COMMAND_COMMENT = "# Command: "
+
+#: Characters Python's ``str.splitlines`` treats as line breaks although
+#: systemd does not. Escaped in the record anyway, so no reader of the unit
+#: file can ever see the record as two lines.
+_UNICODE_BREAKS = ("\u0085", "\u2028", "\u2029")
+
 #: An ExecStart token that needs no quoting. ``%`` is deliberately excluded:
 #: systemd expands it as a specifier, so any token carrying one goes through
 #: the quoted-and-escaped path.
@@ -111,6 +123,70 @@ _ELAPSE_LINE = re.compile(r"^\s*(?:Next elapse|Iter\.\s*#\d+):\s*(.+)$", re.MULT
 #: The weekday-prefixed timestamp on an elapse line, once TZ=UTC pins every
 #: run to the zone the console displays in: "Thu 2026-01-01 00:00:00 UTC".
 _ELAPSE_TIMESTAMP = re.compile(r"^\w+\s+(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s+UTC$")
+
+
+def command_comment(command: str) -> str:
+    """
+    Render the comment line that records a job's command as typed.
+
+    The value is JSON-quoted: every control character, backslash and quote
+    is escaped and the line always ends in ``"``, so it is one line and can
+    never end in the lone backslash systemd reads as a continuation that
+    would fold the next line into the comment. Validation already refuses
+    control characters in a command; this holds without it.
+
+    Args:
+        command: The command line as the operator typed it.
+
+    Returns:
+        The full comment line, without a trailing newline.
+    """
+    encoded = json.dumps(command, ensure_ascii=False)
+    for char in _UNICODE_BREAKS:
+        encoded = encoded.replace(char, f"\\u{ord(char):04x}")
+    return f"{_COMMAND_COMMENT}{encoded}"
+
+
+def read_command_comment(line: str) -> str | None:
+    """
+    Decode a line written by :func:`command_comment`.
+
+    Args:
+        line: One line of a service unit.
+
+    Returns:
+        The recorded command, or None when the line is not a command record
+        or does not decode as one.
+    """
+    if not line.startswith(_COMMAND_COMMENT):
+        return None
+    try:
+        value = json.loads(line[len(_COMMAND_COMMENT) :])
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, str) else None
+
+
+def decode_exec_start(exec_start: str) -> list[str] | None:
+    """
+    Undo :meth:`CronManager.build_exec_start`: the argv systemd will execute.
+
+    Bare tokens carry nothing to undo. Quoted tokens hold systemd's C escapes
+    for backslash and double quote - the only two ``escape_systemd_value``
+    writes, and exactly the two POSIX splitting undoes inside double quotes -
+    and ``$`` and ``%`` doubled, which are halved here.
+
+    Args:
+        exec_start: The value after ``ExecStart=``.
+
+    Returns:
+        The argv, or None when the value is not something this module wrote.
+    """
+    try:
+        tokens = shlex.split(exec_start)
+    except ValueError:
+        return None
+    return [token.replace("$$", "$").replace("%%", "%") for token in tokens]
 
 
 @dataclass
@@ -427,7 +503,9 @@ class CronManager:
 
         return CronJob(
             name=name,
-            command=job.command,
+            # Stripped so the record agrees with the console, which trims
+            # before saving: re-saving a job must leave its unit unchanged.
+            command=job.command.strip(),
             schedule=calendar,
             user=user,
             working_directory=working_directory,
@@ -561,6 +639,7 @@ class CronManager:
             user=job.user or "",
             working_directory=job.working_directory or "",
             app_domain=job.app_domain or "",
+            command_record=command_comment(job.command),
             exec_start=self.build_exec_start(self.parse_command(job.command)),
         )
 
@@ -763,9 +842,9 @@ class CronManager:
             name: Validated job name.
 
         Returns:
-            ``command`` (the raw ``ExecStart`` value), ``user``,
-            ``working_directory`` and ``app_domain``, each empty when the file
-            cannot be read.
+            ``command`` (the command line as the operator typed it, see
+            :meth:`_command_for_editing`), ``user``, ``working_directory`` and
+            ``app_domain``, each empty when the file cannot be read.
         """
         fields = {"command": "", "user": "", "working_directory": "", "app_domain": ""}
         path = self.SYSTEMD_DIR / f"{UNIT_PREFIX}{name}.service"
@@ -773,16 +852,67 @@ class CronManager:
             content = path.read_text()
         except OSError:
             return fields
-        for line in content.splitlines():
+        exec_start = ""
+        record: str | None = None
+        # split("\n") rather than splitlines(): systemd breaks lines on
+        # newlines only, and splitlines() would also break on characters a
+        # command may legitimately contain, such as U+2028.
+        for line in content.split("\n"):
             if line.startswith("ExecStart="):
-                fields["command"] = line[len("ExecStart=") :].strip()
+                exec_start = line[len("ExecStart=") :].strip()
+            elif line.startswith(_COMMAND_COMMENT):
+                record = read_command_comment(line)
             elif line.startswith("User="):
                 fields["user"] = line[len("User=") :].strip()
             elif line.startswith("WorkingDirectory="):
                 fields["working_directory"] = line[len("WorkingDirectory=") :].strip()
             elif line.startswith(_APP_COMMENT):
                 fields["app_domain"] = line[len(_APP_COMMENT) :].strip()
+        fields["command"] = self._command_for_editing(exec_start, record)
         return fields
+
+    @staticmethod
+    def _command_for_editing(exec_start: str, record: str | None) -> str:
+        """
+        Choose the command line to show an operator and hand back for editing.
+
+        The record written at creation is what the operator typed, and it is
+        what a save must send back: ExecStart is escaped for systemd, and
+        feeding it through :meth:`build_exec_start` again doubled every ``$``
+        and ``%`` once more per save. The record is only trusted while it
+        still describes ExecStart - a unit edited by hand shows what runs.
+        Without a usable record (a unit written before it existed, or a stale
+        one) ExecStart is decoded and re-quoted as a POSIX command line, which
+        parses back to the same argv.
+
+        Args:
+            exec_start: The unit's ``ExecStart`` value.
+            record: The decoded ``# Command:`` comment, if any.
+
+        Returns:
+            The command line, or ExecStart verbatim when it cannot be decoded.
+        """
+        argv = decode_exec_start(exec_start)
+        if argv is None:
+            return exec_start
+        if record is not None:
+            try:
+                typed = shlex.split(record)
+            except ValueError:
+                typed = []
+            # parse_command resolves a bare program name to an absolute path,
+            # so ExecStart may hold /usr/bin/php where the record says php.
+            if (
+                typed
+                and len(typed) == len(argv)
+                and typed[1:] == argv[1:]
+                and (
+                    typed[0] == argv[0]
+                    or ("/" not in typed[0] and argv[0].endswith(f"/{typed[0]}"))
+                )
+            ):
+                return record
+        return shlex.join(argv)
 
     def _job_info(self, name: str, enabled: bool) -> dict[str, Any]:
         """
@@ -868,8 +998,8 @@ class CronManager:
         contract, and from the unit files this module itself wrote.
 
         Returns:
-            One entry per job: ``name``, ``command`` (the raw ``ExecStart``
-            value), ``user``, ``working_directory``, ``app_domain``,
+            One entry per job: ``name``, ``command`` (as the operator typed
+            it, not the escaped ``ExecStart``), ``user``, ``working_directory``, ``app_domain``,
             ``enabled``, ``on_calendar``, ``next_run`` and ``last_run`` as
             systemd prints them, ``last_exit_code`` (None when the job never
             ran) and ``last_result``.

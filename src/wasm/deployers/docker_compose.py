@@ -151,6 +151,28 @@ def _names_its_own_project(compose_path: Path) -> bool:
     return _ENV_PROJECT_NAME.search(env_text) is not None
 
 
+def _env_project_name(compose_path: Path) -> str | None:
+    """
+    Read the project name a stack's ``.env`` sets, if it sets one.
+
+    Args:
+        compose_path: The compose file in use; the ``.env`` beside it is read.
+
+    Returns:
+        The value of ``COMPOSE_PROJECT_NAME``, or None.
+    """
+    env_file = compose_path.parent / ".env"
+    try:
+        text = env_file.read_text(encoding="utf-8") if env_file.is_file() else ""
+    except (OSError, UnicodeDecodeError):
+        return None
+    for line in text.splitlines():
+        if _ENV_PROJECT_NAME.match(line):
+            value = line.split("=", 1)[1].strip().strip("'\"")
+            return value or None
+    return None
+
+
 def compose_project_name(app_path: Path, compose_path: Path | None) -> str | None:
     """
     Reproduce the Compose project name this stack has always had.
@@ -1784,6 +1806,82 @@ class DockerComposeDeployer(AppDeployer):
         if not result.success:
             self.logger.warning(f"docker compose down failed: {result.stderr.strip()}")
         return result.success
+
+    def remove_kept_images(self) -> list[str]:
+        """
+        Remove the images updates kept under :data:`PREVIOUS_TAG` for this stack.
+
+        What :func:`wasm.deployers.lifecycle.delete_app` calls once the stack
+        is down. An update tags the image each service ran as
+        ``<project>-<service>:wasm-previous`` (see :func:`keep_tag`), and
+        nothing else ever removes it. The tags this stack can have are derived
+        from its compose file (every service, under every name its project can
+        have had) and only those that exist are removed; another stack's are
+        left alone. ``docker image rm`` of a tag only untags an image that has
+        other names.
+
+        Returns:
+            The tags removed.
+
+        Raises:
+            DeploymentError: No compose file is left to read the services from.
+            DockerError: Docker could not list or remove them, with its output.
+        """
+        if self.compose_path is None:
+            self._discover_compose_file()
+        compose_path = self._compose_file_path()
+        try:
+            document = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+            raise DeploymentError(
+                f"Cannot read {compose_path} to name the images kept for going back",
+                details=str(exc),
+            ) from exc
+        document = document if isinstance(document, dict) else {}
+        services = document.get("services")
+        names = [str(name) for name in services] if isinstance(services, dict) else []
+        projects = {
+            name
+            for name in (
+                compose_project_name(self.app_path, compose_path),
+                document.get("name") if isinstance(document.get("name"), str) else None,
+                _env_project_name(compose_path),
+                self.app_name,
+            )
+            if name
+        }
+        wanted = {keep_tag(project, service) for project in projects for service in names}
+        if not wanted:
+            return []
+
+        listed = self._run(
+            [
+                "docker",
+                "image",
+                "ls",
+                "--filter",
+                f"reference=*:{PREVIOUS_TAG}",
+                "--format",
+                "{{.Repository}}:{{.Tag}}",
+            ]
+        )
+        if not listed.success:
+            raise DockerError("Could not list the images kept for going back", listed.stderr)
+        present = {line.strip() for line in listed.stdout.splitlines() if line.strip()}
+
+        removed: list[str] = []
+        failures: list[str] = []
+        for tag in sorted(wanted & present):
+            result = self._run(["docker", "image", "rm", tag])
+            if result.success:
+                removed.append(tag)
+            else:
+                failures.append(f"{tag}: {(result.stderr or result.stdout).strip()}")
+        if failures:
+            raise DockerError(
+                "Some images kept for going back were not removed", "\n".join(failures)
+            )
+        return removed
 
     def delete(self, remove_volumes: bool = False) -> None:
         """

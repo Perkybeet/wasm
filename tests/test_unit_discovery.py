@@ -707,3 +707,46 @@ def test_journalctl_s_own_error_reaches_the_client(
     error = next(frame for frame in frames if frame["type"] == "error")
     assert "Permission denied" in error["message"]
     assert "status 1" in error["message"]
+
+
+def test_a_sibling_application_named_like_a_workspace_is_not_the_monorepos(
+    runner: FakeRunner, unit_dirs: dict[str, Path], store: WASMStore
+) -> None:
+    """
+    Monorepo shop.com's fallback matches ``shop-com-*``; the application
+    api.shop-com.io is not a workspace of it, and neither is the legacy unit
+    of another application, nor the workspace of a longer-named monorepo.
+    """
+    mono = deploy(store, "shop.com", app_type="monorepo")
+    deploy(store, "shop-com-api.io")  # its unit: shop-com-api-io
+    deploy(store, "shop-com-old.io")  # its unit: shop-com-old-io
+    deploy(store, "shop-com-admin.io", app_type="monorepo")
+    for name in (
+        "shop-com-web",
+        "shop-com-worker",
+        "shop-com-api-io",
+        "shop-com-old-io",
+        "shop-com-admin-io-web",
+    ):
+        marked(unit_dirs, name)
+
+    manager = ServiceManager()
+
+    assert manager.app_units(mono) == ["shop-com-web", "shop-com-worker"]
+    owners = {row["name"]: row["app"] for row in manager.list_services()}
+    assert owners["shop-com-api-io"] == "shop-com-api.io"
+    assert owners["shop-com-admin-io-web"] == "shop-com-admin.io"
+    assert owners["shop-com-web"] == "shop.com"
+
+
+def test_a_unit_owned_by_another_applications_row_is_not_a_workspace(
+    runner: FakeRunner, unit_dirs: dict[str, Path], store: WASMStore
+) -> None:
+    """The services table says whose a unit is, whatever its name."""
+    mono = deploy(store, "shop.com", app_type="monorepo")
+    other = deploy(store, "elsewhere.io")
+    store.create_service(Service(name="shop-com-jobs", app_id=other.id))
+    marked(unit_dirs, "shop-com-jobs")
+    marked(unit_dirs, "shop-com-web")
+
+    assert ServiceManager().app_units(mono) == ["shop-com-web"]

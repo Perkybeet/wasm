@@ -279,3 +279,19 @@ class TestErrorBoundary:
         captured = capsys.readouterr()
         assert exit_code == 1
         assert "the command failed" in captured.out
+
+
+#: Commands whose help, or whose siblings in 2.1, promise the global flags
+#: after the command name. 'wasm backup import DIR --dry-run' was a usage
+#: error while the help text told the operator to use exactly that.
+AFTER_THE_NAME = ("app health", "releases keep", "notify telegram-chats", "backup import")
+
+
+@pytest.mark.parametrize("path", AFTER_THE_NAME)
+def test_these_commands_accept_the_global_flags_after_their_name(path: str) -> None:
+    command = resolve(path)
+    assert command is not None
+    declared = {opt for param in command.params for opt in param.opts}
+
+    for flag in ("--verbose", "--dry-run", "--no-color"):
+        assert flag in declared, f"'wasm {path} {flag}' is a usage error"

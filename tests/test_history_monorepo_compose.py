@@ -46,10 +46,14 @@ def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[WASMStore
 def existing_app(store: WASMStore, app_type: str, root: Path) -> App:
     """An application whose row carries settings no deploy knows about."""
     app = store.create_app(App(domain=DOMAIN, app_type=app_type, app_path=str(root)))
-    app.keep_releases = 3
     app.persistent_paths = ["uploads"]
     app.memory_max_mb, app.cpu_quota_percent, app.tasks_max = 512, 50, 256
-    return store.update_app(app)
+    store.update_app(app)
+    # The retention has a setter of its own; a full-row write leaves it alone.
+    store.set_keep_releases(DOMAIN, 3)
+    refreshed = store.get_app(DOMAIN)
+    assert refreshed is not None
+    return refreshed
 
 
 def v5_columns(app: App | None) -> tuple[Any, ...]:
