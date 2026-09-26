@@ -150,7 +150,10 @@ export function Shell() {
           }}
         />
         <main id="main" tabIndex={-1} className="flex-1 outline-none">
-          <div className="mx-auto w-full max-w-[1200px] px-4 pt-6 pb-16 sm:px-6 lg:px-8 lg:pt-8">
+          {/* Data pages use a wide screen: tables and charts earn the room. Prose keeps its
+              reading measure (Section and DangerZone cap it in ch), and forms, wizards and
+              dialogs keep caps of their own. */}
+          <div className="mx-auto w-full max-w-[1600px] px-4 pt-6 pb-16 sm:px-6 lg:px-8 lg:pt-8">
             <ErrorBoundary resetKey={pathname}>
               <Outlet />
             </ErrorBoundary>

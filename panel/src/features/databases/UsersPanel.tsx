@@ -15,7 +15,6 @@ import { EmptyState } from "../../components/ui/EmptyState";
 import { IconButton } from "../../components/ui/IconButton";
 import { Menu, MenuItem } from "../../components/ui/Menu";
 import { Select } from "../../components/ui/Select";
-import { Skeleton } from "../../components/ui/Skeleton";
 import { CreateUserDialog } from "./CreateUserDialog";
 import { engineLabel } from "./data";
 import { GrantDialog } from "./GrantDialog";
@@ -64,12 +63,14 @@ function UserActions({ user }: { user: DatabaseUser }) {
 
 export interface UsersPanelProps {
   engines: readonly Engine[];
+  /** The engines are still loading: which of them run is not known yet. */
+  loading?: boolean;
   engine: string;
   onEngineChange: (engine: string) => void;
 }
 
 /** The users of one engine, with grant, revoke and delete - engine-scoped, like the CLI's `wasm db user` commands. */
-export function UsersPanel({ engines, engine, onEngineChange }: UsersPanelProps) {
+export function UsersPanel({ engines, loading = false, engine, onEngineChange }: UsersPanelProps) {
   const users = useQuery({ ...databaseUsersQuery(engine), enabled: engine !== "" });
   const runnable = engines.filter((item) => item.installed && item.running);
 
@@ -119,7 +120,14 @@ export function UsersPanel({ engines, engine, onEngineChange }: UsersPanelProps)
         </>
       }
     >
-      {runnable.length === 0 ? (
+      {loading ? (
+        // The table's own placeholder: until the engines answer, "No running engine" would be
+        // a guess, and a card of that size swapped for a table moved everything around it.
+        <div aria-busy="true">
+          <span className="sr-only">Loading users</span>
+          <DataTable columns={columns} rows={[]} getRowId={() => ""} caption="Database users" loading />
+        </div>
+      ) : runnable.length === 0 ? (
         <EmptyState
           level={3}
           icon={<UserRound />}
@@ -130,13 +138,7 @@ export function UsersPanel({ engines, engine, onEngineChange }: UsersPanelProps)
         <QueryState
           query={users}
           label="users"
-          skeleton={
-            <div aria-hidden="true" className="flex flex-col gap-2">
-              {[0, 1].map((i) => (
-                <Skeleton key={i} className="h-10 rounded-card" />
-              ))}
-            </div>
-          }
+          skeleton={<DataTable columns={columns} rows={[]} getRowId={() => ""} caption={`Users on ${engineLabel(engine)}`} loading />}
           isEmpty={(data) => data.users.length === 0}
           empty={
             <EmptyState

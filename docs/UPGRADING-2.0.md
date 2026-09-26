@@ -182,9 +182,11 @@ step 1 before doing anything else.
 ### 6. Start the console and sign in
 
 ```bash
-wasm web start -d <the options you noted>
-wasm web token --new               # the token to sign in with
+wasm web enable <the options you noted>   # a service that survives reboots; prints the token
 ```
+
+On a version without `wasm web enable` (2.0.x), `wasm web start -d <the options you noted>`
+starts it in the background until the next reboot, printing the token the same way.
 
 Sign in, check that every application appears with its state, and try one action that asks
 for sudo mode (revealing an `.env`, for example). If you have not enrolled two-factor
@@ -320,19 +322,29 @@ leaves everything else where it is.
 
 **Deploy engine**
 
-- Monorepo and Docker Compose projects deploy in place: no releases, no health-gated
-  activation (a failed health check is reported, not rolled back), no migration, and no
-  aliases or redirects. They are fronted by nginx only: Compose ignores `--webserver apache`,
-  and a monorepo created with `--webserver apache` gets no site configuration.
+- Monorepo and Docker Compose projects deploy in place: no releases, no migration, and no
+  aliases or redirects. In 2.0 a failed health check after their update is reported, not
+  rolled back. From 2.1 an update of either goes back automatically: a stack's containers are
+  recreated from the images they ran and its compose file checked out at the previous commit
+  (volumes are never touched), and a monorepo is rebuilt from its previous commit; see
+  [releases.md](releases.md#docker-compose-and-monorepo-applications). A first deploy of either
+  that does not answer is still only reported. They are fronted by nginx only: Compose ignores
+  `--webserver apache`, and a monorepo created with `--webserver apache` gets no site
+  configuration.
 - Docker Compose applications take their resource limits from the compose file. Limits given
   when creating one through the API are accepted and not applied.
-- The health gate probes `/` on the application's port and accepts any status below 500. It
-  is not configurable; an application whose `/` answers 5xx cannot pass it.
+- The health gate probes `/` on the application's port and accepts any status below 500, for
+  30 seconds. In 2.0 it is not configurable, so an application whose `/` answers 5xx cannot
+  pass it. From 2.1, `wasm app health DOMAIN --path /healthz --expect 200-399 --timeout 120`
+  (or `PATCH /api/apps/{domain}/health`) sets the path, the accepted statuses and the wait;
+  see [releases.md](releases.md#configuring-the-health-check).
 - Activating a release restarts the unit: expect the restart's worth of downtime.
   Blue/green activation is not in 2.0.
-- Release retention is five per application and cannot be changed from the CLI, the console
-  or the API.
-- An application in place keeps 1.x behaviour: it is built over the live tree, and a failed
+- Release retention is five per application and cannot be changed in 2.0. From 2.1, `wasm
+  releases keep DOMAIN N` (1 to 50, or `PATCH /api/apps/{domain}/releases/retention`) changes
+  it and prunes at once; see [releases.md](releases.md#retention).
+- An application in place keeps 1.x behaviour (Docker Compose and monorepo excepted from
+  2.1, as above): it is built over the live tree, and a failed
   health check after the restart is reported, not rolled back.
 - Migrating a tree that is not a git checkout needs every writable directory named with
   `--persist`; untracked files outside a persistent path stay in the first release only.
@@ -359,10 +371,11 @@ leaves everything else where it is.
 
 **Console and API**
 
-- `wasm web start -d` is a background process, not a systemd unit: it does not start again
-  after a reboot. It now prints its access token the same way a foreground start does, and a
+- `wasm web start -d` prints its access token the same way a foreground start does, and a
   running console reads the token from disk on every request, so issuing a new one with
-  `wasm web token --new` retires the old one at once, with no restart needed.
+  `wasm web token --new` retires the old one at once, with no restart needed. To keep the
+  console running across reboots, run it as a service with `wasm web enable` (2.1); see
+  [console.md](console.md#keep-it-running).
 - WebSocket tickets from `POST /api/auth/ws-ticket` now also work for an API token, not only
   a browser session: the ticket redeems as that same token, its scope included (admin or
   otherwise). Before, the endpoint accepted the request but no handshake could ever redeem

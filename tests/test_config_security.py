@@ -36,6 +36,7 @@ from wasm.core.config import (
     REDACTED,
     Config,
     _is_secret_key,
+    is_secret_key,
     redact_secrets,
     restore_redacted,
     restrict_file,
@@ -209,6 +210,23 @@ class TestStorePermissions:
             assert db_dir.stat().st_mode & 0o077 == 0
         finally:
             WASMStore.reset_instance()
+
+
+class TestIsSecretKey:
+    """
+    The public entry point to the same classification :func:`redact_secrets`
+    uses - 'wasm config set' reads it to decide whether to warn that a value
+    typed in argv lands in shell history.
+    """
+
+    @pytest.mark.parametrize("key", ["password", "api_key", "AuthToken", "monitor.smtp.password"])
+    def test_agrees_with_the_private_classifier_for_a_secret(self, key: str) -> None:
+        leaf = key.rsplit(".", 1)[-1]
+        assert is_secret_key(leaf) == _is_secret_key(leaf) is True
+
+    @pytest.mark.parametrize("key", ["keyboard_layout", "monkey", "apps_directory", "username"])
+    def test_agrees_with_the_private_classifier_for_a_non_secret(self, key: str) -> None:
+        assert is_secret_key(key) == _is_secret_key(key) is False
 
 
 class TestRedactSecrets:

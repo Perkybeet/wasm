@@ -6,9 +6,10 @@
 ``wasm releases``: what an application on the release layout has built, and
 going back to one of them.
 
-A presentation layer over :func:`wasm.deployers.lifecycle.list_releases` and
-:func:`wasm.deployers.lifecycle.activate_release`, the functions the panel's
-``/api/apps/{domain}/releases`` endpoints call too. Going back is instant
+A presentation layer over :func:`wasm.deployers.lifecycle.list_releases`,
+:func:`wasm.deployers.lifecycle.activate_release` and
+:func:`wasm.deployers.lifecycle.set_release_retention`, the functions the
+panel's ``/api/apps/{domain}/releases`` endpoints call too. Going back is instant
 because nothing is rebuilt: ``current`` is re-pointed, the unit restarted,
 and the release kept only if it passes the same health gate as a deploy.
 """
@@ -21,9 +22,15 @@ import json
 import click
 
 from wasm.cli.app import Context, WasmGroup, json_option, pass_context
+from wasm.core.exceptions import WASMError
 from wasm.core.logger import Logger
-from wasm.core.store import DeploymentTrigger
-from wasm.deployers.lifecycle import ReleaseInfo, activate_release, list_releases
+from wasm.core.store import DeploymentTrigger, get_store
+from wasm.deployers.lifecycle import (
+    ReleaseInfo,
+    activate_release,
+    list_releases,
+    set_release_retention,
+)
 from wasm.deployers.recorder import CapturingLogger
 
 
@@ -110,3 +117,41 @@ def rollback(ctx: Context, domain: str, release: str | None) -> None:
             f"Release {outcome.previous.id} stays on disk: "
             f"wasm releases rollback {outcome.domain} {outcome.previous.id}"
         )
+
+
+@cli.command("keep")
+@click.argument("domain")
+@click.argument("count", required=False, type=int, metavar="N")
+@json_option("Print the retention and what was pruned as JSON.")
+@pass_context
+def keep_command(ctx: Context, domain: str, count: int | None) -> None:
+    """
+    Show or set how many releases an application keeps on disk.
+
+    N is from 1 to 50. Releases beyond it
+    are removed now, oldest first; the active release and the one a rollback
+    goes to are always kept, whatever N is.
+    """
+    if count is None:
+        app = get_store().get_app(domain)
+        if app is None:
+            raise WASMError(
+                f"Application not found: {domain}",
+                details="Run 'wasm list' to see what is deployed.",
+            )
+        if ctx.json_output:
+            click.echo(json.dumps({"domain": app.domain, "keep_releases": app.keep_releases}))
+        else:
+            ctx.logger.key_value("Keeps", f"{app.keep_releases} releases")
+        return
+
+    logger = CapturingLogger(verbose=ctx.verbose)
+    change = set_release_retention(domain, count, logger=logger)
+    if ctx.json_output:
+        click.echo(json.dumps(dataclasses.asdict(change) | {"pruned": list(change.pruned)}))
+        return
+    logger.success(f"{change.domain} keeps {change.keep_releases} releases")
+    if change.pruned:
+        logger.info(f"Removed {len(change.pruned)}: {', '.join(change.pruned)}")
+    else:
+        logger.info("Nothing to remove")

@@ -19,6 +19,12 @@ reach (``core/store.py`` is owned elsewhere in this task's file split), and the
 table is small on any real machine - :func:`~wasm.core.store.WASMStore.prune_deployments`
 keeps at most twenty rows per domain - so :func:`_filtered_page` fetches a
 generous batch and does the filtering, ordering and pagination here instead.
+
+Two actions on one deployment live here too, mounted under ``/api/apps`` by
+:data:`app_router`: rebuilding its exact commit (the update job, with the
+commit) and going back to what it produced
+(:func:`~wasm.deployers.lifecycle.rollback_to_deployment`). Both need the
+``deploy`` scope, like an update.
 """
 
 from __future__ import annotations
@@ -35,12 +41,19 @@ from wasm.core.store import (
     StoreError,
     get_store,
 )
+from wasm.deployers.lifecycle import rollback_availability
 from wasm.deployers.logs import read_deployment_log
 from wasm.web.api.auth import get_current_session
-from wasm.web.api.deps import WASMErrorRoute, strict_domain
+from wasm.web.api.deps import JobAcceptedResponse, WASMErrorRoute, strict_domain
+from wasm.web.auth import actor_label
+from wasm.web.jobs import JobType, get_job_manager, rollback_deployment_job, update_app_job
 from wasm.web.pydantic_compat import iso_offset_validator
 
 router = APIRouter(route_class=WASMErrorRoute)
+
+#: Actions on one deployment, mounted at ``/api/apps`` beside the apps
+#: router: ``/{domain}/deployments/{id}/...`` is a path apps.py never defines.
+app_router = APIRouter(route_class=WASMErrorRoute)
 
 #: Rows fetched from the store before this layer's own filtering and keyset
 #: pagination are applied. Generous on purpose: a page short of matches because
@@ -65,6 +78,12 @@ class DeploymentOut(BaseModel):
             layout. None for an in-place deployment.
         commit_message: Subject line of the deployed commit, for a git
             source. None for a source that is not git.
+        snapshot_backup: In place, the backup that holds exactly what this
+            deployment produced, taken by the update that followed it.
+        rollback_available: Whether going back to this deployment is
+            possible now: its release is on disk and not live, or its
+            snapshot backup still exists.
+        rollback_unavailable_reason: Why not, when it is not.
     """
 
     id: int
@@ -81,6 +100,9 @@ class DeploymentOut(BaseModel):
     job_id: str | None = None
     release_id: str | None = None
     commit_message: str | None = None
+    snapshot_backup: str | None = None
+    rollback_available: bool = False
+    rollback_unavailable_reason: str | None = None
 
     _iso_timestamps = iso_offset_validator("started_at", "finished_at")
 
@@ -110,10 +132,12 @@ class DeploymentLogOut(BaseModel):
     missing_reason: str | None = None
 
 
-def _to_out(record: DeploymentRecord) -> DeploymentOut:
+def _to_out(record: DeploymentRecord, availability: dict[int, str | None]) -> DeploymentOut:
     """
     Args:
         record: A row read from the store.
+        availability: :func:`~wasm.deployers.lifecycle.rollback_availability`
+            of the rows being answered.
 
     Returns:
         The API shape of the row.
@@ -141,6 +165,9 @@ def _to_out(record: DeploymentRecord) -> DeploymentOut:
         job_id=record.job_id,
         release_id=record.release_id,
         commit_message=record.commit_message,
+        snapshot_backup=record.snapshot_backup,
+        rollback_available=record.id in availability and availability[record.id] is None,
+        rollback_unavailable_reason=availability.get(record.id),
     )
 
 
@@ -220,8 +247,11 @@ def list_deployments(
     )
     next_before_id = page[-1].id if page and has_more else None
 
+    availability = rollback_availability(page)
     return DeploymentListResponse(
-        items=[_to_out(record) for record in page], total=total, next_before_id=next_before_id
+        items=[_to_out(record, availability) for record in page],
+        total=total,
+        next_before_id=next_before_id,
     )
 
 
@@ -245,7 +275,7 @@ def get_deployment(
     record = get_store().get_deployment(deployment_id)
     if record is None:
         raise HTTPException(status_code=404, detail=f"Deployment not found: {deployment_id}")
-    return _to_out(record)
+    return _to_out(record, rollback_availability([record]))
 
 
 @router.get("/{deployment_id}/log", response_model=DeploymentLogOut)
@@ -278,4 +308,145 @@ def get_deployment_log(
     result = read_deployment_log(record, tail=tail)
     return DeploymentLogOut(
         content=result.content, truncated=result.truncated, missing_reason=result.missing_reason
+    )
+
+
+def _deployment_of(domain: str, deployment_id: int) -> DeploymentRecord:
+    """
+    Read a deployment that must belong to an application.
+
+    Args:
+        domain: The application's domain, validated.
+        deployment_id: The deployment.
+
+    Returns:
+        The row.
+
+    Raises:
+        HTTPException: 404 when there is no such deployment of that application.
+    """
+    record = get_store().get_deployment(deployment_id)
+    if record is None or record.domain != domain:
+        raise HTTPException(
+            status_code=404, detail=f"Deployment {deployment_id} of {domain} not found"
+        )
+    return record
+
+
+@app_router.post(
+    "/{domain}/deployments/{deployment_id}/rebuild",
+    response_model=JobAcceptedResponse,
+    status_code=202,
+)
+def rebuild_deployment(
+    domain: str, deployment_id: int, session: Annotated[dict, Depends(get_current_session)]
+) -> JobAcceptedResponse:
+    """
+    Queue a deploy of the exact commit a deployment was built from.
+
+    The update job, given the commit: on releases a release of that commit
+    still on disk is activated (instant), otherwise the commit is built as a
+    new release; in place the checkout is put on the commit and rebuilt.
+    There is no ``nothing_new`` check: asking for a commit is explicit.
+
+    Args:
+        domain: Domain of the application.
+        deployment_id: The deployment whose commit to rebuild.
+        session: The authenticated session.
+
+    Returns:
+        The queued job.
+
+    Raises:
+        HTTPException: 404 for an unknown application or deployment, 409 when
+            the deployment recorded no commit (its source is not git).
+    """
+    domain = strict_domain(domain)
+    record = _deployment_of(domain, deployment_id)
+    if get_store().get_app(domain) is None:
+        raise HTTPException(status_code=404, detail=f"Application not found: {domain}")
+    commit = record.git_commit
+    if not commit:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "no_commit",
+                "detail": f"Deployment {deployment_id} recorded no commit to rebuild",
+                "hint": "Its source is not a git repository. Update the application to "
+                "build its source again.",
+            },
+        )
+    job = get_job_manager().create_job(
+        job_type=JobType.UPDATE,
+        name=f"Rebuild {domain} at {commit}",
+        description=f"Deploying commit {commit} of {domain} again",
+        func=update_app_job,
+        kwargs={"domain": domain, "commit": commit},
+        metadata={"domain": domain, "commit": commit, "deployment_id": deployment_id},
+        actor=actor_label(session),
+    )
+    return JobAcceptedResponse(
+        job_id=job.id,
+        status=job.status.value,
+        message=f"Rebuild of {domain} at {commit} queued",
+        job=job.to_dict(),
+    )
+
+
+@app_router.post(
+    "/{domain}/deployments/{deployment_id}/rollback",
+    response_model=JobAcceptedResponse,
+    status_code=202,
+)
+def rollback_deployment(
+    domain: str, deployment_id: int, session: Annotated[dict, Depends(get_current_session)]
+) -> JobAcceptedResponse:
+    """
+    Queue going back to what a deployment produced.
+
+    On releases its release is activated behind the health gate; in place
+    its snapshot backup (taken by the update that followed it) is restored,
+    after a safety backup of the current state.
+
+    Args:
+        domain: Domain of the application.
+        deployment_id: The deployment to go back to.
+        session: The authenticated session.
+
+    Returns:
+        The queued job.
+
+    Raises:
+        HTTPException: 404 for an unknown deployment of the application, 409
+            ``rollback_unavailable`` with the reason when it cannot be gone
+            back to.
+    """
+    domain = strict_domain(domain)
+    record = _deployment_of(domain, deployment_id)
+    reason = rollback_availability([record]).get(deployment_id)
+    if reason is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "rollback_unavailable",
+                "detail": reason,
+                "hint": "Rebuild its commit instead"
+                if record.git_commit
+                else "Restore a backup from the Backups tab instead",
+            },
+        )
+    job = get_job_manager().create_job(
+        job_type=JobType.RESTORE,
+        name=f"Rollback {domain}",
+        description=f"Going back to deployment {deployment_id} of {domain}",
+        func=rollback_deployment_job,
+        kwargs={"domain": domain, "deployment_id": deployment_id},
+        metadata={"domain": domain, "deployment_id": deployment_id},
+        actor=actor_label(session),
+    )
+    return JobAcceptedResponse(
+        job_id=job.id,
+        status=job.status.value,
+        message=f"Rollback of {domain} to deployment {deployment_id} queued",
+        job=job.to_dict(),
     )

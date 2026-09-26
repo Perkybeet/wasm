@@ -68,16 +68,29 @@ monitor runs.
 wasm config set monitor.smtp.host smtp.example.com
 wasm config set monitor.smtp.port 465
 wasm config set monitor.smtp.username alerts@example.com
-wasm config set monitor.smtp.password '...'
-wasm config set monitor.email_recipients '["admin@example.com"]'
+printf '%s' "$SMTP_PASSWORD" | wasm config set monitor.smtp.password --stdin
+wasm config set monitor.email_recipients admin@example.com,oncall@example.com
 wasm config set monitor.notify true
 wasm monitor test-email
 ```
 
+The password never has to be typed into the command line: `--stdin` reads it from standard
+input (a single trailing newline is stripped), and `wasm config set monitor.smtp.password
+--prompt` asks for it interactively without echoing it back. Typing a secret straight into
+`VALUE` on a real terminal prints a warning suggesting one of the two - see
+[Secrets via `--stdin`](security.md#secrets-via---stdin). `monitor.email_recipients` takes a
+comma-separated list directly, the same as `--list`, because it already defaults to a list.
+
 With `monitor.notify` on, a scan that records new observations mails them to the
 recipients. A process that keeps matching the same signal does not send a message every
 scan. Credentials are only sent over TLS: `use_ssl` (implicit TLS, the default) or `use_tls`
-(STARTTLS); without either, a configured password is refused.
+(STARTTLS) - not both at once, and never neither when a username or password is set.
+
+`monitor.smtp.host`, `.port`, `.from_address` and every address in `monitor.email_recipients`
+are validated when set - a bad hostname, a port outside 1-65535, both `use_ssl` and `use_tls`
+enabled, or an address that is not `name@domain` are refused with the reason, whether set with
+`wasm config set monitor.smtp.*` or through the console's Settings form
+(`GET`/`PUT /api/config/smtp`, see [API](#api)).
 
 ## Configuration
 
@@ -121,7 +134,9 @@ only when `notifications.enabled` is on and the event is enabled. Test a channel
 | `GET /api/monitor/observations` | Recorded observations and their counts |
 | `POST /api/monitor/observations/{id}/acknowledge` | Mark one as seen |
 | `POST /api/monitor/install`, `/uninstall`, `/enable`, `/disable`, `/start`, `/stop` | Manage the unit |
-| `POST /api/monitor/test-email` | Send a test email |
+| `POST /api/monitor/test-email` | Send a test email; a failure carries the SMTP server's own reply verbatim in `output` |
+| `GET /api/config/smtp` | SMTP settings and recipients; the password is never returned, only whether one is set |
+| `PUT /api/config/smtp` | Update them (sudo mode); a blank password keeps the one already stored |
 
 ## Troubleshooting
 

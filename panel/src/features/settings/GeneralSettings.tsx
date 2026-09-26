@@ -28,7 +28,8 @@ import type { SelectOption } from "../../components/ui/Select";
 import { Skeleton } from "../../components/ui/Skeleton";
 import { toast } from "../../components/ui/toast";
 import { configGetCommand, configSetCommand } from "./shell";
-import { SettingsFormCard, SettingsSection } from "./SettingsForm";
+import { SettingsFormCard, SettingsFormSkeleton, SettingsSection } from "./SettingsForm";
+import type { SkeletonField } from "./SettingsForm";
 import { useSettingsForm } from "./useSettingsForm";
 import type { FormValues, SettingsForm } from "./useSettingsForm";
 
@@ -48,23 +49,19 @@ function commandsFor<V extends FormValues>(form: SettingsForm<V>, keys: Record<k
   return form.changed.map((name) => configSetCommand(keys[name], values[name] ?? ""));
 }
 
-/** The loading shape of a section's form: labels and controls still to come. */
-function FormSkeleton({ fields }: { fields: number }) {
-  return (
-    <div aria-hidden="true" className="flex flex-col gap-5 rounded-card border border-border bg-surface p-5 shadow-raised">
-      {Array.from({ length: fields }, (_, index) => (
-        <div key={index} className="flex flex-col gap-2">
-          <Skeleton className="h-3 w-32" />
-          <Skeleton className="h-8 w-full max-w-md" />
-        </div>
-      ))}
-      <Skeleton className="ml-auto h-8 w-28" />
-    </div>
-  );
-}
-
 /** A section's form once its settings are loaded; the skeleton or the failure until then. */
-function Loaded<T>({ query, label, fields, children }: { query: UseQueryResult<T>; label: string; fields: number; children: ReactNode }) {
+function Loaded<T>({
+  query,
+  label,
+  fields,
+  children,
+}: {
+  query: UseQueryResult<T>;
+  label: string;
+  /** The form's fields, for a placeholder of the same height. */
+  fields: readonly SkeletonField[];
+  children: ReactNode;
+}) {
   if (query.data !== undefined) return <>{children}</>;
   if (query.isError) {
     return (
@@ -79,7 +76,7 @@ function Loaded<T>({ query, label, fields, children }: { query: UseQueryResult<T
   return (
     <div aria-busy="true">
       <span className="sr-only">{`Loading ${label}`}</span>
-      <FormSkeleton fields={fields} />
+      <SettingsFormSkeleton fields={fields} />
     </div>
   );
 }
@@ -114,7 +111,7 @@ function AppsDirectorySection() {
       description="Where new applications are cloned, built and run from. Applications that already exist keep their own path."
       commands={commandsFor(form, { apps_directory: "apps_directory" }, "apps_directory")}
     >
-      <Loaded query={query} label="the applications directory" fields={1}>
+      <Loaded query={query} label="the applications directory" fields={[{ description: 1 }]}>
         <SettingsFormCard {...cardProps(form, "Could not save the applications directory")}>
           <Field label="Directory" description="An absolute path, such as /var/www/apps." error={form.fieldErrors.apps_directory}>
             <Input
@@ -158,7 +155,7 @@ function WebserverSection() {
       description="Serves the sites WASM creates and terminates their HTTPS. Sites that already exist stay on the server they were created for."
       commands={commandsFor(form, { webserver: "webserver" }, "webserver")}
     >
-      <Loaded query={query} label="the web server" fields={1}>
+      <Loaded query={query} label="the web server" fields={[{}]}>
         <SettingsFormCard {...cardProps(form, "Could not save the web server")}>
           <Field label="Web server for new sites" nativeLabel={false} error={form.fieldErrors.webserver}>
             <Select
@@ -203,7 +200,7 @@ function CertificatesSection() {
       }
       commands={commandsFor(form, { email: "ssl.email" }, "ssl.email")}
     >
-      <Loaded query={query} label="the certificate settings" fields={1}>
+      <Loaded query={query} label="the certificate settings" fields={[{ description: 2 }]}>
         <SettingsFormCard {...cardProps(form, "Could not save the certificate email")}>
           <Field
             label="Email for certificate notices"
@@ -247,7 +244,7 @@ function BackupsSection() {
       description="Where backups of applications are written and how many are kept. After each backup, the oldest ones past the limit are deleted."
       commands={commandsFor(form, { directory: "backup.directory", max_per_app: "backup.max_per_app" }, "backup")}
     >
-      <Loaded query={query} label="the backup settings" fields={2}>
+      <Loaded query={query} label="the backup settings" fields={[{}, { description: 1 }]}>
         <SettingsFormCard {...cardProps(form, "Could not save the backup settings")}>
           <Field label="Backup directory" error={form.fieldErrors.directory}>
             <Input
@@ -309,7 +306,7 @@ function ConsoleAddressSection() {
       }
       commands={commandsFor(form, { host: "web.host", port: "web.port" }, "web.host")}
     >
-      <Loaded query={query} label="the console address" fields={2}>
+      <Loaded query={query} label="the console address" fields={[{ inline: 2 }]}>
         <SettingsFormCard {...cardProps(form, "Could not save the console address")}>
           <div className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_8rem]">
             <Field label="Host" error={form.fieldErrors.host}>
@@ -356,7 +353,13 @@ function cardProps<V extends FormValues>(form: SettingsForm<V>, errorTitle: stri
 /** Where the settings live on disk, and whether the console can write them. */
 function ConfigFileLine() {
   const { data } = useQuery(configQuery());
-  if (data === undefined) return <Skeleton className="h-4 w-72" />;
+  if (data === undefined) {
+    return (
+      <div className="flex h-5 items-center">
+        <Skeleton className="h-3.5 w-72" />
+      </div>
+    );
+  }
   return (
     <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-13 text-fg-muted">
       <span className="flex min-w-0 items-start gap-2">

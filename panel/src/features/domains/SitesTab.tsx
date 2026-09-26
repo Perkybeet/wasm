@@ -166,7 +166,9 @@ export function SitesTab() {
               </Menu>
             )}
           />
-          <CommandHint command="wasm site list" label="From a terminal" />
+          {/* Drawn with the rows, not before: under a list of unknown length it would only be
+              pushed down the page when they arrive. */}
+          {sites.isPending ? null : <CommandHint command="wasm site list" label="From a terminal" />}
         </>
       )}
 

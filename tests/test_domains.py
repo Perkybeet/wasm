@@ -266,13 +266,22 @@ def test_a_tls_site_expands_its_certificate_to_every_domain(machine: Machine) ->
     assert "return 301 https://example.com$request_uri;" in config
 
 
-def test_a_failed_order_keeps_the_domain_and_reports_certbot_verbatim(machine: Machine) -> None:
+def test_a_failed_order_keeps_the_domain_and_reports_certbot_verbatim(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The certbot failure text happens to say "Challenge failed", which is also
+    what triggers the DNS diagnosis in ``CertManager`` - so DNS is pinned here
+    as pointing here, to keep this test about the one thing it is for:
+    certbot's own words surviving unparaphrased.
+    """
     machine.deploy(tls=True)
     machine.runner.script(
         ["certbot", "certonly"],
         stderr="Challenge failed for domain shop.example.com\nType: dns\n",
         exit_code=1,
     )
+    monkeypatch.setattr(domains, "check_dns", lambda *a, **kw: SimpleNamespace(points_here=True))
 
     change = domains.add_domain("example.com", "shop.example.com")
 

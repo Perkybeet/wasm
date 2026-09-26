@@ -53,6 +53,7 @@ from wasm.core.exceptions import WASMError
 from wasm.core.runner import CommandRunner, get_runner
 from wasm.core.store import App, DeploymentStatus, WASMStore, get_store
 from wasm.core.utils import domain_to_app_name
+from wasm.deployers.helpers.health_gate import HealthCheck
 from wasm.managers.cert_manager import CertManager
 from wasm.managers.service_manager import ServiceManager
 
@@ -188,8 +189,8 @@ def _default_http_get(url: str, headers: Mapping[str, str]) -> tuple[int | None,
     Make one real HTTP GET request with a short timeout.
 
     Args:
-        url: Address to request. Always http://127.0.0.1:<port>/, built by the
-            caller, never from unvalidated input.
+        url: Address to request. Always http://127.0.0.1:<port><path>, built
+            by the caller from a path the store validated.
         headers: Extra request headers, such as an explicit Host.
 
     Returns:
@@ -444,11 +445,18 @@ def _check_port(ctx: _Context) -> ProbeResult:
 
 
 def _check_http_direct(ctx: _Context) -> ProbeResult:
-    """Probe the app directly on 127.0.0.1:<port>, bypassing nginx."""
+    """
+    Probe the app directly on 127.0.0.1:<port>, bypassing nginx.
+
+    Asks what the health gate asks - the application's path, judged by its
+    expectation - so a diagnosis never calls healthy what a deploy would
+    roll back, or the reverse.
+    """
     if ctx.app is None or ctx.app.is_static or not ctx.app.port:
         return Check("http_direct", "skip", "No backend port to probe directly", ""), {}
 
-    url = f"http://127.0.0.1:{ctx.app.port}/"
+    check = HealthCheck.for_app(ctx.app)
+    url = check.url(ctx.app.port)
     code, error = ctx.http_get(url, {})
     if error is not None:
         return (
@@ -461,22 +469,29 @@ def _check_http_direct(ctx: _Context) -> ProbeResult:
             {"ok": False, "status": None, "error": error},
         )
 
-    ok = code is not None and code < 500
+    ok = code is not None and check.accepts(code)
     status: CheckStatus = "ok" if ok else "fail"
     return (
         Check(
             "http_direct",
             status,
             f"HTTP {code} from 127.0.0.1:{ctx.app.port}",
-            f"GET {url} -> {code}",
+            f"GET {url} -> {code} (healthy: {check.describe_expect()})",
         ),
         {"ok": ok, "status": code, "error": None},
     )
 
 
 def _check_http_nginx(ctx: _Context) -> ProbeResult:
-    """Probe the app through nginx, with the domain as the Host header."""
-    url = f"http://127.0.0.1:{_NGINX_PROBE_PORT}/"
+    """
+    Probe the app through nginx, with the domain as the Host header.
+
+    The same path and expectation as the direct probe, with one allowance:
+    port 80 redirecting (to HTTPS, usually) is the site working, not the
+    application failing its expectation.
+    """
+    check = HealthCheck.for_app(ctx.app)
+    url = check.url(_NGINX_PROBE_PORT)
     code, error = ctx.http_get(url, {"Host": ctx.domain})
     if error is not None:
         return (
@@ -484,7 +499,7 @@ def _check_http_nginx(ctx: _Context) -> ProbeResult:
             {"ok": False, "status": None, "error": error},
         )
 
-    ok = code is not None and code < 500
+    ok = code is not None and (check.accepts(code) or 300 <= code < 400)
     status: CheckStatus = "ok" if ok else "fail"
     evidence = f"GET {url} Host: {ctx.domain} -> {code}"
     return (

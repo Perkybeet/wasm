@@ -50,7 +50,12 @@ from wasm.deployers.docker_compose import DockerComposeDeployer
 from wasm.deployers.helpers.env_manager import EnvManager
 from wasm.deployers.helpers.layout import CONFIGURED, LAYOUTS, choose_layout
 from wasm.deployers.helpers.package_manager import SUPPORTED_PACKAGE_MANAGERS
-from wasm.deployers.lifecycle import delete_app, update_app
+from wasm.deployers.lifecycle import (
+    NOTHING_NEW_HINT,
+    check_upstream,
+    delete_app,
+    update_app,
+)
 from wasm.deployers.monorepo import MonorepoDeployer
 from wasm.deployers.registry import available_types
 from wasm.managers.apache_manager import ApacheManager
@@ -743,13 +748,25 @@ def _control_service(domain: str, action: str, logger: Logger) -> int:
     return 0
 
 
+def _can_ask() -> bool:
+    """
+    Report whether someone is at a terminal to answer a question.
+
+    Returns:
+        True when standard input is a terminal.
+    """
+    return sys.stdin.isatty()
+
+
 def _update_app(
     domain: str,
     *,
     logger: Logger,
     source: str | None = None,
     branch: str | None = None,
+    commit: str | None = None,
     package_manager: str = "auto",
+    force: bool = False,
 ) -> int:
     """
     Rebuild a deployed application from its source, then restart it.
@@ -757,12 +774,19 @@ def _update_app(
     The sequence itself is :func:`wasm.deployers.lifecycle.update_app`, shared
     with the panel and the git webhook; this only presents it.
 
+    A plain update first asks the remote whether the branch has anything the
+    live build lacks (:func:`~wasm.deployers.lifecycle.check_upstream`). When
+    it does not, a terminal is asked whether to rebuild anyway; a script, with
+    no one to ask, rebuilds and says so. ``force`` skips the question.
+
     Args:
         domain: Application domain.
         logger: Logger of the current command.
         source: Fetch from this source instead of the recorded one.
         branch: Git branch to update from.
+        commit: Deploy this commit instead of the head of the branch.
         package_manager: Node package manager, or ``auto``.
+        force: Rebuild without asking when there is nothing new.
 
     Returns:
         Exit code.
@@ -770,13 +794,30 @@ def _update_app(
     Raises:
         WASMError: When the application is unknown or a step fails.
     """
-    logger.header(f"Updating: {domain}")
+    # A commit or a new source is explicit about what to build; only a plain
+    # update can be "the same thing again".
+    if commit is None and source is None:
+        upstream = check_upstream(domain, branch=branch, logger=logger)
+        if upstream is not None and not upstream.has_new_commits:
+            logger.info(upstream.summary)
+            if force:
+                logger.info("Rebuilding it anyway (--force)")
+            elif _can_ask():
+                logger.info(NOTHING_NEW_HINT)
+                if not click.confirm("Rebuild it anyway?", default=False):
+                    logger.info("Nothing to do")
+                    return 0
+            else:
+                logger.info("Not a terminal, so nobody to ask: rebuilding it anyway")
+
+    logger.header(f"Updating: {domain}" + (f" at {commit}" if commit else ""))
     logger.blank()
 
     outcome = update_app(
         domain,
         source=source,
         branch=branch,
+        commit=commit,
         package_manager=package_manager,
         trigger=DeploymentTrigger.CLI.value,
         on_phase=logger.step,
@@ -1241,7 +1282,9 @@ def _handle_update(args: Namespace) -> int:
         logger=Logger(verbose=args.verbose),
         source=getattr(args, "source", None),
         branch=getattr(args, "branch", None),
+        commit=getattr(args, "commit", None),
         package_manager=getattr(args, "package_manager", "auto") or "auto",
+        force=bool(getattr(args, "force", False)),
     )
 
 
@@ -1522,6 +1565,11 @@ def restart(ctx: Context, domain: str) -> None:
 @click.option("-s", "--source", help="Fetch from this source instead of the recorded one.")
 @click.option("-b", "--branch", help="Git branch to update from.")
 @click.option(
+    "--commit",
+    metavar="SHA",
+    help="Deploy this commit (full or abbreviated) instead of the head of the branch.",
+)
+@click.option(
     "--package-manager",
     "--pm",
     "package_manager",
@@ -1530,6 +1578,12 @@ def restart(ctx: Context, domain: str) -> None:
     show_default=True,
     help="Node package manager. Detected from the lockfile when left on auto.",
 )
+@click.option(
+    "-y",
+    "--force",
+    is_flag=True,
+    help="Rebuild without asking when the branch has nothing new since the live commit.",
+)
 @global_flags
 @pass_context
 def update(
@@ -1537,7 +1591,9 @@ def update(
     domain: str,
     source: str | None,
     branch: str | None,
+    commit: str | None,
     package_manager: str,
+    force: bool,
 ) -> None:
     """
     Pull the latest code, rebuild and restart an application.
@@ -1548,6 +1604,12 @@ def update(
     is built and activated behind a health gate, and a release that does not
     answer is rolled back automatically - the previous release is the way
     back.
+
+    When the branch has no commit since the live one, it asks before
+    rebuilding the same commit (a script is not asked and rebuilds); -y
+    skips the question. --commit deploys that exact commit: on releases an
+    existing release of it is activated, otherwise it is built; in place the
+    checkout is put on it, and the next update follows the branch again.
     """
     _exit(
         _update_app(
@@ -1555,7 +1617,9 @@ def update(
             logger=ctx.logger,
             source=source,
             branch=branch,
+            commit=commit,
             package_manager=package_manager,
+            force=force,
         ),
     )
 

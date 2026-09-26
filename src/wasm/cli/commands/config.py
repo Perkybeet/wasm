@@ -17,12 +17,17 @@ example ``wasm config set apps_directory /var/www/apps``. ``set`` goes through
 WASM has no manager for, a port or timeout out of range), so a value the panel
 would reject is rejected here too. A secret value is never printed back by
 either command: both redact it exactly as :func:`~wasm.core.config.redact_secrets`
-does for the panel.
+does for the panel. ``set`` also never requires a secret *in* on the command
+line: ``--stdin`` reads VALUE from standard input and ``--prompt`` asks for it
+without echoing it back, because everything typed after ``wasm`` lands in the
+shell's history and, for as long as the process runs, in ``ps`` for every
+local user to read.
 """
 
 from __future__ import annotations
 
 import json
+import sys
 from argparse import Namespace
 from typing import Any, NoReturn
 
@@ -35,6 +40,7 @@ from wasm.core.config import (
     NO_DEFAULT,
     Config,
     coerce_config_value,
+    is_secret_key,
     redact_secrets,
 )
 from wasm.core.exceptions import ConfigError
@@ -248,6 +254,51 @@ def _coerce_cli_value(existing: Any, raw: str) -> Any:
     return coerce_config_value(existing, raw)
 
 
+def _read_stdin_value() -> str:
+    """
+    Read a value piped to standard input, the way ``--stdin`` asks for.
+
+    A secret typed in argv lands in shell history and is visible in ``ps`` to
+    every local user for as long as the process runs; piping it in instead
+    (``printf '%s' "$TOKEN" | wasm config set monitor.smtp.password --stdin``)
+    keeps it out of both.
+
+    Returns:
+        The bytes read, decoded as text, with exactly one trailing newline
+        removed - what a shell's ``echo`` or a text editor's saved file adds,
+        and what a caller using ``printf`` or ``-n`` never had in the first
+        place.
+    """
+    raw = sys.stdin.read()
+    if raw.endswith("\n"):
+        raw = raw[:-1]
+    return raw
+
+
+def _warn_if_secret_typed_in_argv(key: str, logger: Logger) -> None:
+    """
+    Nudge an operator typing a secret on the command line towards ``--stdin``.
+
+    Only fires on a real terminal: a script piping a value in through some
+    other means already has it off the command line's own history, and a
+    warning on every automated run would train operators to ignore it.
+
+    Args:
+        key: Dotted key exactly as given on the command line.
+        logger: Logger the warning is printed through.
+    """
+    leaf = key.rsplit(".", 1)[-1]
+    if not is_secret_key(leaf):
+        return
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return
+    logger.warning(
+        f"{key} looks like a secret. Typing it here puts it in this shell's history "
+        "and lets other users on this machine see it with 'ps'. Use "
+        f"'wasm config set {key} --stdin' (or --prompt) instead."
+    )
+
+
 def _run_set(key: str, raw_value: str, logger: Logger, *, as_list: bool = False) -> int:
     """
     Set one configuration value, addressed by its dotted key, and save it.
@@ -390,7 +441,7 @@ def get(ctx: Context, key: str) -> None:
 
 @cli.command("set")
 @click.argument("key")
-@click.argument("value")
+@click.argument("value", required=False)
 @click.option(
     "--list",
     "as_list",
@@ -400,9 +451,31 @@ def get(ctx: Context, key: str) -> None:
         "notifications.allow_private_hosts."
     ),
 )
+@click.option(
+    "--stdin",
+    "from_stdin",
+    is_flag=True,
+    help=(
+        "Read VALUE from standard input instead of the command line, so a "
+        "secret never lands in shell history or in 'ps'."
+    ),
+)
+@click.option(
+    "--prompt",
+    "from_prompt",
+    is_flag=True,
+    help="Prompt for VALUE without echoing it back, like a password prompt.",
+)
 @global_flags
 @pass_context
-def set_(ctx: Context, key: str, value: str, as_list: bool) -> None:
+def set_(
+    ctx: Context,
+    key: str,
+    value: str | None,
+    as_list: bool,
+    from_stdin: bool,
+    from_prompt: bool,
+) -> None:
     """
     Set one configuration value, addressed by its dotted key, and save it.
 
@@ -416,8 +489,8 @@ def set_(ctx: Context, key: str, value: str, as_list: bool) -> None:
     A key needing a list value takes it two ways: 'wasm config set
     notifications.allow_private_hosts internal.example,partner.example
     --list' splits VALUE on commas, and a key that already holds a list (for
-    example monitor.email_recipients) also accepts a JSON array such as
-    '["a@example.com"]' without --list.
+    example monitor.email_recipients) also accepts a plain comma-separated
+    value or a JSON array such as '["a@example.com"]' without --list.
 
     VALUE is coerced by the key's schema: a key with a default is parsed as
     that default's type (a boolean, a whole number, a decimal or a list), so
@@ -425,5 +498,31 @@ def set_(ctx: Context, key: str, value: str, as_list: bool) -> None:
     A key with no default, such as monitor.notify, is parsed as a JSON scalar
     or list instead - true, false, null, a number, or a JSON array - and
     falls back to a plain string when VALUE is not valid JSON.
+
+    VALUE typed here lands in this shell's history file and, for as long as
+    the command runs, is visible to every local user through 'ps' - fine for
+    apps_directory, not for monitor.smtp.password. '--stdin' reads VALUE from
+    standard input instead, stripping exactly one trailing newline, so
+    'printf '%s' "$PASSWORD" | wasm config set monitor.smtp.password --stdin'
+    never puts it on the command line; '--prompt' asks for it interactively
+    without echoing it back. Typing a value for a key that looks like a
+    secret straight into VALUE on a real terminal prints a warning suggesting
+    one of the two.
     """
-    _exit(_run_set(key, value, ctx.logger, as_list=as_list))
+    sources = (value is not None, from_stdin, from_prompt)
+    if sources.count(True) != 1:
+        raise click.UsageError("Give VALUE, or exactly one of --stdin / --prompt, not a mix.")
+
+    if from_stdin:
+        resolved_value = _read_stdin_value()
+    elif from_prompt:
+        resolved_value = click.prompt("Value", hide_input=True)
+    elif value is not None:
+        resolved_value = value
+        _warn_if_secret_typed_in_argv(key, ctx.logger)
+    else:
+        # Unreachable: the count check above guarantees exactly one of VALUE,
+        # --stdin or --prompt was given.
+        raise click.UsageError("Give VALUE, or exactly one of --stdin / --prompt, not a mix.")
+
+    _exit(_run_set(key, resolved_value, ctx.logger, as_list=as_list))

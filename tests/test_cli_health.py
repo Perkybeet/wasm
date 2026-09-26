@@ -17,6 +17,7 @@ from __future__ import annotations
 import functools
 import io
 import json
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -43,14 +44,22 @@ _GB = 1024**3
 class _FakeWebServer:
     """A web server that is whatever the test says it is."""
 
-    def __init__(self, installed: bool = True, active: bool = True) -> None:
+    def __init__(
+        self,
+        installed: bool = True,
+        active: bool = True,
+        sites: list[Any] = (),  # type: ignore[assignment]
+    ) -> None:
         """
         Args:
-            installed: Whether the binary is on PATH.
+            installed: Whether the unit or package is installed.
             active: Whether the unit is running.
+            sites: Sites this backend serves, as ``list_sites`` would report
+                them; only ``enabled`` is read.
         """
         self._installed = installed
         self._active = active
+        self._sites = list(sites)
 
     def is_installed(self) -> bool:
         """Whether the server is installed."""
@@ -59,6 +68,10 @@ class _FakeWebServer:
     def get_status(self) -> dict[str, Any]:
         """What the server is doing right now."""
         return {"active": self._active}
+
+    def list_sites(self) -> list[Any]:
+        """Sites this backend serves."""
+        return self._sites
 
 
 class _FakeServices:
@@ -451,6 +464,48 @@ def test_a_stopped_web_server_is_an_issue_and_exits_one(server: Any) -> None:
     assert "Nginx: Stopped" in result.output
 
 
+def test_a_stopped_unused_apache_is_not_a_warning(server: Any) -> None:
+    """
+    The regression: Apache installed as a dependency, never configured for a
+    site, and stopped - reported as "installed but not running" on a server
+    that has no Apache site at all.
+    """
+    server.apache = _FakeWebServer(installed=True, active=False, sites=[])
+
+    result = invoke(standalone_mode=False)
+
+    assert result.return_value == 0, result.output
+    assert "Apache is installed but not running" not in result.output
+    assert "not in use" in result.output.lower()
+
+
+def test_a_stopped_apache_with_an_enabled_site_is_a_warning(server: Any) -> None:
+    """A stopped Apache that actually serves a site is still an operator's problem."""
+    server.apache = _FakeWebServer(
+        installed=True, active=False, sites=[SimpleNamespace(enabled=True)]
+    )
+
+    result = invoke(standalone_mode=False)
+
+    assert result.return_value == 0, result.output
+    assert "Apache is installed but not running" in result.output
+
+
+def test_a_stopped_apache_with_an_apache_app_is_a_warning(server: Any) -> None:
+    """No site enabled in Apache's own directory, but an app is recorded as its."""
+    from wasm.core.store import WebServer
+
+    server.apache = _FakeWebServer(installed=True, active=False, sites=[])
+    app = _app("example.com")
+    app.webserver = WebServer.APACHE.value
+    server.store = _FakeStore([app])
+
+    result = invoke(standalone_mode=False)
+
+    assert result.return_value == 0, result.output
+    assert "Apache is installed but not running" in result.output
+
+
 def test_no_web_server_at_all_is_an_issue(server: Any) -> None:
     """A server with neither nginx nor apache cannot serve anything."""
     server.nginx = _FakeWebServer(installed=False)
@@ -473,7 +528,56 @@ def test_a_certificate_near_expiry_is_reported(server: Any) -> None:
     result = invoke(standalone_mode=False)
 
     assert result.return_value == 1
-    assert "1 expiring soon" in result.output
+    assert "1 total, 0 expired, 1 expiring soon" in result.output
+    assert re.search(r"expires in \d+ days", result.output)
+
+
+def test_an_expired_certificate_is_reported_as_expired_not_expiring(server: Any) -> None:
+    """
+    The regression: an expired certificate read "1 expiring soon" (warning)
+    while the exit code said the check had failed - the row and the verdict
+    disagreed about how bad this was.
+    """
+    past = (datetime.now() - timedelta(days=80)).isoformat()
+    server.certs = _FakeCerts([{"name": "arenna38.com", "expiry": past}])
+
+    result = invoke(standalone_mode=False)
+
+    assert result.return_value == 1
+    assert "1 total, 1 expired, 0 expiring soon" in result.output
+    assert "SSL Certificates" in result.output
+    assert re.search(r"expired \d+ days ago", result.output)
+    assert "expires in -" not in result.output
+
+
+def test_an_expired_certificate_makes_the_row_status_critical(server: Any) -> None:
+    """The check's own status agrees with the verdict it drives, not just a warning icon."""
+    past = (datetime.now() - timedelta(days=1)).isoformat()
+    server.certs = _FakeCerts([{"name": "example.com", "expiry": past}])
+
+    report = health_module.collect_health_report()
+
+    assert report.certificates.status == "error"
+    assert report.verdict == "error"
+
+
+def test_a_mix_of_expired_and_expiring_certificates_counts_each_apart(server: Any) -> None:
+    """An operator with several certificates needs the two counts kept apart."""
+    expired = (datetime.now() - timedelta(days=1)).isoformat()
+    soon = (datetime.now() + timedelta(days=3)).isoformat()
+    healthy = (datetime.now() + timedelta(days=80)).isoformat()
+    server.certs = _FakeCerts(
+        [
+            {"name": "expired.example.com", "expiry": expired},
+            {"name": "soon.example.com", "expiry": soon},
+            {"name": "healthy.example.com", "expiry": healthy},
+        ]
+    )
+
+    report = health_module.collect_health_report()
+
+    assert report.certificates.value == "3 total, 1 expired, 1 expiring soon"
+    assert report.certificates.status == "error"
 
 
 def test_a_healthy_certificate_is_not_reported_as_expiring(server: Any) -> None:

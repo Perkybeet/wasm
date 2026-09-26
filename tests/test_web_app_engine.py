@@ -523,3 +523,133 @@ def test_the_application_shows_its_layout_and_limits(
         None,
         64,
     )
+
+
+# ---------------------------------------------------------------------------
+# Health check
+# ---------------------------------------------------------------------------
+
+
+def test_the_health_settings_are_set_as_a_whole(
+    client: TestClient, store: WASMStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A field left out or null goes back to its default, like the limits."""
+    from wasm.deployers import lifecycle
+
+    monkeypatch.setattr(lifecycle, "get_store", lambda: store)
+    store.create_app(App(domain=DOMAIN, app_type="nodejs", port=3100, app_path=str(tmp_path)))
+    store.set_app_health(DOMAIN, path="/old", expect="200", timeout=60)
+
+    response = client.patch(
+        f"/api/apps/{DOMAIN}/health", json={"path": "/healthz", "expect": "200-399"}
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "domain": DOMAIN,
+        "path": "/healthz",
+        "expect": "200-399",
+        "timeout": None,
+        "effective_path": "/healthz",
+        "effective_expect": "200-399",
+        "effective_timeout": 30,
+    }
+    app = store.get_app(DOMAIN)
+    assert (app.health_path, app.health_expect, app.health_timeout) == ("/healthz", "200-399", None)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [{"path": "https://evil.example.com/"}, {"expect": "700"}, {"timeout": 4}, {"timeout": 601}],
+)
+def test_a_bad_health_setting_is_a_400_and_nothing_is_written(
+    client: TestClient,
+    store: WASMStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    body: dict[str, Any],
+) -> None:
+    from wasm.deployers import lifecycle
+
+    monkeypatch.setattr(lifecycle, "get_store", lambda: store)
+    store.create_app(App(domain=DOMAIN, app_type="nodejs", port=3100, app_path=str(tmp_path)))
+
+    response = client.patch(f"/api/apps/{DOMAIN}/health", json=body)
+
+    assert response.status_code == 400, response.text
+    app = store.get_app(DOMAIN)
+    assert (app.health_path, app.health_expect, app.health_timeout) == (None, None, None)
+
+
+def test_the_application_shows_its_health_settings(
+    client: TestClient, store: WASMStore, tmp_path: Path
+) -> None:
+    release_app(store, tmp_path / "rel")
+    store.set_app_health(DOMAIN, path="/healthz", expect="204", timeout=120)
+
+    body = client.get(f"/api/apps/{DOMAIN}").json()
+
+    assert (body["health_path"], body["health_expect"], body["health_timeout"]) == (
+        "/healthz",
+        "204",
+        120,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Release retention
+# ---------------------------------------------------------------------------
+
+
+def test_the_retention_is_set_through_the_lifecycle(
+    client: TestClient, store: WASMStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wasm.deployers.lifecycle import RetentionChange
+
+    release_app(store, tmp_path / "rel")
+    calls: list[Any] = []
+
+    def apply(domain: str, keep: int, **kwargs: Any) -> RetentionChange:
+        calls.append((domain, keep))
+        return RetentionChange(domain=domain, keep_releases=keep, pruned=(RELEASE_A,))
+
+    monkeypatch.setattr(apps_api, "set_release_retention", apply)
+
+    response = client.patch(f"/api/apps/{DOMAIN}/releases/retention", json={"keep": 3})
+
+    assert response.status_code == 200, response.text
+    assert calls == [(DOMAIN, 3)]
+    assert response.json() == {"domain": DOMAIN, "keep_releases": 3, "pruned": [RELEASE_A]}
+
+
+@pytest.mark.parametrize("keep", [0, 51])
+def test_a_retention_out_of_range_is_a_400(
+    client: TestClient,
+    store: WASMStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    keep: int,
+) -> None:
+    from wasm.deployers import lifecycle
+
+    monkeypatch.setattr(lifecycle, "get_store", lambda: store)
+    release_app(store, tmp_path / "rel", releases=(RELEASE_A, RELEASE_B))
+
+    response = client.patch(f"/api/apps/{DOMAIN}/releases/retention", json={"keep": keep})
+
+    assert response.status_code == 400, response.text
+    assert "50" in response.text
+    assert (tmp_path / "rel" / "releases" / RELEASE_A).is_dir()
+
+
+@pytest.mark.parametrize("path", ["/{domain}/health", "/{domain}/releases/retention"])
+def test_changing_health_or_retention_needs_sudo_mode_and_admin(path: str) -> None:
+    """Retention deletes releases; the health gate decides what may serve."""
+    from fastapi.routing import APIRoute
+
+    from wasm.web.auth import required_scope
+
+    route = next(r for r in apps_api.router.routes if isinstance(r, APIRoute) and r.path == path)
+    assert route.methods == {"PATCH"}
+    assert any(dep.call is require_elevated for dep in route.dependant.dependencies)
+    assert required_scope("PATCH", "/api/apps" + path.replace("{domain}", DOMAIN)) == "admin"

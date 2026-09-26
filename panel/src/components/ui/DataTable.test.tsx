@@ -115,6 +115,16 @@ describe("DataTable", () => {
     expect(screen.getByText("No applications yet.")).toBeInTheDocument();
   });
 
+  it("draws as many placeholder rows as it is told to expect, five by default", () => {
+    const { rerender } = render(<DataTable caption="Applications" columns={COLUMNS} rows={[]} getRowId={(r) => r.domain} loading />);
+    // The header row and the placeholders.
+    expect(screen.getAllByRole("row")).toHaveLength(1 + 5);
+    rerender(<DataTable caption="Applications" columns={COLUMNS} rows={[]} getRowId={(r) => r.domain} loading skeletonRows={12} />);
+    expect(screen.getAllByRole("row")).toHaveLength(1 + 12);
+    rerender(<DataTable caption="Applications" columns={COLUMNS} rows={[]} getRowId={(r) => r.domain} loading skeletonRows={0} />);
+    expect(screen.getAllByRole("row")).toHaveLength(1 + 1);
+  });
+
   it("has no accessibility violations", async () => {
     const { container } = render(
       <div>

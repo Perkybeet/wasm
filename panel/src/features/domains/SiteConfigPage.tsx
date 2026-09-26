@@ -109,13 +109,29 @@ function TestPassed({ webserver, output, id }: { webserver: string; output: stri
   );
 }
 
+/**
+ * The loaded view's shape, line for line: the "Serves" and "File" lines, the editor at its own
+ * height, and the row of buttons. Anything shorter pushed the terminal hint down the page when
+ * the configuration arrived.
+ */
 function EditorSkeleton() {
   return (
-    <div aria-busy="true" className="flex flex-col gap-2 rounded-control border border-border p-3">
+    <div aria-busy="true" className="flex flex-col gap-3">
       <span className="sr-only">Loading the configuration</span>
-      {["w-2/5", "w-2/3", "w-1/2", "w-3/4", "w-1/3", "w-3/5", "w-1/2", "w-2/3"].map((width, index) => (
-        <Skeleton key={index} className={`h-3 ${width}`} />
-      ))}
+      <div aria-hidden="true" className="flex flex-col gap-3">
+        <div className="flex h-4 items-center">
+          <Skeleton className="h-3 w-48" />
+        </div>
+        <div className="flex h-4 items-center">
+          <Skeleton className="h-3 w-72 max-w-full" />
+        </div>
+        <div className="flex h-[26rem] min-w-0 flex-col gap-2 rounded-control border border-border p-3 sm:h-[34rem]">
+          {["w-2/5", "w-2/3", "w-1/2", "w-3/4", "w-1/3", "w-3/5", "w-1/2", "w-2/3"].map((width, index) => (
+            <Skeleton key={index} className={`h-3 ${width}`} />
+          ))}
+        </div>
+        <div className="h-8" />
+      </div>
     </div>
   );
 }
@@ -222,8 +238,9 @@ export function SiteConfigPage({ site }: { site: string }) {
       </span>
     </span>
   ) : (
-    <span aria-hidden="true" className="flex items-center gap-3">
-      <Skeleton className="h-4 w-20" />
+    // A line as tall as the loaded one: its tallest part is the 13px TLS word.
+    <span aria-hidden="true" className="flex h-5 items-center gap-3">
+      <Skeleton className="h-3 w-16" />
       <Skeleton className="h-3 w-12" />
     </span>
   );

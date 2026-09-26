@@ -58,3 +58,26 @@ class ApacheManager(WebServerManager):
             fs: Filesystem to write through. Defaults to the process-wide one.
         """
         super().__init__(backend or APACHE_BACKEND, verbose=verbose, runner=runner, fs=fs)
+
+    def is_installed(self) -> bool:
+        """
+        Check whether Apache is installed.
+
+        The base implementation asks ``shutil.which("apache2")``, which
+        answers true for any binary named ``apache2`` reachable on PATH -
+        including one left behind by a package that was later removed - and
+        that is what reported "Apache is installed but not running" on a
+        server where ``systemctl status apache2`` answered "could not be
+        found". systemd's LoadState is what actually knows whether the unit,
+        and the package that ships it, is present.
+
+        Returns:
+            True when systemd has the ``apache2`` unit loaded. Falls back to
+            the binary check when systemctl itself could not be run (no
+            systemd on this machine at all), so this never regresses to
+            "not installed" purely because the query could not be made.
+        """
+        result = self._run(["systemctl", "show", "-p", "LoadState", self.backend.service])
+        if result.success and result.stdout.strip():
+            return result.stdout.strip() == "LoadState=loaded"
+        return self.runner.exists(self.backend.binary)

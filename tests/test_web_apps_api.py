@@ -551,7 +551,7 @@ def test_an_unreachable_source_answers_400_not_500(
     """A repository WASM cannot fetch is a validation problem, not a server fault."""
     from wasm.core.exceptions import SourceError
 
-    def broken(source: str, *, branch: str | None = None) -> Any:
+    def broken(source: str, *, branch: str | None = None, **_: Any) -> Any:
         raise SourceError(
             "Could not reach the repository", details="Check the URL and your network"
         )
@@ -580,7 +580,7 @@ def test_a_source_matching_no_app_type_answers_400_not_500(
     """
     from wasm.core.exceptions import DeploymentError
 
-    def unmatched(source: str, *, branch: str | None = None) -> Any:
+    def unmatched(source: str, *, branch: str | None = None, **_: Any) -> Any:
         raise DeploymentError(
             f"Could not identify the application type at {source}",
             details="Choose a type explicitly instead of relying on auto-detection.",
@@ -595,3 +595,137 @@ def test_a_source_matching_no_app_type_answers_400_not_500(
     assert body["error"] == "validationerror"
     assert "Could not identify" in body["detail"]
     assert "Choose a type explicitly" in body["hint"]
+
+
+# ---------------------------------------------------------------------------
+# POST /api/apps/inspect: the verdict, and a cancel that stops the work
+# ---------------------------------------------------------------------------
+
+
+def _inspection(**overrides: Any) -> Any:
+    from wasm.deployers.inspect import SourceInspection
+
+    fields: dict[str, Any] = {
+        "app_type": "python",
+        "detected_types": ["python"],
+        "package_manager": None,
+        "install_command": ["pip", "install", "-r", "requirements.txt"],
+        "build_command": [],
+        "start_command": "gunicorn app:app",
+        "default_port": 8000,
+        "env_keys": [],
+        "branch": "main",
+        "commit": "abc1234",
+    }
+    fields.update(overrides)
+    return SourceInspection(**fields)
+
+
+def test_the_inspection_carries_the_compatibility_verdict(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recognised but not deployable here: the wizard is told why and what to do."""
+    import threading
+
+    seen: dict[str, Any] = {}
+
+    def inspected(source: str, *, branch: str | None = None, cancel: Any = None) -> Any:
+        seen["cancel"] = cancel
+        return _inspection(
+            compatible=False,
+            verdict="This is a Python project, but this server does not have python3.",
+            suggestion="Install what it needs with `wasm setup init`, then deploy it.",
+        )
+
+    monkeypatch.setattr(apps_api, "inspect_source", inspected)
+
+    response = client.post("/api/apps/inspect", json={"source": "https://example.com/app.git"})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["app_type"] == "python"
+    assert body["compatible"] is False
+    assert "python3" in body["verdict"]
+    assert "wasm setup init" in body["suggestion"]
+    # The endpoint hands the inspection an event it can be cancelled with.
+    assert isinstance(seen["cancel"], threading.Event)
+
+
+class _LeavingClient:
+    """A request whose client disconnects after a few polls."""
+
+    def __init__(self, polls_before_leaving: int) -> None:
+        self.polls = 0
+        self.leave_after = polls_before_leaving
+
+    async def is_disconnected(self) -> bool:
+        self.polls += 1
+        return self.polls > self.leave_after
+
+
+def test_a_client_that_leaves_cancels_the_work_and_waits_for_its_cleanup() -> None:
+    """
+    The browser aborted: the worker's event is set, and the endpoint does not
+    answer until the worker has stopped (and removed its checkout).
+    """
+    import asyncio
+    import threading
+    import time
+
+    from wasm.core.runner import CommandCancelled
+
+    cancel = threading.Event()
+    cleaned = threading.Event()
+
+    def work() -> str:
+        try:
+            if not cancel.wait(timeout=10):
+                return "finished"
+            raise CommandCancelled("Cancelled: git clone")
+        finally:
+            time.sleep(0.1)  # the checkout being removed
+            cleaned.set()
+
+    started = time.monotonic()
+    with pytest.raises(CommandCancelled):
+        asyncio.run(apps_api._run_until_disconnected(_LeavingClient(2), cancel, work))
+
+    assert cancel.is_set()
+    assert cleaned.is_set(), "answered before the worker had cleaned up"
+    assert time.monotonic() - started < 5
+
+
+def test_a_client_that_stays_gets_the_result_and_cancels_nothing() -> None:
+    import asyncio
+    import threading
+
+    cancel = threading.Event()
+
+    result = asyncio.run(
+        apps_api._run_until_disconnected(_LeavingClient(10_000), cancel, lambda: "done")
+    )
+
+    assert result == "done"
+    assert not cancel.is_set()
+
+
+def test_the_endpoint_answers_499_once_the_cancelled_inspection_stopped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nobody reads it; the access log says the client closed the request."""
+    import asyncio
+
+    from wasm.core.runner import CommandCancelled
+
+    def inspected(source: str, *, branch: str | None = None, cancel: Any = None) -> Any:
+        assert cancel is not None and cancel.wait(timeout=10)
+        raise CommandCancelled("Inspection cancelled")
+
+    monkeypatch.setattr(apps_api, "inspect_source", inspected)
+    body = apps_api.InspectSourceRequest(source="https://example.com/app.git")
+
+    response = asyncio.run(
+        apps_api.inspect_app_source(body, _LeavingClient(1), {"type": "master"})  # type: ignore[arg-type]
+    )
+
+    assert response.status_code == 499

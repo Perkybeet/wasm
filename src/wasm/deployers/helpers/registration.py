@@ -54,8 +54,9 @@ class StoreRegistrar:
 
         The row is rebuilt from what this deployment knows, so everything it
         does not know is carried over from the existing row: the layout, the
-        release retention, the persistent paths and the resource limits are
-        the application's settings, not something a redeploy may reset.
+        release retention, the persistent paths, the resource limits and the
+        health check are the application's settings, not something a
+        redeploy may reset.
 
         Args:
             domain: Natural key of the application.
@@ -113,6 +114,9 @@ class StoreRegistrar:
             app.memory_max_mb = existing.memory_max_mb
             app.cpu_quota_percent = existing.cpu_quota_percent
             app.tasks_max = existing.tasks_max
+            app.health_path = existing.health_path
+            app.health_expect = existing.health_expect
+            app.health_timeout = existing.health_timeout
         if layout is not None:
             app.layout = layout
         if persistent_paths is not None:

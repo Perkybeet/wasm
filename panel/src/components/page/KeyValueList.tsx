@@ -46,7 +46,7 @@ export function KeyValueList({ items, empty = "Not set", className }: KeyValueLi
         return (
           <div
             key={item.label}
-            className="group grid min-h-10 grid-cols-[minmax(6.5rem,30%)_minmax(0,1fr)] items-center gap-x-4 py-1.5"
+            className="group grid min-h-10 grid-cols-[minmax(6.5rem,min(30%,15rem))_minmax(0,1fr)] items-center gap-x-4 py-1.5"
           >
             <dt className="text-13 text-fg-muted">{item.label}</dt>
             <dd className="flex min-w-0 flex-col">
@@ -79,14 +79,34 @@ export function KeyValueList({ items, empty = "Not set", className }: KeyValueLi
   );
 }
 
-/** The loading shape of a KeyValueList: the same rows, the values still to come. */
-export function KeyValueListSkeleton({ rows = 4, className }: { rows?: number; className?: string }) {
+/**
+ * The loading shape of a KeyValueList: the same rows, the values still to come. `hints` names
+ * the rows (by index) that carry a note under the value, so each is as tall as it will be.
+ */
+export function KeyValueListSkeleton({
+  rows = 4,
+  hints = [],
+  className,
+}: {
+  rows?: number;
+  hints?: readonly number[];
+  className?: string;
+}) {
   return (
     <div aria-hidden="true" className={cx("flex flex-col divide-y divide-border", className)}>
       {Array.from({ length: rows }, (_, i) => (
-        <div key={i} className="grid min-h-10 grid-cols-[minmax(6.5rem,30%)_minmax(0,1fr)] items-center gap-x-4 py-1.5">
+        <div key={i} className="grid min-h-10 grid-cols-[minmax(6.5rem,min(30%,15rem))_minmax(0,1fr)] items-center gap-x-4 py-1.5">
           <Skeleton className="h-3 w-20" />
-          <Skeleton className={cx("h-3", i % 2 === 0 ? "w-32" : "w-24")} />
+          <div className="flex min-w-0 flex-col">
+            <div className="flex h-5 items-center">
+              <Skeleton className={cx("h-3", i % 2 === 0 ? "w-32" : "w-24")} />
+            </div>
+            {hints.includes(i) ? (
+              <div className="flex h-4 items-center">
+                <Skeleton className="h-2.5 w-48 max-w-full" />
+              </div>
+            ) : null}
+          </div>
         </div>
       ))}
     </div>

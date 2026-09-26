@@ -172,21 +172,28 @@ machine-readable output where supported.
 ## The console
 
 ```bash
-wasm web start            # listens on 127.0.0.1:8080 and prints an access token
+wasm web enable           # a systemd service on 127.0.0.1:8080; prints an access token
 ```
 
-The console listens on loopback unless you give it TLS. Reach it through an SSH tunnel:
+The console listens on loopback unless you give it TLS, so opening the server's address in a
+browser will not reach it. Reach it through an SSH tunnel from your own machine; the banner
+prints the exact line:
 
 ```bash
 ssh -L 8080:127.0.0.1:8080 root@server.example.com    # then open http://localhost:8080
 ```
 
+`wasm web enable` keeps it running: it writes `wasm-web.service`, which starts at boot and
+restarts on failure, and `wasm web disable` removes it. To try it first, `wasm web start`
+runs it in the foreground until Ctrl+C, and `wasm web start -d` in the background until
+`wasm web stop` or the next reboot. All three take the same options and print the access
+token the same way.
+
 To expose it, serve TLS (`--host 0.0.0.0 --tls-cert ... --tls-key ...`, or `--self-signed`),
 or put it behind a reverse proxy that terminates TLS and declare it with `--trusted-proxy`.
-Binding beyond loopback without TLS is refused unless you pass `--insecure-http`.
-`wasm web start -d` runs it in the background, printing its access token the same way a
-foreground start does. A running console reads the token from disk on every request, so
-`wasm web token --new` retires the old one at once, with no restart needed.
+Binding beyond loopback without TLS is refused unless you pass `--insecure-http`. A running
+console reads the token from disk on every request, so `wasm web token --new` retires the
+old one at once, with no restart needed.
 
 Sign in with the access token, plus a code when two-factor authentication is on
 (`wasm 2fa enroll`). Destructive actions ask you to confirm it is you (sudo mode) and stay
@@ -434,7 +441,7 @@ See [docs/security.md](docs/security.md), which also says how to report a vulner
 | `wasm config` | Read and set WASM's configuration |
 | `wasm store` | Inspect, export and maintain WASM's database |
 | **Console and access** | |
-| `wasm web` | Start, stop and inspect the console; issue its access token |
+| `wasm web` | Start, stop and inspect the console, or run it as a service; issue its access token |
 | `wasm token` | Create, list and revoke scoped API tokens |
 | `wasm sessions` | List and revoke console sessions |
 | `wasm 2fa` | Enrol, confirm, disable or recover two-factor authentication |

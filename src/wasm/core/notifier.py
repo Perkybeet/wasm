@@ -80,6 +80,7 @@ from urllib.request import Request
 from wasm import __version__
 from wasm.core.config import Config
 from wasm.core.exceptions import WASMError
+from wasm.validators.telegram import validate_telegram_chat_id
 
 if TYPE_CHECKING:
     from wasm.monitor.email_notifier import EmailNotifier
@@ -397,6 +398,30 @@ class NotificationEvent:
             raise ValueError(f"Unknown notification kind {self.kind!r}; expected one of: {known}")
 
 
+@dataclass(frozen=True)
+class TelegramChat:
+    """
+    One chat the configured Telegram bot has seen an update from.
+
+    Finding a chat id today means calling the Bot API's ``getUpdates`` by hand
+    and reading raw JSON; :meth:`Notifier.list_telegram_chats` is that lookup,
+    and this is one row of its answer.
+
+    Attributes:
+        id: The chat id - what ``notifications.channels.telegram.chat_id``
+            wants.
+        type: Telegram's own chat type: ``private``, ``group``,
+            ``supergroup`` or ``channel``.
+        title: The chat's own name, for a group, supergroup or channel.
+        username: The chat's, or the user's, ``@username``, when it has one.
+    """
+
+    id: int
+    type: str
+    title: str | None = None
+    username: str | None = None
+
+
 def _message_text(event: NotificationEvent) -> str:
     """
     Render the plain text the chat channels carry.
@@ -532,14 +557,16 @@ def _telegram_request(bot_token: str, chat_id: str, event: NotificationEvent) ->
         The request.
 
     Raises:
-        ValueError: When the token does not have the Bot API shape. The token
-            is never included in the message.
+        ValueError: When the token does not have the Bot API shape, or the
+            chat id does not look like one Telegram would recognise. Neither
+            is ever included in the message.
     """
     if not _TELEGRAM_TOKEN_RE.match(bot_token):
         raise ValueError(
             "notifications.channels.telegram.bot_token does not look like a "
             "Telegram bot token (expected <digits>:<secret>)"
         )
+    chat_id = validate_telegram_chat_id(chat_id)
     url = f"{_TELEGRAM_API}/bot{bot_token}/sendMessage"
     return _json_request(url, {"chat_id": chat_id, "text": _message_text(event)})
 
@@ -579,6 +606,97 @@ def _describe_error(exc: BaseException, *, include_body: bool = True) -> str:
     if isinstance(exc, URLError):
         return str(exc.reason)
     return str(exc)
+
+
+def _telegram_error_description(exc: HTTPError) -> str | None:
+    """
+    Read the Bot API's own ``description`` field out of a rejected request.
+
+    ``test_channel`` never echoes a remote response body back to the settings
+    page for any other channel - see :func:`_describe_error` - because that
+    URL is whatever the operator configured, and a reachable-but-not-quite
+    -blocked private destination could use the test button to read its own
+    answer back through the panel. ``api.telegram.org`` is not that: it is a
+    fixed, hardcoded host this module dials itself, never one the operator's
+    configuration can redirect elsewhere, so its own explanation of a 400 -
+    "Bad Request: chat not found" - is exactly the fact an operator needs to
+    fix a wrong chat id, not attacker-influenced content.
+
+    Args:
+        exc: The HTTP error the Bot API answered with.
+
+    Returns:
+        The ``description`` field, or None when the body is not the JSON
+        shape the Bot API always answers with.
+    """
+    try:
+        body = exc.read(2048).decode("utf-8", "replace")
+        data = json.loads(body)
+    except (OSError, ValueError):
+        return None
+    description = data.get("description") if isinstance(data, dict) else None
+    return description if isinstance(description, str) and description else None
+
+
+def _chat_from_update(update: dict[str, Any]) -> dict[str, Any] | None:
+    """
+    Find the ``chat`` object inside one ``getUpdates`` entry.
+
+    An update carries the chat under a different key depending on what kind
+    of update it is - ``message``, ``edited_message``, ``channel_post``,
+    ``my_chat_member`` and others all nest one - so every value is checked
+    rather than a fixed key, which would silently miss whichever update types
+    the Bot API adds next.
+
+    Args:
+        update: One entry of ``getUpdates``'s ``result``.
+
+    Returns:
+        The chat object, or None when this update carries none.
+    """
+    for value in update.values():
+        if not isinstance(value, dict):
+            continue
+        chat = value.get("chat")
+        if isinstance(chat, dict):
+            return chat
+    return None
+
+
+def _parse_telegram_chats(payload: Any) -> list[TelegramChat]:
+    """
+    Turn a ``getUpdates`` response into the chats it mentions.
+
+    Args:
+        payload: The Bot API's decoded JSON response.
+
+    Returns:
+        Every distinct chat found, in the order first seen.
+
+    Raises:
+        ValueError: When the response is not the Bot API's own success shape.
+    """
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        description = payload.get("description") if isinstance(payload, dict) else None
+        raise ValueError(description or "Telegram did not report success.")
+
+    seen: dict[int, TelegramChat] = {}
+    for update in payload.get("result") or []:
+        if not isinstance(update, dict):
+            continue
+        chat = _chat_from_update(update)
+        if chat is None:
+            continue
+        chat_id = chat.get("id")
+        if not isinstance(chat_id, int):
+            continue
+        seen[chat_id] = TelegramChat(
+            id=chat_id,
+            type=str(chat.get("type") or "unknown"),
+            title=chat.get("title"),
+            username=chat.get("username"),
+        )
+    return list(seen.values())
 
 
 class Notifier:
@@ -676,12 +794,64 @@ class Notifier:
         try:
             sent = self._dispatch(name, event, channels)
         except _DELIVERY_ERRORS as exc:
+            if name == "telegram" and isinstance(exc, HTTPError):
+                description = _telegram_error_description(exc)
+                if description:
+                    return _scrub(f"HTTP {exc.code} {exc.reason}: {description}", channels)
             # include_body=False: this string is rendered on the settings
-            # page, and the endpoint's response body is not ours to repeat.
+            # page, and the endpoint's response body is not ours to repeat -
+            # except for Telegram above, whose host is not the operator's to
+            # redirect.
             return _scrub(_describe_error(exc, include_body=False), channels)
         if not sent:
             return f"Channel {name} is not configured; set {_SETTING_HINTS[name]} first."
         return None
+
+    def list_telegram_chats(self) -> list[TelegramChat]:
+        """
+        List the chats the configured Telegram bot has seen.
+
+        Finding a chat id today means opening the Bot API's ``getUpdates`` URL
+        by hand and reading raw JSON. This is that lookup, using the bot token
+        already saved, through the same HTTP path - and so the same SSRF
+        guard and timeout - as every other channel; ``api.telegram.org`` is
+        fixed and always public, so the guard is a formality here, but one
+        chokepoint means it is never a decision a new caller has to remember
+        to make again.
+
+        Telegram only queues an update the bot has not already been asked
+        for, so a chat will not appear here until it has sent the bot a
+        message, or the bot has been added to it, since the last time this
+        was called (or the token's webhook, if any, last polled it).
+
+        Returns:
+            Every chat found, deduplicated by chat id.
+
+        Raises:
+            ValueError: When no bot token is configured, or the Bot API's
+                response could not be parsed as its own success shape.
+            OSError: When the Bot API could not be reached or answered with
+                an HTTP error.
+        """
+        channels: dict[str, Any] = self._settings().get("channels") or {}
+        telegram: dict[str, Any] = channels.get("telegram") or {}
+        bot_token = str(telegram.get("bot_token") or "")
+        if not bot_token:
+            raise ValueError(_SETTING_HINTS["telegram"] + " must be set first.")
+        if not _TELEGRAM_TOKEN_RE.match(bot_token):
+            raise ValueError(
+                "notifications.channels.telegram.bot_token does not look like a "
+                "Telegram bot token (expected <digits>:<secret>)"
+            )
+
+        url = f"{_TELEGRAM_API}/bot{bot_token}/getUpdates"
+        _require_public_destination(url, self._config)
+        request = Request(url, headers={"User-Agent": USER_AGENT})
+        with self._opener(request, timeout=NOTIFY_TIMEOUT) as response:
+            body = response.read()
+
+        payload = json.loads(body.decode("utf-8", "replace"))
+        return _parse_telegram_chats(payload)
 
     def _settings(self) -> dict[str, Any]:
         """

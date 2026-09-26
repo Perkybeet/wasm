@@ -568,10 +568,18 @@ export function TwoFactorSection() {
     body = (
       <div aria-busy="true" className="flex gap-3 rounded-card border border-border bg-surface p-5 shadow-raised">
         <span className="sr-only">Loading the two-factor state</span>
-        <Skeleton className="size-5" />
-        <div className="flex flex-1 flex-col gap-2">
-          <Skeleton className="h-4 w-16" />
-          <Skeleton className="h-3 w-72 max-w-full" />
+        {/* The "On" state's lines, the one a hardened console shows: state, meaning, codes left. */}
+        <Skeleton className="mt-0.5 size-5" />
+        <div aria-hidden="true" className="flex flex-1 flex-col gap-0.5">
+          <div className="flex h-5 items-center">
+            <Skeleton className="h-3.5 w-16" />
+          </div>
+          <div className="flex h-5 items-center">
+            <Skeleton className="h-3 w-72 max-w-full" />
+          </div>
+          <div className="mt-1 flex h-5 items-center">
+            <Skeleton className="h-3 w-40" />
+          </div>
         </div>
       </div>
     );

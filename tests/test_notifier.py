@@ -28,7 +28,7 @@ import ipaddress
 import json
 import logging
 from pathlib import Path
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request
 
 import pytest
@@ -42,6 +42,7 @@ from wasm.core.notifier import (
     USER_AGENT,
     NotificationEvent,
     Notifier,
+    validate_telegram_chat_id,
 )
 
 #: The documented shape of a Bot API token: ``<bot id>:<secret>``.
@@ -358,6 +359,53 @@ class TestTelegramChannel:
         assert opener.requests == []
         assert "telegram" in caplog.text
 
+    def test_a_malformed_chat_id_is_refused_before_it_reaches_telegram(
+        self, config: Config, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A chat id that is not the Bot API's shape never becomes a request."""
+        config.set("notifications.enabled", True)
+        config.set("notifications.channels.telegram.bot_token", BOT_TOKEN)
+        # Written by an older version, before the config refused it on save.
+        config._config["notifications"]["channels"]["telegram"]["chat_id"] = "not-a-chat-id"
+        opener = CapturingOpener()
+
+        with caplog.at_level(logging.WARNING, logger="wasm.core.notifier"):
+            Notifier(config, opener=opener).notify(make_event())
+
+        assert opener.requests == []
+        assert "telegram" in caplog.text
+
+
+class TestTelegramChatIdValidation:
+    """
+    The regression: a supergroup id copied without its leading minus fails
+    with Telegram's own "chat not found" and nothing points at the missing
+    character.
+    """
+
+    @pytest.mark.parametrize("value", ["42", "-1002003004005", "0", "@some_channel"])
+    def test_accepts_the_documented_shapes(self, value: str) -> None:
+        assert validate_telegram_chat_id(value) == value
+
+    def test_refuses_an_arbitrary_string(self) -> None:
+        with pytest.raises(ValueError, match="not a Telegram chat id"):
+            validate_telegram_chat_id("not-a-chat-id")
+
+    def test_a_channel_username_must_start_with_at(self) -> None:
+        with pytest.raises(ValueError):
+            validate_telegram_chat_id("some_channel")
+
+    def test_suggests_the_missing_minus_sign(self) -> None:
+        """A positive, 13+ digit id starting with 100 is a channel id missing its sign."""
+        with pytest.raises(ValueError) as raised:
+            validate_telegram_chat_id("1002003004005")
+
+        assert "-1002003004005" in str(raised.value)
+
+    def test_a_short_positive_id_is_not_flagged_as_missing_a_sign(self) -> None:
+        """A private chat id is a plain positive integer; it must not be second-guessed."""
+        assert validate_telegram_chat_id("100200") == "100200"
+
 
 class TestTestChannel:
     """The settings-page button: try one channel, get the truth back."""
@@ -404,6 +452,68 @@ class TestTestChannel:
 
         assert result is not None
         assert "pigeon" in result
+
+    def test_a_telegram_400_includes_its_own_description(self, config: Config) -> None:
+        """
+        The regression: a test send that answered 400 only ever showed "HTTP
+        400 Bad Request". ``api.telegram.org`` is fixed and known, unlike an
+        operator's own webhook URL, so its own explanation is safe to show.
+        """
+        config.set("notifications.channels.telegram.bot_token", BOT_TOKEN)
+        config.set("notifications.channels.telegram.chat_id", "-1002003004005")
+        opener = CapturingOpener()
+        body = json.dumps(
+            {"ok": False, "error_code": 400, "description": "Bad Request: chat not found"}
+        ).encode()
+        opener.errors["https://api.telegram.org"] = HTTPError(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(body),
+        )
+
+        result = Notifier(config, opener=opener).test_channel("telegram")
+
+        assert result == "HTTP 400 Bad Request: Bad Request: chat not found"
+        assert BOT_TOKEN not in result
+
+    def test_a_telegram_error_without_json_falls_back_to_the_bare_status(
+        self, config: Config
+    ) -> None:
+        """A response that is not the Bot API's JSON shape must not crash the lookup."""
+        config.set("notifications.channels.telegram.bot_token", BOT_TOKEN)
+        config.set("notifications.channels.telegram.chat_id", "-1002003004005")
+        opener = CapturingOpener()
+        opener.errors["https://api.telegram.org"] = HTTPError(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            502,
+            "Bad Gateway",
+            {},
+            io.BytesIO(b"<html>not json</html>"),
+        )
+
+        result = Notifier(config, opener=opener).test_channel("telegram")
+
+        assert result == "HTTP 502 Bad Gateway"
+
+    def test_a_non_telegram_400_never_echoes_the_body(self, config: Config) -> None:
+        """The SSRF rule still holds: an operator's own webhook body is never reflected."""
+        config.set("notifications.channels.webhook.webhook_url", WEBHOOK_URL)
+        opener = CapturingOpener()
+        opener.errors["https://hooks.example.test"] = HTTPError(
+            WEBHOOK_URL,
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(b'{"description": "secret internal detail"}'),
+        )
+
+        result = Notifier(config, opener=opener).test_channel("webhook")
+
+        assert result == "HTTP 400 Bad Request"
+        assert result is not None
+        assert "secret internal detail" not in result
 
 
 class FakeEmailNotifier:
@@ -576,3 +686,113 @@ class TestSSRFGuard:
         """A resolved embedded address that is genuinely public must still pass."""
         monkeypatch.setattr(notifier_module, "_resolve_host", lambda host: ("::ffff:8.8.8.8",))
         notifier_module._require_public_destination("http://dns.example.test/hook", config)
+
+
+class _JsonOpener:
+    """A minimal opener answering every request with the same fixed body."""
+
+    def __init__(self, body: bytes) -> None:
+        """
+        Args:
+            body: What every call returns as the response body.
+        """
+        self.body = body
+        self.requests: list[Request] = []
+
+    def __call__(self, request: Request, timeout: float | None = None) -> io.BytesIO:
+        """
+        Args:
+            request: The request the notifier built.
+            timeout: Ignored; recorded by the caller's signature only.
+
+        Returns:
+            The scripted body.
+        """
+        self.requests.append(request)
+        return io.BytesIO(self.body)
+
+
+class TestTelegramChats:
+    """
+    Finding a chat id today means opening the Bot API's getUpdates by hand.
+    :meth:`Notifier.list_telegram_chats` is that lookup, reusing the bot token
+    already saved and the same HTTP path - and SSRF guard - as sending one.
+    """
+
+    def _configure(self, config: Config) -> None:
+        config.set("notifications.channels.telegram.bot_token", BOT_TOKEN)
+
+    def test_lists_every_distinct_chat_id_first_seen(self, config: Config) -> None:
+        self._configure(config)
+        payload = {
+            "ok": True,
+            "result": [
+                {
+                    "update_id": 1,
+                    "message": {
+                        "chat": {
+                            "id": 123,
+                            "type": "private",
+                            "username": "ops",
+                            "first_name": "Ops",
+                        }
+                    },
+                },
+                {
+                    "update_id": 2,
+                    "channel_post": {
+                        "chat": {"id": -1001234567890, "type": "channel", "title": "Ops Room"}
+                    },
+                },
+                # Same chat again, from a later update: reported once.
+                {
+                    "update_id": 3,
+                    "message": {"chat": {"id": 123, "type": "private", "username": "ops"}},
+                },
+            ],
+        }
+        opener = _JsonOpener(json.dumps(payload).encode())
+
+        chats = Notifier(config, opener=opener).list_telegram_chats()
+
+        assert [chat.id for chat in chats] == [123, -1001234567890]
+        assert chats[0].type == "private"
+        assert chats[0].username == "ops"
+        assert chats[1].title == "Ops Room"
+        assert opener.requests[0].full_url == f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+
+    def test_refuses_when_no_token_is_configured(self, config: Config) -> None:
+        with pytest.raises(ValueError, match="bot_token"):
+            Notifier(config, opener=_JsonOpener(b"{}")).list_telegram_chats()
+
+    def test_refuses_a_malformed_token_before_any_request(self, config: Config) -> None:
+        config.set("notifications.channels.telegram.bot_token", "junk/../../evil")
+        opener = _JsonOpener(b"{}")
+
+        with pytest.raises(ValueError, match="does not look like"):
+            Notifier(config, opener=opener).list_telegram_chats()
+
+        assert opener.requests == []
+
+    def test_a_telegram_failure_is_reported_in_its_own_words(self, config: Config) -> None:
+        self._configure(config)
+        opener = _JsonOpener(json.dumps({"ok": False, "description": "Unauthorized"}).encode())
+
+        with pytest.raises(ValueError, match="Unauthorized"):
+            Notifier(config, opener=opener).list_telegram_chats()
+
+    def test_updates_with_no_chat_are_skipped_not_crashed_on(self, config: Config) -> None:
+        self._configure(config)
+        payload = {
+            "ok": True,
+            "result": [{"update_id": 1, "my_chat_member": {"new_chat_member": {}}}],
+        }
+        opener = _JsonOpener(json.dumps(payload).encode())
+
+        assert Notifier(config, opener=opener).list_telegram_chats() == []
+
+    def test_no_updates_yet_is_an_empty_list_not_an_error(self, config: Config) -> None:
+        self._configure(config)
+        opener = _JsonOpener(json.dumps({"ok": True, "result": []}).encode())
+
+        assert Notifier(config, opener=opener).list_telegram_chats() == []

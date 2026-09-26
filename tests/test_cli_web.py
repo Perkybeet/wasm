@@ -125,6 +125,25 @@ def _write_web_config(path: Path, **settings: Any) -> None:
     Config.reset_instance()
 
 
+@pytest.fixture(autouse=True)
+def no_console_service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Point the directory ``wasm-web.service`` is looked up in at an empty one.
+
+    Every start asks whether the console already runs as that service; on a
+    developer machine that ran ``wasm web enable``, the real unit would answer.
+
+    Args:
+        tmp_path: Per-test temporary directory.
+        monkeypatch: Patching helper, scoped to the test.
+    """
+    from wasm.managers.service_manager import ServiceManager
+
+    managed = tmp_path / "systemd-units"
+    managed.mkdir()
+    monkeypatch.setattr(ServiceManager, "SYSTEMD_DIR", managed)
+
+
 @pytest.fixture
 def cli_runner() -> CliRunner:
     """
@@ -177,17 +196,21 @@ def started(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """
     captured: dict[str, Any] = {}
 
-    def foreground(config: Any, *, insecure_http: bool = False) -> int:
+    def foreground(config: Any, *, insecure_http: bool = False, options: Any = None) -> int:
         captured["config"] = config
         captured["mode"] = "foreground"
         captured["insecure_http"] = insecure_http
+        captured["options"] = options
         return 0
 
-    def daemon(config: Any, verbose: bool, *, insecure_http: bool = False) -> int:
+    def daemon(
+        config: Any, verbose: bool, *, insecure_http: bool = False, options: Any = None
+    ) -> int:
         captured["config"] = config
         captured["mode"] = "daemon"
         captured["verbose"] = verbose
         captured["insecure_http"] = insecure_http
+        captured["options"] = options
         return 0
 
     monkeypatch.setattr(web, "_start_foreground", foreground)
@@ -1326,7 +1349,11 @@ def test_status_json_reports_a_stopped_panel(cli_runner: CliRunner, pid_file: Pa
     result = cli_runner.invoke(web.cli, ["status", "--json"])
 
     assert result.exit_code == 0, result.output
-    assert json.loads(result.output) == {"status": "not running"}
+    assert json.loads(result.output) == {
+        "status": "not running",
+        "mode": None,
+        "service": {"unit": "wasm-web.service", "installed": False},
+    }
 
 
 def test_status_json_reports_a_running_panel(cli_runner: CliRunner, pid_file: Path) -> None:

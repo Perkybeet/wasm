@@ -16,13 +16,14 @@ here unchanged; :mod:`wasm.cli.commands.health` now only formats and prints
 from __future__ import annotations
 
 import shutil
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
 
 from wasm.core.app_state import RUNNING, STATIC, resolve_states
 from wasm.core.config import Config
 from wasm.core.exceptions import WASMError
-from wasm.core.store import get_store
+from wasm.core.store import WebServer, get_store
 from wasm.managers.apache_manager import ApacheManager
 from wasm.managers.cert_manager import CertificateInfo, CertManager
 from wasm.managers.nginx_manager import NginxManager
@@ -226,9 +227,18 @@ def _check_web_servers(
     if apache_installed:
         if apache.get_status().get("active"):
             apache_check = HealthCheck("Apache", "Running", "ok")
-        else:
+        elif _apache_has_a_site(apache):
             warnings.append("Apache is installed but not running")
             apache_check = HealthCheck("Apache", "Stopped", "warning")
+        else:
+            # The package is present - systemd loads its unit - but nothing on
+            # this server is configured to run on it. That is not an
+            # operator's problem the way a stopped, in-use server is: it is
+            # what "apache2 is not installed" looked like before is_installed
+            # asked the binary on PATH instead of the unit, and a stray
+            # apache2ctl or a package pulled in as a dependency must not read
+            # as an outage.
+            apache_check = HealthCheck("Apache", "Stopped (not in use)", "info")
     else:
         apache_check = HealthCheck("Apache", "Not installed", "info")
 
@@ -236,6 +246,32 @@ def _check_web_servers(
         issues.append("No web server installed")
 
     return nginx_check, apache_check
+
+
+def _apache_has_a_site(apache: ApacheManager) -> bool:
+    """
+    Report whether anything is actually configured to run on Apache.
+
+    Apache being installed is a fact about the package; this is the fact that
+    decides whether a stopped Apache is an operator's problem. A distribution
+    that installs it as a dependency of something else, never enabled and
+    serving nothing, must not be reported the same way as a real site that
+    stopped answering.
+
+    Args:
+        apache: The Apache manager to read sites from.
+
+    Returns:
+        True when a site is enabled in Apache's ``sites-enabled``, or a
+        deployed application records Apache as its web server.
+    """
+    if any(site.enabled for site in apache.list_sites()):
+        return True
+    try:
+        apps = get_store().list_apps()
+    except (WASMError, sqlite3.Error):
+        return False
+    return any(app.webserver == WebServer.APACHE.value for app in apps)
 
 
 def _check_applications(verbose: bool, warnings: list[str]) -> HealthCheck:
@@ -296,7 +332,14 @@ def _check_certificates(verbose: bool, issues: list[str], warnings: list[str]) -
 
     try:
         certs = cert_manager.list_certificates()
-        expiring_soon = []
+        expired: list[str] = []
+        expiring_soon: list[str] = []
+        # Tracked apart from `expiring_soon` (which also holds a cert that is
+        # merely close, not gone) so the check's own status can be "error"
+        # exactly when the verdict this feeds is: a certificate under
+        # CERT_CRITICAL_DAYS is as urgent as one already expired, even though
+        # neither is "expired" in the strict sense.
+        critical = False
 
         for cert in certs:
             expiry = cert.get("expiry")
@@ -311,19 +354,23 @@ def _check_certificates(verbose: bool, issues: list[str], warnings: list[str]) -
                 continue
 
             label = _certificate_label(cert)
-            if days_left < CERT_CRITICAL_DAYS:
+            if days_left < 0:
+                issues.append(f"Certificate for {label} expired {abs(days_left)} days ago")
+                expired.append(label)
+                critical = True
+            elif days_left < CERT_CRITICAL_DAYS:
                 issues.append(f"Certificate for {label} expires in {days_left} days")
                 expiring_soon.append(label)
+                critical = True
             elif days_left < CERT_WARNING_DAYS:
                 warnings.append(f"Certificate for {label} expires in {days_left} days")
                 expiring_soon.append(label)
 
-        if expiring_soon:
-            return HealthCheck(
-                "SSL Certificates",
-                f"{len(certs)} total, {len(expiring_soon)} expiring soon",
-                "warning",
+        if expired or expiring_soon:
+            value = (
+                f"{len(certs)} total, {len(expired)} expired, {len(expiring_soon)} expiring soon"
             )
+            return HealthCheck("SSL Certificates", value, "error" if critical else "warning")
         if certs:
             return HealthCheck("SSL Certificates", f"{len(certs)} total, all valid", "ok")
         return HealthCheck("SSL Certificates", "None configured", "info")

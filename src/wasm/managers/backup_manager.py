@@ -90,7 +90,7 @@ from wasm.core.fs import (
 )
 from wasm.core.logger import Logger
 from wasm.core.runner import DEFAULT_TIMEOUT, CommandResult, CommandRunner, get_runner
-from wasm.core.store import AppType, DeploymentTrigger, get_store
+from wasm.core.store import AppType, DeploymentStatus, DeploymentTrigger, get_store
 from wasm.core.utils import domain_to_app_name
 from wasm.deployers.helpers.layout import RELEASES, env_file_in, layout_on_disk
 from wasm.deployers.helpers.permissions import hand_over_tree
@@ -3144,12 +3144,58 @@ class RollbackManager:
             self.logger.debug(f"No existing app to backup: {domain}")
             return None
 
-        return self.backup_manager.create(
+        backup = self.backup_manager.create(
             domain=domain,
             description=description,
             include_env=True,
             tags=["pre-deploy", "auto"],
         )
+        # On releases the previous build stays on disk as a release, which is
+        # what going back to a deployment activates; only in place is this
+        # backup the one copy of what the previous deployment produced.
+        if (
+            backup is not None
+            and not self.backup_manager._rehearsing
+            and layout_on_disk(app_path) != RELEASES
+        ):
+            self._link_snapshot(domain, backup)
+        return backup
+
+    def _link_snapshot(self, domain: str, backup: BackupMetadata) -> None:
+        """
+        Record a pre-deploy backup as the snapshot of the deployment it holds.
+
+        The tree being backed up is what the most recent finished deployment
+        left, provided it succeeded: after a failed one the tree is whatever
+        the failure left behind, which is nobody's snapshot. The commit, when
+        both sides know it, must agree too, so a tree changed by hand since is
+        not passed off as the deployment's.
+
+        Args:
+            domain: The application's domain.
+            backup: The backup just taken.
+        """
+        store = get_store()
+        unfinished = {DeploymentStatus.QUEUED.value, DeploymentStatus.RUNNING.value}
+        try:
+            for record in store.list_deployments(domain, limit=20):
+                # The operation taking this backup may already be recording.
+                if record.status in unfinished:
+                    continue
+                if record.status != DeploymentStatus.SUCCESS.value or record.id is None:
+                    return
+                if backup.git_commit and record.git_commit:
+                    short = min(len(backup.git_commit), len(record.git_commit))
+                    if backup.git_commit[:short] != record.git_commit[:short]:
+                        return
+                store.set_deployment_snapshot(record.id, backup.id)
+                self.logger.debug(f"Backup {backup.id} holds deployment {record.id}")
+                return
+        except (WASMError, sqlite3.Error) as exc:
+            # The backup exists and serves its purpose; only the link to the
+            # deployment it holds is missing, which costs that deployment its
+            # one-step rollback.
+            self.logger.warning(f"Could not link backup {backup.id} to its deployment: {exc}")
 
     def rollback(
         self,

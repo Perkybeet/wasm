@@ -38,7 +38,7 @@ export function ConnectionString({ engine, database }: { engine: string; databas
       description="Built from a username and password you already have. WASM reads nothing from the server to make it."
     >
       <div className="flex flex-col gap-4 rounded-card border border-border bg-surface p-4 shadow-raised">
-        <form onSubmit={submit} className="grid gap-3 sm:grid-cols-3">
+        <form onSubmit={submit} className="grid max-w-4xl gap-3 sm:grid-cols-3">
           <Field label="Username">
             <Input mono value={username} onValueChange={setUsername} autoComplete="off" spellCheck={false} />
           </Field>

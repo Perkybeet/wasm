@@ -35,6 +35,7 @@ from wasm.core.config import (
     DEFAULT_BACKUP_DIR,
     DEFAULT_CONFIG,
     NO_DEFAULT,
+    REDACTED,
     Config,
     coerce_config_value,
     redact_secrets,
@@ -42,6 +43,7 @@ from wasm.core.config import (
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import WASMErrorRoute, require_elevated
 from wasm.web.auth import actor_label, get_audit_logger, get_client_ip
+from wasm.web.pydantic_compat import field_validator
 
 if TYPE_CHECKING:
     from wasm.core.notifier import Notifier
@@ -225,6 +227,43 @@ class WebConfig(BaseModel):
     session_timeout: int = Field(3600, ge=300, le=86400, description="Session timeout in seconds")
 
 
+class SMTPConfig(BaseModel):
+    """
+    SMTP settings for the monitor's email notifications and test message.
+
+    ``password`` is write-only: it is never sent back by ``GET /config/smtp``
+    (see :class:`SMTPSettingsResponse`), so unlike a secret round-tripped
+    through the generic ``PUT``/``PATCH /api/config`` there is no
+    :data:`~wasm.core.config.REDACTED` placeholder for the console to echo
+    back untouched. Instead an empty ``password`` keeps whatever is already
+    stored, the same as leaving a webhook URL field blank leaves its channel
+    alone - only a non-empty value replaces it. There is no way to explicitly
+    blank the password through this endpoint; ``wasm config set
+    monitor.smtp.password ''`` still does that directly.
+    """
+
+    host: str = Field("", description="SMTP server hostname; empty means not configured")
+    port: int = Field(465, ge=1, le=65535, description="SMTP server port")
+    use_ssl: bool = Field(True, description="Connect with implicit TLS (SMTPS), usually port 465")
+    use_tls: bool = Field(
+        False,
+        description="Connect in the clear and upgrade with STARTTLS, usually port 587",
+    )
+    username: str = Field(
+        "", description="Account to authenticate with; empty for an anonymous relay"
+    )
+    password: str = Field(
+        "", description="Password for that account; leave blank to keep the one already stored"
+    )
+    from_address: str = Field(
+        "", description="Envelope sender address; falls back to the username when empty"
+    )
+    recipients: list[str] = Field(
+        default_factory=list,
+        description="Addresses the monitor's reports and test message are sent to",
+    )
+
+
 # ============ Response-only models ============
 #
 # Every model below answers a GET or confirms a write. None of them is also
@@ -313,6 +352,27 @@ class WebSettingsResponse(BaseModel):
     host: str
     port: int
     session_timeout: int
+
+
+class SMTPSettingsResponse(BaseModel):
+    """
+    The configured SMTP settings.
+
+    ``password`` is not a field here at all, redacted or otherwise: unlike
+    ``GET /api/config``'s untyped dump, this endpoint never sends the password
+    out, so there is nothing to redact and no ``***`` for a form to treat as
+    "leave alone". ``password_set`` is what a console form uses instead, to
+    show "a password is configured" without ever holding the value.
+    """
+
+    host: str
+    port: int
+    use_ssl: bool
+    use_tls: bool
+    username: str
+    from_address: str
+    recipients: list[str]
+    password_set: bool
 
 
 # ============ Endpoints ============
@@ -670,6 +730,82 @@ def update_web_config(
     return MessageResponse(message="Web configuration updated (restart required)")
 
 
+@router.get("/smtp", response_model=SMTPSettingsResponse)
+def get_smtp_config(session: dict = Depends(get_current_session)) -> SMTPSettingsResponse:
+    """
+    Get the monitor's SMTP settings.
+
+    Args:
+        session: Authenticated session, injected by the dependency.
+
+    Returns:
+        The configured server, transport, account and recipients, and whether
+        a password is stored - never the password itself.
+    """
+    config = load_config()
+    smtp_defaults: dict[str, Any] = DEFAULT_CONFIG["monitor"]["smtp"]
+    return SMTPSettingsResponse(
+        host=config.get("monitor.smtp.host", smtp_defaults["host"]),
+        port=config.get("monitor.smtp.port", smtp_defaults["port"]),
+        use_ssl=config.get("monitor.smtp.use_ssl", smtp_defaults["use_ssl"]),
+        use_tls=config.get("monitor.smtp.use_tls", smtp_defaults["use_tls"]),
+        username=config.get("monitor.smtp.username", smtp_defaults["username"]),
+        from_address=config.get("monitor.smtp.from_address", smtp_defaults["from_address"]),
+        recipients=config.get("monitor.email_recipients", []),
+        password_set=bool(config.get("monitor.smtp.password", "")),
+    )
+
+
+@router.put("/smtp", response_model=MessageResponse)
+def update_smtp_config(
+    body: SMTPConfig,
+    request: Request,
+    session: dict = Depends(require_elevated),
+) -> MessageResponse:
+    """
+    Update the monitor's SMTP settings.
+
+    Goes through :meth:`~wasm.core.config.Config.set`, so the same rule 'wasm
+    config set monitor.smtp.*' enforces - a hostname for ``host``, a port in
+    range, ``use_ssl`` and ``use_tls`` not both on, a valid address for
+    ``from_address`` and every recipient - rejects a value here too, in the
+    same words. An empty ``password`` is translated to the
+    :data:`~wasm.core.config.REDACTED` placeholder before the write, which is
+    what actually keeps the stored password: see :class:`SMTPConfig`.
+
+    Args:
+        body: Body carrying the SMTP settings.
+        request: The incoming request, for the audit record.
+        session: Authenticated session, injected by the dependency.
+
+    Returns:
+        Confirmation message.
+
+    Raises:
+        ConfigError: 400, through the error boundary, for a host that is not
+            a hostname, a port out of range, both ``use_ssl`` and ``use_tls``
+            enabled, or an invalid ``from_address`` or recipient.
+        HTTPException: If the configuration cannot be written.
+    """
+    config = load_config()
+    config.set(
+        "monitor.smtp",
+        {
+            "host": body.host,
+            "port": body.port,
+            "use_ssl": body.use_ssl,
+            "use_tls": body.use_tls,
+            "username": body.username,
+            "password": body.password if body.password else REDACTED,
+            "from_address": body.from_address,
+        },
+    )
+    config.set("monitor.email_recipients", body.recipients)
+    persist(config)
+    _audit_write(request, session, changed=["monitor"])
+    return MessageResponse(message="SMTP configuration updated")
+
+
 @router.post("/reload", response_model=ConfigReloadResponse)
 def reload_config(session: dict = Depends(get_current_session)) -> ConfigReloadResponse:
     """
@@ -702,6 +838,112 @@ def get_defaults(session: dict = Depends(get_current_session)) -> dict[str, Any]
     """
     defaults: dict[str, Any] = redact_secrets(DEFAULT_CONFIG)
     return defaults
+
+
+class TelegramConfig(BaseModel):
+    """
+    Telegram bot settings for notifications.
+
+    ``bot_token`` is write-only, the same rule :class:`SMTPConfig` follows for
+    a password: it is never sent back by ``GET .../telegram`` (see
+    :class:`TelegramSettingsResponse`), and an empty value on a write keeps
+    whatever is already stored rather than clearing it.
+    """
+
+    bot_token: str = Field(
+        "", description="Bot API token; leave blank to keep the one already stored"
+    )
+    chat_id: str = Field("", description="Destination chat: an integer id, or an @channel username")
+
+    @field_validator("chat_id")
+    @classmethod
+    def _chat_id_telegram_would_accept(cls, value: str) -> str:
+        """
+        Refuse here what Telegram would refuse, with the likely mistake named.
+
+        Empty is left alone: it means "not set yet", which is how a bot token
+        can be saved before its chat id is known - :meth:`Notifier.list_telegram_chats`
+        exists for finding that id, and needs only the token.
+
+        Args:
+            value: The chat id as it arrived.
+
+        Returns:
+            The value unchanged.
+
+        Raises:
+            ValueError: When it is neither an integer id nor an
+                ``@channelname``. A positive id of 13 or more digits starting
+                with ``100`` is named as what it almost certainly is: a
+                supergroup or channel id missing its leading minus. FastAPI
+                answers this as a 422 with the message as detail.
+        """
+        if not value:
+            return value
+        from wasm.validators.telegram import validate_telegram_chat_id
+
+        return validate_telegram_chat_id(value)
+
+
+class TelegramSettingsResponse(BaseModel):
+    """The configured Telegram channel. ``bot_token`` is never sent back."""
+
+    chat_id: str
+    bot_token_set: bool
+
+
+@router.get("/notifications/telegram", response_model=TelegramSettingsResponse)
+def get_telegram_config(session: dict = Depends(get_current_session)) -> TelegramSettingsResponse:
+    """
+    Get the configured Telegram channel, without its bot token.
+
+    Args:
+        session: Authenticated session, injected by the dependency.
+
+    Returns:
+        The configured chat id and whether a bot token is stored.
+    """
+    config = load_config()
+    return TelegramSettingsResponse(
+        chat_id=config.get("notifications.channels.telegram.chat_id", ""),
+        bot_token_set=bool(config.get("notifications.channels.telegram.bot_token", "")),
+    )
+
+
+@router.put("/notifications/telegram", response_model=MessageResponse)
+def update_telegram_config(
+    body: TelegramConfig,
+    request: Request,
+    session: dict = Depends(require_elevated),
+) -> MessageResponse:
+    """
+    Update the Telegram channel's bot token and chat id.
+
+    The chat id is validated against the shape Telegram's Bot API accepts
+    before it is ever written - see :class:`TelegramConfig` - which is what
+    turns a missing minus sign into an error naming the fix at save time
+    instead of a "chat not found" the next time a deploy tries to notify.
+
+    Args:
+        body: Body carrying the bot token and chat id.
+        request: The incoming request, for the audit record.
+        session: Authenticated session, injected by the dependency.
+
+    Returns:
+        Confirmation message.
+
+    Raises:
+        HTTPException: If the configuration cannot be written.
+    """
+    config = load_config()
+    bot_token = body.bot_token or config.get("notifications.channels.telegram.bot_token", "")
+    config.set(
+        "notifications.channels.telegram",
+        {"bot_token": bot_token, "chat_id": body.chat_id},
+    )
+    persist(config)
+    _audit_write(request, session, changed=["notifications"])
+    return MessageResponse(message="Telegram configuration updated")
 
 
 class NotificationTestResult(BaseModel):
@@ -757,3 +999,56 @@ def test_notification_channel(
     if error is None:
         return NotificationTestResult(ok=True, detail=f"Test message sent through {channel}.")
     return NotificationTestResult(ok=False, detail=error)
+
+
+class TelegramChatOut(BaseModel):
+    """One chat the configured Telegram bot has seen, as the panel shows it."""
+
+    id: int
+    type: str
+    title: str | None = None
+    username: str | None = None
+
+
+class TelegramChatsResult(BaseModel):
+    """Every chat :meth:`~wasm.core.notifier.Notifier.list_telegram_chats` found."""
+
+    chats: list[TelegramChatOut]
+
+
+@router.post("/notifications/telegram/chats", response_model=TelegramChatsResult)
+def list_telegram_chats(session: dict = Depends(get_current_session)) -> TelegramChatsResult:
+    """
+    List the chats the configured Telegram bot has seen.
+
+    Finding a chat id today means opening the Bot API's ``getUpdates`` URL by
+    hand and reading raw JSON, or asking an assistant to do it. This is that
+    lookup, using the bot token already saved, over the notifier's own HTTP
+    path - the same SSRF guard and timeout as every other channel.
+
+    Plain ``get_current_session``, not :func:`require_elevated`: this only
+    reads what Telegram has queued for the bot, the same reasoning
+    :func:`test_notification_channel` already applies to sending a message -
+    neither one changes anything WASM manages.
+
+    Args:
+        session: Authenticated session, injected by the dependency.
+
+    Returns:
+        Every chat found.
+
+    Raises:
+        HTTPException: 400 when no bot token is configured, the token does
+            not have the Bot API's shape, or the Bot API could not be reached
+            or answered with an error - in its own words.
+    """
+    try:
+        chats = _build_notifier().list_telegram_chats()
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return TelegramChatsResult(
+        chats=[
+            TelegramChatOut(id=chat.id, type=chat.type, title=chat.title, username=chat.username)
+            for chat in chats
+        ]
+    )

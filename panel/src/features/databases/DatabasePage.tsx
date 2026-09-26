@@ -28,7 +28,7 @@ function Overview({ engine, name }: { engine: string; name: string }) {
   if (database.data === undefined) {
     return (
       <div className="rounded-card border border-border bg-surface px-4 py-1">
-        <KeyValueListSkeleton rows={4} />
+        <KeyValueListSkeleton rows={5} />
       </div>
     );
   }

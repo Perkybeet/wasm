@@ -140,7 +140,7 @@ def inspected(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """
     seen: list[str] = []
 
-    def fake_inspect(source: str, *, branch: str | None = None) -> Any:
+    def fake_inspect(source: str, *, branch: str | None = None, **_: Any) -> Any:
         seen.append(source)
         raise AssertionError("the test only checks whether the fetch was reached")
 

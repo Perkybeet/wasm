@@ -241,6 +241,16 @@ def test_percent_is_doubled_so_systemd_does_not_expand_it(
     assert 'ExecStart=/usr/bin/date "+%%Y-%%m-%%d"' in service.read_text()
 
 
+def test_dollar_is_doubled_so_the_script_reaches_the_shell_as_typed(
+    runner: FakeRunner, systemd_dir: Path
+) -> None:
+    """systemd substituted $HOME itself, so the shell never saw the variable."""
+    CronManager().create_job(job(command="/bin/sh -c 'echo $HOME ${USER}'"))
+
+    _, service = written_units(systemd_dir)
+    assert 'ExecStart=/bin/sh -c "echo $$HOME $${USER}"' in service.read_text()
+
+
 def test_an_unparseable_command_is_refused_and_nothing_is_written(
     runner: FakeRunner, systemd_dir: Path
 ) -> None:

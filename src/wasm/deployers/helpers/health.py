@@ -103,8 +103,15 @@ def wait_until_healthy(
             # The URL is always http://127.0.0.1:<port><path>, built here; S310
             # guards against a caller-supplied scheme, which cannot occur.
             with opener.open(url, timeout=PROBE_TIMEOUT) as response:
-                if response.status == 200 or (accept is not None and accept(response.status)):
+                # With an expectation, it alone decides: an application told
+                # to answer 204 is not healthy because it answered 200.
+                if accept(response.status) if accept is not None else response.status == 200:
                     return True
+                if on_attempt is not None:
+                    on_attempt(
+                        f"Health check attempt {attempt + 1} failed: "
+                        f"HTTP {response.status} is not an expected status"
+                    )
         except HTTPError as e:
             # An HTTP error status is still an answer; whether it is a
             # healthy one is the caller's call.

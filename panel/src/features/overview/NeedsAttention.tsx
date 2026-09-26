@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { TriangleAlert } from "lucide-react";
-import { Fragment, useMemo } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 import { appsQuery } from "../../api/queries/apps";
@@ -137,10 +137,34 @@ function Item({ item }: { item: AttentionItem }) {
   );
 }
 
-function SkeletonRows() {
+/** Where the block's last rendered height is kept, so the next load reserves as much. */
+export const ATTENTION_HEIGHT_KEY = "wasm.overview.attention-height";
+/** One skeleton row with its divider. */
+const SKELETON_ROW = 63;
+
+/** How tall the block was when the overview last showed it, in CSS pixels; null if unknown. */
+export function rememberedAttentionHeight(): number | null {
+  try {
+    const value = Number(window.localStorage.getItem(ATTENTION_HEIGHT_KEY));
+    return Number.isFinite(value) && value > 0 ? value : null;
+  } catch {
+    // Storage can be disabled (privacy modes): the skeleton falls back to its own two rows.
+    return null;
+  }
+}
+
+function rememberAttentionHeight(height: number): void {
+  try {
+    window.localStorage.setItem(ATTENTION_HEIGHT_KEY, String(Math.round(height)));
+  } catch {
+    // Not kept: the next load reserves the default instead, and may shift once.
+  }
+}
+
+function SkeletonRows({ count }: { count: number }) {
   return (
     <div aria-hidden="true" className="divide-y divide-border rounded-card border border-border bg-surface shadow-raised">
-      {[0, 1].map((i) => (
+      {Array.from({ length: count }, (_, i) => i).map((i) => (
         <div key={i} className="grid grid-cols-[1rem_minmax(0,1fr)] gap-3 px-4 py-3.5">
           <Skeleton className="mt-0.5 size-3.5 rounded-pill" />
           <div className="flex flex-col gap-2">
@@ -171,7 +195,12 @@ function Unchecked({ what, error }: { what: string; error: unknown }) {
  * The top of the overview: every problem on the machine, worst first, each linking to where
  * it is fixed. When there is none, one quiet line says what was checked.
  */
-export function NeedsAttention() {
+export interface NeedsAttentionProps {
+  /** Called once every source has answered and the block has its final height. */
+  onSettled?: () => void;
+}
+
+export function NeedsAttention({ onSettled }: NeedsAttentionProps = {}) {
   const apps = useQuery(appsQuery());
   const deploys = useQuery(recentDeploysQuery());
   const certs = useQuery(certsQuery());
@@ -192,8 +221,30 @@ export function NeedsAttention() {
     [apps.data, deploys.data, certs.data, observations.data, machine.data, units.data],
   );
 
-  const loading = apps.isPending || deploys.isPending;
+  // Every source answers (or fails) before any item is drawn: items arriving one source at a
+  // time would grow the block, and push the charts and applications below it, once per source.
+  const loading = [apps, deploys, certs, observations, machine, units].some((query) => query.isPending);
   const count = loading ? null : items.length;
+
+  // The space the block took last time is held for it while it loads, so on the usual reload
+  // (the same problems as a minute ago) nothing below it moves when it lands.
+  const [reserved] = useState(rememberedAttentionHeight);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!loading) onSettled?.();
+  }, [loading, onSettled]);
+  useEffect(() => {
+    const body = bodyRef.current;
+    if (loading || !body) return;
+    const observer = new ResizeObserver(() => {
+      rememberAttentionHeight(body.offsetHeight);
+    });
+    observer.observe(body);
+    rememberAttentionHeight(body.offsetHeight);
+    return () => {
+      observer.disconnect();
+    };
+  }, [loading]);
   useAnnounceChange(
     count === null ? null : String(count),
     count === null ? null : count === 0 ? "Nothing needs attention" : `${String(count)} ${count === 1 ? "item needs" : "items need"} attention`,
@@ -212,7 +263,7 @@ export function NeedsAttention() {
     body = (
       <div aria-busy="true">
         <span className="sr-only">Checking the machine</span>
-        <SkeletonRows />
+        <SkeletonRows count={reserved === null ? 2 : Math.max(1, Math.round(reserved / SKELETON_ROW))} />
       </div>
     );
   } else if (items.length === 0) {
@@ -250,7 +301,9 @@ export function NeedsAttention() {
         ) : undefined
       }
     >
-      {body}
+      <div ref={bodyRef} style={loading && reserved !== null ? { minHeight: reserved } : undefined}>
+        {body}
+      </div>
       {unchecked.length > 0 ? (
         <div className="-mt-1 flex flex-col gap-1">
           {unchecked.map((source) => (

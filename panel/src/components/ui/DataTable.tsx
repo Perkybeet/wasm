@@ -44,6 +44,12 @@ export interface DataTableProps<T> {
   /** Per-row controls at the end of the row, typically a Menu. */
   rowActions?: (row: T) => ReactNode;
   loading?: boolean;
+  /**
+   * How many placeholder rows to draw while loading: the number of rows the caller expects
+   * (a count it already knows, a page size), so the table does not grow or shrink under the
+   * content below it when the rows arrive. Five when unknown; at least one.
+   */
+  skeletonRows?: number;
   /** Shown instead of rows when there are none, usually an EmptyState. */
   empty?: ReactNode;
   density?: "compact" | "comfortable";
@@ -81,6 +87,7 @@ export function DataTable<T>({
   onRowActivate,
   rowActions,
   loading = false,
+  skeletonRows = 5,
   empty,
   density = "comfortable",
   className,
@@ -211,7 +218,7 @@ export function DataTable<T>({
         {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions */}
         <tbody ref={bodyRef} onKeyDown={moveFocus}>
           {loading
-            ? Array.from({ length: 5 }, (_, i) => (
+            ? Array.from({ length: Math.max(1, Math.round(skeletonRows)) }, (_, i) => (
                 <tr key={`skeleton-${String(i)}`} className="border-b border-border last:border-0">
                   {columns.map((column) => (
                     <td

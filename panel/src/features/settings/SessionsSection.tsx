@@ -126,7 +126,23 @@ export function SessionsSection() {
         <QueryState
           query={query}
           label="sessions"
-          skeleton={<DataTable caption="Active sessions" columns={columns} rows={[]} getRowId={(s) => s.sid_prefix} loading />}
+          // One row, the least there can be (this one), compact like the loaded table; the line
+          // under it has its place held too.
+          skeleton={
+            <div className="flex min-w-0 flex-col gap-3">
+              <DataTable
+                caption="Active sessions"
+                columns={columns}
+                rows={[]}
+                getRowId={(s) => s.sid_prefix}
+                density="compact"
+                rowActions={() => null}
+                loading
+                skeletonRows={1}
+              />
+              <div aria-hidden="true" className="h-8" />
+            </div>
+          }
         >
           {(data) => (
             <DataTable

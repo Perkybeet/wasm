@@ -214,3 +214,79 @@ def test_a_value_that_is_not_a_size_is_a_usage_error(limited: list[tuple[Any, ..
     assert result.exit_code == 2
     assert "512M, 2G or none" in result.output
     assert limited == []
+
+
+# ---------------------------------------------------------------------------
+# wasm app health
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def checked(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
+    """An application with a health path, in a store the command and lifecycle share."""
+    from wasm.core.store import App, WASMStore
+    from wasm.deployers import lifecycle
+
+    WASMStore.reset_instance()
+    store = WASMStore(tmp_path / "wasm.db")
+    store.create_app(App(domain=DOMAIN, app_type="nodejs", port=3100, app_path=str(tmp_path)))
+    store.set_app_health(DOMAIN, path="/healthz", expect=None, timeout=None)
+    monkeypatch.setattr(app_module, "get_store", lambda: store)
+    monkeypatch.setattr(lifecycle, "get_store", lambda: store)
+    yield store
+    WASMStore.reset_instance()
+
+
+def test_health_without_options_shows_the_settings_and_their_defaults(
+    checked: Any, log: list[str]
+) -> None:
+    result = invoke(["app", "health", DOMAIN])
+
+    assert result.exit_code == 0, result.output
+    text = "\n".join(log)
+    assert "/healthz" in text
+    assert "below 500" in text
+    assert "30" in text
+
+
+def test_health_options_not_named_keep_their_value(checked: Any) -> None:
+    result = invoke(["app", "health", DOMAIN, "--expect", "200-399", "--timeout", "90"])
+
+    assert result.exit_code == 0, result.output
+    app = checked.get_app(DOMAIN)
+    assert (app.health_path, app.health_expect, app.health_timeout) == ("/healthz", "200-399", 90)
+
+
+def test_health_reset_goes_back_to_the_defaults(checked: Any) -> None:
+    result = invoke(["app", "health", DOMAIN, "--reset"])
+
+    assert result.exit_code == 0, result.output
+    app = checked.get_app(DOMAIN)
+    assert (app.health_path, app.health_expect, app.health_timeout) == (None, None, None)
+
+
+def test_health_json_prints_the_settings(checked: Any) -> None:
+    result = invoke(["--json", "app", "health", DOMAIN, "--timeout", "45"])
+
+    assert result.exit_code == 0, result.output
+    body = json.loads(result.output)
+    assert body["domain"] == DOMAIN
+    assert (body["path"], body["expect"], body["timeout"]) == ("/healthz", None, 45)
+    assert body["effective"] == {
+        "path": "/healthz",
+        "expect": "any status below 500",
+        "timeout": 45,
+    }
+
+
+def test_health_refuses_a_bad_value_and_changes_nothing(checked: Any, log: list[str]) -> None:
+    from wasm.cli.app import main
+
+    assert main(["app", "health", DOMAIN, "--path", "http://evil.example.com/"]) == 1
+    assert checked.get_app(DOMAIN).health_path == "/healthz"
+
+
+def test_health_reset_with_a_value_is_a_usage_error(checked: Any) -> None:
+    result = invoke(["app", "health", DOMAIN, "--reset", "--timeout", "10"])
+
+    assert result.exit_code == 2

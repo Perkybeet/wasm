@@ -68,11 +68,12 @@
      and deploy logs are CLI output verbatim (CLAUDE.md: never paraphrased), and the CLI
      writes emoji glyphs (📦, 🔨...) into its own progress lines; JetBrains Mono has no glyphs
      for them, so an emoji-capable fallback font is listed after it, only for the code points
-     JetBrains Mono itself does not cover. */
-  --font-sans: "Mona Sans Variable", ui-sans-serif, system-ui, sans-serif;
+     JetBrains Mono itself does not cover. Right after each real font come its metric-matched
+     fallbacks (fonts.css), which draw the text until it arrives in the room it will take. */
+  --font-sans: "Mona Sans Variable", "Mona Sans Fallback", "Mona Sans Fallback DejaVu", ui-sans-serif, system-ui, sans-serif;
   --font-mono:
-    "JetBrains Mono Variable", ui-monospace, "SFMono-Regular", Menlo, "Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji",
-    monospace;
+    "JetBrains Mono Variable", "JetBrains Mono Fallback", "JetBrains Mono Fallback Consolas", "JetBrains Mono Fallback Liberation",
+    ui-monospace, "SFMono-Regular", Menlo, "Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji", monospace;
   --fs-12: 0.75rem;
   --lh-12: 1rem;
   --fs-13: 0.8125rem;

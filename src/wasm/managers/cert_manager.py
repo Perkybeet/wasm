@@ -61,6 +61,31 @@ _CRON_LINE = "0 0,12 * * * root certbot renew -q\n"
 #: writable, and the line holds no secret, so it is the usual 0644.
 _CRON_MODE = 0o644
 
+#: Where certbot logs full ACME exchanges. ``certbot certonly``/``renew``
+#: print only a short summary to stdout and stderr under ``--non-interactive``;
+#: the ACME server's own explanation - the "Detail:" line, and sometimes the
+#: address it validated against ("addressUsed") - can land only here.
+LETSENCRYPT_LOG = Path("/var/log/letsencrypt/letsencrypt.log")
+
+#: How far back to read the log looking for a challenge detail. It rotates,
+#: but the entry for a command that just ran is always at the tail.
+_LETSENCRYPT_LOG_TAIL_BYTES = 65536
+
+#: Substrings that mark certbot's own output as an ACME challenge or
+#: authorization failure, as opposed to a rate limit, a missing plugin, or
+#: certbot itself failing to run. DNS is only ever the cause of the former, so
+#: this gates the DNS lookup :func:`_diagnose_challenge_failure` performs -
+#: without it, a renewal refused for "too many certificates already issued"
+#: would resolve the domain for no reason and, worse, could report a DNS
+#: problem that was never the actual cause.
+_CHALLENGE_FAILURE_MARKERS = (
+    "challenge failed",
+    "challenges have failed",
+    "urn:ietf:params:acme:error:",
+    "detail:",
+    "fetching http",
+)
+
 #: Fields of :class:`CertificateInfo` that hold text, used to type the mapping
 #: accessor the CLI and the health check still read certificates through.
 _TextField = Literal["name", "expiry", "expiry_full", "cert_path", "key_path", "issuer"]
@@ -79,6 +104,155 @@ _SELF_SIGNED_MIN_VALIDITY = 86400
 #: from values, so anything that could restructure the subject is refused
 #: rather than escaped.
 _SUBJECT_NAME = re.compile(r"^[A-Za-z0-9._:-]+$")
+
+
+def _read_letsencrypt_log_detail() -> str | None:
+    """
+    Read the challenge detail from certbot's own log when its output lacks one.
+
+    Read-only, and tolerant of the file being absent - a fresh install, a
+    distribution that logs elsewhere, or simply no certbot run yet.
+
+    Returns:
+        The last line carrying a "Detail:" or "addressUsed", from "Detail:"
+        onward when that is what matched, or None when the log cannot be read
+        or carries neither.
+    """
+    try:
+        with LETSENCRYPT_LOG.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            handle.seek(max(0, size - _LETSENCRYPT_LOG_TAIL_BYTES))
+            data = handle.read()
+    except OSError:
+        return None
+
+    text = data.decode("utf-8", errors="replace")
+    for line in reversed(text.splitlines()):
+        if "Detail:" in line:
+            return line[line.index("Detail:") :].strip()
+        if "addressUsed" in line:
+            return line.strip()
+    return None
+
+
+def _certbot_failure_output(result: CommandResult) -> str:
+    """
+    Certbot's own report of a failure, filled in from its log when thin.
+
+    Args:
+        result: The failed certbot command.
+
+    Returns:
+        Stdout or stderr, verbatim, with the log's own "Detail:" or
+        "addressUsed" line appended when the command's own output carried
+        neither.
+    """
+    output = (result.stderr or result.stdout).strip()
+    if "Detail:" in output or "addressUsed" in output:
+        return output
+    extra = _read_letsencrypt_log_detail()
+    if not extra:
+        return output
+    return f"{output}\n{extra}" if output else extra
+
+
+def _looks_like_challenge_failure(output: str) -> bool:
+    """
+    Tell an ACME challenge or authorization failure apart from anything else.
+
+    A rate limit, a missing certbot plugin, or certbot itself failing to run
+    are certbot failures too, and none of them has anything to do with DNS.
+    Only a challenge failure does, so this gates the DNS lookup in
+    :func:`_diagnose_challenge_failure`.
+
+    Args:
+        output: Certbot's own output.
+
+    Returns:
+        True when the output looks like a failed challenge or authorization.
+    """
+    lowered = output.lower()
+    return any(marker in lowered for marker in _CHALLENGE_FAILURE_MARKERS)
+
+
+def _diagnose_domain_dns(domain: str) -> tuple[str, str] | None:
+    """
+    Find the DNS reason an ACME challenge against one domain would fail.
+
+    Reuses :func:`wasm.deployers.domains.check_dns`, the one implementation of
+    "does this name resolve to this machine" - imported here rather than at
+    module level because ``deployers.domains`` imports ``deployers.base``,
+    which imports this module: a lazy import breaks the cycle without moving
+    either function to a lower layer neither owns.
+
+    Args:
+        domain: The domain the failed challenge was for.
+
+    Returns:
+        ``(message, details)`` naming the domain and the record at fault, or
+        None when the domain resolves here (the failure has another cause) or
+        its DNS cannot be evaluated at all.
+    """
+    from wasm.deployers.domains import check_dns
+
+    try:
+        result = check_dns(domain)
+    except WASMError:
+        return None
+    if result.points_here:
+        return None
+
+    expected = ", ".join(result.expected_addresses) or "this machine"
+
+    if not result.resolved_addresses:
+        return (
+            f"{domain} has no DNS record pointing at this machine",
+            f"Add an A or AAAA record for {domain} pointing at {expected}, then try again.",
+        )
+
+    wrong = [
+        address for address in result.resolved_addresses if address not in result.expected_addresses
+    ]
+    # Let's Encrypt resolves AAAA before A and connects over IPv6 first when
+    # one is published, so a wrong AAAA is the cause even when the A record is
+    # fine - it is not the record certbot's challenge ever reached.
+    ipv6 = next((address for address in wrong if ":" in address), None)
+    if ipv6:
+        return (
+            f"{domain} has an IPv6 (AAAA) record, {ipv6}, that is not this machine. "
+            "Let's Encrypt connects over IPv6 first, so the challenge reached another server.",
+            f"Remove or correct the AAAA record for {domain}; this machine answers on {expected}.",
+        )
+
+    address = wrong[0]
+    return (
+        f"{domain} has an IPv4 (A) record, {address}, that is not this machine.",
+        f"Remove or correct the A record for {domain}; this machine answers on {expected}.",
+    )
+
+
+def _diagnose_challenge_failure(output: str, domains: Sequence[str]) -> tuple[str, str] | None:
+    """
+    Find the likely cause of a failed ACME challenge, DNS first.
+
+    Args:
+        output: Certbot's own output, gating whether this is worth checking
+            at all (see :func:`_looks_like_challenge_failure`).
+        domains: The domains the order or renewal covered, checked in order.
+
+    Returns:
+        ``(message, details)`` for the first domain whose DNS does not point
+        here, or None when the output does not look like a challenge failure,
+        no domain was given, or every domain resolves here.
+    """
+    if not domains or not _looks_like_challenge_failure(output):
+        return None
+    for domain in domains:
+        diagnosis = _diagnose_domain_dns(domain)
+        if diagnosis is not None:
+            return diagnosis
+    return None
 
 
 def _pem_block(text: str, label: str) -> str | None:
@@ -728,10 +902,16 @@ class CertManager(BaseManager):
 
         result = self._exec(cmd, timeout=_ISSUE_TIMEOUT)
         if not result.success:
+            output = _certbot_failure_output(result)
+            diagnosis = _diagnose_challenge_failure(output, requested)
+            if diagnosis is not None:
+                message, details = diagnosis
+                raise CertificateError(message, details=details, output=output or None)
             raise CertificateError(
                 f"Failed to obtain certificate for {primary}",
-                details=(result.stderr or result.stdout).strip()
+                details=output
                 or "Check that the domain resolves to this host and port 80 is reachable.",
+                output=output or None,
             )
 
         paths = self.get_cert_path(primary)
@@ -1033,8 +1213,9 @@ class CertManager(BaseManager):
         """
         cmd = ["certbot", "renew", "--non-interactive"]
 
-        if domain:
-            cmd.extend(["--cert-name", self._validated(domain)])
+        validated = self._validated(domain) if domain else None
+        if validated:
+            cmd.extend(["--cert-name", validated])
         if force:
             cmd.append("--force-renewal")
         if dry_run:
@@ -1042,10 +1223,19 @@ class CertManager(BaseManager):
 
         result = self._exec(cmd, timeout=_RENEW_TIMEOUT)
         if not result.success:
+            output = _certbot_failure_output(result)
+            # A bulk "renew everything" failure can span several unrelated
+            # domains; diagnosing DNS only when one was named keeps this to a
+            # single lookup instead of re-reading every lineage from certbot.
+            diagnosis = _diagnose_challenge_failure(output, [validated] if validated else ())
+            if diagnosis is not None:
+                message, details = diagnosis
+                raise CertificateError(message, details=details, output=output or None)
             raise CertificateError(
                 "Certificate renewal failed",
-                details=(result.stderr or result.stdout).strip()
+                details=output
                 or "Run 'certbot renew --dry-run' to see what the ACME server reports.",
+                output=output or None,
             )
 
         return True

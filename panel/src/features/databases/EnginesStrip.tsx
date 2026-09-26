@@ -101,14 +101,35 @@ function EngineTile({ engine }: { engine: Engine }) {
   );
 }
 
+/** Four tiles with the loaded tile's lines: name and state, version and port, the actions. */
 function EnginesSkeleton() {
   return (
     <div aria-hidden="true" className="grid grid-cols-2 gap-3 lg:grid-cols-4">
       {[0, 1, 2, 3].map((i) => (
-        <div key={i} className="flex flex-col gap-3 rounded-card border border-border bg-surface px-4 py-3.5">
-          <Skeleton className="h-4 w-24" />
-          <Skeleton className="h-3 w-16" />
-          <Skeleton className="h-7 w-20" />
+        <div key={i} className="flex flex-col gap-3 rounded-card border border-border bg-surface px-4 py-3.5 shadow-raised">
+          <div className="flex flex-col gap-1">
+            <div className="flex h-5 items-center">
+              <Skeleton className="h-3.5 w-24" />
+            </div>
+            <div className="flex h-4 items-center">
+              <Skeleton className="h-3 w-16" />
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-x-3">
+            {[0, 1].map((column) => (
+              <div key={column} className="flex flex-col gap-0.5">
+                <div className="flex h-4 items-center">
+                  <Skeleton className="h-2.5 w-12" />
+                </div>
+                <div className="flex h-4 items-center">
+                  <Skeleton className="h-3 w-14" />
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="pt-1">
+            <Skeleton className="h-7 w-20" />
+          </div>
         </div>
       ))}
     </div>

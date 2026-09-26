@@ -366,7 +366,7 @@
         "type": "object"
       },
       "AppInfo": {
-        "description": "A deployed application and the live state of its service.\n\nAttributes:\n    name: Application name, which is its domain.\n    domain: Domain the application is served on.\n    status: What is true about it right now, resolved by\n        :func:`wasm.core.app_state.resolve_state` - the one place the CLI\n        and the panel agree on this: ``running``, ``restarting`` (systemd\n        is crash-looping the unit), ``no_answer`` (the unit is up but\n        nothing accepts connections on its port), ``stopped``, ``failed``\n        (systemd gave up on it), ``static`` (served directly by the web\n        server, there is no unit) or ``unknown`` (systemd could not be\n        asked).\n    active: Whether the unit is active.\n    enabled: Whether the unit starts on boot.\n    pid: Main PID when running.\n    uptime: How long the unit has been up.\n    port: Upstream port.\n    app_type: Deployer that owns it.\n    path: Application directory.\n    source: Git URL or local path it was deployed from.\n    branch: Git branch it tracks, or None for a source that has none.\n    layout: ``inplace`` or ``releases``.\n    keep_releases: Release directories kept before older ones are pruned.\n        Meaningful only on ``releases``; the in-place default otherwise.\n    build_command: Argv the deployer runs to build the project, read off\n        the same ``get_build_command()`` the deploy used. Empty in a\n        list response - computing it means instantiating the deployer\n        once per application, which this endpoint does not do for a\n        list - and filled in when this application is fetched on its own.\n    start_command: What its unit runs, exactly as the deploy recorded it\n        on the service row. None for a static site, which has no unit.\n    memory_max_mb: Memory limit of its unit, in MB, or None.\n    cpu_quota_percent: CPU quota of its unit, in percent of one CPU, or None.\n    tasks_max: Task limit of its unit, or None.\n    webhook_enabled: Whether a webhook secret is set for it. The secret\n        itself is never part of this or any other response; it is set\n        through ``POST /api/apps/{domain}/webhook-secret`` and cleared\n        through the ``DELETE`` of the same path.\n    unit: The systemd unit that runs it, or None for a static site.\n    run_as: The account its unit runs as, or None for a static site.\n    last_deployment: Its most recent deployment attempt, or None when\n        nothing has ever been recorded for it.",
+        "description": "A deployed application and the live state of its service.\n\nAttributes:\n    name: Application name, which is its domain.\n    domain: Domain the application is served on.\n    status: What is true about it right now, resolved by\n        :func:`wasm.core.app_state.resolve_state` - the one place the CLI\n        and the panel agree on this: ``running``, ``restarting`` (systemd\n        is crash-looping the unit), ``no_answer`` (the unit is up but\n        nothing accepts connections on its port), ``stopped``, ``failed``\n        (systemd gave up on it), ``static`` (served directly by the web\n        server, there is no unit) or ``unknown`` (systemd could not be\n        asked).\n    active: Whether the unit is active.\n    enabled: Whether the unit starts on boot.\n    pid: Main PID when running.\n    uptime: How long the unit has been up.\n    port: Upstream port.\n    app_type: Deployer that owns it.\n    path: Application directory.\n    source: Git URL or local path it was deployed from.\n    branch: Git branch it tracks, or None for a source that has none.\n    layout: ``inplace`` or ``releases``.\n    keep_releases: Release directories kept before older ones are pruned.\n        Meaningful only on ``releases``; the in-place default otherwise.\n    build_command: Argv the deployer runs to build the project, read off\n        the same ``get_build_command()`` the deploy used. Empty in a\n        list response - computing it means instantiating the deployer\n        once per application, which this endpoint does not do for a\n        list - and filled in when this application is fetched on its own.\n    start_command: What its unit runs, exactly as the deploy recorded it\n        on the service row. None for a static site, which has no unit.\n    memory_max_mb: Memory limit of its unit, in MB, or None.\n    cpu_quota_percent: CPU quota of its unit, in percent of one CPU, or None.\n    tasks_max: Task limit of its unit, or None.\n    health_path: Path the health gate probes, or None for ``/``.\n    health_expect: Statuses the health gate accepts, such as\n        ``200-399``, or None for any status below 500.\n    health_timeout: Seconds the health gate waits, or None for its\n        default of 30.\n    webhook_enabled: Whether a webhook secret is set for it. The secret\n        itself is never part of this or any other response; it is set\n        through ``POST /api/apps/{domain}/webhook-secret`` and cleared\n        through the ``DELETE`` of the same path.\n    unit: The systemd unit that runs it, or None for a static site.\n    run_as: The account its unit runs as, or None for a static site.\n    last_deployment: Its most recent deployment attempt, or None when\n        nothing has ever been recorded for it.",
         "properties": {
           "active": {
             "title": "Active",
@@ -419,6 +419,39 @@
           "enabled": {
             "title": "Enabled",
             "type": "boolean"
+          },
+          "health_expect": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Health Expect"
+          },
+          "health_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Health Path"
+          },
+          "health_timeout": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Health Timeout"
           },
           "keep_releases": {
             "default": 5,
@@ -2601,7 +2634,7 @@
         "type": "object"
       },
       "DeploymentOut": {
-        "description": "One deployment attempt, as the console lists and inspects it.\n\nAttributes:\n    job_id: The background job that started this deployment, when the\n        panel queued it. None for a CLI or webhook deploy.\n    release_id: The release this deployment built, on the releases\n        layout. None for an in-place deployment.\n    commit_message: Subject line of the deployed commit, for a git\n        source. None for a source that is not git.",
+        "description": "One deployment attempt, as the console lists and inspects it.\n\nAttributes:\n    job_id: The background job that started this deployment, when the\n        panel queued it. None for a CLI or webhook deploy.\n    release_id: The release this deployment built, on the releases\n        layout. None for an in-place deployment.\n    commit_message: Subject line of the deployed commit, for a git\n        source. None for a source that is not git.\n    snapshot_backup: In place, the backup that holds exactly what this\n        deployment produced, taken by the update that followed it.\n    rollback_available: Whether going back to this deployment is\n        possible now: its release is on disk and not live, or its\n        snapshot backup still exists.\n    rollback_unavailable_reason: Why not, when it is not.",
         "properties": {
           "commit_message": {
             "anyOf": [
@@ -2702,6 +2735,33 @@
               }
             ],
             "title": "Release Id"
+          },
+          "rollback_available": {
+            "default": false,
+            "title": "Rollback Available",
+            "type": "boolean"
+          },
+          "rollback_unavailable_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rollback Unavailable Reason"
+          },
+          "snapshot_backup": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snapshot Backup"
           },
           "started_at": {
             "anyOf": [
@@ -3243,6 +3303,68 @@
           "status"
         ],
         "title": "HealthCheckOut",
+        "type": "object"
+      },
+      "HealthCheckResponse": {
+        "description": "The health check an application has now.\n\nAttributes:\n    domain: The application's domain.\n    path: The path it set, or None for the default.\n    expect: The statuses it set, or None for the default.\n    timeout: The seconds it set, or None for the default.\n    effective_path: The path the gate requests.\n    effective_expect: The statuses the gate accepts, as an operator\n        reads them: the list, or \"any status below 500\".\n    effective_timeout: The seconds the gate waits.",
+        "properties": {
+          "domain": {
+            "title": "Domain",
+            "type": "string"
+          },
+          "effective_expect": {
+            "title": "Effective Expect",
+            "type": "string"
+          },
+          "effective_path": {
+            "title": "Effective Path",
+            "type": "string"
+          },
+          "effective_timeout": {
+            "title": "Effective Timeout",
+            "type": "integer"
+          },
+          "expect": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expect"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          },
+          "timeout": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timeout"
+          }
+        },
+        "required": [
+          "domain",
+          "effective_path",
+          "effective_expect",
+          "effective_timeout"
+        ],
+        "title": "HealthCheckResponse",
         "type": "object"
       },
       "InspectSourceRequest": {
@@ -4996,6 +5118,33 @@
         "title": "RenewCertRequest",
         "type": "object"
       },
+      "RetentionResponse": {
+        "description": "The retention an application has now.\n\nAttributes:\n    domain: The application's domain.\n    keep_releases: Releases it keeps.\n    pruned: Ids of the releases removed to honour it, oldest first.",
+        "properties": {
+          "domain": {
+            "title": "Domain",
+            "type": "string"
+          },
+          "keep_releases": {
+            "title": "Keep Releases",
+            "type": "integer"
+          },
+          "pruned": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Pruned",
+            "type": "array"
+          }
+        },
+        "required": [
+          "domain",
+          "keep_releases",
+          "pruned"
+        ],
+        "title": "RetentionResponse",
+        "type": "object"
+      },
       "RevokedResponse": {
         "description": "Confirmation that one record - a session or an API token - was revoked.",
         "properties": {
@@ -5102,6 +5251,117 @@
           "domain"
         ],
         "title": "RollbackRequest",
+        "type": "object"
+      },
+      "SMTPConfig": {
+        "description": "SMTP settings for the monitor's email notifications and test message.\n\n``password`` is write-only: it is never sent back by ``GET /config/smtp``\n(see :class:`SMTPSettingsResponse`), so unlike a secret round-tripped\nthrough the generic ``PUT``/``PATCH /api/config`` there is no\n:data:`~wasm.core.config.REDACTED` placeholder for the console to echo\nback untouched. Instead an empty ``password`` keeps whatever is already\nstored, the same as leaving a webhook URL field blank leaves its channel\nalone - only a non-empty value replaces it. There is no way to explicitly\nblank the password through this endpoint; ``wasm config set\nmonitor.smtp.password ''`` still does that directly.",
+        "properties": {
+          "from_address": {
+            "default": "",
+            "description": "Envelope sender address; falls back to the username when empty",
+            "title": "From Address",
+            "type": "string"
+          },
+          "host": {
+            "default": "",
+            "description": "SMTP server hostname; empty means not configured",
+            "title": "Host",
+            "type": "string"
+          },
+          "password": {
+            "default": "",
+            "description": "Password for that account; leave blank to keep the one already stored",
+            "title": "Password",
+            "type": "string"
+          },
+          "port": {
+            "default": 465,
+            "description": "SMTP server port",
+            "maximum": 65535.0,
+            "minimum": 1.0,
+            "title": "Port",
+            "type": "integer"
+          },
+          "recipients": {
+            "description": "Addresses the monitor's reports and test message are sent to",
+            "items": {
+              "type": "string"
+            },
+            "title": "Recipients",
+            "type": "array"
+          },
+          "use_ssl": {
+            "default": true,
+            "description": "Connect with implicit TLS (SMTPS), usually port 465",
+            "title": "Use Ssl",
+            "type": "boolean"
+          },
+          "use_tls": {
+            "default": false,
+            "description": "Connect in the clear and upgrade with STARTTLS, usually port 587",
+            "title": "Use Tls",
+            "type": "boolean"
+          },
+          "username": {
+            "default": "",
+            "description": "Account to authenticate with; empty for an anonymous relay",
+            "title": "Username",
+            "type": "string"
+          }
+        },
+        "title": "SMTPConfig",
+        "type": "object"
+      },
+      "SMTPSettingsResponse": {
+        "description": "The configured SMTP settings.\n\n``password`` is not a field here at all, redacted or otherwise: unlike\n``GET /api/config``'s untyped dump, this endpoint never sends the password\nout, so there is nothing to redact and no ``***`` for a form to treat as\n\"leave alone\". ``password_set`` is what a console form uses instead, to\nshow \"a password is configured\" without ever holding the value.",
+        "properties": {
+          "from_address": {
+            "title": "From Address",
+            "type": "string"
+          },
+          "host": {
+            "title": "Host",
+            "type": "string"
+          },
+          "password_set": {
+            "title": "Password Set",
+            "type": "boolean"
+          },
+          "port": {
+            "title": "Port",
+            "type": "integer"
+          },
+          "recipients": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Recipients",
+            "type": "array"
+          },
+          "use_ssl": {
+            "title": "Use Ssl",
+            "type": "boolean"
+          },
+          "use_tls": {
+            "title": "Use Tls",
+            "type": "boolean"
+          },
+          "username": {
+            "title": "Username",
+            "type": "string"
+          }
+        },
+        "required": [
+          "host",
+          "port",
+          "use_ssl",
+          "use_tls",
+          "username",
+          "from_address",
+          "recipients",
+          "password_set"
+        ],
+        "title": "SMTPSettingsResponse",
         "type": "object"
       },
       "SSLConfig": {
@@ -5753,7 +6013,7 @@
         "type": "object"
       },
       "SourceInspectionResponse": {
-        "description": "What a repository is, discovered before anything is deployed from it.\n\nAttributes:\n    app_type: The application type the new-app wizard would deploy as;\n        the first entry of ``detected_types``.\n    detected_types: Every registered application type that recognised\n        the repository, most specific first (registry priority order).\n    package_manager: The Node package manager the repository's lock file\n        implies, or None when it is not a Node project.\n    install_command: Argv the chosen deployer would run to install\n        dependencies. Empty when the type has none.\n    build_command: Argv the chosen deployer would run to build the\n        project. Empty when there is nothing to build.\n    start_command: Shell command the chosen deployer would run as the\n        service's ``ExecStart``. Empty for a static site.\n    default_port: Port the chosen deployer uses when none is requested.\n    env_keys: Environment variables discovered from ``.env.example``.\n    branch: The branch inspected, or the checkout's current branch when\n        none was requested.\n    commit: Short commit hash of the checkout, empty when the source is\n        not a Git repository.",
+        "description": "What a repository is, discovered before anything is deployed from it.\n\nAttributes:\n    app_type: The application type the new-app wizard would deploy as;\n        the first entry of ``detected_types``.\n    detected_types: Every registered application type that recognised\n        the repository, most specific first (registry priority order).\n    package_manager: The Node package manager the repository's lock file\n        implies, or None when it is not a Node project.\n    install_command: Argv the chosen deployer would run to install\n        dependencies. Empty when the type has none.\n    build_command: Argv the chosen deployer would run to build the\n        project. Empty when there is nothing to build.\n    start_command: Shell command the chosen deployer would run as the\n        service's ``ExecStart``. Empty for a static site.\n    default_port: Port the chosen deployer uses when none is requested.\n    env_keys: Environment variables discovered from ``.env.example``.\n    branch: The branch inspected, or the checkout's current branch when\n        none was requested.\n    commit: Short commit hash of the checkout, empty when the source is\n        not a Git repository.\n    compatible: Whether this server can deploy it as ``app_type`` as it\n        is: false when a program the type needs is missing.\n    verdict: What WASM found, in a sentence.\n    suggestion: What to do before deploying, when there is something.",
         "properties": {
           "app_type": {
             "title": "App Type",
@@ -5773,6 +6033,18 @@
           "commit": {
             "title": "Commit",
             "type": "string"
+          },
+          "compatible": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether this server can deploy it as app_type as it is",
+            "title": "Compatible"
           },
           "default_port": {
             "title": "Default Port",
@@ -5813,6 +6085,30 @@
           "start_command": {
             "title": "Start Command",
             "type": "string"
+          },
+          "suggestion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What to do before deploying, when there is something",
+            "title": "Suggestion"
+          },
+          "verdict": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What WASM found, in a sentence",
+            "title": "Verdict"
           }
         },
         "required": [
@@ -5930,6 +6226,102 @@
           "disks"
         ],
         "title": "SystemInfo",
+        "type": "object"
+      },
+      "TelegramChatOut": {
+        "description": "One chat the configured Telegram bot has seen, as the panel shows it.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          },
+          "username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Username"
+          }
+        },
+        "required": [
+          "id",
+          "type"
+        ],
+        "title": "TelegramChatOut",
+        "type": "object"
+      },
+      "TelegramChatsResult": {
+        "description": "Every chat :meth:`~wasm.core.notifier.Notifier.list_telegram_chats` found.",
+        "properties": {
+          "chats": {
+            "items": {
+              "$ref": "#/components/schemas/TelegramChatOut"
+            },
+            "title": "Chats",
+            "type": "array"
+          }
+        },
+        "required": [
+          "chats"
+        ],
+        "title": "TelegramChatsResult",
+        "type": "object"
+      },
+      "TelegramConfig": {
+        "description": "Telegram bot settings for notifications.\n\n``bot_token`` is write-only, the same rule :class:`SMTPConfig` follows for\na password: it is never sent back by ``GET .../telegram`` (see\n:class:`TelegramSettingsResponse`), and an empty value on a write keeps\nwhatever is already stored rather than clearing it.",
+        "properties": {
+          "bot_token": {
+            "default": "",
+            "description": "Bot API token; leave blank to keep the one already stored",
+            "title": "Bot Token",
+            "type": "string"
+          },
+          "chat_id": {
+            "default": "",
+            "description": "Destination chat: an integer id, or an @channel username",
+            "title": "Chat Id",
+            "type": "string"
+          }
+        },
+        "title": "TelegramConfig",
+        "type": "object"
+      },
+      "TelegramSettingsResponse": {
+        "description": "The configured Telegram channel. ``bot_token`` is never sent back.",
+        "properties": {
+          "bot_token_set": {
+            "title": "Bot Token Set",
+            "type": "boolean"
+          },
+          "chat_id": {
+            "title": "Chat Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "chat_id",
+          "bot_token_set"
+        ],
+        "title": "TelegramSettingsResponse",
         "type": "object"
       },
       "TestSiteConfigRequest": {
@@ -6076,6 +6468,49 @@
         "title": "UpdateAppEnvRequest",
         "type": "object"
       },
+      "UpdateHealthRequest": {
+        "description": "What the health gate must ask of an application.\n\nThe three are set together, like the limits: a field left out or null\ngoes back to its default.",
+        "properties": {
+          "expect": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Statuses that mean up, 100 to 599: 200-399, or 200,204. Null: any status below 500",
+            "title": "Expect"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Path to probe on 127.0.0.1, such as /healthz. Null: /",
+            "title": "Path"
+          },
+          "timeout": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Seconds it gets to answer, 5 to 600. Null: 30",
+            "title": "Timeout"
+          }
+        },
+        "title": "UpdateHealthRequest",
+        "type": "object"
+      },
       "UpdateInfo": {
         "description": "Installed version and, when known, the released one.",
         "properties": {
@@ -6189,12 +6624,33 @@
             "description": "Domain of the application to update",
             "title": "Domain",
             "type": "string"
+          },
+          "force": {
+            "default": false,
+            "description": "Rebuild even when the branch has no commit the live build lacks",
+            "title": "Force",
+            "type": "boolean"
           }
         },
         "required": [
           "domain"
         ],
         "title": "UpdateRequest",
+        "type": "object"
+      },
+      "UpdateRetentionRequest": {
+        "description": "How many releases an application keeps.",
+        "properties": {
+          "keep": {
+            "description": "Releases to keep, 1 to 50. The active one and the rollback target are always kept",
+            "title": "Keep",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "keep"
+        ],
+        "title": "UpdateRetentionRequest",
         "type": "object"
       },
       "UpdateServiceConfigRequest": {
@@ -6963,7 +7419,7 @@
     },
     "/api/apps/inspect": {
       "post": {
-        "description": "Preview what a repository is before deploying it.\n\nFetches the source into a throwaway checkout, detects the application\ntype, and reports the commands, port and environment variables a\ndeployment would use, so the new-app wizard has something real to show\ninstead of a guess. Nothing is written outside the checkout, which is\nremoved before this returns, and no application, domain or unit is\ncreated.\n\nAdmin scope, like creating one: fetching runs as root and reads back what\nit fetched. A local path is reserved to the operator in person, exactly\nas it is for ``POST /api/apps``.\n\nArgs:\n    body: The source to inspect and the branch to check out.\n    request: The incoming request, for the audit record of a refusal.\n    session: The authenticated session.\n\nReturns:\n    The inspection result.\n\nRaises:\n    HTTPException: 403 when the source is a local path and the credential\n        may not read one.\n    SourceError: The source is invalid, or fetching it failed. Answered\n        as 400: the operator gave a source WASM cannot reach, not a\n        server fault.\n    ValidationError: The checkout matches no registered application\n        type. ``inspect_source`` raises ``DeploymentError`` for this -\n        right for the CLI, where it means the whole operation failed -\n        but here it is the wizard's input that could not be classified,\n        so it is translated to the API's validation-error contract\n        (400 with details) instead of the 500 an unqualified\n        ``DeploymentError`` would answer.",
+        "description": "Preview what a repository is before deploying it.\n\nFetches what detection needs (for git, ``ls-remote`` and a sparse,\nblobless checkout of the files the detectors read), detects the\napplication type, and reports the commands, port and environment\nvariables a deployment would use and whether this server can deploy it,\nso the new-app wizard has something real to show instead of a guess.\nNothing is written outside the scratch checkout, which is removed before\nthis returns, and no application, domain or unit is created.\n\nA client that disconnects (the wizard's Cancel aborts the fetch) cancels\nthe inspection: the git command running is killed and the checkout\nremoved at once, instead of the clone running on to its deadline.\n\nAdmin scope, like creating one: fetching runs as root and reads back what\nit fetched. A local path is reserved to the operator in person, exactly\nas it is for ``POST /api/apps``.\n\nArgs:\n    body: The source to inspect and the branch to check out.\n    request: The incoming request, for the audit record of a refusal.\n    session: The authenticated session.\n\nReturns:\n    The inspection result, or an empty 499 once a cancelled inspection\n    has stopped (nobody is there to read it).\n\nRaises:\n    HTTPException: 403 when the source is a local path and the credential\n        may not read one.\n    SourceError: The source is invalid, or fetching it failed. Answered\n        as 400: the operator gave a source WASM cannot reach, not a\n        server fault.\n    ValidationError: The checkout matches no registered application\n        type. ``inspect_source`` raises ``DeploymentError`` for this -\n        right for the CLI, where it means the whole operation failed -\n        but here it is the wizard's input that could not be classified,\n        so it is translated to the API's validation-error contract\n        (400 with details) instead of the 500 an unqualified\n        ``DeploymentError`` would answer.",
         "operationId": "inspect_app_source_api_apps_inspect_post",
         "requestBody": {
           "content": {
@@ -7126,6 +7582,110 @@
         "summary": "Get App",
         "tags": [
           "Applications"
+        ]
+      }
+    },
+    "/api/apps/{domain}/deployments/{deployment_id}/rebuild": {
+      "post": {
+        "description": "Queue a deploy of the exact commit a deployment was built from.\n\nThe update job, given the commit: on releases a release of that commit\nstill on disk is activated (instant), otherwise the commit is built as a\nnew release; in place the checkout is put on the commit and rebuilt.\nThere is no ``nothing_new`` check: asking for a commit is explicit.\n\nArgs:\n    domain: Domain of the application.\n    deployment_id: The deployment whose commit to rebuild.\n    session: The authenticated session.\n\nReturns:\n    The queued job.\n\nRaises:\n    HTTPException: 404 for an unknown application or deployment, 409 when\n        the deployment recorded no commit (its source is not git).",
+        "operationId": "rebuild_deployment_api_apps__domain__deployments__deployment_id__rebuild_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "domain",
+            "required": true,
+            "schema": {
+              "title": "Domain",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "deployment_id",
+            "required": true,
+            "schema": {
+              "title": "Deployment Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobAcceptedResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rebuild Deployment",
+        "tags": [
+          "Deployments"
+        ]
+      }
+    },
+    "/api/apps/{domain}/deployments/{deployment_id}/rollback": {
+      "post": {
+        "description": "Queue going back to what a deployment produced.\n\nOn releases its release is activated behind the health gate; in place\nits snapshot backup (taken by the update that followed it) is restored,\nafter a safety backup of the current state.\n\nArgs:\n    domain: Domain of the application.\n    deployment_id: The deployment to go back to.\n    session: The authenticated session.\n\nReturns:\n    The queued job.\n\nRaises:\n    HTTPException: 404 for an unknown deployment of the application, 409\n        ``rollback_unavailable`` with the reason when it cannot be gone\n        back to.",
+        "operationId": "rollback_deployment_api_apps__domain__deployments__deployment_id__rollback_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "domain",
+            "required": true,
+            "schema": {
+              "title": "Domain",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "deployment_id",
+            "required": true,
+            "schema": {
+              "title": "Deployment Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobAcceptedResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rollback Deployment",
+        "tags": [
+          "Deployments"
         ]
       }
     },
@@ -7474,6 +8034,59 @@
         ]
       }
     },
+    "/api/apps/{domain}/health": {
+      "patch": {
+        "description": "Set the path, the accepted statuses and the timeout of an application's health check.\n\nThe health gate decides which release may serve, so changing what it\nasks needs sudo mode, like the limits. The values are validated where\nthey are stored; nothing restarts.\n\nArgs:\n    domain: Domain of the application.\n    body: The three settings.\n    session: The authenticated, elevated session.\n\nReturns:\n    The settings the application has now, and what the gate asks.\n\nRaises:\n    HTTPException: 404 when the application is unknown.\n    ValidationError: A value is not one the gate can use (400).\n    DeploymentError: It is a static site, checked by its files.",
+        "operationId": "update_app_health_api_apps__domain__health_patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "domain",
+            "required": true,
+            "schema": {
+              "title": "Domain",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateHealthRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthCheckResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update App Health",
+        "tags": [
+          "Applications"
+        ]
+      }
+    },
     "/api/apps/{domain}/limits": {
       "patch": {
         "description": "Set the memory, CPU and task limits of an application's unit.\n\nRewrites the unit (every unit, for a monorepo) and reloads systemd, which\nis a change to what runs as root's configuration, so it needs sudo mode\nlike editing a unit by hand does. The values are validated where every\ncaller's are, in the service manager.\n\nArgs:\n    domain: Domain of the application.\n    body: The limits, and whether to restart now.\n    session: The authenticated, elevated session.\n\nReturns:\n    The limits the application has now.\n\nRaises:\n    HTTPException: 404 when the application is unknown.\n    ValidationError: A limit is out of range (400, with the range).\n    DeploymentError: Nothing runs as a unit for it.",
@@ -7735,6 +8348,59 @@
           }
         },
         "summary": "Get App Releases",
+        "tags": [
+          "Applications"
+        ]
+      }
+    },
+    "/api/apps/{domain}/releases/retention": {
+      "patch": {
+        "description": "Set how many releases an application keeps, and prune to it now.\n\nPruning deletes release directories, so it needs sudo mode. The number\nis validated where it is stored.\n\nArgs:\n    domain: Domain of the application.\n    body: The retention.\n    session: The authenticated, elevated session.\n\nReturns:\n    The retention it has now and what was removed.\n\nRaises:\n    HTTPException: 404 when the application is unknown.\n    ValidationError: The number is out of range (400).\n    DeploymentError: It is deployed in place, with no releases.",
+        "operationId": "update_release_retention_api_apps__domain__releases_retention_patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "domain",
+            "required": true,
+            "schema": {
+              "title": "Domain",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateRetentionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetentionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Release Retention",
         "tags": [
           "Applications"
         ]
@@ -9729,6 +10395,90 @@
         ]
       }
     },
+    "/api/config/notifications/telegram": {
+      "get": {
+        "description": "Get the configured Telegram channel, without its bot token.\n\nArgs:\n    session: Authenticated session, injected by the dependency.\n\nReturns:\n    The configured chat id and whether a bot token is stored.",
+        "operationId": "get_telegram_config_api_config_notifications_telegram_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TelegramSettingsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Telegram Config",
+        "tags": [
+          "Configuration"
+        ]
+      },
+      "put": {
+        "description": "Update the Telegram channel's bot token and chat id.\n\nThe chat id is validated against the shape Telegram's Bot API accepts\nbefore it is ever written - see :class:`TelegramConfig` - which is what\nturns a missing minus sign into an error naming the fix at save time\ninstead of a \"chat not found\" the next time a deploy tries to notify.\n\nArgs:\n    body: Body carrying the bot token and chat id.\n    request: The incoming request, for the audit record.\n    session: Authenticated session, injected by the dependency.\n\nReturns:\n    Confirmation message.\n\nRaises:\n    HTTPException: If the configuration cannot be written.",
+        "operationId": "update_telegram_config_api_config_notifications_telegram_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TelegramConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Telegram Config",
+        "tags": [
+          "Configuration"
+        ]
+      }
+    },
+    "/api/config/notifications/telegram/chats": {
+      "post": {
+        "description": "List the chats the configured Telegram bot has seen.\n\nFinding a chat id today means opening the Bot API's ``getUpdates`` URL by\nhand and reading raw JSON, or asking an assistant to do it. This is that\nlookup, using the bot token already saved, over the notifier's own HTTP\npath - the same SSRF guard and timeout as every other channel.\n\nPlain ``get_current_session``, not :func:`require_elevated`: this only\nreads what Telegram has queued for the bot, the same reasoning\n:func:`test_notification_channel` already applies to sending a message -\nneither one changes anything WASM manages.\n\nArgs:\n    session: Authenticated session, injected by the dependency.\n\nReturns:\n    Every chat found.\n\nRaises:\n    HTTPException: 400 when no bot token is configured, the token does\n        not have the Bot API's shape, or the Bot API could not be reached\n        or answered with an error - in its own words.",
+        "operationId": "list_telegram_chats_api_config_notifications_telegram_chats_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TelegramChatsResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Telegram Chats",
+        "tags": [
+          "Configuration"
+        ]
+      }
+    },
     "/api/config/notifications/{channel}/test": {
       "post": {
         "description": "Send a test message through one notification channel.\n\nIgnores the master switch and the per-event filters on purpose - the\nbutton exists to try a channel before notifications are turned on - and\nnever echoes the remote server's response body back to the client:\n:meth:`~wasm.core.notifier.Notifier.test_channel` already refuses a\nprivate destination and scrubs configured secrets out of any failure it\nreports.\n\nArgs:\n    channel: Channel name, one of the notifier's channels.\n    session: Authenticated session, injected by the dependency.\n\nReturns:\n    ``ok=True`` with a confirmation, or ``ok=False`` with the failure in\n    the receiving server's own words.",
@@ -9789,6 +10539,68 @@
           }
         },
         "summary": "Reload Config",
+        "tags": [
+          "Configuration"
+        ]
+      }
+    },
+    "/api/config/smtp": {
+      "get": {
+        "description": "Get the monitor's SMTP settings.\n\nArgs:\n    session: Authenticated session, injected by the dependency.\n\nReturns:\n    The configured server, transport, account and recipients, and whether\n    a password is stored - never the password itself.",
+        "operationId": "get_smtp_config_api_config_smtp_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SMTPSettingsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Smtp Config",
+        "tags": [
+          "Configuration"
+        ]
+      },
+      "put": {
+        "description": "Update the monitor's SMTP settings.\n\nGoes through :meth:`~wasm.core.config.Config.set`, so the same rule 'wasm\nconfig set monitor.smtp.*' enforces - a hostname for ``host``, a port in\nrange, ``use_ssl`` and ``use_tls`` not both on, a valid address for\n``from_address`` and every recipient - rejects a value here too, in the\nsame words. An empty ``password`` is translated to the\n:data:`~wasm.core.config.REDACTED` placeholder before the write, which is\nwhat actually keeps the stored password: see :class:`SMTPConfig`.\n\nArgs:\n    body: Body carrying the SMTP settings.\n    request: The incoming request, for the audit record.\n    session: Authenticated session, injected by the dependency.\n\nReturns:\n    Confirmation message.\n\nRaises:\n    ConfigError: 400, through the error boundary, for a host that is not\n        a hostname, a port out of range, both ``use_ssl`` and ``use_tls``\n        enabled, or an invalid ``from_address`` or recipient.\n    HTTPException: If the configuration cannot be written.",
+        "operationId": "update_smtp_config_api_config_smtp_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SMTPConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Smtp Config",
         "tags": [
           "Configuration"
         ]
@@ -11969,7 +12781,7 @@
     },
     "/api/jobs/update": {
       "post": {
-        "description": "Queue an update.\n\nArgs:\n    request: The update request.\n    session: The authenticated session.\n\nReturns:\n    The queued job.",
+        "description": "Queue an update.\n\nUnless ``force`` is set, the head of the branch on the remote is compared\nwith the live commit first (``git ls-remote``, nothing is downloaded), and\nan update that would rebuild the same commit is refused with ``409\nnothing_new``. The webhook does not ask: a push is itself the news.\n\nArgs:\n    request: The update request.\n    session: The authenticated session.\n\nReturns:\n    The queued job.\n\nRaises:\n    HTTPException: 409 ``nothing_new`` when the branch has nothing new.",
         "operationId": "create_update_job_api_jobs_update_post",
         "requestBody": {
           "content": {
@@ -12610,7 +13422,7 @@
     },
     "/api/monitor/test-email": {
       "post": {
-        "description": "Send a test message through the configured SMTP relay.\n\nArgs:\n    session: Authenticated session, injected.\n\nReturns:\n    A success payload.\n\nRaises:\n    HTTPException: When SMTP is not configured or delivery failed.",
+        "description": "Send a test message through the configured SMTP relay.\n\nArgs:\n    session: Authenticated session, injected.\n\nReturns:\n    A success payload.\n\nRaises:\n    HTTPException: When SMTP is not configured or delivery failed. A\n        delivery failure carries the mail server's own reply verbatim in\n        ``output`` (``EmailNotifier`` already redacts the password out of\n        it), alongside the friendlier ``detail`` a console renders as the\n        headline - the same ``detail``/``output`` split\n        ``POST /api/sites/reload`` uses for a rejected web server config,\n        so a form built over this endpoint does not have to parse the\n        server's words out of a single sentence to show them.",
         "operationId": "test_email_api_monitor_test_email_post",
         "responses": {
           "200": {

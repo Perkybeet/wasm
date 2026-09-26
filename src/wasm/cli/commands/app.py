@@ -10,7 +10,9 @@
 :func:`~wasm.deployers.migrate.migrate`, which ``POST /api/apps/{d}/migrate``
 calls too. ``limits`` sets the memory, CPU and task limits of its unit through
 :func:`wasm.deployers.lifecycle.set_resource_limits`, like ``PATCH
-/api/apps/{d}/limits``. This module only parses, presents and asks.
+/api/apps/{d}/limits``. ``health`` sets what the health gate asks of it
+through :func:`wasm.deployers.lifecycle.set_health_check`, like ``PATCH
+/api/apps/{d}/health``. This module only parses, presents and asks.
 """
 
 from __future__ import annotations
@@ -24,8 +26,9 @@ import click
 from wasm.cli.app import Context, WasmGroup, json_option, pass_context
 from wasm.core.exceptions import WASMError
 from wasm.core.logger import Logger
-from wasm.core.store import DeploymentTrigger, get_store
-from wasm.deployers.lifecycle import set_resource_limits
+from wasm.core.store import App, DeploymentTrigger, get_store
+from wasm.deployers.helpers.health_gate import HealthCheck
+from wasm.deployers.lifecycle import set_health_check, set_resource_limits
 from wasm.deployers.migrate import MigrationPlan, migrate, plan_migration
 from wasm.deployers.recorder import CapturingLogger
 from wasm.managers.service_manager import ResourceLimits
@@ -258,3 +261,87 @@ def limits_command(
         ctx.logger.info(
             f"The running process keeps its old limits until it restarts: wasm restart {domain}"
         )
+
+
+def health_settings(app: App) -> dict[str, object]:
+    """
+    Describe an application's health check: what it set, and what the gate uses.
+
+    Args:
+        app: The application.
+
+    Returns:
+        The stored values (None where it keeps the default) and, under
+        ``effective``, what the gate actually asks.
+    """
+    check = HealthCheck.for_app(app)
+    return {
+        "domain": app.domain,
+        "path": app.health_path,
+        "expect": app.health_expect,
+        "timeout": app.health_timeout,
+        "effective": {
+            "path": check.path,
+            "expect": check.describe_expect(),
+            "timeout": check.seconds,
+        },
+    }
+
+
+@cli.command("health")
+@click.argument("domain")
+@click.option("--path", metavar="PATH", help="Path the health check requests, such as /healthz.")
+@click.option(
+    "--expect",
+    metavar="STATUSES",
+    help="Statuses that mean up: 200-399, or 200,204. Default: any status below 500.",
+)
+@click.option("--timeout", type=int, metavar="SECONDS", help="Seconds it gets to answer, 5 to 600.")
+@click.option("--reset", is_flag=True, default=False, help="Go back to the defaults for all three.")
+@json_option("Print the health check settings as JSON.")
+@pass_context
+def health_command(
+    ctx: Context,
+    domain: str,
+    path: str | None,
+    expect: str | None,
+    timeout: int | None,
+    reset: bool,
+) -> None:
+    """
+    Show or set what the health gate asks of an application.
+
+    Every deploy, update, rollback and migration keeps the new release only
+    if it answers the health check; the diagnosis asks the same. An option
+    not named keeps its value. Nothing restarts: the next activation uses
+    the new settings.
+    """
+    app = get_store().get_app(domain)
+    if app is None:
+        raise WASMError(
+            f"Application not found: {domain}", details="Run 'wasm list' to see what is deployed."
+        )
+    named = path is not None or expect is not None or timeout is not None
+    if reset and named:
+        raise click.UsageError("--reset goes back to every default; name no value with it.")
+    if reset or named:
+        app = set_health_check(
+            app.domain,
+            path=None if reset else (path if path is not None else app.health_path),
+            expect=None if reset else (expect if expect is not None else app.health_expect),
+            timeout=None if reset else (timeout if timeout is not None else app.health_timeout),
+        )
+    settings = health_settings(app)
+    if ctx.json_output:
+        click.echo(json.dumps(settings))
+        return
+    if reset or named:
+        ctx.logger.success(f"Health check of {app.domain} updated")
+    check = HealthCheck.for_app(app)
+    ctx.logger.key_value("Path", check.path + ("" if app.health_path else " (default)"))
+    ctx.logger.key_value(
+        "Healthy", check.describe_expect() + ("" if app.health_expect else " (default)")
+    )
+    ctx.logger.key_value(
+        "Timeout", f"{check.seconds} s" + ("" if app.health_timeout is not None else " (default)")
+    )

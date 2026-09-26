@@ -22,7 +22,7 @@ from click.testing import CliRunner
 
 from wasm.cli.app import cli as root_cli
 from wasm.cli.commands import notify as notify_module
-from wasm.core.notifier import Notifier
+from wasm.core.notifier import Notifier, TelegramChat
 
 
 @pytest.fixture
@@ -42,7 +42,7 @@ def fake_notifier(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     Returns:
         A dict the test scripts: set "error" to make the channel fail.
     """
-    state: dict[str, Any] = {"error": None, "calls": []}
+    state: dict[str, Any] = {"error": None, "calls": [], "chats": [], "chats_error": None}
 
     class FakeNotifier:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -62,6 +62,18 @@ def fake_notifier(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
             """
             state["calls"].append(name)
             return state["error"]
+
+        def list_telegram_chats(self) -> list[TelegramChat]:
+            """
+            Returns:
+                The scripted chats.
+
+            Raises:
+                ValueError: When the test scripted one.
+            """
+            if state["chats_error"] is not None:
+                raise state["chats_error"]
+            return state["chats"]
 
     monkeypatch.setattr(notify_module, "Notifier", FakeNotifier)
     return state
@@ -98,3 +110,47 @@ def test_an_unknown_channel_is_a_usage_error(cli_runner: CliRunner) -> None:
 def test_uses_the_real_notifier_class(cli_runner: CliRunner, tmp_path: Path) -> None:
     """Without the fake, the command reaches the real Notifier and its guard."""
     assert notify_module.Notifier is Notifier
+
+
+# ---------------------------------------------------------------------------
+# wasm notify telegram-chats
+# ---------------------------------------------------------------------------
+
+
+def test_telegram_chats_lists_every_chat_found(
+    cli_runner: CliRunner, fake_notifier: dict[str, Any]
+) -> None:
+    fake_notifier["chats"] = [
+        TelegramChat(id=123, type="private", username="ops"),
+        TelegramChat(id=-1001234567890, type="supergroup", title="Ops Room"),
+    ]
+
+    result = cli_runner.invoke(root_cli, ["notify", "telegram-chats"])
+
+    assert result.exit_code == 0, result.output
+    assert "123" in result.output
+    assert "@ops" in result.output
+    assert "-1001234567890" in result.output
+    assert "Ops Room" in result.output
+
+
+def test_telegram_chats_with_none_found_says_so(
+    cli_runner: CliRunner, fake_notifier: dict[str, Any]
+) -> None:
+    result = cli_runner.invoke(root_cli, ["notify", "telegram-chats"])
+
+    assert result.exit_code == 0, result.output
+    assert "no chats" in result.output.lower()
+
+
+def test_telegram_chats_reports_a_missing_token(
+    cli_runner: CliRunner, fake_notifier: dict[str, Any]
+) -> None:
+    fake_notifier["chats_error"] = ValueError(
+        "notifications.channels.telegram.bot_token and chat_id must be set first."
+    )
+
+    result = cli_runner.invoke(root_cli, ["notify", "telegram-chats"])
+
+    assert result.exit_code != 0
+    assert "bot_token" in result.output

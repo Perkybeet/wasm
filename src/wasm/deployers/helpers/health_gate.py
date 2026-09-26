@@ -15,23 +15,43 @@ rule with two answers - so the gate is one class both
 What it does not decide is what happens next: the caller re-activates the
 release that was serving and says so, because only the caller knows which one
 that was.
+
+What it asks is the application's own :class:`HealthCheck`: the path, the
+statuses that mean up and how long to wait, as the operator set them with
+``wasm app health`` or the console, and 2.0's rule for whatever they did not.
 """
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Callable, Sequence
-from typing import Protocol
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Protocol
 
 from wasm.core.exceptions import WASMError
 from wasm.core.logger import Logger
 from wasm.deployers.helpers.health import answers, wait_until_healthy
+from wasm.validators.health import parse_health_expect
+
+if TYPE_CHECKING:
+    from wasm.core.store import App
 
 #: How long a new release gets to answer before it is rolled back: attempts,
 #: and seconds between them. Longer than the post-deploy check, because a
 #: failed gate throws a good build away while a failed report only warns.
 HEALTH_GATE_ATTEMPTS = 15
 HEALTH_GATE_DELAY = 2.0
+
+#: What the gate probes when neither the application nor its deployer says.
+DEFAULT_HEALTH_PATH = "/"
+
+#: Seconds a release gets to answer when the application does not say: the
+#: attempts and the delay above, which is what every 2.0 gate waited.
+DEFAULT_HEALTH_TIMEOUT = int(HEALTH_GATE_ATTEMPTS * HEALTH_GATE_DELAY)
+
+#: How the default expectation reads to an operator.
+DEFAULT_EXPECT_DESCRIPTION = "any status below 500"
 
 #: Journal lines attached to a failed health gate, so the deployment record
 #: shows why the process did not come up, not only that it did not.
@@ -43,6 +63,99 @@ _ATTEMPT = re.compile(r"^Health check attempt (\d+) failed: (.*)$", re.DOTALL)
 
 #: The probe's signature: :func:`~wasm.deployers.helpers.health.wait_until_healthy`.
 Probe = Callable[..., bool]
+
+
+@dataclass(frozen=True)
+class HealthCheck:
+    """
+    What the health gate asks of one application.
+
+    The values come from the store, which validated them on the way in, so
+    this only interprets them. None for any of them is the 2.0 behaviour.
+
+    Attributes:
+        path: The path probed on 127.0.0.1, such as ``/healthz``.
+        expect: The statuses that mean up, such as ``200-399``, or None for
+            any status below 500.
+        timeout: Seconds the application gets to answer, or None for
+            :data:`DEFAULT_HEALTH_TIMEOUT`.
+    """
+
+    path: str = DEFAULT_HEALTH_PATH
+    expect: str | None = None
+    timeout: int | None = None
+
+    @classmethod
+    def for_app(cls, app: App | None, *, default_path: str = DEFAULT_HEALTH_PATH) -> HealthCheck:
+        """
+        Read an application's health check off its row.
+
+        Args:
+            app: The row, or None for an application not registered yet.
+            default_path: The deployer's own path, used when the application
+                names none.
+
+        Returns:
+            The check.
+        """
+        if app is None:
+            return cls(path=default_path)
+        return cls(
+            path=app.health_path or default_path,
+            expect=app.health_expect,
+            timeout=app.health_timeout,
+        )
+
+    def url(self, port: int | None) -> str:
+        """
+        Say what to request.
+
+        Args:
+            port: The port the application listens on.
+
+        Returns:
+            ``http://127.0.0.1:<port><path>``: always the application itself,
+            never a name that could resolve elsewhere.
+        """
+        return f"http://127.0.0.1:{port}{self.path}"
+
+    def accepts(self, status: int) -> bool:
+        """
+        Tell whether a status means the application is up.
+
+        Args:
+            status: The HTTP status it answered with.
+
+        Returns:
+            Whether it is in the expectation, or below 500 without one.
+        """
+        if self.expect is None:
+            return answers(status)
+        return any(low <= status <= high for low, high in parse_health_expect(self.expect))
+
+    @property
+    def seconds(self) -> int:
+        """Seconds the application gets to answer."""
+        return self.timeout if self.timeout is not None else DEFAULT_HEALTH_TIMEOUT
+
+    def attempts(self, delay: float) -> int:
+        """
+        Turn the wait into probes.
+
+        Args:
+            delay: Seconds between probes.
+
+        Returns:
+            As many probes as fit in :attr:`seconds`, at least one; exactly
+            :data:`HEALTH_GATE_ATTEMPTS` without a timeout of its own.
+        """
+        if self.timeout is None:
+            return HEALTH_GATE_ATTEMPTS
+        return max(1, math.ceil(self.timeout / delay))
+
+    def describe_expect(self) -> str:
+        """Say which statuses count, as an operator reads it."""
+        return self.expect if self.expect is not None else DEFAULT_EXPECT_DESCRIPTION
 
 
 class UnitControl(Protocol):
@@ -62,6 +175,7 @@ class HealthGate:
     Attributes:
         unit: The unit to restart, or None for a site nothing runs for.
         url: What to probe over HTTP, or None for a site served off disk.
+        check: The application's health check, when it has one of its own.
     """
 
     def __init__(
@@ -74,7 +188,8 @@ class HealthGate:
         probe: Probe = wait_until_healthy,
         restart: Callable[[], object] | None = None,
         files_check: Callable[[], bool] | None = None,
-        attempts: int = HEALTH_GATE_ATTEMPTS,
+        check: HealthCheck | None = None,
+        attempts: int | None = None,
         delay: float = HEALTH_GATE_DELAY,
     ) -> None:
         """
@@ -92,7 +207,11 @@ class HealthGate:
                 restarting ``unit``, or nothing without one.
             files_check: Decides a site served off disk, which has no URL of
                 its own to probe. Without one, such a site passes.
-            attempts: How many probes before giving up.
+            check: The application's health check: which statuses mean up
+                and how long to wait. The caller builds ``url`` from its
+                path. None is the 2.0 rule: below 500, for 30 seconds.
+            attempts: How many probes before giving up. None derives them
+                from the check's timeout.
             delay: Seconds between probes.
         """
         self.unit = unit
@@ -102,7 +221,11 @@ class HealthGate:
         self._probe = probe
         self._restart = restart
         self._files_check = files_check
-        self._attempts = attempts
+        self.check = check
+        self._attempts = (
+            attempts if attempts is not None else (check or HealthCheck()).attempts(delay)
+        )
+        self._accept: Callable[[int], bool] = check.accepts if check is not None else answers
         self._delay = delay
         self._failures: list[str] = []
 
@@ -135,7 +258,7 @@ class HealthGate:
             retries=self._attempts,
             delay=self._delay,
             on_attempt=self._note_attempt,
-            accept=answers,
+            accept=self._accept,
         )
         if healthy:
             return True, ""

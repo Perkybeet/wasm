@@ -201,6 +201,9 @@ DEPLOY_SCOPE_PATHS = frozenset(
 DEPLOY_SCOPE_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Activating a release is an instant rollback: the same act as queueing one.
     re.compile(r"^/api/apps/[^/]+/releases/[^/]+/activate$"),
+    # Rebuilding a deployment's commit is an update; going back to what a
+    # deployment produced is a rollback.
+    re.compile(r"^/api/apps/[^/]+/deployments/[0-9]+/(rebuild|rollback)$"),
 )
 
 #: Recorded in the payload the auth dependency hands to endpoints. Kept as

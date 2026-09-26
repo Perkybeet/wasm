@@ -13,6 +13,7 @@ and output that stays parseable.
 
 from __future__ import annotations
 
+import io
 import json
 import sys
 from argparse import Namespace
@@ -118,8 +119,8 @@ def wasm() -> Wasm:
     """
     cli_runner = CliRunner()
 
-    def invoke(*args: str) -> Invocation:
-        result = cli_runner.invoke(root_cli, list(args))
+    def invoke(*args: str, input: str | None = None) -> Invocation:
+        result = cli_runner.invoke(root_cli, list(args), input=input)
         return Invocation(
             exit_code=result.exit_code,
             output=result.output,
@@ -706,6 +707,23 @@ def test_set_a_list_default_key_also_accepts_a_json_array_without_the_flag(
     assert stored["monitor"]["email_recipients"] == ["ops@example.com", "a@b.com"]
 
 
+def test_set_a_list_default_key_also_accepts_a_plain_comma_separated_value(
+    wasm: Wasm, real_config_path: Path
+) -> None:
+    """
+    monitor.email_recipients defaults to a list, so a bare comma-separated
+    value must store a list, exactly as it would with --list, without asking
+    an operator to know that a key with a list default needs brackets and
+    quotes instead. Before this test, 'a@x.com,b@y.com' was stored as that
+    literal string, not the two-item list the parallel --list flow produces.
+    """
+    result = wasm("config", "set", "monitor.email_recipients", "a@x.com,b@y.com")
+
+    assert result.exit_code == 0, result.output
+    stored = yaml.safe_load(real_config_path.read_text())
+    assert stored["monitor"]["email_recipients"] == ["a@x.com", "b@y.com"]
+
+
 def test_set_get_round_trips_a_list_value(wasm: Wasm, real_config_path: Path) -> None:
     """'config get' shows a list value as YAML, the same as any other structured value."""
     wasm("config", "set", "notifications.allow_private_hosts", "internal.example", "--list")
@@ -783,6 +801,188 @@ def test_the_panel_documented_smtp_host_command_works(wasm: Wasm, real_config_pa
     assert wasm("config", "get", "monitor.smtp.host").output.strip() == "smtp.example.com"
 
 
+# ---------------------------------------------------------------------------
+# config set monitor.smtp.* validation - the chokepoint in core/config.py, so
+# the CLI is refused in the same words as GET/PUT /api/config/smtp.
+# ---------------------------------------------------------------------------
+
+
+def test_set_refuses_an_smtp_host_that_is_not_a_hostname(
+    wasm: Wasm, real_config_path: Path
+) -> None:
+    result = wasm("config", "set", "monitor.smtp.host", "not a host!!")
+
+    assert result.exit_code == 1
+    assert "not a valid hostname" in result.output
+    assert not real_config_path.exists()
+
+
+def test_set_refuses_an_smtp_port_out_of_range(wasm: Wasm, real_config_path: Path) -> None:
+    result = wasm("config", "set", "monitor.smtp.port", "70000")
+
+    assert result.exit_code == 1
+    assert "monitor.smtp.port must be between 1 and 65535" in result.output
+
+
+def test_set_refuses_enabling_both_smtp_transports(wasm: Wasm, real_config_path: Path) -> None:
+    """use_ssl and use_tls are two ways to reach the same server; only one may be on."""
+    assert wasm("config", "set", "monitor.smtp.use_ssl", "true").exit_code == 0
+
+    result = wasm("config", "set", "monitor.smtp.use_tls", "true")
+
+    assert result.exit_code == 1
+    assert "cannot both be enabled" in result.output
+    # The single-leaf write that failed the cross-field check must not have
+    # been applied either.
+    assert yaml.safe_load(real_config_path.read_text())["monitor"]["smtp"]["use_tls"] is False
+
+
+def test_set_refuses_an_invalid_smtp_from_address(wasm: Wasm, real_config_path: Path) -> None:
+    result = wasm("config", "set", "monitor.smtp.from_address", "not-an-email")
+
+    assert result.exit_code == 1
+    assert "not a valid email address" in result.output
+
+
+def test_set_refuses_an_invalid_recipient(wasm: Wasm, real_config_path: Path) -> None:
+    result = wasm("config", "set", "monitor.email_recipients", "ops@example.com,not-an-email")
+
+    assert result.exit_code == 1
+    assert "invalid email address" in result.output
+    assert not real_config_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# config set --stdin / --prompt: a secret value never has to touch argv
+# ---------------------------------------------------------------------------
+
+
+def test_set_stdin_reads_the_value_from_standard_input(wasm: Wasm, real_config_path: Path) -> None:
+    result = wasm("config", "set", "monitor.smtp.password", "--stdin", input="hunter2\n")
+
+    assert result.exit_code == 0, result.output
+    stored = yaml.safe_load(real_config_path.read_text())
+    assert stored["monitor"]["smtp"]["password"] == "hunter2"
+
+
+def test_set_stdin_strips_exactly_one_trailing_newline(wasm: Wasm, real_config_path: Path) -> None:
+    """A value copy-pasted from a file with its own trailing newline keeps the rest."""
+    result = wasm("config", "set", "monitor.smtp.password", "--stdin", input="hunter2\n\n")
+
+    assert result.exit_code == 0, result.output
+    stored = yaml.safe_load(real_config_path.read_text())
+    assert stored["monitor"]["smtp"]["password"] == "hunter2\n"
+
+
+def test_set_stdin_without_a_trailing_newline_is_kept_whole(
+    wasm: Wasm, real_config_path: Path
+) -> None:
+    """printf '%s' with no trailing newline must not lose its last character."""
+    result = wasm("config", "set", "monitor.smtp.password", "--stdin", input="hunter2")
+
+    assert result.exit_code == 0, result.output
+    stored = yaml.safe_load(real_config_path.read_text())
+    assert stored["monitor"]["smtp"]["password"] == "hunter2"
+
+
+def test_set_prompt_reads_the_value_without_echoing_it_in_the_transcript(
+    wasm: Wasm, real_config_path: Path
+) -> None:
+    result = wasm("config", "set", "monitor.smtp.password", "--prompt", input="hunter2\n")
+
+    assert result.exit_code == 0, result.output
+    stored = yaml.safe_load(real_config_path.read_text())
+    assert stored["monitor"]["smtp"]["password"] == "hunter2"
+    assert "hunter2" not in result.output
+
+
+def test_set_refuses_a_value_together_with_stdin(wasm: Wasm, real_config_path: Path) -> None:
+    result = wasm("config", "set", "monitor.smtp.password", "typed", "--stdin", input="piped\n")
+
+    assert result.exit_code == 2
+    assert "Give VALUE" in result.output
+
+
+def test_set_refuses_a_value_together_with_prompt(wasm: Wasm, real_config_path: Path) -> None:
+    result = wasm("config", "set", "monitor.smtp.password", "typed", "--prompt", input="piped\n")
+
+    assert result.exit_code == 2
+
+
+def test_set_refuses_stdin_together_with_prompt(wasm: Wasm, real_config_path: Path) -> None:
+    result = wasm("config", "set", "monitor.smtp.password", "--stdin", "--prompt", input="piped\n")
+
+    assert result.exit_code == 2
+
+
+def test_set_without_a_value_or_a_source_is_a_usage_error(
+    wasm: Wasm, real_config_path: Path
+) -> None:
+    result = wasm("config", "set", "monitor.smtp.password")
+
+    assert result.exit_code == 2
+    assert "Give VALUE" in result.output
+
+
+def test_set_does_not_warn_for_a_secret_key_off_a_real_terminal(
+    wasm: Wasm, real_config_path: Path
+) -> None:
+    """
+    CliRunner replaces stdin/stdout with objects that are never a TTY, the
+    same as a script's - the case the warning must stay silent for. The
+    warning itself is pinned directly below, against
+    ``_warn_if_secret_typed_in_argv``, because CliRunner's own stdin
+    substitution makes it impossible to simulate a real terminal through
+    ``invoke()``.
+    """
+    result = wasm("config", "set", "monitor.smtp.password", "hunter2")
+
+    assert result.exit_code == 0, result.output
+    assert "--stdin" not in result.output
+
+
+def test_warn_if_secret_typed_in_argv_warns_on_a_real_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A secret typed straight into VALUE is still accepted - the warning is a
+    nudge, not a refusal - but an operator at a real terminal is told to use
+    --stdin instead, because it just landed in this shell's history.
+    """
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    buffer = io.StringIO()
+
+    config_cmd._warn_if_secret_typed_in_argv("monitor.smtp.password", Logger(stream=buffer))
+
+    assert "--stdin" in buffer.getvalue()
+    assert "monitor.smtp.password" in buffer.getvalue()
+
+
+def test_warn_if_secret_typed_in_argv_is_silent_for_a_non_secret_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    buffer = io.StringIO()
+
+    config_cmd._warn_if_secret_typed_in_argv("apps_directory", Logger(stream=buffer))
+
+    assert buffer.getvalue() == ""
+
+
+def test_warn_if_secret_typed_in_argv_is_silent_without_a_real_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    buffer = io.StringIO()
+
+    config_cmd._warn_if_secret_typed_in_argv("monitor.smtp.password", Logger(stream=buffer))
+
+    assert buffer.getvalue() == ""
+
+
 def test_get_and_set_do_not_offer_json(wasm: Wasm) -> None:
     """Nothing here builds a JSON payload, so --json is not offered."""
     for name in ("get", "set"):
@@ -840,3 +1040,14 @@ def test_handle_config_without_an_action_prints_the_summary(
     """`wasm config` with no action keeps listing its commands."""
     assert config_cmd.handle_config(Namespace(action=None, verbose=False)) == 0
     assert "upgrade" in capsys.readouterr().out
+
+
+def test_a_group_chat_id_without_its_minus_is_refused_at_the_config_chokepoint() -> None:
+    """The same rule as the API's Telegram form, for `wasm config set` too."""
+    from wasm.core.config import Config
+    from wasm.core.exceptions import ConfigError
+
+    with pytest.raises(ConfigError) as caught:
+        Config().set("notifications.channels.telegram.chat_id", "1004482709713")
+
+    assert "-1004482709713" in (caught.value.details or "")

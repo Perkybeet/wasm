@@ -229,9 +229,13 @@ class UpdateResult:
         prisma_updated: Whether Prisma client generation and migrations ran.
         is_static: Whether the application has no service to restart.
         start_command: The command the service runs, empty for a static site.
+        restarted: The units the deployer already restarted and saw pass the
+            health gate, so the caller must not restart them again; None when
+            restarting is left to the caller.
     """
 
     package_manager: str
     prisma_updated: bool
     is_static: bool
     start_command: str
+    restarted: tuple[str, ...] | None = None

@@ -503,7 +503,14 @@ def _try_certificate(deployer: BaseDeployer, log: Logger) -> tuple[bool, str | N
     try:
         _cover_every_domain(deployer)
     except CertificateError as exc:
-        output = exc.details or exc.message
+        if exc.output and exc.details and exc.details.strip() != exc.output.strip():
+            # A diagnosis (a record pointing elsewhere, say) goes above certbot's
+            # own words, which stay verbatim underneath.
+            output = f"{exc.message}\n{exc.details}\n\n{exc.output}"
+        elif exc.output:
+            output = exc.output
+        else:
+            output = exc.details or exc.message
         log.warning(f"The certificate was not extended: {exc.message}")
         return False, output
     return True, None

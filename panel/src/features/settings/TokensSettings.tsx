@@ -153,12 +153,15 @@ export function TokensSettings() {
           )}
         </QueryState>
       </Section>
-      <Section
-        title="Using a token"
-        description="Send it in the Authorization header. A token cannot open the console in a browser; it is for the API only."
-      >
-        <CommandHint command={`curl -H "Authorization: Bearer wasm_tok_..." ${window.location.origin}/api/apps`} />
-      </Section>
+      {/* Under a list of unknown length: drawn with it, never pushed down the page by it. */}
+      {query.data !== undefined || query.isError ? (
+        <Section
+          title="Using a token"
+          description="Send it in the Authorization header. A token cannot open the console in a browser; it is for the API only."
+        >
+          <CommandHint command={`curl -H "Authorization: Bearer wasm_tok_..." ${window.location.origin}/api/apps`} />
+        </Section>
+      ) : null}
 
       <CreateTokenDialog
         open={creating}

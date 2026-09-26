@@ -96,6 +96,7 @@ def recorder(monkeypatch: pytest.MonkeyPatch) -> Recorder:
         lifecycle,
         "SourceManager",
         lambda verbose=False: SimpleNamespace(
+            get_repo_info=lambda path: {"commit": "abc1234"},
             pull=lambda path, branch=None: rec.calls.append(("pull", path, branch)),
             fetch=lambda source, path, branch=None, force=False, clean=True: rec.calls.append(
                 ("fetch", source, path, force, clean)

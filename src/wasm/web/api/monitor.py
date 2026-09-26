@@ -765,7 +765,14 @@ def test_email(session: Session) -> MonitorActionResponse:
         A success payload.
 
     Raises:
-        HTTPException: When SMTP is not configured or delivery failed.
+        HTTPException: When SMTP is not configured or delivery failed. A
+            delivery failure carries the mail server's own reply verbatim in
+            ``output`` (``EmailNotifier`` already redacts the password out of
+            it), alongside the friendlier ``detail`` a console renders as the
+            headline - the same ``detail``/``output`` split
+            ``POST /api/sites/reload`` uses for a rejected web server config,
+            so a form built over this endpoint does not have to parse the
+            server's words out of a single sentence to show them.
     """
     notifier = EmailNotifier(verbose=False)
 
@@ -783,6 +790,15 @@ def test_email(session: Session) -> MonitorActionResponse:
     try:
         notifier.send_test_email()
     except EmailError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "email_error",
+                "detail": exc.message,
+                "hint": None,
+                "fields": None,
+                "output": exc.details or exc.message,
+            },
+        ) from exc
 
     return MonitorActionResponse(success=True, message="Test email sent")

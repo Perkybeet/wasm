@@ -256,6 +256,14 @@ def certs_client(runner: Any) -> TestClient:
     return _client((certs_api.router, "/api/certs"))
 
 
+#: Handlers that are coroutines on purpose, each with the reason it is safe.
+ASYNC_BY_DESIGN = {
+    # Watches request.is_disconnected() to cancel the inspection when the
+    # client leaves; every blocking step runs in the threadpool.
+    "inspect_app_source",
+}
+
+
 class TestEventLoopSafety:
     """Handlers block on external programs, so they must not run on the loop."""
 
@@ -266,6 +274,7 @@ class TestEventLoopSafety:
             route.endpoint.__name__
             for route in module.router.routes
             if inspect.iscoroutinefunction(getattr(route, "endpoint", None))
+            and route.endpoint.__name__ not in ASYNC_BY_DESIGN
         ]
         assert offenders == [], f"these handlers would freeze the event loop: {offenders}"
 
@@ -278,6 +287,7 @@ class TestEventLoopSafety:
             if isinstance(route, APIRoute)
             and Path(inspect.getfile(route.endpoint)).name in owned
             and inspect.iscoroutinefunction(route.endpoint)
+            and route.endpoint.__name__ not in ASYNC_BY_DESIGN
         ]
         assert offenders == [], f"these handlers would freeze the event loop: {offenders}"
 

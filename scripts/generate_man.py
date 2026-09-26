@@ -29,6 +29,26 @@ ROOT = Path(__file__).resolve().parent.parent
 TARGETS = (ROOT / "man/wasm.1", ROOT / "obs/wasm.1")
 
 
+def _has_default(option: click.Option) -> bool:
+    """
+    Report whether an option has a default worth printing.
+
+    Click 8.2 and later mark "no default" with a sentinel instead of None;
+    printed, it read "Default: Sentinel.UNSET" on every option without one.
+
+    Args:
+        option: The option.
+
+    Returns:
+        True when the option has a real, non-flag default.
+    """
+    unset = getattr(click.core, "UNSET", None)
+    default = option.default
+    if option.is_flag or default is None or default is False:
+        return False
+    return unset is None or default is not unset
+
+
 def escape(text: str) -> str:
     """
     Escape text for roff.
@@ -76,7 +96,7 @@ def render_command(command: click.Command, path: tuple[str, ...]) -> list[str]:
         lines.append(".TP")
         lines.append(f".B {flags}")
         text = " ".join((option.help or "").split()) or "No description."
-        if option.default not in (None, False) and not option.is_flag:
+        if _has_default(option):
             text += f" Default: {option.default}."
         lines.append(escape(text))
 

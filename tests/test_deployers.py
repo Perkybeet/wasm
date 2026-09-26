@@ -1457,7 +1457,11 @@ def test_docker_compose_update_rebuilds_and_recreates(
     result = deployer.update(on_step=steps.append)
 
     assert result.is_static is True
-    assert steps == ["Rebuilding Docker images", "Recreating containers"]
+    assert steps == [
+        "Recording what is serving",
+        "Rebuilding Docker images",
+        "Recreating containers",
+    ]
     assert runner.calls_to("git") == []
     assert runner.ran(
         "docker",
@@ -1547,6 +1551,12 @@ EXEMPT_CALLS = {
     # A preview, not a deployment: the scratch checkout must be removed for
     # real even under --dry-run, and nothing in it is application state.
     ("inspect.py", "tempfile.TemporaryDirectory"),
+    # The empty workspace directories a sparse checkout leaves out, created
+    # inside that same scratch checkout so detection sees the tree it would.
+    ("inspect.py", "os.makedirs"),
+    # The scratch checkouts of an inspection whose process was killed, swept
+    # at console start; never a link, never another account's directory.
+    ("inspect.py", "shutil.rmtree"),
 }
 
 

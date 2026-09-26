@@ -21,19 +21,24 @@ class that this module exists to make impossible:
 - **Secrets never travel in argv.** Anything on a command line is visible in
   ``ps`` to every user on the box. Passwords go through ``env`` or ``stdin``,
   and ``redact`` keeps them out of the logs.
+
+An operation can also be cancelled while its commands run: see
+:func:`cancellable`.
 """
 
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import os
 import queue
 import shutil
+import signal
 import subprocess
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import IO
@@ -51,11 +56,103 @@ EXIT_TIMEOUT = -1
 #: Exit code POSIX shells use for "command not found".
 EXIT_NOT_FOUND = 127
 
+#: How often a command running inside a cancel scope looks at the scope's
+#: event. Short enough that a cancelled clone stops before the operator has
+#: finished reading the button they pressed.
+CANCEL_POLL_INTERVAL = 0.1
+
 _REDACTED = "***"
 
 
 class CommandError(WASMError):
     """A command failed and the caller asked for failures to be fatal."""
+
+
+class CommandCancelled(WASMError):
+    """A command was stopped, or never started, because its operation was cancelled."""
+
+
+#: The event of the innermost :func:`cancellable` block, per thread (and per
+#: task). A context variable rather than a ``cancel=`` argument on every
+#: method: cancellation belongs to an operation, not to one call, and every
+#: command the operation runs has to stop, however many managers deep it is
+#: issued. Threading an argument through each of them is a rule with as many
+#: holes as there are callers.
+_cancel_event: contextvars.ContextVar[threading.Event | None] = contextvars.ContextVar(
+    "wasm_cancel_event", default=None
+)
+
+
+@contextlib.contextmanager
+def cancellable(event: threading.Event) -> Iterator[threading.Event]:
+    """
+    Make every command run inside the block stop when ``event`` is set.
+
+    A command that would start after the event is set raises
+    :class:`CommandCancelled` without starting; one that is running is killed
+    together with every process it started (it runs in its own session, so
+    ``git clone``'s ``git-remote-https`` and ``index-pack`` go with it), then
+    :class:`CommandCancelled` is raised. The event is set from another thread,
+    typically the web request whose client went away.
+
+    Commands outside a scope run exactly as before, in the caller's session,
+    so a Ctrl+C at a terminal still reaches them.
+
+    Args:
+        event: Set it to cancel.
+
+    Yields:
+        The same event.
+    """
+    token = _cancel_event.set(event)
+    try:
+        yield event
+    finally:
+        _cancel_event.reset(token)
+
+
+def _cancel_scope(redacted: Sequence[str]) -> threading.Event | None:
+    """
+    Return the active cancel event, refusing to start once it is set.
+
+    Args:
+        redacted: The command about to start, for the error message.
+
+    Returns:
+        The event of the enclosing :func:`cancellable` block, or None.
+
+    Raises:
+        CommandCancelled: When the operation was already cancelled.
+    """
+    event = _cancel_event.get()
+    if event is not None and event.is_set():
+        raise CommandCancelled(f"Cancelled before it started: {' '.join(redacted)}")
+    return event
+
+
+def _kill_session(process: subprocess.Popen, *, drain: bool = True) -> None:
+    """
+    Kill a process started in its own session, and everything it started.
+
+    Args:
+        process: A process started with ``start_new_session=True``, so its
+            pid is also its process group id.
+        drain: Read the pipes to their end while reaping. False when another
+            thread already reads them (:meth:`SubprocessRunner.stream`).
+    """
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)
+    try:
+        # Reaps the child; draining also closes the pipes, which reach their
+        # end once every member of the group is dead.
+        if drain:
+            process.communicate(timeout=5)
+        else:
+            process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        # Something left the group (setsid) and holds the pipes. The child
+        # itself is dead; the pipes close when the object is collected.
+        process.kill()
 
 
 @dataclass(frozen=True)
@@ -372,6 +469,7 @@ class SubprocessRunner(CommandRunner):
         if input is not None and stdin_path is not None:
             raise ValueError("input and stdin_path are exclusive: a process has one stdin")
         args, run_env, redacted = self._prepare(argv, env, user, secrets)
+        cancel = _cancel_scope(redacted)
         started = time.monotonic()
         try:
             with contextlib.ExitStack() as stack:
@@ -383,17 +481,22 @@ class SubprocessRunner(CommandRunner):
                     stdin = stack.enter_context(open(stdin_path, "rb"))
                 else:
                     stdin = None if input is not None else subprocess.DEVNULL
-                completed = subprocess.run(
-                    args,
-                    cwd=str(cwd) if cwd else None,
-                    env=run_env,
-                    input=input,
-                    stdin=stdin,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    check=False,
-                )
+                if cancel is not None:
+                    completed = self._run_cancellable(
+                        args, cwd, run_env, input, stdin, timeout, cancel, redacted
+                    )
+                else:
+                    completed = subprocess.run(
+                        args,
+                        cwd=str(cwd) if cwd else None,
+                        env=run_env,
+                        input=input,
+                        stdin=stdin,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                        check=False,
+                    )
         except subprocess.TimeoutExpired:
             result = CommandResult(
                 argv=redacted,
@@ -426,6 +529,72 @@ class SubprocessRunner(CommandRunner):
             )
         return result.check() if check else result
 
+    @staticmethod
+    def _run_cancellable(
+        args: list[str],
+        cwd: Path | None,
+        run_env: dict[str, str],
+        input: str | None,
+        stdin: IO[bytes] | int | None,
+        timeout: int,
+        cancel: threading.Event,
+        redacted: tuple[str, ...],
+    ) -> subprocess.CompletedProcess[str]:
+        """
+        Run a command to completion unless its cancel scope is set first.
+
+        The process gets its own session, so cancelling or timing out kills
+        the whole tree it started, not only the direct child.
+
+        Args:
+            args: Final argv.
+            cwd: Working directory.
+            run_env: Complete environment.
+            input: Text for stdin, or None.
+            stdin: The stdin to give the process when ``input`` is None.
+            timeout: Deadline in seconds.
+            cancel: The scope's event.
+            redacted: Argv for messages.
+
+        Returns:
+            The finished process, as :func:`subprocess.run` would return it.
+
+        Raises:
+            CommandCancelled: When the event is set while the command runs.
+            subprocess.TimeoutExpired: When the deadline passes first; the
+                process tree has been killed.
+        """
+        process = subprocess.Popen(
+            args,
+            cwd=str(cwd) if cwd else None,
+            env=run_env,
+            stdin=subprocess.PIPE if input is not None else stdin,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + timeout
+        pending = input
+        while True:
+            remaining = deadline - time.monotonic()
+            try:
+                # communicate() may be called again after it times out; the
+                # input is handed over on the first call only.
+                stdout, stderr = process.communicate(
+                    input=pending, timeout=max(0.0, min(CANCEL_POLL_INTERVAL, remaining))
+                )
+            except subprocess.TimeoutExpired:
+                pending = None
+                if cancel.is_set():
+                    _kill_session(process)
+                    raise CommandCancelled(f"Cancelled: {' '.join(redacted)}") from None
+                if time.monotonic() >= deadline:
+                    _kill_session(process)
+                    raise
+                continue
+            return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
+
     def stream(
         self,
         argv: Sequence[str],
@@ -438,6 +607,7 @@ class SubprocessRunner(CommandRunner):
         secrets: Sequence[str] = (),
     ) -> CommandResult:
         args, run_env, redacted = self._prepare(argv, env, user, secrets)
+        cancel = _cancel_scope(redacted)
         started = time.monotonic()
         collected: list[str] = []
         try:
@@ -450,6 +620,10 @@ class SubprocessRunner(CommandRunner):
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
+                # Its own session only inside a cancel scope, where the whole
+                # tree must be killable; outside one, a Ctrl+C at the
+                # terminal has to keep reaching the child.
+                start_new_session=cancel is not None,
             )
         except FileNotFoundError:
             return CommandResult(
@@ -478,12 +652,16 @@ class SubprocessRunner(CommandRunner):
         deadline = started + timeout
         timed_out = False
         while True:
+            if cancel is not None and cancel.is_set():
+                _kill_session(process, drain=False)
+                reader.join(timeout=1)
+                raise CommandCancelled(f"Cancelled: {' '.join(redacted)}")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 timed_out = True
                 break
             try:
-                line = lines.get(timeout=min(remaining, 0.2))
+                line = lines.get(timeout=min(remaining, CANCEL_POLL_INTERVAL))
             except queue.Empty:
                 continue
             if line is None:
@@ -491,7 +669,9 @@ class SubprocessRunner(CommandRunner):
             collected.append(line)
             on_line(line)
 
-        if timed_out:
+        if timed_out and cancel is not None:
+            _kill_session(process, drain=False)
+        elif timed_out:
             process.kill()
         try:
             process.wait(timeout=5)
@@ -523,6 +703,10 @@ class SubprocessRunner(CommandRunner):
         secrets: Sequence[str] = (),
     ) -> CommandResult:
         args, run_env, redacted = self._prepare(argv, env, user, secrets)
+        # Checked before the destination is created; a dump already running
+        # is not interrupted, because a cancel that leaves half a backup
+        # needs its own undo, which no caller has asked for yet.
+        _cancel_scope(redacted)
         destination.parent.mkdir(parents=True, exist_ok=True)
         started = time.monotonic()
 
@@ -885,6 +1069,9 @@ class FakeRunner(CommandRunner):
         if user is not None:
             args = [*runuser_prefix(user), *args]
         recorded = tuple(args)
+        # Like the real runner: a command of a cancelled operation never runs,
+        # so it is not recorded as having run either.
+        _cancel_scope(recorded)
         self.calls.append(recorded)
         self.envs.append(dict(env) if env is not None else None)
         for scripted in reversed(self._scripted):

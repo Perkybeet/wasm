@@ -28,6 +28,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from wasm.cli.commands import monitor as cli_monitor
+from wasm.core.exceptions import EmailError
 from wasm.core.logger import Logger
 from wasm.web.api import monitor as monitor_api
 from wasm.web.api.auth import get_current_session
@@ -468,6 +469,51 @@ def test_test_email_endpoint_sends_through_the_notifier(client: TestClient) -> N
 
     assert response.status_code == 200, response.text
     assert response.json()["success"] is True
+
+
+class _FailingNotifier(_FakeNotifier):
+    """A notifier whose test message is always rejected by the mail server."""
+
+    def send_test_email(self) -> bool:
+        """Fail the way a real server would: a redacted, verbatim reply."""
+        raise EmailError(
+            "Failed to send the notification email",
+            details="550 5.1.1 <ops@example.com>: Recipient address rejected",
+        )
+
+
+def test_test_email_endpoint_reports_the_smtp_error_verbatim_in_output(
+    monitor_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A delivery failure must show the mail server's own words, not a
+    paraphrase - CLAUDE.md's "a system error is never paraphrased" applies to
+    SMTP exactly as it does to nginx or systemd.
+
+    Builds its own app, with the error boundary ``wasm.web.server.create_app``
+    registers for the real API, rather than the bare-router ``client``
+    fixture the other endpoint tests share: that boundary is what turns a
+    dict-shaped ``HTTPException.detail`` into the API's ``detail``/``output``
+    contract, and it is the whole point being tested here.
+    """
+    from starlette.exceptions import HTTPException as StarletteHTTPException
+
+    from wasm.web.api.deps import handle_http_exception
+
+    _install_psutil_metrics(monkeypatch)
+    monkeypatch.setattr(monitor_api, "EmailNotifier", _FailingNotifier)
+
+    app = FastAPI(exception_handlers={StarletteHTTPException: handle_http_exception})
+    app.include_router(monitor_api.router, prefix="/api/monitor")
+    app.dependency_overrides[get_current_session] = lambda: {"session_id": "test"}
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.post("/api/monitor/test-email")
+
+    assert response.status_code == 502, response.text
+    body = response.json()
+    assert body["output"] == "550 5.1.1 <ops@example.com>: Recipient address rejected"
+    assert body["detail"] == "Failed to send the notification email"
 
 
 def test_endpoints_are_synchronous_so_they_do_not_block_the_event_loop() -> None:

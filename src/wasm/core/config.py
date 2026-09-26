@@ -50,6 +50,7 @@ import yaml  # type: ignore[import-untyped]
 
 from wasm.core.exceptions import ConfigError, SecurityError
 from wasm.core.fs import SECRET_DIR_MODE, SECRET_MODE, FileSystem, get_fs
+from wasm.validators.domain import is_valid_domain
 
 logger = logging.getLogger(__name__)
 
@@ -394,11 +395,189 @@ def _int_range_validator(label: str, low: int, high: int) -> Callable[[Any], int
     return validator
 
 
+#: A loose but real email address: something@something.tld. This is a syntax
+#: check, not a mailbox check - the only way to know an address actually
+#: receives mail is to send it one, which 'wasm config set' and a PUT of the
+#: monitor's SMTP settings have no business doing.
+_EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _is_valid_email(value: str) -> bool:
+    """
+    Check whether a string looks like an email address.
+
+    Args:
+        value: Candidate address.
+
+    Returns:
+        True if it has the shape of an address.
+    """
+    return bool(_EMAIL_PATTERN.match(value))
+
+
+def _validate_optional_email(label: str) -> Callable[[Any], str]:
+    """
+    Build a validator that accepts an email address, or leaves it unset.
+
+    An SMTP sender address is meaningfully absent (it falls back to the
+    account username), unlike a recipient list, so empty is accepted here and
+    refused by :func:`_validate_email_list`.
+
+    Args:
+        label: Name used in the error message.
+
+    Returns:
+        A function raising :class:`ConfigError` for a non-empty value that is
+        not an email address.
+    """
+
+    def validator(value: Any) -> str:
+        text = "" if value is None else str(value).strip()
+        if not text:
+            return ""
+        if not _is_valid_email(text):
+            raise ConfigError(
+                f"{label} is not a valid email address",
+                details=f"Got {text!r}. Use an address such as ops@example.com.",
+            )
+        return text
+
+    return validator
+
+
+def _validate_email_list(label: str) -> Callable[[Any], list[str]]:
+    """
+    Build a validator that requires a list of email addresses.
+
+    Accepts a comma-separated string too, the same shape 'wasm config set'
+    would otherwise need ``--list`` for, so a caller that bypasses the CLI's
+    own coercion (a direct :meth:`Config.set` call, or a future front end that
+    posts a string) is still refused rather than silently storing a single
+    malformed entry.
+
+    Args:
+        label: Name used in the error message.
+
+    Returns:
+        A function raising :class:`ConfigError` when the value is not a list
+        (or comma-separated string) of valid addresses.
+    """
+
+    def validator(value: Any) -> list[str]:
+        if isinstance(value, str):
+            items = [item.strip() for item in value.split(",") if item.strip()]
+        elif isinstance(value, list):
+            items = [str(item).strip() for item in value if str(item).strip()]
+        else:
+            raise ConfigError(
+                f"{label} must be a list of email addresses",
+                details=f"Got {value!r}.",
+            )
+
+        invalid = [item for item in items if not _is_valid_email(item)]
+        if invalid:
+            raise ConfigError(
+                f"{label} contains an invalid email address: {', '.join(invalid)}",
+                details="Every recipient must be an address such as ops@example.com.",
+            )
+        return items
+
+    return validator
+
+
+def _validate_smtp_host(value: Any) -> str:
+    """
+    Accept an SMTP server hostname, or leave it unset.
+
+    Reuses :func:`~wasm.validators.domain.is_valid_domain`, the same check a
+    site's domain goes through - loose enough to accept ``localhost`` and a
+    bare IP octet by shape, strict enough to catch a URL or a value with a
+    stray path or space pasted in by mistake.
+
+    Args:
+        value: The candidate value, from either front end.
+
+    Returns:
+        The value unchanged, once it is known to be usable.
+
+    Raises:
+        ConfigError: When the value is set and is not a valid hostname.
+    """
+    text = "" if value is None else str(value).strip()
+    if not text:
+        return ""
+    valid, error = is_valid_domain(text)
+    if not valid:
+        raise ConfigError(
+            f"monitor.smtp.host is not a valid hostname: {error}",
+            details=f"Got {text!r}. Use a hostname such as smtp.example.com.",
+        )
+    return text
+
+
+def _validate_smtp_section(smtp: dict[str, Any]) -> None:
+    """
+    Refuse an SMTP configuration that cannot describe a real connection.
+
+    Applied to the whole ``monitor.smtp`` section as it would end up after any
+    write that touches it - a single ``wasm config set monitor.smtp.use_tls
+    true`` and a full ``PUT /api/config/smtp`` both funnel through
+    :meth:`Config.set`, so a contradiction cannot land in the file through one
+    and not the other.
+
+    Args:
+        smtp: The section as it would be stored, after the write being
+            validated is applied.
+
+    Raises:
+        ConfigError: When both ``use_ssl`` and ``use_tls`` are enabled at
+            once - implicit TLS and STARTTLS are two different ways to reach
+            the same server, and a connection can only be made one way.
+    """
+    if smtp.get("use_ssl") and smtp.get("use_tls"):
+        raise ConfigError(
+            "monitor.smtp.use_ssl and monitor.smtp.use_tls cannot both be enabled",
+            details=(
+                "use_ssl connects with implicit TLS, usually on port 465; use_tls "
+                "connects in the clear and upgrades with STARTTLS, usually on port "
+                "587. They are two ways to reach the same server - turn one off."
+            ),
+        )
+
+
 # Validation wasm.web.api.config applies through its own typed endpoints
-# (WebserverConfig, BackupConfig, WebConfig), reproduced here against the
-# dotted key each endpoint actually writes so a value the panel would reject
-# cannot be waved through by using 'wasm config set' or the generic
-# PATCH /api/config instead.
+# (WebserverConfig, BackupConfig, WebConfig, SMTPConfig), reproduced here
+# against the dotted key each endpoint actually writes so a value the panel
+# would reject cannot be waved through by using 'wasm config set' or the
+# generic PATCH /api/config instead.
+def _validate_telegram_chat_id(value: Any) -> str:
+    """
+    Accept a Telegram chat id or leave it unset.
+
+    Args:
+        value: The configured ``chat_id``.
+
+    Returns:
+        The id as a stripped string, or ``""`` when unset.
+
+    Raises:
+        ConfigError: When it is neither an integer id nor an ``@channelname``,
+            including the id of a group written without its minus sign.
+    """
+    from wasm.validators.telegram import validate_telegram_chat_id
+
+    text = "" if value is None else str(value).strip()
+    if not text:
+        return ""
+    try:
+        return validate_telegram_chat_id(text)
+    except ValueError as exc:
+        raise ConfigError(
+            "notifications.channels.telegram.chat_id is not a Telegram chat id",
+            details=str(exc),
+        ) from exc
+
+
 _KEY_VALIDATORS: dict[str, Callable[[Any], Any]] = {
     "webserver": _validate_webserver,
     "backup.max_per_app": _int_range_validator("backup.max_per_app", 1, 100),
@@ -412,6 +591,19 @@ _KEY_VALIDATORS: dict[str, Callable[[Any], Any]] = {
     # Empty is stored as the default; relative is refused. See
     # resolve_backup_directory for the server this came from.
     "backup.directory": _validate_backup_directory,
+    "monitor.smtp.host": _validate_smtp_host,
+    "monitor.smtp.port": _int_range_validator("monitor.smtp.port", 1, 65535),
+    "monitor.smtp.from_address": _validate_optional_email("monitor.smtp.from_address"),
+    "monitor.email_recipients": _validate_email_list("monitor.email_recipients"),
+    "notifications.channels.telegram.chat_id": _validate_telegram_chat_id,
+}
+
+# Rules spanning more than one key of the same container - monitor.smtp's
+# use_ssl and use_tls being mutually exclusive cannot be expressed as a rule
+# over a single dotted key the way _KEY_VALIDATORS entries are. Keyed by the
+# container's own dotted path.
+_SECTION_VALIDATORS: dict[str, Callable[[dict[str, Any]], None]] = {
+    "monitor.smtp": _validate_smtp_section,
 }
 
 
@@ -468,6 +660,34 @@ def _validate_known_values_in(tree: dict[str, Any]) -> None:
         if leaf not in node:
             continue
         node[leaf] = validator(node[leaf])
+
+
+def _validate_known_sections_in(tree: dict[str, Any]) -> None:
+    """
+    Apply every whole-section rule in :data:`_SECTION_VALIDATORS` present in a tree.
+
+    The counterpart of :func:`_validate_known_values_in` for a rule that spans
+    more than one key of the same container, so :meth:`Config.replace` enforces
+    it too: a full ``PUT /api/config`` carrying a contradictory
+    ``monitor.smtp`` section must be refused exactly as a typed endpoint or
+    ``wasm config set`` would refuse it.
+
+    Args:
+        tree: Resolved configuration about to be stored.
+
+    Raises:
+        ConfigError: When a present section's value fails its rule.
+    """
+    for key, validator in _SECTION_VALIDATORS.items():
+        parts = key.split(".")
+        node: Any = tree
+        for part in parts:
+            if not isinstance(node, dict) or part not in node:
+                node = None
+                break
+            node = node[part]
+        if isinstance(node, dict):
+            validator(node)
 
 
 # Deprecated dotted spellings, mapped to the flat key every deployer and the
@@ -588,9 +808,11 @@ def coerce_config_value(existing: Any, raw: str) -> Any:
     problem: without this, ``wasm config set ssl.enabled false`` or a PATCH
     body ``{"path": "ssl.enabled", "value": "false"}`` stores the literal
     string ``"false"``, which is truthy. A key whose current or default value
-    is a list also accepts a JSON array (``["a@example.com"]``) without any
-    extra flag, since a command line or a string field has no other way to
-    shape one.
+    is a list also accepts a JSON array (``["a@example.com"]``) or a plain
+    comma-separated value (``a@example.com,b@example.com``) without any extra
+    flag, since a command line or a string field has no other way to shape
+    one and typing brackets and quotes for every list-valued key would defeat
+    the point of a default telling the coercion what shape to expect.
 
     A key with no default at all - ``existing`` is :data:`NO_DEFAULT` - has no
     type to match, so the value is parsed as a JSON scalar (``true``,
@@ -617,8 +839,17 @@ def coerce_config_value(existing: Any, raw: str) -> Any:
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
-            return raw
-        return parsed if isinstance(parsed, list) else raw
+            parsed = None
+        if isinstance(parsed, list):
+            return parsed
+        # Not JSON, or valid JSON that parsed to something other than a list
+        # (a bare number, for instance): fall back to the same comma-separated
+        # shape '--list' produces for a key with no default, so 'wasm config
+        # set monitor.email_recipients a@x.com,b@y.com' stores a list instead
+        # of the literal string - argv has no native list type, and a value
+        # already shaped like one is the whole reason this key has a default
+        # to coerce against in the first place.
+        return [item.strip() for item in raw.split(",") if item.strip()]
 
     if isinstance(existing, bool):
         lowered = raw.strip().lower()
@@ -708,6 +939,25 @@ def _is_secret_key(key: str) -> bool:
 
     words = re.split(r"[^a-z0-9]+", normalized)
     return any(word in SECRET_KEY_MARKERS for word in words)
+
+
+def is_secret_key(key: str) -> bool:
+    """
+    Report whether a configuration key's leaf name holds a secret.
+
+    The public entry point to the same classification :func:`redact_secrets`
+    uses, for a caller outside this module - ``wasm config set`` warning that
+    a secret typed in argv lands in shell history and ``ps``, for one - that
+    needs the answer without depending on a private name.
+
+    Args:
+        key: Configuration key name (not a dotted path; pass the leaf, such
+            as ``"password"`` out of ``"monitor.smtp.password"``).
+
+    Returns:
+        True if the value behind this key must be redacted.
+    """
+    return _is_secret_key(key)
 
 
 def redact_secrets(config: Any) -> Any:
@@ -1202,8 +1452,9 @@ class Config:
         A handful of keys carry the same rule
         :mod:`wasm.web.api.config` enforces through its own typed endpoints
         (``webserver``, ``backup.max_per_app``, ``web.port``,
-        ``web.session_timeout``); a value one of them rejects is rejected here
-        too, whichever front end called.
+        ``web.session_timeout``, the ``monitor.smtp`` fields and
+        ``monitor.email_recipients``); a value one of them rejects is rejected
+        here too, whichever front end called.
 
         A key listed in :data:`KEY_ALIASES`, such as ``apps.directory``, is
         written to its canonical key instead, so a deprecated spelling cannot
@@ -1226,12 +1477,15 @@ class Config:
         value = _validate_known_value(key, value)
         if isinstance(value, dict):
             # A whole section written at once ("backup" with a dict) must meet
-            # the same per-key rules as writing its keys one by one.
+            # the same per-key rules as writing its keys one by one, and any
+            # rule spanning more than one key of that section (monitor.smtp's
+            # use_ssl/use_tls).
             value = copy.deepcopy(value)
             wrapper: dict[str, Any] = value
             for part in reversed(key.split(".")):
                 wrapper = {part: wrapper}
             _validate_known_values_in(wrapper)
+            _validate_known_sections_in(wrapper)
 
         keys = key.split(".")
         config = self._config
@@ -1243,7 +1497,22 @@ class Config:
 
         leaf = keys[-1]
         resolved = restore_redacted({leaf: value}, {leaf: config.get(leaf)})[leaf]
-        config[leaf] = _strip_removed_under(key, resolved)
+        resolved = _strip_removed_under(key, resolved)
+
+        # A rule spanning more than one key of the same container (again,
+        # monitor.smtp's use_ssl/use_tls) must also catch a single leaf write
+        # such as "monitor.smtp.use_tls" - the dict branch above only sees a
+        # whole section written at once, and "wasm config set
+        # monitor.smtp.use_tls true" never presents one. The section is
+        # checked as it will read after this write, siblings included.
+        container_key = ".".join(keys[:-1])
+        section_validator = _SECTION_VALIDATORS.get(container_key)
+        if section_validator is not None:
+            prospective = dict(config)
+            prospective[leaf] = resolved
+            section_validator(prospective)
+
+        config[leaf] = resolved
 
     def replace(self, config: dict[str, Any]) -> None:
         """
@@ -1275,6 +1544,7 @@ class Config:
         resolved: dict[str, Any] = restore_redacted(folded, self._config)
         stripped = _strip_removed_keys(resolved)
         _validate_known_values_in(stripped)
+        _validate_known_sections_in(stripped)
         self._config = stripped
 
     @property

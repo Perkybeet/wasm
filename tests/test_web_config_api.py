@@ -443,6 +443,23 @@ class TestUpdateSemantics:
         assert response.status_code == 200, response.text
         assert stored_value(config_path, "monitor.notify") is True
 
+    def test_patch_coerces_a_comma_separated_string_for_a_list_default_key(
+        self, client: TestClient, config_path: Path
+    ) -> None:
+        """
+        monitor.email_recipients defaults to a list; a caller posting the same
+        plain comma-separated string 'wasm config set' now accepts must store
+        a list too, not the literal string - the two front ends share
+        coerce_config_value precisely so they cannot disagree about this.
+        """
+        response = client.patch(
+            "/api/config",
+            json={"path": "monitor.email_recipients", "value": "a@x.com,b@y.com"},
+        )
+
+        assert response.status_code == 200, response.text
+        assert stored_value(config_path, "monitor.email_recipients") == ["a@x.com", "b@y.com"]
+
     def test_patch_normalises_the_deprecated_apps_directory_alias(
         self, client: TestClient, config_path: Path
     ) -> None:
@@ -747,6 +764,239 @@ class TestBackupDirectoryIsNeverRelative:
         assert "absolute" in response.text
 
 
+class TestSMTPSettings:
+    """
+    GET/PUT /api/config/smtp: the monitor's SMTP settings for a console form.
+
+    Three things distinguish this endpoint from every other typed section:
+    the password is never sent back, not even redacted, because
+    ``SMTPSettingsResponse`` has no such field; a blank ``password`` on a
+    write keeps whatever is stored, rather than clearing it, because a form
+    that never receives the password has no other way to say "leave it
+    alone"; and validation - a real hostname, a port in range, not both
+    transports at once, valid addresses - lives at the ``Config.set``
+    chokepoint, so it is pinned again directly against
+    ``wasm.core.config._KEY_VALIDATORS`` in ``tests/test_cli_config.py``.
+    """
+
+    def test_get_reports_the_defaults_when_nothing_is_configured(self, client: TestClient) -> None:
+        response = client.get("/api/config/smtp")
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body == {
+            "host": "",
+            "port": 465,
+            "use_ssl": True,
+            "use_tls": False,
+            "username": "",
+            "from_address": "",
+            "recipients": [],
+            "password_set": False,
+        }
+
+    def test_password_is_never_a_field_of_the_response(
+        self, client: TestClient, config_path: Path
+    ) -> None:
+        config = Config()
+        config.set("monitor.smtp.password", "hunter2")
+        assert config.save() is True
+        Config.reset_instance()
+
+        response = client.get("/api/config/smtp")
+
+        assert response.status_code == 200, response.text
+        assert "password" not in response.json()
+        assert "hunter2" not in response.text
+
+    def test_put_stores_every_field_and_reports_password_set(
+        self, client: TestClient, config_path: Path
+    ) -> None:
+        response = client.put(
+            "/api/config/smtp",
+            json={
+                "host": "smtp.example.com",
+                "port": 587,
+                "use_ssl": False,
+                "use_tls": True,
+                "username": "wasm",
+                "password": "hunter2",
+                "from_address": "wasm@example.com",
+                "recipients": ["ops@example.com", "oncall@example.com"],
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        assert "hunter2" not in response.text
+        assert stored_value(config_path, "monitor.smtp.password") == "hunter2"
+        assert stored_value(config_path, "monitor.smtp.host") == "smtp.example.com"
+        assert stored_value(config_path, "monitor.email_recipients") == [
+            "ops@example.com",
+            "oncall@example.com",
+        ]
+
+        body = client.get("/api/config/smtp").json()
+        assert body["host"] == "smtp.example.com"
+        assert body["port"] == 587
+        assert body["use_ssl"] is False
+        assert body["use_tls"] is True
+        assert body["username"] == "wasm"
+        assert body["from_address"] == "wasm@example.com"
+        assert body["recipients"] == ["ops@example.com", "oncall@example.com"]
+        assert body["password_set"] is True
+
+    def test_a_blank_password_keeps_the_stored_one(
+        self, client: TestClient, config_path: Path
+    ) -> None:
+        first = client.put(
+            "/api/config/smtp",
+            json={
+                "host": "smtp.example.com",
+                "port": 465,
+                "use_ssl": True,
+                "use_tls": False,
+                "username": "wasm",
+                "password": "hunter2",
+                "from_address": "",
+                "recipients": [],
+            },
+        )
+        assert first.status_code == 200, first.text
+
+        second = client.put(
+            "/api/config/smtp",
+            json={
+                "host": "smtp.example.com",
+                "port": 465,
+                "use_ssl": True,
+                "use_tls": False,
+                "username": "wasm",
+                "password": "",
+                "from_address": "",
+                "recipients": [],
+            },
+        )
+
+        assert second.status_code == 200, second.text
+        assert stored_value(config_path, "monitor.smtp.password") == "hunter2"
+        assert client.get("/api/config/smtp").json()["password_set"] is True
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"host": "not a host!!"},
+            {"from_address": "not-an-email"},
+            {"recipients": ["ops@example.com", "not-an-email"]},
+        ],
+    )
+    def test_put_rejects_an_invalid_field(
+        self, client: TestClient, config_path: Path, body: dict[str, Any]
+    ) -> None:
+        payload = {
+            "host": "",
+            "port": 465,
+            "use_ssl": True,
+            "use_tls": False,
+            "username": "",
+            "password": "",
+            "from_address": "",
+            "recipients": [],
+            **body,
+        }
+
+        response = client.put("/api/config/smtp", json=payload)
+
+        assert response.status_code == 400, response.text
+        assert not config_path.exists()
+
+    def test_put_rejects_a_port_out_of_range(self, client: TestClient, config_path: Path) -> None:
+        """
+        Caught by the Pydantic field (``ge=1, le=65535``, the same shape
+        ``WebConfig.port`` uses) before it ever reaches ``Config.set`` - a
+        422, not the chokepoint's 400. The chokepoint's own rule is what
+        keeps 'wasm config set monitor.smtp.port' honest, pinned directly in
+        tests/test_cli_config.py.
+        """
+        response = client.put(
+            "/api/config/smtp",
+            json={
+                "host": "",
+                "port": 70000,
+                "use_ssl": True,
+                "use_tls": False,
+                "username": "",
+                "password": "",
+                "from_address": "",
+                "recipients": [],
+            },
+        )
+
+        assert response.status_code == 422, response.text
+        assert not config_path.exists()
+
+    def test_put_rejects_both_transports_enabled(
+        self, client: TestClient, config_path: Path
+    ) -> None:
+        response = client.put(
+            "/api/config/smtp",
+            json={
+                "host": "smtp.example.com",
+                "port": 465,
+                "use_ssl": True,
+                "use_tls": True,
+                "username": "",
+                "password": "",
+                "from_address": "",
+                "recipients": [],
+            },
+        )
+
+        assert response.status_code == 400, response.text
+        assert "cannot both be enabled" in response.text
+        assert not config_path.exists()
+
+    def test_write_is_audited_under_the_monitor_key(
+        self, client: TestClient, audit_log: Path
+    ) -> None:
+        response = client.put(
+            "/api/config/smtp",
+            json={
+                "host": "smtp.example.com",
+                "port": 465,
+                "use_ssl": True,
+                "use_tls": False,
+                "username": "",
+                "password": "",
+                "from_address": "",
+                "recipients": [],
+            },
+        )
+        assert response.status_code == 200, response.text
+
+        entries = read_audit(audit_log)
+        assert any(e["action"] == "config.update" and "monitor" in e["detail"] for e in entries)
+
+    def test_a_rejected_write_is_not_audited_as_a_change(
+        self, client: TestClient, audit_log: Path
+    ) -> None:
+        response = client.put(
+            "/api/config/smtp",
+            json={
+                "host": "not a host!!",
+                "port": 465,
+                "use_ssl": True,
+                "use_tls": False,
+                "username": "",
+                "password": "",
+                "from_address": "",
+                "recipients": [],
+            },
+        )
+        assert response.status_code == 400
+
+        assert read_audit(audit_log) == []
+
+
 class TestTypedSectionsNeedElevation:
     """
     The five typed section saves need sudo mode exactly like ``PUT``/``PATCH
@@ -806,6 +1056,10 @@ class TestTypedSectionsNeedElevation:
             ("/api/config/backup", {"directory": "/var/backups/wasm", "max_per_app": 5}),
             ("/api/config/ssl", {"enabled": True, "provider": "certbot", "email": "ops@x.com"}),
             ("/api/config/web", {"host": "127.0.0.1", "port": 8080, "session_timeout": 3600}),
+            (
+                "/api/config/smtp",
+                {"host": "smtp.example.com", "port": 465, "use_ssl": True, "use_tls": False},
+            ),
         ],
     )
     def test_a_fresh_cookie_session_is_refused(
@@ -824,6 +1078,10 @@ class TestTypedSectionsNeedElevation:
             ("/api/config/backup", {"directory": "/var/backups/wasm", "max_per_app": 5}),
             ("/api/config/ssl", {"enabled": True, "provider": "certbot", "email": "ops@x.com"}),
             ("/api/config/web", {"host": "127.0.0.1", "port": 8080, "session_timeout": 3600}),
+            (
+                "/api/config/smtp",
+                {"host": "smtp.example.com", "port": 465, "use_ssl": True, "use_tls": False},
+            ),
         ],
     )
     def test_an_elevated_cookie_session_may_write(
@@ -835,3 +1093,171 @@ class TestTypedSectionsNeedElevation:
         response = cookie_client.put(path, json=body)
 
         assert response.status_code == 200, response.text
+
+
+# --------------------------------------------------------------- telegram chats
+
+
+def _notifier_with_opener(opener: Any) -> Any:
+    """
+    Args:
+        opener: The stand-in for urlopen.
+
+    Returns:
+        A notifier over the current sandboxed configuration, wired with the
+        given opener instead of a real socket.
+    """
+    from wasm.core.notifier import Notifier
+
+    return Notifier(Config(), opener=opener)
+
+
+class _JsonOpener:
+    """A minimal opener answering every request with the same fixed body."""
+
+    def __init__(self, body: bytes) -> None:
+        """
+        Args:
+            body: What every call returns as the response body.
+        """
+        self.body = body
+        self.requests: list[Any] = []
+
+    def __call__(self, request: Any, timeout: float | None = None) -> Any:
+        """
+        Args:
+            request: The request the notifier built.
+            timeout: Ignored; recorded by the caller's signature only.
+
+        Returns:
+            The scripted body.
+        """
+        import io
+
+        self.requests.append(request)
+        return io.BytesIO(self.body)
+
+
+class TestTelegramChats:
+    """``POST /api/config/notifications/telegram/chats``: finding a chat id."""
+
+    def test_lists_the_chats_the_bot_has_seen(
+        self, client: TestClient, config_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = Config()
+        config.set("notifications.channels.telegram.bot_token", "110201543:AAHtoken")
+        assert config.save() is True
+        Config.reset_instance()
+
+        opener = _JsonOpener(
+            json.dumps(
+                {
+                    "ok": True,
+                    "result": [
+                        {
+                            "update_id": 1,
+                            "message": {"chat": {"id": 123, "type": "private", "username": "ops"}},
+                        }
+                    ],
+                }
+            ).encode()
+        )
+        monkeypatch.setattr(config_api, "_build_notifier", lambda: _notifier_with_opener(opener))
+
+        response = client.post("/api/config/notifications/telegram/chats")
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["chats"] == [{"id": 123, "type": "private", "title": None, "username": "ops"}]
+
+    def test_no_bot_token_is_a_400_naming_the_setting(self, client: TestClient) -> None:
+        response = client.post("/api/config/notifications/telegram/chats")
+
+        assert response.status_code == 400
+        assert "bot_token" in response.json()["detail"]
+
+    def test_does_not_require_elevation(self, client: TestClient) -> None:
+        """This only reads what Telegram has queued; nothing WASM manages changes."""
+        response = client.post("/api/config/notifications/telegram/chats")
+
+        assert response.status_code != 403
+
+
+# --------------------------------------------------------------- telegram settings
+
+
+class TestTelegramSettings:
+    """``GET``/``PUT /api/config/notifications/telegram``: saving a chat id."""
+
+    def test_get_never_returns_the_bot_token(self, client: TestClient, config_path: Path) -> None:
+        config = Config()
+        config.set("notifications.channels.telegram.bot_token", "110201543:AAHtoken")
+        config.set("notifications.channels.telegram.chat_id", "-1002003004005")
+        assert config.save() is True
+        Config.reset_instance()
+
+        response = client.get("/api/config/notifications/telegram")
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body == {"chat_id": "-1002003004005", "bot_token_set": True}
+        assert "bot_token" not in body
+        assert "110201543" not in response.text
+
+    def test_put_saves_the_token_and_chat_id(self, client: TestClient, config_path: Path) -> None:
+        response = client.put(
+            "/api/config/notifications/telegram",
+            json={"bot_token": "110201543:AAHtoken", "chat_id": "-1002003004005"},
+        )
+
+        assert response.status_code == 200, response.text
+        config = Config()
+        assert config.get("notifications.channels.telegram.bot_token") == "110201543:AAHtoken"
+        assert config.get("notifications.channels.telegram.chat_id") == "-1002003004005"
+
+    def test_put_with_an_empty_token_keeps_the_stored_one(
+        self, client: TestClient, config_path: Path
+    ) -> None:
+        config = Config()
+        config.set("notifications.channels.telegram.bot_token", "110201543:AAHtoken")
+        assert config.save() is True
+        Config.reset_instance()
+
+        response = client.put(
+            "/api/config/notifications/telegram",
+            json={"bot_token": "", "chat_id": "42"},
+        )
+
+        assert response.status_code == 200, response.text
+        config = Config()
+        assert config.get("notifications.channels.telegram.bot_token") == "110201543:AAHtoken"
+        assert config.get("notifications.channels.telegram.chat_id") == "42"
+
+    def test_a_chat_id_missing_its_minus_sign_is_refused_with_a_hint(
+        self, client: TestClient, config_path: Path
+    ) -> None:
+        response = client.put(
+            "/api/config/notifications/telegram",
+            json={"bot_token": "110201543:AAHtoken", "chat_id": "1002003004005"},
+        )
+
+        assert response.status_code == 422, response.text
+        assert "-1002003004005" in response.text
+
+    def test_a_channel_username_is_accepted(self, client: TestClient, config_path: Path) -> None:
+        response = client.put(
+            "/api/config/notifications/telegram",
+            json={"bot_token": "110201543:AAHtoken", "chat_id": "@ops_alerts"},
+        )
+
+        assert response.status_code == 200, response.text
+        config = Config()
+        assert config.get("notifications.channels.telegram.chat_id") == "@ops_alerts"
+
+    def test_a_junk_chat_id_is_refused(self, client: TestClient, config_path: Path) -> None:
+        response = client.put(
+            "/api/config/notifications/telegram",
+            json={"bot_token": "110201543:AAHtoken", "chat_id": "not-a-chat-id"},
+        )
+
+        assert response.status_code == 422, response.text

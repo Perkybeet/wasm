@@ -40,7 +40,7 @@ from wasm.core.exceptions import (
 )
 from wasm.core.fs import SECRET_DIR_MODE, SECRET_MODE, get_fs
 from wasm.core.redact import Scrubber, app_secret_values, scrubber_for, secret_env_values
-from wasm.core.store import JobRecord, get_store
+from wasm.core.store import DeploymentTrigger, JobRecord, get_store
 
 logger = logging.getLogger(__name__)
 
@@ -1032,6 +1032,7 @@ def deploy_app_job(
 
 def update_app_job(
     domain: str,
+    commit: str | None = None,
     job_context: JobContext | None = None,
 ) -> dict[str, Any]:
     """
@@ -1039,6 +1040,8 @@ def update_app_job(
 
     Args:
         domain: Domain of the application to update.
+        commit: Deploy this commit instead of the head of the branch: the
+            console's "rebuild this deployment".
         job_context: Injected by the job manager.
 
     Returns:
@@ -1047,10 +1050,16 @@ def update_app_job(
     Raises:
         WASMError: When the application is unknown or a step fails.
     """
-    return run_update(domain, trigger="panel", job_context=job_context)
+    return run_update(domain, trigger="panel", job_context=job_context, commit=commit)
 
 
-def run_update(domain: str, *, trigger: str, job_context: JobContext | None) -> dict[str, Any]:
+def run_update(
+    domain: str,
+    *,
+    trigger: str,
+    job_context: JobContext | None,
+    commit: str | None = None,
+) -> dict[str, Any]:
     """
     Run the shared update sequence as a job, reporting its phases as progress.
 
@@ -1064,6 +1073,7 @@ def run_update(domain: str, *, trigger: str, job_context: JobContext | None) -> 
         domain: Domain of the application to update.
         trigger: Who asked for it, recorded in the deployment history.
         job_context: Injected by the job manager.
+        commit: Deploy this commit instead of the head of the branch.
 
     Returns:
         Summary of the update.
@@ -1084,6 +1094,7 @@ def run_update(domain: str, *, trigger: str, job_context: JobContext | None) -> 
 
     outcome = update_app(
         domain,
+        commit=commit,
         trigger=trigger,
         on_phase=lambda index, total, message: context.update(message, 100 * (index - 1) // total),
         on_step=context.log,
@@ -1098,6 +1109,7 @@ def run_update(domain: str, *, trigger: str, job_context: JobContext | None) -> 
         "domain": domain,
         "status": "updated",
         "trigger": trigger,
+        "commit": commit,
         "restarted": list(outcome.restarted),
         "active": outcome.active,
         "deployment_id": outcome.deployment_id,
@@ -1384,6 +1396,44 @@ def rollback_app_job(
 
     context.update("Rollback complete", 100)
     return {"domain": domain, "backup_id": backup_id, "status": "rolled_back"}
+
+
+def rollback_deployment_job(
+    domain: str,
+    deployment_id: int,
+    job_context: JobContext | None = None,
+) -> dict[str, Any]:
+    """
+    Put back what one deployment produced: its release, or its snapshot backup.
+
+    Args:
+        domain: Domain of the application.
+        deployment_id: The deployment to go back to.
+        job_context: Injected by the job manager.
+
+    Returns:
+        Summary of the rollback.
+
+    Raises:
+        WASMError: The deployment cannot be gone back to, or going back failed.
+    """
+    from wasm.deployers.lifecycle import rollback_to_deployment
+
+    context = _require_context(job_context)
+    context.set_metadata("domain", domain)
+    context.set_metadata("deployment_id", deployment_id)
+    context.update(f"Going back to deployment {deployment_id}", 20)
+
+    outcome = rollback_to_deployment(domain, deployment_id, trigger=DeploymentTrigger.PANEL.value)
+
+    context.update("Rollback complete", 100)
+    return {
+        "domain": domain,
+        "deployment_id": deployment_id,
+        "release_id": outcome.release_id,
+        "backup_id": outcome.backup_id,
+        "status": "rolled_back",
+    }
 
 
 def database_engine_job(

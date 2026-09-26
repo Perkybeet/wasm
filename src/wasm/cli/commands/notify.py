@@ -45,3 +45,32 @@ def test_command(ctx: Context, channel: str) -> None:
         raise SystemExit(1)
 
     ctx.logger.success(f"Test message sent through {channel}.")
+
+
+@cli.command("telegram-chats")
+@pass_context
+def telegram_chats_command(ctx: Context) -> None:
+    """
+    List the chats the configured Telegram bot has seen.
+
+    Finding a chat id today means opening the Bot API's getUpdates URL by hand
+    and reading raw JSON. Send the bot a message, or add it to the group or
+    channel, then run this to read the id back - Telegram only queues an
+    update the bot has not already been asked for.
+    """
+    try:
+        chats = Notifier(Config()).list_telegram_chats()
+    except (OSError, ValueError) as exc:
+        ctx.logger.error("Could not list Telegram chats", details=str(exc))
+        raise SystemExit(1) from exc
+
+    if not chats:
+        ctx.logger.warning(
+            "No chats yet. Send the bot a message, or add it to the group or channel, "
+            "then run this again."
+        )
+        return
+
+    for chat in chats:
+        label = chat.title or (f"@{chat.username}" if chat.username else "(no name)")
+        ctx.logger.info(f"{chat.id}\t{chat.type}\t{label}")

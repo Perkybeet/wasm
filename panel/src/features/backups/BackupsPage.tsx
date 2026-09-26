@@ -2,7 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Archive, Plus, X } from "lucide-react";
 import { useMemo } from "react";
 
-import { backupsQuery } from "../../api/queries/backups";
+import { backupSchedulesQuery, backupStorageQuery, backupsQuery } from "../../api/queries/backups";
 import { PageHeader } from "../../app/PageHeader";
 import { CommandHint } from "../../components/page/CommandHint";
 import { ErrorBlock } from "../../components/page/QueryState";
@@ -20,6 +20,8 @@ import { StorageUsageBar } from "./StorageUsageBar";
 import { useBackupRefresh } from "./useBackupRefresh";
 
 const ALL = "all";
+/** The most placeholder rows worth drawing: past a screenful, more only lengthens the page below the fold. */
+const MAX_SKELETON_ROWS = 20;
 
 type SearchPatch = { [K in keyof BackupsSearch]?: BackupsSearch[K] | undefined };
 
@@ -36,6 +38,12 @@ export function BackupsPage({ search, onSearchChange }: BackupsPageProps) {
   const shown = useMemo(() => filterBackups(all, search), [all, search]);
   const domains = useMemo(() => backupDomains(all), [all]);
   const filtered = isFiltered(search);
+  // The storage summary counts every backup and usually answers first: the list's placeholder
+  // holds that many rows, so the schedules below do not jump when the list lands.
+  const storage = useQuery(backupStorageQuery());
+  const expected = search.domain === undefined ? storage.data?.backup_count : undefined;
+  // Fetched from the start, though drawn only once the list is in (below).
+  useQuery(backupSchedulesQuery());
 
   const set = (patch: SearchPatch): void => {
     const next: SearchPatch = { ...search, ...patch };
@@ -108,6 +116,7 @@ export function BackupsPage({ search, onSearchChange }: BackupsPageProps) {
                 backups={shown}
                 caption={filtered ? "Backups matching the filters" : "Every backup"}
                 loading={backups.isPending}
+                {...(expected !== undefined && expected > 0 ? { skeletonRows: Math.min(expected, MAX_SKELETON_ROWS) } : {})}
                 empty={
                   <EmptyState
                     title="No backup matches"
@@ -126,7 +135,9 @@ export function BackupsPage({ search, onSearchChange }: BackupsPageProps) {
           )}
         </Section>
 
-        <SchedulesSection />
+        {/* Under a list whose length is not known until it loads: drawn once it has, so the
+            schedules never jump down the page as the backups arrive above them. */}
+        {backups.data !== undefined || backups.isError ? <SchedulesSection /> : null}
       </div>
     </>
   );

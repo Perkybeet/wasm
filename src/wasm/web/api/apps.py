@@ -17,18 +17,24 @@ here for that to be true.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
-from collections.abc import Mapping
+import threading
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from wasm.core import app_state
 from wasm.core.app_state import AppState, resolve_state_with_status, resolve_states_with_status
 from wasm.core.config import REDACTED, redact_secrets
 from wasm.core.exceptions import DeploymentError, SourceError, ValidationError, WASMError
+from wasm.core.runner import CommandCancelled
 from wasm.core.store import (
     DEFAULT_KEEP_RELEASES,
     App,
@@ -41,10 +47,17 @@ from wasm.core.utils import domain_to_app_name
 from wasm.deployers.base import BaseDeployer
 from wasm.deployers.helpers.app_env import read_app_env, write_app_env
 from wasm.deployers.helpers.env_manager import EnvManager, redact_url_credentials
+from wasm.deployers.helpers.health_gate import HealthCheck
 from wasm.deployers.helpers.layout import RELEASES
 from wasm.deployers.helpers.package_manager import SUPPORTED_PACKAGE_MANAGERS
-from wasm.deployers.inspect import inspect_source
-from wasm.deployers.lifecycle import activate_release, list_releases, set_resource_limits
+from wasm.deployers.inspect import SourceInspection, inspect_source
+from wasm.deployers.lifecycle import (
+    activate_release,
+    list_releases,
+    set_health_check,
+    set_release_retention,
+    set_resource_limits,
+)
 from wasm.deployers.migrate import MigrationPlan, plan_migration
 from wasm.deployers.registry import DeployerRegistry, available_types
 from wasm.deployers.releases import is_release_id
@@ -86,6 +99,8 @@ _STATUS_LABELS: dict[str, str] = {
 }
 
 router = APIRouter(route_class=WASMErrorRoute)
+
+_logger = logging.getLogger(__name__)
 
 #: Port preferred when the client does not pick one.
 DEFAULT_PORT = 3000
@@ -149,6 +164,11 @@ class AppInfo(BaseModel):
         memory_max_mb: Memory limit of its unit, in MB, or None.
         cpu_quota_percent: CPU quota of its unit, in percent of one CPU, or None.
         tasks_max: Task limit of its unit, or None.
+        health_path: Path the health gate probes, or None for ``/``.
+        health_expect: Statuses the health gate accepts, such as
+            ``200-399``, or None for any status below 500.
+        health_timeout: Seconds the health gate waits, or None for its
+            default of 30.
         webhook_enabled: Whether a webhook secret is set for it. The secret
             itself is never part of this or any other response; it is set
             through ``POST /api/apps/{domain}/webhook-secret`` and cleared
@@ -178,6 +198,9 @@ class AppInfo(BaseModel):
     memory_max_mb: int | None = None
     cpu_quota_percent: int | None = None
     tasks_max: int | None = None
+    health_path: str | None = None
+    health_expect: str | None = None
+    health_timeout: int | None = None
     webhook_enabled: bool = False
     unit: str | None = None
     run_as: str | None = None
@@ -492,6 +515,9 @@ def _to_app_info(
         memory_max_mb=app.memory_max_mb,
         cpu_quota_percent=app.cpu_quota_percent,
         tasks_max=app.tasks_max,
+        health_path=app.health_path,
+        health_expect=app.health_expect,
+        health_timeout=app.health_timeout,
         webhook_enabled=webhook_enabled,
         unit=service.name if service is not None else None,
         run_as=service.user if service is not None else None,
@@ -782,6 +808,10 @@ class SourceInspectionResponse(BaseModel):
             none was requested.
         commit: Short commit hash of the checkout, empty when the source is
             not a Git repository.
+        compatible: Whether this server can deploy it as ``app_type`` as it
+            is: false when a program the type needs is missing.
+        verdict: What WASM found, in a sentence.
+        suggestion: What to do before deploying, when there is something.
     """
 
     app_type: str
@@ -794,26 +824,88 @@ class SourceInspectionResponse(BaseModel):
     env_keys: list[EnvKeyResponse]
     branch: str
     commit: str
+    compatible: bool | None = Field(
+        default=None, description="Whether this server can deploy it as app_type as it is"
+    )
+    verdict: str | None = Field(default=None, description="What WASM found, in a sentence")
+    suggestion: str | None = Field(
+        default=None, description="What to do before deploying, when there is something"
+    )
+
+
+#: How often the inspect endpoint asks whether its client is still there.
+_DISCONNECT_POLL_SECONDS = 0.25
+
+#: Not a status a client ever reads: nginx's "client closed request", so the
+#: access log tells a cancelled inspection from a failed one.
+_CLIENT_CLOSED_REQUEST = 499
+
+_T = TypeVar("_T")
+
+
+async def _run_until_disconnected(
+    request: Request, cancel: threading.Event, work: Callable[[], _T]
+) -> _T:
+    """
+    Run blocking work in a worker thread, cancelling it if the client leaves.
+
+    The console's Cancel aborts the browser's fetch; uvicorn then answers
+    ``http.disconnect`` on the request, which is polled here while the work
+    runs. On a disconnect ``cancel`` is set, which the command runner
+    watches, and this still waits for the worker to return, so everything
+    the work cleans up on its way out is gone before the request ends.
+
+    Polled with ``asyncio.wait`` rather than a task group: a task group
+    reports the work's own exception inside an ``ExceptionGroup``, which the
+    API's error boundary would not recognise as the ``WASMError`` it is.
+
+    Args:
+        request: The request whose client is watched.
+        cancel: Set when the client disconnects, or when this coroutine is
+            itself cancelled (the server shutting down).
+        work: What to run; it must honour ``cancel``.
+
+    Returns:
+        What ``work`` returned.
+
+    Raises:
+        Exception: Whatever ``work`` raised, as it raised it.
+    """
+    task = asyncio.ensure_future(run_in_threadpool(work))
+    try:
+        while not task.done():
+            await asyncio.wait({task}, timeout=_DISCONNECT_POLL_SECONDS)
+            if not task.done() and not cancel.is_set() and await request.is_disconnected():
+                cancel.set()
+    finally:
+        if not task.done():
+            cancel.set()
+    return task.result()
 
 
 # NOTE: declared before GET /{domain} and its siblings so a request for
 # /api/apps/inspect is never shadowed by a route that treats "inspect" as a
 # domain.
 @router.post("/inspect", response_model=SourceInspectionResponse)
-def inspect_app_source(
+async def inspect_app_source(
     body: InspectSourceRequest,
     request: Request,
     session: Annotated[dict, Depends(get_current_session)],
-) -> SourceInspectionResponse:
+) -> SourceInspectionResponse | Response:
     """
     Preview what a repository is before deploying it.
 
-    Fetches the source into a throwaway checkout, detects the application
-    type, and reports the commands, port and environment variables a
-    deployment would use, so the new-app wizard has something real to show
-    instead of a guess. Nothing is written outside the checkout, which is
-    removed before this returns, and no application, domain or unit is
-    created.
+    Fetches what detection needs (for git, ``ls-remote`` and a sparse,
+    blobless checkout of the files the detectors read), detects the
+    application type, and reports the commands, port and environment
+    variables a deployment would use and whether this server can deploy it,
+    so the new-app wizard has something real to show instead of a guess.
+    Nothing is written outside the scratch checkout, which is removed before
+    this returns, and no application, domain or unit is created.
+
+    A client that disconnects (the wizard's Cancel aborts the fetch) cancels
+    the inspection: the git command running is killed and the checkout
+    removed at once, instead of the clone running on to its deadline.
 
     Admin scope, like creating one: fetching runs as root and reads back what
     it fetched. A local path is reserved to the operator in person, exactly
@@ -825,7 +917,8 @@ def inspect_app_source(
         session: The authenticated session.
 
     Returns:
-        The inspection result.
+        The inspection result, or an empty 499 once a cancelled inspection
+        has stopped (nobody is there to read it).
 
     Raises:
         HTTPException: 403 when the source is a local path and the credential
@@ -841,11 +934,19 @@ def inspect_app_source(
             (400 with details) instead of the 500 an unqualified
             ``DeploymentError`` would answer.
     """
-    _require_local_source_privilege(request, session, body.source)
+    cancel = threading.Event()
+
+    def work() -> SourceInspection:
+        _require_local_source_privilege(request, session, body.source)
+        return inspect_source(body.source, branch=body.branch, cancel=cancel)
+
     try:
-        result = inspect_source(body.source, branch=body.branch)
+        result = await _run_until_disconnected(request, cancel, work)
     except DeploymentError as exc:
         raise ValidationError(exc.message, details=exc.details) from exc
+    except CommandCancelled:
+        _logger.info("Inspection of %s cancelled: the client went away", body.source)
+        return Response(status_code=_CLIENT_CLOSED_REQUEST)
     return SourceInspectionResponse(
         app_type=result.app_type,
         detected_types=result.detected_types,
@@ -865,6 +966,9 @@ def inspect_app_source(
         ],
         branch=result.branch,
         commit=result.commit,
+        compatible=result.compatible,
+        verdict=result.verdict or None,
+        suggestion=result.suggestion,
     )
 
 
@@ -1731,4 +1835,156 @@ def update_app_limits(
         units=list(change.units),
         restarted=change.restarted,
         restart_required=not change.restarted,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Health check
+# ---------------------------------------------------------------------------
+
+
+class UpdateHealthRequest(BaseModel):
+    """
+    What the health gate must ask of an application.
+
+    The three are set together, like the limits: a field left out or null
+    goes back to its default.
+    """
+
+    path: str | None = Field(
+        default=None, description="Path to probe on 127.0.0.1, such as /healthz. Null: /"
+    )
+    expect: str | None = Field(
+        default=None,
+        description="Statuses that mean up, 100 to 599: 200-399, or 200,204. "
+        "Null: any status below 500",
+    )
+    timeout: int | None = Field(
+        default=None, description="Seconds it gets to answer, 5 to 600. Null: 30"
+    )
+
+
+class HealthCheckResponse(BaseModel):
+    """
+    The health check an application has now.
+
+    Attributes:
+        domain: The application's domain.
+        path: The path it set, or None for the default.
+        expect: The statuses it set, or None for the default.
+        timeout: The seconds it set, or None for the default.
+        effective_path: The path the gate requests.
+        effective_expect: The statuses the gate accepts, as an operator
+            reads them: the list, or "any status below 500".
+        effective_timeout: The seconds the gate waits.
+    """
+
+    domain: str
+    path: str | None = None
+    expect: str | None = None
+    timeout: int | None = None
+    effective_path: str
+    effective_expect: str
+    effective_timeout: int
+
+
+@router.patch("/{domain}/health", response_model=HealthCheckResponse)
+def update_app_health(
+    domain: str,
+    body: UpdateHealthRequest,
+    session: Annotated[dict, Depends(require_elevated)],
+) -> HealthCheckResponse:
+    """
+    Set the path, the accepted statuses and the timeout of an application's health check.
+
+    The health gate decides which release may serve, so changing what it
+    asks needs sudo mode, like the limits. The values are validated where
+    they are stored; nothing restarts.
+
+    Args:
+        domain: Domain of the application.
+        body: The three settings.
+        session: The authenticated, elevated session.
+
+    Returns:
+        The settings the application has now, and what the gate asks.
+
+    Raises:
+        HTTPException: 404 when the application is unknown.
+        ValidationError: A value is not one the gate can use (400).
+        DeploymentError: It is a static site, checked by its files.
+    """
+    app = _env_app(domain)
+    app = set_health_check(app.domain, path=body.path, expect=body.expect, timeout=body.timeout)
+    check = HealthCheck.for_app(app)
+    return HealthCheckResponse(
+        domain=app.domain,
+        path=app.health_path,
+        expect=app.health_expect,
+        timeout=app.health_timeout,
+        effective_path=check.path,
+        effective_expect=check.describe_expect(),
+        effective_timeout=check.seconds,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Release retention
+# ---------------------------------------------------------------------------
+
+
+class UpdateRetentionRequest(BaseModel):
+    """How many releases an application keeps."""
+
+    keep: int = Field(
+        ...,
+        description="Releases to keep, 1 to 50. The active one and the rollback target "
+        "are always kept",
+    )
+
+
+class RetentionResponse(BaseModel):
+    """
+    The retention an application has now.
+
+    Attributes:
+        domain: The application's domain.
+        keep_releases: Releases it keeps.
+        pruned: Ids of the releases removed to honour it, oldest first.
+    """
+
+    domain: str
+    keep_releases: int
+    pruned: list[str]
+
+
+@router.patch("/{domain}/releases/retention", response_model=RetentionResponse)
+def update_release_retention(
+    domain: str,
+    body: UpdateRetentionRequest,
+    session: Annotated[dict, Depends(require_elevated)],
+) -> RetentionResponse:
+    """
+    Set how many releases an application keeps, and prune to it now.
+
+    Pruning deletes release directories, so it needs sudo mode. The number
+    is validated where it is stored.
+
+    Args:
+        domain: Domain of the application.
+        body: The retention.
+        session: The authenticated, elevated session.
+
+    Returns:
+        The retention it has now and what was removed.
+
+    Raises:
+        HTTPException: 404 when the application is unknown.
+        ValidationError: The number is out of range (400).
+        DeploymentError: It is deployed in place, with no releases.
+    """
+    app = _env_app(domain)
+    change = set_release_retention(app.domain, body.keep)
+    return RetentionResponse(
+        domain=change.domain, keep_releases=change.keep_releases, pruned=list(change.pruned)
     )

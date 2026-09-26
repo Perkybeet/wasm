@@ -37,7 +37,10 @@ async function environmentTab(extra: Record<string, RouteHandler> = {}) {
     ...extra,
   });
   const harness = renderConsole(`/apps/${DOMAIN}/environment`);
-  await screen.findByRole("table", { name: `Environment variables of ${DOMAIN}` });
+  // The placeholder is the same table with placeholder rows; the loaded one is not busy.
+  await waitFor(() => {
+    expect(screen.getByRole("table", { name: `Environment variables of ${DOMAIN}` })).not.toHaveAttribute("aria-busy");
+  });
   return { ...harness, backend };
 }
 

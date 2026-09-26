@@ -71,7 +71,7 @@ from wasm.deployers.helpers import (
     preflight,
 )
 from wasm.deployers.helpers.health import failure_output, wait_until_healthy
-from wasm.deployers.helpers.health_gate import HealthGate
+from wasm.deployers.helpers.health_gate import HealthCheck, HealthGate
 from wasm.deployers.helpers.layout import RELEASES, choose_layout, env_file_in
 from wasm.deployers.helpers.nginx_config import NginxAdvancedConfig
 from wasm.deployers.helpers.permissions import hand_over_file, hand_over_tree
@@ -1661,10 +1661,29 @@ class BaseDeployer(AppDeployer):
         Returns:
             True if application is healthy.
         """
-        url = f"http://127.0.0.1:{self.port}{self.get_health_check()}"
+        check = self._health_check_settings()
+        url = check.url(self.port)
         self.logger.substep(f"Checking: {url}")
 
-        return wait_until_healthy(url, retries=retries, delay=delay, on_attempt=self.logger.debug)
+        return wait_until_healthy(
+            url,
+            retries=retries,
+            delay=delay,
+            on_attempt=self.logger.debug,
+            # Without an expectation of its own, the strict check this
+            # report always made: a 200, redirects followed.
+            accept=check.accepts if check.expect is not None else None,
+        )
+
+    def _health_check_settings(self) -> HealthCheck:
+        """
+        Read what the application's health check asks.
+
+        Returns:
+            The application's own path, expectation and timeout, over this
+            deployer's path.
+        """
+        return HealthCheck.for_app(self._app_row(), default_path=self.get_health_check())
 
     def build_pipeline(self) -> list[DeployStep]:
         """
@@ -1952,18 +1971,22 @@ class BaseDeployer(AppDeployer):
         """
         Build the gate a release must pass to stay active.
 
-        A service answers over HTTP: any response below 500 means the process
-        started and routes requests, redirects included. A site without a
-        service is checked by the deployer's own :meth:`health_check`, which
-        looks for the files it serves.
+        A service answers over HTTP, on the application's health path, with a
+        status its expectation accepts: without settings of its own, any
+        response below 500 means the process started and routes requests,
+        redirects included. A site without a service is checked by the
+        deployer's own :meth:`health_check`, which looks for the files it
+        serves.
 
         Returns:
             The gate, the same one an operator's rollback goes through.
         """
         serves = bool(self.get_start_command())
+        check = self._health_check_settings()
         return HealthGate(
             unit=self.app_name if serves and self.app_name else None,
-            url=f"http://127.0.0.1:{self.port}{self.get_health_check()}" if serves else None,
+            url=check.url(self.port) if serves else None,
+            check=check,
             services=self.service_manager,
             logger=self.logger,
             # Looked up here, at call time, so it is the one this module holds.
@@ -2133,14 +2156,12 @@ class BaseDeployer(AppDeployer):
         if app_id is None:
             return
         try:
-            on_disk = {release.id for release in staged.manager.list()}
-            removed_ids = {release.id for release in removed}
-            stale = [
-                row.id
-                for index, row in enumerate(self.store.list_releases(app_id))
-                if row.id not in on_disk and (row.id in removed_ids or index >= keep)
-            ]
-            self.store.delete_releases(app_id, stale)
+            self.store.forget_pruned_releases(
+                app_id,
+                on_disk={release.id for release in staged.manager.list()},
+                removed={release.id for release in removed},
+                keep=keep,
+            )
         except _RECORDING_ERRORS as exc:
             self.logger.warning(f"Could not forget pruned releases: {exc}")
 
@@ -2280,8 +2301,13 @@ class BaseDeployer(AppDeployer):
         checkout = (self.app_path / REPO_CACHE_DIR) if self._staged is not None else self.app_path
         if not (checkout / ".git").is_dir():
             return None
+        # The staged commit, not the cache's HEAD: a rebuild of an older
+        # commit exports it while the cache stays on the head of the branch.
+        staged = self._staged.commit if self._staged is not None else None
         result = self.runner.run(
-            ["git", "log", "-1", "--format=%s"], cwd=checkout, timeout=GIT_LOG_TIMEOUT
+            ["git", "log", "-1", "--format=%s", *([staged] if staged else [])],
+            cwd=checkout,
+            timeout=GIT_LOG_TIMEOUT,
         )
         subject = result.stdout.strip()
         return subject if result.success and subject else None

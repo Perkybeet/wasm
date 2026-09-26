@@ -14,7 +14,11 @@ function SettingsLayout() {
     <>
       <PageHeader title="Settings" description="How WASM runs on this machine and who can reach the console." />
       <LinkTabs label="Settings sections" tabs={SETTINGS_TABS} className="-mt-4 mb-8" />
-      <Outlet />
+      {/* Every settings page is a form: it keeps the measure it was designed at rather than
+          stretching its fields across a wide screen. */}
+      <div className="max-w-6xl">
+        <Outlet />
+      </div>
     </>
   );
 }

@@ -7,12 +7,14 @@ import { cx } from "../../lib/cx";
 import { IconButton } from "./IconButton";
 import { useNeedsScrollFocus } from "./scrollable";
 
-export type DialogSize = "sm" | "md" | "lg";
+export type DialogSize = "sm" | "md" | "lg" | "xl";
 
 const WIDTHS: Record<DialogSize, string> = {
   sm: "sm:max-w-[400px]",
   md: "sm:max-w-[520px]",
   lg: "sm:max-w-[720px]",
+  // For looking at something closely (a chart enlarged), not for a form.
+  xl: "sm:max-w-[1280px]",
 };
 
 export const BACKDROP =

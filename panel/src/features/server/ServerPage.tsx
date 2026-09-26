@@ -17,6 +17,14 @@ import { MonitorCard } from "./MonitorCard";
 import { checkName, checkView, verdictView } from "./data";
 import type { HealthCheck } from "./data";
 
+/** The checks `wasm health` runs on a typical machine, for the placeholder's height. */
+const TYPICAL_CHECKS = 6;
+/** Mounts a server usually has: the root, a boot partition, a data volume. */
+const TYPICAL_DISKS = 3;
+/** The loopback and one network card. */
+const TYPICAL_INTERFACES = 2;
+/** The processes the table asks for; a machine always runs at least that many. */
+const PROCESS_LIMIT = 25;
 
 function HealthChecks({ checks }: { checks: readonly HealthCheck[] }) {
   return (
@@ -37,6 +45,28 @@ function HealthChecks({ checks }: { checks: readonly HealthCheck[] }) {
   );
 }
 
+/** The loaded card's shape: the verdict's pill, then one row per check. */
+function HealthSkeleton() {
+  return (
+    <div aria-busy="true" className="rounded-card border border-border bg-surface px-4 shadow-raised">
+      <span className="sr-only">Running the health check</span>
+      <div aria-hidden="true">
+        <div className="flex h-12 items-center border-b border-border">
+          <Skeleton className="h-6 w-20 rounded-pill" />
+        </div>
+        <div className="flex flex-col divide-y divide-border">
+          {Array.from({ length: TYPICAL_CHECKS }, (_, index) => (
+            <div key={index} className="flex h-9 items-center justify-between gap-3">
+              <Skeleton className="h-3 w-28" />
+              <Skeleton className="h-3 w-40" />
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function Health() {
   const health = useQuery(systemHealthQuery());
   return (
@@ -44,7 +74,7 @@ function Health() {
       {health.isError && health.data === undefined ? (
         <ErrorBlock compact error={health.error} title="Could not run the health check" onRetry={() => void health.refetch()} />
       ) : health.data === undefined ? (
-        <Skeleton className="h-40 w-full rounded-card" />
+        <HealthSkeleton />
       ) : (
         <div className="rounded-card border border-border bg-surface px-4 shadow-raised">
           <div className="flex items-center gap-2 border-b border-border py-3">
@@ -83,12 +113,20 @@ function SystemInfo() {
     );
   }
   if (info.data === undefined) {
+    // The tiles themselves with placeholder readings, and the disks table's own placeholder:
+    // the loaded section's shape, so what follows it does not move when the answer lands.
+    const pending = <Skeleton className="h-4 w-20" />;
     return (
       <Section title="System">
-        <div aria-hidden="true" className="grid grid-cols-2 gap-3 lg:grid-cols-3 xl:grid-cols-5">
-          {[0, 1, 2, 3, 4].map((i) => (
-            <Skeleton key={i} className="h-20 rounded-card" />
-          ))}
+        <div aria-busy="true" className="flex flex-col gap-4">
+          <span className="sr-only">Loading system information</span>
+          <div aria-hidden="true" className="grid grid-cols-2 gap-3 lg:grid-cols-3 xl:grid-cols-5">
+            <StatTile label="Host" value={pending} detail={<Skeleton className="my-0.5 h-3 w-24" />} className="col-span-2 lg:col-span-1" />
+            {["Kernel", "CPU", "Memory", "Version"].map((label) => (
+              <StatTile key={label} label={label} value={pending} detail={<Skeleton className="my-0.5 h-3 w-24" />} />
+            ))}
+          </div>
+          <Disks disks={[]} loading />
         </div>
       </Section>
     );
@@ -117,7 +155,13 @@ function SystemInfo() {
   );
 }
 
-function Disks({ disks }: { disks: readonly { device: string; mount_point: string; total_gb: number; used_gb: number; percent_used: number }[] }) {
+function Disks({
+  disks,
+  loading = false,
+}: {
+  disks: readonly { device: string; mount_point: string; total_gb: number; used_gb: number; percent_used: number }[];
+  loading?: boolean;
+}) {
   const columns: Column<(typeof disks)[number]>[] = [
     {
       id: "mount",
@@ -165,6 +209,8 @@ function Disks({ disks }: { disks: readonly { device: string; mount_point: strin
       rows={disks}
       getRowId={(row) => row.mount_point}
       caption="Disks"
+      loading={loading}
+      skeletonRows={TYPICAL_DISKS}
       defaultSort={{ column: "mount", direction: "ascending" }}
       empty={<p className="p-4 text-13 text-fg-muted">No mounted filesystem could be read.</p>}
     />
@@ -208,6 +254,7 @@ function Network() {
           getRowId={(row) => row.name}
           caption="Network interfaces"
           loading={network.isPending}
+          skeletonRows={TYPICAL_INTERFACES}
           defaultSort={{ column: "name", direction: "ascending" }}
           empty={<p className="p-4 text-13 text-fg-muted">No network interface was reported.</p>}
         />
@@ -227,7 +274,7 @@ const SORT_OPTIONS: readonly { value: SortBy; label: string }[] = [
 
 function Processes() {
   const [sortBy, setSortBy] = useState<SortBy>("cpu");
-  const processes = useQuery(processesQuery(sortBy, 25));
+  const processes = useQuery(processesQuery(sortBy, PROCESS_LIMIT));
   const rows = processes.data?.processes ?? [];
   const columns: Column<(typeof rows)[number]>[] = [
     { id: "pid", header: "PID", mono: true, width: "w-16", cell: (row) => row.pid },
@@ -273,6 +320,7 @@ function Processes() {
           // landmark-unique rule (and a screen reader's landmarks list) flags as a duplicate.
           caption="Processes by resource use"
           loading={processes.isPending}
+          skeletonRows={PROCESS_LIMIT}
           empty={<p className="p-4 text-13 text-fg-muted">No process was reported.</p>}
         />
       )}

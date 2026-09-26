@@ -350,7 +350,12 @@ class CronManager:
         Tokens that need nothing are written bare, so the unit stays readable;
         everything else is double-quoted with systemd's own escaping. ``%`` is
         always doubled, in either form, so systemd does not expand it as a
-        specifier.
+        specifier, and so is ``$``: systemd substitutes ``$NAME`` and
+        ``${NAME}`` in ExecStart from the unit's own environment before the
+        program runs, so ``/bin/sh -c 'echo $HOME'`` reached the shell as
+        ``echo /root`` - or with the variable silently empty - instead of the
+        script the operator wrote. Doubled, the text arrives as typed and a
+        shell asked for explicitly does its own expansion.
 
         Args:
             argv: The parsed argument vector.
@@ -363,7 +368,7 @@ class CronManager:
             if _BARE_TOKEN.match(token):
                 rendered.append(token)
             else:
-                rendered.append(f'"{escape_systemd_value(token)}"')
+                rendered.append(f'"{escape_systemd_value(token).replace("$", "$$")}"')
         return " ".join(rendered)
 
     def _validate(self, job: CronJob) -> CronJob:

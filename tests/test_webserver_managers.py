@@ -422,6 +422,51 @@ def test_both_backends_expose_the_same_contract(nginx: NginxManager, apache: Apa
     assert nginx_api - apache_api == {"create_advanced_site"}
 
 
+def test_apache_is_installed_when_systemd_has_loaded_the_unit(
+    apache: ApacheManager, runner: FakeRunner
+) -> None:
+    """The unit's LoadState, not a stray binary on PATH, decides "installed"."""
+    runner.script(["systemctl", "show", "-p", "LoadState", "apache2"], stdout="LoadState=loaded\n")
+
+    assert apache.is_installed() is True
+
+
+def test_apache_is_not_installed_when_the_unit_is_not_found(
+    apache: ApacheManager, runner: FakeRunner
+) -> None:
+    """
+    The regression: ``shutil.which("apache2")`` found a binary on a server
+    where the package was not installed, and ``systemctl status apache2``
+    answered "could not be found". A binary being on PATH must not override
+    what systemd itself knows.
+    """
+    runner.script(
+        ["systemctl", "show", "-p", "LoadState", "apache2"], stdout="LoadState=not-found\n"
+    )
+    # The stray binary is still "on PATH" as far as a naive check goes.
+    runner.only_knows("apache2")
+
+    assert apache.is_installed() is False
+
+
+def test_apache_installed_check_falls_back_to_the_binary_without_systemd(
+    apache: ApacheManager, runner: FakeRunner
+) -> None:
+    """A machine with no systemd at all must not read as "Apache not installed"."""
+    runner.script(
+        ["systemctl", "show", "-p", "LoadState", "apache2"],
+        exit_code=1,
+        stderr="System has not been booted with systemd",
+    )
+    runner.only_knows("apache2")
+
+    assert apache.is_installed() is True
+
+    runner.only_knows()
+
+    assert apache.is_installed() is False
+
+
 @pytest.mark.parametrize("backend", ["nginx", "apache"])
 def test_status_is_a_record_not_a_dict_of_guesses(
     managers: dict[str, WebServerManager], runner: FakeRunner, backend: str

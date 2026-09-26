@@ -158,6 +158,12 @@ class DomainKind(str, Enum):
 #: Releases kept on disk when the application does not say otherwise.
 DEFAULT_KEEP_RELEASES = 5
 
+#: The fewest and the most releases an application may keep. One is the
+#: release that serves (pruning also spares the rollback target); past fifty
+#: the directory is a backup strategy, and a poor one.
+MIN_KEEP_RELEASES = 1
+MAX_KEEP_RELEASES = 50
+
 
 @dataclass
 class App:
@@ -189,6 +195,12 @@ class App:
     memory_max_mb: int | None = None
     cpu_quota_percent: int | None = None
     tasks_max: int | None = None
+    # Schema v9: what the health gate asks. None is the 2.0 behaviour for
+    # each: the deployer's path ("/"), any status below 500, and the gate's
+    # default wait. Written only through set_app_health, which validates.
+    health_path: str | None = None
+    health_expect: str | None = None
+    health_timeout: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -388,6 +400,9 @@ class DeploymentRecord:
     job_id: str | None = None
     release_id: str | None = None
     commit_message: str | None = None
+    #: Schema v9: the backup holding exactly what this deployment produced,
+    #: taken by the next in-place update before it changed anything.
+    snapshot_backup: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -533,7 +548,7 @@ class MonorepoWorkspace:
 
 
 # Schema version for migrations
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 _DEPLOYMENT_STATUSES_SQL = ", ".join(f"'{status.value}'" for status in DeploymentStatus)
 _DEPLOYMENT_TRIGGERS_SQL = ", ".join(f"'{trigger.value}'" for trigger in DeploymentTrigger)
@@ -571,7 +586,11 @@ CREATE TABLE IF NOT EXISTS deployments (
     -- this history, and the history must not either.
     job_id TEXT,
     release_id TEXT,
-    commit_message TEXT
+    commit_message TEXT,
+    -- Schema v9: the backup that holds exactly what this deployment
+    -- produced. Set by the next in-place update when it takes its
+    -- pre-deploy backup; NULL until then, and for every older row.
+    snapshot_backup TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_deployments_domain_started
@@ -678,8 +697,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_domains_one_primary
     ON domains(app_id) WHERE kind = '{DomainKind.PRIMARY.value}';
 """
 
+# Schema v9: what the health gate asks of an application. NULL, which every
+# existing row gets, is the 2.0 behaviour for each. Shared by the fresh
+# install path and the v8-to-v9 migration, like APPS_V5_COLUMNS.
+APPS_V9_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("health_path", "TEXT"),
+    ("health_expect", "TEXT"),
+    ("health_timeout", "INTEGER"),
+)
+
 _APPS_V5_COLUMNS_SQL = "".join(
     f"    {name} {definition},\n" for name, definition in APPS_V5_COLUMNS
+)
+
+_APPS_V9_COLUMNS_SQL = "".join(
+    f"    {name} {definition},\n" for name, definition in APPS_V9_COLUMNS
 )
 
 
@@ -742,6 +774,9 @@ CREATE TABLE IF NOT EXISTS apps (
     -- Schema v5: the release layout columns, from APPS_V5_COLUMNS.
 """
     + _APPS_V5_COLUMNS_SQL
+    + """    -- Schema v9: the health check columns, from APPS_V9_COLUMNS.
+"""
+    + _APPS_V9_COLUMNS_SQL
     + """    created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     deployed_at TEXT
@@ -1234,6 +1269,7 @@ class WASMStore:
             6: self._migrate_v5_to_v6,
             7: self._migrate_v6_to_v7,
             8: self._migrate_v7_to_v8,
+            9: self._migrate_v8_to_v9,
         }
 
         for version in range(from_version + 1, SCHEMA_VERSION + 1):
@@ -1353,6 +1389,31 @@ class WASMStore:
         for column in ("job_id", "release_id", "commit_message"):
             if column not in columns:
                 cursor.execute(f"ALTER TABLE deployments ADD COLUMN {column} TEXT")
+
+    def _migrate_v8_to_v9(self, cursor: sqlite3.Cursor) -> None:
+        """
+        Give every application its health check settings, and every deployment its snapshot (schema v9).
+
+        NULL, which every existing row gets, is exactly what 2.0 did: the
+        gate probes ``/``, accepts any status below 500 and waits its
+        default. A deployment recorded before this column existed has no
+        snapshot to point at: its tree was never backed up as such.
+
+        Args:
+            cursor: Cursor the migration runs on.
+        """
+        # Idempotent for the same reason as v7-to-v8: a database walking
+        # every migration in one opening created deployments at step 2 from
+        # today's DEPLOYMENTS_SCHEMA_SQL, which already has the column.
+        apps = {row[1] for row in cursor.execute("PRAGMA table_info(apps)").fetchall()}
+        for name, definition in APPS_V9_COLUMNS:
+            if name not in apps:
+                cursor.execute(f"ALTER TABLE apps ADD COLUMN {name} {definition}")
+        deployments = {
+            row[1] for row in cursor.execute("PRAGMA table_info(deployments)").fetchall()
+        }
+        if "snapshot_backup" not in deployments:
+            cursor.execute("ALTER TABLE deployments ADD COLUMN snapshot_backup TEXT")
 
     # =========================================================================
     # Application CRUD
@@ -1578,6 +1639,89 @@ class WASMStore:
             cursor.execute("SELECT webhook_secret FROM apps WHERE domain = ?", (domain,))
             row = cursor.fetchone()
             return row["webhook_secret"] if row else None
+
+    def set_app_health(
+        self,
+        domain: str,
+        *,
+        path: str | None,
+        expect: str | None,
+        timeout: int | None,
+    ) -> bool:
+        """
+        Store what the health gate asks of an application, all three at once.
+
+        The one writer of these columns, so the one place they are validated:
+        a value the gate could not use - a URL with a host, a status that
+        does not exist, a wait of a second - never reaches the row, whoever
+        asked.
+
+        Args:
+            domain: Application domain.
+            path: Path to probe, such as ``/healthz``; None for the
+                deployer's own (``/``).
+            expect: Statuses that mean up, such as ``200-399``; None for any
+                status below 500.
+            timeout: Seconds the application gets to answer; None for the
+                gate's default.
+
+        Returns:
+            True if the application exists and the row was updated.
+
+        Raises:
+            ValidationError: A value is not one the gate can use; nothing is
+                written.
+        """
+        from wasm.validators.health import (
+            check_health_expect,
+            check_health_path,
+            check_health_timeout,
+        )
+
+        values = (
+            None if path is None else check_health_path(path),
+            None if expect is None else check_health_expect(expect),
+            None if timeout is None else check_health_timeout(timeout),
+        )
+        with self._transaction() as cursor:
+            cursor.execute(
+                "UPDATE apps SET health_path = ?, health_expect = ?, health_timeout = ?, "
+                "updated_at = ? WHERE domain = ?",
+                (*values, datetime.now().isoformat(), domain),
+            )
+            return cursor.rowcount > 0
+
+    def set_keep_releases(self, domain: str, keep: int) -> bool:
+        """
+        Store how many releases an application keeps on disk.
+
+        Args:
+            domain: Application domain.
+            keep: Releases to keep, from :data:`MIN_KEEP_RELEASES` to
+                :data:`MAX_KEEP_RELEASES`.
+
+        Returns:
+            True if the application exists and the row was updated.
+
+        Raises:
+            ValidationError: The number is out of range; nothing is written.
+        """
+        if (
+            isinstance(keep, bool)
+            or not isinstance(keep, int)
+            or not MIN_KEEP_RELEASES <= keep <= MAX_KEEP_RELEASES
+        ):
+            raise ValidationError(
+                f"Cannot keep {keep!r} releases",
+                details=f"Keep from {MIN_KEEP_RELEASES} to {MAX_KEEP_RELEASES}. The active "
+                "release and the one a rollback goes to are kept whatever the number.",
+            )
+        with self._transaction() as cursor:
+            cursor.execute(
+                "UPDATE apps SET keep_releases = ?, updated_at = ? WHERE domain = ?",
+                (keep, datetime.now().isoformat(), domain),
+            )
+            return cursor.rowcount > 0
 
     def list_webhook_flags(self, domains: Iterable[str] | None = None) -> dict[str, bool]:
         """
@@ -2419,6 +2563,38 @@ class WASMStore:
             )
             return cursor.rowcount > 0
 
+    def set_deployment_snapshot(self, deployment_id: int, backup_id: str) -> None:
+        """
+        Link a deployment to the backup that holds exactly what it produced.
+
+        An in-place update backs the tree up before it changes it; that tree
+        is what the previous deployment built, so the backup is that
+        deployment's snapshot, and going back to it means restoring it.
+
+        Args:
+            deployment_id: The deployment whose result the backup holds.
+            backup_id: The backup's id.
+
+        Raises:
+            ValidationError: The backup id is empty.
+            WASMError: There is no such deployment.
+        """
+        if not backup_id or not backup_id.strip():
+            raise ValidationError(
+                "A deployment snapshot needs a backup id",
+                details="Pass the id of the backup that was just taken.",
+            )
+        with self._transaction() as cursor:
+            cursor.execute(
+                "UPDATE deployments SET snapshot_backup = ? WHERE id = ?",
+                (backup_id, deployment_id),
+            )
+            if cursor.rowcount == 0:
+                raise WASMError(
+                    f"Deployment {deployment_id} does not exist",
+                    details="Its history may have been pruned; nothing was linked.",
+                )
+
     def finish_deployment(self, deployment_id: int, status: str, error: str | None = None) -> None:
         """
         Record the outcome of a deployment.
@@ -2728,6 +2904,33 @@ class WASMStore:
                 [app_id, *release_ids],
             )
             return cursor.rowcount
+
+    def forget_pruned_releases(
+        self, app_id: int, *, on_disk: set[str], removed: set[str], keep: int
+    ) -> int:
+        """
+        Forget the release rows a prune made stale.
+
+        A release just pruned is forgotten at once. A release that is gone
+        for another reason - it failed and was removed - stays listed while
+        it is among the newest ``keep`` rows, so a recent failure stays
+        visible, and is forgotten after that.
+
+        Args:
+            app_id: The application.
+            on_disk: Ids of the releases still on disk.
+            removed: Ids of the releases the prune removed.
+            keep: The application's retention.
+
+        Returns:
+            How many rows were deleted.
+        """
+        stale = [
+            row.id
+            for index, row in enumerate(self.list_releases(app_id))
+            if row.id not in on_disk and (row.id in removed or index >= keep)
+        ]
+        return self.delete_releases(app_id, stale)
 
     @staticmethod
     def _check_release_status(status: str) -> None:

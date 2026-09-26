@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 
 import { metricSeriesQuery } from "../../api/queries/metrics";
@@ -21,10 +21,21 @@ const WINDOW_WORDS: Record<MetricWindow, string> = {
 };
 
 const CHART_HEIGHT = 132;
+/** The whole chart block: caption (36px), readout (16px) and plot, 12px apart. */
+const CHART_BLOCK_HEIGHT = 36 + 12 + 16 + 12 + CHART_HEIGHT;
 
-/** One metric's history, refreshed as often as a new point could change the picture. */
-function useSeries(metric: string, window: MetricWindow) {
-  return useQuery({ ...metricSeriesQuery(metric, window), refetchInterval: window === "1h" ? 30_000 : 5 * 60_000 });
+/**
+ * One metric's history, refreshed as often as a new point could change the picture. A new
+ * range keeps the previous one on screen until it arrives: the chart (and its enlarged view,
+ * where the range can be changed too) stays put instead of dropping back to a skeleton.
+ */
+function useSeries(metric: string, window: MetricWindow, enabled = true) {
+  return useQuery({
+    ...metricSeriesQuery(metric, window),
+    refetchInterval: window === "1h" ? 30_000 : 5 * 60_000,
+    placeholderData: keepPreviousData,
+    enabled,
+  });
 }
 
 interface ChartSpec {
@@ -55,29 +66,35 @@ function ChartFrame({ children }: { children: ReactNode }) {
   return <div className="min-w-0 rounded-card border border-border bg-surface p-4 shadow-raised">{children}</div>;
 }
 
+/**
+ * Exactly as tall as the chart that replaces it (the caption's 36px, the readout's 16px, the
+ * plot, and the gaps between), so the sections below do not move when the data lands.
+ */
 function ChartSkeleton({ title }: { title: string }) {
   return (
-    <div aria-busy="true" className="flex flex-col gap-3">
+    <div aria-busy="true" className="flex flex-col gap-3" style={{ minHeight: CHART_BLOCK_HEIGHT }}>
       <span className="sr-only">{`Loading the ${title.toLowerCase()} chart`}</span>
       <div aria-hidden="true" className="flex flex-col gap-3">
-        <div className="flex flex-col gap-1.5">
+        <div className="flex h-9 flex-col justify-center gap-1.5">
           <Skeleton className="h-3.5 w-20" />
           <Skeleton className="h-3 w-28" />
         </div>
-        <Skeleton className="h-3 w-24" />
+        <div className="flex h-4 items-center">
+          <Skeleton className="h-3 w-24" />
+        </div>
         <Skeleton className="h-33 w-full rounded-control" />
       </div>
     </div>
   );
 }
 
-function MetricChart({ spec, window }: { spec: ChartSpec; window: MetricWindow }) {
+function MetricChart({ spec, window, onWindowChange }: { spec: ChartSpec } & MachineChartsProps) {
   const [first, second] = spec.series;
   const one = useSeries(first?.metric ?? "", window);
   // Hooks run in a fixed order: the second series and the ceiling are fetched only when the
   // chart has one, and otherwise the query is left disabled.
-  const two = useQuery({ ...metricSeriesQuery(second?.metric ?? "", window), enabled: second !== undefined });
-  const ceiling = useQuery({ ...metricSeriesQuery(spec.ceiling ?? "", window), enabled: spec.ceiling !== undefined });
+  const two = useSeries(second?.metric ?? "", window, second !== undefined);
+  const ceiling = useSeries(spec.ceiling ?? "", window, spec.ceiling !== undefined);
 
   const queries = [one, ...(second ? [two] : [])];
   const failed = queries.find((query) => query.isError);
@@ -109,7 +126,7 @@ function MetricChart({ spec, window }: { spec: ChartSpec; window: MetricWindow }
   if (aligned.timestamps.length < 2) {
     return (
       <ChartFrame>
-        <div className="flex flex-col" style={{ minHeight: CHART_HEIGHT + 76 }}>
+        <div className="flex flex-col" style={{ minHeight: CHART_BLOCK_HEIGHT }}>
           <h3 className="text-13 font-medium text-fg">{spec.title}</h3>
           <p className="text-12 text-fg-faint">{WINDOW_WORDS[window]}</p>
           <p className="m-auto max-w-[30ch] py-4 text-center text-13 text-pretty text-fg-muted">
@@ -130,6 +147,7 @@ function MetricChart({ spec, window }: { spec: ChartSpec; window: MetricWindow }
         series={spec.series.map((s, i) => ({ label: s.label, values: aligned.values[i] ?? [] }))}
         formatValue={spec.format}
         height={CHART_HEIGHT}
+        rangeSelector={{ value: window, control: <RangeControl window={window} onWindowChange={onWindowChange} /> }}
         {...(range !== undefined ? { yRange: range } : {})}
       />
     </ChartFrame>
@@ -141,19 +159,25 @@ export interface MachineChartsProps {
   onWindowChange: (window: MetricWindow) => void;
 }
 
+/** The one range control, on the section and again in an enlarged chart. */
+function RangeControl({ window, onWindowChange }: MachineChartsProps) {
+  return <SegmentedControl label="Time range" options={WINDOWS} value={window} onValueChange={onWindowChange} />;
+}
+
 /** The machine's recent history: CPU, memory, network and disk over the chosen window. */
 export function MachineCharts({ window, onWindowChange }: MachineChartsProps) {
   return (
     <Section
       title="Machine"
       description="CPU, memory, network and disk over time."
-      actions={<SegmentedControl label="Time range" options={WINDOWS} value={window} onValueChange={onWindowChange} />}
+      actions={<RangeControl window={window} onWindowChange={onWindowChange} />}
     >
-      {/* Sized by the room the page gives it, not the viewport: the sidebar comes and goes. */}
+      {/* Sized by the room the page gives it, not the viewport: the sidebar comes and goes.
+          Four abreast only where each still gets a readable width (about 350px). */}
       <div className="@container">
-        <div className="grid gap-4 @2xl:grid-cols-2 @5xl:grid-cols-4">
+        <div className="grid gap-4 @2xl:grid-cols-2 @[88rem]:grid-cols-4">
           {CHARTS.map((spec) => (
-            <MetricChart key={spec.title} spec={spec} window={window} />
+            <MetricChart key={spec.title} spec={spec} window={window} onWindowChange={onWindowChange} />
           ))}
         </div>
       </div>

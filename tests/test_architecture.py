@@ -860,7 +860,7 @@ class TestMaintainerScripts:
         "obs/debian.postrm",
     )
 
-    RPM_SCRIPTLET_NAMES = ("%pre", "%post", "%preun", "%postun")
+    RPM_SCRIPTLET_NAMES = ("%pre", "%post", "%preun", "%postun", "%posttrans")
 
     PIP_INSTALL = re.compile(r"\bpip3?\s+install\b|\bpython3?\s+-m\s+pip\s+install\b")
     CHMOD_LINE = re.compile(r"\bchmod\s+(?:-\w+\s+)?0?([0-7]{3})\s+(\S+)")
@@ -887,7 +887,7 @@ class TestMaintainerScripts:
 
     def _rpm_scriptlets(self) -> dict[str, str]:
         """
-        Split rpm/wasm.spec into the body of each %pre/%post/%preun/%postun.
+        Split rpm/wasm.spec into the body of each %pre/%post/%preun/%postun/%posttrans.
 
         Returns:
             Mapping of "rpm/wasm.spec %scriptlet" to its body text, for every
@@ -1040,6 +1040,68 @@ class TestMaintainerScripts:
             )
             assert re.search(r"systemctl\s+disable\s+wasm-monitor", text), (
                 f"{name} does not disable wasm-monitor.service"
+            )
+
+    def test_package_removal_stops_and_disables_the_console_service(self):
+        """
+        'wasm web enable' writes and enables wasm-web.service, which neither
+        dpkg nor rpm ships: removal must stop and disable it like the monitor,
+        and still stop a console started with 'wasm web start -d'.
+        """
+        prerm = (REPO / "obs/debian.prerm").read_text(encoding="utf-8")
+        preun = self._rpm_scriptlets().get("rpm/wasm.spec %preun", "")
+
+        for name, text in (("obs/debian.prerm", prerm), ("rpm/wasm.spec %preun", preun)):
+            assert re.search(r"systemctl\s+stop\s+wasm-web\.service", text), (
+                f"{name} does not stop wasm-web.service"
+            )
+            assert re.search(r"systemctl\s+disable\s+wasm-web\.service", text), (
+                f"{name} does not disable wasm-web.service"
+            )
+            assert re.search(r"wasm\s+web\s+stop", text), (
+                f"{name} no longer stops a console started with 'wasm web start -d'"
+            )
+
+    def test_debian_upgrade_restarts_a_running_console_service(self):
+        """
+        prerm leaves wasm-web.service running across an upgrade, so postinst's
+        configure branch restarts it onto the new code - only when the unit
+        exists and is active, so a console the operator stopped stays stopped.
+        """
+        postinst = (REPO / "obs/debian.postinst").read_text(encoding="utf-8")
+        configure_start = postinst.index("configure)")
+        configure_body = postinst[configure_start : postinst.index(";;", configure_start)]
+        after_configure = postinst[postinst.index(";;", configure_start) :]
+
+        assert re.search(r"systemctl\s+restart\s+wasm-web\.service", configure_body), (
+            "postinst's configure) branch never restarts wasm-web.service"
+        )
+        assert "wasm-web" not in after_configure, "postinst touches the console outside configure)"
+
+        guard = configure_body[: configure_body.index("systemctl restart wasm-web")]
+        guard = guard[guard.rindex("if ") :]
+        assert "/etc/systemd/system/wasm-web.service" in guard, (
+            "the restart is not guarded on the unit existing"
+        )
+        assert re.search(r"systemctl\s+is-active\s+(--quiet\s+)?wasm-web\.service", guard), (
+            "the restart is not guarded on the unit being active"
+        )
+
+    def test_rpm_upgrade_restarts_a_running_console_service(self):
+        """
+        %preun leaves wasm-web.service running across an upgrade; %posttrans,
+        after the old files are gone, restarts it only if it is running.
+        """
+        scriptlets = self._rpm_scriptlets()
+        posttrans = scriptlets.get("rpm/wasm.spec %posttrans", "")
+
+        assert re.search(r"systemctl\s+try-restart\s+wasm-web\.service", posttrans), (
+            "rpm/wasm.spec %posttrans does not try-restart wasm-web.service"
+        )
+        for name in ("%pre", "%post", "%postun"):
+            body = scriptlets.get(f"rpm/wasm.spec {name}", "")
+            assert not re.search(r"systemctl\s+\S*restart\s+wasm-web", body), (
+                f"rpm/wasm.spec {name} restarts the console; only %posttrans may"
             )
 
     def test_removal_scripts_never_start_or_enable_anything(self):

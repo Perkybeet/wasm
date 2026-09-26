@@ -113,6 +113,7 @@ def stage_release(
     releases: ReleaseManager,
     source_manager: SourceManager,
     logger: Logger,
+    commit: str | None = None,
 ) -> StagedRelease:
     """
     Create a new release directory and put the source in it.
@@ -123,6 +124,9 @@ def stage_release(
         releases: Manager of the application's releases.
         source_manager: Manager the fetch goes through.
         logger: Where progress is reported.
+        commit: For a git source, a full commit id already in the repository
+            cache (see :meth:`SourceManager.resolve_commit`) to export instead
+            of the head of the branch: a rebuild of that exact commit.
 
     Returns:
         The staged release.
@@ -132,8 +136,9 @@ def stage_release(
     """
     source_type, _ = validate_source(source)
     cache = releases.app_path / REPO_CACHE_DIR
-    commit: str | None = None
-    if source_type == "git":
+    if source_type != "git":
+        commit = None
+    elif commit is None:
         logger.substep(f"Repository cache: {cache}")
         commit = source_manager.sync_cache(source, cache, branch)
 

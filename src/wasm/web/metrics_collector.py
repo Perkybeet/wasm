@@ -38,6 +38,7 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from wasm.core.exceptions import WASMError
 from wasm.monitor.timeseries import MetricsStore, default_metrics_db_path
@@ -97,6 +98,7 @@ class MetricsCollector:
         interval_s: float = DEFAULT_INTERVAL_SECONDS,
         cgroup_root: Path = CGROUP_ROOT,
         clock: Callable[[], float] = time.monotonic,
+        units_for: Callable[[Any], list[str]] | None = None,
     ) -> None:
         """
         Args:
@@ -106,6 +108,9 @@ class MetricsCollector:
                 can point it at a fake tree.
             clock: Monotonic time source for rate deltas. Injected so tests
                 never depend on real elapsed time.
+            units_for: Names the units an application runs as. Defaults to
+                :meth:`ServiceManager.app_units`, the one mapping; injected so
+                tests need no systemd.
         """
         self.store = store
         self.interval_s = float(interval_s)
@@ -118,7 +123,8 @@ class MetricsCollector:
         self._last_tick: float | None = None
         self._last_net: tuple[int, int] | None = None
         self._last_cpu_usec: dict[str, int] = {}
-        self._domains: list[str] = []
+        self._units: dict[str, list[str]] = {}
+        self._units_for = units_for or _app_units
         self._domains_read_at: float | None = None
         self._consolidated_at = self._clock()
 
@@ -259,63 +265,93 @@ class MetricsCollector:
             nothing and costs nothing.
         """
         pairs: list[tuple[str, float]] = []
-        for domain in self._app_domains(now):
-            unit_dir = self.cgroup_root / f"wasm-{domain}.service"
+        for domain, units in self._app_units(now).items():
+            memory_total: int | None = None
+            cpu_total: float | None = None
+            for unit in units:
+                unit_dir = self.cgroup_root / f"{unit}.service"
+                try:
+                    memory = int((unit_dir / "memory.current").read_text())
+                except (OSError, ValueError):
+                    log.debug("no readable memory cgroup for %s", unit)
+                else:
+                    memory_total = (memory_total or 0) + memory
 
-            try:
-                memory = int((unit_dir / "memory.current").read_text())
-            except (OSError, ValueError):
-                log.debug("no readable memory cgroup for %s", domain)
-            else:
-                pairs.append((f"app.{domain}.mem.bytes", float(memory)))
+                usec = _read_cpu_usec(unit_dir / "cpu.stat")
+                if usec is None:
+                    # Forget the counter so a unit that comes back does not have
+                    # its first delta measured against a life it no longer lives.
+                    self._last_cpu_usec.pop(unit, None)
+                    continue
+                previous = self._last_cpu_usec.get(unit)
+                self._last_cpu_usec[unit] = usec
+                if previous is None or elapsed is None or elapsed <= 0:
+                    continue
+                delta = usec - previous
+                if delta < 0:
+                    # The unit restarted between ticks and its counter began
+                    # again at zero.
+                    continue
+                cpu_total = (cpu_total or 0.0) + delta / (elapsed * USEC_PER_SECOND) * 100
 
-            usec = _read_cpu_usec(unit_dir / "cpu.stat")
-            if usec is None:
-                # Forget the counter so a unit that comes back does not have
-                # its first delta measured against a life it no longer lives.
-                self._last_cpu_usec.pop(domain, None)
-                continue
-            previous = self._last_cpu_usec.get(domain)
-            self._last_cpu_usec[domain] = usec
-            if previous is None or elapsed is None or elapsed <= 0:
-                continue
-            delta = usec - previous
-            if delta < 0:
-                # The unit restarted between ticks and its counter began
-                # again at zero.
-                continue
-            pairs.append((f"app.{domain}.cpu.percent", delta / (elapsed * USEC_PER_SECOND) * 100))
+            # A monorepo runs as several units: the application is their sum.
+            if memory_total is not None:
+                pairs.append((f"app.{domain}.mem.bytes", float(memory_total)))
+            if cpu_total is not None:
+                pairs.append((f"app.{domain}.cpu.percent", cpu_total))
 
         return pairs
 
-    def _app_domains(self, now: float) -> list[str]:
+    def _app_units(self, now: float) -> dict[str, list[str]]:
         """
-        Name the applications worth sampling, refreshed on a slow timer.
+        Name the applications worth sampling and their units, refreshed on a slow timer.
 
         Args:
             now: The current monotonic time.
 
         Returns:
-            The domains of every application in the store. On a store error
-            the previous list is kept: a transient read failure must not blank
-            every app's chart for a tick.
+            Each application's domain with the units it runs as. On a store
+            error the previous answer is kept: a transient read failure must not
+            blank every app's chart for a tick.
         """
         if self._domains_read_at is not None and now - self._domains_read_at < APPS_REFRESH_SECONDS:
-            return self._domains
+            return self._units
 
         try:
             from wasm.core.store import get_store
 
-            domains = [app.domain for app in get_store().list_apps() if app.domain]
+            apps = [app for app in get_store().list_apps() if app.domain]
         except _STORE_ERRORS:
             log.debug("the application list could not be refreshed", exc_info=True)
         else:
-            self._domains = domains
+            units: dict[str, list[str]] = {}
+            for app in apps:
+                try:
+                    units[app.domain] = self._units_for(app)
+                except WASMError as exc:
+                    log.debug("could not name the units of %s: %s", app.domain, exc)
+            self._units = units
             # Deleted applications must not keep a CPU counter alive forever.
-            for stale in set(self._last_cpu_usec) - set(domains):
+            live = {unit for names in units.values() for unit in names}
+            for stale in set(self._last_cpu_usec) - live:
                 del self._last_cpu_usec[stale]
         self._domains_read_at = now
-        return self._domains
+        return self._units
+
+
+def _app_units(app: Any) -> list[str]:
+    """
+    Name the units an application runs as, through the one mapping.
+
+    Args:
+        app: The application.
+
+    Returns:
+        Its unit names, without the ``.service`` suffix.
+    """
+    from wasm.managers.service_manager import ServiceManager
+
+    return ServiceManager(verbose=False).app_units(app)
 
 
 def _read_cpu_usec(cpu_stat: Path) -> int | None:

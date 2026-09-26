@@ -22,6 +22,7 @@ from wasm.web.api.certs import router as certs_router
 from wasm.web.api.config import router as config_router
 from wasm.web.api.cron import router as cron_router
 from wasm.web.api.databases import router as databases_router
+from wasm.web.api.deployments import app_router as deployment_actions_router
 from wasm.web.api.deployments import router as deployments_router
 from wasm.web.api.deps import install_error_handlers
 from wasm.web.api.diagnose import router as diagnose_router
@@ -63,6 +64,9 @@ router.include_router(deployments_router, prefix="/deployments", tags=["Deployme
 # routers compose without colliding. Kept separate because apps.py is owned
 # by another agent while this task was in flight.
 router.include_router(diagnose_router, prefix="/apps", tags=["Applications"])
+# Same composition: deployments.py's actions on one deployment are under
+# "/{domain}/deployments/{id}/", which apps.py does not define.
+router.include_router(deployment_actions_router, prefix="/apps", tags=["Deployments"])
 # Same composition: domains.py owns only paths under "/{domain}/domains".
 router.include_router(domains_router, prefix="/apps", tags=["Domains"])
 # domains.py's second router: a DNS check with no application yet, for the

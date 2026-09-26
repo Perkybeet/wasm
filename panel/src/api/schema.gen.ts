@@ -76,12 +76,17 @@ export interface paths {
          * Inspect App Source
          * @description Preview what a repository is before deploying it.
          *
-         *     Fetches the source into a throwaway checkout, detects the application
-         *     type, and reports the commands, port and environment variables a
-         *     deployment would use, so the new-app wizard has something real to show
-         *     instead of a guess. Nothing is written outside the checkout, which is
-         *     removed before this returns, and no application, domain or unit is
-         *     created.
+         *     Fetches what detection needs (for git, ``ls-remote`` and a sparse,
+         *     blobless checkout of the files the detectors read), detects the
+         *     application type, and reports the commands, port and environment
+         *     variables a deployment would use and whether this server can deploy it,
+         *     so the new-app wizard has something real to show instead of a guess.
+         *     Nothing is written outside the scratch checkout, which is removed before
+         *     this returns, and no application, domain or unit is created.
+         *
+         *     A client that disconnects (the wizard's Cancel aborts the fetch) cancels
+         *     the inspection: the git command running is killed and the checkout
+         *     removed at once, instead of the clone running on to its deadline.
          *
          *     Admin scope, like creating one: fetching runs as root and reads back what
          *     it fetched. A local path is reserved to the operator in person, exactly
@@ -93,7 +98,8 @@ export interface paths {
          *         session: The authenticated session.
          *
          *     Returns:
-         *         The inspection result.
+         *         The inspection result, or an empty 499 once a cancelled inspection
+         *         has stopped (nobody is there to read it).
          *
          *     Raises:
          *         HTTPException: 403 when the source is a local path and the credential
@@ -193,6 +199,80 @@ export interface paths {
          *         HTTPException: 404 when the application is unknown.
          */
         delete: operations["delete_app_api_apps__domain__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/apps/{domain}/deployments/{deployment_id}/rebuild": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rebuild Deployment
+         * @description Queue a deploy of the exact commit a deployment was built from.
+         *
+         *     The update job, given the commit: on releases a release of that commit
+         *     still on disk is activated (instant), otherwise the commit is built as a
+         *     new release; in place the checkout is put on the commit and rebuilt.
+         *     There is no ``nothing_new`` check: asking for a commit is explicit.
+         *
+         *     Args:
+         *         domain: Domain of the application.
+         *         deployment_id: The deployment whose commit to rebuild.
+         *         session: The authenticated session.
+         *
+         *     Returns:
+         *         The queued job.
+         *
+         *     Raises:
+         *         HTTPException: 404 for an unknown application or deployment, 409 when
+         *             the deployment recorded no commit (its source is not git).
+         */
+        post: operations["rebuild_deployment_api_apps__domain__deployments__deployment_id__rebuild_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/apps/{domain}/deployments/{deployment_id}/rollback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rollback Deployment
+         * @description Queue going back to what a deployment produced.
+         *
+         *     On releases its release is activated behind the health gate; in place
+         *     its snapshot backup (taken by the update that followed it) is restored,
+         *     after a safety backup of the current state.
+         *
+         *     Args:
+         *         domain: Domain of the application.
+         *         deployment_id: The deployment to go back to.
+         *         session: The authenticated session.
+         *
+         *     Returns:
+         *         The queued job.
+         *
+         *     Raises:
+         *         HTTPException: 404 for an unknown deployment of the application, 409
+         *             ``rollback_unavailable`` with the reason when it cannot be gone
+         *             back to.
+         */
+        post: operations["rollback_deployment_api_apps__domain__deployments__deployment_id__rollback_post"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -407,6 +487,43 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/apps/{domain}/health": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Update App Health
+         * @description Set the path, the accepted statuses and the timeout of an application's health check.
+         *
+         *     The health gate decides which release may serve, so changing what it
+         *     asks needs sudo mode, like the limits. The values are validated where
+         *     they are stored; nothing restarts.
+         *
+         *     Args:
+         *         domain: Domain of the application.
+         *         body: The three settings.
+         *         session: The authenticated, elevated session.
+         *
+         *     Returns:
+         *         The settings the application has now, and what the gate asks.
+         *
+         *     Raises:
+         *         HTTPException: 404 when the application is unknown.
+         *         ValidationError: A value is not one the gate can use (400).
+         *         DeploymentError: It is a static site, checked by its files.
+         */
+        patch: operations["update_app_health_api_apps__domain__health_patch"];
+        trace?: never;
+    };
     "/api/apps/{domain}/limits": {
         parameters: {
             query?: never;
@@ -584,6 +701,42 @@ export interface paths {
         options?: never;
         head?: never;
         patch?: never;
+        trace?: never;
+    };
+    "/api/apps/{domain}/releases/retention": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Update Release Retention
+         * @description Set how many releases an application keeps, and prune to it now.
+         *
+         *     Pruning deletes release directories, so it needs sudo mode. The number
+         *     is validated where it is stored.
+         *
+         *     Args:
+         *         domain: Domain of the application.
+         *         body: The retention.
+         *         session: The authenticated, elevated session.
+         *
+         *     Returns:
+         *         The retention it has now and what was removed.
+         *
+         *     Raises:
+         *         HTTPException: 404 when the application is unknown.
+         *         ValidationError: The number is out of range (400).
+         *         DeploymentError: It is deployed in place, with no releases.
+         */
+        patch: operations["update_release_retention_api_apps__domain__releases_retention_patch"];
         trace?: never;
     };
     "/api/apps/{domain}/releases/{release_id}/activate": {
@@ -2090,6 +2243,93 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/config/notifications/telegram": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Telegram Config
+         * @description Get the configured Telegram channel, without its bot token.
+         *
+         *     Args:
+         *         session: Authenticated session, injected by the dependency.
+         *
+         *     Returns:
+         *         The configured chat id and whether a bot token is stored.
+         */
+        get: operations["get_telegram_config_api_config_notifications_telegram_get"];
+        /**
+         * Update Telegram Config
+         * @description Update the Telegram channel's bot token and chat id.
+         *
+         *     The chat id is validated against the shape Telegram's Bot API accepts
+         *     before it is ever written - see :class:`TelegramConfig` - which is what
+         *     turns a missing minus sign into an error naming the fix at save time
+         *     instead of a "chat not found" the next time a deploy tries to notify.
+         *
+         *     Args:
+         *         body: Body carrying the bot token and chat id.
+         *         request: The incoming request, for the audit record.
+         *         session: Authenticated session, injected by the dependency.
+         *
+         *     Returns:
+         *         Confirmation message.
+         *
+         *     Raises:
+         *         HTTPException: If the configuration cannot be written.
+         */
+        put: operations["update_telegram_config_api_config_notifications_telegram_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/config/notifications/telegram/chats": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * List Telegram Chats
+         * @description List the chats the configured Telegram bot has seen.
+         *
+         *     Finding a chat id today means opening the Bot API's ``getUpdates`` URL by
+         *     hand and reading raw JSON, or asking an assistant to do it. This is that
+         *     lookup, using the bot token already saved, over the notifier's own HTTP
+         *     path - the same SSRF guard and timeout as every other channel.
+         *
+         *     Plain ``get_current_session``, not :func:`require_elevated`: this only
+         *     reads what Telegram has queued for the bot, the same reasoning
+         *     :func:`test_notification_channel` already applies to sending a message -
+         *     neither one changes anything WASM manages.
+         *
+         *     Args:
+         *         session: Authenticated session, injected by the dependency.
+         *
+         *     Returns:
+         *         Every chat found.
+         *
+         *     Raises:
+         *         HTTPException: 400 when no bot token is configured, the token does
+         *             not have the Bot API's shape, or the Bot API could not be reached
+         *             or answered with an error - in its own words.
+         */
+        post: operations["list_telegram_chats_api_config_notifications_telegram_chats_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/config/notifications/{channel}/test": {
         parameters: {
             query?: never;
@@ -2145,6 +2385,59 @@ export interface paths {
          *         The redacted configuration and the path it came from.
          */
         post: operations["reload_config_api_config_reload_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/config/smtp": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Smtp Config
+         * @description Get the monitor's SMTP settings.
+         *
+         *     Args:
+         *         session: Authenticated session, injected by the dependency.
+         *
+         *     Returns:
+         *         The configured server, transport, account and recipients, and whether
+         *         a password is stored - never the password itself.
+         */
+        get: operations["get_smtp_config_api_config_smtp_get"];
+        /**
+         * Update Smtp Config
+         * @description Update the monitor's SMTP settings.
+         *
+         *     Goes through :meth:`~wasm.core.config.Config.set`, so the same rule 'wasm
+         *     config set monitor.smtp.*' enforces - a hostname for ``host``, a port in
+         *     range, ``use_ssl`` and ``use_tls`` not both on, a valid address for
+         *     ``from_address`` and every recipient - rejects a value here too, in the
+         *     same words. An empty ``password`` is translated to the
+         *     :data:`~wasm.core.config.REDACTED` placeholder before the write, which is
+         *     what actually keeps the stored password: see :class:`SMTPConfig`.
+         *
+         *     Args:
+         *         body: Body carrying the SMTP settings.
+         *         request: The incoming request, for the audit record.
+         *         session: Authenticated session, injected by the dependency.
+         *
+         *     Returns:
+         *         Confirmation message.
+         *
+         *     Raises:
+         *         ConfigError: 400, through the error boundary, for a host that is not
+         *             a hostname, a port out of range, both ``use_ssl`` and ``use_tls``
+         *             enabled, or an invalid ``from_address`` or recipient.
+         *         HTTPException: If the configuration cannot be written.
+         */
+        put: operations["update_smtp_config_api_config_smtp_put"];
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -3502,12 +3795,20 @@ export interface paths {
          * Create Update Job
          * @description Queue an update.
          *
+         *     Unless ``force`` is set, the head of the branch on the remote is compared
+         *     with the live commit first (``git ls-remote``, nothing is downloaded), and
+         *     an update that would rebuild the same commit is refused with ``409
+         *     nothing_new``. The webhook does not ask: a push is itself the news.
+         *
          *     Args:
          *         request: The update request.
          *         session: The authenticated session.
          *
          *     Returns:
          *         The queued job.
+         *
+         *     Raises:
+         *         HTTPException: 409 ``nothing_new`` when the branch has nothing new.
          */
         post: operations["create_update_job_api_jobs_update_post"];
         delete?: never;
@@ -4055,7 +4356,14 @@ export interface paths {
          *         A success payload.
          *
          *     Raises:
-         *         HTTPException: When SMTP is not configured or delivery failed.
+         *         HTTPException: When SMTP is not configured or delivery failed. A
+         *             delivery failure carries the mail server's own reply verbatim in
+         *             ``output`` (``EmailNotifier`` already redacts the password out of
+         *             it), alongside the friendlier ``detail`` a console renders as the
+         *             headline - the same ``detail``/``output`` split
+         *             ``POST /api/sites/reload`` uses for a rejected web server config,
+         *             so a form built over this endpoint does not have to parse the
+         *             server's words out of a single sentence to show them.
          */
         post: operations["test_email_api_monitor_test_email_post"];
         delete?: never;
@@ -5262,6 +5570,11 @@ export interface components {
          *         memory_max_mb: Memory limit of its unit, in MB, or None.
          *         cpu_quota_percent: CPU quota of its unit, in percent of one CPU, or None.
          *         tasks_max: Task limit of its unit, or None.
+         *         health_path: Path the health gate probes, or None for ``/``.
+         *         health_expect: Statuses the health gate accepts, such as
+         *             ``200-399``, or None for any status below 500.
+         *         health_timeout: Seconds the health gate waits, or None for its
+         *             default of 30.
          *         webhook_enabled: Whether a webhook secret is set for it. The secret
          *             itself is never part of this or any other response; it is set
          *             through ``POST /api/apps/{domain}/webhook-secret`` and cleared
@@ -5286,6 +5599,12 @@ export interface components {
             domain: string;
             /** Enabled */
             enabled: boolean;
+            /** Health Expect */
+            health_expect?: string | null;
+            /** Health Path */
+            health_path?: string | null;
+            /** Health Timeout */
+            health_timeout?: number | null;
             /**
              * Keep Releases
              * @default 5
@@ -6478,6 +6797,12 @@ export interface components {
          *             layout. None for an in-place deployment.
          *         commit_message: Subject line of the deployed commit, for a git
          *             source. None for a source that is not git.
+         *         snapshot_backup: In place, the backup that holds exactly what this
+         *             deployment produced, taken by the update that followed it.
+         *         rollback_available: Whether going back to this deployment is
+         *             possible now: its release is on disk and not live, or its
+         *             snapshot backup still exists.
+         *         rollback_unavailable_reason: Why not, when it is not.
          */
         DeploymentOut: {
             /** Commit Message */
@@ -6502,6 +6827,15 @@ export interface components {
             job_id?: string | null;
             /** Release Id */
             release_id?: string | null;
+            /**
+             * Rollback Available
+             * @default false
+             */
+            rollback_available: boolean;
+            /** Rollback Unavailable Reason */
+            rollback_unavailable_reason?: string | null;
+            /** Snapshot Backup */
+            snapshot_backup?: string | null;
             /** Started At */
             started_at?: string | null;
             /** Status */
@@ -6790,6 +7124,36 @@ export interface components {
             status: string;
             /** Value */
             value: string;
+        };
+        /**
+         * HealthCheckResponse
+         * @description The health check an application has now.
+         *
+         *     Attributes:
+         *         domain: The application's domain.
+         *         path: The path it set, or None for the default.
+         *         expect: The statuses it set, or None for the default.
+         *         timeout: The seconds it set, or None for the default.
+         *         effective_path: The path the gate requests.
+         *         effective_expect: The statuses the gate accepts, as an operator
+         *             reads them: the list, or "any status below 500".
+         *         effective_timeout: The seconds the gate waits.
+         */
+        HealthCheckResponse: {
+            /** Domain */
+            domain: string;
+            /** Effective Expect */
+            effective_expect: string;
+            /** Effective Path */
+            effective_path: string;
+            /** Effective Timeout */
+            effective_timeout: number;
+            /** Expect */
+            expect?: string | null;
+            /** Path */
+            path?: string | null;
+            /** Timeout */
+            timeout?: number | null;
         };
         /**
          * InspectSourceRequest
@@ -7730,6 +8094,23 @@ export interface components {
             force: boolean;
         };
         /**
+         * RetentionResponse
+         * @description The retention an application has now.
+         *
+         *     Attributes:
+         *         domain: The application's domain.
+         *         keep_releases: Releases it keeps.
+         *         pruned: Ids of the releases removed to honour it, oldest first.
+         */
+        RetentionResponse: {
+            /** Domain */
+            domain: string;
+            /** Keep Releases */
+            keep_releases: number;
+            /** Pruned */
+            pruned: string[];
+        };
+        /**
          * RevokedResponse
          * @description Confirmation that one record - a session or an API token - was revoked.
          */
@@ -7780,6 +8161,97 @@ export interface components {
              * @description Domain of the application
              */
             domain: string;
+        };
+        /**
+         * SMTPConfig
+         * @description SMTP settings for the monitor's email notifications and test message.
+         *
+         *     ``password`` is write-only: it is never sent back by ``GET /config/smtp``
+         *     (see :class:`SMTPSettingsResponse`), so unlike a secret round-tripped
+         *     through the generic ``PUT``/``PATCH /api/config`` there is no
+         *     :data:`~wasm.core.config.REDACTED` placeholder for the console to echo
+         *     back untouched. Instead an empty ``password`` keeps whatever is already
+         *     stored, the same as leaving a webhook URL field blank leaves its channel
+         *     alone - only a non-empty value replaces it. There is no way to explicitly
+         *     blank the password through this endpoint; ``wasm config set
+         *     monitor.smtp.password ''`` still does that directly.
+         */
+        SMTPConfig: {
+            /**
+             * From Address
+             * @description Envelope sender address; falls back to the username when empty
+             * @default
+             */
+            from_address: string;
+            /**
+             * Host
+             * @description SMTP server hostname; empty means not configured
+             * @default
+             */
+            host: string;
+            /**
+             * Password
+             * @description Password for that account; leave blank to keep the one already stored
+             * @default
+             */
+            password: string;
+            /**
+             * Port
+             * @description SMTP server port
+             * @default 465
+             */
+            port: number;
+            /**
+             * Recipients
+             * @description Addresses the monitor's reports and test message are sent to
+             */
+            recipients?: string[];
+            /**
+             * Use Ssl
+             * @description Connect with implicit TLS (SMTPS), usually port 465
+             * @default true
+             */
+            use_ssl: boolean;
+            /**
+             * Use Tls
+             * @description Connect in the clear and upgrade with STARTTLS, usually port 587
+             * @default false
+             */
+            use_tls: boolean;
+            /**
+             * Username
+             * @description Account to authenticate with; empty for an anonymous relay
+             * @default
+             */
+            username: string;
+        };
+        /**
+         * SMTPSettingsResponse
+         * @description The configured SMTP settings.
+         *
+         *     ``password`` is not a field here at all, redacted or otherwise: unlike
+         *     ``GET /api/config``'s untyped dump, this endpoint never sends the password
+         *     out, so there is nothing to redact and no ``***`` for a form to treat as
+         *     "leave alone". ``password_set`` is what a console form uses instead, to
+         *     show "a password is configured" without ever holding the value.
+         */
+        SMTPSettingsResponse: {
+            /** From Address */
+            from_address: string;
+            /** Host */
+            host: string;
+            /** Password Set */
+            password_set: boolean;
+            /** Port */
+            port: number;
+            /** Recipients */
+            recipients: string[];
+            /** Use Ssl */
+            use_ssl: boolean;
+            /** Use Tls */
+            use_tls: boolean;
+            /** Username */
+            username: string;
         };
         /**
          * SSLConfig
@@ -8180,6 +8652,10 @@ export interface components {
          *             none was requested.
          *         commit: Short commit hash of the checkout, empty when the source is
          *             not a Git repository.
+         *         compatible: Whether this server can deploy it as ``app_type`` as it
+         *             is: false when a program the type needs is missing.
+         *         verdict: What WASM found, in a sentence.
+         *         suggestion: What to do before deploying, when there is something.
          */
         SourceInspectionResponse: {
             /** App Type */
@@ -8190,6 +8666,11 @@ export interface components {
             build_command: string[];
             /** Commit */
             commit: string;
+            /**
+             * Compatible
+             * @description Whether this server can deploy it as app_type as it is
+             */
+            compatible?: boolean | null;
             /** Default Port */
             default_port: number;
             /** Detected Types */
@@ -8202,6 +8683,16 @@ export interface components {
             package_manager: string | null;
             /** Start Command */
             start_command: string;
+            /**
+             * Suggestion
+             * @description What to do before deploying, when there is something
+             */
+            suggestion?: string | null;
+            /**
+             * Verdict
+             * @description What WASM found, in a sentence
+             */
+            verdict?: string | null;
         };
         /**
          * SuccessResponse
@@ -8248,6 +8739,61 @@ export interface components {
             os: string;
             /** Uptime */
             uptime: string;
+        };
+        /**
+         * TelegramChatOut
+         * @description One chat the configured Telegram bot has seen, as the panel shows it.
+         */
+        TelegramChatOut: {
+            /** Id */
+            id: number;
+            /** Title */
+            title?: string | null;
+            /** Type */
+            type: string;
+            /** Username */
+            username?: string | null;
+        };
+        /**
+         * TelegramChatsResult
+         * @description Every chat :meth:`~wasm.core.notifier.Notifier.list_telegram_chats` found.
+         */
+        TelegramChatsResult: {
+            /** Chats */
+            chats: components["schemas"]["TelegramChatOut"][];
+        };
+        /**
+         * TelegramConfig
+         * @description Telegram bot settings for notifications.
+         *
+         *     ``bot_token`` is write-only, the same rule :class:`SMTPConfig` follows for
+         *     a password: it is never sent back by ``GET .../telegram`` (see
+         *     :class:`TelegramSettingsResponse`), and an empty value on a write keeps
+         *     whatever is already stored rather than clearing it.
+         */
+        TelegramConfig: {
+            /**
+             * Bot Token
+             * @description Bot API token; leave blank to keep the one already stored
+             * @default
+             */
+            bot_token: string;
+            /**
+             * Chat Id
+             * @description Destination chat: an integer id, or an @channel username
+             * @default
+             */
+            chat_id: string;
+        };
+        /**
+         * TelegramSettingsResponse
+         * @description The configured Telegram channel. ``bot_token`` is never sent back.
+         */
+        TelegramSettingsResponse: {
+            /** Bot Token Set */
+            bot_token_set: boolean;
+            /** Chat Id */
+            chat_id: string;
         };
         /**
          * TestSiteConfigRequest
@@ -8345,6 +8891,30 @@ export interface components {
             };
         };
         /**
+         * UpdateHealthRequest
+         * @description What the health gate must ask of an application.
+         *
+         *     The three are set together, like the limits: a field left out or null
+         *     goes back to its default.
+         */
+        UpdateHealthRequest: {
+            /**
+             * Expect
+             * @description Statuses that mean up, 100 to 599: 200-399, or 200,204. Null: any status below 500
+             */
+            expect?: string | null;
+            /**
+             * Path
+             * @description Path to probe on 127.0.0.1, such as /healthz. Null: /
+             */
+            path?: string | null;
+            /**
+             * Timeout
+             * @description Seconds it gets to answer, 5 to 600. Null: 30
+             */
+            timeout?: number | null;
+        };
+        /**
          * UpdateInfo
          * @description Installed version and, when known, the released one.
          */
@@ -8404,6 +8974,23 @@ export interface components {
              * @description Domain of the application to update
              */
             domain: string;
+            /**
+             * Force
+             * @description Rebuild even when the branch has no commit the live build lacks
+             * @default false
+             */
+            force: boolean;
+        };
+        /**
+         * UpdateRetentionRequest
+         * @description How many releases an application keeps.
+         */
+        UpdateRetentionRequest: {
+            /**
+             * Keep
+             * @description Releases to keep, 1 to 50. The active one and the rollback target are always kept
+             */
+            keep: number;
         };
         /**
          * UpdateServiceConfigRequest
@@ -9010,6 +9597,70 @@ export interface operations {
             };
         };
     };
+    rebuild_deployment_api_apps__domain__deployments__deployment_id__rebuild_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                domain: string;
+                deployment_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobAcceptedResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    rollback_deployment_api_apps__domain__deployments__deployment_id__rollback_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                domain: string;
+                deployment_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobAcceptedResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     diagnose_app_api_apps__domain__diagnose_get: {
         parameters: {
             query?: never;
@@ -9239,6 +9890,41 @@ export interface operations {
             };
         };
     };
+    update_app_health_api_apps__domain__health_patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateHealthRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HealthCheckResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     update_app_limits_api_apps__domain__limits_patch: {
         parameters: {
             query?: never;
@@ -9393,6 +10079,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ReleasesResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_release_retention_api_apps__domain__releases_retention_patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateRetentionRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RetentionResponse"];
                 };
             };
             /** @description Validation Error */
@@ -10869,6 +11590,79 @@ export interface operations {
             };
         };
     };
+    get_telegram_config_api_config_notifications_telegram_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TelegramSettingsResponse"];
+                };
+            };
+        };
+    };
+    update_telegram_config_api_config_notifications_telegram_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TelegramConfig"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MessageResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_telegram_chats_api_config_notifications_telegram_chats_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TelegramChatsResult"];
+                };
+            };
+        };
+    };
     test_notification_channel_api_config_notifications__channel__test_post: {
         parameters: {
             query?: never;
@@ -10916,6 +11710,59 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ConfigReloadResponse"];
+                };
+            };
+        };
+    };
+    get_smtp_config_api_config_smtp_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SMTPSettingsResponse"];
+                };
+            };
+        };
+    };
+    update_smtp_config_api_config_smtp_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SMTPConfig"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MessageResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

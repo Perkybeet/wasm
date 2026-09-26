@@ -200,31 +200,55 @@ function CheckRow({ check, domain }: { check: Check; domain: string }) {
   );
 }
 
+/** The probes a diagnosis runs; the checks list's placeholder holds as many rows. */
+const PROBES = 10;
+
+/**
+ * The loaded view's shape: the verdict card with its pill row, the cause (a line of the large
+ * title, often two) and the tally; then the Checks section with a row per probe. The terminal
+ * hint below starts where it will stay, well below the fold.
+ */
 function DiagnosisSkeleton() {
   return (
     <div className="flex flex-col gap-8">
       <div className="flex overflow-hidden rounded-card border border-border bg-surface shadow-raised">
         <span aria-hidden="true" className="w-1 shrink-0 bg-border" />
         <div className="flex flex-1 flex-col gap-4 px-5 py-4 sm:px-6 sm:py-5">
-          <div className="flex items-center gap-2.5 text-13 text-fg-muted">
+          <div className="flex min-h-8 items-center gap-2.5 text-13 text-fg-muted">
             <Spinner size={14} className="text-warn" />
             <span>Running the checks. Probing the unit, the port, HTTP, the logs and the certificate takes a few seconds.</span>
           </div>
-          <div aria-hidden="true" className="flex flex-col gap-2">
-            <Skeleton className="h-3 w-24" />
-            <Skeleton className="h-6 w-full max-w-md" />
+          <div aria-hidden="true" className="flex max-w-[72ch] flex-col gap-1">
+            <div className="flex h-4 items-center">
+              <Skeleton className="h-3 w-24" />
+            </div>
+            <div className="flex h-14 flex-col justify-center gap-2 sm:h-16">
+              <Skeleton className="h-5 w-full sm:h-6" />
+              <Skeleton className="h-5 w-2/3 sm:h-6" />
+            </div>
           </div>
-          <Skeleton className="h-3 w-64" />
+          <div aria-hidden="true" className="flex h-5 items-center">
+            <Skeleton className="h-3 w-64" />
+          </div>
         </div>
       </div>
-      <div aria-hidden="true" className="flex flex-col divide-y divide-border rounded-card border border-border bg-surface shadow-raised">
-        {Array.from({ length: 6 }, (_, i) => (
-          <div key={i} className="flex items-center gap-4 px-4 py-3.5">
-            <Skeleton className="h-3 w-16" />
-            <Skeleton className="h-3 w-28" />
-            <Skeleton className={cx("h-3", i % 2 === 0 ? "w-72" : "w-52")} />
-          </div>
-        ))}
+      {/* The Checks section's header as it will be drawn, not a second region of that name. */}
+      <div aria-hidden="true" className="flex min-w-0 flex-col gap-4">
+        <div>
+          <p className="title text-16 text-fg">Checks</p>
+          <p className="mt-0.5 max-w-[68ch] text-13 text-pretty text-fg-muted">
+            Every probe, in the order it ran, with its output as the system printed it.
+          </p>
+        </div>
+        <div className="flex flex-col divide-y divide-border rounded-card border border-border bg-surface shadow-raised">
+          {Array.from({ length: PROBES }, (_, i) => (
+            <div key={i} className="flex h-11 items-center gap-3 px-4">
+              <Skeleton className="h-3 w-16 sm:w-24" />
+              <Skeleton className="h-3 w-28 sm:w-44" />
+              <Skeleton className={cx("h-3", i % 2 === 0 ? "w-72" : "w-52")} />
+            </div>
+          ))}
+        </div>
       </div>
     </div>
   );

@@ -1,0 +1,69 @@
+/*
+ * Fallback faces tuned to the real fonts' metrics, so the text drawn before Mona Sans and
+ * JetBrains Mono arrive (font-display: swap) takes the same room they will: the swap changes
+ * the glyphs, not the lines, and nothing below them moves.
+ *
+ * Each face points at locally installed fonts with the same metrics (Arial, Liberation Sans and
+ * Arimo are metric-compatible; so are DejaVu Sans Mono and Menlo), and scales them:
+ *
+ *   size-adjust     = average advance of the real font / the fallback's, over a sample of the
+ *                     console's own English copy and digits
+ *   ascent-override = the real font's ascender / its units per em / size-adjust (descent alike)
+ *   line-gap        = 0, as in both real fonts
+ *
+ * Numbers measured with fontTools from the woff2 files @fontsource-variable ships (Mona Sans at
+ * wght 400, wdth 100: advance 0.4553 em, ascender 1090 and descender 320 of 1000, USE_TYPO_METRICS
+ * set with typo = hhea; JetBrains Mono: advance 0.6 em, 1020 and 300 of 1000) and from Arial
+ * (0.4390 em), DejaVu Sans (0.5008 em), Consolas (0.5498 em), DejaVu Sans Mono (0.6021 em) and
+ * Courier New / Liberation Mono (0.6001 em). Re-measure when a font package is updated.
+ */
+
+@font-face {
+  font-family: "Mona Sans Fallback";
+  src: local("Arial"), local("ArialMT"), local("Liberation Sans"), local("Arimo");
+  font-weight: 100 900;
+  size-adjust: 103.71%;
+  ascent-override: 105.1%;
+  descent-override: 30.85%;
+  line-gap-override: 0%;
+}
+
+@font-face {
+  font-family: "Mona Sans Fallback DejaVu";
+  src: local("DejaVu Sans"), local("DejaVuSans");
+  font-weight: 100 900;
+  size-adjust: 90.93%;
+  ascent-override: 119.87%;
+  descent-override: 35.19%;
+  line-gap-override: 0%;
+}
+
+@font-face {
+  font-family: "JetBrains Mono Fallback";
+  src: local("DejaVu Sans Mono"), local("DejaVuSansMono"), local("Menlo"), local("Menlo-Regular");
+  font-weight: 100 900;
+  size-adjust: 99.66%;
+  ascent-override: 102.35%;
+  descent-override: 30.1%;
+  line-gap-override: 0%;
+}
+
+@font-face {
+  font-family: "JetBrains Mono Fallback Consolas";
+  src: local("Consolas");
+  font-weight: 100 900;
+  size-adjust: 109.13%;
+  ascent-override: 93.47%;
+  descent-override: 27.49%;
+  line-gap-override: 0%;
+}
+
+@font-face {
+  font-family: "JetBrains Mono Fallback Liberation";
+  src: local("Liberation Mono"), local("LiberationMono"), local("Courier New"), local("CourierNewPSMT");
+  font-weight: 100 900;
+  size-adjust: 99.98%;
+  ascent-override: 102.02%;
+  descent-override: 30%;
+  line-gap-override: 0%;
+}

@@ -76,7 +76,7 @@ from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from jinja2 import Environment, PackageLoader, TemplateNotFound
 from jinja2 import TemplateError as JinjaTemplateError
@@ -548,6 +548,24 @@ class ServiceManager(BaseManager):
         candidate = validate_service_name(str(name).removesuffix(".service"))
         return candidate.removeprefix(self.LEGACY_PREFIX) or candidate
 
+    #: Units WASM runs for itself, not for an application.
+    OWN_UNITS: ClassVar[frozenset[str]] = frozenset({"wasm-web", "wasm-monitor"})
+    #: Prefixes of the units WASM writes for scheduled work.
+    OWN_UNIT_PREFIXES: ClassVar[tuple[str, ...]] = ("wasm-cron-", "wasm-backup-")
+
+    @classmethod
+    def _is_own_unit_name(cls, name: str) -> bool:
+        """
+        Report whether a unit name is one of WASM's own, never an application's.
+
+        Args:
+            name: Unit name without the ``.service`` suffix.
+
+        Returns:
+            True for the console, the monitor and the scheduled-work units.
+        """
+        return name in cls.OWN_UNITS or name.startswith(cls.OWN_UNIT_PREFIXES)
+
     def _resolve_service_name(self, name: str) -> str:
         """
         Resolve actual service name, checking both new and legacy formats.
@@ -570,6 +588,10 @@ class ServiceManager(BaseManager):
             # A caller that spells the prefix means that unit. Only fall back to
             # the unprefixed form when it is the one actually installed,
             # otherwise the prefix - a WASM ownership signal - is thrown away.
+            # WASM's own units are never an application's: "wasm-web" falling
+            # back to an app named "web" would stop that app instead of the console.
+            if self._is_own_unit_name(given):
+                return given
             stripped = given.removeprefix(self.LEGACY_PREFIX) or given
             if (self.SYSTEMD_DIR / f"{given}.service").exists():
                 return given
@@ -1659,6 +1681,59 @@ class ServiceManager(BaseManager):
 
         self._write_unit_atomically(self._get_service_file(unit), content)
         self.daemon_reload()
+
+    def install_unit(self, name: str, template: str, context: Mapping[str, Any]) -> Path:
+        """
+        Write one of WASM's own units under exactly the name given.
+
+        :meth:`create_service` names an application's unit and drops the legacy
+        ``wasm-`` prefix, and refuses a unit that already exists. WASM's own
+        units (the console's ``wasm-web``) keep the prefix, because it is what
+        marks them as WASM's, and are rewritten in place when their options
+        change. The ownership rule is the same one every other operation
+        applies: systemd must load the unit from the managed directory, it must
+        not eclipse a unit the system ships, and a file already there must be
+        WASM's.
+
+        Args:
+            name: Unit name, with or without the ``.service`` suffix. Kept as
+                given, prefix included.
+            template: Template name without the ``.service.j2`` suffix.
+            context: Variables handed to the template. Values interpolated into
+                a directive are the caller's to validate.
+
+        Returns:
+            The unit file that was written.
+
+        Raises:
+            ServiceError: When the unit is not WASM's to write, the rendered
+                body lacks the marker, or the file cannot be written.
+            TemplateError: If the template is missing or invalid.
+            ValidationError: When the name is not a safe unit name.
+        """
+        unit = validate_service_name(str(name).removesuffix(".service"))
+        path = self.SYSTEMD_DIR / f"{unit}.service"
+        content = self._render_unit(template, context)
+        self._check_unit_body(unit, content)
+
+        reason = self._refusal(
+            unit,
+            path,
+            fragment=self._fragment_path(f"{unit}.service"),
+            shadowed=self._shadowing_file(unit),
+            # A new file carries the marker checked above; an existing one has
+            # to show it is WASM's before it is replaced.
+            signal=lambda: not path.exists() or self._carries_wasm_signal(unit, path),
+        )
+        if reason:
+            raise ServiceError(
+                f"Refusing to write a unit WASM does not manage: {unit}",
+                details=f"{reason}. Remove or rename that unit first.",
+            )
+
+        self._write_unit_atomically(path, content)
+        self.daemon_reload()
+        return path
 
     def _check_unit_body(self, unit: str, content: str) -> None:
         """

@@ -11,26 +11,69 @@ can do.
 ## Starting it
 
 ```bash
-wasm web start            # foreground, 127.0.0.1:8080; prints the access token
-wasm web start -d         # background; prints no token
+wasm web start            # foreground, 127.0.0.1:8080; prints the access token; Ctrl+C stops it
+wasm web start -d         # background until 'wasm web stop' or the next reboot; prints the token
+wasm web enable           # a systemd service: survives reboots; prints the token
 wasm web token --new      # issue a token to sign in with
-wasm web status
+wasm web status           # running or not, and whether as the service or in the background
 wasm web stop
 ```
 
-Every start issues a new access token and prints it once, in the same banner whether it runs
-in the foreground or, with `-d`, in the background: the parent process prints it before
-handing the server over to the child, so it is never silently issued unseen. `wasm web
-token` without options only reports whether a token is issued: the token itself is stored as
-a salted hash and cannot be shown again. A running console reads the token from disk on
-every request, so issuing a new one with `wasm web token --new` retires the old one at once,
-with no restart needed; see [security.md](security.md#authentication) for more, including
-what `--regenerate` invalidates beyond the token itself.
+Every start issues a new access token and prints it once, in the same banner whichever way
+the console runs: in the foreground, in the background with `-d` (the parent process prints
+it before handing the server over to the child), or as a service with `wasm web enable`. It
+is never silently issued unseen, and systemd starting the service again (at boot, after a
+failure, after an upgrade) issues none: it keeps serving the token `wasm web enable`
+printed. `wasm web token` without options only reports whether a token is issued: the token
+itself is stored as a salted hash and cannot be shown again. A running console reads the
+token from disk on every request, so issuing a new one with `wasm web token --new` retires
+the old one at once, with no restart needed; see [security.md](security.md#authentication)
+for more, including what `--regenerate` invalidates beyond the token itself.
 
-`wasm web start -d` runs the console as a background process, with its log in
-`/var/log/wasm/web.log` and its PID in `/var/run/wasm-web.pid`. It is not a systemd unit and
-does not start again after a reboot. `wasm web restart` takes the same options as `start`
-and does not remember the ones used before: pass them again.
+A foreground console runs until you press Ctrl+C or close the SSH session it was started
+from; its banner says so, and prints the `wasm web enable` line that would keep it running
+with the same options. `wasm web start -d` runs it as a background process, with its log in
+`/var/log/wasm/web.log` and its PID in `/var/run/wasm-web.pid`: it does not start again
+after a reboot. `wasm web restart` takes the same options as `start` and does not remember
+the ones used before: pass them again.
+
+### Keep it running
+
+`wasm web enable` runs the console as a systemd service, `wasm-web.service`: started now,
+started again at every boot, and restarted if it fails.
+
+```bash
+wasm web enable                                   # 127.0.0.1:8080, reached over SSH
+wasm web enable --host 0.0.0.0 --self-signed      # any option 'wasm web start' takes
+wasm web status                                   # Runs as: wasm-web.service (starts at boot)
+journalctl -u wasm-web                            # its log
+wasm web disable                                  # stop it, disable it and remove the unit
+```
+
+- It takes the options `wasm web start` takes, checked by the same rules: binding beyond
+  loopback without TLS is refused here too, before anything is written. There is no `-d`:
+  systemd keeps it running.
+- It writes `/etc/systemd/system/wasm-web.service`, whose `ExecStart` is this machine's
+  `wasm` binary running the console in the foreground with those options, then enables and
+  starts it, waits until it listens, and only then prints the access token and how to reach
+  it. If it does not come up, the journal is shown instead, and no token is issued.
+- The token is printed on your terminal by `wasm web enable`, never by the service: the
+  service's output is the journal, which more accounts can read than root. The unit file
+  holds no credential either. A lost token is replaced with `wasm web token --new`, which
+  the running service accepts at once.
+- To change the options, run `wasm web enable` again with the new ones: the unit is
+  rewritten and the service restarted. `wasm web disable` removes it; the token and the
+  console's state under `/etc/wasm` stay.
+- While the service runs, `wasm web start` and `wasm web restart` refuse to start a second
+  console and name the service, and `wasm web stop` points at `wasm web disable` (or
+  `systemctl stop wasm-web`, which stops it until the next boot).
+- A console already running with `-d` has to be stopped first (`wasm web stop`), so the
+  service can take its port.
+- The service runs as root with systemd's own `PATH`, like every other unit. The unit's
+  hardening leaves everything the console does as root intact (installing packages, writing
+  `/etc`, deploying into `/var/www`); the template explains each directive.
+- Upgrading the package restarts a running `wasm-web.service` onto the new version;
+  removing the package stops and disables it.
 
 If the console's Python packages are missing, `wasm web start` says which and offers to
 install them; `wasm web install --apt` or `--pip` installs them directly.
@@ -40,7 +83,8 @@ install them; `wasm web install --apt` or `--pip` installs them directly.
 The console acts as root, so it listens on loopback unless you give it TLS.
 
 **Over SSH (the default and the safest).** Leave it on `127.0.0.1` and forward the port from
-your own machine:
+your own machine. `127.0.0.1` answers on the server itself and nowhere else, so opening the
+server's address in a browser will not reach it; the banner prints the exact line to run:
 
 ```bash
 ssh -L 8080:127.0.0.1:8080 root@server.example.com
@@ -50,17 +94,20 @@ ssh -L 8080:127.0.0.1:8080 root@server.example.com
 **With TLS served by WASM.** Binding to anything but loopback requires a certificate:
 
 ```bash
-wasm web start -d --host 0.0.0.0 --tls-cert /etc/letsencrypt/live/panel.example.com/fullchain.pem \
-                                 --tls-key /etc/letsencrypt/live/panel.example.com/privkey.pem
-wasm web start -d --host 0.0.0.0 --self-signed    # minted under /etc/wasm/panel-tls, reused while valid
+wasm web enable --host 0.0.0.0 --tls-cert /etc/letsencrypt/live/panel.example.com/fullchain.pem \
+                               --tls-key /etc/letsencrypt/live/panel.example.com/privkey.pem
+wasm web enable --host 0.0.0.0 --self-signed    # minted under /etc/wasm/panel-tls, reused while valid
 ```
 
 **Behind a reverse proxy that terminates TLS.** Keep the console on loopback and declare the
 proxy, so the session cookie is marked `Secure` and client addresses are the real ones:
 
 ```bash
-wasm web start -d --trusted-proxy 127.0.0.1
+wasm web enable --trusted-proxy 127.0.0.1
 ```
+
+Every example here works with `wasm web start` as well, for a console that should not
+outlive the session.
 
 `--allow-ip ADDR/CIDR` (repeatable) restricts who may connect at all. `--insecure-http` serves
 cleartext beyond loopback; the token and the session cookie then cross the network

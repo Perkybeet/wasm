@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { Boxes, Plus } from "lucide-react";
-import { useMemo } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { appsQuery } from "../../api/queries/apps";
 import type { MetricWindow } from "../../api/queries/metrics";
@@ -15,7 +15,7 @@ import { AppsTable } from "../apps/AppsTable";
 import { latestDeployByDomain, recentDeploysQuery, useLatestMetrics } from "../apps/data";
 import { useStateTransitions } from "../apps/useStateTransitions";
 import { MachineCharts } from "./MachineCharts";
-import { NeedsAttention } from "./NeedsAttention";
+import { NeedsAttention, rememberedAttentionHeight } from "./NeedsAttention";
 import { RecentDeployments } from "./RecentDeployments";
 
 function NewAppLink() {
@@ -82,7 +82,34 @@ export interface OverviewPageProps {
  * The first page: what needs attention on this machine, then its recent history, every
  * application with its state, and the latest deploys.
  */
+/** The longest the sections under Needs attention wait for it before showing regardless. */
+const HOLD_BELOW_MS = 1_500;
+
+/**
+ * Whether the sections under Needs attention may show yet. Its height is only known once every
+ * source has answered; until then, with no height remembered from an earlier visit to reserve,
+ * what is below it is laid out but not shown (`visibility: hidden`), so it never jumps down
+ * under the operator's pointer as the block fills. Never held for longer than a moment.
+ */
+function useHoldBelowAttention(): { ready: boolean; settled: () => void } {
+  const [ready, setReady] = useState(() => rememberedAttentionHeight() !== null);
+  useEffect(() => {
+    if (ready) return;
+    const timer = setTimeout(() => {
+      setReady(true);
+    }, HOLD_BELOW_MS);
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [ready]);
+  const settled = useCallback(() => {
+    setReady(true);
+  }, []);
+  return { ready, settled };
+}
+
 export function OverviewPage({ window, onWindowChange }: OverviewPageProps) {
+  const below = useHoldBelowAttention();
   return (
     <>
       <PageHeader
@@ -91,10 +118,13 @@ export function OverviewPage({ window, onWindowChange }: OverviewPageProps) {
         actions={<NewAppLink />}
       />
       <Sections>
-        <NeedsAttention />
-        <MachineCharts window={window} onWindowChange={onWindowChange} />
-        <Applications />
-        <RecentDeployments />
+        <NeedsAttention onSettled={below.settled} />
+        {/* display: contents keeps each section a direct item of the stack and its gap. */}
+        <div className={below.ready ? "contents" : "invisible contents"}>
+          <MachineCharts window={window} onWindowChange={onWindowChange} />
+          <Applications />
+          <RecentDeployments />
+        </div>
       </Sections>
     </>
   );

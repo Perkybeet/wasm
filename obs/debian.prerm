@@ -13,8 +13,13 @@ case "$1" in
         systemctl stop wasm-monitor.service >/dev/null 2>&1 || true
         systemctl disable wasm-monitor.service >/dev/null 2>&1 || true
 
-        # The console runs as a daemon (wasm web start -d), not as a unit; stop
-        # it while its binary still exists.
+        # 'wasm web enable' writes and enables wasm-web.service at runtime, in
+        # the same way and for the same reason as the monitor above.
+        systemctl stop wasm-web.service >/dev/null 2>&1 || true
+        systemctl disable wasm-web.service >/dev/null 2>&1 || true
+
+        # Without 'wasm web enable' the console runs as a daemon (wasm web
+        # start -d), not as a unit; stop it while its binary still exists.
         if [ -x /usr/bin/wasm ]; then
             /usr/bin/wasm web stop >/dev/null 2>&1 || true
         fi

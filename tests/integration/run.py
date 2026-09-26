@@ -1385,6 +1385,130 @@ def scenario_domains(sc: Scenario) -> None:
 # scenarios they always have.
 
 
+#: The stack the Compose health gate scenario deploys, served by git daemon.
+COMPOSE_GATE_REPO = "/root/fixtures/compose-gate"
+COMPOSE_GATE_URL = "git://127.0.0.1/compose-gate"
+COMPOSE_GATE_DOMAIN = "compose-gate.test"
+COMPOSE_GATE_ROOT = "/var/www/apps/compose-gate-test"
+COMPOSE_GATE_PROJECT = "compose-gate-test"
+
+
+def compose_gate_web(sc: Scenario, script: str, label: str) -> subprocess.CompletedProcess[str]:
+    """Run a shell command inside the stack's web container."""
+    container = (
+        "$(docker ps -q "
+        f"-f label=com.docker.compose.project={COMPOSE_GATE_PROJECT} "
+        "-f label=com.docker.compose.service=web)"
+    )
+    return sc.run(f"docker exec {container} sh -c '{script}'", timeout=30, label=label)
+
+
+@scenario("compose_update_rolls_back")
+def scenario_compose_rollback(sc: Scenario) -> None:
+    """A stack whose update does not answer goes back to the images and commit that served.
+
+    The web service is built from the repository, so going back needs the
+    image the old container ran, not a rebuild. A file written into a named
+    volume before the update must still be there after the way back.
+    Skipped, with a note, when Docker is not reachable inside the container.
+    """
+    probe = sc.run(
+        "command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 "
+        "&& echo available || echo unavailable",
+        timeout=30,
+        check=False,
+        label="check whether Docker is reachable inside the container",
+    )
+    if probe.stdout.strip() != "available":
+        sc.evidence.append(
+            "NOTE: Docker is not reachable inside the integration container "
+            "(tests/integration/Dockerfile.systemd does not install it), so this scenario "
+            "is SKIPPED. Its behaviour is covered with a fake runner by "
+            "tests/test_inplace_health_gate.py."
+        )
+        return
+
+    sc.run(
+        f"mkdir -p {COMPOSE_GATE_REPO}/html && cd {COMPOSE_GATE_REPO} && "
+        "printf 'FROM nginx:alpine\\nCOPY html /usr/share/nginx/html\\n' > Dockerfile && "
+        "printf 'gate v1' > html/index.html && "
+        'printf \'services:\\n  web:\\n    build: .\\n    ports:\\n      - "18091:80"\\n'
+        "    volumes:\\n      - data:/data\\nvolumes:\\n  data: {}\\n' > docker-compose.yml && "
+        "git init -q && git config user.email wasm-it@example.com && "
+        "git config user.name 'WASM Integration' && git add -A && git commit -q -m 'gate v1'",
+        timeout=30,
+        label="(fixture repo) a stack whose web image is built from the repository",
+    )
+    first = sc.run(
+        f"git -C {COMPOSE_GATE_REPO} rev-parse HEAD", timeout=15, label="the first commit"
+    ).stdout.strip()
+
+    create = (
+        f"wasm create -d {COMPOSE_GATE_DOMAIN} -s {COMPOSE_GATE_URL} -t docker-compose --no-ssl"
+    )
+    sc.run(create, timeout=DEPLOY_TIMEOUT, label=create)
+    page = sc.run(
+        f"curl -sS -H 'Host: {COMPOSE_GATE_DOMAIN}' http://127.0.0.1/",
+        timeout=30,
+        label=f"curl -H 'Host: {COMPOSE_GATE_DOMAIN}' http://127.0.0.1/",
+    )
+    sc.check("gate v1" in page.stdout, f"the stack did not serve v1: {page.stdout!r}")
+    compose_gate_web(sc, "echo kept > /data/marker", "write a marker into the named volume")
+
+    # nginx refuses to start on a broken configuration: the container exits.
+    sc.run(
+        f"cd {COMPOSE_GATE_REPO} && printf 'gate v2' > html/index.html && "
+        "printf 'FROM nginx:alpine\\nCOPY html /usr/share/nginx/html\\n"
+        "RUN echo broken > /etc/nginx/conf.d/broken.conf\\n' > Dockerfile && "
+        "git add -A && git commit -q -m 'gate v2: nginx cannot start'",
+        timeout=30,
+        label="(fixture repo) commit a version whose container cannot start",
+    )
+    update = sc.run(
+        f"wasm update {COMPOSE_GATE_DOMAIN}",
+        timeout=DEPLOY_TIMEOUT,
+        check=False,
+        label=f"wasm update {COMPOSE_GATE_DOMAIN}",
+    )
+    output = update.stdout + update.stderr
+    sc.check(update.returncode != 0, "an update that does not answer must fail")
+    sc.check(
+        "did not pass its health check" in output and "running again" in output,
+        f"the update did not say it went back: {output!r}",
+    )
+
+    page = sc.run(
+        f"curl -sS -H 'Host: {COMPOSE_GATE_DOMAIN}' http://127.0.0.1/",
+        timeout=30,
+        label=f"curl -H 'Host: {COMPOSE_GATE_DOMAIN}' http://127.0.0.1/",
+    )
+    sc.check("gate v1" in page.stdout, f"v1 is not serving again: {page.stdout!r}")
+    marker = compose_gate_web(sc, "cat /data/marker", "read the marker back from the volume")
+    sc.check(marker.stdout.strip() == "kept", f"the named volume lost its data: {marker.stdout!r}")
+    head = sc.run(
+        f"git -C {COMPOSE_GATE_ROOT} rev-parse HEAD", timeout=15, label="the tree's commit"
+    )
+    sc.check(head.stdout.strip() == first, f"the tree is not back on v1: {head.stdout!r}")
+    kept = sc.run(
+        f"docker image ls --format '{{{{.Repository}}}}:{{{{.Tag}}}}' {COMPOSE_GATE_PROJECT}-web",
+        timeout=15,
+        label=f"docker image ls {COMPOSE_GATE_PROJECT}-web",
+    )
+    sc.check(
+        f"{COMPOSE_GATE_PROJECT}-web:wasm-previous" in kept.stdout,
+        f"the image that served was not kept: {kept.stdout!r}",
+    )
+    row = sc.run(
+        store_query(
+            "SELECT status FROM deployments WHERE domain = 'compose-gate.test' "
+            "ORDER BY id DESC LIMIT 1"
+        ),
+        timeout=15,
+        label="SELECT the update's history row",
+    )
+    sc.check(row.stdout.strip() == "failed", f"the update's row: {row.stdout!r}")
+
+
 @dataclass
 class UpgradeApp:
     """One application the upgrade rehearsal deploys with 1.6.5 and re-checks after 2.0."""

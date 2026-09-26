@@ -26,7 +26,7 @@ import { splitErrors } from "./formErrors";
 import { CHANNELS, EVENTS, REDACTED, channelValue, isChannelConfigured, parseHostList, readNotificationSettings } from "./notifications";
 import type { ChannelField, ChannelSpec, NotificationSettings as Settings } from "./notifications";
 import { configSetCommand } from "./shell";
-import { SettingsFormCard, SettingsSection } from "./SettingsForm";
+import { SettingsFormCard, SettingsFormSkeleton, SettingsSection } from "./SettingsForm";
 import { useSettingsForm } from "./useSettingsForm";
 
 function useRefreshConfig() {
@@ -60,7 +60,7 @@ function DeliverySection({ query }: { query: ConfigQuery }) {
       description="The one switch for every channel. Test messages are sent whether it is on or off, so a channel can be tried first."
       commands={[configSetCommand("notifications.enabled", !checked)]}
     >
-      <WithSettings query={query} rows={2}>
+      <WithSettings query={query} skeleton={<DeliverySkeleton />}>
         {() => (
           <div className={cx(SURFACE, "px-5 py-4")}>
             <Switch
@@ -433,7 +433,7 @@ function ChannelsSection({ query }: { query: ConfigQuery }) {
       title="Where alerts go"
       description="Every channel with a destination receives the events turned on below. Webhook URLs and the bot token are write-only: once saved they are never shown again, and a field left empty keeps what is stored. Send a test to find out what a channel does."
     >
-      <WithSettings query={query} rows={6}>
+      <WithSettings query={query} skeleton={<ChannelsSkeleton />}>
         {(settings) => (
           <div className={cx(SURFACE, "flex min-w-0 flex-col divide-y divide-border")}>
             {CHANNELS.map((spec) =>
@@ -477,7 +477,7 @@ function EventsSection({ query }: { query: ConfigQuery }) {
           : ["wasm config get notifications.events"]
       }
     >
-      <WithSettings query={query} rows={6}>
+      <WithSettings query={query} skeleton={<EventsSkeleton />}>
         {() => (
           <SettingsFormCard
             dirty={form.dirty}
@@ -534,7 +534,7 @@ function PrivateHostsSection({ query }: { query: ConfigQuery }) {
       // `wasm config set` stores a list as one string, so reading is the only honest command.
       commands={["wasm config get notifications.allow_private_hosts"]}
     >
-      <WithSettings query={query} rows={2}>
+      <WithSettings query={query} skeleton={<SettingsFormSkeleton fields={[{ rows: 3, description: 1 }]} />}>
         {() => (
           <SettingsFormCard
             dirty={form.dirty}
@@ -570,21 +570,103 @@ function PrivateHostsSection({ query }: { query: ConfigQuery }) {
 type ConfigQuery = ReturnType<typeof useQuery<ConsoleConfig>>;
 
 /** A section's content once the configuration is read; its skeleton or the failure until then. */
-function WithSettings({ query, rows, children }: { query: ConfigQuery; rows: number; children: (settings: Settings) => ReactNode }) {
+function WithSettings({
+  query,
+  skeleton,
+  children,
+}: {
+  query: ConfigQuery;
+  /** The loaded content's shape, so the sections below stay where they are when it arrives. */
+  skeleton: ReactNode;
+  children: (settings: Settings) => ReactNode;
+}) {
   return (
-    <QueryState
-      query={query}
-      label="the notification settings"
-      skeleton={
-        <div className={cx(SURFACE, "flex flex-col gap-3 p-5")}>
-          {Array.from({ length: rows }, (_, index) => (
-            <Skeleton key={index} className="h-4 w-full max-w-sm" />
-          ))}
-        </div>
-      }
-    >
+    <QueryState query={query} label="the notification settings" skeleton={skeleton}>
       {(data) => children(readNotificationSettings(data.config))}
     </QueryState>
+  );
+}
+
+/** The switch's card: its label and the line under it. */
+function DeliverySkeleton() {
+  return (
+    <div aria-hidden="true" className={cx(SURFACE, "flex flex-col px-5 py-4")}>
+      <div className="flex h-5 items-center justify-between gap-4">
+        <Skeleton className="h-3.5 w-32" />
+        <Skeleton className="h-5 w-8 rounded-pill" />
+      </div>
+      <div className="flex h-5 items-center">
+        <Skeleton className="h-3 w-40" />
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The channels as they will be drawn: their names, descriptions and field labels are fixed, so
+ * they are set as the loaded view sets them (and wrap the same way); only what the configuration
+ * holds - whether a channel is set up, its fields' values - is a placeholder.
+ */
+function ChannelsSkeleton() {
+  return (
+    <div aria-hidden="true" className={cx(SURFACE, "flex min-w-0 flex-col divide-y divide-border")}>
+      {CHANNELS.map((spec) => (
+        <div key={spec.id} className="flex min-w-0 flex-col gap-3 px-5 py-4">
+          <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
+            <div className="min-w-0 flex-1 basis-60">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-14 font-semibold text-fg">{spec.label}</span>
+                <Skeleton className="h-3 w-24" />
+              </div>
+              <p className="max-w-[60ch] text-13 text-fg-muted">{spec.description}</p>
+            </div>
+            {/* As wide as a test button with its reason beside it. */}
+            <Skeleton className="h-7 w-64 max-w-full" />
+          </div>
+          {spec.fields.length > 0 ? (
+            <div className={cx("grid min-w-0 gap-3", spec.fields.length > 1 && "sm:grid-cols-2")}>
+              {spec.fields.map((field) => (
+                <div key={field.key} className="flex min-w-0 flex-col gap-1.5">
+                  <span className="text-13 font-medium text-fg">{field.label}</span>
+                  <Skeleton className="h-8 w-full" />
+                  {field.description !== undefined ? <span className="text-12 text-fg-muted">{field.description}</span> : null}
+                </div>
+              ))}
+            </div>
+          ) : (
+            // Email: the switch, then the SMTP account's three lines.
+            <div className="flex flex-col gap-3">
+              <div className="flex h-5 items-center">
+                <Skeleton className="h-3.5 w-48" />
+              </div>
+              <Skeleton className="h-[5.375rem] w-full rounded-control" />
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** The events' card: one checkbox with its description per event, and the form's footer. */
+function EventsSkeleton() {
+  return (
+    <div aria-hidden="true" className={cx(SURFACE, "flex min-w-0 flex-col")}>
+      <div className="flex flex-col gap-3.5 p-5">
+        {EVENTS.map((event) => (
+          <div key={event.kind} className="flex items-start gap-2.5 text-14">
+            <Skeleton className="mt-0.5 size-4 shrink-0" />
+            <div className="flex min-w-0 flex-col">
+              <span className="text-fg">{event.label}</span>
+              <span className="text-13 text-fg-muted">{event.unsent ? `${event.description} Not sent by this version of WASM yet.` : event.description}</span>
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="flex justify-end rounded-b-card border-t border-border bg-bg-sunken px-5 py-3">
+        <Skeleton className="h-8 w-28" />
+      </div>
+    </div>
   );
 }
 

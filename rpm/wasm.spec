@@ -268,11 +268,28 @@ if [ $1 -eq 0 ]; then
     systemctl stop wasm-monitor.service >/dev/null 2>&1 || :
     systemctl disable wasm-monitor.service >/dev/null 2>&1 || :
 
-    # The console runs as a daemon (wasm web start -d), not as a unit; stop it
-    # while its binary still exists.
+    # 'wasm web enable' writes and enables wasm-web.service at runtime, in the
+    # same way and for the same reason as the monitor above.
+    systemctl stop wasm-web.service >/dev/null 2>&1 || :
+    systemctl disable wasm-web.service >/dev/null 2>&1 || :
+
+    # Without 'wasm web enable' the console runs as a daemon (wasm web start
+    # -d), not as a unit; stop it while its binary still exists.
     if [ -x /usr/bin/wasm ]; then
         /usr/bin/wasm web stop >/dev/null 2>&1 || :
     fi
+fi
+
+%posttrans
+# 'wasm web enable' runs the console as wasm-web.service, and %preun leaves it
+# running across an upgrade, still serving the code the upgrade replaced.
+# Restarted here rather than in %post because %posttrans runs once the whole
+# transaction is done, the old version's files removed included. try-restart
+# only restarts a unit that is running: a console the operator stopped stays
+# stopped, and a first install has none running, so in practice this acts on
+# upgrades only. The unit itself names /usr/bin/wasm and is not rewritten.
+if [ -f /etc/systemd/system/wasm-web.service ]; then
+    systemctl try-restart wasm-web.service >/dev/null 2>&1 || :
 fi
 
 %changelog

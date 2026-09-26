@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { ChartLine } from "lucide-react";
 import type { ReactNode } from "react";
@@ -71,15 +71,28 @@ function Frame({ children }: { children: ReactNode }) {
   return <div className="min-w-0 rounded-card border border-border bg-surface p-4 shadow-raised">{children}</div>;
 }
 
+/**
+ * Shaped like the chart that replaces it, block for block: the caption (36px), the readout
+ * (16px), the plot, and the summary sentence under its rule. The page below stays put when
+ * the data lands.
+ */
 function ChartSkeleton({ title }: { title: string }) {
   return (
     <Frame>
-      <div aria-busy="true" className="flex flex-col gap-3">
+      <div aria-busy="true">
         <span className="sr-only">{`Loading the ${title.toLowerCase()} chart`}</span>
         <div aria-hidden="true" className="flex flex-col gap-3">
-          <Skeleton className="h-3.5 w-24" />
-          <Skeleton className="h-3 w-64" />
+          <div className="flex h-9 flex-col justify-center gap-1.5">
+            <Skeleton className="h-3.5 w-24" />
+            <Skeleton className="h-3 w-64 max-w-full" />
+          </div>
+          <div className="flex h-4 items-center">
+            <Skeleton className="h-3 w-32" />
+          </div>
           <Skeleton className="h-45 w-full rounded-control" />
+          <div className="flex h-7 items-end border-t border-border">
+            <Skeleton className="h-3 w-80 max-w-full" />
+          </div>
         </div>
       </div>
     </Frame>
@@ -93,17 +106,22 @@ function MetricChart({
   range,
   markers,
   now,
+  onRangeChange,
 }: {
   spec: ChartSpec;
   app: App;
   range: MetricRange;
   markers: readonly ChartMarker[];
   now: number;
+  onRangeChange: (range: MetricRange) => void;
 }) {
   const detail = rangeSpec(range);
   const series = useQuery({
     ...metricSeriesQuery(spec.metric(app.domain), detail.window),
     refetchInterval: range === "1h" ? 30_000 : 5 * 60_000,
+    // A new range keeps the previous one on screen until it arrives, so an enlarged chart
+    // whose range is changed stays open instead of dropping back to a skeleton.
+    placeholderData: keepPreviousData,
   });
 
   if (series.isError && series.data === undefined) {
@@ -150,6 +168,7 @@ function MetricChart({
           formatValue={spec.format}
           height={CHART_HEIGHT}
           markers={markers}
+          rangeSelector={{ value: range, control: <RangeControl range={range} onRangeChange={onRangeChange} /> }}
         />
         <p className="border-t border-border pt-3 text-12 text-pretty text-fg-muted" data-summary="">
           <span className="sr-only">{`${spec.title}: `}</span>
@@ -199,6 +218,18 @@ export interface MetricsTabProps {
   domain: string;
   range: MetricRange;
   onRangeChange: (range: MetricRange) => void;
+}
+
+/** The one range control, on the section and again in an enlarged chart. */
+function RangeControl({ range, onRangeChange }: Pick<MetricsTabProps, "range" | "onRangeChange">) {
+  return (
+    <SegmentedControl
+      label="Time range"
+      options={RANGES.map((spec) => ({ value: spec.value, label: spec.label }))}
+      value={range}
+      onValueChange={onRangeChange}
+    />
+  );
 }
 
 /**
@@ -274,18 +305,19 @@ export function MetricsTab({ domain, range, onRangeChange }: MetricsTabProps) {
     <Section
       title="CPU and memory"
       description="Read from the app's unit every few seconds while the panel runs; older readings are kept as minute and hour averages."
-      actions={
-        <SegmentedControl
-          label="Time range"
-          options={RANGES.map((spec) => ({ value: spec.value, label: spec.label }))}
-          value={range}
-          onValueChange={onRangeChange}
-        />
-      }
+      actions={<RangeControl range={range} onRangeChange={onRangeChange} />}
     >
       <div className="grid min-w-0 gap-4 xl:grid-cols-2">
         {CHARTS.map((spec) => (
-          <MetricChart key={spec.title} spec={spec} app={app.data} range={range} markers={chartMarkers} now={now} />
+          <MetricChart
+            key={spec.title}
+            spec={spec}
+            app={app.data}
+            range={range}
+            markers={chartMarkers}
+            now={now}
+            onRangeChange={onRangeChange}
+          />
         ))}
       </div>
       <DeployList domain={domain} marks={marks} />

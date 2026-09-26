@@ -65,6 +65,19 @@ case "$1" in
             echo "resource use, service health and notable processes, and acts on"
             echo "nothing. The auto_terminate and use_ai settings are ignored."
         fi
+
+        # 'wasm web enable' runs the console as wasm-web.service. prerm leaves
+        # it running across an upgrade, so it is still serving the code this
+        # upgrade replaced: restart it onto the new one. Only a unit that
+        # exists and is running - a console the operator stopped stays stopped,
+        # and on a first install there is none. The unit itself is not
+        # rewritten: it only names /usr/bin/wasm and the options chosen.
+        if [ -f /etc/systemd/system/wasm-web.service ] && \
+                systemctl is-active --quiet wasm-web.service 2>/dev/null; then
+            echo "Restarting the console (wasm-web.service) on the new version..."
+            systemctl restart wasm-web.service || \
+                echo "wasm-web.service did not restart: journalctl -u wasm-web -n 50" >&2
+        fi
         ;;
     
     abort-upgrade|abort-remove|abort-deconfigure)

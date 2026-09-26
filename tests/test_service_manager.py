@@ -1093,3 +1093,20 @@ def test_managers_have_no_direct_filesystem_calls(relative: str) -> None:
         f"{relative} changes the filesystem without going through wasm.core.fs: "
         + "; ".join(offenders)
     )
+
+
+@pytest.mark.parametrize(
+    "own", ["wasm-web", "wasm-monitor", "wasm-cron-nightly", "wasm-backup-shop"]
+)
+def test_wasm_own_units_never_resolve_to_an_application_of_the_same_name(
+    tmp_path: Path, own: str
+) -> None:
+    """
+    "wasm-web" used to fall back to "web.service" when only that existed, so disabling the
+    console could stop an application named "web".
+    """
+    manager = ServiceManager(verbose=False)
+    manager.SYSTEMD_DIR = tmp_path
+    (tmp_path / f"{own.removeprefix('wasm-')}.service").write_text("[Unit]\n")
+
+    assert manager._resolve_service_name(own) == own

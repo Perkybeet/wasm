@@ -7,6 +7,22 @@ Monorepo deployer for WASM.
 
 Handles deployment of Turborepo/pnpm workspace monorepos with multiple
 applications, shared databases, and unified build processes.
+
+A monorepo cannot build releases, so an update rebuilds it in place and then
+restarts every workspace's unit and probes each one on its own port. When one
+does not answer, the tree goes back to the commit it was on before the update
+and is rebuilt from it, and the units are restarted and probed again.
+
+Why a checkout and a rebuild, and not the pre-update backup: a backup leaves
+out ``node_modules``, ``.git`` and the build output (``dist``, ``build``,
+``.next/cache``), so restoring one needs the same install and build anyway;
+it replaces the whole tree, so whatever the application wrote into it since
+the backup would be lost; and it may not exist, because an update goes on
+without one when it cannot be taken. A checkout rewrites tracked files only,
+keeps ``.git`` so the next update pulls normally, and leaves every untracked
+file - ``.env`` files, uploads - where it is. A tree that is not a git
+checkout has no commit to go back to; the update says so and names the
+backup as the way back.
 """
 
 import json
@@ -14,6 +30,7 @@ import secrets
 import shutil
 import sqlite3
 import string
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -29,7 +46,7 @@ from wasm.core.exceptions import (
     ServiceError,
     WASMError,
 )
-from wasm.core.fs import FileSystem
+from wasm.core.fs import DryRunFileSystem, FileSystem
 from wasm.core.logger import Icons
 from wasm.core.runner import CommandResult, CommandRunner, get_runner
 from wasm.core.store import (
@@ -52,6 +69,8 @@ from wasm.deployers.helpers import (
     TurboHelper,
     WorkspaceHelper,
 )
+from wasm.deployers.helpers.health import wait_until_healthy
+from wasm.deployers.helpers.health_gate import HealthCheck, HealthGate
 from wasm.deployers.helpers.permissions import hand_over_tree
 from wasm.deployers.helpers.preflight import repository_unreachable
 from wasm.deployers.helpers.registration import StoreRegistrar
@@ -60,6 +79,7 @@ from wasm.deployers.interface import AppDeployer, StepReporter, UpdateResult
 from wasm.deployers.recorder import (
     CapturingLogger,
     DeploymentRecorder,
+    GitInfo,
     checkout_git_info,
     recorder_for,
     recording,
@@ -78,6 +98,26 @@ INSTALL_TIMEOUT = 1800
 
 #: Everything else here is a quick local command.
 COMMAND_TIMEOUT = 300
+
+#: systemd reports a unit active the instant it forks, so a unit with no port
+#: to probe gets this long to fail before its state is believed.
+SETTLE_SECONDS = 2
+
+
+@dataclass(frozen=True)
+class WorkspaceRestart:
+    """
+    What restarting every workspace's unit and probing it found.
+
+    Attributes:
+        restarted: The units restarted.
+        healthy: Whether every one of them passed its health gate.
+        evidence: For each one that did not, the probes and its journal.
+    """
+
+    restarted: tuple[str, ...]
+    healthy: bool
+    evidence: str
 
 
 @dataclass
@@ -190,6 +230,14 @@ class MonorepoDeployer(AppDeployer):
         self._created_sites: list[str] = []
         self._is_new_deployment: bool = True
 
+        # Set by lifecycle.update_app: the commit the tree was on before the
+        # pull, which only the caller that pulled can know. A failed update
+        # checks it out and rebuilds it.
+        self.previous_commit: str | None = None
+        # The commit and branch of the attempt, kept when a failed update
+        # puts the previous commit back, so its history row names what failed.
+        self._attempted_git: tuple[str | None, str | None] | None = None
+
     @property
     def runner(self) -> CommandRunner:
         """The command runner this deployer executes through."""
@@ -199,7 +247,9 @@ class MonorepoDeployer(AppDeployer):
     def source_manager(self) -> SourceManager:
         """The manager that fetches source code."""
         if self._source_manager is None:
-            self._source_manager = SourceManager(verbose=self.verbose, fs=self._fs)
+            self._source_manager = SourceManager(
+                verbose=self.verbose, runner=self._runner, fs=self._fs
+            )
         return self._source_manager
 
     @source_manager.setter
@@ -580,8 +630,12 @@ class MonorepoDeployer(AppDeployer):
         second pipeline that no test could reach and that drifted from
         :meth:`deploy` every time either side changed.
 
-        Restarting the services is deliberately not part of this: which units
-        exist is a store question, and the caller already owns it.
+        For a registered application, every unit it records is then
+        restarted and probed behind the health gate, inside this update's
+        history row, so a workspace that does not answer fails the update it
+        belongs to (see the module's docstring for how it goes back). An
+        application with no row leaves restarting to the caller, and says so
+        with ``restarted=None``.
 
         Args:
             on_step: Called as each step begins.
@@ -590,8 +644,11 @@ class MonorepoDeployer(AppDeployer):
             What was done, for the caller to present.
 
         Raises:
-            DeploymentError: When the deployer was not configured, or when
-                dependency installation fails.
+            DeploymentError: When the deployer was not configured, when
+                dependency installation fails, or when a workspace did not
+                pass the health gate; by then the previous commit has been
+                put back if there was one, and the message says whether it
+                answers.
             BuildError: When the build fails.
         """
         if not self.app_path or self.app_path == Path():
@@ -634,6 +691,16 @@ class MonorepoDeployer(AppDeployer):
         self._build_all()
         self._set_permissions()
 
+        units = self._units()
+        restarted: tuple[str, ...] | None = None
+        if units is not None:
+            report("Restarting workspaces")
+            outcome = self._restart_and_probe(units)
+            if not outcome.healthy:
+                report("Putting the previous commit back")
+                raise self._go_back(units, outcome.evidence)
+            restarted = outcome.restarted
+
         return UpdateResult(
             package_manager=self.package_manager,
             prisma_updated=prisma_updated,
@@ -641,6 +708,158 @@ class MonorepoDeployer(AppDeployer):
             # nothing static about it.
             is_static=False,
             start_command="",
+            restarted=restarted,
+        )
+
+    def _units(self) -> list[Service] | None:
+        """
+        List the units the application's workspaces run as.
+
+        Returns:
+            The units the store records for it, by name, or None when the
+            application has no row, which leaves restarting to the caller.
+        """
+        app = self.store.get_app(self.domain)
+        if app is None or app.id is None:
+            return None
+        units = sorted(
+            (s for s in self.store.list_services() if s.app_id == app.id), key=lambda s: s.name
+        )
+        if not units:
+            self.logger.warning(
+                f"No units are recorded for {self.domain}; redeploy it to create them"
+            )
+        return units
+
+    def _rehearsing(self) -> bool:
+        """
+        Report whether this is a ``--dry-run``, where nothing was restarted to probe.
+
+        Returns:
+            True under a rehearsing filesystem.
+        """
+        return isinstance(self.fs, DryRunFileSystem)
+
+    def _unit_gate(self, unit: Service, check: HealthCheck) -> HealthGate:
+        """
+        Build the gate one workspace's unit must pass.
+
+        Args:
+            unit: The unit.
+            check: The application's health check: path, statuses and wait.
+
+        Returns:
+            The gate, probing the unit's own port. It never restarts: every
+            unit is restarted before any is probed.
+        """
+        return HealthGate(
+            unit=unit.name,
+            url=check.url(unit.port) if unit.port else None,
+            check=check,
+            services=self.service_manager,
+            logger=self.logger,
+            # Looked up here, at call time, so it is the one this module holds.
+            probe=wait_until_healthy,
+            restart=lambda: None,
+        )
+
+    def _restart_and_probe(self, units: Sequence[Service]) -> WorkspaceRestart:
+        """
+        Restart every unit, then probe each one.
+
+        All of them are restarted before any is probed, so the stretch in
+        which some workspaces run the new build and others the old one is as
+        short as it can be. A unit with a port is probed over HTTP with the
+        application's health check; one without (a worker) has to be running.
+
+        Args:
+            units: The units.
+
+        Returns:
+            What was restarted, and whether every unit passed.
+        """
+        check = HealthCheck.for_app(self.store.get_app(self.domain))
+        restarted: list[str] = []
+        failures: list[str] = []
+        for unit in units:
+            self.logger.substep(f"Restarting {unit.name}")
+            try:
+                self.service_manager.restart(unit.name)
+            except WASMError as exc:
+                failures.append(self._unit_gate(unit, check).evidence(str(exc)))
+            else:
+                restarted.append(unit.name)
+
+        if not self._rehearsing():
+            if any(not unit.port for unit in units):
+                time.sleep(SETTLE_SECONDS)
+            for unit in units:
+                if unit.name not in restarted:
+                    continue
+                gate = self._unit_gate(unit, check)
+                if unit.port:
+                    healthy, evidence = gate.restart_and_probe()
+                    if not healthy:
+                        failures.append(f"{unit.name}: {evidence}")
+                elif not self.service_manager.get_status(unit.name).get("active"):
+                    failures.append(gate.evidence(f"{unit.name} is not running."))
+
+        return WorkspaceRestart(
+            restarted=tuple(restarted), healthy=not failures, evidence="\n\n".join(failures)
+        )
+
+    def _go_back(self, units: Sequence[Service], evidence: str) -> DeploymentError:
+        """
+        Put the previous commit back after a workspace failed the gate.
+
+        The tree is checked out at the commit it was on before the update,
+        installed and built again (Prisma's client is generated, but no
+        migration runs: a migration cannot be undone, and the old tree's are
+        already applied), and every unit restarted and probed. Nothing is
+        restarted on a tree whose rebuild failed.
+
+        Args:
+            units: The application's units.
+            evidence: What the gate saw.
+
+        Returns:
+            The error to raise, which says whether the previous commit is
+            back and answering.
+        """
+        attempted = f"The update of {self.domain} did not pass its health check"
+        self.logger.warning(attempted)
+        if not self.previous_commit:
+            return DeploymentError(
+                f"{attempted}; the tree is not a git checkout, so there was no commit to go "
+                "back to",
+                details=f"{evidence}\n\nThe workspaces are running the new build. Restore "
+                f"the backup taken before the update with: wasm rollback {self.domain}",
+            )
+
+        previous = self.previous_commit[:7]
+        self._attempted_git = self._git_info()()
+        self.logger.substep(f"Going back to commit {previous}")
+        try:
+            self.source_manager.checkout_commit(self.app_path, self.previous_commit)
+            self._install_dependencies()
+            self._run_prisma_migrations(migrate=False)
+            self._build_all()
+            self._set_permissions()
+        except WASMError as exc:
+            return DeploymentError(
+                f"{attempted}; commit {previous} could not be put back",
+                details=f"{evidence}\n\nPutting commit {previous} back failed, and nothing "
+                f"was restarted on the half-built tree:\n{exc}",
+            )
+
+        again = self._restart_and_probe(units)
+        if again.healthy:
+            return DeploymentError(
+                f"{attempted}; commit {previous} is serving again", details=evidence
+            )
+        return DeploymentError(
+            f"{attempted}; commit {previous} was rebuilt and restarted but is not answering either",
+            details=f"{evidence}\n\nAfter going back:\n{again.evidence}",
         )
 
     def _pre_flight_check(self) -> None:
@@ -972,9 +1191,13 @@ class MonorepoDeployer(AppDeployer):
                 "Failed to install dependencies", details=result.stderr or result.stdout
             )
 
-    def _run_prisma_migrations(self) -> bool:
+    def _run_prisma_migrations(self, migrate: bool = True) -> bool:
         """
         Run Prisma migrations if detected.
+
+        Args:
+            migrate: Also apply migrations. Going back to a previous commit
+                only regenerates the client: a migration cannot be undone.
 
         Returns:
             True when a Prisma client was generated or a migration ran, so an
@@ -1002,7 +1225,7 @@ class MonorepoDeployer(AppDeployer):
                 if not result.success:
                     self.logger.warning(f"Prisma generate failed: {result.stderr}")
 
-            if "db:migrate" in scripts:
+            if migrate and "db:migrate" in scripts:
                 self.logger.substep("Running Prisma migrations (pnpm db:migrate)")
                 result = self._run(["pnpm", "db:migrate"], timeout=120)
                 if not result.success:
@@ -1033,7 +1256,9 @@ class MonorepoDeployer(AppDeployer):
 
                 # Check for migrations
                 migrations_dir = prisma_dir / "migrations"
-                if migrations_dir.exists() and any(migrations_dir.iterdir()):
+                if not migrate:
+                    self.logger.substep("Migrations left as they are")
+                elif migrations_dir.exists() and any(migrations_dir.iterdir()):
                     self.logger.substep("Running Prisma migrations")
                     result = self._run(
                         [
@@ -1458,15 +1683,14 @@ class MonorepoDeployer(AppDeployer):
             self.store.update_service_status(service_name, active=True, enabled=True)
 
         # Health checks
-        import time
-
         time.sleep(3)  # Give services time to start
 
         for ws in self.workspaces:
             service_name = f"{self.app_name}-{ws.name}"
             status = self.service_manager.get_status(service_name)
 
-            if status.get("active") != "active":
+            # get_status answers a bool; comparing it with "active" warned always.
+            if not status.get("active"):
                 self.logger.warning(f"Service {service_name} may not be running correctly")
 
     def _register_app_in_store(self, status: str) -> App:
@@ -1520,7 +1744,24 @@ class MonorepoDeployer(AppDeployer):
         Returns:
             A recorder, built where every deployer's is.
         """
-        return recorder_for(self, git_info=checkout_git_info(self.source_manager, self.app_path))
+        return recorder_for(self, git_info=self._git_info())
+
+    def _git_info(self) -> GitInfo:
+        """
+        Answer the commit and branch a history row records.
+
+        Returns:
+            A reader of the checkout, which answers what was attempted
+            instead once a failed update has put the previous commit back.
+        """
+        checkout = checkout_git_info(self.source_manager, self.app_path)
+
+        def read() -> tuple[str | None, str | None]:
+            if self._attempted_git is not None:
+                return self._attempted_git
+            return checkout()
+
+        return read
 
     def _show_deployment_summary(self, ssl_obtained: bool) -> None:
         """Show deployment summary."""

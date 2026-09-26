@@ -280,3 +280,118 @@ class TestAFailingFreshInstallIsAtomic:
             cursor.execute("SELECT MAX(version) FROM schema_version")
             assert cursor.fetchone()[0] == SCHEMA_VERSION
         assert "apps" in _raw_tables(db_path)
+
+
+def _create_v8_database(db_path: Path) -> None:
+    """
+    Create a real v8 database as 2.0.x leaves it, with data in every table v9 touches.
+
+    One application with a non-default retention and limits, and one
+    deployment with the v8 links filled in: the rows the v8-to-v9 migration
+    must carry over unchanged while it adds its columns.
+
+    Args:
+        db_path: Where the database file is created.
+    """
+    _create_v7_database(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        for column in ("job_id", "release_id", "commit_message"):
+            conn.execute(f"ALTER TABLE deployments ADD COLUMN {column} TEXT")
+        conn.execute("INSERT INTO schema_version (version) VALUES (8)")
+        conn.execute(
+            "INSERT INTO apps (domain, app_type, app_path, layout, keep_releases, memory_max_mb)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            ("v8.example.com", "nodejs", "/var/www/apps/v8-example-com", "releases", 7, 512),
+        )
+        conn.execute(
+            "UPDATE deployments SET job_id = 'ab12cd34', release_id = '20260101-000000-aaaaaaa'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class TestSchemaV9Migration:
+    """
+    Schema v9: the health gate's settings on every application, and the
+    backup that holds exactly what a deployment produced.
+    """
+
+    def test_a_v8_database_keeps_its_rows_and_gains_empty_settings(self, fresh, tmp_path):
+        """Every new column is NULL - "what WASM did before" - and nothing else moves."""
+        db_path = tmp_path / "wasm.db"
+        _create_v8_database(db_path)
+
+        store = WASMStore(db_path, fs=RecordingFileSystem())
+
+        assert _raw_max_version(db_path) == SCHEMA_VERSION == 9
+        app = store.get_app("v8.example.com")
+        assert app is not None
+        assert (app.layout, app.keep_releases, app.memory_max_mb) == ("releases", 7, 512)
+        assert (app.health_path, app.health_expect, app.health_timeout) == (None, None, None)
+        record = store.list_deployments("old.example.com")[0]
+        assert (record.job_id, record.release_id) == ("ab12cd34", "20260101-000000-aaaaaaa")
+        assert record.snapshot_backup is None
+
+    def test_the_migration_is_idempotent(self, fresh, tmp_path):
+        """Run twice on the same cursor, the second run finds its columns and adds nothing."""
+        db_path = tmp_path / "wasm.db"
+        _create_v8_database(db_path)
+        store = WASMStore(db_path, fs=RecordingFileSystem())
+        before = (_raw_columns(db_path, "apps"), _raw_columns(db_path, "deployments"))
+
+        with store._ddl_transaction() as cursor:
+            store._migrate_v8_to_v9(cursor)
+
+        assert (_raw_columns(db_path, "apps"), _raw_columns(db_path, "deployments")) == before
+        WASMStore.reset_instance()
+        reopened = WASMStore(db_path, fs=RecordingFileSystem())
+        assert reopened.get_app("v8.example.com") is not None
+
+    def test_a_failing_v8_to_v9_step_leaves_v8_intact(self, fresh, tmp_path):
+        """A crash after the first column rolls that column back with the version."""
+        db_path = tmp_path / "wasm.db"
+        _create_v8_database(db_path)
+
+        def _crash(self: WASMStore, cursor: sqlite3.Cursor) -> None:
+            cursor.execute("ALTER TABLE apps ADD COLUMN health_path TEXT")
+            raise sqlite3.OperationalError("simulated crash mid-migration")
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(WASMStore, "_migrate_v8_to_v9", _crash)
+            with pytest.raises(sqlite3.OperationalError):
+                WASMStore(db_path, fs=RecordingFileSystem())
+
+        assert _raw_max_version(db_path) == 8
+        assert "health_path" not in _raw_columns(db_path, "apps")
+
+    def test_the_fresh_schema_and_the_migration_agree(self, fresh, tmp_path):
+        """Both paths to v9 give apps and deployments the same columns."""
+        db_path = tmp_path / "migrated.db"
+        _create_v8_database(db_path)
+        WASMStore(db_path, fs=RecordingFileSystem())
+        WASMStore.reset_instance()
+        WASMStore(tmp_path / "fresh.db", fs=RecordingFileSystem())
+
+        for table in ("apps", "deployments"):
+            assert _raw_columns(db_path, table) == _raw_columns(tmp_path / "fresh.db", table)
+        assert {"health_path", "health_expect", "health_timeout"} <= _raw_columns(db_path, "apps")
+        assert "snapshot_backup" in _raw_columns(db_path, "deployments")
+
+    def test_a_migrated_database_records_the_new_facts(self, fresh, tmp_path):
+        """The columns are usable at once: settings round-trip, a snapshot is linked."""
+        db_path = tmp_path / "wasm.db"
+        _create_v8_database(db_path)
+        store = WASMStore(db_path, fs=RecordingFileSystem())
+
+        assert store.set_app_health("v8.example.com", path="/healthz", expect="200-399", timeout=90)
+        store.set_deployment_snapshot(1, "v8-example-com_20260102_030405")
+
+        app = store.get_app("v8.example.com")
+        assert (app.health_path, app.health_expect, app.health_timeout) == (
+            "/healthz",
+            "200-399",
+            90,
+        )
+        assert store.get_deployment(1).snapshot_backup == "v8-example-com_20260102_030405"

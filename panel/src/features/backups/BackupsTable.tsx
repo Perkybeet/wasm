@@ -105,6 +105,8 @@ export interface BackupsTableProps {
   backups: readonly BackupRow[];
   caption: string;
   loading?: boolean;
+  /** Rows to hold while loading: the number the storage summary already counted, when known. */
+  skeletonRows?: number;
   empty?: ReactNode;
 }
 
@@ -113,7 +115,7 @@ export interface BackupsTableProps {
  * verification against its checksum - `last_verified_at` and `verified_ok`, as the backup
  * itself records them, so the state survives a reload instead of resetting to "not checked".
  */
-export function BackupsTable({ backups, caption, loading = false, empty }: BackupsTableProps) {
+export function BackupsTable({ backups, caption, loading = false, skeletonRows, empty }: BackupsTableProps) {
   const { verify } = useBackupActions();
   const [checking, setChecking] = useState<ReadonlySet<string>>(new Set());
 
@@ -209,6 +211,7 @@ export function BackupsTable({ backups, caption, loading = false, empty }: Backu
       getRowId={(row) => row.backup_id}
       caption={caption}
       loading={loading}
+      {...(skeletonRows !== undefined ? { skeletonRows } : {})}
       {...(empty !== undefined ? { empty } : {})}
       rowActions={(row) => (
         <RowActions backup={row} checking={checking.has(row.backup_id)} onVerify={() => onVerify(row)} />

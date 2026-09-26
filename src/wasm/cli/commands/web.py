@@ -6,8 +6,8 @@
 The ``wasm web`` command group.
 
 This is the only way the panel is started in practice, so the security posture
-of a deployment is decided here. Two rules follow from the panel being a root
-shell with a login form:
+of a deployment is decided here. These rules follow from the panel being a
+root shell with a login form:
 
 - **Everything ``SecurityConfig`` can enforce is reachable from the command
   line.** A flag that only exists in Python is a flag nobody sets, which is how
@@ -22,6 +22,11 @@ shell with a login form:
   string typed: "", ``*``, ``0``, ``::`` and a name that resolves to 0.0.0.0
   are all the same socket, and a set of known-good host strings recognised one
   of them.
+- **A console that must survive a reboot is a systemd unit, not a daemon.**
+  ``wasm web enable`` writes ``wasm-web.service`` through ServiceManager,
+  validated by the same rules as ``start``, and prints the token on the
+  operator's terminal. The unit runs ``wasm web start --under-systemd``, which
+  prints no token: its standard output is the journal.
 - **``wasm web token`` reports; it does not rotate.** The command people run to
   look the root credential up cannot be the command that revokes it. Issuing
   takes ``--new`` and a confirmation that names what stops working.
@@ -48,12 +53,14 @@ import importlib.util
 import json
 import logging
 import os
+import shlex
+import shutil
 import signal
 import socket
 import sys
 import time
 from argparse import ArgumentParser, Namespace
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -63,13 +70,14 @@ import click
 
 from wasm.cli.app import Context, WasmGroup, global_flags, json_option, pass_context
 from wasm.core.config import Config
-from wasm.core.exceptions import SecurityError, WASMError
+from wasm.core.exceptions import SecurityError, ServiceError, WASMError
 from wasm.core.fs import get_fs
 from wasm.core.logger import Logger
 from wasm.core.net import (
     ALL_INTERFACES,
     host_addresses,
     is_loopback_host,
+    loopback_access_lines,
     normalize_host,
     strip_brackets,
 )
@@ -103,7 +111,35 @@ RESTART_PAUSE = 1
 #: operator is still reading the error.
 PORT_SUGGESTION_SPAN = 20
 
+#: The unit ``wasm web enable`` writes. It keeps the ``wasm-`` prefix that
+#: marks WASM's own units, next to ``wasm-monitor``.
+WEB_UNIT = "wasm-web"
+WEB_UNIT_FILE = f"{WEB_UNIT}.service"
+
+#: The template it is rendered from, under ``templates/systemd``.
+WEB_UNIT_TEMPLATE = "wasm-web"
+
+#: How long ``wasm web enable`` waits for the service to listen before it
+#: calls the start a failure. A console comes up in a second or two; the
+#: margin is for a slow disk importing FastAPI cold.
+SERVICE_START_TIMEOUT = 30
+
+#: Seconds between two looks at the starting service.
+SERVICE_POLL_INTERVAL = 0.5
+
+#: Journal lines shown when the service does not come up.
+SERVICE_JOURNAL_LINES = 30
+
 F = TypeVar("F", bound=Callable[..., Any])
+
+#: ``--daemon``, for the two commands that may background the console.
+_daemon_option = click.option(
+    "-d",
+    "--daemon",
+    is_flag=True,
+    help="Run in the background, until 'wasm web stop' or the next reboot. "
+    "'wasm web enable' survives reboots.",
+)
 
 
 def get_pid_file() -> Path:
@@ -155,6 +191,11 @@ class StartOptions:
         insecure_http: Serve cleartext beyond loopback, in so many words.
         allow_ip: Addresses or CIDRs allowed to connect, empty for anyone.
         trusted_proxy: Peers whose forwarding headers are believed.
+        under_systemd: Run as ``wasm-web.service`` runs it: serve the token
+            ``wasm web enable`` issued and print none, since standard output
+            is the journal; write no PID file, since systemd tracks the
+            process; and do not refuse to start because the service is up,
+            since this is the service.
     """
 
     host: str = "127.0.0.1"
@@ -167,6 +208,48 @@ class StartOptions:
     insecure_http: bool = False
     allow_ip: tuple[str, ...] = ()
     trusted_proxy: tuple[str, ...] = ()
+    under_systemd: bool = False
+
+
+def _option_argv(options: StartOptions, *, explicit: bool = True) -> list[str]:
+    """
+    Spell exposure options back as the command line flags that produce them.
+
+    One spelling serves both places the options are written down: the
+    ``ExecStart`` of ``wasm-web.service`` and the ``wasm web enable`` line a
+    foreground start suggests. TLS paths are made absolute, because systemd
+    starts the service from ``/`` and the operator typed them relative to a
+    shell it never sees.
+
+    Args:
+        options: The options to spell.
+        explicit: Write the host and the port even when they are the defaults.
+            The unit states them; a suggestion for a human leaves them out.
+
+    Returns:
+        The flags, one argv element each.
+    """
+    defaults = StartOptions()
+    argv: list[str] = []
+    if explicit or normalize_host(options.host) != defaults.host:
+        argv += ["--host", normalize_host(options.host)]
+    if explicit or options.port != defaults.port:
+        argv += ["--port", str(options.port)]
+    if options.require_https:
+        argv.append("--require-https")
+    if options.self_signed:
+        argv.append("--self-signed")
+    if options.tls_cert:
+        argv += ["--tls-cert", os.path.abspath(options.tls_cert)]
+    if options.tls_key:
+        argv += ["--tls-key", os.path.abspath(options.tls_key)]
+    if options.insecure_http:
+        argv.append("--insecure-http")
+    for entry in options.allow_ip:
+        argv += ["--allow-ip", entry]
+    for entry in options.trusted_proxy:
+        argv += ["--trusted-proxy", entry]
+    return argv
 
 
 def add_start_arguments(parser: ArgumentParser) -> None:
@@ -790,7 +873,75 @@ def _ensure_self_signed(host: str, logger: Logger, verbose: bool) -> None:
     )
 
 
-def _report_daemon_started(config: SecurityConfig, pid: int, token: str, logger: Logger) -> None:
+def _set_apart(lines: list[str], block: Sequence[str]) -> list[str]:
+    """
+    Put a blank line on each side of a run of lines, where it occurs.
+
+    Args:
+        lines: The banner.
+        block: The lines to set apart, in order.
+
+    Returns:
+        The banner, with the block framed by blank lines when it is present.
+    """
+    size = len(block)
+    for index in range(len(lines) - size + 1) if size else ():
+        if lines[index : index + size] == list(block):
+            before = [] if index and lines[index - 1] == "" else [""]
+            return [*lines[:index], *before, *block, "", *lines[index + size :]]
+    return lines
+
+
+def _print_banner(config: SecurityConfig, token: str, notes: Sequence[str]) -> None:
+    """
+    Print the banner that hands the operator the console: token, address, notes.
+
+    Every front door that issues a token prints through here - the foreground
+    start, the background start and ``wasm web enable`` - so the handover is
+    the same whichever way the console runs. The SSH tunnel line, the only way
+    to open a loopback console from another machine, is set apart so it is not
+    read past; ``notes`` say how this console stops and whether it survives a
+    reboot.
+
+    Args:
+        config: The configuration the console runs with.
+        token: The access token issued for it.
+        notes: Lines closing the banner, before its last rule.
+    """
+    from wasm.web.server import banner_address, startup_banner
+
+    scheme = "https" if config.require_https else "http"
+    address = banner_address(config.host)
+    lines = list(startup_banner(token, address, config.port, scheme))
+    lines = _set_apart(lines, loopback_access_lines(address, config.port, scheme=scheme))
+    if notes:
+        lines = [*lines[:-1], "", *notes, lines[-1]]
+    print("\n".join(lines))
+    print(flush=True)
+
+
+def _enable_hint(options: StartOptions | None) -> str:
+    """
+    Spell the ``wasm web enable`` that would keep this console running.
+
+    Args:
+        options: The options this console was started with, when known.
+
+    Returns:
+        A command line to paste.
+    """
+    flags = _option_argv(options, explicit=False) if options is not None else []
+    return shlex.join(["wasm", "web", "enable", *flags])
+
+
+def _report_daemon_started(
+    config: SecurityConfig,
+    pid: int,
+    token: str,
+    logger: Logger,
+    *,
+    options: StartOptions | None = None,
+) -> None:
     """
     Report a backgrounded panel: its token, how to reach it, how to stop it.
 
@@ -802,16 +953,180 @@ def _report_daemon_started(config: SecurityConfig, pid: int, token: str, logger:
         pid: Process id of the panel.
         token: The access token issued for this start.
         logger: Logger for the report.
+        options: The options it was started with, for the ``wasm web enable``
+            line that keeps it running across reboots.
     """
-    from wasm.web.server import banner_address, startup_banner
-
-    scheme = "https" if config.require_https else "http"
-
-    print("\n".join(startup_banner(token, banner_address(config.host), config.port, scheme)))
-    print(flush=True)
+    _print_banner(
+        config,
+        token,
+        (
+            "Runs in the background until 'wasm web stop' or the next reboot.",
+            f"To keep it running across reboots: wasm web stop && {_enable_hint(options)}",
+        ),
+    )
     logger.success(f"Web server started in background (PID: {pid})")
     logger.info("Use 'wasm web status' to check status")
     logger.info("Use 'wasm web stop' to stop the server")
+
+
+def _dependencies_ready(logger: Logger, verbose: bool, *, dry_run: bool) -> bool:
+    """
+    Check the console's packages, offering to install what is missing.
+
+    Checked before anything else: SecurityConfig lives in wasm.web.auth, which
+    imports fastapi, so building the configuration on a host without the
+    panel's packages would answer a missing dependency with an ImportError
+    traceback.
+
+    Args:
+        logger: Logger for the report.
+        verbose: Whether to log verbosely.
+        dry_run: A rehearsal never offers to install: accepting would install
+            packages, which is exactly what it promised not to do.
+
+    Returns:
+        True when every package is importable.
+    """
+    all_installed, missing_apt, missing_pip = _check_dependencies()
+    if all_installed:
+        return True
+
+    logger.error("Web dependencies not installed")
+    logger.info(f"Missing packages: {', '.join(missing_apt)}")
+
+    if not dry_run and _prompt_install(missing_apt, missing_pip, verbose):
+        all_installed, _, _ = _check_dependencies()
+        if all_installed:
+            logger.success("Dependencies installed successfully!")
+            logger.blank()
+            return True
+        logger.error("Some dependencies could not be installed")
+        return False
+
+    logger.blank()
+    logger.info("Install manually with one of the following:")
+    for instruction in _get_install_instructions(missing_apt, missing_pip):
+        logger.info(f"  {instruction}")
+    logger.blank()
+    logger.info("Or run: wasm web install")
+    return False
+
+
+def _running_daemon_pid() -> int | None:
+    """
+    Name the background console this machine has a record of, if it runs.
+
+    Returns:
+        Its PID, or None when there is no live one. A stale PID file is
+        removed on the way, through the fs seam, so a rehearsal keeps it.
+    """
+    pid_file = get_pid_file()
+    if not pid_file.exists():
+        return None
+    try:
+        pid = int(pid_file.read_text().strip())
+        os.kill(pid, 0)
+    except (ProcessLookupError, ValueError):
+        get_fs().remove(pid_file, missing_ok=True)
+        return None
+    return pid
+
+
+def _service_manager(verbose: bool) -> Any:
+    """
+    Build the manager every systemd operation on the console's unit goes through.
+
+    Args:
+        verbose: Whether to log verbosely.
+
+    Returns:
+        A :class:`~wasm.managers.service_manager.ServiceManager`.
+    """
+    from wasm.managers.service_manager import ServiceManager
+
+    return ServiceManager(verbose=verbose)
+
+
+def _service_unit_path() -> Path:
+    """
+    Where ``wasm web enable`` writes the console's unit.
+
+    Returns:
+        ``wasm-web.service`` in the directory ServiceManager manages.
+    """
+    from wasm.managers.service_manager import ServiceManager
+
+    return Path(ServiceManager.SYSTEMD_DIR) / WEB_UNIT_FILE
+
+
+def _service_status(verbose: bool) -> dict[str, Any] | None:
+    """
+    Ask systemd about the console's unit, when it is installed.
+
+    The file is checked first, and only then is ServiceManager asked: the
+    manager resolves ``wasm-web`` to ``web`` when only ``web.service`` exists,
+    and an application named ``web`` is not the console.
+
+    Args:
+        verbose: Whether to log verbosely.
+
+    Returns:
+        :meth:`~wasm.managers.service_manager.ServiceManager.get_status`'s
+        answer, or None when the unit is not installed.
+    """
+    if not _service_unit_path().exists():
+        return None
+    status: dict[str, Any] = _service_manager(verbose).get_status(WEB_UNIT)
+    return status
+
+
+def _refuse_while_service_runs(verbose: bool, *, action: str) -> None:
+    """
+    Refuse to bring up a second console while ``wasm-web.service`` runs.
+
+    A second console would print a new token, retiring the one the service's
+    operator holds, and then fail to bind the port the service holds.
+
+    Args:
+        verbose: Whether to log verbosely.
+        action: What was refused, for the message.
+
+    Raises:
+        ServiceError: When the service is running.
+    """
+    status = _service_status(verbose)
+    if status is None or not status["active"]:
+        return
+    raise ServiceError(
+        f"Refusing to {action} a second console: it already runs as {WEB_UNIT_FILE}",
+        details=(
+            "The service holds its port and serves the token 'wasm web enable' printed.\n"
+            "  - to change its options: wasm web enable <new options>\n"
+            "  - to stop it and remove it: wasm web disable\n"
+            f"  - to stop it until the next boot: systemctl stop {WEB_UNIT}\n"
+            "  - to see how it runs: wasm web status"
+        ),
+    )
+
+
+def _issue_token(config: SecurityConfig) -> str:
+    """
+    Issue the access token a console about to serve will accept.
+
+    Args:
+        config: The configuration naming the state directory.
+
+    Returns:
+        The token, the only readable copy there is.
+    """
+    from wasm.web.auth import TokenManager
+
+    manager = TokenManager(config)
+    try:
+        return manager.generate_master_token()
+    finally:
+        # The daemon forks next, and an SQLite connection must not cross a fork.
+        manager.sessions.close()
 
 
 def _start(options: StartOptions, verbose: bool, *, dry_run: bool = False) -> int:
@@ -828,36 +1143,12 @@ def _start(options: StartOptions, verbose: bool, *, dry_run: bool = False) -> in
 
     Raises:
         SecurityError: When the requested exposure is not protected.
+        ServiceError: When the console already runs as ``wasm-web.service``.
     """
     logger = Logger(verbose=verbose)
 
-    # Dependencies first: SecurityConfig lives in wasm.web.auth, which imports
-    # fastapi, so building the configuration on a host without the panel's
-    # packages would answer a missing dependency with an ImportError traceback.
-    all_installed, missing_apt, missing_pip = _check_dependencies()
-    if not all_installed:
-        logger.error("Web dependencies not installed")
-        logger.info(f"Missing packages: {', '.join(missing_apt)}")
-
-        # Offer to install automatically. A rehearsal never offers: accepting
-        # would install packages, which is exactly what it promised not to do.
-        if not dry_run and _prompt_install(missing_apt, missing_pip, verbose):
-            # Re-check after installation
-            all_installed, _, _ = _check_dependencies()
-            if all_installed:
-                logger.success("Dependencies installed successfully!")
-                logger.blank()
-            else:
-                logger.error("Some dependencies could not be installed")
-                return 1
-        else:
-            logger.blank()
-            logger.info("Install manually with one of the following:")
-            for instruction in _get_install_instructions(missing_apt, missing_pip):
-                logger.info(f"  {instruction}")
-            logger.blank()
-            logger.info("Or run: wasm web install")
-            return 1
+    if not _dependencies_ready(logger, verbose, dry_run=dry_run):
+        return 1
 
     # Refuses an unsafe exposure before a stale PID file is removed or a socket
     # is bound. Everything this call does is a read, so a rehearsal reaches it
@@ -865,19 +1156,16 @@ def _start(options: StartOptions, verbose: bool, *, dry_run: bool = False) -> in
     config = _build_security_config(options)
     host = config.host
 
+    if not options.under_systemd:
+        _refuse_while_service_runs(verbose, action="start")
+
     # Check if already running
     pid_file = get_pid_file()
-    if pid_file.exists():
-        try:
-            pid = int(pid_file.read_text().strip())
-            # Check if process exists
-            os.kill(pid, 0)
-            logger.warning(f"Web server already running (PID: {pid})")
-            logger.info("Use 'wasm web stop' to stop it first")
-            return 1
-        except (ProcessLookupError, ValueError):
-            # Process not running, remove stale PID file
-            get_fs().remove(pid_file, missing_ok=True)
+    running = _running_daemon_pid()
+    if running is not None:
+        logger.warning(f"Web server already running (PID: {running})")
+        logger.info("Use 'wasm web stop' to stop it first")
+        return 1
 
     # The PID file only catches a panel this machine still has a record of. A
     # panel whose PID file was removed, or anything else on the port, walked
@@ -921,17 +1209,29 @@ def _start(options: StartOptions, verbose: bool, *, dry_run: bool = False) -> in
         scheme = "https" if config.require_https else "http"
         placement = "in the background" if options.daemon else "in the foreground"
         logger.info(f"would serve the panel {placement} at {scheme}://{host}:{config.port}")
-        logger.info(f"would record the process in {pid_file}")
+        if not options.under_systemd:
+            logger.info(f"would record the process in {pid_file}")
         return 0
 
     if options.daemon:
-        return _start_daemon(config, verbose, insecure_http=options.insecure_http)
-    return _start_foreground(config, insecure_http=options.insecure_http)
+        return _start_daemon(config, verbose, insecure_http=options.insecure_http, options=options)
+    return _start_foreground(config, insecure_http=options.insecure_http, options=options)
 
 
-def _start_foreground(config: SecurityConfig, *, insecure_http: bool = False) -> int:
+def _start_foreground(
+    config: SecurityConfig,
+    *,
+    insecure_http: bool = False,
+    options: StartOptions | None = None,
+) -> int:
     """
     Start the web server in the foreground.
+
+    The token is issued and printed here, not by the server, so the banner can
+    say how this console stops and how to keep it running; the server then
+    serves that token and issues none. Under systemd no token is issued at
+    all: standard output is the journal, and the token the service serves is
+    the one ``wasm web enable`` printed on the operator's terminal.
 
     Args:
         config: The security configuration to serve with.
@@ -939,32 +1239,67 @@ def _start_foreground(config: SecurityConfig, *, insecure_http: bool = False) ->
             many words, forwarded to :func:`wasm.web.server.run_server` - the
             chokepoint that actually binds the socket, and which refuses the
             exposure again on its own if this is not passed through.
+        options: The options it was started with: whether it runs under
+            systemd, and what ``wasm web enable`` would need to be told.
 
     Returns:
         Exit code.
     """
-    from wasm.web.server import run_server
+    from wasm.web.server import run_server, verify_tls_material
 
-    # Create PID file
+    under_systemd = options is not None and options.under_systemd
+    scheme = "https" if config.require_https else "http"
+
+    if config.require_https:
+        # Checked before the token is issued, so a missing certificate is
+        # reported instead of handing over a credential for nothing.
+        verify_tls_material(config)
+
     fs = get_fs()
     pid_file = get_pid_file()
-    fs.make_dir(pid_file.parent)
-    fs.write_text(pid_file, str(os.getpid()))
+
+    if under_systemd:
+        print(
+            f"WASM console serving {scheme}://{config.host}:{config.port} as {WEB_UNIT_FILE}. "
+            "Sign in with the token 'wasm web enable' printed; "
+            "'wasm web token --new' issues another.",
+            flush=True,
+        )
+    else:
+        _print_banner(
+            config,
+            _issue_token(config),
+            (
+                "Press Ctrl+C to stop the console. To keep it running across reboots: "
+                f"{_enable_hint(options)}",
+            ),
+        )
+        # systemd tracks the service's process itself; a PID file next to it
+        # would only invite 'wasm web stop' to kill what systemd supervises.
+        fs.make_dir(pid_file.parent)
+        fs.write_text(pid_file, str(os.getpid()))
 
     try:
         run_server(
             host=config.host,
             port=config.port,
             config=config,
-            show_token=True,
+            show_token=False,
             insecure_http=insecure_http,
         )
         return 0
     finally:
-        fs.remove(pid_file, missing_ok=True)
+        if not under_systemd:
+            fs.remove(pid_file, missing_ok=True)
 
 
-def _start_daemon(config: SecurityConfig, verbose: bool, *, insecure_http: bool = False) -> int:
+def _start_daemon(
+    config: SecurityConfig,
+    verbose: bool,
+    *,
+    insecure_http: bool = False,
+    options: StartOptions | None = None,
+) -> int:
     """
     Start the web server as a daemon, printing the access token it serves.
 
@@ -977,28 +1312,23 @@ def _start_daemon(config: SecurityConfig, verbose: bool, *, insecure_http: bool 
         verbose: Whether to log verbosely.
         insecure_http: Whether cleartext beyond loopback was accepted in so
             many words, forwarded to :func:`wasm.web.server.run_server`.
+        options: The options it was started with, for the ``wasm web enable``
+            line the banner suggests.
 
     Returns:
         Exit code.
     """
-    from wasm.web.auth import TokenManager
-
     logger = Logger(verbose=verbose)
 
     # Issued here, before the fork, because the parent is the only process
     # still attached to the terminal. The child serves this token and issues
     # none of its own (show_token=False below).
-    manager = TokenManager(config)
-    try:
-        token = manager.generate_master_token()
-    finally:
-        # An SQLite connection must not cross a fork.
-        manager.sessions.close()
+    token = _issue_token(config)
 
     pid = os.fork()
 
     if pid > 0:
-        _report_daemon_started(config, pid, token, logger)
+        _report_daemon_started(config, pid, token, logger, options=options)
         return 0
 
     # Child process
@@ -1053,6 +1383,11 @@ def _stop(verbose: bool, *, dry_run: bool = False) -> int:
     """
     Stop the running panel.
 
+    Only the background console is this command's to stop. A console running
+    as ``wasm-web.service`` is named instead: killing systemd's process would
+    leave a unit that comes back at the next boot, and saying "not running"
+    next to it would be false.
+
     Args:
         verbose: Whether to log verbosely.
         dry_run: Report the signal instead of sending it.
@@ -1066,6 +1401,12 @@ def _stop(verbose: bool, *, dry_run: bool = False) -> int:
     pid_file = get_pid_file()
 
     if not pid_file.exists():
+        status = _service_status(verbose)
+        if status is not None and status["active"]:
+            logger.error(f"The console runs as {WEB_UNIT_FILE}, not as a background process")
+            logger.info("To stop it and remove it:  wasm web disable")
+            logger.info(f"To stop it until the next boot:  systemctl stop {WEB_UNIT}")
+            return 1
         logger.info("Web server is not running")
         return 0
 
@@ -1100,9 +1441,61 @@ def _stop(verbose: bool, *, dry_run: bool = False) -> int:
         return 1
 
 
+def _service_payload(status: dict[str, Any] | None) -> dict[str, Any]:
+    """
+    Describe the console's unit for ``wasm web status``.
+
+    Args:
+        status: What systemd said, or None when the unit is not installed.
+
+    Returns:
+        ``installed``, and when it is, whether it runs, starts at boot, and
+        systemd's own state words.
+    """
+    if status is None:
+        return {"unit": WEB_UNIT_FILE, "installed": False}
+    return {
+        "unit": WEB_UNIT_FILE,
+        "installed": True,
+        "active": bool(status["active"]),
+        "enabled": bool(status["enabled"]),
+        "active_state": status.get("active_state", ""),
+        "sub_state": status.get("sub_state", ""),
+    }
+
+
+def _process_detail(pid: int, payload: dict[str, Any]) -> None:
+    """
+    Add memory and start time for a running console to a status payload.
+
+    Extra detail is a nicety; psutil may be missing or the process may have
+    exited between the check and the query. Either is expected and reported at
+    debug level; anything else is a bug in this function and must not be
+    reported as a cosmetic warning.
+
+    Args:
+        pid: The console's process.
+        payload: The payload to extend in place.
+    """
+    try:
+        import psutil
+    except ImportError:
+        log.debug("psutil is not installed; skipping extra process detail")
+        return
+    try:
+        proc = psutil.Process(pid)
+        payload["memory_mb"] = round(proc.memory_info().rss / 1024 / 1024, 1)
+        payload["started"] = proc.create_time()
+    except psutil.Error as exc:
+        log.debug("Could not read extra process detail for pid %s: %s", pid, exc)
+
+
 def _status(verbose: bool, *, json_output: bool = False) -> int:
     """
-    Report whether the panel is running.
+    Report whether the panel is running, and how: as the service or the daemon.
+
+    How it runs decides whether it survives a reboot, which is the thing an
+    operator who started it with ``-d`` did not know.
 
     Args:
         verbose: Whether to log verbosely.
@@ -1116,68 +1509,61 @@ def _status(verbose: bool, *, json_output: bool = False) -> int:
             asked for - the ordinary error path, not an invalid JSON body.
     """
     logger = Logger(verbose=verbose)
+    service = _service_status(verbose)
+    payload: dict[str, Any] = {"status": "not running", "mode": None}
 
-    pid_file = get_pid_file()
-
-    if not json_output:
-        logger.header("WASM Web Interface Status")
-
-    if not pid_file.exists():
-        if json_output:
-            click.echo(json.dumps({"status": "not running"}))
-        else:
-            logger.key_value("Status", "not running")
-        return 0
-
-    try:
-        pid = int(pid_file.read_text().strip())
-
-        # Check if process is running
-        os.kill(pid, 0)
-
-        payload: dict[str, Any] = {"status": "running", "pid": pid}
-
-        # Extra detail is a nicety; psutil may be missing or the process may
-        # have exited between the signal and the query. Either is expected
-        # and reported at debug level; anything else is a bug in this
-        # function and must not be reported as a cosmetic warning.
-        try:
-            import psutil
-        except ImportError:
-            log.debug("psutil is not installed; skipping extra process detail")
-        else:
+    if service is not None and service["active"]:
+        payload.update(status="running", mode="service")
+        pid = str(service.get("pid", "")).strip()
+        if pid.isdigit() and int(pid) > 0:
+            payload["pid"] = int(pid)
+            _process_detail(int(pid), payload)
+    else:
+        pid_file = get_pid_file()
+        if pid_file.exists():
             try:
-                proc = psutil.Process(pid)
-                payload["memory_mb"] = round(proc.memory_info().rss / 1024 / 1024, 1)
-                payload["started"] = proc.create_time()
-            except psutil.Error as exc:
-                log.debug("Could not read extra process detail for pid %s: %s", pid, exc)
+                pid_value = int(pid_file.read_text().strip())
+                os.kill(pid_value, 0)
+            except ProcessLookupError:
+                payload["status"] = "not running (stale PID)"
+                get_fs().remove(pid_file, missing_ok=True)
+            except ValueError:
+                if json_output:
+                    raise WASMError("Invalid PID file") from None
+                logger.header("WASM Web Interface Status")
+                logger.error("Invalid PID file")
+                return 1
+            else:
+                payload.update(status="running", mode="daemon", pid=pid_value)
+                _process_detail(pid_value, payload)
 
-        if json_output:
-            click.echo(json.dumps(payload))
-            return 0
+    payload["service"] = _service_payload(service)
 
-        logger.key_value("Status", "running")
-        logger.key_value("PID", str(pid))
-        if "memory_mb" in payload:
-            logger.key_value("Memory", f"{payload['memory_mb']:.1f} MB")
-        if "started" in payload:
-            logger.key_value("Started", str(payload["started"]))
-
+    if json_output:
+        click.echo(json.dumps(payload))
         return 0
 
-    except ProcessLookupError:
-        if json_output:
-            click.echo(json.dumps({"status": "not running (stale PID)"}))
-        else:
-            logger.key_value("Status", "not running (stale PID)")
-        get_fs().remove(pid_file, missing_ok=True)
-        return 0
-    except ValueError:
-        if json_output:
-            raise WASMError("Invalid PID file") from None
-        logger.error("Invalid PID file")
-        return 1
+    logger.header("WASM Web Interface Status")
+    logger.key_value("Status", payload["status"])
+    if payload["mode"] == "service":
+        boot = "starts at boot" if service and service["enabled"] else "does not start at boot"
+        logger.key_value("Runs as", f"{WEB_UNIT_FILE} ({boot})")
+    elif payload["mode"] == "daemon":
+        logger.key_value("Runs as", "background process (does not survive a reboot)")
+    if "pid" in payload:
+        logger.key_value("PID", str(payload["pid"]))
+    if "memory_mb" in payload:
+        logger.key_value("Memory", f"{payload['memory_mb']:.1f} MB")
+    if "started" in payload:
+        logger.key_value("Started", str(payload["started"]))
+
+    if service is not None and not service["active"]:
+        state = service.get("active_state") or "inactive"
+        logger.key_value("Service", f"{WEB_UNIT_FILE} is {state}")
+        logger.info(f"See why: journalctl -u {WEB_UNIT} -n 50")
+    elif payload["mode"] == "daemon":
+        logger.info("To keep it running across reboots: wasm web stop && wasm web enable")
+    return 0
 
 
 def _restart(options: StartOptions, verbose: bool, *, dry_run: bool = False) -> int:
@@ -1194,8 +1580,14 @@ def _restart(options: StartOptions, verbose: bool, *, dry_run: bool = False) -> 
 
     Raises:
         SecurityError: When the requested exposure is not protected.
+        ServiceError: When the console runs as ``wasm-web.service``, which
+            'wasm web enable' restarts with new options.
     """
     logger = Logger(verbose=verbose)
+
+    # Before anything is stopped: half a restart of the wrong console is worse
+    # than none.
+    _refuse_while_service_runs(verbose, action="restart")
 
     logger.info("Restarting web server...")
 
@@ -1207,6 +1599,224 @@ def _restart(options: StartOptions, verbose: bool, *, dry_run: bool = False) -> 
         time.sleep(RESTART_PAUSE)
 
     return _start(options, verbose, dry_run=dry_run)
+
+
+def _wasm_executable() -> str:
+    """
+    Locate the wasm entry point the unit's ExecStart runs.
+
+    systemd has no PATH of the operator's, so a relative command in a unit is
+    a service that never starts.
+
+    Returns:
+        The absolute path ``shutil.which`` finds.
+
+    Raises:
+        ServiceError: When wasm is not on PATH.
+    """
+    found = shutil.which("wasm")
+    if not found:
+        raise ServiceError(
+            "Could not find the wasm executable to run from the systemd unit",
+            details=(
+                "Install WASM system-wide (the distribution package, or pip install "
+                "wasm-cli as root) so that 'wasm' is on PATH, then run 'wasm web enable' again."
+            ),
+        )
+    return os.path.abspath(found)
+
+
+def _service_exec_start(options: StartOptions) -> str:
+    """
+    Build the unit's ExecStart: this machine's wasm, running the console.
+
+    Args:
+        options: The exposure the operator asked for, already validated.
+
+    Returns:
+        The value written after ``ExecStart=``.
+
+    Raises:
+        ServiceError: When wasm is not on PATH.
+        ValidationError: When a value carries a character a unit line cannot
+            hold.
+    """
+    from wasm.managers.cron_manager import CronManager
+    from wasm.validators.environment import validate_unit_value
+
+    argv = [_wasm_executable(), "web", "start", "--under-systemd", *_option_argv(options)]
+    for value in argv:
+        validate_unit_value(value, field="ExecStart")
+        if "$" in value:
+            # systemd expands $NAME in ExecStart even inside quotes.
+            raise ServiceError(
+                f"Refusing to write {value!r} into the console's unit",
+                details="systemd would expand the '$' in it. Use a path without one.",
+            )
+    return str(CronManager.build_exec_start(argv))
+
+
+def _wait_until_serving(manager: Any, host: str, port: int) -> None:
+    """
+    Wait until the started service listens, or report why it does not.
+
+    ``systemctl start`` returns once the process is forked, not once it
+    serves, so a console that fails to bind would otherwise be reported as
+    running - with a token printed for it.
+
+    Args:
+        manager: The service manager.
+        host: The address the console binds.
+        port: The port it binds.
+
+    Raises:
+        ServiceError: When the unit fails, or does not listen in time. The
+            details carry the journal verbatim.
+    """
+    deadline = time.monotonic() + SERVICE_START_TIMEOUT
+    while True:
+        status = manager.get_status(WEB_UNIT)
+        if status["active"] and _port_in_use(host, port):
+            return
+        restarting = status.get("sub_state") == "auto-restart"
+        failed = status.get("active_state") in ("failed", "inactive") or restarting
+        if failed or time.monotonic() >= deadline:
+            journal = manager.logs(WEB_UNIT, lines=SERVICE_JOURNAL_LINES).strip()
+            what = (
+                "failed to start" if failed else f"is not listening after {SERVICE_START_TIMEOUT}s"
+            )
+            # The fix first, then systemd's own words, verbatim.
+            advice = (
+                "Fix what the journal says and run 'wasm web enable' again, or remove "
+                f"the unit with 'wasm web disable'. More: journalctl -u {WEB_UNIT} -n 100"
+            )
+            raise ServiceError(
+                f"{WEB_UNIT_FILE} {what}",
+                details=f"{advice}\n\n{journal}" if journal else advice,
+            )
+        time.sleep(SERVICE_POLL_INTERVAL)
+
+
+def _enable(options: StartOptions, verbose: bool, *, dry_run: bool = False) -> int:
+    """
+    Run the console as ``wasm-web.service``: started now, and at every boot.
+
+    The options are validated by the very function ``wasm web start`` uses, so
+    a service cannot be written for an exposure a start would refuse. The
+    token is issued here and printed on this terminal, once the service
+    listens; the service serves it and prints none, because its output is the
+    journal. Running it again with other options rewrites the unit and
+    restarts the service.
+
+    Args:
+        options: How the operator asked for the console to be exposed.
+        verbose: Whether to log verbosely.
+        dry_run: Report what would be written and started instead.
+
+    Returns:
+        Exit code.
+
+    Raises:
+        SecurityError: When the requested exposure is not protected.
+        ServiceError: When the unit is not WASM's to write, wasm is not on
+            PATH, or the service does not come up.
+    """
+    logger = Logger(verbose=verbose)
+
+    if not _dependencies_ready(logger, verbose, dry_run=dry_run):
+        return 1
+
+    config = _build_security_config(options)
+    host = config.host
+
+    running = _running_daemon_pid()
+    if running is not None:
+        logger.error(f"A console already runs in the background (PID: {running})")
+        logger.info("Stop it first, so the service can take its port:  wasm web stop")
+        return 1
+
+    previous = _service_status(verbose)
+    was_active = previous is not None and bool(previous["active"])
+    # A service already running holds its own port; anything else on it would
+    # only make the new service crash-loop.
+    if not dry_run and not was_active and _port_in_use(host, config.port):
+        _report_taken_port(host, config.port, logger)
+        return 1
+
+    exec_start = _service_exec_start(options)
+
+    if options.self_signed:
+        if dry_run:
+            logger.info(f"would mint or reuse a self-signed certificate under {PANEL_TLS_DIR}")
+        else:
+            # Minted now, so a failure is shown here rather than in the journal.
+            _ensure_self_signed(host, logger, verbose)
+
+    manager = _service_manager(verbose)
+    path = manager.install_unit(WEB_UNIT, WEB_UNIT_TEMPLATE, {"exec_start": exec_start})
+
+    if dry_run:
+        # Nothing was written, so ServiceManager would find no unit to enable.
+        logger.info(f"would enable and start {WEB_UNIT_FILE}")
+        logger.info("would issue a new access token and print it here")
+        return 0
+
+    manager.enable(WEB_UNIT)
+    manager.restart(WEB_UNIT)
+    _wait_until_serving(manager, host, config.port)
+
+    _print_banner(
+        config,
+        _issue_token(config),
+        (
+            f"Runs as {WEB_UNIT_FILE}: started at boot, restarted if it fails.",
+            "Change its options with 'wasm web enable'; stop and remove it with "
+            "'wasm web disable'.",
+        ),
+    )
+    logger.success(f"{WEB_UNIT_FILE} {'restarted' if was_active else 'enabled and started'}")
+    logger.info(f"Unit: {path}")
+    logger.info(f"Logs: journalctl -u {WEB_UNIT}")
+    return 0
+
+
+def _disable(verbose: bool, *, dry_run: bool = False) -> int:
+    """
+    Stop ``wasm-web.service``, keep it from starting at boot, and remove it.
+
+    The access token and the console's state under ``/etc/wasm`` stay: the
+    next start, of either kind, issues a new token anyway.
+
+    Args:
+        verbose: Whether to log verbosely.
+        dry_run: Report instead of acting; the runner and fs seams hold back
+            every change.
+
+    Returns:
+        Exit code.
+
+    Raises:
+        ServiceError: When the unit at that path is not WASM's.
+    """
+    logger = Logger(verbose=verbose)
+
+    # Checked before ServiceManager is asked anything: it falls back from
+    # wasm-web to web.service, which may well be an application's unit.
+    if not _service_unit_path().exists():
+        logger.info(f"The console is not installed as a service ({WEB_UNIT_FILE})")
+        return 0
+
+    _service_manager(verbose).delete_service(WEB_UNIT)
+
+    if dry_run:
+        logger.info(f"would stop, disable and remove {WEB_UNIT_FILE}")
+        return 0
+
+    logger.success(f"{WEB_UNIT_FILE} stopped, disabled and removed")
+    logger.info(
+        "Start the console by hand with 'wasm web start', or again at boot with 'wasm web enable'."
+    )
+    return 0
 
 
 def _confirm_token_change(config: SecurityConfig, regenerate: bool) -> None:
@@ -1470,11 +2080,12 @@ def _install(use_apt: bool, use_pip: bool, verbose: bool) -> int:
 
 def _exposure_options(command: F) -> F:
     """
-    Attach the options shared by ``web start`` and ``web restart``.
+    Attach the options shared by ``web start``, ``web restart`` and ``web enable``.
 
-    Both commands bring the panel up, so both have to be able to say the same
-    things about how it is exposed. Declaring them once is what keeps the two
-    from drifting apart.
+    All three bring the panel up, so all three have to be able to say the same
+    things about how it is exposed. Declaring them once is what keeps them
+    from drifting apart. ``--daemon`` is not among them: a service is never
+    backgrounded, so it is declared by the two commands that take it.
 
     Args:
         command: The command function being decorated.
@@ -1500,7 +2111,6 @@ def _exposure_options(command: F) -> F:
             show_default=True,
             help="Port to listen on.",
         ),
-        click.option("-d", "--daemon", is_flag=True, help="Run in the background."),
         click.option(
             "--require-https",
             is_flag=True,
@@ -1557,13 +2167,22 @@ def cli() -> None:
     """
     Run the browser panel for this server.
 
-    The panel acts as root, so it listens on 127.0.0.1 unless you give it TLS
-    or a list of addresses allowed to reach it.
+    The panel acts as root, so it listens on 127.0.0.1 unless you give it TLS;
+    reach it from your machine with 'ssh -L 8080:127.0.0.1:8080 user@server'.
+    'wasm web enable' keeps it running across reboots.
     """
 
 
 @cli.command("start")
 @_exposure_options
+@_daemon_option
+@click.option(
+    "--under-systemd",
+    is_flag=True,
+    hidden=True,
+    help="Run as wasm-web.service does: print no token, write no PID file. "
+    "Written into the unit by 'wasm web enable'; not for interactive use.",
+)
 @global_flags
 @pass_context
 def start_command(
@@ -1578,8 +2197,19 @@ def start_command(
     insecure_http: bool,
     allow_ip: tuple[str, ...],
     trusted_proxy: tuple[str, ...],
+    under_systemd: bool,
 ) -> NoReturn:
-    """Start the panel and print an access token."""
+    """
+    Start the panel and print an access token.
+
+    It runs in the foreground until Ctrl+C, or with -d in the background until
+    'wasm web stop' or the next reboot. 'wasm web enable' takes the same
+    options and keeps it running across reboots.
+    """
+    if under_systemd and daemon:
+        raise click.UsageError(
+            "--under-systemd runs the console in the foreground for systemd; drop --daemon."
+        )
     options = StartOptions(
         host=host,
         port=port,
@@ -1591,15 +2221,61 @@ def start_command(
         insecure_http=insecure_http,
         allow_ip=tuple(allow_ip),
         trusted_proxy=tuple(trusted_proxy),
+        under_systemd=under_systemd,
     )
     _exit(_start(options, ctx.verbose, dry_run=ctx.dry_run))
+
+
+@cli.command("enable")
+@_exposure_options
+@global_flags
+@pass_context
+def enable_command(
+    ctx: Context,
+    host: str,
+    port: int,
+    require_https: bool,
+    tls_cert: str | None,
+    tls_key: str | None,
+    self_signed: bool,
+    insecure_http: bool,
+    allow_ip: tuple[str, ...],
+    trusted_proxy: tuple[str, ...],
+) -> NoReturn:
+    """
+    Run the panel as a systemd service that survives reboots.
+
+    Writes wasm-web.service with these options (the same ones 'wasm web start'
+    takes and checks), enables and starts it, and prints the access token.
+    Run it again to change the options.
+    """
+    options = StartOptions(
+        host=host,
+        port=port,
+        require_https=require_https,
+        tls_cert=tls_cert,
+        tls_key=tls_key,
+        self_signed=self_signed,
+        insecure_http=insecure_http,
+        allow_ip=tuple(allow_ip),
+        trusted_proxy=tuple(trusted_proxy),
+    )
+    _exit(_enable(options, ctx.verbose, dry_run=ctx.dry_run))
+
+
+@cli.command("disable")
+@global_flags
+@pass_context
+def disable_command(ctx: Context) -> NoReturn:
+    """Stop the panel's systemd service and remove it."""
+    _exit(_disable(ctx.verbose, dry_run=ctx.dry_run))
 
 
 @cli.command("stop")
 @global_flags
 @pass_context
 def stop_command(ctx: Context) -> NoReturn:
-    """Stop the running panel."""
+    """Stop the panel started with 'wasm web start -d'."""
     _exit(_stop(ctx.verbose, dry_run=ctx.dry_run))
 
 
@@ -1608,12 +2284,13 @@ def stop_command(ctx: Context) -> NoReturn:
 @json_option("Print the status as JSON.")
 @pass_context
 def status_command(ctx: Context) -> NoReturn:
-    """Show whether the panel is running."""
+    """Show whether the panel is running, and whether as a service or in the background."""
     _exit(_status(ctx.verbose, json_output=ctx.json_output))
 
 
 @cli.command("restart")
 @_exposure_options
+@_daemon_option
 @global_flags
 @pass_context
 def restart_command(
@@ -1754,6 +2431,34 @@ def _handle_restart(args: Namespace) -> int:
     )
 
 
+def _handle_enable(args: Namespace) -> int:
+    """
+    Handle ``web enable`` from the argparse tree.
+
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        Exit code.
+    """
+    return _enable(
+        _start_options(args), args.verbose, dry_run=bool(getattr(args, "dry_run", False))
+    )
+
+
+def _handle_disable(args: Namespace) -> int:
+    """
+    Handle ``web disable`` from the argparse tree.
+
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        Exit code.
+    """
+    return _disable(args.verbose, dry_run=bool(getattr(args, "dry_run", False)))
+
+
 def _handle_token(args: Namespace) -> int:
     """
     Handle ``web token`` from the argparse tree.
@@ -1815,6 +2520,8 @@ def handle_web(args: Namespace) -> int:
         "stop": _handle_stop,
         "status": _handle_status,
         "restart": _handle_restart,
+        "enable": _handle_enable,
+        "disable": _handle_disable,
         "token": _handle_token,
         "install": _handle_install,
     }

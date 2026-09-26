@@ -4,6 +4,7 @@ import type { ReactNode, SyntheticEvent } from "react";
 import { CommandHint } from "../../components/page/CommandHint";
 import { ErrorBlock } from "../../components/page/QueryState";
 import { Button } from "../../components/ui/Button";
+import { Skeleton } from "../../components/ui/Skeleton";
 import { cx } from "../../lib/cx";
 
 export interface SettingsSectionProps {
@@ -108,5 +109,56 @@ export function SettingsFormCard({
         </Button>
       </footer>
     </form>
+  );
+}
+
+/** One field of a form still loading: its label, its control, and its description's lines. */
+export interface SkeletonField {
+  /** Lines of description under the control, as the loaded field wraps them on a desktop. */
+  description?: number;
+  /** Rows of a textarea; an input or a select when absent. */
+  rows?: number;
+  /** Fields sharing one row, side by side (a host and its port). */
+  inline?: number;
+}
+
+/**
+ * A SettingsFormCard still loading, line for line: each field's label, control and description
+ * at the heights Field, Input and Textarea give them, and the footer with its button, so the
+ * sections below do not move when the settings arrive.
+ */
+export function SettingsFormSkeleton({ fields }: { fields: readonly SkeletonField[] }) {
+  return (
+    <div aria-hidden="true" className="flex min-w-0 flex-col rounded-card border border-border bg-surface shadow-raised">
+      <div className="flex min-w-0 flex-col gap-5 p-5">
+        {fields.map((field, index) => (
+          <div key={index} className="flex min-w-0 gap-4">
+            {Array.from({ length: field.inline ?? 1 }, (_, column) => (
+              <div key={column} className="flex min-w-0 flex-1 flex-col gap-1.5">
+                <div className="flex h-5 items-center">
+                  <Skeleton className="h-3 w-32" />
+                </div>
+                {field.rows !== undefined ? (
+                  // Textarea: 20px a row, its vertical padding and its border.
+                  <div className="w-full max-w-md" style={{ height: 14 + 20 * field.rows }}>
+                    <Skeleton className="h-full" />
+                  </div>
+                ) : (
+                  <Skeleton className="h-8 w-full max-w-md" />
+                )}
+                {Array.from({ length: field.description ?? 0 }, (_, line) => (
+                  <div key={line} className="flex h-4 items-center">
+                    <Skeleton className="h-2.5 w-64 max-w-full" />
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+      <div className="flex justify-end rounded-b-card border-t border-border bg-bg-sunken px-5 py-3">
+        <Skeleton className="h-8 w-28" />
+      </div>
+    </div>
   );
 }

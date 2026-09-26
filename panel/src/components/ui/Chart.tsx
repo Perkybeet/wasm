@@ -1,10 +1,13 @@
+import { Maximize2, ZoomIn, ZoomOut } from "lucide-react";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
-import type { CSSProperties, ReactElement, ReactNode } from "react";
+import type { CSSProperties, KeyboardEvent, ReactElement, ReactNode } from "react";
 import uPlot from "uplot";
 
 import { cx } from "../../lib/cx";
 import { isHttpUrl } from "../../lib/url";
 import { Button } from "./Button";
+import { Dialog } from "./Dialog";
+import { IconButton } from "./IconButton";
 import { STATUS, StatusGlyph } from "./StatusPill";
 import type { Status } from "./StatusPill";
 import { Tooltip } from "./Tooltip";
@@ -42,6 +45,16 @@ export interface ChartMarker {
   ) => ReactElement<Record<string, unknown>>;
 }
 
+/**
+ * The page's own range selector, repeated in the enlarged chart so the range can be changed
+ * without closing it. The page owns the range (usually in the URL) and re-renders the chart
+ * with the new data; `value` tells the chart the range changed, which resets any zoom.
+ */
+export interface ChartRangeSelector {
+  value: string;
+  control: ReactNode;
+}
+
 export interface ChartProps {
   title: string;
   /** Window of the data in words, e.g. "Last 30 minutes". Part of the summary. */
@@ -52,7 +65,7 @@ export interface ChartProps {
   series: readonly ChartSeries[];
   /** Events drawn on the time axis: deploys today, generically anything with a moment and a state. */
   markers?: readonly ChartMarker[];
-  /** Formats a value for axis, legend, summary and table. */
+  /** Formats a value for axis, legend, summary and table. Pass a stable function. */
   formatValue?: (value: number) => string;
   /** Fixes the value axis, e.g. [0, 100] for percentages. */
   yRange?: readonly [number, number];
@@ -63,6 +76,8 @@ export interface ChartProps {
    */
   timeFormat?: "clock" | "date";
   height?: number;
+  /** Shown in the enlarged chart, where the page has one. */
+  rangeSelector?: ChartRangeSelector;
   className?: string;
 }
 
@@ -303,41 +318,120 @@ function markerAffordance(marker: ChartMarker, children: ReactNode, className: s
   );
 }
 
+/** A stretch of the time axis, Unix seconds, [from, to]. */
+export type ChartWindow = readonly [number, number];
+
+function defaultFormat(value: number): string {
+  return value.toLocaleString(undefined, { maximumFractionDigits: 1 });
+}
+
+/** The first and last index whose moment is inside `window` (all of them without one). */
+export function visibleBounds(timestamps: readonly number[], window: ChartWindow | null): readonly [number, number] | null {
+  if (timestamps.length === 0) return null;
+  if (window === null) return [0, timestamps.length - 1];
+  const lo = timestamps.findIndex((t) => t >= window[0]);
+  const hi = timestamps.findLastIndex((t) => t <= window[1]);
+  return lo === -1 || hi === -1 || hi < lo ? null : [lo, hi];
+}
+
+/** The moment in full, for assistive technology: "Sep 25, 2026, 14:32:05". */
+function absoluteTime(seconds: number): string {
+  return new Date(seconds * 1000).toLocaleString([], { dateStyle: "medium", timeStyle: "medium", hourCycle: "h23" });
+}
+
+/** What the readout says of one sample, e.g. "14:32, CPU 12.4%". */
+export function readoutWords(
+  seconds: number,
+  withDate: boolean,
+  series: readonly ChartSeries[],
+  index: number,
+  format: (value: number) => string,
+): string {
+  const values = series.map((s) => {
+    const value = s.values[index];
+    return `${s.label} ${value === null || value === undefined ? "no reading" : format(value)}`;
+  });
+  return [formatChartTime(seconds, withDate), ...values].join(", ");
+}
+
 /**
- * A time series drawn with uPlot. The canvas is an image with a written summary; the same
- * numbers are one press away as a table, for screen readers and for anyone who wants them.
- * Markers (deploys, typically) are drawn by the chart itself: a hairline on the canvas and a
- * focusable state glyph positioned from uPlot's own geometry.
+ * `value`, at most once per `ms`: the newest value always lands, but a key held down does not
+ * queue a sentence per sample for a screen reader to work through.
  */
-export function Chart({
+export function useThrottled(value: string, ms: number): string {
+  const [shown, setShown] = useState(value);
+  const last = useRef(0);
+  useEffect(() => {
+    const wait = Math.max(0, last.current + ms - Date.now());
+    const timer = setTimeout(() => {
+      last.current = Date.now();
+      setShown(value);
+    }, wait);
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [value, ms]);
+  return shown;
+}
+
+const ANNOUNCE_EVERY_MS = 400;
+
+interface ChartBodyProps {
+  title: string;
+  summary: string;
+  timestamps: readonly number[];
+  series: readonly ChartSeries[];
+  markers: readonly ChartMarker[] | undefined;
+  formatValue: (value: number) => string;
+  yRange: readonly [number, number] | undefined;
+  withDate: boolean;
+  height: number;
+  asTable: boolean;
+  tableId: string;
+  /** The stretch shown; null for all of it. */
+  zoom: ChartWindow | null;
+  /** Set only where the chart zooms (the enlarged one): dragging across it selects a stretch. */
+  onZoom?: (window: ChartWindow | null) => void;
+}
+
+/**
+ * Everything under a chart's title: the readout, and the plot or its table. Shared by the
+ * chart on the page and the enlarged one, so both read, step and draw the same way.
+ */
+function ChartBody({
   title,
-  description,
+  summary,
   timestamps,
   series,
   markers,
-  formatValue = (v) => v.toLocaleString(undefined, { maximumFractionDigits: 1 }),
+  formatValue,
   yRange,
-  timeFormat,
-  height = 160,
-  className,
-}: ChartProps) {
-  const [asTable, setAsTable] = useState(false);
+  withDate,
+  height,
+  asTable,
+  tableId,
+  zoom,
+  onZoom,
+}: ChartBodyProps) {
   const [positions, setPositions] = useState<readonly MarkerPosition[]>([]);
+  // The sample under the cursor (pointer or keyboard); null shows the latest values.
+  const [cursor, setCursor] = useState<number | null>(null);
+  const [spoken, setSpoken] = useState("");
+  const announcement = useThrottled(spoken, ANNOUNCE_EVERY_MS);
   const hostRef = useRef<HTMLDivElement>(null);
   const plotRef = useRef<uPlot | null>(null);
   const formatRef = useRef(formatValue);
-  const timestampsRef = useRef(timestamps);
   const markersRef = useRef<readonly ChartMarker[]>(markers ?? []);
-  const withDateRef = useRef(false);
-  const tableId = useId();
-
-  const withDate = timeFormat ? timeFormat === "date" : needsDateFormat(timestamps);
+  const withDateRef = useRef(withDate);
+  const onZoomRef = useRef(onZoom);
+  const hintId = useId();
+  const zoomable = onZoom !== undefined;
 
   useEffect(() => {
     formatRef.current = formatValue;
-    timestampsRef.current = timestamps;
     markersRef.current = markers ?? [];
     withDateRef.current = withDate;
+    onZoomRef.current = onZoom;
   });
 
   const data = useMemo<uPlot.AlignedData>(
@@ -346,10 +440,17 @@ export function Chart({
   );
   const labels = series.map((s) => s.label).join("\u0000");
   const markersKey = (markers ?? []).map((m) => `${String(m.at)}|${m.state}|${m.label}`).join("\u0000");
-  const from = timestamps[0];
-  const to = timestamps.at(-1);
+  const from = zoom?.[0] ?? timestamps[0];
+  const to = zoom?.[1] ?? timestamps.at(-1);
   const visibleMarkers = markers !== undefined && from !== undefined && to !== undefined ? markersInRange(markers, from, to) : [];
-  const summary = summarise(title, description, series, formatValue, markers !== undefined ? visibleMarkers.length : undefined);
+  const bounds = visibleBounds(timestamps, zoom);
+
+  // Each value keeps the width of the widest it can show, so the readout does not jostle the
+  // series beside it as the cursor moves.
+  const valueWidths = useMemo(
+    () => series.map((s) => s.values.reduce<number>((widest, v) => (v === null ? widest : Math.max(widest, formatValue(v).length)), 1)),
+    [series, formatValue],
+  );
 
   useEffect(() => {
     const host = hostRef.current;
@@ -359,7 +460,18 @@ export function Chart({
       width: Math.max(host.clientWidth, 240),
       height,
       legend: { show: false },
-      cursor: { drag: { x: false, y: false }, points: { size: 6 } },
+      cursor: {
+        drag: { x: zoomable, y: false, setScale: false },
+        points: { size: 6 },
+        bind: {
+          // uPlot's own double-click resets the scale behind React's back; here it resets the
+          // zoom the enlarged chart holds, and does nothing where there is none.
+          dblclick: () => () => {
+            onZoomRef.current?.(null);
+            return null;
+          },
+        },
+      },
       scales: {
         x: { time: true },
         y: yRange
@@ -403,20 +515,39 @@ export function Chart({
         })),
       ],
       hooks: {
-        // Fires after every redraw uPlot does on its own - construction, setData, setSize -
-        // so this alone keeps the hairlines and the marker positions in sync without an
-        // external observer watching the DOM for changes.
+        // Fires after every redraw uPlot does on its own - construction, setData, setSize,
+        // setScale - so this alone keeps the hairlines and the marker positions in sync with
+        // what is on the canvas, zoomed or not.
         draw: [
           (u: uPlot) => {
-            const first = timestampsRef.current[0];
-            const last = timestampsRef.current.at(-1);
-            if (first === undefined || last === undefined) {
+            const min = u.scales["x"]?.min;
+            const max = u.scales["x"]?.max;
+            if (min === undefined || max === undefined) {
               setPositions([]);
               return;
             }
-            const visible = markersInRange(markersRef.current, first, last);
+            const visible = markersInRange(markersRef.current, min, max);
             drawMarkerLines(u, visible, (state) => palette.tone[STATUS[state].tone]);
             setPositions(positionMarkers(u, visible, uPlot.pxRatio || 1));
+          },
+        ],
+        // The readout follows uPlot's own cursor: the nearest sample, or none once it leaves.
+        setCursor: [
+          (u: uPlot) => {
+            setCursor(u.cursor.idx ?? null);
+          },
+        ],
+        setSelect: [
+          (u: uPlot) => {
+            const { left, width } = u.select;
+            if (width < 2) return;
+            u.setSelect({ left: 0, top: 0, width: 0, height: 0 }, false);
+            const start = u.posToVal(left, "x");
+            const end = u.posToVal(left + width, "x");
+            // A stretch with fewer than two samples is not a line: leave the zoom as it is.
+            const inside = timestampsInside(u.data[0], start, end);
+            if (inside < 2) return;
+            onZoomRef.current?.([start, end]);
           },
         ],
       },
@@ -445,47 +576,110 @@ export function Chart({
       scheme.removeEventListener("change", repaint);
       plot.destroy();
       plotRef.current = null;
+      setCursor(null);
     };
-    // Data and marker changes are applied below without rebuilding the plot.
+    // Data, marker and zoom changes are applied below without rebuilding the plot.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [asTable, height, labels, yRange?.[0], yRange?.[1]]);
+  }, [asTable, height, labels, zoomable, yRange?.[0], yRange?.[1]]);
 
+  const zoomFrom = zoom?.[0];
+  const zoomTo = zoom?.[1];
   useEffect(() => {
+    const plot = plotRef.current;
+    if (!plot) return;
     // markersKey is not read here, but setData re-runs the draw hook above, so a marker that
     // arrived without a new reading (a deploy just this second) still gets drawn.
-    plotRef.current?.setData(data);
-  }, [data, markersKey]);
+    plot.setData(data);
+    if (zoomFrom !== undefined && zoomTo !== undefined) plot.setScale("x", { min: zoomFrom, max: zoomTo });
+  }, [data, markersKey, zoomFrom, zoomTo, asTable]);
 
+  /** Moves the cursor to a sample (null hides it) and says so, from the keyboard. */
+  const moveCursor = (index: number | null): void => {
+    setCursor(index);
+    const plot = plotRef.current;
+    if (index === null) {
+      setSpoken("");
+      plot?.setCursor({ left: -10, top: -10 });
+      return;
+    }
+    const at = timestamps[index];
+    if (at === undefined) return;
+    setSpoken(readoutWords(at, withDate, series, index, formatValue));
+    if (plot) {
+      const value = series[0]?.values[index];
+      const top = value === null || value === undefined ? plot.bbox.height / (2 * (uPlot.pxRatio || 1)) : plot.valToPos(value, "y");
+      plot.setCursor({ left: plot.valToPos(at, "x"), top });
+    }
+  };
+
+  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
+    if (bounds === null) return;
+    const [lo, hi] = bounds;
+    const current = cursor !== null && cursor >= lo && cursor <= hi ? cursor : null;
+    let next: number | null;
+    switch (event.key) {
+      case "ArrowLeft":
+        next = current === null ? hi : Math.max(lo, current - 1);
+        break;
+      case "ArrowRight":
+        next = current === null ? hi : Math.min(hi, current + 1);
+        break;
+      case "Home":
+        next = lo;
+        break;
+      case "End":
+        next = hi;
+        break;
+      case "Escape":
+        // With nothing to clear, Escape is the enclosing dialog's to close.
+        if (cursor === null) return;
+        event.stopPropagation();
+        next = null;
+        break;
+      default:
+        return;
+    }
+    event.preventDefault();
+    moveCursor(next);
+  };
+
+  const shown = cursor !== null && cursor < timestamps.length ? cursor : null;
+  const shownAt = shown === null ? undefined : timestamps[shown];
   const latest = series.map((s) => s.values.findLast((v) => v !== null) ?? null);
+  const readout = series.map((s, index) => (shown === null ? latest[index] : s.values[shown]) ?? null);
 
   return (
-    <figure className={cx("flex min-w-0 flex-col gap-3", className)}>
-      <figcaption className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <div className="text-13 font-medium text-fg">{title}</div>
-          {description !== undefined ? <div className="text-12 text-fg-faint">{description}</div> : null}
-        </div>
-        <Button
-          size="sm"
-          variant="ghost"
-          aria-pressed={asTable}
-          aria-controls={asTable ? tableId : undefined}
-          onClick={() => setAsTable((v) => !v)}
-          className="-mr-2"
-        >
-          View as table
-        </Button>
-      </figcaption>
-
-      <ul className="flex flex-wrap gap-x-4 gap-y-1" aria-label="Series">
-        {series.map((s, index) => (
-          <li key={s.label} className="flex items-center gap-1.5 text-12 text-fg-muted">
-            <SeriesSwatch index={index} />
-            <span>{s.label}</span>
-            <span className="mono text-fg">{latest[index] !== null && latest[index] !== undefined ? formatValue(latest[index]) : "-"}</span>
-          </li>
-        ))}
-      </ul>
+    <>
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-12">
+        {/* The moment the values below were read: the hovered sample's, or the newest. */}
+        <span className="mono shrink-0 text-fg-muted" style={{ minWidth: withDate ? "12ch" : "6ch" }} data-readout-time="">
+          {shownAt === undefined ? (
+            "Latest"
+          ) : (
+            <time dateTime={new Date(shownAt * 1000).toISOString()}>
+              <span aria-hidden="true">{formatChartTime(shownAt, withDate)}</span>
+              <span className="sr-only">{absoluteTime(shownAt)}</span>
+            </time>
+          )}
+        </span>
+        <ul className="flex flex-wrap gap-x-4 gap-y-1" aria-label="Series">
+          {series.map((s, index) => {
+            const value = readout[index];
+            return (
+              <li key={s.label} className="flex items-center gap-1.5 text-fg-muted">
+                <SeriesSwatch index={index} />
+                <span>{s.label}</span>
+                <span className="mono text-right text-fg" style={{ minWidth: `${String(valueWidths[index] ?? 1)}ch` }}>
+                  {value !== null && value !== undefined ? formatValue(value) : "-"}
+                </span>
+              </li>
+            );
+          })}
+        </ul>
+      </div>
+      <div role="status" aria-live="polite" aria-atomic="true" className="sr-only">
+        {announcement}
+      </div>
 
       {asTable ? (
         <div className="rounded-control border border-border">
@@ -514,6 +708,7 @@ export function Chart({
               <tbody>
                 {timestamps
                   .map((t, i) => ({ t, i }))
+                  .filter(({ i }) => bounds !== null && i >= bounds[0] && i <= bounds[1])
                   .reverse()
                   .map(({ t, i }) => (
                     <tr key={t} className="border-t border-border">
@@ -559,7 +754,29 @@ export function Chart({
         </div>
       ) : (
         <div className="relative min-w-0">
-          <div ref={hostRef} role="img" aria-label={summary} className="min-w-0" style={{ height }} />
+          {/* The keyboard's way into the readout. An application, not the image itself: a
+              screen reader in browse mode keeps the arrow keys for itself on anything else,
+              and they are what steps from sample to sample here. jsx-a11y does not count
+              "application" as interactive, though it is exactly the role for this. */}
+          {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions */}
+          <div
+            role="application"
+            aria-roledescription="chart"
+            aria-label={title}
+            aria-describedby={hintId}
+            // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex
+            tabIndex={0}
+            onKeyDown={onKeyDown}
+            onBlur={() => {
+              if (spoken !== "") moveCursor(null);
+            }}
+            className="rounded-control focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
+          >
+            <div ref={hostRef} role="img" aria-label={summary} className="min-w-0" style={{ height }} />
+          </div>
+          <span id={hintId} className="sr-only">
+            {`Left and right arrow keys step through the samples, Home and End go to the first and last, Escape clears.${zoomable ? " Drag across the chart with a pointer to zoom, or use the zoom buttons." : ""}`}
+          </span>
           {positions.length > 0 ? (
             <div className="pointer-events-none absolute inset-0 z-10">
               {positions.map(({ marker, left, top }) => (
@@ -579,6 +796,195 @@ export function Chart({
           ) : null}
         </div>
       )}
+    </>
+  );
+}
+
+/** How many of `timestamps` fall within [start, end]. */
+function timestampsInside(timestamps: ArrayLike<number>, start: number, end: number): number {
+  let count = 0;
+  for (const t of Array.from(timestamps)) {
+    if (t >= start && t <= end) count += 1;
+  }
+  return count;
+}
+
+/**
+ * The window after zooming in (half the span) or out (twice it) around the middle of what is
+ * shown, kept within the data; null once it covers all of it again. Zooming in stops at a
+ * handful of samples, where there is nothing more to see.
+ */
+export function zoomStep(timestamps: readonly number[], current: ChartWindow | null, direction: "in" | "out"): ChartWindow | null {
+  const first = timestamps[0];
+  const last = timestamps.at(-1);
+  if (first === undefined || last === undefined || last <= first) return current;
+  const [start, end] = current ?? [first, last];
+  const middle = (start + end) / 2;
+  const span = direction === "in" ? (end - start) / 2 : (end - start) * 2;
+  if (span >= last - first) return null;
+  let next: [number, number] = [middle - span / 2, middle + span / 2];
+  if (next[0] < first) next = [first, first + span];
+  if (next[1] > last) next = [last - span, last];
+  if (direction === "in" && timestampsInside(timestamps, next[0], next[1]) < 4) return current;
+  return next;
+}
+
+/** A dialog's chart fills what the viewport leaves under the dialog's header and controls. */
+function expandedHeight(): number {
+  return Math.round(Math.min(560, Math.max(240, window.innerHeight * 0.88 - 300)));
+}
+
+interface ChartDialogProps extends Omit<ChartBodyProps, "asTable" | "tableId" | "zoom" | "onZoom" | "height"> {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  description: string | undefined;
+  rangeSelector: ChartRangeSelector | undefined;
+}
+
+/** The chart enlarged: the page's range, zoom on the time axis, the readout and the table. */
+function ChartDialog({ open, onOpenChange, description, rangeSelector, ...body }: ChartDialogProps) {
+  const [asTable, setAsTable] = useState(false);
+  // The zoom belongs to the range it was made in: a new range starts whole.
+  const [zoom, setZoom] = useState<{ range: string; window: ChartWindow } | null>(null);
+  const tableId = useId();
+  const rangeKey = rangeSelector?.value ?? "";
+  const active = zoom !== null && zoom.range === rangeKey ? zoom.window : null;
+  const [height] = useState(expandedHeight);
+
+  const apply = (window: ChartWindow | null): void => {
+    setZoom(window === null ? null : { range: rangeKey, window });
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange} title={body.title} description={description} size="xl">
+      <div className="flex flex-col gap-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>{rangeSelector?.control}</div>
+          <div className="flex flex-wrap items-center gap-1">
+            <IconButton
+              label="Zoom in"
+              icon={<ZoomIn />}
+              size="sm"
+              disabled={asTable}
+              onClick={() => {
+                apply(zoomStep(body.timestamps, active, "in"));
+              }}
+            />
+            <IconButton
+              label="Zoom out"
+              icon={<ZoomOut />}
+              size="sm"
+              disabled={asTable || active === null}
+              onClick={() => {
+                apply(zoomStep(body.timestamps, active, "out"));
+              }}
+            />
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={active === null}
+              onClick={() => {
+                apply(null);
+              }}
+            >
+              Reset zoom
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              aria-pressed={asTable}
+              aria-controls={asTable ? tableId : undefined}
+              onClick={() => {
+                setAsTable((v) => !v);
+              }}
+            >
+              View as table
+            </Button>
+          </div>
+        </div>
+        <ChartBody {...body} height={height} asTable={asTable} tableId={tableId} zoom={active} onZoom={apply} />
+        <p className="text-12 text-pretty text-fg-faint">
+          {active === null
+            ? "Drag across the chart to zoom into a stretch of time."
+            : `Showing ${formatChartTime(active[0], body.withDate)} to ${formatChartTime(active[1], body.withDate)}. Double-click the chart or reset the zoom to see all of it.`}
+        </p>
+      </div>
+    </Dialog>
+  );
+}
+
+/**
+ * A time series drawn with uPlot. The canvas is an image with a written summary; the same
+ * numbers are one press away as a table, for screen readers and for anyone who wants them.
+ * Hovering (or stepping with the arrow keys) reads out one sample; Expand opens it large, with
+ * the page's range and zoom. Markers (deploys, typically) are drawn by the chart itself: a
+ * hairline on the canvas and a focusable state glyph positioned from uPlot's own geometry.
+ */
+export function Chart({
+  title,
+  description,
+  timestamps,
+  series,
+  markers,
+  formatValue = defaultFormat,
+  yRange,
+  timeFormat,
+  height = 160,
+  rangeSelector,
+  className,
+}: ChartProps) {
+  const [asTable, setAsTable] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  const tableId = useId();
+
+  const withDate = timeFormat ? timeFormat === "date" : needsDateFormat(timestamps);
+  const from = timestamps[0];
+  const to = timestamps.at(-1);
+  const visibleMarkers = markers !== undefined && from !== undefined && to !== undefined ? markersInRange(markers, from, to) : [];
+  const summary = summarise(title, description, series, formatValue, markers !== undefined ? visibleMarkers.length : undefined);
+  const shared = { title, summary, timestamps, series, markers, formatValue, yRange, withDate };
+
+  return (
+    <figure className={cx("flex min-w-0 flex-col gap-3", className)}>
+      <figcaption className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-13 font-medium text-fg">{title}</div>
+          {description !== undefined ? <div className="text-12 text-fg-faint">{description}</div> : null}
+        </div>
+        <div className="-mr-2 flex shrink-0 items-center gap-0.5">
+          <IconButton
+            label={`Expand ${title}`}
+            icon={<Maximize2 />}
+            size="sm"
+            onClick={() => {
+              setExpanded(true);
+            }}
+          />
+          <Button
+            size="sm"
+            variant="ghost"
+            aria-pressed={asTable}
+            aria-controls={asTable ? tableId : undefined}
+            onClick={() => {
+              setAsTable((v) => !v);
+            }}
+          >
+            View as table
+          </Button>
+        </div>
+      </figcaption>
+
+      <ChartBody {...shared} height={height} asTable={asTable} tableId={tableId} zoom={null} />
+
+      {expanded ? (
+        <ChartDialog
+          {...shared}
+          open={expanded}
+          onOpenChange={setExpanded}
+          description={description}
+          rangeSelector={rangeSelector}
+        />
+      ) : null}
     </figure>
   );
 }

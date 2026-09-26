@@ -91,6 +91,10 @@ GIT_TIMEOUT = 60
 GIT_NETWORK_TIMEOUT = 300
 GIT_CLONE_TIMEOUT = 600
 
+#: git's exit status for a usage error, such as an option this version of git
+#: does not know.
+_GIT_USAGE_ERROR = 129
+
 _COPY_CHUNK = 1 << 16
 
 #: The only schemes that mean "fetch these bytes over the network".
@@ -109,6 +113,20 @@ _REMOTE_HELPER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*::")
 _SCP_LIKE_RE = re.compile(r"^[\w.+-]+@[\w.-]+:(?!/)[\w./~+-]+$")
 
 _GIT_REF_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/+-]*$")
+
+#: A commit named by its hash: git's shortest abbreviation up to a full
+#: SHA-256 id. Hex only, so it can never be read as an option or a ref name.
+_COMMIT_ID_RE = re.compile(r"^[0-9a-f]{4,64}$")
+
+#: Lengths of a full commit id (SHA-1, SHA-256): the only ids a server can be
+#: asked for by name, because an abbreviation is resolved by the client.
+_FULL_COMMIT_LENGTHS = (40, 64)
+
+#: Local git configuration key naming the branch an in-place checkout follows
+#: while it is detached on one commit. Written by
+#: :meth:`SourceManager.checkout_commit`, read by :meth:`SourceManager.pull`,
+#: so the next plain update goes back to following the branch.
+FOLLOW_BRANCH_KEY = "wasm.branch"
 
 _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:")
 
@@ -429,6 +447,43 @@ def validate_git_ref(ref: str) -> str:
             details="Use letters, digits and any of . _ / + -",
         )
     return candidate
+
+
+def validate_commit_id(commit: str) -> str:
+    """
+    Check that a commit id is a hash git can resolve and argv can carry.
+
+    Args:
+        commit: Full or abbreviated commit hash.
+
+    Returns:
+        The id, lowercased and stripped.
+
+    Raises:
+        SourceError: If it is not 4 to 64 hexadecimal characters.
+    """
+    candidate = (commit or "").strip().lower()
+    if not _COMMIT_ID_RE.match(candidate):
+        raise SourceError(
+            f"Not a commit id: {commit!r}",
+            details="Name the commit by its hash, full or abbreviated to at least 4 "
+            "characters, as git log shows it.",
+        )
+    return candidate
+
+
+@dataclass(frozen=True)
+class RemoteHead:
+    """
+    The commit a branch points at on the remote, as ``git ls-remote`` says.
+
+    Attributes:
+        branch: The branch asked about, or the remote's default branch.
+        commit: Its full commit id.
+    """
+
+    branch: str
+    commit: str
 
 
 # Download -----------------------------------------------------------------
@@ -1555,6 +1610,235 @@ class SourceManager(BaseManager):
         finally:
             self.fs.remove(archive, missing_ok=True)
 
+    def remote_head(self, source: str, branch: str | None = None) -> RemoteHead:
+        """
+        Ask the remote which commit a branch points at, downloading nothing.
+
+        ``git ls-remote`` reads the remote's refs and nothing else, so this is
+        cheap enough to ask before every update whether there is anything new.
+
+        Args:
+            source: Git URL, optionally with ``#branch``.
+            branch: Branch to ask about. None asks about the branch in the
+                URL, or else the remote's default branch.
+
+        Returns:
+            The branch and the full id of the commit it points at.
+
+        Raises:
+            SourceError: If the source is not a git URL, the branch does not
+                exist on the remote, or the remote cannot be read (a refused
+                credential gets the error that says how to grant access).
+        """
+        source_type, normalized = validate_source(source)
+        if source_type != "git":
+            raise SourceError(
+                f"Not a git source: {source}",
+                details="Only a git remote has a branch head to compare with.",
+            )
+        parsed = parse_git_url(normalized)
+        branch = branch or parsed["branch"] or None
+        url = validate_git_remote_url(normalized.split("#")[0])
+
+        if branch:
+            safe_branch = validate_git_ref(branch)
+            result = self._git(
+                ["ls-remote", "--exit-code", "--", url, f"refs/heads/{safe_branch}"],
+                timeout=GIT_NETWORK_TIMEOUT,
+            )
+            # --exit-code: 2 means the remote answered and has no such ref.
+            if result.exit_code == 2:
+                raise SourceError(
+                    f"Branch {safe_branch} does not exist on {url}",
+                    details="Check the branch name, or deploy another branch with --branch.",
+                )
+            if not result.success:
+                raise self._git_failed(result, f"Cannot read the branches of {url}", url=url)
+            for line in result.stdout.splitlines():
+                commit, _, ref = line.partition("\t")
+                if ref.strip() == f"refs/heads/{safe_branch}":
+                    return RemoteHead(branch=safe_branch, commit=commit.strip())
+            raise SourceError(
+                f"Branch {safe_branch} does not exist on {url}",
+                details=result.stdout.strip() or "git ls-remote answered nothing.",
+            )
+
+        result = self._git(
+            ["ls-remote", "--symref", "--", url, "HEAD"], timeout=GIT_NETWORK_TIMEOUT
+        )
+        if not result.success:
+            raise self._git_failed(result, f"Cannot read the branches of {url}", url=url)
+        default: str | None = None
+        head: str | None = None
+        for line in result.stdout.splitlines():
+            left, _, ref = line.partition("\t")
+            if ref.strip() != "HEAD":
+                continue
+            if left.startswith("ref: refs/heads/"):
+                default = left.removeprefix("ref: refs/heads/").strip()
+            else:
+                head = left.strip()
+        if default is None or head is None:
+            raise SourceError(
+                f"Cannot tell the default branch of {url}",
+                details="Name the branch the application follows with --branch.",
+            )
+        return RemoteHead(branch=default, commit=head)
+
+    def resolve_commit(self, repository: Path, commit: str) -> str:
+        """
+        Name the one commit an id means in a clone, fetching it when missing.
+
+        The clone is asked first, so a commit that is already there costs no
+        network. Otherwise a full id is fetched by name, which every forge
+        allows, and failing that (or for an abbreviation, which only the
+        client can expand) every branch and tag is fetched, with the rest of
+        the history when the clone is shallow, and the id is asked again.
+
+        Args:
+            repository: A clone with an ``origin`` remote.
+            commit: Full or abbreviated commit id.
+
+        Returns:
+            The full commit id.
+
+        Raises:
+            SourceError: If the id is not a hash, names more than one commit,
+                names none, or the fetch fails.
+        """
+        wanted = validate_commit_id(commit)
+        self._ensure_safe_directory(repository)
+
+        found = self._lookup_commit(repository, wanted)
+        if found is not None:
+            return found
+
+        if len(wanted) in _FULL_COMMIT_LENGTHS:
+            by_name = self._git(
+                ["fetch", "origin", wanted], cwd=repository, timeout=GIT_NETWORK_TIMEOUT
+            )
+            if by_name.success:
+                found = self._lookup_commit(repository, wanted)
+                if found is not None:
+                    return found
+
+        shallow = self._git(["rev-parse", "--is-shallow-repository"], cwd=repository)
+        fetch = ["fetch"]
+        if shallow.success and shallow.stdout.strip() == "true":
+            fetch.append("--unshallow")
+        fetch += ["--tags", "origin", "+refs/heads/*:refs/remotes/origin/*"]
+        result = self._git(fetch, cwd=repository, timeout=GIT_CLONE_TIMEOUT)
+        if not result.success:
+            raise self._git_failed(
+                result, f"Fetching the history to find {wanted} failed", repository=repository
+            )
+
+        found = self._lookup_commit(repository, wanted)
+        if found is None:
+            raise SourceError(
+                f"Commit {wanted} does not exist in the repository",
+                details="Check the id with 'git log'. A commit that only exists on a fork, "
+                "or that a force push removed from every branch, cannot be deployed.",
+            )
+        return found
+
+    def _lookup_commit(self, repository: Path, commit: str) -> str | None:
+        """
+        Expand a commit id the clone already has.
+
+        Args:
+            repository: The clone.
+            commit: A validated commit id.
+
+        Returns:
+            The full id, or None when the clone does not have it.
+
+        Raises:
+            SourceError: If the abbreviation names more than one commit.
+        """
+        result = self._git(["rev-parse", "--verify", f"{commit}^{{commit}}"], cwd=repository)
+        if result.success and result.stdout.strip():
+            return result.stdout.strip().splitlines()[-1]
+        if "ambiguous" in result.stderr.lower():
+            raise SourceError(
+                f"{commit} names more than one commit",
+                details="Give more characters of the commit id.",
+            )
+        return None
+
+    def checkout_commit(self, path: Path, commit: str) -> str:
+        """
+        Put an in-place checkout on exactly one commit.
+
+        The checkout is detached at the commit rather than moving the branch:
+        a branch reset to an older commit would make the next ``git pull
+        --rebase`` replay whatever that commit has that the remote branch does
+        not. The branch that was checked out is remembered under
+        :data:`FOLLOW_BRANCH_KEY`, and :meth:`pull` goes back to it, so the
+        next plain update follows the branch again.
+
+        Tracked files are rewritten to the commit (``--force``); untracked
+        ones, the application's uploads among them, are left where they are.
+
+        Args:
+            path: The checkout.
+            commit: Full or abbreviated commit id.
+
+        Returns:
+            The full commit id checked out.
+
+        Raises:
+            SourceError: If the path is not a checkout, the commit cannot be
+                resolved, or the checkout fails.
+        """
+        if not (path / ".git").exists():
+            raise SourceError(
+                f"Not a Git repository: {path}",
+                details="Only an application deployed from git can be put on a commit.",
+            )
+        full = self.resolve_commit(path, commit)
+
+        # Only a checkout on a branch names one; one already detached by an
+        # earlier rebuild keeps the branch that rebuild remembered.
+        attached = self._git(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd=path)
+        if attached.success and attached.stdout.strip():
+            self._git(["config", FOLLOW_BRANCH_KEY, attached.stdout.strip()], cwd=path)
+
+        result = self._git(["checkout", "--force", "--detach", full], cwd=path)
+        if not result.success:
+            raise SourceError(f"Git checkout of {full[:7]} failed", details=result.stderr)
+        return full
+
+    def _followed_branch(self, path: Path) -> str | None:
+        """
+        Name the branch a detached checkout goes back to.
+
+        Args:
+            path: The checkout.
+
+        Returns:
+            The branch :meth:`checkout_commit` remembered, else the remote's
+            default branch, else None.
+        """
+        remembered = self._git(["config", "--get", FOLLOW_BRANCH_KEY], cwd=path)
+        if remembered.success and remembered.stdout.strip():
+            return remembered.stdout.strip()
+        default = self._git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd=path)
+        name = default.stdout.strip() if default.success else ""
+        return name.removeprefix("origin/") or None
+
+    def _is_detached(self, path: Path) -> bool:
+        """
+        Report whether a checkout is on a commit rather than a branch.
+
+        Args:
+            path: The checkout.
+
+        Returns:
+            True when HEAD is detached.
+        """
+        return not self._git(["symbolic-ref", "--quiet", "HEAD"], cwd=path).success
+
     def clone_git(
         self,
         url: str,
@@ -1623,6 +1907,121 @@ class SourceManager(BaseManager):
 
         return True
 
+    def sparse_clone(
+        self,
+        source: str,
+        destination: Path,
+        *,
+        branch: str | None = None,
+        patterns: Sequence[str],
+    ) -> bool:
+        """
+        Check out a handful of files of a branch's tip, and nothing else.
+
+        What repository inspection needs instead of a clone: one commit
+        (``--depth 1``), its trees but no file contents (``--filter=blob:none``),
+        and then only the blobs the sparse patterns name, fetched by the
+        checkout. A repository of hundreds of megabytes costs its tree
+        listing and a few kilobytes of ``package.json``.
+
+        ``--sparse`` is not passed to the clone: with ``--no-checkout`` it
+        would only initialise cone mode, which ``sparse-checkout set
+        --no-cone`` then replaces. Checked against git 2.34 (Ubuntu 22.04),
+        2.39 (Debian 12) and 2.43.
+
+        Args:
+            source: Git URL, optionally with ``#branch``.
+            destination: Directory to create the checkout in; must not exist.
+            branch: Branch or tag to check out; ``#branch`` in the URL when
+                omitted, and the repository default when neither names one.
+            patterns: Non-cone sparse-checkout patterns, each anchored at the
+                root with a leading ``/``.
+
+        Returns:
+            True when the sparse checkout is in place; False when this git
+            cannot do one (an option it does not know, a sparse step that
+            fails), so the caller can fall back to a shallow clone.
+
+        Raises:
+            SourceError: If the source or branch is unsafe, a pattern is not
+                anchored, or the remote refused or could not be reached; those
+                would fail a full clone just the same.
+        """
+        source_type, normalized = validate_source(source)
+        if source_type != "git":
+            raise SourceError(
+                f"Not a git source: {source}",
+                details="Only a git remote can be checked out sparsely.",
+            )
+        url = validate_git_remote_url(normalized.split("#")[0])
+        ref = branch or parse_git_url(normalized)["branch"] or None
+        branch_args = ["--branch", validate_git_ref(ref)] if ref else []
+        for pattern in patterns:
+            # Anchored patterns can never be read as an option, and never
+            # match a file deeper in the tree than the caller meant.
+            if not pattern.startswith("/") or "\n" in pattern:
+                raise SourceError(f"Not an anchored sparse-checkout pattern: {pattern!r}")
+
+        if is_ssh_url(url):
+            ensure_ssh_setup(url, auto_generate=True, verbose=self.verbose)
+
+        result = self._git(
+            [
+                "clone",
+                "--filter=blob:none",
+                "--depth",
+                "1",
+                "--no-checkout",
+                *branch_args,
+                "--",
+                url,
+                str(destination),
+            ],
+            timeout=GIT_NETWORK_TIMEOUT,
+        )
+        if result.exit_code == _GIT_USAGE_ERROR:
+            self.logger.debug(f"git cannot clone without blobs: {result.stderr.strip()}")
+            return False
+        if not result.success:
+            raise self._git_failed(result, f"Git clone failed: {url}", url=url)
+
+        result = self._git(["sparse-checkout", "set", "--no-cone", *patterns], cwd=destination)
+        if not result.success:
+            self.logger.debug(f"git cannot check out sparsely: {result.stderr.strip()}")
+            return False
+
+        # The checkout is what fetches the blobs the patterns kept, so it is
+        # a network command and can be refused credentials like the clone.
+        result = self._git(["checkout", "-q"], cwd=destination, timeout=GIT_NETWORK_TIMEOUT)
+        if not result.success:
+            if is_git_auth_failure(f"{result.stderr}\n{result.stdout}"):
+                raise git_auth_error(url, result)
+            self.logger.debug(f"Sparse checkout failed: {result.stderr.strip()}")
+            return False
+        return True
+
+    def list_files(self, repository: Path) -> list[str]:
+        """
+        Name every file of the checked-out commit, without reading one.
+
+        In a blobless clone the trees are local and the file contents are
+        not, so this answers what the repository holds at no network cost,
+        whatever the sparse checkout left out.
+
+        Args:
+            repository: A clone.
+
+        Returns:
+            Paths relative to the repository root, POSIX separators.
+
+        Raises:
+            SourceError: If git cannot list the commit.
+        """
+        result = self._git(["ls-tree", "-r", "-z", "--name-only", "HEAD"], cwd=repository)
+        if not result.success:
+            raise SourceError(f"Cannot list the files of {repository}", details=result.stderr)
+        return [name for name in result.stdout.split("\0") if name]
+
     def _ensure_safe_directory(self, path: Path) -> None:
         """
         Ensure a directory is marked as safe for Git operations.
@@ -1672,6 +2071,18 @@ class SourceManager(BaseManager):
 
         # Ensure directory is marked as safe (handles dubious ownership)
         self._ensure_safe_directory(path)
+
+        # A checkout that a rebuild put on one commit is detached, and
+        # `pull` on a detached HEAD has no branch to follow: go back to the
+        # one the rebuild left, so a plain update follows the branch again.
+        if safe_branch is None and self._is_detached(path):
+            followed = self._followed_branch(path)
+            if followed is None:
+                raise SourceError(
+                    f"{path} is on a single commit and names no branch to go back to",
+                    details="Name the branch to follow: wasm update <domain> --branch <name>",
+                )
+            safe_branch = validate_git_ref(followed)
 
         # Check for local changes that would prevent pull
         has_changes = self._has_local_changes(path)
@@ -1951,7 +2362,7 @@ class SourceManager(BaseManager):
         Returns:
             Dictionary with repository information.
         """
-        info = {
+        info: dict[str, Any] = {
             "is_git": False,
             "branch": None,
             "remote": None,
@@ -1968,6 +2379,10 @@ class SourceManager(BaseManager):
         result = self._git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=path)
         if result.success:
             info["branch"] = result.stdout.strip()
+        if info["branch"] == "HEAD":
+            # Detached on one commit by a rebuild: what it follows is the
+            # branch the next update returns to, not the word HEAD.
+            info["branch"] = self._followed_branch(path)
 
         # Get remote URL
         result = self._git(["config", "--get", "remote.origin.url"], cwd=path)

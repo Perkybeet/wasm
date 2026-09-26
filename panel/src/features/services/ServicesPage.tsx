@@ -139,7 +139,9 @@ export function ServicesPage({ search, onSearchChange }: ServicesPageProps) {
               />
             }
           />
-          <CommandHint command="wasm service list" label="From a terminal" />
+          {/* Drawn with the rows, not before: under a list of unknown length it would only be
+              pushed down the page when they arrive. */}
+          {services.isPending ? null : <CommandHint command="wasm service list" label="From a terminal" />}
         </div>
       )}
 

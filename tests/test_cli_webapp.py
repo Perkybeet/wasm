@@ -22,6 +22,7 @@ from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import ANY
 
 import click
 import pytest
@@ -319,6 +320,7 @@ class DeployerSpy:
             prisma_updated=False,
             is_static=False,
             start_command="/usr/bin/node server.js",
+            restarted=None,
         )
 
 
@@ -346,6 +348,7 @@ def make_app(
         domain=domain,
         app_type=app_type,
         app_path=app_path,
+        layout="inplace",
         is_static=is_static,
         status="running",
         port=3000,
@@ -1254,6 +1257,8 @@ def test_update_delegates_the_rebuild_to_the_deployer(
         lambda verbose=False: SimpleNamespace(
             pull=lambda path, branch=None: pulls.append((path, branch)),
             fetch=lambda *a, **kw: None,
+            # No commit to compare: the nothing-new check stays out of the way.
+            get_repo_info=lambda path: {"commit": None},
         ),
     )
     monkeypatch.setattr(
@@ -1295,6 +1300,7 @@ def test_update_accepts_yarn(
         lambda verbose=False: SimpleNamespace(
             pull=lambda path, branch=None: None,
             fetch=lambda *a, **kw: None,
+            get_repo_info=lambda path: {"commit": None},
         ),
     )
     monkeypatch.setattr(
@@ -1341,7 +1347,9 @@ def test_update_rebuilds_a_monorepo_through_its_deployer(
     monkeypatch.setattr(
         lifecycle,
         "SourceManager",
-        lambda verbose=False: SimpleNamespace(pull=lambda path, branch=None: None),
+        lambda verbose=False: SimpleNamespace(
+            pull=lambda path, branch=None: None, get_repo_info=lambda path: {"commit": None}
+        ),
     )
     monkeypatch.setattr(
         lifecycle,
@@ -1374,6 +1382,142 @@ def test_update_refuses_an_application_that_is_not_there(
     assert result.exit_code == 1
     assert isinstance(result.exception, webapp.WASMError)
     assert "Application not found: example.com" in str(result.exception)
+
+
+class UpdateCalls:
+    """What ``wasm update`` asked of the lifecycle."""
+
+    def __init__(self) -> None:
+        self.updates: list[dict[str, Any]] = []
+        self.checks: list[dict[str, Any]] = []
+
+
+@pytest.fixture
+def update_calls(monkeypatch: pytest.MonkeyPatch) -> UpdateCalls:
+    """
+    Replace the update and the upstream check the command calls.
+
+    The upstream check answers "nothing new since abc1234" unless a test
+    changes ``answer``.
+
+    Args:
+        monkeypatch: Patching helper.
+
+    Returns:
+        The recorded calls.
+    """
+    calls = UpdateCalls()
+    calls.answer = lifecycle.UpstreamState(  # type: ignore[attr-defined]
+        domain="example.com", branch="main", live_commit="abc1234", remote_commit="abc1234" * 5
+    )
+
+    def check_upstream(domain: str, **kwargs: Any) -> Any:
+        calls.checks.append({"domain": domain, **kwargs})
+        return calls.answer  # type: ignore[attr-defined]
+
+    def update_app(domain: str, **kwargs: Any) -> Any:
+        calls.updates.append({"domain": domain, **kwargs})
+        return lifecycle.AppUpdate(
+            domain=domain,
+            app_type="nextjs",
+            package_manager="npm",
+            prisma_updated=False,
+            is_static=False,
+            restarted=("example-com",),
+            active=True,
+        )
+
+    monkeypatch.setattr(webapp, "check_upstream", check_upstream)
+    monkeypatch.setattr(webapp, "update_app", update_app)
+    return calls
+
+
+def test_update_commit_deploys_that_commit_without_asking(
+    cli_runner: CliRunner, update_calls: UpdateCalls
+) -> None:
+    """--commit is explicit: no upstream check, the commit reaches the lifecycle."""
+    result = cli_runner.invoke(
+        webapp.cli.commands["update"], ["example.com", "--commit", "abc1234"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert update_calls.checks == []
+    assert update_calls.updates[0]["commit"] == "abc1234"
+
+
+def test_update_with_nothing_new_asks_on_a_terminal_and_can_stop(
+    cli_runner: CliRunner,
+    update_calls: UpdateCalls,
+    console: io.StringIO,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Declined: nothing rebuilt, and it says why it asked."""
+    monkeypatch.setattr(webapp, "_can_ask", lambda: True)
+
+    result = cli_runner.invoke(webapp.cli.commands["update"], ["example.com"], input="n\n")
+
+    assert result.exit_code == 0, result.output
+    assert update_calls.updates == []
+    output = shown(result, console)
+    assert "No new commits on main since abc1234, which is live" in output
+    assert "Rebuild it anyway?" in output
+    assert "last build broke" in output
+
+
+def test_update_with_nothing_new_rebuilds_when_the_terminal_says_so(
+    cli_runner: CliRunner, update_calls: UpdateCalls, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Confirmed: the same update as always."""
+    monkeypatch.setattr(webapp, "_can_ask", lambda: True)
+
+    result = cli_runner.invoke(webapp.cli.commands["update"], ["example.com"], input="y\n")
+
+    assert result.exit_code == 0, result.output
+    assert len(update_calls.updates) == 1
+
+
+def test_update_with_nothing_new_in_a_script_rebuilds_and_says_so(
+    cli_runner: CliRunner,
+    update_calls: UpdateCalls,
+    console: io.StringIO,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nobody to ask: proceed, never block a script on a prompt."""
+    monkeypatch.setattr(webapp, "_can_ask", lambda: False)
+
+    result = cli_runner.invoke(webapp.cli.commands["update"], ["example.com"])
+
+    assert result.exit_code == 0, result.output
+    assert len(update_calls.updates) == 1
+    assert "rebuilding it anyway" in shown(result, console)
+
+
+@pytest.mark.parametrize("flag", ["-y", "--force"])
+def test_update_force_skips_the_question(
+    cli_runner: CliRunner, update_calls: UpdateCalls, monkeypatch: pytest.MonkeyPatch, flag: str
+) -> None:
+    """-y and --force rebuild the live commit without asking."""
+    monkeypatch.setattr(webapp, "_can_ask", lambda: True)
+
+    result = cli_runner.invoke(webapp.cli.commands["update"], ["example.com", flag])
+
+    assert result.exit_code == 0, result.output
+    assert len(update_calls.updates) == 1
+    assert "Rebuild it anyway?" not in result.output
+
+
+def test_update_with_news_does_not_ask(
+    cli_runner: CliRunner, update_calls: UpdateCalls, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Something new on the branch, or nothing to compare: straight to the update."""
+    monkeypatch.setattr(webapp, "_can_ask", lambda: True)
+    update_calls.answer = None  # type: ignore[attr-defined]
+
+    result = cli_runner.invoke(webapp.cli.commands["update"], ["example.com", "-b", "main"])
+
+    assert result.exit_code == 0, result.output
+    assert update_calls.checks == [{"domain": "example.com", "branch": "main", "logger": ANY}]
+    assert len(update_calls.updates) == 1
 
 
 # ---------------------------------------------------------------------------

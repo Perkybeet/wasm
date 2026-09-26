@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field
 
 from wasm.core.exceptions import ValidationError
 from wasm.core.store import JobRecord, get_store
+from wasm.deployers.lifecycle import NOTHING_NEW_HINT, check_upstream
 from wasm.validators.names import validate_filename
 from wasm.web.api.auth import get_current_session
 from wasm.web.api.deps import WASMErrorRoute, require_elevated, strict_domain
@@ -60,6 +61,10 @@ class UpdateRequest(BaseModel):
     """Request to update an application."""
 
     domain: str = Field(..., description="Domain of the application to update")
+    force: bool = Field(
+        default=False,
+        description="Rebuild even when the branch has no commit the live build lacks",
+    )
 
 
 class DeleteRequest(BaseModel):
@@ -340,14 +345,33 @@ def create_update_job(
     """
     Queue an update.
 
+    Unless ``force`` is set, the head of the branch on the remote is compared
+    with the live commit first (``git ls-remote``, nothing is downloaded), and
+    an update that would rebuild the same commit is refused with ``409
+    nothing_new``. The webhook does not ask: a push is itself the news.
+
     Args:
         request: The update request.
         session: The authenticated session.
 
     Returns:
         The queued job.
+
+    Raises:
+        HTTPException: 409 ``nothing_new`` when the branch has nothing new.
     """
     domain = strict_domain(request.domain)
+    if not request.force:
+        upstream = check_upstream(domain)
+        if upstream is not None and not upstream.has_new_commits:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "nothing_new",
+                    "detail": upstream.summary,
+                    "hint": NOTHING_NEW_HINT,
+                },
+            )
     job = get_job_manager().create_job(
         job_type=JobType.UPDATE,
         name=f"Update {domain}",

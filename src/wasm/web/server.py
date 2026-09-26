@@ -557,11 +557,14 @@ async def lifespan(app: FastAPI):
     Args:
         app: The application being started.
     """
+    from wasm.deployers.inspect import remove_stale_checkouts
     from wasm.web.jobs import get_job_manager
     from wasm.web.metrics_collector import start_metrics_collector, stop_metrics_collector
 
     manager = get_token_manager()
     manager.purge_expired_sessions()
+    # What a console killed mid-inspection could not remove itself.
+    remove_stale_checkouts()
     jobs = get_job_manager()
     notify_jobs = JobNotificationSubscriber()
     jobs.subscribe_all(notify_jobs)

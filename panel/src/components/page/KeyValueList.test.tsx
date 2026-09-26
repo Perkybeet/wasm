@@ -57,6 +57,13 @@ describe("KeyValueList", () => {
     expect(container.firstElementChild?.children).toHaveLength(3);
   });
 
+  it("reserves a second line for the rows that will carry a note", () => {
+    const { container } = render(<KeyValueListSkeleton rows={3} hints={[1]} />);
+    const rows = Array.from(container.firstElementChild?.children ?? []);
+    // Each row's value column: one line, or the line and the note's.
+    expect(rows.map((row) => row.lastElementChild?.children.length)).toEqual([1, 2, 1]);
+  });
+
   it("has no accessibility violations", async () => {
     const { container } = render(<KeyValueList items={[...ITEMS, { label: "Note", value: "x", hint: "Set by MemoryMax" }]} />);
     await expectNoAxeViolations(container);

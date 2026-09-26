@@ -10,7 +10,6 @@ import { Section } from "../../components/page/Section";
 import { Button } from "../../components/ui/Button";
 import { EmptyState } from "../../components/ui/EmptyState";
 import { Select } from "../../components/ui/Select";
-import { Skeleton } from "../../components/ui/Skeleton";
 import { CreateDatabaseDialog } from "./CreateDatabaseDialog";
 import { DatabasesTable } from "./DatabasesTable";
 import { engineLabel } from "./data";
@@ -60,11 +59,11 @@ export function DatabasesPage() {
           <QueryState
             query={databases}
             label="databases"
+            // The table itself with placeholder rows, and the hint under it: the loaded shape.
             skeleton={
-              <div aria-hidden="true" className="flex flex-col gap-2">
-                {[0, 1, 2].map((i) => (
-                  <Skeleton key={i} className="h-10 rounded-card" />
-                ))}
+              <div className="flex flex-col gap-3">
+                <DatabasesTable databases={[]} caption="Databases" loading />
+                <CommandHint command="wasm db list" label="From a terminal" />
               </div>
             }
             isEmpty={(data) => data.databases.length === 0}
@@ -98,6 +97,7 @@ export function DatabasesPage() {
 
         <UsersPanel
           engines={engines.data?.engines ?? []}
+          loading={engines.isPending}
           engine={activeUsersEngine}
           onEngineChange={setUsersEngine}
         />

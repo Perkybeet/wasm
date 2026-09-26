@@ -168,3 +168,94 @@ def test_a_refused_rollback_exits_1_with_the_lifecycle_words(
     assert main(["releases", "rollback", DOMAIN]) == 1
     assert any("deployed in place" in line for line in log)
     assert any("wasm app migrate" in line for line in log)
+
+
+# ---------------------------------------------------------------------------
+# wasm releases keep
+# ---------------------------------------------------------------------------
+
+
+def test_keep_sets_the_retention_through_the_lifecycle_and_names_what_was_pruned(
+    monkeypatch: pytest.MonkeyPatch, log: list[str]
+) -> None:
+    """The lifecycle validates and prunes; the command reports."""
+    from wasm.deployers.lifecycle import RetentionChange
+
+    calls: list[tuple[str, int]] = []
+
+    def apply(domain: str, keep: int, **kwargs: Any) -> RetentionChange:
+        calls.append((domain, keep))
+        return RetentionChange(domain=domain, keep_releases=keep, pruned=(OLD,))
+
+    monkeypatch.setattr(releases_module, "set_release_retention", apply)
+
+    result = invoke(["releases", "keep", DOMAIN, "3"])
+
+    assert result.exit_code == 0, result.output
+    assert calls == [(DOMAIN, 3)]
+    assert any("keeps 3 releases" in line for line in log)
+    assert any(OLD in line for line in log)
+
+
+def test_keep_prints_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    from wasm.deployers.lifecycle import RetentionChange
+
+    monkeypatch.setattr(
+        releases_module,
+        "set_release_retention",
+        lambda domain, keep, **kw: RetentionChange(domain=domain, keep_releases=keep, pruned=()),
+    )
+
+    result = invoke(["--json", "releases", "keep", DOMAIN, "7"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == {"domain": DOMAIN, "keep_releases": 7, "pruned": []}
+
+
+def test_keep_out_of_range_exits_1_with_the_range(
+    monkeypatch: pytest.MonkeyPatch, log: list[str], tmp_path: Path
+) -> None:
+    """The store's refusal, verbatim; nothing is pruned."""
+    from wasm.core.store import App, WASMStore
+    from wasm.deployers import lifecycle
+
+    WASMStore.reset_instance()
+    store = WASMStore(tmp_path / "wasm.db")
+    store.create_app(
+        App(domain=DOMAIN, app_type="nodejs", app_path=str(tmp_path), layout="releases")
+    )
+    monkeypatch.setattr(lifecycle, "get_store", lambda: store)
+    try:
+        assert main(["releases", "keep", DOMAIN, "0"]) == 1
+    finally:
+        WASMStore.reset_instance()
+    assert any("50" in line for line in log)
+
+
+def test_keep_without_a_number_shows_the_retention(
+    monkeypatch: pytest.MonkeyPatch, log: list[str], tmp_path: Path
+) -> None:
+    from wasm.core.store import App, WASMStore
+
+    WASMStore.reset_instance()
+    store = WASMStore(tmp_path / "wasm.db")
+    store.create_app(
+        App(
+            domain=DOMAIN,
+            app_type="nodejs",
+            app_path=str(tmp_path),
+            layout="releases",
+            keep_releases=8,
+        )
+    )
+    monkeypatch.setattr(releases_module, "get_store", lambda: store)
+    monkeypatch.setattr(
+        releases_module, "set_release_retention", lambda *a, **k: pytest.fail("changed")
+    )
+    try:
+        result = invoke(["releases", "keep", DOMAIN])
+    finally:
+        WASMStore.reset_instance()
+
+    assert result.exit_code == 0, result.output
+    assert any("8" in line for line in log)

@@ -10,6 +10,9 @@ from __future__ import annotations
 import dataclasses
 import gzip
 import sys
+import threading
+import time
+from pathlib import Path
 
 import pytest
 
@@ -17,11 +20,13 @@ from wasm.core.runner import (
     DEFAULT_TIMEOUT,
     EXIT_NOT_FOUND,
     EXIT_TIMEOUT,
+    CommandCancelled,
     CommandError,
     CommandResult,
     DryRunRunner,
     FakeRunner,
     SubprocessRunner,
+    cancellable,
     get_runner,
     is_read_only,
     runuser_prefix,
@@ -500,3 +505,121 @@ class TestCommandResult:
 
         with pytest.raises((AttributeError, TypeError, dataclasses.FrozenInstanceError)):
             result.exit_code = 1  # type: ignore[misc]
+
+
+class TestCancellation:
+    """
+    A cancel scope stops every command an operation runs, however deep.
+
+    The new-app wizard's Cancel used to abort only the browser's fetch: the
+    clone behind it ran on to its ten-minute deadline. A scope's event is what
+    the endpoint sets when the client goes away, and the runner is what has to
+    notice, because it is the only thing holding the process.
+    """
+
+    def test_a_command_in_a_cancelled_scope_never_starts(self, real: SubprocessRunner, tmp_path):
+        marker = tmp_path / "ran"
+        event = threading.Event()
+        event.set()
+
+        with cancellable(event), pytest.raises(CommandCancelled):
+            real.run(["touch", str(marker)])
+
+        assert not marker.exists()
+
+    def test_cancelling_kills_the_command_and_everything_it_started(
+        self, real: SubprocessRunner, tmp_path
+    ):
+        # git clone is a tree of processes (remote-https, index-pack); killing
+        # only the parent leaves the download running. The grandchild here
+        # stands in for them.
+        pidfile = tmp_path / "grandchild.pid"
+        event = threading.Event()
+        threading.Timer(0.3, event.set).start()
+
+        started = time.monotonic()
+        with cancellable(event), pytest.raises(CommandCancelled) as raised:
+            real.run(["sh", "-c", f"sleep 30 & echo $! > {pidfile}; wait"], timeout=60)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 5, "the command ran on after the cancel"
+        assert "sh" in str(raised.value)
+        grandchild = int(pidfile.read_text())
+        assert _gone(grandchild), "a process the command started survived the cancel"
+
+    def test_stream_is_cancelled_too(self, real: SubprocessRunner):
+        event = threading.Event()
+        threading.Timer(0.3, event.set).start()
+        lines: list[str] = []
+
+        started = time.monotonic()
+        with cancellable(event), pytest.raises(CommandCancelled):
+            real.stream(["sh", "-c", "echo one; sleep 30"], on_line=lines.append, timeout=60)
+
+        assert time.monotonic() - started < 5
+        assert lines == ["one"]
+
+    def test_a_scope_keeps_output_exit_code_and_input(self, real: SubprocessRunner):
+        with cancellable(threading.Event()):
+            echoed = real.run(["cat"], input="hello")
+            failed = real.run(["sh", "-c", "echo oops >&2; exit 3"])
+
+        assert echoed.success and echoed.stdout == "hello"
+        assert failed.exit_code == 3 and failed.stderr.strip() == "oops"
+
+    def test_a_scope_keeps_the_deadline(self, real: SubprocessRunner):
+        with cancellable(threading.Event()):
+            result = real.run(["sleep", "10"], timeout=1)
+
+        assert result.timed_out
+        assert result.exit_code == EXIT_TIMEOUT
+
+    def test_the_scope_ends_with_the_block(self, real: SubprocessRunner):
+        event = threading.Event()
+        with cancellable(event):
+            pass
+        event.set()
+
+        assert real.run(["true"]).success
+
+    def test_the_fake_runner_honours_the_scope(self):
+        fake = FakeRunner()
+        event = threading.Event()
+        event.set()
+
+        with cancellable(event), pytest.raises(CommandCancelled):
+            fake.run(["git", "clone"])
+
+        assert fake.calls == [], "a cancelled command must not be recorded as run"
+
+
+def _gone(pid: int, wait: float = 3.0) -> bool:
+    """
+    Wait for a process to disappear.
+
+    Args:
+        pid: The process id.
+        wait: Seconds to wait before giving up.
+
+    Returns:
+        True when the process no longer exists (or is a zombie awaiting init).
+    """
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().split(")")[-1].split()[0]
+        except (FileNotFoundError, ProcessLookupError):
+            return True
+        if state == "Z":
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_a_stream_in_a_scope_still_keeps_its_deadline():
+    """The deadline kills the whole tree inside a scope, as the cancel does."""
+    with cancellable(threading.Event()):
+        result = SubprocessRunner().stream(["sleep", "10"], on_line=lambda _line: None, timeout=1)
+
+    assert result.timed_out
+    assert result.exit_code == EXIT_TIMEOUT

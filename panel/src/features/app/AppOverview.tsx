@@ -289,7 +289,8 @@ function Domains({ app }: { app: App }) {
         {domains.isError && domains.data === undefined ? (
           <ErrorBlock compact error={domains.error} title="Could not load the domains" className="my-3" />
         ) : domains.data === undefined ? (
-          <KeyValueListSkeleton rows={2} />
+          // One row: the app's own name, which every app has; aliases are the exception.
+          <KeyValueListSkeleton rows={1} />
         ) : (
           <ul className="flex flex-col divide-y divide-border">
             {entries.map((entry) => {
@@ -437,25 +438,54 @@ function Resources({ app }: { app: App }) {
   );
 }
 
+/** A tile's lines at StatTile's own heights: the label, the reading, the line under it. */
+function TileSkeleton() {
+  return (
+    <div className="flex min-w-0 flex-col gap-1.5 rounded-card border border-border bg-surface px-4 py-3.5 shadow-raised">
+      <div className="flex h-4 items-center">
+        <Skeleton className="h-3 w-20" />
+      </div>
+      <div className="flex h-7 items-center">
+        <Skeleton className="h-5 w-28" />
+      </div>
+      <div className="flex h-4 items-center">
+        <Skeleton className="h-3 w-24" />
+      </div>
+    </div>
+  );
+}
+
+/** A section's heading line as it will be drawn, without being a heading itself. */
+function HeadingSkeleton({ title }: { title: string }) {
+  return <p className="title text-16 text-fg">{title}</p>;
+}
+
+/**
+ * The loaded page's shape: the four tiles, then Domains and Runtime side by side under their
+ * headings, with as many rows as they usually have. Sections that load on their own (the
+ * webhook, the resources) keep their own placeholders once the page is drawn.
+ */
 function OverviewSkeleton() {
   return (
     <div aria-busy="true" className="flex flex-col gap-8">
       <span className="sr-only">Loading the application</span>
       <div aria-hidden="true" className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         {[0, 1, 2, 3].map((i) => (
-          <div key={i} className="flex flex-col gap-2.5 rounded-card border border-border bg-surface px-4 py-3.5">
-            <Skeleton className="h-3 w-20" />
-            <Skeleton className="h-5 w-28" />
-            <Skeleton className="h-3 w-24" />
-          </div>
+          <TileSkeleton key={i} />
         ))}
       </div>
       <div aria-hidden="true" className="grid gap-8 lg:grid-cols-2">
-        <div className="rounded-card border border-border bg-surface px-4 py-1">
-          <KeyValueListSkeleton rows={3} />
+        <div className="flex min-w-0 flex-col gap-4">
+          <HeadingSkeleton title="Domains" />
+          <div className="rounded-card border border-border bg-surface px-4 py-1 shadow-raised">
+            <KeyValueListSkeleton rows={1} />
+          </div>
         </div>
-        <div className="rounded-card border border-border bg-surface px-4 py-1">
-          <KeyValueListSkeleton rows={6} />
+        <div className="flex min-w-0 flex-col gap-4">
+          <HeadingSkeleton title="Runtime" />
+          <div className="rounded-card border border-border bg-surface px-4 py-1 shadow-raised">
+            <KeyValueListSkeleton rows={7} hints={[5]} />
+          </div>
         </div>
       </div>
     </div>

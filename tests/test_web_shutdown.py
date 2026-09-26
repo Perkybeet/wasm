@@ -208,6 +208,26 @@ def _quiet_lifespan(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(server_module, "get_token_manager", Tokens)
 
+    from wasm.deployers import inspect as inspect_module
+
+    # The sweep of the machine's temporary directory is not this suite's to run.
+    monkeypatch.setattr(inspect_module, "remove_stale_checkouts", lambda: [])
+
+
+def test_the_lifespan_sweeps_stale_inspection_checkouts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A console killed mid-inspection left a checkout; the next start removes it."""
+    from wasm.deployers import inspect as inspect_module
+
+    _quiet_lifespan(monkeypatch)
+    swept: list[bool] = []
+    monkeypatch.setattr(inspect_module, "remove_stale_checkouts", lambda: swept.append(True))
+
+    async def exercise() -> None:
+        async with server_module.lifespan(FastAPI()):
+            assert swept == [True]
+
+    asyncio.run(exercise())
+
 
 def test_the_lifespan_cancelled_by_a_second_ctrl_c_ends_quietly(
     monkeypatch: pytest.MonkeyPatch,

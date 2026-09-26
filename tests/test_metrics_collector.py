@@ -132,7 +132,17 @@ def collector(
     domains: FakeAppStore,
 ) -> MetricsCollector:
     """Build a collector wired entirely to fakes."""
-    return MetricsCollector(store, cgroup_root=tmp_path / "cgroup", clock=clock)
+    return MetricsCollector(
+        store,
+        cgroup_root=tmp_path / "cgroup",
+        clock=clock,
+        units_for=lambda app: [unit_of(app.domain)],
+    )
+
+
+def unit_of(domain: str) -> str:
+    """The unit an application runs as: named after it, dots as dashes."""
+    return domain.replace(".", "-")
 
 
 def write_cgroup(root: Path, domain: str, *, usage_usec: int, memory: int) -> Path:
@@ -148,7 +158,7 @@ def write_cgroup(root: Path, domain: str, *, usage_usec: int, memory: int) -> Pa
     Returns:
         The unit's cgroup directory.
     """
-    unit = root / f"wasm-{domain}.service"
+    unit = root / f"{unit_of(domain)}.service"
     unit.mkdir(parents=True, exist_ok=True)
     (unit / "cpu.stat").write_text(
         f"usage_usec {usage_usec}\nuser_usec {usage_usec // 2}\nsystem_usec {usage_usec // 2}\n"
@@ -513,3 +523,54 @@ def test_start_and_stop_wire_and_clear_the_singleton(
         metrics_collector.stop_metrics_collector()
 
     assert metrics_collector.get_metrics_collector() is None
+
+
+def test_the_default_mapping_reads_the_unit_named_after_the_application(
+    store: MetricsStore,
+    clock: FrozenClock,
+    tmp_path: Path,
+    fake_psutil: FakePsutil,
+    domains: FakeAppStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The collector used to look for wasm-<domain>.service, a name no unit has had since 0.14.1
+    (units are named after the app, dots as dashes), so no application was ever sampled.
+    """
+    from wasm.managers.service_manager import ServiceManager
+
+    monkeypatch.setattr(ServiceManager, "app_units", lambda self, app: [unit_of(app.domain)])
+    domains.domains = ["shop.example.com"]
+    root = tmp_path / "cgroup"
+    write_cgroup(root, "shop.example.com", usage_usec=1, memory=4096)
+    collector = MetricsCollector(store, cgroup_root=root, clock=clock)
+
+    collector.sample_once()
+
+    assert collector.latest()["app.shop.example.com.mem.bytes"] == 4096
+
+
+def test_an_application_with_several_units_is_their_sum(
+    store: MetricsStore,
+    clock: FrozenClock,
+    tmp_path: Path,
+    fake_psutil: FakePsutil,
+    domains: FakeAppStore,
+) -> None:
+    """A monorepo runs one unit per workspace; its chart is the whole application."""
+    root = tmp_path / "cgroup"
+    for unit, memory in (("mono-example-com-web", 1000), ("mono-example-com-api", 500)):
+        (root / f"{unit}.service").mkdir(parents=True)
+        (root / f"{unit}.service" / "memory.current").write_text(f"{memory}\n")
+        (root / f"{unit}.service" / "cpu.stat").write_text("usage_usec 1\n")
+    domains.domains = ["mono.example.com"]
+    collector = MetricsCollector(
+        store,
+        cgroup_root=root,
+        clock=clock,
+        units_for=lambda app: ["mono-example-com-web", "mono-example-com-api"],
+    )
+
+    collector.sample_once()
+
+    assert collector.latest()["app.mono.example.com.mem.bytes"] == 1500

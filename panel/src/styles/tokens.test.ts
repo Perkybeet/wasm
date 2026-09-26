@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { contrastRatio, parseHex, readThemeTokens } from "../lib/contrast";
+import fontsCss from "./fonts.css?raw";
 import tokensCss from "./tokens.css?raw";
 
 const TOKENS = readThemeTokens(tokensCss);
@@ -143,5 +144,29 @@ describe("design tokens", () => {
     const stack = match?.[1] ?? "";
     expect(stack).toContain('"JetBrains Mono Variable"');
     expect(stack).toMatch(/"Noto Color Emoji"|"Apple Color Emoji"|"Segoe UI Emoji"/);
+  });
+
+  it("follows each real font with its metric-matched fallbacks, each one declared and scaled", () => {
+    // Text drawn before the fonts arrive takes the room it will keep, so the swap moves nothing.
+    const stack = (token: string): string[] =>
+      (new RegExp(`--${token}:\\s*([^;]+);`).exec(tokensCss)?.[1] ?? "").split(",").map((family) => family.trim().replace(/"/g, ""));
+    const sans = stack("font-sans");
+    const mono = stack("font-mono");
+    expect(sans.slice(0, 3)).toEqual(["Mona Sans Variable", "Mona Sans Fallback", "Mona Sans Fallback DejaVu"]);
+    expect(mono.slice(0, 4)).toEqual([
+      "JetBrains Mono Variable",
+      "JetBrains Mono Fallback",
+      "JetBrains Mono Fallback Consolas",
+      "JetBrains Mono Fallback Liberation",
+    ]);
+    const faces = [...fontsCss.matchAll(/@font-face\s*{([^}]*)}/g)].map((match) => match[1] ?? "");
+    for (const family of [...sans.slice(1, 3), ...mono.slice(1, 4)]) {
+      const face = faces.find((body) => body.includes(`font-family: "${family}";`));
+      expect(face, family).toBeDefined();
+      expect(face).toMatch(/src: local\(/);
+      expect(face).toMatch(/size-adjust: \d+(\.\d+)?%;/);
+      expect(face).toMatch(/ascent-override: \d+(\.\d+)?%;/);
+      expect(face).toMatch(/descent-override: \d+(\.\d+)?%;/);
+    }
   });
 });

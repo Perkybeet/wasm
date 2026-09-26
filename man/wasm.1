@@ -70,6 +70,28 @@ Print the status as JSON.
 .SS wasm app
 Change how a deployed application is laid out and what it may use.
 
+.SS wasm app health
+Show or set what the health gate asks of an application.
+.TP
+.B Arguments
+.br
+\fIdomain\fR
+.TP
+.B \-\-path
+Path the health check requests, such as /healthz.
+.TP
+.B \-\-expect
+Statuses that mean up: 200\-399, or 200,204. Default: any status below 500.
+.TP
+.B \-\-timeout
+Seconds it gets to answer, 5 to 600.
+.TP
+.B \-\-reset
+Go back to the defaults for all three.
+.TP
+.B \-\-json
+Print the health check settings as JSON.
+
 .SS wasm app limits
 Show or set the memory, CPU and task limits of an application.
 .TP
@@ -78,13 +100,13 @@ Show or set the memory, CPU and task limits of an application.
 \fIdomain\fR
 .TP
 .B \-\-memory
-Memory limit: 512M, 2G, or none to remove it. Default: Sentinel.UNSET.
+Memory limit: 512M, 2G, or none to remove it.
 .TP
 .B \-\-cpu
-CPU quota: 50% of one CPU, 200% for two, or none. Default: Sentinel.UNSET.
+CPU quota: 50% of one CPU, 200% for two, or none.
 .TP
 .B \-\-tasks
-Processes and threads it may run, or none. Default: Sentinel.UNSET.
+Processes and threads it may run, or none.
 .TP
 .B \-\-restart
 Restart now so the new limits apply.
@@ -100,7 +122,7 @@ Move an in\-place application onto the release layout.
 \fIdomain\fR
 .TP
 .B \-\-persist
-Keep this path in shared/ across releases. Repeat for each; replaces detection. Default: Sentinel.UNSET.
+Keep this path in shared/ across releases. Repeat for each; replaces detection.
 .TP
 .B \-\-yes, \-y
 Do not ask for confirmation.
@@ -137,19 +159,19 @@ Dump the application databases into the archive.
 Copy the application's Docker volumes into the archive.
 .TP
 .B \-\-schemas
-Dump only this PostgreSQL schema. Repeat for several. Default: Sentinel.UNSET.
+Dump only this PostgreSQL schema. Repeat for several.
 .TP
 .B \-\-redis\-method
 How to capture Redis: a point\-in\-time rdb or the aof log. Default: rdb.
 .TP
 .B \-\-retention\-count
-Keep at most this many backups of the application. Default: Sentinel.UNSET.
+Keep at most this many backups of the application.
 .TP
 .B \-\-retention\-days
-Delete backups of the application older than this many days. Default: Sentinel.UNSET.
+Delete backups of the application older than this many days.
 .TP
 .B \-t, \-\-tags
-Comma\-separated tags to file the backup under. Default: Sentinel.UNSET.
+Comma\-separated tags to file the backup under.
 
 .SS wasm backup delete
 Delete a backup and remove its archive from disk.
@@ -186,10 +208,10 @@ List the backups on this server, newest first.
 \fIdomain\fR
 .TP
 .B \-t, \-\-tags
-Only show backups carrying one of these tags. Default: Sentinel.UNSET.
+Only show backups carrying one of these tags.
 .TP
 .B \-n, \-\-limit
-Show at most this many backups. Default: Sentinel.UNSET.
+Show at most this many backups.
 .TP
 .B \-\-open
 Print the panel URL for the backup list, opening it if a display is available.
@@ -205,7 +227,7 @@ Put an application back the way a backup left it.
 \fIbackup_id\fR
 .TP
 .B \-\-target\-domain
-Restore into this domain instead of the original one. Default: Sentinel.UNSET.
+Restore into this domain instead of the original one.
 .TP
 .B \-\-no\-env
 Keep the current .env files.
@@ -265,13 +287,13 @@ Obtain, inspect and retire the SSL certificates of this server.
 Obtain a certificate for one or more domains.
 .TP
 .B \-d, \-\-domain
-Domain to cover. Repeat it for every extra name on the certificate. Default: Sentinel.UNSET.
+Domain to cover. Repeat it for every extra name on the certificate.
 .TP
 .B \-e, \-\-email
-Address Let's Encrypt sends expiry warnings to. Default: Sentinel.UNSET.
+Address Let's Encrypt sends expiry warnings to.
 .TP
 .B \-w, \-\-webroot
-Directory served at the domain, where the challenge files are written. Default: Sentinel.UNSET.
+Directory served at the domain, where the challenge files are written.
 .TP
 .B \-\-standalone
 Answer the challenge with certbot's own server. Port 80 must be free.
@@ -318,7 +340,7 @@ Print the certificate list as JSON.
 Renew certificates before they expire.
 .TP
 .B \-d, \-\-domain
-Renew only this certificate. Default: every certificate that is due. Default: Sentinel.UNSET.
+Renew only this certificate. Default: every certificate that is due.
 .TP
 .B \-\-force
 Renew even when the certificate is not near expiry. Counts against the rate limit.
@@ -385,6 +407,12 @@ Set one configuration value, addressed by its dotted key, and save it.
 .B \-\-list
 Treat VALUE as a comma\-separated list, for a key such as notifications.allow_private_hosts.
 .TP
+.B \-\-stdin
+Read VALUE from standard input instead of the command line, so a secret never lands in shell history or in 'ps'.
+.TP
+.B \-\-prompt
+Prompt for VALUE without echoing it back, like a password prompt.
+.TP
 .B \-v, \-\-verbose
 Show the detail of each step.
 .TP
@@ -428,22 +456,22 @@ Never emit colour.
 Deploy a web application and put it online.
 .TP
 .B \-d, \-\-domain
-Domain the application is served on. Default: Sentinel.UNSET.
+Domain the application is served on.
 .TP
 .B \-s, \-\-source
-Git URL or directory to deploy from. Default: Sentinel.UNSET.
+Git URL or directory to deploy from.
 .TP
 .B \-t, \-\-type
 Application type. Detected from the source when left on auto. Default: auto.
 .TP
 .B \-p, \-\-port
-Port the application listens on. A free one is chosen when omitted. Default: Sentinel.UNSET.
+Port the application listens on. A free one is chosen when omitted.
 .TP
 .B \-w, \-\-webserver
 Web server that fronts the application. Default: nginx.
 .TP
 .B \-b, \-\-branch
-Git branch to deploy. Default: Sentinel.UNSET.
+Git branch to deploy.
 .TP
 .B \-\-no\-ssl
 Serve over plain HTTP, without a certificate.
@@ -452,31 +480,31 @@ Serve over plain HTTP, without a certificate.
 Also answer on www.<domain>, redirecting it to the domain (see 'wasm domain').
 .TP
 .B \-\-env\-file
-File of KEY=value lines to install as the application environment. Default: Sentinel.UNSET.
+File of KEY=value lines to install as the application environment.
 .TP
 .B \-\-package\-manager, \-\-pm
 Node package manager. Detected from the lockfile when left on auto. Default: auto.
 .TP
 .B \-\-subdomains
-Serve a monorepo app on this subdomain. Repeat once per app. Default: Sentinel.UNSET.
+Serve a monorepo app on this subdomain. Repeat once per app.
 .TP
 .B \-\-workspaces
-Deploy only this monorepo workspace. Repeat to select several. Default: Sentinel.UNSET.
+Deploy only this monorepo workspace. Repeat to select several.
 .TP
 .B \-\-no\-database
 Skip database provisioning for a monorepo.
 .TP
 .B \-\-compose\-file
-Compose file to use, relative to the project. Detected when omitted. Default: Sentinel.UNSET.
+Compose file to use, relative to the project. Detected when omitted.
 .TP
 .B \-\-compose\-profiles
-Activate this Docker Compose profile. Repeat to activate several. Default: Sentinel.UNSET.
+Activate this Docker Compose profile. Repeat to activate several.
 .TP
 .B \-\-layout
-Build every deploy as a release behind a health gate, or in place. Defaults to the server's deploy.layout. Default: Sentinel.UNSET.
+Build every deploy as a release behind a health gate, or in place. Defaults to the server's deploy.layout.
 .TP
 .B \-\-persist
-Keep this path, relative to the app, in shared/ across releases. Repeat for several. Default: Sentinel.UNSET.
+Keep this path, relative to the app, in shared/ across releases. Repeat for several.
 .TP
 .B \-\-force
 Deploy into an app directory that already holds files: in place they are replaced, .env included; on releases a release is added beside them.
@@ -506,13 +534,13 @@ Create a cron job as a systemd timer, or rewrite one WASM already owns.
 hourly, daily, weekly, monthly, or a systemd OnCalendar expression. Default: daily.
 .TP
 .B \-\-user
-Unix user to run as. The configured service_user by default. Default: Sentinel.UNSET.
+Unix user to run as. The configured service_user by default.
 .TP
 .B \-\-working\-directory
-Absolute directory to run the command in. Default: Sentinel.UNSET.
+Absolute directory to run the command in.
 .TP
 .B \-\-app
-Associate the job with a deployed application; its runtime directory (current/ for a releases application) becomes the default. Default: Sentinel.UNSET.
+Associate the job with a deployed application; its runtime directory (current/ for a releases application) becomes the default.
 
 .SS wasm cron delete
 Remove a cron job's timer and service units.
@@ -575,10 +603,10 @@ Write a database to a backup file.
 \fIdatabase\fR
 .TP
 .B \-\-engine, \-e
-Engine the database is on. Default: Sentinel.UNSET.
+Engine the database is on.
 .TP
 .B \-\-output, \-o
-Where to write the file. Defaults to the engine's backup directory. Default: Sentinel.UNSET.
+Where to write the file. Defaults to the engine's backup directory.
 .TP
 .B \-\-no\-compress
 Write the dump without gzip.
@@ -587,10 +615,10 @@ Write the dump without gzip.
 List the database backups on this server.
 .TP
 .B \-\-engine, \-e
-Only this engine. Defaults to all of them. Default: Sentinel.UNSET.
+Only this engine. Defaults to all of them.
 .TP
 .B \-\-database, \-d
-Only backups of this database. Default: Sentinel.UNSET.
+Only backups of this database.
 .TP
 .B \-\-json
 Print the backup list as JSON.
@@ -599,25 +627,25 @@ Print the backup list as JSON.
 Store the administrative credentials WASM uses for an engine.
 .TP
 .B \-\-engine, \-e
-Engine the credentials are for. Default: Sentinel.UNSET.
+Engine the credentials are for.
 .TP
 .B \-\-user, \-u
-Administrative user, such as root or postgres. Default: Sentinel.UNSET.
+Administrative user, such as root or postgres.
 .TP
 .B \-\-password, \-p
-Administrative password. Default: Sentinel.UNSET.
+Administrative password.
 
 .SS wasm db connect
 Open a session with the engine's own client.
 .TP
 .B \-\-engine, \-e
-Engine to connect to. Default: Sentinel.UNSET.
+Engine to connect to.
 .TP
 .B \-\-database, \-d
-Database to open. Default: Sentinel.UNSET.
+Database to open.
 .TP
 .B \-\-username, \-u
-User to connect as. Default: Sentinel.UNSET.
+User to connect as.
 
 .SS wasm db connection\-string
 Print a connection string for an application to use.
@@ -629,10 +657,10 @@ Print a connection string for an application to use.
 \fIusername\fR
 .TP
 .B \-\-engine, \-e
-Engine the database is on. Default: Sentinel.UNSET.
+Engine the database is on.
 .TP
 .B \-\-password, \-p
-Password. A placeholder is printed when omitted. Default: Sentinel.UNSET.
+Password. A placeholder is printed when omitted.
 .TP
 .B \-\-host
 Host the application uses. Default: localhost.
@@ -645,13 +673,13 @@ Create a database and record it in the store.
 \fIname\fR
 .TP
 .B \-\-engine, \-e
-Engine to create it on. Default: Sentinel.UNSET.
+Engine to create it on.
 .TP
 .B \-\-owner, \-o
-User that will own the database. Default: Sentinel.UNSET.
+User that will own the database.
 .TP
 .B \-\-encoding
-Character encoding. Defaults to UTF8. Default: Sentinel.UNSET.
+Character encoding. Defaults to UTF8.
 
 .SS wasm db drop
 Delete a database and everything in it.
@@ -661,7 +689,7 @@ Delete a database and everything in it.
 \fIname\fR
 .TP
 .B \-\-engine, \-e
-Engine the database is on. Default: Sentinel.UNSET.
+Engine the database is on.
 .TP
 .B \-\-force, \-f, \-y
 Do not ask for confirmation.
@@ -682,10 +710,10 @@ Grant a user privileges on a database.
 \fIdatabase\fR
 .TP
 .B \-\-engine, \-e
-Engine the database is on. Default: Sentinel.UNSET.
+Engine the database is on.
 .TP
 .B \-\-privileges
-Comma\-separated privileges. Defaults to the engine's full set. Default: Sentinel.UNSET.
+Comma\-separated privileges. Defaults to the engine's full set.
 .TP
 .B \-\-host
 Host the grant applies to. Default: localhost.
@@ -698,7 +726,7 @@ Show the size, owner and encoding of a database.
 \fIname\fR
 .TP
 .B \-\-engine, \-e
-Engine the database is on. Default: Sentinel.UNSET.
+Engine the database is on.
 .TP
 .B \-\-json
 Print the database's details as JSON.
@@ -714,7 +742,7 @@ Install a database engine on this server.
 List the databases on every running engine.
 .TP
 .B \-\-engine, \-e
-Only this engine. Defaults to all of them. Default: Sentinel.UNSET.
+Only this engine. Defaults to all of them.
 .TP
 .B \-\-open
 Print the panel URL for the database list, opening it if a display is available.
@@ -732,7 +760,7 @@ Run one statement against a database, read\-only unless told otherwise.
 \fIquery\fR
 .TP
 .B \-\-engine, \-e
-Engine the database is on. Default: Sentinel.UNSET.
+Engine the database is on.
 .TP
 .B \-\-write
 Allow the statement to change data. Without it the engine runs one statement in a read\-only transaction.
@@ -754,7 +782,7 @@ Load a backup into a database.
 \fIfile\fR
 .TP
 .B \-\-engine, \-e
-Engine the database is on. Default: Sentinel.UNSET.
+Engine the database is on.
 .TP
 .B \-\-drop
 Drop the database before restoring it.
@@ -772,10 +800,10 @@ Take privileges away from a user.
 \fIdatabase\fR
 .TP
 .B \-\-engine, \-e
-Engine the database is on. Default: Sentinel.UNSET.
+Engine the database is on.
 .TP
 .B \-\-privileges
-Comma\-separated privileges. Defaults to the engine's full set. Default: Sentinel.UNSET.
+Comma\-separated privileges. Defaults to the engine's full set.
 .TP
 .B \-\-host
 Host the grant applies to. Default: localhost.
@@ -825,13 +853,13 @@ Create a database user.
 \fIusername\fR
 .TP
 .B \-\-engine, \-e
-Engine to create the user on. Default: Sentinel.UNSET.
+Engine to create the user on.
 .TP
 .B \-\-password, \-p
-Password. One is generated and shown when omitted. Default: Sentinel.UNSET.
+Password. One is generated and shown when omitted.
 .TP
 .B \-\-database, \-d
-Database to grant the new user access to. Default: Sentinel.UNSET.
+Database to grant the new user access to.
 .TP
 .B \-\-host
 Host the user may connect from. Default: localhost.
@@ -844,7 +872,7 @@ Delete a database user.
 \fIusername\fR
 .TP
 .B \-\-engine, \-e
-Engine the user is on. Default: Sentinel.UNSET.
+Engine the user is on.
 .TP
 .B \-\-host
 Host the user was created for. Default: localhost.
@@ -856,7 +884,7 @@ Do not ask for confirmation.
 List the users of an engine.
 .TP
 .B \-\-engine, \-e
-Engine to list the users of. Default: Sentinel.UNSET.
+Engine to list the users of.
 .TP
 .B \-\-json
 Print the user list as JSON.
@@ -1063,6 +1091,9 @@ Do not ask for confirmation.
 .SS wasm notify
 Send test notifications through a configured channel.
 
+.SS wasm notify telegram\-chats
+List the chats the configured Telegram bot has seen.
+
 .SS wasm notify test
 Send a test message through CHANNEL.
 .TP
@@ -1072,6 +1103,18 @@ Send a test message through CHANNEL.
 
 .SS wasm releases
 List an application's releases and go back to one instantly.
+
+.SS wasm releases keep
+Show or set how many releases an application keeps on disk.
+.TP
+.B Arguments
+.br
+\fIdomain\fR
+.br
+\fIcount\fR
+.TP
+.B \-\-json
+Print the retention and what was pruned as JSON.
 
 .SS wasm releases list
 List the releases of an application, newest first.
@@ -1127,13 +1170,13 @@ Manage the systemd services WASM owns.
 Create a service and install its unit file.
 .TP
 .B \-\-name, \-n
-Name for the new service. Default: Sentinel.UNSET.
+Name for the new service.
 .TP
 .B \-\-command, \-c
-Command the service runs. Default: Sentinel.UNSET.
+Command the service runs.
 .TP
 .B \-\-directory, \-d
-Directory the command runs in. Default: Sentinel.UNSET.
+Directory the command runs in.
 .TP
 .B \-\-user, \-u
 Account to run as. Default: www\-data.
@@ -1242,7 +1285,7 @@ Never emit colour.
 Install tab completion for wasm.
 .TP
 .B \-s, \-\-shell
-Shell to generate for. Detected from $SHELL when omitted. Default: Sentinel.UNSET.
+Shell to generate for. Detected from $SHELL when omitted.
 .TP
 .B \-u, \-\-user\-only
 Install for the current user instead of system\-wide. Needs no root.
@@ -1308,7 +1351,7 @@ Create a key if this machine has none.
 Algorithm to generate the key with. Default: ed25519.
 .TP
 .B \-T, \-\-test
-Try to connect to a Git host. Default: Sentinel.UNSET.
+Try to connect to a Git host.
 .TP
 .B \-S, \-\-show
 Print the public key to add to your Git host.
@@ -1329,7 +1372,7 @@ Manage the nginx and apache virtual hosts on this server.
 Create a site and secure it with a certificate.
 .TP
 .B \-\-domain, \-d
-Domain to serve, such as example.com. Default: Sentinel.UNSET.
+Domain to serve, such as example.com.
 .TP
 .B \-\-webserver, \-w
 Web server to configure. Default: nginx.
@@ -1507,13 +1550,19 @@ Pull the latest code, rebuild and restart an application.
 \fIdomain\fR
 .TP
 .B \-s, \-\-source
-Fetch from this source instead of the recorded one. Default: Sentinel.UNSET.
+Fetch from this source instead of the recorded one.
 .TP
 .B \-b, \-\-branch
-Git branch to update from. Default: Sentinel.UNSET.
+Git branch to update from.
+.TP
+.B \-\-commit
+Deploy this commit (full or abbreviated) instead of the head of the branch.
 .TP
 .B \-\-package\-manager, \-\-pm
 Node package manager. Detected from the lockfile when left on auto. Default: auto.
+.TP
+.B \-y, \-\-force
+Rebuild without asking when the branch has nothing new since the live commit.
 .TP
 .B \-v, \-\-verbose
 Show the detail of each step.
@@ -1526,6 +1575,57 @@ Never emit colour.
 
 .SS wasm web
 Run the browser panel for this server.
+.TP
+.B \-v, \-\-verbose
+Show the detail of each step.
+.TP
+.B \-\-dry\-run
+Rehearse without changing anything. Read\-only checks still run.
+.TP
+.B \-\-no\-color
+Never emit colour.
+
+.SS wasm web disable
+Stop the panel's systemd service and remove it.
+.TP
+.B \-v, \-\-verbose
+Show the detail of each step.
+.TP
+.B \-\-dry\-run
+Rehearse without changing anything. Read\-only checks still run.
+.TP
+.B \-\-no\-color
+Never emit colour.
+
+.SS wasm web enable
+Run the panel as a systemd service that survives reboots.
+.TP
+.B \-H, \-\-host
+Interface to bind to. Anything but loopback needs TLS (\-\-tls\-cert/\-\-tls\-key or \-\-self\-signed) or \-\-insecure\-http. Default: 127.0.0.1.
+.TP
+.B \-p, \-\-port
+Port to listen on. Default: 8080.
+.TP
+.B \-\-require\-https
+Serve TLS from the panel and refuse cleartext. Needs \-\-tls\-cert and \-\-tls\-key, or \-\-self\-signed.
+.TP
+.B \-\-tls\-cert
+Certificate chain to serve.
+.TP
+.B \-\-tls\-key
+Private key for the certificate.
+.TP
+.B \-\-self\-signed
+Serve TLS with a self\-signed certificate, minted under /etc/wasm/panel\-tls and reused while it is valid.
+.TP
+.B \-\-insecure\-http
+Serve cleartext HTTP beyond loopback. The access token and the session cookie cross the network unencrypted.
+.TP
+.B \-\-allow\-ip
+Only answer this address or network. Repeat to allow several. Restricts who connects; encrypts nothing.
+.TP
+.B \-\-trusted\-proxy
+Believe forwarding headers from this peer. Declare the proxy that terminates TLS so the session cookie is issued with Secure.
 .TP
 .B \-v, \-\-verbose
 Show the detail of each step.
@@ -1563,17 +1663,14 @@ Interface to bind to. Anything but loopback needs TLS (\-\-tls\-cert/\-\-tls\-ke
 .B \-p, \-\-port
 Port to listen on. Default: 8080.
 .TP
-.B \-d, \-\-daemon
-Run in the background.
-.TP
 .B \-\-require\-https
 Serve TLS from the panel and refuse cleartext. Needs \-\-tls\-cert and \-\-tls\-key, or \-\-self\-signed.
 .TP
 .B \-\-tls\-cert
-Certificate chain to serve. Default: Sentinel.UNSET.
+Certificate chain to serve.
 .TP
 .B \-\-tls\-key
-Private key for the certificate. Default: Sentinel.UNSET.
+Private key for the certificate.
 .TP
 .B \-\-self\-signed
 Serve TLS with a self\-signed certificate, minted under /etc/wasm/panel\-tls and reused while it is valid.
@@ -1582,10 +1679,13 @@ Serve TLS with a self\-signed certificate, minted under /etc/wasm/panel\-tls and
 Serve cleartext HTTP beyond loopback. The access token and the session cookie cross the network unencrypted.
 .TP
 .B \-\-allow\-ip
-Only answer this address or network. Repeat to allow several. Restricts who connects; encrypts nothing. Default: Sentinel.UNSET.
+Only answer this address or network. Repeat to allow several. Restricts who connects; encrypts nothing.
 .TP
 .B \-\-trusted\-proxy
-Believe forwarding headers from this peer. Declare the proxy that terminates TLS so the session cookie is issued with Secure. Default: Sentinel.UNSET.
+Believe forwarding headers from this peer. Declare the proxy that terminates TLS so the session cookie is issued with Secure.
+.TP
+.B \-d, \-\-daemon
+Run in the background, until 'wasm web stop' or the next reboot. 'wasm web enable' survives reboots.
 .TP
 .B \-v, \-\-verbose
 Show the detail of each step.
@@ -1605,17 +1705,14 @@ Interface to bind to. Anything but loopback needs TLS (\-\-tls\-cert/\-\-tls\-ke
 .B \-p, \-\-port
 Port to listen on. Default: 8080.
 .TP
-.B \-d, \-\-daemon
-Run in the background.
-.TP
 .B \-\-require\-https
 Serve TLS from the panel and refuse cleartext. Needs \-\-tls\-cert and \-\-tls\-key, or \-\-self\-signed.
 .TP
 .B \-\-tls\-cert
-Certificate chain to serve. Default: Sentinel.UNSET.
+Certificate chain to serve.
 .TP
 .B \-\-tls\-key
-Private key for the certificate. Default: Sentinel.UNSET.
+Private key for the certificate.
 .TP
 .B \-\-self\-signed
 Serve TLS with a self\-signed certificate, minted under /etc/wasm/panel\-tls and reused while it is valid.
@@ -1624,10 +1721,16 @@ Serve TLS with a self\-signed certificate, minted under /etc/wasm/panel\-tls and
 Serve cleartext HTTP beyond loopback. The access token and the session cookie cross the network unencrypted.
 .TP
 .B \-\-allow\-ip
-Only answer this address or network. Repeat to allow several. Restricts who connects; encrypts nothing. Default: Sentinel.UNSET.
+Only answer this address or network. Repeat to allow several. Restricts who connects; encrypts nothing.
 .TP
 .B \-\-trusted\-proxy
-Believe forwarding headers from this peer. Declare the proxy that terminates TLS so the session cookie is issued with Secure. Default: Sentinel.UNSET.
+Believe forwarding headers from this peer. Declare the proxy that terminates TLS so the session cookie is issued with Secure.
+.TP
+.B \-d, \-\-daemon
+Run in the background, until 'wasm web stop' or the next reboot. 'wasm web enable' survives reboots.
+.TP
+.B \-\-under\-systemd
+Run as wasm\-web.service does: print no token, write no PID file. Written into the unit by 'wasm web enable'; not for interactive use.
 .TP
 .B \-v, \-\-verbose
 Show the detail of each step.
@@ -1639,7 +1742,7 @@ Rehearse without changing anything. Read\-only checks still run.
 Never emit colour.
 
 .SS wasm web status
-Show whether the panel is running.
+Show whether the panel is running, and whether as a service or in the background.
 .TP
 .B \-v, \-\-verbose
 Show the detail of each step.
@@ -1654,7 +1757,7 @@ Never emit colour.
 Print the status as JSON.
 
 .SS wasm web stop
-Stop the running panel.
+Stop the panel started with 'wasm web start \-d'.
 .TP
 .B \-v, \-\-verbose
 Show the detail of each step.

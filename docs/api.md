@@ -86,7 +86,8 @@ carries a credential, the session cookie included.
 Some operations ask a session to confirm its operator: deleting an application, a
 database, a user, a service, a site, a certificate, a backup or a domain; restoring a
 backup; revoking a certificate; revealing or writing an `.env`; migrating to releases;
-changing resource limits; editing a unit or site by hand; creating a service; creating or
+changing resource limits, the health check or the release retention; editing a unit or site
+by hand; creating a service; creating or
 rewriting a cron job or a backup schedule; deploying or inspecting a local path; SQL in
 write mode; writing the configuration; issuing an API token; enrolling, confirming or
 disabling 2FA; regenerating backup codes.
@@ -351,8 +352,10 @@ Request and response bodies are in `/api/openapi.json`.
 | `GET /api/apps/{domain}/env` | `.env`, redacted; `?unmask=true` needs admin and sudo |
 | `PUT /api/apps/{domain}/env` | Replace the `.env`; the answer says a restart is required. sudo |
 | `PATCH /api/apps/{domain}/limits` | `{memory_max_mb, cpu_quota_percent, tasks_max, restart}`; null removes a limit. sudo |
+| `PATCH /api/apps/{domain}/health` | `{path, expect, timeout}`, what the health gate asks; null or absent is the default (`/`, any status below 500, 30 s). 400 on a value the gate cannot use. sudo |
 | `GET /api/apps/{domain}/releases` | Releases, newest first |
 | `POST /api/apps/{domain}/releases/{id}/activate` | Instant rollback or roll forward. deploy |
+| `PATCH /api/apps/{domain}/releases/retention` | `{keep}`, 1 to 50; prunes now and answers with what it removed. sudo |
 | `GET /api/apps/{domain}/rollback-points` | Backups usable by a backup rollback |
 | `GET /api/apps/{domain}/migrate/plan` | What moving to releases would do |
 | `POST /api/apps/{domain}/migrate` | Move to releases. sudo |

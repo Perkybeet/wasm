@@ -5,6 +5,7 @@ import { expectNoAxeViolations } from "../../test/axe";
 import { renderConsole } from "../../test/console";
 import { FakeEventSource, MACHINE, fakeBackend, json, signedInRoutes } from "../../test/fakes";
 import type { RouteHandler } from "../../test/fakes";
+import { ATTENTION_HEIGHT_KEY, rememberedAttentionHeight } from "./NeedsAttention";
 
 // uPlot draws on a canvas jsdom does not have; the charts' contract is their summary.
 vi.mock("uplot", () => ({
@@ -145,6 +146,43 @@ describe("the overview", () => {
     });
   });
 
+  it("changes the range from an enlarged chart, which stays open on the new range", async () => {
+    const { user, location } = await overview();
+    await screen.findByRole("img", { name: /^CPU, last hour/ });
+    await user.click(screen.getByRole("button", { name: "Expand CPU" }));
+    const dialog = await screen.findByRole("dialog", { name: "CPU" });
+    await user.click(within(dialog).getByRole("radio", { name: "24h" }));
+    await waitFor(() => {
+      expect(location().search).toEqual({ window: "24h" });
+    });
+    expect(screen.getByRole("dialog", { name: "CPU" })).toBeInTheDocument();
+    expect(await within(dialog).findByRole("img", { name: /^CPU, last 24 hours/ })).toBeInTheDocument();
+  });
+
+  it("holds the room Needs attention took last time while it loads, and remembers it", async () => {
+    window.localStorage.setItem(ATTENTION_HEIGHT_KEY, "240");
+    await overview();
+    const attention = screen.getByRole("region", { name: /Needs attention/ });
+    const busy = within(attention).getByText("Checking the machine").closest("[aria-busy]");
+    expect(busy?.parentElement).toHaveStyle({ minHeight: "240px" });
+    await within(attention).findByRole("link", { name: "admin.example.com" });
+    // Measured once drawn (jsdom lays nothing out, so it measures nothing) and no longer held.
+    expect(within(attention).getAllByRole("list")[0]?.parentElement).not.toHaveStyle({ minHeight: "240px" });
+    expect(rememberedAttentionHeight()).toBeNull();
+    window.localStorage.removeItem(ATTENTION_HEIGHT_KEY);
+  });
+
+  it("keeps the sections below hidden until Needs attention has its height, on a first visit", async () => {
+    window.localStorage.removeItem(ATTENTION_HEIGHT_KEY);
+    await overview();
+    const machine = screen.getByRole("region", { name: "Machine", hidden: true });
+    expect(machine.parentElement).toHaveClass("invisible");
+    await within(screen.getByRole("region", { name: /Needs attention/ })).findByRole("link", { name: "admin.example.com" });
+    await waitFor(() => {
+      expect(machine.parentElement).not.toHaveClass("invisible");
+    });
+  });
+
   it("opens with the range the URL names", async () => {
     await overview(undefined, "/?window=30d");
     expect(screen.getByRole("radio", { name: "30d" })).toHaveAttribute("aria-checked", "true");
@@ -152,7 +190,7 @@ describe("the overview", () => {
 
   it("has no accessibility violations", async () => {
     await overview();
-    await screen.findByRole("link", { name: "admin.example.com" });
+    await within(screen.getByRole("region", { name: /Needs attention/ })).findByRole("link", { name: "admin.example.com" });
     await expectNoAxeViolations(screen.getByRole("main"));
   });
 });

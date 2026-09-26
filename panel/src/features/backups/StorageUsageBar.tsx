@@ -18,11 +18,23 @@ export function StorageUsageBar() {
   if (storage.isError && storage.data === undefined) {
     return <ErrorBlock compact error={storage.error} title="Could not read backup storage usage" onRetry={() => void storage.refetch()} />;
   }
-  if (storage.data === undefined) {
+  // The machine's disk decides between a meter and a bare figure, which differ in height:
+  // until it answers (the top bar usually has it already), the placeholder holds the meter's.
+  if (storage.data === undefined || (machine.data === undefined && !machine.isError)) {
     return (
-      <div className="flex flex-col gap-2 rounded-card border border-border bg-surface px-4 py-3.5 shadow-raised">
-        <Skeleton className="h-3 w-40" />
-        <Skeleton className="h-1.5 w-full rounded-pill" />
+      // The loaded card's lines, each at its own height: the meter's label row and track, then
+      // the line that counts the backups.
+      <div aria-hidden="true" className="flex flex-col gap-3 rounded-card border border-border bg-surface px-4 py-3.5 shadow-raised">
+        <div className="flex flex-col gap-1.5">
+          <div className="flex h-5 items-center justify-between gap-3">
+            <Skeleton className="h-3 w-16" />
+            <Skeleton className="h-3 w-32" />
+          </div>
+          <Skeleton className="h-1.5 w-full rounded-pill" />
+        </div>
+        <div className="flex h-4 items-center">
+          <Skeleton className="h-3 w-80 max-w-full" />
+        </div>
       </div>
     );
   }

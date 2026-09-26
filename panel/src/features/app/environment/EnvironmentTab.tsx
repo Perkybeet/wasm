@@ -18,7 +18,6 @@ import { DataTable } from "../../../components/ui/DataTable";
 import type { Column } from "../../../components/ui/DataTable";
 import { EmptyState } from "../../../components/ui/EmptyState";
 import { IconButton } from "../../../components/ui/IconButton";
-import { Skeleton } from "../../../components/ui/Skeleton";
 import { cx } from "../../../lib/cx";
 import { formatCount } from "../../../lib/format";
 import { reportActionError } from "../../apps/useAppActions";
@@ -50,19 +49,6 @@ function Masked() {
       </span>
       <span className="sr-only">Hidden</span>
     </span>
-  );
-}
-
-function TableSkeleton() {
-  return (
-    <div aria-hidden="true" className="flex flex-col divide-y divide-border rounded-card border border-border bg-surface shadow-raised">
-      {[0, 1, 2, 3, 4].map((i) => (
-        <div key={i} className="flex h-11 items-center gap-6 px-4">
-          <Skeleton className={cx("h-3", i % 2 === 0 ? "w-36" : "w-28")} />
-          <Skeleton className="h-3 w-24" />
-        </div>
-      ))}
-    </div>
   );
 }
 
@@ -248,17 +234,21 @@ export function EnvironmentTab({ domain }: { domain: string }) {
     </>
   );
 
+  // An editor, capped like a form: the value column truncates long before a wide screen's
+  // edge, and past that the row's own actions would drift away from the variable.
   return (
-    <div className="flex flex-col gap-8">
+    <div className="flex max-w-6xl flex-col gap-8">
       <Section
         title="Variables"
+        // Two lines whatever the path's length: the sentence, then the file on a line of its
+        // own, cut short with the whole path on hover. A path that wrapped the sentence moved
+        // the table down when the app's details arrived.
         description={
           <>
-            {"Read from "}
-            <code translate="no" className="text-12 break-all text-fg">
+            <span className="block">{isStatic ? "Read when the site is built, from" : "Read by the app's process when it starts, from"}</span>
+            <code translate="no" title={file} className="block truncate text-12 text-fg">
               {file}
             </code>
-            {isStatic ? " when the site is built." : " by the app's process when it starts."}
           </>
         }
         actions={env.data !== undefined && masked.size + counts.added > 0 ? actions : undefined}
@@ -266,7 +256,9 @@ export function EnvironmentTab({ domain }: { domain: string }) {
         <QueryState
           query={env}
           label="the environment"
-          skeleton={<TableSkeleton />}
+          skeleton={
+            <DataTable caption={`Environment variables of ${domain}`} columns={columns} rows={[]} getRowId={(row) => row.name} rowActions={rowActions} density="compact" loading />
+          }
           isEmpty={() => rows.length === 0}
           empty={
             <EmptyState
@@ -317,7 +309,7 @@ export function EnvironmentTab({ domain }: { domain: string }) {
             </div>
           )}
         </QueryState>
-        {env.data !== undefined && rows.length > 0 ? (
+        {rows.length > 0 || env.data === undefined ? (
           <p className="flex items-center gap-1.5 text-12 text-fg-muted">
             <Lock aria-hidden="true" className="size-3.5 shrink-0 text-fg-faint" />
             Secret values are hidden by the server. Revealing or editing one asks you to confirm it&apos;s you.

@@ -160,7 +160,9 @@ export function AppsPage({ search, onSearchChange }: AppsPageProps) {
               />
             }
           />
-          <CommandHint command="wasm list" label="From a terminal" />
+          {/* Drawn with the rows, not before: under a list of unknown length it would only be
+              pushed down the page when they arrive. */}
+          {apps.isPending ? null : <CommandHint command="wasm list" label="From a terminal" />}
         </div>
       )}
     </>

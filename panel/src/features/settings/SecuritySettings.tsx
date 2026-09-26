@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 
+import { sessionsQuery } from "../../api/queries/auth";
 import { configQuery } from "../../api/queries/config";
 import { useDocumentTitle } from "../../app/documentTitle";
 import { KeyValueList, KeyValueListSkeleton } from "../../components/page/KeyValueList";
@@ -65,7 +66,12 @@ function LockoutSection() {
       description="How the console answers repeated failed sign-ins. Set under web in config.yaml and read when the console starts, so a change applies after a restart."
       commands={["wasm config get web", "wasm web restart"]}
     >
-      <QueryState query={query} label="the lockout policy" skeleton={<KeyValueListSkeleton rows={5} />}>
+      <QueryState query={query} label="the lockout policy" skeleton={
+          <div className="rounded-card border border-border bg-surface px-5 py-2 shadow-raised">
+            <KeyValueListSkeleton rows={5} hints={[0, 2, 3]} />
+          </div>
+        }
+      >
         {(data) => (
           <div className="rounded-card border border-border bg-surface px-5 py-2 shadow-raised">
             <KeyValueList items={policyItems(readLockoutPolicy(data.config))} />
@@ -79,11 +85,14 @@ function LockoutSection() {
 /** Settings > Security: the second factor, who is signed in, and the lockout policy. */
 export function SecuritySettings() {
   useDocumentTitle("Security settings", 1);
+  const sessions = useQuery(sessionsQuery());
   return (
     <Sections>
       <TwoFactorSection />
       <SessionsSection />
-      <LockoutSection />
+      {/* After the sessions, whose number is not known until they load: drawn with them, the
+          policy never jumps down the page as the list lengthens above it. */}
+      {sessions.data !== undefined || sessions.isError ? <LockoutSection /> : null}
     </Sections>
   );
 }

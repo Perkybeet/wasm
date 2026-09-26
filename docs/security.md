@@ -63,6 +63,32 @@ Cron jobs follow the same rule: a job's command is split like a POSIX shell woul
 and run without a shell, so pipes, `&&` and globs are inert text. Write `/bin/sh -c "..."`
 explicitly when a job needs a shell.
 
+## Secrets via --stdin
+
+The same rule applies one level up, to how an operator runs `wasm` itself: a value typed after
+`wasm config set` is written to the shell's history file and, for as long as the process runs,
+visible to every local user through `ps`. That is fine for `apps_directory`; it is not fine for
+`monitor.smtp.password` or a webhook URL.
+
+```bash
+# Avoid - lands in shell history and in ps
+wasm config set monitor.smtp.password 'hunter2'
+
+# Read from standard input instead - a single trailing newline is stripped
+printf '%s' "$SMTP_PASSWORD" | wasm config set monitor.smtp.password --stdin
+
+# Or ask for it interactively, without echoing it back
+wasm config set monitor.smtp.password --prompt
+```
+
+`--stdin` and `--prompt` are mutually exclusive with giving `VALUE` on the command line, and
+with each other; `wasm config set KEY` with none of the three is a usage error. Typing a value
+for a key `wasm.core.config.redact_secrets` would redact (`password`, `token`, `key`,
+`webhook`, `secret`, `credential`, `auth`, and their compounds) straight into `VALUE` on a real
+terminal prints a warning suggesting `--stdin`, and is otherwise accepted: the warning is a
+nudge, never a refusal, so a script that has already taken the value out of argv some other way
+does not have to be rewritten.
+
 ## Exposing the console
 
 The console acts as root, so how it is reached matters more than anything else on this page.

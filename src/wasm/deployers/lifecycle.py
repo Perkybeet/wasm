@@ -50,18 +50,27 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 from wasm.core.applock import app_lock
 from wasm.core.config import Config
-from wasm.core.exceptions import DeploymentError, ServiceError, WASMError
+from wasm.core.exceptions import (
+    DeploymentError,
+    ServiceError,
+    SourceError,
+    ValidationError,
+    WASMError,
+)
 from wasm.core.fs import SECRET_MODE, get_fs, is_rehearsal
 from wasm.core.logger import Logger
 from wasm.core.store import (
     App,
+    AppType,
+    DeploymentRecord,
+    DeploymentStatus,
     DeploymentTrigger,
     ReleaseRecord,
     ReleaseStatus,
@@ -69,14 +78,16 @@ from wasm.core.store import (
     get_store,
 )
 from wasm.core.utils import domain_to_app_name
+from wasm.deployers.base import BaseDeployer
 from wasm.deployers.docker_compose import (
     DockerComposeDeployer,
     compose_file_from_unit,
     compose_file_option,
 )
 from wasm.deployers.helpers.health import wait_until_healthy
-from wasm.deployers.helpers.health_gate import HealthGate
+from wasm.deployers.helpers.health_gate import HealthCheck, HealthGate
 from wasm.deployers.helpers.layout import INPLACE, RELEASES, app_root, env_file_in
+from wasm.deployers.helpers.release_build import stage_release
 from wasm.deployers.interface import UpdateResult
 from wasm.deployers.monorepo import MonorepoDeployer
 from wasm.deployers.recorder import CapturingLogger, DeploymentRecorder, recording
@@ -89,11 +100,11 @@ from wasm.deployers.releases import (
     release_order_key,
 )
 from wasm.managers.apache_manager import ApacheManager
-from wasm.managers.backup_manager import RollbackManager
+from wasm.managers.backup_manager import BackupManager, RollbackManager
 from wasm.managers.cert_manager import CertManager
 from wasm.managers.nginx_manager import NginxManager
 from wasm.managers.service_manager import ResourceLimits, ServiceManager
-from wasm.managers.source_manager import SourceManager
+from wasm.managers.source_manager import SourceManager, validate_commit_id
 from wasm.managers.webserver import delete_site_completely
 from wasm.validators.domain import validate_domain
 from wasm.validators.source import validate_source
@@ -147,6 +158,7 @@ def update_app(
     *,
     source: str | None = None,
     branch: str | None = None,
+    commit: str | None = None,
     package_manager: str = "auto",
     trigger: str = DeploymentTrigger.CLI.value,
     job_id: str | None = None,
@@ -158,11 +170,22 @@ def update_app(
     """
     Pull the latest code into a deployed application, rebuild it and restart it.
 
+    With ``commit``, that exact commit is deployed instead of the head of the
+    branch: "rebuild this deployment". On releases, a release built from it
+    that is still on disk and not active is activated behind the health gate
+    (instant, nothing is rebuilt); otherwise the commit is exported from the
+    repository cache into a new release and built. In place, the checkout is
+    detached at the commit and rebuilt; the next update without a commit goes
+    back to following the branch (see
+    :meth:`~wasm.managers.source_manager.SourceManager.checkout_commit`).
+
     Args:
         domain: Domain of the application.
         source: Fetch from this source instead of pulling the current one.
             This replaces the tree; the ``.env`` file is carried across.
         branch: Git branch to update from.
+        commit: Deploy this commit, full or abbreviated; it must name exactly
+            one commit, and is fetched when the clone does not have it.
         package_manager: Node package manager, or ``auto``.
         trigger: Who asked for the update, recorded in the deployment history.
         job_id: The background job driving this update, when the panel
@@ -179,9 +202,21 @@ def update_app(
     Raises:
         WASMError: When the application is unknown or a step fails. A failed
             build leaves the previous build running.
+        SourceError: The commit is not a commit id, names more than one
+            commit or none, or the application is not deployed from git.
+        ValidationError: A commit was given together with a source or a
+            branch, which it makes meaningless.
         AppBusyError: Another operation is running on the application.
     """
     domain = validate_domain(domain)
+    if commit is not None:
+        commit = validate_commit_id(commit)
+        if source or branch:
+            raise ValidationError(
+                "A commit names exactly what to deploy; a source or a branch does not apply",
+                details=f"Run either 'wasm update {domain} --commit {commit}' or an update "
+                "from a source or a branch, not both.",
+            )
     # Held for the whole update, backup to restart: a rollback, a migration
     # or a second update (a webhook firing while an operator updates by hand)
     # must not interleave with it. Refused at once, naming this update.
@@ -190,6 +225,7 @@ def update_app(
             domain,
             source=source,
             branch=branch,
+            commit=commit,
             package_manager=package_manager,
             trigger=trigger,
             job_id=job_id,
@@ -205,6 +241,7 @@ def _update_app(
     *,
     source: str | None,
     branch: str | None,
+    commit: str | None,
     package_manager: str,
     trigger: str,
     job_id: str | None,
@@ -220,6 +257,7 @@ def _update_app(
         domain: A validated domain.
         source: Fetch from this source instead of pulling the current one.
         branch: Git branch to update from.
+        commit: A validated commit id to deploy instead of the branch head.
         package_manager: Node package manager, or ``auto``.
         trigger: Who asked for the update.
         job_id: The background job driving this update, when there is one.
@@ -262,6 +300,7 @@ def _update_app(
             app_path,
             source=source,
             branch=branch,
+            commit=commit,
             package_manager=package_manager,
             trigger=trigger,
             job_id=job_id,
@@ -269,6 +308,15 @@ def _update_app(
             on_step=on_step,
             log=log,
             verbose=verbose,
+        )
+
+    if commit is not None and not (app_path / ".git").exists():
+        # Checked before the backup: nothing is worth doing for a tree that
+        # has no history to take the commit from.
+        raise SourceError(
+            f"{domain} is not a git checkout; there is no commit {commit} to deploy",
+            details=f"An application deployed from a directory or an archive is rebuilt "
+            f"from its source: wasm update {domain}",
         )
 
     phase(1, PHASES, "Creating pre-update backup")
@@ -285,7 +333,16 @@ def _update_app(
 
     source_manager = SourceManager(verbose=verbose)
     recorded_source = app.source if app else ""
-    if source:
+    # Read before the checkout moves: what a monorepo or a stack goes back to.
+    previous_commit = _serving_commit(source_manager, app, app_path)
+    if commit is not None:
+        phase(2, PHASES, f"Checking out commit {commit}")
+        full = source_manager.checkout_commit(app_path, commit)
+        log.substep(
+            f"Commit {full[:7]}, detached: the next update without --commit follows the "
+            "branch again"
+        )
+    elif source:
         phase(2, PHASES, "Fetching from new source")
         log.substep(f"Source: {source}")
         _refetch_without_deleting(source_manager, source, app_path, branch)
@@ -306,11 +363,11 @@ def _update_app(
     phase(4, PHASES, "Rebuilding")
     if app_type == "monorepo":
         result, deployment_id = _rebuild_monorepo(
-            domain, app_path, app_name, on_step, verbose, trigger, job_id
+            domain, app_path, app_name, on_step, verbose, trigger, job_id, previous_commit
         )
     elif app_type == "docker-compose":
         result, deployment_id = _rebuild_compose(
-            domain, app_path, app_name, on_step, verbose, trigger, job_id
+            domain, app_path, app_name, on_step, verbose, trigger, job_id, previous_commit
         )
     else:
         deployer = get_deployer(app_type, verbose=verbose)
@@ -332,6 +389,9 @@ def _update_app(
     if result.is_static:
         restarted: tuple[str, ...] = ()
         active = True
+    elif result.restarted is not None:
+        # The deployer restarted and probed them behind the health gate.
+        restarted, active = result.restarted, bool(result.restarted)
     elif app_type == "monorepo":
         restarted, active = _restart_workspaces(app.id if app else None, app_name, log, verbose)
     else:
@@ -355,6 +415,7 @@ def _update_release(
     *,
     source: str | None,
     branch: str | None,
+    commit: str | None,
     package_manager: str,
     trigger: str,
     job_id: str | None,
@@ -371,6 +432,9 @@ def _update_release(
         app_path: The application directory.
         source: Fetch from this source instead of the recorded one.
         branch: Git branch; the recorded one when None.
+        commit: Deploy this commit instead of the head of the branch: the
+            newest release built from it that is on disk and not active is
+            activated, and otherwise it is built as a new release.
         package_manager: Node package manager, or ``auto``.
         trigger: Who asked for the update.
         job_id: The background job driving this update, when there is one.
@@ -405,13 +469,12 @@ def _update_release(
             details="Redeploy it with the type it was created with.",
         )
 
-    active = ReleaseManager(app_path).current()
-    phase(2, RELEASE_PHASES, "Building and activating a new release")
-    log.substep(
-        f"Release {active.id} stays on disk to fall back to"
-        if active is not None
-        else "There is no active release to fall back to"
-    )
+    if commit is not None and validate_source(fetch_from)[0] != "git":
+        raise SourceError(
+            f"{app.domain} is not deployed from git; there is no commit {commit} to deploy",
+            details=f"Its source is {fetch_from}. Rebuild it from there: wasm update {app.domain}",
+        )
+
     deployer.configure(
         domain=app.domain,
         source=fetch_from,
@@ -424,6 +487,54 @@ def _update_release(
         package_manager=package_manager,
         trigger=trigger,
         job_id=job_id,
+    )
+
+    releases = ReleaseManager(app_path)
+    active = releases.current()
+    if commit is not None:
+        # Only the release pipeline of BaseDeployer can be handed a staged
+        # release; every type that supports releases is built on it.
+        if not isinstance(deployer, BaseDeployer):
+            raise DeploymentError(
+                f"{app_type} applications cannot deploy a single commit",
+                details=f"Update {app.domain} from its branch instead: wasm update {app.domain}",
+            )
+        source_manager = deployer.source_manager
+        full = _resolve_in_cache(source_manager, fetch_from, app_path, branch or app.branch, commit)
+        built = next(
+            (r for r in releases.list() if not r.active and r.commit and full.startswith(r.commit)),
+            None,
+        )
+        if built is not None:
+            phase(2, RELEASE_PHASES, f"Activating release {built.id}, built from {full[:7]}")
+            activation = _activate_release(app, built.id, trigger=trigger, log=log)
+            return AppUpdate(
+                domain=app.domain,
+                app_type=app_type,
+                package_manager=package_manager,
+                prisma_updated=False,
+                is_static=app.is_static,
+                restarted=() if app.is_static else (app_path.name,),
+                active=True,
+                deployment_id=activation.deployment_id,
+            )
+        phase(2, RELEASE_PHASES, f"Building commit {full[:7]} as a new release")
+        deployer.adopt_release(
+            stage_release(
+                fetch_from,
+                branch or app.branch,
+                releases=deployer.releases,
+                source_manager=source_manager,
+                logger=log,
+                commit=full,
+            )
+        )
+    else:
+        phase(2, RELEASE_PHASES, "Building and activating a new release")
+    log.substep(
+        f"Release {active.id} stays on disk to fall back to"
+        if active is not None
+        else "There is no active release to fall back to"
     )
     result = deployer.update(on_step=on_step)
 
@@ -440,6 +551,34 @@ def _update_release(
         active=True,
         deployment_id=getattr(deployer, "last_deployment_id", None),
     )
+
+
+def _resolve_in_cache(
+    source_manager: SourceManager, source: str, app_path: Path, branch: str | None, commit: str
+) -> str:
+    """
+    Name the commit to deploy, from the repository cache of a release application.
+
+    The cache is cloned first when there is none yet; one that exists is only
+    fetched when it does not have the commit.
+
+    Args:
+        source_manager: Manager git goes through.
+        source: The application's git source.
+        app_path: The application directory.
+        branch: The branch the cache follows.
+        commit: A validated commit id.
+
+    Returns:
+        The full commit id.
+
+    Raises:
+        SourceError: The commit names none or more than one commit, or git failed.
+    """
+    cache = app_path / REPO_CACHE_DIR
+    if not (cache / ".git").is_dir():
+        source_manager.sync_cache(source, cache, branch)
+    return source_manager.resolve_commit(cache, commit)
 
 
 def _refetch_without_deleting(
@@ -496,6 +635,31 @@ def _resolve_type(stored_type: str | None, app_path: Path, verbose: bool) -> str
     return detect_app_type(app_path, verbose=verbose) or "nodejs"
 
 
+def _serving_commit(source_manager: SourceManager, app: App | None, app_path: Path) -> str | None:
+    """
+    Read the commit an in-place monorepo or stack serves, before an update moves it.
+
+    Only those two types go back by commit when the update fails its health
+    gate (their deployers check it out again); every other type is either on
+    releases or keeps 1.x behaviour, and pays nothing for this.
+
+    Args:
+        source_manager: Manager git goes through.
+        app: The application's row, if it has one.
+        app_path: The application directory.
+
+    Returns:
+        The commit, or None for another type, a tree that is not a git
+        checkout, or one whose commit cannot be read.
+    """
+    if app is None or app.app_type not in (AppType.MONOREPO.value, AppType.DOCKER_COMPOSE.value):
+        return None
+    if not (app_path / ".git").exists():
+        return None
+    commit = source_manager.get_repo_info(app_path).get("commit")
+    return str(commit) if commit else None
+
+
 def _rebuild_monorepo(
     domain: str,
     app_path: Path,
@@ -504,9 +668,10 @@ def _rebuild_monorepo(
     verbose: bool,
     trigger: str,
     job_id: str | None = None,
+    previous_commit: str | None = None,
 ) -> tuple[UpdateResult, int | None]:
     """
-    Rebuild every workspace of a monorepo.
+    Rebuild every workspace of a monorepo, and restart each behind the health gate.
 
     Args:
         domain: Domain of the application.
@@ -516,6 +681,8 @@ def _rebuild_monorepo(
         verbose: Verbosity of the deployer.
         trigger: Who asked, recorded in the deployment history.
         job_id: The background job driving this update, when there is one.
+        previous_commit: The commit the tree was on before this update: what
+            the deployer checks out and rebuilds when a workspace does not answer.
 
     Returns:
         What the deployer did, and the deployment history row it wrote.
@@ -527,6 +694,7 @@ def _rebuild_monorepo(
     deployer.trigger = trigger
     deployer.job_id = job_id
     deployer.package_manager = "pnpm"
+    deployer.previous_commit = previous_commit
     result = deployer.update(on_step=on_step)
     return result, getattr(deployer, "last_deployment_id", None)
 
@@ -539,9 +707,14 @@ def _rebuild_compose(
     verbose: bool,
     trigger: str,
     job_id: str | None = None,
+    previous_commit: str | None = None,
 ) -> tuple[UpdateResult, int | None]:
     """
     Rebuild the images of a Docker Compose project and recreate its containers.
+
+    The deployer records what serves before building, and puts it back when
+    the new containers do not pass the health gate (see
+    :class:`~wasm.deployers.docker_compose.ServingState`).
 
     Args:
         domain: Domain of the application.
@@ -551,6 +724,8 @@ def _rebuild_compose(
         verbose: Verbosity of the deployer.
         trigger: Who asked, recorded in the deployment history.
         job_id: The background job driving this update, when there is one.
+        previous_commit: The commit the tree was on before this update: the
+            compose file a failed update checks out again.
 
     Returns:
         What the deployer did, and the deployment history row it wrote.
@@ -566,6 +741,7 @@ def _rebuild_compose(
         deployer.compose_file = str(compose_file_option(unit_compose_file))
     deployer.trigger = trigger
     deployer.job_id = job_id
+    deployer.previous_commit = previous_commit
     result = deployer.update(on_step=on_step)
     return result, getattr(deployer, "last_deployment_id", None)
 
@@ -596,7 +772,11 @@ def _restart_workspaces(
     app_id: int | None, app_name: str, log: Logger, verbose: bool
 ) -> tuple[tuple[str, ...], bool]:
     """
-    Restart every unit a monorepo runs as.
+    Restart every unit a monorepo runs as, when its deployer left that to the caller.
+
+    A registered monorepo's deployer restarts and probes its units itself,
+    behind the health gate (:meth:`~wasm.deployers.monorepo.MonorepoDeployer.update`);
+    this is what restarts the rest.
 
     Args:
         app_id: Store id of the application, if it is registered.
@@ -950,8 +1130,9 @@ def health_gate_for(
 
     A deploy builds its gate from the deployer, which knows the build; an
     activation or a migration only has the row, and asks the same questions
-    of it: which unit serves, on which port, and for a site nothing runs for,
-    whether the directory the web server serves has a page.
+    of it: which unit serves, on which port, what its health check asks, and
+    for a site nothing runs for, whether the directory the web server serves
+    has a page.
 
     Args:
         app: The application.
@@ -967,9 +1148,11 @@ def health_gate_for(
     service = store.get_service_by_app_id(app.id) if app.id is not None else None
     if not app.is_static:
         unit = service.name if service is not None else app_root(app).name
+        check = HealthCheck.for_app(app)
         return HealthGate(
             unit=unit,
-            url=f"http://127.0.0.1:{app.port}/",
+            url=check.url(app.port),
+            check=check,
             services=services,
             logger=log,
             probe=wait_until_healthy,
@@ -1098,6 +1281,285 @@ def _cache_branch(root: Path, recorded: str | None) -> str | None:
     if recorded or not (root / REPO_CACHE_DIR / ".git").is_dir():
         return recorded
     return SourceManager().get_repo_info(root / REPO_CACHE_DIR).get("branch")
+
+
+# ---------------------------------------------------------------------------
+# Is there anything new to deploy
+# ---------------------------------------------------------------------------
+
+#: When rebuilding the commit that is already live is still worth it. Shared
+#: by the console's ``nothing_new`` answer and the CLI's question.
+NOTHING_NEW_HINT = (
+    "Rebuilding the same commit still makes sense when the environment or the "
+    "dependencies changed, or when the last build broke. Update with force to "
+    "rebuild it anyway."
+)
+
+
+@dataclass(frozen=True)
+class UpstreamState:
+    """
+    The head of the branch an application follows, against the commit it runs.
+
+    Attributes:
+        domain: The application's domain.
+        branch: The branch compared.
+        live_commit: The commit that is live, as recorded on disk: the active
+            release's, or the in-place checkout's (short).
+        remote_commit: The full commit the branch points at on the remote.
+    """
+
+    domain: str
+    branch: str
+    live_commit: str
+    remote_commit: str
+
+    @property
+    def has_new_commits(self) -> bool:
+        """Whether the branch has moved past the commit that is live."""
+        return not self.remote_commit.lower().startswith(self.live_commit.lower())
+
+    @property
+    def summary(self) -> str:
+        """The sentence both surfaces show when there is nothing new."""
+        return f"No new commits on {self.branch} since {self.live_commit[:7]}, which is live"
+
+
+def check_upstream(
+    domain: str, *, branch: str | None = None, logger: Logger | None = None
+) -> UpstreamState | None:
+    """
+    Ask the remote whether the branch has anything the live build does not.
+
+    ``git ls-remote`` only: nothing is downloaded and nothing on disk changes,
+    so it runs before the update is even queued. The console and the CLI ask
+    it; the webhook does not, because a push is itself the news.
+
+    Args:
+        domain: The application's domain.
+        branch: The branch the update would follow; the one the application
+            follows when None.
+        logger: Where a failure to ask is reported.
+
+    Returns:
+        The comparison, or None when there is nothing to compare: the
+        application is unknown, is not deployed from git, has no live commit,
+        or the remote could not be asked (reported on ``logger``; the update
+        itself will say why, verbosely).
+    """
+    log = logger if logger is not None else Logger()
+    app = get_store().get_app(validate_domain(domain))
+    if app is None:
+        return None
+    root = app_root(app)
+    source: str | None
+    try:
+        if app.layout == RELEASES:
+            source = app.source
+            active = ReleaseManager(root).current()
+            live = active.commit if active is not None else None
+            follow = branch or app.branch or _cache_branch(root, None)
+        else:
+            if not (root / ".git").exists():
+                return None
+            info = SourceManager().get_repo_info(root)
+            live = info.get("commit")
+            source = app.source or info.get("remote")
+            follow = branch or info.get("branch") or app.branch
+        if not source or not live or validate_source(source)[0] != "git":
+            return None
+        head = SourceManager().remote_head(source, follow)
+    except SourceError as exc:
+        log.warning(f"Could not tell whether there is anything new to deploy: {exc.message}")
+        return None
+    return UpstreamState(
+        domain=app.domain, branch=head.branch, live_commit=live, remote_commit=head.commit
+    )
+
+
+# ---------------------------------------------------------------------------
+# Going back to a deployment
+# ---------------------------------------------------------------------------
+
+#: Statuses of a deployment whose result can be gone back to: one that
+#: served, including one a later rollback replaced.
+_RESTORABLE = frozenset({DeploymentStatus.SUCCESS.value, DeploymentStatus.ROLLED_BACK.value})
+
+
+@dataclass(frozen=True)
+class DeploymentRollback:
+    """
+    What :func:`rollback_to_deployment` did.
+
+    Attributes:
+        domain: The application's domain.
+        deployment_id: The deployment gone back to.
+        release_id: The release activated, on releases.
+        backup_id: The backup restored, in place.
+        history_id: The history row the activation wrote, on releases. A
+            restore writes its own row, which it does not return.
+    """
+
+    domain: str
+    deployment_id: int
+    release_id: str | None
+    backup_id: str | None
+    history_id: int | None
+
+
+def rollback_availability(records: Sequence[DeploymentRecord]) -> dict[int, str | None]:
+    """
+    Say, for each deployment, whether it can be gone back to, and if not why.
+
+    On releases that takes its release, on disk and not active. In place it
+    takes its snapshot: the pre-update backup the next update took, which
+    holds exactly what this deployment produced, and which must still exist.
+
+    Args:
+        records: Deployments, of any applications.
+
+    Returns:
+        Deployment id to None when it can be gone back to, or to the reason
+        it cannot.
+    """
+    store = get_store()
+    apps: dict[str, App | None] = {}
+    releases: dict[str, tuple[set[str], str | None]] = {}
+    backups: dict[str, bool] = {}
+    backup_manager: BackupManager | None = None
+    answers: dict[int, str | None] = {}
+
+    for record in records:
+        if record.id is None:
+            continue
+        if record.domain not in apps:
+            apps[record.domain] = store.get_app(record.domain)
+        app = apps[record.domain]
+        if app is None:
+            answers[record.id] = f"{record.domain} is no longer deployed"
+            continue
+        if record.status not in _RESTORABLE:
+            answers[record.id] = (
+                f"Deployment {record.id} did not finish serving anything to go back to"
+            )
+            continue
+
+        if app.layout == RELEASES:
+            if record.domain not in releases:
+                manager = ReleaseManager(app_root(app))
+                current = manager.current()
+                releases[record.domain] = (
+                    {release.id for release in manager.list()},
+                    current.id if current is not None else None,
+                )
+            on_disk, active = releases[record.domain]
+            if record.release_id is None:
+                answers[record.id] = f"Deployment {record.id} built no release"
+            elif record.release_id == active:
+                answers[record.id] = f"Release {record.release_id} is already live"
+            elif record.release_id not in on_disk:
+                answers[record.id] = (
+                    f"Release {record.release_id} is no longer on disk; rebuild its commit instead"
+                )
+            else:
+                answers[record.id] = None
+            continue
+
+        snapshot = record.snapshot_backup
+        if snapshot is None:
+            answers[record.id] = (
+                f"No backup holds what deployment {record.id} produced; rebuild its commit instead"
+            )
+            continue
+        if snapshot not in backups:
+            if backup_manager is None:
+                backup_manager = BackupManager()
+            backups[snapshot] = backup_manager.get_backup(snapshot) is not None
+        answers[record.id] = (
+            None
+            if backups[snapshot]
+            else f"Backup {snapshot} of deployment {record.id} no longer exists"
+        )
+    return answers
+
+
+def rollback_to_deployment(
+    domain: str,
+    deployment_id: int,
+    *,
+    trigger: str = DeploymentTrigger.CLI.value,
+    logger: Logger | None = None,
+    verbose: bool = False,
+) -> DeploymentRollback:
+    """
+    Put back what one deployment of an application produced.
+
+    On releases, its release is activated behind the health gate (see
+    :func:`activate_release`). In place, its snapshot backup is restored and
+    rebuilt by :meth:`~wasm.managers.backup_manager.RollbackManager.rollback`,
+    which takes a safety backup of the current state first. Either way the
+    operation is a history row of its own.
+
+    Args:
+        domain: The application's domain.
+        deployment_id: The deployment to go back to.
+        trigger: Who asked, recorded in the history.
+        logger: Where the activation reports its progress, on releases.
+        verbose: Verbosity of the managers.
+
+    Returns:
+        What was done.
+
+    Raises:
+        WASMError: The deployment is not one of this application's.
+        DeploymentError: It cannot be gone back to (see
+            :func:`rollback_availability`), or its release did not pass the
+            health gate.
+        BackupError: The restore failed.
+        AppBusyError: Another operation is running on the application.
+    """
+    domain = validate_domain(domain)
+    record = get_store().get_deployment(deployment_id)
+    if record is None or record.domain != domain:
+        raise WASMError(
+            f"Deployment {deployment_id} of {domain} not found",
+            details=f"See the application's history: GET /api/deployments?domain={domain}",
+        )
+    reason = rollback_availability([record]).get(deployment_id)
+    if reason is not None:
+        raise DeploymentError(
+            reason,
+            details=(
+                f"Rebuild its commit instead: wasm update {domain} --commit {record.git_commit}"
+                if record.git_commit
+                else f"Restore a backup instead: wasm rollback {domain}"
+            ),
+        )
+
+    app = get_store().get_app(domain)
+    # rollback_availability answered None, so on releases there is a release
+    # on disk to activate, and in place a snapshot backup that exists.
+    if app is not None and app.layout == RELEASES and record.release_id is not None:
+        activation = activate_release(
+            domain, record.release_id, trigger=trigger, logger=logger, verbose=verbose
+        )
+        return DeploymentRollback(
+            domain=domain,
+            deployment_id=deployment_id,
+            release_id=activation.release.id,
+            backup_id=None,
+            history_id=activation.deployment_id,
+        )
+
+    backup_id = record.snapshot_backup
+    RollbackManager(verbose=verbose).rollback(domain=domain, backup_id=backup_id, trigger=trigger)
+    return DeploymentRollback(
+        domain=domain,
+        deployment_id=deployment_id,
+        release_id=None,
+        backup_id=backup_id,
+        history_id=None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1249,6 +1711,148 @@ def _set_resource_limits(
     app.tasks_max = limits.tasks_max
     store.update_app(app)
     return LimitsChange(domain=domain, limits=limits, units=tuple(units), restarted=restart)
+
+
+# ---------------------------------------------------------------------------
+# Health check
+# ---------------------------------------------------------------------------
+
+
+def set_health_check(
+    domain: str,
+    *,
+    path: str | None,
+    expect: str | None,
+    timeout: int | None,
+) -> App:
+    """
+    Tell the health gate what to ask of an application.
+
+    Every activation from then on - deploy, update, rollback, migration, a
+    limits restart - probes ``path`` and accepts only ``expect`` within
+    ``timeout``, and the diagnosis probes the same. Nothing restarts: the
+    settings are read the next time something is activated. The values are
+    validated where they are stored.
+
+    Args:
+        domain: The application's domain.
+        path: Path to probe, or None for ``/``.
+        expect: Statuses that mean up, such as ``200-399``, or None for any
+            status below 500.
+        timeout: Seconds it gets to answer, from 5 to 600, or None for the
+            default.
+
+    Returns:
+        The application's row as it is now.
+
+    Raises:
+        WASMError: The application is unknown.
+        DeploymentError: It is a static site, which the gate checks by its
+            files, not over HTTP.
+        ValidationError: A value is not one the gate can use.
+    """
+    store = get_store()
+    app = _known_app(store, validate_domain(domain))
+    if app.is_static:
+        raise DeploymentError(
+            f"{app.domain} is a static site; nothing answers HTTP for it but the web server",
+            details="Its health check is that the directory it serves has an index.html.",
+        )
+    store.set_app_health(app.domain, path=path, expect=expect, timeout=timeout)
+    return _known_app(store, app.domain)
+
+
+def _known_app(store: WASMStore, domain: str) -> App:
+    """
+    Read an application's row, or say it is not deployed.
+
+    Args:
+        store: The store.
+        domain: A validated domain.
+
+    Returns:
+        The row.
+
+    Raises:
+        WASMError: There is none.
+    """
+    app = store.get_app(domain)
+    if app is None:
+        raise WASMError(
+            f"Application not found: {domain}", details="Run 'wasm list' to see what is deployed."
+        )
+    return app
+
+
+# ---------------------------------------------------------------------------
+# Release retention
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RetentionChange:
+    """
+    What :func:`set_release_retention` did.
+
+    Attributes:
+        domain: The application's domain.
+        keep_releases: The retention it has now.
+        pruned: Ids of the releases removed from disk, oldest first.
+    """
+
+    domain: str
+    keep_releases: int
+    pruned: tuple[str, ...]
+
+
+def set_release_retention(
+    domain: str, keep: int, *, logger: Logger | None = None
+) -> RetentionChange:
+    """
+    Set how many releases an application keeps, and prune to it now.
+
+    Pruning keeps the newest ``keep``, the active release wherever it is and
+    the one a rollback would go to (:meth:`ReleaseManager.prune`), so no
+    number takes away what serves or the way back. The rows of the pruned
+    releases are forgotten as a deploy's prune forgets them.
+
+    Args:
+        domain: The application's domain.
+        keep: Releases to keep, 1 to 50.
+        logger: Where each pruned release is reported.
+
+    Returns:
+        What was done.
+
+    Raises:
+        WASMError: The application is unknown.
+        DeploymentError: It is in place, where there are no releases.
+        ValidationError: ``keep`` is out of range; nothing is pruned.
+        AppBusyError: Another operation is running on the application.
+    """
+    log = logger if logger is not None else Logger()
+    app = _release_app(validate_domain(domain))
+    store = get_store()
+    # A deploy pruning at the same moment, or an activation re-pointing
+    # current, must not race the list this prune decides from.
+    with app_lock(app.domain, "release retention change"):
+        store.set_keep_releases(app.domain, keep)
+        releases = ReleaseManager(app_root(app), logger=log)
+        removed = releases.prune(keep)
+        for release in removed:
+            log.substep(f"Pruned release {release.id}")
+        # Under --dry-run the prune only said what it would remove; the rows
+        # describe what is on disk, which did not change.
+        if app.id is not None and not is_rehearsal():
+            store.forget_pruned_releases(
+                app.id,
+                on_disk={release.id for release in releases.list()},
+                removed={release.id for release in removed},
+                keep=keep,
+            )
+    return RetentionChange(
+        domain=app.domain, keep_releases=keep, pruned=tuple(r.id for r in removed)
+    )
 
 
 # ---------------------------------------------------------------------------

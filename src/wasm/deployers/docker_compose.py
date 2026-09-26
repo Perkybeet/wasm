@@ -8,13 +8,23 @@ Docker Compose deployer for WASM.
 Handles deployment of applications defined by Docker Compose files,
 including multi-container setups with path-based Nginx routing,
 environment variable management, and systemd integration.
+
+A stack cannot build releases, so an update rebuilds it in place. What makes
+that safe is that the update records what serves before it builds - the
+commit of the tree and the image every running container was created from -
+and puts exactly that back when the new containers do not pass the health
+gate: the tree is checked out at that commit, each image gets the name the
+compose file uses for it again, and ``docker compose up -d --no-build``
+recreates the containers from them. Nothing on the way touches a volume: no
+``down``, no ``-v``, no ``--renew-anon-volumes``; recreating a container keeps
+its named volumes by name and carries its anonymous ones over.
 """
 
 import json
 import re
 import sqlite3
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, ClassVar
@@ -30,16 +40,19 @@ from wasm.core.exceptions import (
     ValidationError,
     WASMError,
 )
-from wasm.core.fs import FileSystem
+from wasm.core.fs import DryRunFileSystem, FileSystem
 from wasm.core.runner import CommandResult, CommandRunner, get_runner
 from wasm.core.store import AppStatus, AppType, DeploymentTrigger, get_store
 from wasm.core.utils import domain_to_app_name
+from wasm.deployers.helpers.health import wait_until_healthy
+from wasm.deployers.helpers.health_gate import HealthCheck, HealthGate
 from wasm.deployers.helpers.registration import StoreRegistrar
 from wasm.deployers.helpers.target import claim_deploy_target
 from wasm.deployers.interface import AppDeployer, StepReporter, UpdateResult
 from wasm.deployers.recorder import (
     CapturingLogger,
     DeploymentRecorder,
+    GitInfo,
     checkout_git_info,
     recorder_for,
     recording,
@@ -57,6 +70,38 @@ BUILD_TIMEOUT = 1800
 
 #: Bringing a stack up or down, and every query about it.
 COMPOSE_TIMEOUT = 300
+
+#: The tag the image each container ran before an update is kept under, as
+#: ``<project>-<service>:wasm-previous``. Recreating a container from a new
+#: build leaves its old image without a name, and ``docker image prune``
+#: deletes an image without a name; this one is what a failed update goes
+#: back to. Each update moves the tag, so one image per service is kept.
+PREVIOUS_TAG = "wasm-previous"
+
+#: Lines of the containers' own output attached to a failed health gate.
+COMPOSE_LOG_LINES = 40
+
+#: How many times, and how far apart, the containers' state is read after
+#: they are recreated. A container that crashes on start is running for a
+#: moment first, so one reading is not enough.
+CONTAINER_CHECK_ATTEMPTS = 10
+CONTAINER_CHECK_DELAY = 3.0
+
+#: What ``docker inspect`` is asked about each running container: its image,
+#: the reference it was created from, and the service and project Compose
+#: labelled it with. Go templates are the one output format every Docker
+#: version shares.
+_INSPECT_FORMAT = (
+    "{{.Image}}|{{.Config.Image}}"
+    '|{{index .Config.Labels "com.docker.compose.service"}}'
+    '|{{index .Config.Labels "com.docker.compose.project"}}'
+)
+
+#: A container id as ``docker compose ps -q`` prints it.
+_CONTAINER_ID = re.compile(r"^[0-9a-f]{12,64}$")
+
+#: Characters an image repository name cannot hold.
+_IMAGE_NAME_INVALID = re.compile(r"[^a-z0-9._-]+")
 
 # Compose file priority order
 COMPOSE_FILE_PRIORITY = [
@@ -251,6 +296,120 @@ def compose_file_in(app_path: Path, relative: PurePosixPath | str) -> Path:
     return path
 
 
+@dataclass(frozen=True)
+class ServingImage:
+    """
+    The image one service of a stack was running before an update.
+
+    Attributes:
+        service: The Compose service.
+        reference: The image name the container was created from, which is
+            the name the compose file makes Compose look up.
+        image_id: The image's immutable id.
+    """
+
+    service: str
+    reference: str
+    image_id: str
+
+
+@dataclass(frozen=True)
+class ServingState:
+    """
+    What a stack was serving before an update: what a failed update puts back.
+
+    Attributes:
+        project: The Compose project its containers belonged to, or None
+            when none was running.
+        commit: The commit the tree was on, or None when it is not a git
+            checkout or the commit could not be read.
+        images: The image of each service that had a running container.
+    """
+
+    project: str | None
+    commit: str | None
+    images: tuple[ServingImage, ...]
+
+
+def parse_compose_ps(stdout: str) -> list[dict[str, Any]]:
+    """
+    Read what ``docker compose ps --format json`` printed, in any Compose v2 format.
+
+    Compose before 2.21 prints one JSON array; 2.21 and later print one object
+    per line. Both come from the same flag, so both must be read.
+
+    Args:
+        stdout: The command's output.
+
+    Returns:
+        One mapping per container; lines that are not JSON objects are skipped.
+    """
+    text = stdout.strip()
+    if not text:
+        return []
+    try:
+        whole = json.loads(text)
+    except json.JSONDecodeError:
+        whole = None
+    if isinstance(whole, list):
+        return [entry for entry in whole if isinstance(entry, dict)]
+    if isinstance(whole, dict):
+        return [whole]
+    containers: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry, dict):
+            containers.append(entry)
+    return containers
+
+
+def container_problem(container: dict[str, Any]) -> str | None:
+    """
+    Say what is wrong with a container, if anything.
+
+    A one-shot container (a migration, a seed) that ran and exited 0 did its
+    job; one that exited with an error, one Docker keeps restarting and one
+    whose own health check says unhealthy did not.
+
+    Args:
+        container: One entry of :func:`parse_compose_ps`.
+
+    Returns:
+        A line naming the container and its state, or None when it is fine.
+    """
+    name = container.get("Name") or container.get("Service") or "a container"
+    state = str(container.get("State") or "").lower()
+    health = str(container.get("Health") or "").lower()
+    exit_code = container.get("ExitCode")
+    if state in ("restarting", "dead"):
+        suffix = f" (last exit code {exit_code})" if exit_code not in (None, 0, "0") else ""
+        return f"{name}: {state}{suffix}"
+    if state == "exited" and exit_code not in (None, 0, "0"):
+        return f"{name}: exited with code {exit_code}"
+    if health == "unhealthy":
+        return f"{name}: unhealthy"
+    return None
+
+
+def keep_tag(project: str, service: str) -> str:
+    """
+    Name the tag an image that served is kept under while an update runs.
+
+    Args:
+        project: The Compose project.
+        service: The service.
+
+    Returns:
+        ``<project>-<service>:wasm-previous``, restricted to what an image
+        name may hold.
+    """
+    name = _IMAGE_NAME_INVALID.sub("-", f"{project}-{service}".lower()).strip("._-")
+    return f"{name or 'wasm'}:{PREVIOUS_TAG}"
+
+
 @dataclass
 class DockerComposeService:
     """Represents a service from a Docker Compose file."""
@@ -329,6 +488,12 @@ class DockerComposeDeployer(AppDeployer):
         self.compose_file: str | None = None
         self.compose_profiles: list[str] = []
         self.port: int | None = None
+        # The commit the tree was on before the update pulled, which only the
+        # caller that pulled can know: what a failed update checks out again.
+        self.previous_commit: str | None = None
+        # The commit and branch of the attempt, kept when a failed update
+        # puts the previous commit back, so its history row names what failed.
+        self._attempted_git: tuple[str | None, str | None] | None = None
 
         # Parsed state
         self.services: list[DockerComposeService] = []
@@ -499,7 +664,7 @@ class DockerComposeDeployer(AppDeployer):
         self.replace_existing = bool(options.get("replace_existing", False))
         self.deploy_target = None
 
-    def _compose(self, *args: str) -> list[str]:
+    def _compose(self, *args: str, project: str | None = None) -> list[str]:
         """
         Build a ``docker compose`` argument vector for this stack.
 
@@ -511,6 +676,9 @@ class DockerComposeDeployer(AppDeployer):
 
         Args:
             args: Subcommand and its arguments.
+            project: The project to address instead of the derived one: the
+                one the containers that served belonged to, when a failed
+                update puts them back.
 
         Returns:
             The full argument vector, including the project, file and
@@ -518,7 +686,8 @@ class DockerComposeDeployer(AppDeployer):
         """
         cmd = ["docker", "compose"]
         if self.compose_path:
-            project = compose_project_name(self.app_path, self.compose_path)
+            if project is None:
+                project = compose_project_name(self.app_path, self.compose_path)
             if project is not None:
                 cmd.extend(["-p", project])
             cmd.extend(["-f", str(self.compose_path)])
@@ -1030,29 +1199,16 @@ class DockerComposeDeployer(AppDeployer):
                 time.sleep(delay)
                 continue
 
-            try:
-                # Docker compose ps --format json may output one JSON per line
-                all_running = True
-                for line in result.stdout.strip().splitlines():
-                    if not line.strip():
-                        continue
-                    svc_info = json.loads(line)
-                    state = svc_info.get("State", "").lower()
-                    health = svc_info.get("Health", "").lower()
+            all_running = True
+            for svc_info in parse_compose_ps(result.stdout):
+                state = str(svc_info.get("State") or "").lower()
+                health = str(svc_info.get("Health") or "").lower()
+                if state != "running" or health not in ("healthy", ""):
+                    all_running = False
+                    break
 
-                    if state != "running":
-                        all_running = False
-                        break
-
-                    if health and health not in ("healthy", ""):
-                        all_running = False
-                        break
-
-                if all_running:
-                    return True
-
-            except (json.JSONDecodeError, KeyError):
-                pass
+            if all_running:
+                return True
 
             if attempt < retries - 1:
                 time.sleep(delay)
@@ -1093,10 +1249,33 @@ class DockerComposeDeployer(AppDeployer):
         Returns:
             A recorder, built where every deployer's is.
         """
-        return recorder_for(
-            self,
-            git_info=checkout_git_info(SourceManager(verbose=self.verbose), self.app_path),
-        )
+        return recorder_for(self, git_info=self._git_info())
+
+    def _source_manager(self) -> SourceManager:
+        """
+        Build the source manager git goes through, on this deployer's runner.
+
+        Returns:
+            The manager.
+        """
+        return SourceManager(verbose=self.verbose, runner=self._runner, fs=self._fs)
+
+    def _git_info(self) -> GitInfo:
+        """
+        Answer the commit and branch a history row records.
+
+        Returns:
+            A reader of the checkout, which answers what was attempted
+            instead once a failed update has put the previous commit back.
+        """
+        checkout = checkout_git_info(self._source_manager(), self.app_path)
+
+        def read() -> tuple[str | None, str | None]:
+            if self._attempted_git is not None:
+                return self._attempted_git
+            return checkout()
+
+        return read
 
     def _rollback(self) -> None:
         """Clean up on deployment failure."""
@@ -1193,16 +1372,7 @@ class DockerComposeDeployer(AppDeployer):
             Dictionary with service status information.
         """
         result = self._run(self._compose("ps", "--format", "json"))
-        services = []
-
-        if result.success:
-            for line in result.stdout.strip().splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    services.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
+        services = parse_compose_ps(result.stdout) if result.success else []
 
         return {
             "domain": self.domain,
@@ -1213,13 +1383,20 @@ class DockerComposeDeployer(AppDeployer):
 
     def update(self, on_step: StepReporter | None = None) -> UpdateResult:
         """
-        Rebuild the images of this stack and recreate its containers.
+        Rebuild the images of this stack and recreate its containers, behind the health gate.
 
         This used to take no arguments, return None and pull the source itself,
         which is why the CLI could not drive it through the same call as every
         other deployer and grew a third copy of the update flow instead. The
         source is now fetched by whoever owns that step, exactly as
         :meth:`~wasm.deployers.base.BaseDeployer.update` expects.
+
+        What serves is recorded first (see :class:`ServingState`). A build
+        that fails puts the tree and the image names back and recreates
+        nothing, since the containers were never touched. New containers that
+        do not pass the gate are replaced by the ones that served, from the
+        images they ran, and the update fails with the probes, the unit's
+        journal and the containers' own output.
 
         Args:
             on_step: Called as each step begins.
@@ -1228,8 +1405,10 @@ class DockerComposeDeployer(AppDeployer):
             What was done, for the caller to present.
 
         Raises:
-            DeploymentError: When no compose file can be found.
-            DockerError: When the build or the recreate fails.
+            DeploymentError: When no compose file can be found, or the new
+                containers did not pass the health gate; by then what served
+                has been put back, and the message says whether it answers.
+            DockerError: When the build fails.
         """
         with recording(self._recorder(), git_branch=self.branch) as recorder:
             result = self._update_steps(on_step or (lambda _message: None))
@@ -1238,7 +1417,7 @@ class DockerComposeDeployer(AppDeployer):
 
     def _update_steps(self, report: StepReporter) -> UpdateResult:
         """
-        Rebuild the images and recreate the containers.
+        Record what serves, rebuild, recreate and judge the new containers.
 
         Args:
             report: Called as each step begins.
@@ -1247,20 +1426,38 @@ class DockerComposeDeployer(AppDeployer):
             What was done.
 
         Raises:
-            DockerError: When the build or the recreate fails.
+            DeploymentError: The new containers did not pass the health gate.
+            DockerError: The build failed.
         """
         if self.compose_path is None:
             self._discover_compose_file()
 
+        report("Recording what is serving")
+        serving = self._record_serving()
+
         report("Rebuilding Docker images")
-        self._build_images()
+        try:
+            self._build_images()
+        except DockerError as exc:
+            if not serving.images:
+                raise
+            # The containers still run the old images, but the tree and some
+            # image names already say otherwise: the next start of the unit
+            # would bring up whatever half of the stack did build.
+            self.logger.warning("The build failed; putting the tree and the image names back")
+            self._attempted_git = self._git_info()()
+            problems = self._put_back_files(serving)
+            if problems:
+                raise DockerError(
+                    exc.message, details=_paragraphs(exc.details, _problem_list(problems))
+                ) from exc
+            raise
 
         report("Recreating containers")
-        # Services that name an image instead of building one pull it here,
-        # which is a download, not a local recreate.
-        result = self._run(self._compose("up", "-d", "--remove-orphans"), timeout=BUILD_TIMEOUT)
-        if not result.success:
-            raise DockerError("Failed to update containers", result.stderr)
+        healthy, evidence = self._activate(self._recreate)
+        if not healthy:
+            report("Putting back what was serving")
+            raise self._go_back(serving, evidence)
 
         self.store.update_app_status(self.domain, AppStatus.RUNNING.value)
 
@@ -1271,6 +1468,291 @@ class DockerComposeDeployer(AppDeployer):
             # no unit for the caller to restart afterwards.
             is_static=True,
             start_command=" ".join(self._compose("up", "-d")),
+        )
+
+    def _rehearsing(self) -> bool:
+        """
+        Report whether this is a ``--dry-run``, where nothing was recreated to probe.
+
+        Returns:
+            True under a rehearsing filesystem.
+        """
+        return isinstance(self.fs, DryRunFileSystem)
+
+    def _record_serving(self) -> ServingState:
+        """
+        Record what the stack serves now, and keep its images from being pruned.
+
+        Returns:
+            The project, the commit the caller read before pulling, and the
+            image of every service with a running container. Nothing is
+            recorded when Docker cannot say, which is reported: that update
+            has nothing to go back to.
+        """
+        listed = self._run(self._compose("ps", "-q"))
+        if not listed.success:
+            self.logger.warning(
+                "Could not list the running containers; a failed update cannot put them back: "
+                + (listed.stderr.strip() or listed.stdout.strip())
+            )
+            return ServingState(project=None, commit=self.previous_commit, images=())
+        ids = [line.strip() for line in listed.stdout.splitlines()]
+        ids = [cid for cid in ids if _CONTAINER_ID.match(cid)]
+        if not ids:
+            self.logger.substep("No containers are running: there is nothing to go back to")
+            return ServingState(project=None, commit=self.previous_commit, images=())
+
+        inspected = self._run(["docker", "inspect", "--format", _INSPECT_FORMAT, *ids])
+        if not inspected.success:
+            self.logger.warning(
+                "Could not read the images of the running containers; a failed update cannot "
+                f"put them back: {inspected.stderr.strip()}"
+            )
+            return ServingState(project=None, commit=self.previous_commit, images=())
+
+        project: str | None = None
+        images: dict[str, ServingImage] = {}
+        for line in inspected.stdout.splitlines():
+            parts = line.strip().split("|")
+            if len(parts) != 4 or not all(parts[:3]):
+                continue
+            image_id, reference, service, owner = parts
+            project = project or owner or None
+            # A digest names one image for ever; there is no name to move back.
+            if "@" not in reference:
+                images.setdefault(service, ServingImage(service, reference, image_id))
+
+        for image in images.values():
+            tag = keep_tag(project or self.app_name, image.service)
+            kept = self._run(["docker", "image", "tag", image.image_id, tag])
+            if not kept.success:
+                # Still usable by its id until something prunes it.
+                self.logger.warning(
+                    f"Could not tag {image.image_id} as {tag}: {kept.stderr.strip()}"
+                )
+        if images:
+            self.logger.substep(
+                "Serving: " + ", ".join(f"{i.service} ({i.reference})" for i in images.values())
+            )
+        return ServingState(
+            project=project, commit=self.previous_commit, images=tuple(images.values())
+        )
+
+    def _recreate(self) -> None:
+        """
+        Recreate the containers from the images just built.
+
+        Raises:
+            DockerError: Compose failed, with its own output.
+        """
+        # Services that name an image instead of building one pull it here,
+        # which is a download, not a local recreate.
+        result = self._run(self._compose("up", "-d", "--remove-orphans"), timeout=BUILD_TIMEOUT)
+        if not result.success:
+            raise DockerError("Failed to update containers", result.stderr)
+
+    def _recreate_previous(self, serving: ServingState) -> None:
+        """
+        Recreate the containers from the images that served, without building.
+
+        ``--no-build`` is what makes this the previous stack and not a second
+        build of the tree; ``--remove-orphans`` removes the containers of
+        services the failed update added, and only the containers.
+
+        Args:
+            serving: What served.
+
+        Raises:
+            DockerError: Compose failed, with its own output.
+        """
+        command = self._compose(
+            "up", "-d", "--no-build", "--remove-orphans", project=serving.project
+        )
+        result = self._run(command, timeout=BUILD_TIMEOUT)
+        if not result.success:
+            raise DockerError("Failed to recreate the containers that were serving", result.stderr)
+
+    def _health_gate(self, restart: Callable[[], object]) -> HealthGate | None:
+        """
+        Build the gate the stack's web port must pass, with the application's own check.
+
+        Args:
+            restart: What brings the containers up.
+
+        Returns:
+            The gate, or None for a headless stack, which has no port to ask
+            and is judged by its containers alone.
+        """
+        app = self.store.get_app(self.domain)
+        port = app.port if app is not None and app.port else self.port
+        if not port:
+            return None
+        check = HealthCheck.for_app(app)
+        return HealthGate(
+            unit=self.app_name or None,
+            url=check.url(port),
+            check=check,
+            services=ServiceManager(verbose=self.verbose, runner=self._runner),
+            logger=self.logger,
+            # Looked up here, at call time, so it is the one this module holds.
+            probe=wait_until_healthy,
+            restart=restart,
+        )
+
+    def _activate(self, restart: Callable[[], object]) -> tuple[bool, str]:
+        """
+        Bring the containers up and decide whether the stack is up.
+
+        Args:
+            restart: What brings them up.
+
+        Returns:
+            Whether it passed, and when it did not, the evidence verbatim.
+        """
+        if self._rehearsing():
+            # A rehearsal built and recreated nothing; there is nothing to ask.
+            restart()
+            return True, ""
+        gate = self._health_gate(restart)
+        if gate is not None:
+            healthy, evidence = gate.restart_and_probe()
+            if not healthy:
+                return False, evidence
+        else:
+            try:
+                restart()
+            except WASMError as exc:
+                return False, str(exc)
+        return self._containers_settle()
+
+    def _containers_settle(self) -> tuple[bool, str]:
+        """
+        Read the containers' state until none is failing, or the attempts run out.
+
+        Returns:
+            Whether every container is running (or exited cleanly), and when
+            not, which ones and how.
+        """
+        problems: list[str] = []
+        starting = False
+        for attempt in range(CONTAINER_CHECK_ATTEMPTS):
+            if attempt:
+                time.sleep(CONTAINER_CHECK_DELAY)
+            result = self._run(self._compose("ps", "-a", "--format", "json"))
+            if not result.success:
+                problems = [f"docker compose ps failed: {result.stderr.strip()}"]
+                continue
+            containers = parse_compose_ps(result.stdout)
+            problems = [p for p in map(container_problem, containers) if p is not None]
+            starting = any(str(c.get("Health") or "").lower() == "starting" for c in containers)
+            if not problems and not starting:
+                return True, ""
+        if not problems:
+            # Only a health check still in its start period: the stack's own
+            # check has not decided, and the gate above already has.
+            self.logger.warning("Some containers are still starting their own health check")
+            return True, ""
+        return False, "Containers that are not running:\n" + "\n".join(f"  {p}" for p in problems)
+
+    def _containers_output(self) -> str:
+        """
+        Read the last lines of every container's output, before they are replaced.
+
+        Returns:
+            Compose's output verbatim, or why it could not be read.
+        """
+        result = self._run(self._compose("logs", "--tail", str(COMPOSE_LOG_LINES), "--no-color"))
+        if result.success:
+            return result.stdout.strip() or "(the containers printed nothing)"
+        return f"(the containers' output could not be read: {result.stderr.strip()})"
+
+    def _put_back_files(self, serving: ServingState) -> list[str]:
+        """
+        Put the tree and the image names back as they were before the update.
+
+        Every step is attempted even when an earlier one failed.
+
+        Args:
+            serving: What served.
+
+        Returns:
+            What could not be put back, one line each; empty when all was.
+        """
+        problems: list[str] = []
+        if serving.commit:
+            try:
+                full = self._source_manager().checkout_commit(self.app_path, serving.commit)
+            except WASMError as exc:
+                problems.append(f"The tree could not be checked out at {serving.commit[:7]}: {exc}")
+            else:
+                self.logger.substep(f"Tree back on commit {full[:7]}")
+        for image in serving.images:
+            tagged = self._run(["docker", "image", "tag", image.image_id, image.reference])
+            if not tagged.success:
+                problems.append(
+                    f"The image {image.service} ran could not be named {image.reference} again: "
+                    + (tagged.stderr.strip() or tagged.stdout.strip())
+                )
+        return problems
+
+    def _go_back(self, serving: ServingState, evidence: str) -> DeploymentError:
+        """
+        Put back what served after the new containers failed the gate.
+
+        Args:
+            serving: What served.
+            evidence: What the gate saw.
+
+        Returns:
+            The error to raise, which says whether what served is back and answering.
+        """
+        attempted = f"The update of {self.domain} did not pass its health check"
+        self.logger.warning(attempted)
+        # Read now: going back replaces the containers that wrote it.
+        output = self._containers_output()
+        evidence = _paragraphs(
+            evidence,
+            f"Last lines of the containers' output (docker compose logs --tail "
+            f"{COMPOSE_LOG_LINES}):\n{output}",
+        )
+        if not serving.images:
+            self.store.update_app_status(self.domain, AppStatus.FAILED.value)
+            return DeploymentError(
+                f"{attempted}; nothing was running before it, so nothing was put back",
+                details=evidence,
+            )
+
+        self._attempted_git = self._git_info()()
+        problems = self._put_back_files(serving)
+        notes = []
+        if not serving.commit:
+            notes.append(
+                "The tree is not a git checkout at a known commit, so the compose file was not "
+                "put back: the previous images run with the compose file of this update."
+            )
+        try:
+            self._recreate_previous(serving)
+        except DockerError as exc:
+            problems.append(str(exc))
+
+        if problems:
+            self.store.update_app_status(self.domain, AppStatus.FAILED.value)
+            return DeploymentError(
+                f"{attempted}; what was serving could not be put back entirely",
+                details=_paragraphs(evidence, *notes, _problem_list(problems)),
+            )
+
+        restored, after = self._activate(lambda: None)
+        if restored:
+            self.store.update_app_status(self.domain, AppStatus.RUNNING.value)
+            return DeploymentError(
+                f"{attempted}; the containers that were serving are running again",
+                details=_paragraphs(evidence, *notes),
+            )
+        self.store.update_app_status(self.domain, AppStatus.FAILED.value)
+        return DeploymentError(
+            f"{attempted}; the previous containers are back but are not answering either",
+            details=_paragraphs(evidence, *notes, f"After going back:\n{after}"),
         )
 
     def down(self, remove_volumes: bool = False) -> bool:
@@ -1337,6 +1819,32 @@ class DockerComposeDeployer(AppDeployer):
             self.store.delete_app(self.domain)
         except (WASMError, sqlite3.Error) as e:
             self.logger.debug(f"Store cleanup failed: {e}")
+
+
+def _paragraphs(*parts: str | None) -> str:
+    """
+    Join the non-empty parts of an error's details with a blank line.
+
+    Args:
+        parts: The parts, in order.
+
+    Returns:
+        The details.
+    """
+    return "\n\n".join(part for part in parts if part)
+
+
+def _problem_list(problems: Sequence[str]) -> str:
+    """
+    Say what could not be put back.
+
+    Args:
+        problems: One line per step that failed.
+
+    Returns:
+        A paragraph listing them.
+    """
+    return "Putting back what was serving failed:\n" + "\n".join(f"  - {p}" for p in problems)
 
 
 DeployerRegistry.register(DockerComposeDeployer)

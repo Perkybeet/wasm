@@ -522,7 +522,7 @@ def test_health_warns_about_a_certificate_close_to_expiry(
 
     exit_code = handle_health(Namespace(verbose=False))
 
-    assert "1 total, 1 expiring soon" in capfd.readouterr().out
+    assert "1 total, 0 expired, 1 expiring soon" in capfd.readouterr().out
     assert exit_code == expected_exit_code
 
 
