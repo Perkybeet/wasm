@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        2.0.1
+Version:        2.1.0
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        AGPL-3.0-or-later
@@ -293,6 +293,12 @@ if [ -f /etc/systemd/system/wasm-web.service ]; then
 fi
 
 %changelog
+* Sat Sep 26 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 2.1.0-1
+- WASM is now free software under the GNU AGPL 3.0 or later
+- Configurable health check and release retention; rebuild or roll back to a deployment's exact commit; nothing-new check before updates
+- Docker Compose and monorepo updates pass the health gate and roll back
+- wasm web enable runs the console as a service; SMTP, Telegram, health reasons and backups in the console; charts with readout and zoom
+- Fixes: cron edits, credentials in source URLs, per-app metrics, backup ids, rate limiter
 * Sat Sep 26 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 2.0.1-1
 - Backups never land in the working directory (wasm backup import recovers them), unit failures alert by default, one definition of WASM's units, git never prompts for credentials, PostgreSQL read-only console on any port, per-credential rate limits
 * Sat Sep 26 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 2.0.0-1

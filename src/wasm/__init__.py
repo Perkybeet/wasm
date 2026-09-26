@@ -14,7 +14,7 @@ from importlib.metadata import version as _installed_version
 #: as an OBS build directory. The single source of truth is the ``version``
 #: field of pyproject.toml; ``scripts/release.py`` keeps this literal and the
 #: distribution packaging files in step with it.
-_FALLBACK_VERSION = "2.0.1"
+_FALLBACK_VERSION = "2.1.0"
 
 try:
     __version__ = _installed_version("wasm-cli")

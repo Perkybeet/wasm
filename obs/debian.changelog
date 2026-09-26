@@ -1,3 +1,13 @@
+wasm (2.1.0-1) unstable; urgency=medium
+
+  * WASM is now free software under the GNU AGPL 3.0 or later
+  * Configurable health check and release retention; rebuild or roll back to a deployment's exact commit; nothing-new check before updates
+  * Docker Compose and monorepo updates pass the health gate and roll back
+  * wasm web enable runs the console as a service; SMTP, Telegram, health reasons and backups in the console; charts with readout and zoom
+  * Fixes: cron edits, credentials in source URLs, per-app metrics, backup ids, rate limiter
+
+ -- Yago Lopez Prado <yago.lopez.adeje@gmail.com>  Sat, 26 Sep 2026 18:03:01 +0000
+
 wasm (2.0.1-1) unstable; urgency=medium
 
   * Backups never land in the working directory (wasm backup import recovers them), unit failures alert by default, one definition of WASM's units, git never prompts for credentials, PostgreSQL read-only console on any port, per-credential rate limits
