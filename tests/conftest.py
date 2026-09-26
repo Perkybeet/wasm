@@ -145,6 +145,29 @@ def ports(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> Po
 
 
 @pytest.fixture(autouse=True)
+def isolated_store_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Point the store's default locations inside the test's own directory.
+
+    ``USER_DB_PATH`` is computed from ``Path.home()`` when the module is
+    imported, so redirecting ``HOME`` inside a test is too late: a test that
+    reached ``get_store()`` without a store fixture opened the developer's real
+    ``~/.local/share/wasm/wasm.db`` - and, on a machine that also ran a newer
+    WASM, failed on its schema. The system location is redirected too, so a
+    test run as root can never touch ``/var/lib/wasm``. Tests that pin their
+    own paths still do; their monkeypatch runs after this one.
+
+    Args:
+        tmp_path: Per-test temporary directory.
+        monkeypatch: Patching helper, scoped to the test.
+    """
+    from wasm.core import store as store_module
+
+    monkeypatch.setattr(store_module, "USER_DB_PATH", tmp_path / "user-store" / "wasm.db")
+    monkeypatch.setattr(store_module, "DEFAULT_DB_PATH", tmp_path / "system-store" / "wasm.db")
+
+
+@pytest.fixture(autouse=True)
 def default_filesystem() -> Iterator[None]:
     """
     Put the process-wide filesystem back to the real one after every test.
