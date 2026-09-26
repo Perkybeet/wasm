@@ -5,7 +5,7 @@
 #
 
 Name:           wasm-cli
-Version:        1.6.5
+Version:        2.0.0
 Release:        1%{?dist}
 Summary:        Web App System Management CLI Tool
 License:        WASM-NCSAL
@@ -276,6 +276,8 @@ if [ $1 -eq 0 ]; then
 fi
 
 %changelog
+* Sat Sep 26 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 2.0.0-1
+- WASM 2.0: releases with health-gated activation and instant rollback, a new browser console, domains, diagnosis, resource limits, API tokens and sudo mode; see docs/CHANGELOG-2.0.md and docs/UPGRADING-2.0.md
 * Sat Sep 26 2026 Yago Lopez Prado <yago.lopez.adeje@gmail.com> - 1.6.5-1
 - Fix the Debian package pip-installing into the system Python with --break-system-packages on every install and upgrade
 - Fix the Debian package recursively reassigning every file under /var/www/apps to www-data on every upgrade, which could break data directories bind-mounted into containers

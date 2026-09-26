@@ -1,3 +1,9 @@
+wasm (2.0.0-1) unstable; urgency=medium
+
+  * WASM 2.0: releases with health-gated activation and instant rollback, a new browser console, domains, diagnosis, resource limits, API tokens and sudo mode; see docs/CHANGELOG-2.0.md and docs/UPGRADING-2.0.md
+
+ -- Yago Lopez Prado <yago.lopez.adeje@gmail.com>  Sat, 26 Sep 2026 04:35:54 +0000
+
 wasm (1.6.5-1) unstable; urgency=medium
 
   * Fix the Debian package pip-installing into the system Python with --break-system-packages on every install and upgrade
